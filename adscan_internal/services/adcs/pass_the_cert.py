@@ -23,6 +23,7 @@ from adscan_internal.services.adcs.cert_auth import (
     CertAuthConfig,
     authenticate_with_cert_native,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass
@@ -186,6 +187,7 @@ def pass_the_certificate_native(
         result = _resolve_async(authenticate_with_cert_native(cfg, output_dir))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return PassTheCertificateResult(
             domain=domain,
             principal=None,

@@ -22,6 +22,7 @@ from adscan_internal.services.domain_posture import (
     IntelligenceFinding,
     PostureSignal,
 )
+from adscan_core.rich_output import print_exception
 
 
 PostureSink = Callable[[PostureSignal], Optional[IntelligenceFinding]]
@@ -66,6 +67,7 @@ def make_workspace_posture_sink(
                     on_finding(finding)
                 except Exception as cb_exc:
                     telemetry.capture_exception(cb_exc)
+                    print_exception(exception=cb_exc)
                     print_info_debug(
                         f"[posture_sink] on_finding callback raised: "
                         f"{type(cb_exc).__name__}: {cb_exc}"
@@ -73,6 +75,7 @@ def make_workspace_posture_sink(
             return finding
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[posture_sink] sink failed: {type(exc).__name__}: {exc}")
             return None
 

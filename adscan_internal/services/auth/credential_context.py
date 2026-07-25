@@ -67,6 +67,7 @@ from adscan_internal.rich_output import (
     print_info_verbose,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _epoch_key(principal: str, realm: str) -> tuple[str, str]:
@@ -407,6 +408,7 @@ class CredentialContext:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(
                     f"[cred-context] TGT refresh failed: {type(exc).__name__}: {exc}"
                 )

@@ -16,12 +16,13 @@ INTENTIONALLY KEPT ON IMPACKET (hard stops from migration spec):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, List
 import subprocess
 import shlex
 import re
+import time
 
 from rich.table import Table
 
@@ -71,11 +72,13 @@ from adscan_core.tui.patience_notice import (
 from adscan_core.tui.progress_dashboard import (
     ProgressDashboard,
     ProgressDashboardConfig,
+    format_eta,
 )
 from adscan_core.tui.stream_runner import (
     StreamedProcessResult,
     stream_command_lines,
 )
+from adscan_core.rich_output import print_exception
 
 
 _UF_ACCOUNTDISABLE = 0x0002
@@ -321,6 +324,90 @@ def _parse_userenum_output_lines(lines: "list[str] | Iterable[str]", domain: str
     return usernames
 
 
+# Diagnostic categories for the AS-REQ response-code distribution kerbrute
+# reports one line per attempted username (with ``-v``). The verdict text in
+# each line maps 1:1 onto the underlying KDC response code, so tallying them
+# tells "0 valid users" (a legitimate miss -- the org's naming convention was
+# not in the candidate list) APART FROM a silent transport failure (kerbrute
+# produced no per-candidate responses at all). This is the difference the
+# ``✓ users 0 ⚠ errors 0`` summary alone cannot show.
+_USERENUM_DIST_KEYS = ("valid", "unknown_principal", "locked", "other")
+
+
+def _classify_userenum_response_distribution(
+    lines: "Iterable[str]",
+) -> dict[str, int]:
+    """Tally kerbrute per-attempt verdicts into AS-REQ response-code buckets.
+
+    Each bucket maps onto the KDC response the verdict implies:
+
+    * ``valid`` -> ``[+] VALID USERNAME`` == ``KRB5KDC_ERR_PREAUTH_REQUIRED``
+      (a real, enabled principal that requires pre-auth: an enumeration HIT).
+    * ``unknown_principal`` -> ``[!] ... - User does not exist`` ==
+      ``KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN`` (the expected MISS: the candidate is
+      not a real user).
+    * ``locked`` -> ``[!] ... - USER LOCKED OUT`` (a real principal, locked).
+    * ``other`` -> any other ``[!]`` attempt line (network error / timeout /
+      an unclassified KDC error verdict).
+
+    Pure and defensive: never raises, tolerates ANSI codes and log prefixes.
+
+    Args:
+        lines: Iterable of raw kerbrute output lines.
+
+    Returns:
+        Mapping of each bucket in ``_USERENUM_DIST_KEYS`` to its count.
+    """
+    dist = {key: 0 for key in _USERENUM_DIST_KEYS}
+    for raw_line in lines:
+        line = str(raw_line)
+        if "@" not in line:
+            continue
+        if _KERBRUTE_VALID_USERNAME_MARKER in line:
+            dist["valid"] += 1
+            continue
+        if _KERBRUTE_INVALID_USER_MARKER not in line:
+            continue
+        lowered = line.lower()
+        if "does not exist" in lowered:
+            dist["unknown_principal"] += 1
+        elif "locked" in lowered:
+            dist["locked"] += 1
+        else:
+            dist["other"] += 1
+    return dist
+
+
+def _format_userenum_response_distribution(
+    dist: dict[str, int],
+    *,
+    marked_domain: str,
+    candidate_count: int,
+) -> str:
+    """Render the AS-REQ response-code distribution as one diagnostic line."""
+    total = sum(dist.get(key, 0) for key in _USERENUM_DIST_KEYS)
+    summary = (
+        f"Kerberos user-enum AS-REQ response distribution for {marked_domain}: "
+        f"valid/PREAUTH_REQUIRED={dist.get('valid', 0)}, "
+        f"unknown-principal/C_PRINCIPAL_UNKNOWN={dist.get('unknown_principal', 0)}, "
+        f"locked-out={dist.get('locked', 0)}, "
+        f"network-timeout-other={dist.get('other', 0)}, "
+        f"total-responses={total}, candidates={candidate_count}"
+    )
+    if total == 0:
+        summary += (
+            " -- no per-candidate responses parsed: likely a silent transport "
+            "failure (DC unreachable on 88 / no AS-REQ answers), NOT a genuine "
+            "0-result"
+        )
+    elif dist.get("valid", 0) == 0:
+        summary += (
+            " -- responses received but zero valid users: the naming convention "
+            "is likely not represented in this candidate list (a genuine 0-result)"
+        )
+    return summary
+
+
 def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess[str]:
     """Execute a command using the shared command runner.
 
@@ -344,6 +431,143 @@ def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess
             env=cmd_env,
         )
     )
+
+
+# --- Auto-detect broad-sweep early-stop supervisor --------------------------
+#
+# "Detect the username format automatically" streams the LARGE username
+# wordlist through kerbrute live and STOPS DYNAMICALLY as soon as we have enough
+# real users -- rather than guessing the naming pattern from a small inference
+# list, which returned zero users whenever the client's convention was not in
+# that list. The supervisor watches the live valid-hit stream and, when the stop
+# policy fires, triggers the SAME cooperative-cancellation stop path the operator
+# Ctrl+C uses, so the kerbrute subprocess is torn down cleanly and the usernames
+# found so far are kept.
+#
+# Stop policy (stop when ANY of these fires):
+#   1. target  -- ``target_user_count`` valid users found (enough to both infer
+#      the dominant pattern AND directly seed spraying/roasting).
+#   2. idle    -- after >= 1 user, ``idle_timeout_seconds`` with no new valid
+#      user (diminishing returns; the dense name-space is likely exhausted).
+#   3. hard cap -- ``hard_cap_seconds`` total wall-clock, stop regardless.
+# Before the first hit ONLY the hard cap applies -- the first user is the most
+# valuable, so we never abort early before finding anything.
+#
+# All timing uses ``time.monotonic()`` -- NEVER ``time.time()``: the Kerberos
+# clock-skew step physically steps the host wall clock mid-scan, so a wall-clock
+# deadline can jump and mis-fire (the ``scan_timeline.py`` bug pattern).
+_AUTO_DETECT_TARGET_USERS = 5
+_AUTO_DETECT_IDLE_TIMEOUT_SECS = 90.0
+_AUTO_DETECT_HARD_CAP_SECS = 300.0
+
+
+@dataclass
+class KerberosEarlyStopSupervisor:
+    """Dynamic early-stop policy for the auto-detect broad username sweep.
+
+    Fed the running valid-user count from the live kerbrute stream via
+    :meth:`note_valid_hit`; polled between lines via :meth:`should_stop` by the
+    streamer's cooperative-cancellation seam. When a stop condition fires it
+    latches :attr:`stop_reason` and returns ``True`` so the existing
+    cooperative-stop path tears the kerbrute process down cleanly (the usernames
+    found so far are then recovered exactly like a timeout's partial output).
+
+    The supervisor is a plain policy object owned by the CLI, which reads
+    :attr:`stop_reason` / :attr:`found_count` after the run to explain WHY the
+    sweep stopped. It never touches the subprocess, the operator cancellation,
+    or the network -- separation of concerns is deliberate.
+    """
+
+    target_user_count: int = _AUTO_DETECT_TARGET_USERS
+    idle_timeout_seconds: float = _AUTO_DETECT_IDLE_TIMEOUT_SECS
+    hard_cap_seconds: float = _AUTO_DETECT_HARD_CAP_SECS
+    _clock: Callable[[], float] = time.monotonic
+    _start_monotonic: Optional[float] = field(default=None, init=False, repr=False)
+    _last_hit_monotonic: Optional[float] = field(default=None, init=False, repr=False)
+    _found: int = field(default=0, init=False)
+    stop_reason: Optional[str] = field(default=None, init=False)
+
+    def start(self) -> None:
+        """Arm the supervisor at the start of a run (resets all counters)."""
+        self._start_monotonic = self._clock()
+        self._last_hit_monotonic = None
+        self._found = 0
+        self.stop_reason = None
+
+    def _ensure_started(self) -> float:
+        """Return the run start time, lazily arming if ``start`` was not called."""
+        if self._start_monotonic is None:
+            self._start_monotonic = self._clock()
+        return self._start_monotonic
+
+    def note_valid_hit(self, total_found: int) -> None:
+        """Record the current cumulative valid-user count and refresh the idle timer."""
+        self._ensure_started()
+        self._found = max(self._found, int(total_found))
+        self._last_hit_monotonic = self._clock()
+
+    @property
+    def found_count(self) -> int:
+        """Cumulative valid users observed so far."""
+        return self._found
+
+    def elapsed_seconds(self) -> float:
+        """Wall-clock seconds since the run was armed."""
+        start = self._start_monotonic
+        if start is None:
+            return 0.0
+        return max(0.0, self._clock() - start)
+
+    def seconds_since_last_hit(self) -> Optional[float]:
+        """Seconds since the last valid hit, or ``None`` before the first hit."""
+        if self._last_hit_monotonic is None:
+            return None
+        return max(0.0, self._clock() - self._last_hit_monotonic)
+
+    def should_stop(self) -> bool:
+        """True when any stop condition fires; latches :attr:`stop_reason`."""
+        start = self._ensure_started()
+        now = self._clock()
+        elapsed = max(0.0, now - start)
+        # Target -- enough real users to infer the pattern AND seed spray/roast.
+        if self.target_user_count > 0 and self._found >= self.target_user_count:
+            self.stop_reason = "target"
+            return True
+        # Hard cap -- bound the total wall-clock regardless of hits.
+        if self.hard_cap_seconds > 0 and elapsed >= self.hard_cap_seconds:
+            self.stop_reason = "hard_cap"
+            return True
+        # Idle -- only AFTER the first hit; before any hit only the hard cap
+        # applies (never abort early before finding the first, most-valuable user).
+        if (
+            self._found >= 1
+            and self._last_hit_monotonic is not None
+            and self.idle_timeout_seconds > 0
+            and (now - self._last_hit_monotonic) >= self.idle_timeout_seconds
+        ):
+            self.stop_reason = "idle"
+            return True
+        return False
+
+    def status_line(self) -> str:
+        """One-line live status for the dashboard footer (English only)."""
+        target = self.target_user_count
+        elapsed = format_eta(self.elapsed_seconds())
+        since = self.seconds_since_last_hit()
+        if self._found <= 0:
+            hit_part = "no valid users yet"
+        elif since is None:
+            hit_part = f"found {self._found}/{target} target users"
+        else:
+            hit_part = (
+                f"found {self._found}/{target} target users · "
+                f"{format_eta(since)} since last hit"
+            )
+        return (
+            f"broad sweep · {hit_part} · elapsed {elapsed} · auto-stop at "
+            f"{target} users / {format_eta(self.idle_timeout_seconds)} idle / "
+            f"{format_eta(self.hard_cap_seconds)} cap"
+        )
 
 
 # Number of most-recent VALID usernames to show in the dashboard's bounded
@@ -412,6 +636,7 @@ def _stream_userenum_into_dashboard(
     *,
     total: "int | None" = None,
     cancellation: "CooperativeCancellation | None" = None,
+    early_stop: "KerberosEarlyStopSupervisor | None" = None,
 ) -> "StreamedProcessResult | None":
     """Stream kerbrute ``userenum`` stdout, driving the live progress bar.
 
@@ -451,6 +676,12 @@ def _stream_userenum_into_dashboard(
             the caller tells the two apart via ``result.cancelled`` and
             recovers the usernames found before the stop the same way it
             recovers a timeout's partial output.
+        early_stop: Optional :class:`KerberosEarlyStopSupervisor` for the
+            auto-detect broad sweep. Fed the running valid-user count per hit
+            and polled between lines alongside ``cancellation``; when its
+            target / idle / hard-cap policy fires the process is stopped via the
+            same ``cancelled`` path. Its live status also drives the dashboard's
+            footer line so the operator sees the early-stop budget in real time.
 
     Returns:
         A :class:`StreamedProcessResult` on completion, or ``None`` if the
@@ -462,6 +693,9 @@ def _stream_userenum_into_dashboard(
 
     def _push_frame(last: "str | None") -> None:
         try:
+            if early_stop is not None:
+                # Live early-stop budget footer (found N/target · idle · cap).
+                dashboard.set_budget_line(early_stop.status_line())
             if determinate:
                 # done = usernames tested so far (clamped to total by the bar);
                 # success = valid hits so far. last = the current username (raw;
@@ -503,6 +737,10 @@ def _stream_userenum_into_dashboard(
                         pass
                 current_user = user
                 seen_valid.add(user)
+                # Feed the early-stop supervisor the fresh cumulative count so
+                # its target / idle policy can fire on the next poll.
+                if early_stop is not None:
+                    early_stop.note_valid_hit(len(seen_valid))
 
         if not is_attempt:
             return
@@ -518,14 +756,24 @@ def _stream_userenum_into_dashboard(
         # frame is honest even if the trailing batch was below the threshold.
         _push_frame(None)
 
+    def _should_cancel() -> bool:
+        # Auto early-stop (target / idle / hard-cap) and the operator/platform
+        # cooperative stop converge on the ONE ``cancelled`` teardown path.
+        if early_stop is not None and early_stop.should_stop():
+            return True
+        if cancellation is not None and cancellation.should_stop():
+            return True
+        return False
+
+    has_stop = early_stop is not None or cancellation is not None
     return stream_command_lines(
         spawn,
         command=cmd,
         timeout_seconds=timeout,
         on_line=_on_line,
         on_drain=_on_drain,
-        should_cancel=cancellation.should_stop if cancellation is not None else None,
-        on_cancel=(lambda: _push_frame(None)) if cancellation is not None else None,
+        should_cancel=_should_cancel if has_stop else None,
+        on_cancel=(lambda: _push_frame(None)) if has_stop else None,
     )
 
 
@@ -539,6 +787,7 @@ def _run_userenum_with_dashboard(
     domain: str = "",
     total: "int | None" = None,
     cancellation: "CooperativeCancellation | None" = None,
+    early_stop: "KerberosEarlyStopSupervisor | None" = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run kerbrute ``userenum`` under a live progress dashboard.
 
@@ -599,6 +848,7 @@ def _run_userenum_with_dashboard(
                     dashboard,
                     total=total,
                     cancellation=cancellation,
+                    early_stop=early_stop,
                 )
             if streamed is not None:
                 if streamed.timed_out:
@@ -992,6 +1242,50 @@ class KerberosEnumerationMixin:
 
         return recovered
 
+    def _emit_userenum_response_distribution(
+        self,
+        stdout: object,
+        output_file: Path,
+        domain: str,
+        candidate_count: int,
+    ) -> None:
+        """Log the AS-REQ response-code distribution of a completed enum run.
+
+        Turns an opaque ``✓ users 0 ⚠ errors 0`` outcome into a diagnosable
+        one: the counts distinguish a genuine 0-result (candidates answered
+        ``C_PRINCIPAL_UNKNOWN``) from a silent transport failure (no
+        per-candidate responses at all). Best-effort and defensive -- a parse
+        failure never disturbs the enumeration result.
+
+        Prefers the on-disk ``-o`` file (the authoritative record kerbrute
+        writes one attempt line into per candidate with ``-v``); falls back to
+        the process ``stdout`` when the file is empty/unavailable.
+        """
+        try:
+            lines: list[str] = []
+            try:
+                file_text = output_file.read_text(encoding="utf-8", errors="ignore")
+                lines = file_text.splitlines()
+            except OSError:
+                lines = []
+            if not lines and stdout:
+                if isinstance(stdout, bytes):
+                    stdout_text = stdout.decode("utf-8", errors="ignore")
+                else:
+                    stdout_text = str(stdout)
+                lines = stdout_text.splitlines()
+
+            dist = _classify_userenum_response_distribution(lines)
+            print_info_debug(
+                _format_userenum_response_distribution(
+                    dist,
+                    marked_domain=mark_sensitive(str(domain), "domain"),
+                    candidate_count=candidate_count,
+                )
+            )
+        except Exception:  # noqa: BLE001 -- diagnostics must never raise.
+            pass
+
     @requires_auth(AuthMode.UNAUTHENTICATED)
     def enumerate_users_kerberos(
         self,
@@ -1007,6 +1301,7 @@ class KerberosEnumerationMixin:
         timeout: int = 300,
         auth_mode: AuthMode = AuthMode.UNAUTHENTICATED,
         cancellation: "CooperativeCancellation | None" = None,
+        early_stop: "KerberosEarlyStopSupervisor | None" = None,
     ) -> List[str]:
         """Enumerate users via Kerberos without LDAP access.
 
@@ -1045,6 +1340,14 @@ class KerberosEnumerationMixin:
                 continues with that partial list rather than aborting. Kept
                 ``None`` by default so existing callers are unaffected; only
                 the CLI's main wordlist-driven entry point wires a token.
+            early_stop: Optional :class:`KerberosEarlyStopSupervisor` for the
+                auto-detect broad sweep. When provided, the run streams the
+                LARGE username wordlist and stops DYNAMICALLY as soon as the
+                supervisor's target / idle / hard-cap policy fires (via the same
+                partial-recovery ``cancelled`` path as ``cancellation``). The
+                subprocess wall-clock budget is pinned to the supervisor's hard
+                cap so the run terminates even if the stream stalls silently.
+                Kept ``None`` for every ordinary wordlist-driven run.
 
         Returns:
             List of unique usernames (lowercase) discovered.
@@ -1104,6 +1407,15 @@ class KerberosEnumerationMixin:
             candidate_count, floor_seconds=timeout
         )
 
+        # Auto-detect broad sweep: pin the wall-clock budget to the supervisor's
+        # hard cap. ``should_cancel`` is only polled BETWEEN streamed lines, so a
+        # silent stall (no output at all) would never trigger the idle/target
+        # policy -- this guarantees termination regardless, and avoids expanding
+        # to the multi-hour projection for the ~1M-candidate broad list.
+        if early_stop is not None:
+            effective_timeout = max(1, int(early_stop.hard_cap_seconds))
+            early_stop.start()
+
         try:
             maybe_show_patience_notice(
                 PatienceNoticeConfig(
@@ -1153,6 +1465,7 @@ class KerberosEnumerationMixin:
                 domain=domain,
                 total=candidate_count or None,
                 cancellation=cancellation,
+                early_stop=early_stop,
             )
         except subprocess.TimeoutExpired as exc:
             # Recover users found before the timeout fired. kerbrute streams
@@ -1182,6 +1495,7 @@ class KerberosEnumerationMixin:
             return recovered
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.logger.exception(
                 "Unexpected error during Kerberos user enumeration",
                 extra={"domain": domain, "pdc": pdc},
@@ -1195,18 +1509,25 @@ class KerberosEnumerationMixin:
             return []
 
         if getattr(result, "cancelled", False):
-            # The operator (Ctrl+C) or the platform ("Stop" sentinel) requested
-            # an early stop mid-run. This is a STOP, never an abort -- recover
-            # the usernames found before the stop the same way a timeout's
-            # partial output is recovered, and let the scan continue with them.
+            # An early stop fired mid-run: either the operator (Ctrl+C) / platform
+            # ("Stop" sentinel), OR -- on the auto-detect broad sweep -- the
+            # early-stop supervisor's target/idle/hard-cap policy. Both are a STOP,
+            # never an abort: recover the usernames found before the stop the same
+            # way a timeout's partial output is recovered and continue with them.
             recovered = self._recover_partial_userenum(
                 getattr(result, "stdout", None),
                 output_file,
                 domain,
             )
+            stop_reason = getattr(early_stop, "stop_reason", None)
             self.logger.info(
-                "Kerberos user enumeration stopped early by operator/platform",
-                extra={"domain": domain, "pdc": pdc, "recovered": len(recovered)},
+                "Kerberos user enumeration stopped early",
+                extra={
+                    "domain": domain,
+                    "pdc": pdc,
+                    "recovered": len(recovered),
+                    "stop_reason": stop_reason or "operator_or_platform",
+                },
             )
             self.parent._emit_progress(
                 scan_id=scan_id,
@@ -1265,6 +1586,16 @@ class KerberosEnumerationMixin:
             getattr(result, "stdout", None),
             output_file,
             domain,
+        )
+
+        # Diagnostic: surface the AS-REQ response-code distribution so a
+        # completed run that found no users is DIAGNOSABLE (genuine miss vs.
+        # silent transport failure) instead of an opaque "users 0 errors 0".
+        self._emit_userenum_response_distribution(
+            getattr(result, "stdout", None),
+            output_file,
+            domain,
+            candidate_count,
         )
 
         self.parent._emit_progress(
@@ -1551,6 +1882,7 @@ class KerberosEnumerationMixin:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"LDAP enumeration failed while preparing Kerberoast on "
                 f"{mark_sensitive(domain, 'domain')}."
@@ -1603,6 +1935,7 @@ class KerberosEnumerationMixin:
             )
         except KerberosClockSkewError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 "Clock skew too large between this host and the KDC. "
                 "Synchronise the clock and retry."
@@ -1610,6 +1943,7 @@ class KerberosEnumerationMixin:
             return []
         except KerberosTransportError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"Kerberos transport error during Kerberoasting on "
                 f"{mark_sensitive(domain, 'domain')}."
@@ -1617,6 +1951,7 @@ class KerberosEnumerationMixin:
             return []
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"Unexpected error during Kerberoasting on "
                 f"{mark_sensitive(domain, 'domain')}."
@@ -1909,12 +2244,14 @@ class KerberosEnumerationMixin:
                     lines_to_write.append(hash_line)
             except KerberosTransportError as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 self.logger.error(
                     "kerbad no-preauth kerberoast failed",
                     extra={"domain": domain},
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 self.logger.exception(
                     "Unexpected error in no-preauth kerberoast",
                     extra={"domain": domain},
@@ -1983,6 +2320,7 @@ class KerberosEnumerationMixin:
             content = usersfile.read_text(encoding="utf-8", errors="ignore")
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.logger.exception("Failed to read roasting targets from users file")
             return []
         return [line.strip() for line in content.splitlines() if line.strip()]
@@ -2146,6 +2484,7 @@ class KerberosEnumerationMixin:
             roast_results = run_async_sync(asreproast_users(pdc, domain, filtered))
         except KerberosTransportError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"Kerberos transport error during AS-REP roasting on "
                 f"{mark_sensitive(domain, 'domain')}."
@@ -2153,6 +2492,7 @@ class KerberosEnumerationMixin:
             return []
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"Unexpected error during AS-REP roasting on "
                 f"{mark_sensitive(domain, 'domain')}."

@@ -1016,6 +1016,45 @@ RUN set -eux; \
     && echo "SweetPotatoCLR.dll compiled OK" \
     || echo "warning: SweetPotatoCLR compilation failed — binary will need manual placement" >&2; \
   \
+  # TokenTheftCLR – SMB loopback logon session token theft + GodPotato chain for
+  # escalation WITHOUT SeImpersonatePrivilege (Forshaw 2020). Named pipe + SMB
+  # loopback recovers a stored logon session token that retains SeImpersonate.
+  # Activated automatically when SeImpersonatePrivilege is absent from the
+  # process token.
+  #
+  # Two-artifact build: SQL Server's PROCESS token has SeImpersonate stripped
+  # by hardening, so running GodPotato IN-PROCESS (impersonating the stolen
+  # token on a thread only) still resolves DCOM activation against the
+  # stripped process identity and degrades to NT AUTHORITY\NETWORK SERVICE
+  # instead of SYSTEM (confirmed live against HTB DarkZero). The fix mirrors
+  # the public write-up: launch GodPotato as a FRESH PROCESS whose PRIMARY
+  # token is the stolen one. That requires an actual godpotato.exe, which is
+  # compiled standalone here and embedded as a .NET manifest resource inside
+  # TokenTheftCLR.dll (`-resource:`) — so the CLR ships as ONE assembly loaded
+  # via CREATE ASSEMBLY FROM 0x<hex> exactly like the others, and only drops
+  # the embedded exe to disk transiently at runtime (random filename, deleted
+  # after use) purely because CreateProcessWithTokenW needs a real file.
+  mkdir -p /opt/adscan/tools/windows-tools/token-theft-clr; \
+  mcs -target:exe -platform:x64 -sdk:4 \
+    /workspace_build/src/windows_tools/godpotato/Program.cs \
+    /workspace_build/src/windows_tools/godpotato/ArgsParse.cs \
+    /workspace_build/src/windows_tools/godpotato/SharpToken.cs \
+    /workspace_build/src/windows_tools/godpotato/NativeAPI/NativeMethods.cs \
+    /workspace_build/src/windows_tools/godpotato/NativeAPI/GodPotatoContext.cs \
+    /workspace_build/src/windows_tools/godpotato/NativeAPI/GodPotatoUnmarshalTrigger.cs \
+    /workspace_build/src/windows_tools/godpotato/NativeAPI/UnmarshalDCOM.cs \
+    /workspace_build/src/windows_tools/godpotato/NativeAPI/ObjRef.cs \
+    /workspace_build/src/windows_tools/godpotato/NativeAPI/IStreamImpl.cs \
+    -out:/tmp/godpotato_standalone.exe 2>&1 \
+  && mcs -target:library -platform:x64 -sdk:4 \
+    /workspace_build/src/windows_tools/godpotato/SharpToken.cs \
+    /workspace_build/src/windows_tools/token_theft/SqlTokenTheftChain.cs \
+    -resource:/tmp/godpotato_standalone.exe,AdscanGodPotato.exe \
+    -out:/opt/adscan/tools/windows-tools/token-theft-clr/TokenTheftCLR.dll 2>&1 \
+    && echo "TokenTheftCLR.dll compiled OK" \
+    || echo "warning: TokenTheftCLR compilation failed — binary will need manual placement" >&2; \
+  rm -f /tmp/godpotato_standalone.exe; \
+  \
   # pss-dumper + rtlcp-dumper – AV-evasion LSASS dumpers (Mono C# → Windows .NET exe)
   # PssCaptureSnapshot: snapshots lsass into a VA clone, MiniDumpWriteDump targets the
   # snapshot handle (not lsass PID) — bypasses AV hooks on MiniDumpWriteDump(lsass).

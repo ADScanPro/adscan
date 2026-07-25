@@ -41,10 +41,15 @@ from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
 from adscan_internal.services.attack_step_catalog import (
-    edges_chain_compatible,
-    get_attack_step_catalog,
+    context_requirement_satisfied,
+    derive_step_display_status,
+    provides_context_for_relation,
+    required_context_for_relation,
 )
 from adscan_internal.services.smb_exclusion_policy import is_globally_excluded_smb_share
+from adscan_internal.services.destructive_action_policy import (
+    safety_abstention_notes as _safety_abstention_notes,
+)
 from adscan_internal.workspaces import read_json_file, write_json_file
 from adscan_internal.workspaces.state import migrate_legacy_attack_graph
 from adscan_internal.services.tier_lattice import (
@@ -98,16 +103,13 @@ def normalize_target_mode(value: str | None) -> str:
     return mode if mode in _VALID_TARGET_MODES else "domain"
 
 
-# ── Lookup dicts for the credential-context DFS guard ─────────────────────────
-# Built once at module load; any entry missing from the catalog falls back to
-# "other" semantics (provides "none") and "user_credentials" requirement —
-# both of which are the safest defaults for unknown relations.
-_RELATION_SEMANTICS: dict[str, str] = {
-    e.relation: e.compromise_semantics for e in get_attack_step_catalog()
-}
-_RELATION_REQUIRES: dict[str, str] = {
-    e.relation: e.source_context_requirement for e in get_attack_step_catalog()
-}
+# ── Credential-context DFS guard ──────────────────────────────────────────────
+# Credential-context resolution is delegated to the catalog SSOT
+# (provides_context_for_relation / required_context_for_relation). Both are
+# punctuation-insensitive, so the underscored MSSQL catalog keys resolve from the
+# PascalCase relation the graph emits (XpCmdshell, MssqlTokenTheftEscalation);
+# both fall back to the safe defaults ("none" provides / "user_credentials"
+# requires) for a relation missing from the catalog.
 _MEMBEROF_KEY = "memberof"
 _LOCAL_REUSE_KEY = "localadminpassreuse"
 # Access-capability edges that do NOT change which OS credentials the attacker
@@ -139,6 +141,14 @@ _CANRDP_KEY = "canrdp"
 _CANPSREMOTE_KEY = "canpsremote"
 _SQLADMIN_KEY = "sqladmin"
 _SQLACCESS_KEY = "sqlaccess"
+# MssqlLinkedServerLateral (TrustedLink): a SQL-session pivot to a second
+# instance. Transparent to the OS credential-context guard — it does not change
+# which OS credentials the attacker holds (the identity switch is at the SQL
+# layer). Being transparent lets the xp_cmdshell derived self-loop after it
+# evaluate against the start-of-path user_credentials and chain. Its restriction
+# to MSSQL arrivals is enforced separately by the positive MSSQL-lane gate below,
+# not by credential-context.
+_MSSQL_LINKED_KEY = "mssqllinkedserverlateral"
 # Relations that are transparent to credential context — they change the
 # principal identity (or lateral-pivot the attacker to a new host) but do NOT
 # change which credentials the attacker holds.  Any edge that follows one of
@@ -152,8 +162,50 @@ _CONTEXT_TRANSPARENT_KEYS: frozenset[str] = frozenset(
         _CANPSREMOTE_KEY,
         _SQLADMIN_KEY,
         _SQLACCESS_KEY,
+        _MSSQL_LINKED_KEY,
     }
 )
+
+
+# ── MSSQL-session edge gate — MSSQL lateral/execution chains only off an MSSQL
+# access arrival.  ``MssqlLinkedServerLateral`` (and, when later un-gated, the
+# in-SQL escalations) extend the SQL SESSION — they are a property of the SQL
+# session, not of OS local admin.  So they must chain only after an MSSQL access
+# lane (SQLAccess / SQLAdmin / a prior linked-server hop), NEVER after an OS
+# access edge (AdminTo / CanRDP / CanPSRemote).  This is the positive mirror of
+# ``_host_control_withheld_after_access``: instead of withholding host-control
+# edges after a *user-level* arrival, it withholds MSSQL-session edges after a
+# *non-MSSQL* arrival.
+_MSSQL_SESSION_EDGE_KEYS: frozenset[str] = frozenset({_MSSQL_LINKED_KEY})
+
+
+def _mssql_session_edge_withheld_off_non_mssql_arrival(
+    path_relations: list[str],
+    candidate_relation: str,
+) -> bool:
+    """Return True when an MSSQL-session edge is reached off a non-MSSQL arrival.
+
+    Walks back to the most recent access lane in ``path_relations``.  If that
+    lane is an MSSQL lane (SQLAccess / SQLAdmin / a prior linked-server hop) the
+    candidate is allowed; if it is an OS lane (AdminTo / CanRDP / …) the
+    MSSQL-session candidate is withheld.  A candidate with no access lane at all
+    in the path (e.g. a linked-server edge sourced directly, not off a SQL
+    foothold) is withheld — a linked server is reachable only through a SQL
+    session on the source instance.
+    """
+    if str(candidate_relation or "").strip().lower() not in _MSSQL_SESSION_EDGE_KEYS:
+        return False
+
+    from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
+        get_access_lane,
+    )
+
+    for rel in reversed(path_relations):
+        lane = get_access_lane(rel)
+        if lane is None:
+            continue
+        return not lane.is_mssql_lane
+    return True
 
 
 # ── Access-edge gating — arrival != ownership ──────────────────────────────
@@ -308,6 +360,14 @@ def _edges_chain_ok(
     if _host_control_withheld_after_access(path_relations, cand_rel):
         return False
 
+    # Gate 1.5 — MSSQL-session edges (linked-server lateral) chain ONLY off an
+    # MSSQL access arrival, never off an OS access edge (AdminTo/CanRDP/…) nor
+    # sourced with no SQL foothold in the path.  The linked-server login mapping
+    # is a property of the SQL session, so the lateral hop belongs to the MSSQL
+    # lane, not the OS lane.
+    if _mssql_session_edge_withheld_off_non_mssql_arrival(path_relations, cand_rel):
+        return False
+
     # F6 — the synthetic direct-DCSync bridge IS the modeled direct replication
     # capability an admin session already holds on a writable DC.  It passes Gate
     # 1 above (so it is reachable only off a local-admin arrival), but Gate 2
@@ -335,17 +395,20 @@ def _edges_chain_ok(
     if cand_rel in _CONTEXT_TRANSPARENT_KEYS:
         return True  # transparent edges are never blocked
 
-    requires = _RELATION_REQUIRES.get(cand_rel, "user_credentials")
+    requires = required_context_for_relation(cand_rel)
 
-    # Find most recent non-transparent edge in path.
-    prev_semantics: str | None = None
+    # Find most recent non-transparent edge in path and read the context it
+    # PRODUCES (override-aware — so XpCmdshell contributes mssql_rce_session, which
+    # gates the MSSQL SYSTEM-escalation follow-ups behind it). An unknown relation
+    # defaults to "none" (matching the old "other" semantics → provides "none").
+    prev_provides: str | None = None
     for rel in reversed(path_relations):
         if rel not in _CONTEXT_TRANSPARENT_KEYS:
-            prev_semantics = _RELATION_SEMANTICS.get(rel, "other")
+            prev_provides = provides_context_for_relation(rel) or "none"
             break
-    # prev_semantics=None means empty path → implicit user_credentials at start.
+    # prev_provides=None means empty path → implicit user_credentials at start.
 
-    return edges_chain_compatible(prev_semantics, requires)
+    return context_requirement_satisfied(prev_provides, requires)
 
 
 @dataclass(frozen=True)
@@ -355,6 +418,31 @@ class AttackPathStep:
     to_id: str
     status: str
     notes: dict[str, Any]
+
+
+def _self_loop_relation_already_used(
+    acc_steps: list[AttackPathStep],
+    current: str,
+    candidate_relation: str,
+) -> bool:
+    """Return True when this self-loop technique already ran on ``current``.
+
+    Self-loop derived edges (XpCmdshell, DumpLSA, the MSSQL SYSTEM-escalations …)
+    do not advance the DFS to a new node, so the node-visited guard cannot stop a
+    same-node cycle.  Two self-loops that chain into each other and back — e.g.
+    ``XpCmdshell → MssqlTokenTheftEscalation → XpCmdshell → …`` on one SQL host —
+    otherwise oscillate until the depth cap, emitting a path with a doubled tail.
+    A self-loop technique is a one-time capability gain on that host; repeating the
+    SAME relation on the SAME node adds nothing, so it is pruned here.
+    """
+    for step in acc_steps:
+        if (
+            step.from_id == current
+            and step.to_id == current
+            and str(step.relation or "").strip().lower() == candidate_relation
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -578,8 +666,32 @@ def collect_share_exposures_from_graph(
     Returns:
         List of share exposure dicts compatible with
         ``_render_share_resources_panel``.  Each dict contains: ``host``,
-        ``share``, ``access`` (set), ``principals`` (set), ``choke`` (bool),
-        ``impact_rank`` (int 0-3), ``admin_share`` (bool).
+        ``share``, ``access`` (set), ``principals`` (set), ``share_access``
+        (dict), ``choke`` (bool), ``impact_rank`` (int 0-3),
+        ``admin_share`` (bool).
+
+        ``share_access`` is the per-principal read/write map (source A —
+        DACL-derived, no new network I/O). It is keyed by ACE-holder principal
+        node id (the SID for native-collector nodes) and each value is a plain
+        dict of JSON-serialisable primitives::
+
+            {"<PRINCIPAL_SID>": {
+                "read": bool, "write": bool,
+                "source": "acl" | "mxac",   # how the verdict was confirmed
+                "ntfs_verified": bool,       # share ∩ NTFS both present
+                "via_group_sid": str | None, # None for source A (direct ACE)
+                "principal_label": str,
+            }}
+
+        The row-level ``access``/``principals`` collapse stays for backward
+        compatibility (it is scanning-identity-centric); ``share_access`` keeps
+        the split the collapse discards so the report, the web share-exposure
+        view, and the write-share bait can render/consume "share X:
+        WRITE={principals}, READ={principals}, confirmed via {method}". A
+        non-admin scan often cannot read the NTFS folder DACL, so most source-A
+        verdicts are ``ntfs_verified=False`` share-level leads — kept (recall
+        over precision) and flagged. A later live-token (MxAc, source B) pass
+        may add/overwrite a single principal's entry with ``source="mxac"``.
     """
     # Deferred import: ``collector`` package ``__init__`` pulls in
     # ``persistence`` → ``attack_graph_service`` → this module, so a top-level
@@ -635,15 +747,36 @@ def collect_share_exposures_from_graph(
         host_label = str(
             target_node.get("label") or target_node.get("name") or to_id
         ).strip()
+        # A CONNECTABLE host for the SMB drop/enum, distinct from the display
+        # ``host`` label (a computer node's label is the account principal
+        # ``HOST$@REALM``, which does NOT SMB-connect). Prefer the node's IP, then
+        # its DNS hostname. Empty when the node carries neither — callers fall back
+        # to ``host``, which is correct for LIVE-enumerated rows whose ``host`` is
+        # already an IP. (Fixes bait/enum drops failing LOGON_FAILURE against the
+        # principal string on the graph-derived audit path.)
+        _tn_props = target_node.get("properties") or {}
+        host_ip = str(
+            _tn_props.get("ip_address")
+            or target_node.get("ip_address")
+            or _tn_props.get("dnshostname")
+            or target_node.get("dnshostname")
+            or ""
+        ).strip()
 
         key = (host_label.lower(), share_name.lower())
         row = exposures.setdefault(
             key,
             {
                 "host": host_label,
+                "host_ip": host_ip,
                 "share": share_name,
                 "access": set(),
                 "principals": set(),
+                # Per-principal read/write split (source A — DACL-derived).
+                # Keyed by ACE-holder principal node id (SID). Plain dict of
+                # primitives only, so the row serialises clean into
+                # attack_graph.json / technical_report.json / domains_data.
+                "share_access": {},
                 "choke": False,
                 "impact_rank": 0,
                 "admin_share": False,
@@ -675,6 +808,59 @@ def collect_share_exposures_from_graph(
         else:
             row["_raw_access"].add(_SHARE_ACCESS_LABEL[rel_key])  # type: ignore[union-attr]
         row["principals"].add(_principal_label(from_id))  # type: ignore[union-attr]
+
+        # Per-principal read/write split (source A). Mirrors the row-level
+        # verified-vs-raw resolution exactly: a NTFS/MxAc-verified edge derives
+        # read/write from the effective (share ∩ NTFS) mask — authoritative and
+        # independent of how many relation edges the collector emitted for that
+        # mask; an unverified edge falls back to the raw share-grant relation as
+        # a preserved lead (recall over precision). ``source`` + ``ntfs_verified``
+        # carry the confirmation method and confidence per principal.
+        # Cross-domain / unknown-group ACEs arrive as ``share_acl_only`` →
+        # ntfs_verified stays False (we never assert no-access, matching the
+        # collector's is_closure_confident=False path).
+        share_access: dict[str, Any] = row["share_access"]  # type: ignore[assignment]
+        entry = share_access.get(from_id)
+        if entry is None:
+            entry = {
+                "read": False,
+                "write": False,
+                "source": "acl",
+                "ntfs_verified": False,
+                "via_group_sid": None,
+                "principal_label": _principal_label(from_id),
+            }
+            share_access[from_id] = entry
+        if (
+            verification in (VERIFICATION_NTFS_COMPUTED, VERIFICATION_SELF_MXAC)
+            and eff_mask is not None
+        ):
+            for rel in effective_mask_relations(int(eff_mask)):
+                if rel == "ReadShare":
+                    entry["read"] = True
+                elif rel == "WriteShare":
+                    entry["write"] = True
+                elif rel == "FullControlShare":
+                    entry["read"] = True
+                    entry["write"] = True
+            if verification == VERIFICATION_NTFS_COMPUTED:
+                # Effective access proven by intersecting share ∩ NTFS DACL.
+                entry["ntfs_verified"] = True
+            else:
+                # Confirmed against the scanning identity's own live token
+                # (MxAc), not the NTFS DACL read — a distinct, non-admin-required
+                # method. NTFS DACL was NOT read, so ntfs_verified stays False.
+                entry["source"] = "mxac"
+        else:
+            # Unverified raw share-grant lead (NTFS SD unreadable / not
+            # evaluable for this principal). Kept, flagged ntfs_verified=False.
+            if rel_key == "readshare":
+                entry["read"] = True
+            elif rel_key == "writeshare":
+                entry["write"] = True
+            elif rel_key == "fullcontrolshare":
+                entry["read"] = True
+                entry["write"] = True
 
         if bool(notes.get("is_choke_point")):
             row["choke"] = True
@@ -997,12 +1183,29 @@ def compute_display_paths_for_domain_unfiltered(
     return results
 
 
+def _record_affected_principal_count(record: dict[str, Any]) -> int:
+    """Read a display record's affected-principal count (blast radius).
+
+    Stamped by ``apply_affected_user_metadata`` under ``meta`` before the
+    containment filter runs. Returns 0 when absent so the affected-widening
+    carve-out never triggers on an un-annotated record.
+    """
+    meta = record.get("meta")
+    if isinstance(meta, dict):
+        val = meta.get("affected_principal_count")
+        if isinstance(val, int):
+            return val
+    val = record.get("affected_principal_count")
+    return val if isinstance(val, int) else 0
+
+
 def filter_contained_paths_for_domain_listing(
     records: list[dict[str, Any]],
     *,
     keep_shortest: bool = False,
     is_hv_terminal: Callable[[dict[str, Any]], bool] | None = None,
     preserve_prefix_paths: bool = False,
+    affected_widening_carveout: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """Remove paths that are fully contained within another path.
 
@@ -1059,30 +1262,50 @@ def filter_contained_paths_for_domain_listing(
         #   sub-sequences are shadowed — O(L²) per path but unavoidable for the
         #   holistic domain view.
         normalized.sort(key=lambda item: len(item[1]), reverse=True)
-        covered: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        # ``affected_widening_carveout``: track the MAX affected-principal count
+        # among the KEPT super-paths that cover each signature. A shorter sub-path
+        # that reaches strictly MORE principals than every super-path covering it
+        # is a broader finding — it must be rescued, not collapsed into the longer,
+        # narrower chain. This is the SAME "more affected wins" doctrine the
+        # keep_shortest branch already applies; extending it here removes the
+        # historical asymmetry where keep_longest silently buried a broad, often
+        # PROVEN path (e.g. `DOMAIN USERS → ESC1 → DA`, 13 affected) inside a long
+        # single-principal chain that merely PASSES THROUGH Domain Users (1
+        # affected). Without the carve-out ``covered`` is a plain containment set
+        # (legacy holistic behaviour, byte-identical).
+        covered: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
         kept: list[dict[str, Any]] = []
         removed = 0
         for nodes_t, rels_t, record in normalized:
             sig = (nodes_t, rels_t)
             if sig in covered:
-                removed += 1
-                continue
+                if not (
+                    affected_widening_carveout
+                    and _record_affected_principal_count(record) > covered[sig]
+                ):
+                    removed += 1
+                    continue
+                # Broader-origin sub-path (strictly more affected than every kept
+                # super-path covering it) — fall through and keep it.
             kept.append(record)
             rel_len = len(rels_t)
             if rel_len <= 0:
                 continue
+            aff = _record_affected_principal_count(record)
             if preserve_prefix_paths:
                 # O(L): only strict suffixes share the same terminal by definition.
                 # s=0 would be the full path itself — start from 1.
                 for s in range(1, rel_len):
-                    covered.add((nodes_t[s:], rels_t[s:]))
+                    sub = (nodes_t[s:], rels_t[s:])
+                    covered[sub] = max(covered.get(sub, -1), aff)
             else:
                 # O(L²): mark every strict contiguous sub-sequence as covered.
                 for start in range(0, rel_len):
                     for end in range(start + 1, rel_len + 1):
                         if end - start >= rel_len:
                             continue
-                        covered.add((nodes_t[start : end + 1], rels_t[start:end]))
+                        sub = (nodes_t[start : end + 1], rels_t[start:end])
+                        covered[sub] = max(covered.get(sub, -1), aff)
         return kept, removed
     else:
         # Owned/principals multi-user mode: keep the most direct path within each
@@ -1182,6 +1405,22 @@ def filter_contained_paths_for_domain_listing(
                             and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
                         ):
                             continue
+                        # Keep the longer candidate when it reaches the SAME terminal
+                        # at EQUAL tier but from a strictly BROADER origin — a larger
+                        # affected-principal population.  The extra leading prefix
+                        # (e.g. DOMAIN USERS -> Kerberoast -> ... -> domain, 14
+                        # affected) widens "who can walk this" vs the single-principal
+                        # suffix (1 affected); that is headline blast-radius value, not
+                        # redundant length.  Domain-listing scope only
+                        # (``affected_widening_carveout``); the redundant narrow twin is
+                        # dropped in Pass 2.  Owned/principals keep the direct route.
+                        if (
+                            affected_widening_carveout
+                            and cand_tier == kept_tier
+                            and _record_affected_principal_count(record)
+                            > _record_affected_principal_count(kept_rec)
+                        ):
+                            continue
                         is_super_path = True
                         break
             if is_super_path:
@@ -1223,9 +1462,11 @@ def filter_contained_paths_for_domain_listing(
         pass2_removed = 0
         for a_core, record in kept_entries:
             a_tier = tiers_by_id[id(record)]
+            a_terminal = kept_terminal_by_id.get(id(record))
             rec_is_hv = is_hv_terminal(record) if is_hv_terminal is not None else False
             dominated = False
-            if a_core is not None and a_core[1] and not rec_is_hv:
+            if a_core is not None and a_core[1]:
+                a_aff = _record_affected_principal_count(record)
                 for b_core, other in super_path_by_step.get(a_core[1][0], ()):
                     if other is record:
                         continue
@@ -1234,7 +1475,25 @@ def filter_contained_paths_for_domain_listing(
                         or attack_core_is_subsequence(a_core, b_core)
                     ):
                         continue
-                    if tiers_by_id[id(other)] >= a_tier:
+                    b_tier = tiers_by_id[id(other)]
+                    if rec_is_hv:
+                        # HV terminal stays protected (legacy) EXCEPT from a
+                        # broader-origin twin of the SAME compromise: same terminal,
+                        # same tier, strictly more affected principals.  Then the
+                        # narrow twin is redundant and the broad path carries the
+                        # blast-radius headline.  Domain-listing scope only — with the
+                        # carve-out off this branch never fires, so an HV terminal is
+                        # never dominated (byte-identical to the legacy guard).
+                        if (
+                            affected_widening_carveout
+                            and b_tier == a_tier
+                            and kept_terminal_by_id.get(id(other)) == a_terminal
+                            and _record_affected_principal_count(other) > a_aff
+                        ):
+                            dominated = True
+                            break
+                        continue
+                    if b_tier >= a_tier:
                         dominated = True
                         break
             if dominated:
@@ -1294,8 +1553,13 @@ def filter_domain_listing_paths(
         ``(kept_records, removed_count)`` from the containment filter.
     """
     if keep_longest:
-        # Legacy holistic view: collapse sub-paths into the longest kill chain.
-        return filter_contained_paths_for_domain_listing(records, keep_shortest=False)
+        # Holistic view: collapse sub-paths into the longest kill chain, BUT rescue
+        # a broader-origin sub-path (strictly more affected principals than the
+        # super-path covering it) — the "more affected wins" doctrine now applies
+        # in BOTH domain-listing modes, not just keep_shortest.
+        return filter_contained_paths_for_domain_listing(
+            records, keep_shortest=False, affected_widening_carveout=True
+        )
     # Shortest HV-aware: stamp the tiers the keep_shortest branch consumes, then
     # keep the most direct route while protecting HV / domain-object terminals.
     stamp_records_target_tier(records, label_to_node=label_to_node)
@@ -1312,6 +1576,11 @@ def filter_domain_listing_paths(
         keep_shortest=True,
         is_hv_terminal=_is_hv_terminal,
         preserve_prefix_paths=True,
+        # Domain-listing SSOT: prefer the broader-origin twin (more affected
+        # principals) over its single-principal suffix at equal tier/terminal, so
+        # the "any Domain User can reach this" blast-radius headline survives.
+        # Domain scope only — owned/principals never reach this wrapper.
+        affected_widening_carveout=True,
     )
 
 
@@ -1985,6 +2254,174 @@ def _build_implicit_session_followup_overlay(
     return overlay
 
 
+def _build_implicit_xpcmdshell_overlay(
+    graph: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build virtual ``XpCmdshell`` self-loops for MSSQL sysadmin-reachable hosts.
+
+    ``xp_cmdshell`` requires **sysadmin** on the SQL instance.  This overlay
+    injects a synthetic self-loop ``Computer -> XpCmdshell -> Computer`` (the
+    terminal MSSQL-hosted OS-command-execution technique) on every Computer node
+    reached via an MSSQL access edge that grants sysadmin on that instance:
+
+      * ``SQLAdmin`` — sysadmin on the LOCAL instance (static, via the access
+        lane's ``unlocks_mssql_rce`` flag);
+      * ``MssqlLinkedServerLateral`` — sysadmin on the REMOTE instance ONLY when
+        the mapped login is sysadmin there.  That is a PER-EDGE fact
+        (``notes.remote_is_sysadmin``, set by the collector's read-only remote
+        role check); the execution identity is the mapped remote login
+        (``notes.remote_login``), carried onto the self-loop for rendering.
+
+    ``SQLAccess`` (below sysadmin) is deliberately excluded — no local RCE.  This
+    is why the DarkZero chain terminates at DC02 (linked, sysadmin) and not at
+    DC01 (john.w is SQLAccess, not sysadmin there).
+
+    Mirrors :func:`_build_implicit_dumplsa_overlay`: the technique is a host
+    self-loop, ``kind="derived"`` (terminal → a kill chain can END at RCE),
+    theoretical.  Computed once per DFS call, never persisted.
+    """
+    from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
+        access_unlocks_mssql_rce,
+    )
+
+    nodes_map: dict[str, Any] = graph.get("nodes") or {}
+    overlay: dict[str, list[dict[str, Any]]] = {}
+    seen_computer_targets: set[str] = set()
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        rel = str(edge.get("relation") or "").strip().lower()
+        exec_identity = ""
+        # Tri-state: None = unknown (key absent), True = already enabled,
+        # False = disabled-but-sysadmin-can-enable. Only the linked-server edge
+        # carries this fact; the SQLAdmin-local branch leaves it unknown.
+        xp_cmdshell_state: bool | None = None
+        if rel == _MSSQL_LINKED_KEY:
+            notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+            unlocks = bool(notes.get("remote_is_sysadmin"))
+            exec_identity = str(notes.get("remote_login") or "").strip()
+            if "xp_cmdshell_enabled" in notes:
+                xp_cmdshell_state = bool(notes.get("xp_cmdshell_enabled"))
+        else:
+            unlocks = access_unlocks_mssql_rce(rel)
+        if not unlocks:
+            continue
+        to_id = str(edge.get("to") or "").strip()
+        if not to_id or to_id in seen_computer_targets:
+            continue
+        target_node = nodes_map.get(to_id)
+        if not isinstance(target_node, dict):
+            continue
+        if str(target_node.get("kind") or "").strip().lower() != "computer":
+            continue
+        seen_computer_targets.add(to_id)
+        loop_notes: dict[str, Any] = {
+            "virtual": True,
+            "theoretical": True,
+            "synthesized_from": "implicit_xpcmdshell_bridge",
+        }
+        if exec_identity:
+            loop_notes["execution_identity"] = exec_identity
+        # Propagate the xp_cmdshell config state from the linked edge, when known.
+        # True  → already enabled (commands run directly, no config change);
+        # False → disabled but the sysadmin can enable it (must be reverted).
+        # Unknown (key absent) → set neither; execution decides at runtime.
+        if xp_cmdshell_state is True:
+            loop_notes["xp_cmdshell_already_enabled"] = True
+        elif xp_cmdshell_state is False:
+            loop_notes["requires_enable"] = True
+        overlay.setdefault(to_id, []).append(
+            {
+                "from": to_id,
+                "to": to_id,
+                "relation": "XpCmdshell",
+                "kind": "derived",
+                "notes": loop_notes,
+            }
+        )
+
+    return overlay
+
+
+def _build_implicit_openrowset_bulk_overlay(
+    graph: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build virtual ``MssqlOpenRowsetBulkRead`` self-loops for BULK-ops-capable hosts.
+
+    ``OPENROWSET(BULK ... , SINGLE_BLOB)`` lets a session that holds ADMINISTER
+    BULK OPERATIONS read arbitrary files the SQL service account can reach — an
+    arbitrary-file-read technique, chained off the SAME three MSSQL access
+    relations as the XpCmdshell overlay (mirrors
+    :func:`_build_implicit_xpcmdshell_overlay`), but with a DIFFERENT gate:
+    unlike xp_cmdshell (sysadmin-only), this capability is reachable WITHOUT
+    sysadmin —
+
+      * ``SQLAdmin`` — sysadmin on the LOCAL instance always has it (sysadmin
+        bypasses every permission check) — unconditional, like XpCmdshell;
+      * ``SQLAccess`` — below-sysadmin local access. Conditional on the
+        collector's PER-PRINCIPAL fact ``notes.bulk_ops_capable`` (effective
+        ``bulkadmin`` role membership or an explicit ``ADMINISTER BULK
+        OPERATIONS`` grant) — the case XpCmdshell explicitly excludes, but this
+        technique does not, since the permission does not require sysadmin;
+      * ``MssqlLinkedServerLateral`` — conditional on the PER-EDGE fact
+        ``notes.remote_bulk_admin`` (set by the collector's read-only remote
+        probe), mirroring ``notes.remote_is_sysadmin`` for XpCmdshell.
+
+    Computed once per DFS call, never persisted.
+    """
+    nodes_map: dict[str, Any] = graph.get("nodes") or {}
+    overlay: dict[str, list[dict[str, Any]]] = {}
+    seen_computer_targets: set[str] = set()
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        rel = str(edge.get("relation") or "").strip().lower()
+        if rel not in {"sqladmin", "sqlaccess", _MSSQL_LINKED_KEY}:
+            continue
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        exec_identity = ""
+        if rel == _MSSQL_LINKED_KEY:
+            bulk_capable = bool(notes.get("remote_bulk_admin"))
+            exec_identity = str(notes.get("remote_login") or "").strip()
+        elif rel == "sqladmin":
+            # Sysadmin on the local instance always has ADMINISTER BULK
+            # OPERATIONS — the permission check does not apply to sysadmin.
+            bulk_capable = True
+        else:  # sqlaccess
+            bulk_capable = bool(notes.get("bulk_ops_capable"))
+        if not bulk_capable:
+            continue
+        to_id = str(edge.get("to") or "").strip()
+        if not to_id or to_id in seen_computer_targets:
+            continue
+        target_node = nodes_map.get(to_id)
+        if not isinstance(target_node, dict):
+            continue
+        if str(target_node.get("kind") or "").strip().lower() != "computer":
+            continue
+        seen_computer_targets.add(to_id)
+        loop_notes: dict[str, Any] = {
+            "virtual": True,
+            "theoretical": True,
+            "synthesized_from": "implicit_openrowset_bulk_bridge",
+        }
+        if exec_identity:
+            loop_notes["execution_identity"] = exec_identity
+        overlay.setdefault(to_id, []).append(
+            {
+                "from": to_id,
+                "to": to_id,
+                "relation": "MssqlOpenRowsetBulkRead",
+                "kind": "derived",
+                "notes": loop_notes,
+            }
+        )
+
+    return overlay
+
+
 def _build_implicit_path_overlays(
     graph: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -2004,13 +2441,20 @@ def _build_implicit_path_overlays(
       (:func:`_build_implicit_session_followup_overlay`) —
       ``User -> ScheduledTask -> User`` and ``User -> DumpLSASS -> User`` for the
       session user a ``HasSession`` edge lands on, so the path can "become" the
-      session user and traverse their outbound edges.
+      session user and traverse their outbound edges;
+    * the OPENROWSET(BULK ...) arbitrary-file-read bridge
+      (:func:`_build_implicit_openrowset_bulk_overlay`) —
+      ``Computer -> MssqlOpenRowsetBulkRead -> Computer`` for any MSSQL access
+      edge (SQLAdmin unconditionally, SQLAccess / MssqlLinkedServerLateral
+      conditional on the collector's per-principal / per-edge BULK-ops fact).
     """
     merged: dict[str, list[dict[str, Any]]] = {}
     for builder in (
         _build_implicit_dumplsa_overlay,
         _build_implicit_dc_dcsync_overlay,
         _build_implicit_session_followup_overlay,
+        _build_implicit_xpcmdshell_overlay,
+        _build_implicit_openrowset_bulk_overlay,
     ):
         for node_id, edges in builder(graph).items():
             merged.setdefault(node_id, []).extend(edges)
@@ -2425,6 +2869,13 @@ def _dfs_sources_batch_worker(
             # recurse from the same node without re-adding to visited.
             is_self_loop = to_id == current
             if not is_self_loop and to_id in visited:
+                continue
+            # A self-loop technique is a one-time capability gain on this host;
+            # do not re-traverse the same self-loop relation (prevents same-node
+            # cycles like XpCmdshell ↔ MssqlTokenTheftEscalation oscillating).
+            if is_self_loop and _self_loop_relation_already_used(
+                acc_steps, current, _cand_rel
+            ):
                 continue
             # ── Reverse-reachability expansion guard ─────────────────────────
             # Mirror of the sequential DFS guard in compute_maximal_attack_paths:
@@ -3015,6 +3466,13 @@ def compute_maximal_attack_paths(
             is_self_loop = to_id == current
             if not is_self_loop and to_id in visited:
                 continue
+            # A self-loop technique is a one-time capability gain on this host;
+            # do not re-traverse the same self-loop relation (prevents same-node
+            # cycles like XpCmdshell ↔ MssqlTokenTheftEscalation oscillating).
+            if is_self_loop and _self_loop_relation_already_used(
+                acc_steps, current, _cand_rel
+            ):
+                continue
             if allowed_reachable_ids and to_id not in allowed_reachable_ids:
                 continue
             step = AttackPathStep(
@@ -3223,6 +3681,13 @@ def compute_maximal_attack_paths_from_start(
             is_self_loop = to_id == current
             if not is_self_loop and to_id in visited:
                 continue
+            # A self-loop technique is a one-time capability gain on this host;
+            # do not re-traverse the same self-loop relation (prevents same-node
+            # cycles like XpCmdshell ↔ MssqlTokenTheftEscalation oscillating).
+            if is_self_loop and _self_loop_relation_already_used(
+                acc_steps, current, _cand_rel
+            ):
+                continue
             if allowed_reachable_ids and to_id not in allowed_reachable_ids:
                 continue
             step = AttackPathStep(
@@ -3422,6 +3887,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         for s in executable_steps
     ):
         derived_status = "blocked"
+    elif any(s == "closed_by_configuration" for s in statuses):
+        # A relay avenue ADscan observed to be CLOSED with certainty by the
+        # environment's configuration/topology (signing/CBT/no-ADCS/MAQ/single-DC
+        # reflection). A POSITIVE exposure fact — never a risk/held status.
+        derived_status = "closed_by_configuration"
     elif any(s == "unsupported" for s in statuses):
         derived_status = "unsupported"
 
@@ -3431,7 +3901,12 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             {
                 "step": idx,
                 "action": step.relation,
-                "status": step.status,
+                # A non-executed ``context_only`` hop (MemberOf, credential-reuse
+                # pivot) is a structural FACT — surface it as ``structural`` at the
+                # data SSOT so every consumer (snapshot/PDF/web) agrees, never a
+                # per-render relabel. Proven / blocked / config-close statuses are
+                # preserved unchanged (see ``derive_step_display_status``).
+                "status": derive_step_display_status(step.relation, step.status),
                 "details": {
                     "from": label(step.from_id),
                     "to": label(step.to_id),
@@ -3452,11 +3927,18 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                     "reason": str(synthetic_followup.get("reason") or ""),
                     "synthetic_followup": True,
                     "followup_source_group": label(path.target_id),
+                    # A blocked synthetic follow-up (e.g. DNSAdmins abuse) is a
+                    # safety abstention — route it through the single classifier so
+                    # it is stamped ``dangerous_destructive`` and renders under
+                    # "Not executed for safety", never a bare ``dangerous``.
                     **(
-                        {
-                            "blocked_kind": "dangerous",
-                            "reason": str(synthetic_followup.get("reason") or ""),
-                        }
+                        (
+                            _safety_abstention_notes(str(synthetic_followup["relation"]))
+                            or {
+                                "blocked_kind": "dangerous",
+                                "reason": str(synthetic_followup.get("reason") or ""),
+                            }
+                        )
                         if synthetic_status.strip().lower() == "blocked"
                         else {}
                     ),

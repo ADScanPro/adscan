@@ -46,6 +46,7 @@ from adscan_internal.services.share_loot_ai_analysis_service import (
     ShareLootAICredentialFinding,
     ShareLootAIAnalysisService,
 )
+from adscan_core.rich_output import print_exception
 
 ENGINE_CREDSWEEPER = "credsweeper"
 ENGINE_AI = "ai"
@@ -377,6 +378,7 @@ def _run_secret_intelligence_pass(
         # the caller's async context.
         if "cannot be called from a running event loop" not in str(exc):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[secret_intelligence] Pass skipped due to error: {type(exc).__name__}"
             )
@@ -403,12 +405,14 @@ def _run_secret_intelligence_pass(
                 loop.close()
         except Exception as inner_exc:  # noqa: BLE001
             telemetry.capture_exception(inner_exc)
+            print_exception(exception=inner_exc)
             print_info_debug(
                 f"[secret_intelligence] Pass skipped (dedicated loop error): {type(inner_exc).__name__}"
             )
             return {}, [], []
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[secret_intelligence] Pass skipped due to error: {type(exc).__name__}"
         )
@@ -543,6 +547,7 @@ def run_loot_credential_analysis(
             )
         except Exception as _exc:  # noqa: BLE001
             telemetry.capture_exception(_exc)
+            print_exception(exception=_exc)
             print_info_debug(
                 f"[scoring] Policy lookup failed; using defaults: {type(_exc).__name__}"
             )

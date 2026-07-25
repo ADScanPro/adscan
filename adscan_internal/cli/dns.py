@@ -17,6 +17,7 @@ import re
 import tempfile
 
 from adscan_internal import telemetry
+from adscan_internal.interaction import is_non_interactive
 from adscan_internal.rich_output import (
     confirm_ask,
     create_styled_table,
@@ -677,10 +678,46 @@ def _candidate_domains_for_dns_validation(domain: str) -> list[str]:
     return candidates
 
 
-def _build_best_effort_prompt_policy(shell: Any, *, candidate_ip: str) -> BestEffortPromptPolicy:
-    """Return workspace-aware UX for best-effort continuation offers."""
+def _build_best_effort_prompt_policy(
+    shell: Any, *, candidate_ip: str, dc_confirmed_dns_only: bool = False
+) -> BestEffortPromptPolicy:
+    """Return workspace-aware UX for best-effort continuation offers.
+
+    ``dc_confirmed_dns_only`` is the :func:`_is_dns_path_failure` signal — the DC
+    identity is CONFIRMED (fingerprint matched the requested domain, AD ports
+    open) and ONLY the DNS resolver path (port 53) is unreachable. In that case
+    validation did NOT fail — the DC is the right target — so we must not deter
+    the operator with a red "(not recommended)" wall (which reads as "wrong DC"
+    and drove a real auditor to abandon a scan that would still return most of
+    its value). Proceed against the confirmed DC by default, honestly flagging
+    that cross-host / trust resolution stays partial until 53 is reachable. This
+    overrides the audit branch too: for a paid engagement a degraded-but-real
+    result beats nothing.
+    """
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     marked_candidate = mark_sensitive(candidate_ip, "ip")
+    if dc_confirmed_dns_only:
+        return BestEffortPromptPolicy(
+            prompt=(
+                f"Scan {marked_candidate} as the confirmed Domain Controller now? "
+                "(cross-host and trust resolution stay partial until DNS/53 is reachable)"
+            ),
+            default=True,
+            confirmation_copy=(
+                "Scanning the confirmed Domain Controller directly over LDAP/SMB and "
+                "seeding /etc/hosts. Unauthenticated enumeration, posture, password "
+                "spraying and Kerberoast extraction run at full fidelity; cross-host "
+                "lateral movement and cross-domain/trust resolution stay partial until "
+                "UDP+TCP/53 to a DC is reachable."
+            ),
+            recommendation_copy=(
+                "The Domain Controller is confirmed — only its DNS resolver path (port "
+                "53) is unreachable, which degrades name resolution for OTHER hosts, "
+                "not this DC. Continue against the confirmed DC, or re-enter a DC that "
+                "also answers DNS on port 53."
+            ),
+            show_risk_panel=False,
+        )
     if workspace_type == "audit":
         return BestEffortPromptPolicy(
             prompt=(
@@ -903,6 +940,7 @@ def _probe_dc_candidate_ports(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[pdc_preflight] nmap DC probe failed for {marked_ip}: {exc}"
         )
@@ -932,6 +970,7 @@ def _probe_dc_candidate_ports(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[pdc_preflight] reachability DC probe failed for {marked_ip}: {exc}"
         )
@@ -1275,6 +1314,7 @@ def _validate_dns_with_resolver(
         return dns_ok, dns_error
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[pdc_preflight] strict resolver check failed for {marked_domain} "
             f"resolver={marked_resolver}: {exc}"
@@ -1664,8 +1704,20 @@ def preflight_domain_pdc_interactive(
             fingerprint_evidence=fingerprint_evidence,
             port_evidence=port_evidence,
         )
+        # "DC identity confirmed, only DNS/53 unreachable" — validation did NOT
+        # fail. Reframe the panel (yellow, honest title) and hand the operator a
+        # proceed-by-default offer instead of a red "(not recommended)" wall.
+        dns_path_failure = _is_dns_path_failure(
+            validation=validation,
+            fingerprint_evidence=fingerprint_evidence,
+            port_evidence=port_evidence,
+        )
         best_effort_policy = (
-            _build_best_effort_prompt_policy(shell, candidate_ip=candidate_ip)
+            _build_best_effort_prompt_policy(
+                shell,
+                candidate_ip=candidate_ip,
+                dc_confirmed_dns_only=dns_path_failure,
+            )
             if looks_like_dc
             else None
         )
@@ -1676,18 +1728,32 @@ def preflight_domain_pdc_interactive(
             fingerprint_evidence=fingerprint_evidence,
             port_evidence=port_evidence,
         )
+        if dns_path_failure:
+            panel_lead = (
+                "[bold]The Domain Controller is confirmed for this domain — only its "
+                "DNS resolver path (port 53) is unreachable.[/bold]"
+            )
+            panel_title = (
+                "[bold]🧭 DNS Resolver Unreachable — Domain Controller Confirmed[/bold]"
+            )
+            panel_border = "yellow"
+        else:
+            panel_lead = "[bold]We couldn't validate the DC/PDC IP.[/bold]"
+            panel_title = "[bold]🧭 Domain Validation Failed[/bold]"
+            panel_border = "red"
         print_panel(
-            "[bold]We couldn't validate the DC/PDC IP.[/bold]\n\n"
-            f"Domain: {marked_domain}\n"
-            f"IP: {marked_candidate}\n\n"
+            panel_lead
+            + "\n\n"
+            + f"Domain: {marked_domain}\n"
+            + f"IP: {marked_candidate}\n\n"
             + summary_copy
             + "\n\n"
             + "\n".join(attempt_lines)
             + ("\n\n" + "\n".join(evidence_lines) if evidence_lines else "")
             + ("\n\n" + "\n".join(port_lines) if port_lines else "")
             + f"\n\n[bold]Next:[/bold] {next_step}",
-            title="[bold]🧭 Domain Validation Failed[/bold]",
-            border_style="red",
+            title=panel_title,
+            border_style=panel_border,
             padding=(1, 2),
         )
         if dns_error:
@@ -2462,6 +2528,7 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
                 shell.add_to_hosts(domain)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[check_dns] Failed to refresh /etc/hosts for best-effort domain "
                     f"{marked_domain}: {exc}"
@@ -2502,6 +2569,7 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
                                 resolv_nameservers.append(parts[1].strip())
             except OSError as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[dns] Failed to read /etc/resolv.conf: {exc}")
 
             first_ns = resolv_nameservers[0] if resolv_nameservers else None
@@ -2565,11 +2633,13 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
                             return False
                     except Exception as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                 else:
                     # No DC IP to auto-fix; treat as DNS failure.
                     return False
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[dns] Failed resolv.conf preflight: {exc}")
 
     # Use DNSDiscoveryService to check DNS resolution
@@ -2606,11 +2676,29 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
         "Please provide the IP address of a Domain Controller to configure DNS resolution:"
     )
 
+    # In `adscan ci` / non-interactive runs this must never block on stdin (or
+    # spin forever re-printing "cannot be empty" once the auto-resolved
+    # default is empty) — decline the manual DC IP entry and degrade the same
+    # way an interactive operator declining would.
+    if is_non_interactive(shell):
+        marked_domain_ni = mark_sensitive(domain, "domain")
+        print_warning(
+            f"Non-interactive mode: skipping the DC IP prompt for {marked_domain_ni}; "
+            "continuing without DNS resolution for this domain."
+        )
+        print_info_debug(
+            f"[dns] Non-interactive; declining DC IP prompt for {marked_domain_ni}"
+        )
+        return False
+
     while True:
         try:
+            # A discovered trust-partner domain may have an entry in
+            # ``domains_data`` (created empty by the caller) with no ``"pdc"``
+            # key yet — never assume the key exists.
             default_pdc = (
-                shell.domains_data[domain]["pdc"]
-                if shell.domains_data and domain in shell.domains_data
+                shell.domains_data.get(domain, {}).get("pdc")
+                if shell.domains_data
                 else None
             )
             dc_ip = Prompt.ask("DC IP address", default=default_pdc or "")
@@ -2773,12 +2861,14 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
                 )
         except Exception as persist_exc:  # noqa: BLE001
             telemetry.capture_exception(persist_exc)
+            print_exception(exception=persist_exc)
             print_info_debug(
                 "[dns] update_resolver_for_domain: "
                 f"failed to persist hostname to domains_data for {marked_domain}: {persist_exc}"
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[dns] update_resolver_for_domain: "
             f"failed to set selected resolver metadata for {marked_domain}: {exc}"
@@ -2869,6 +2959,7 @@ def resolve_pdc_hostname(
             return hostname
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[dns] Failed SRV hostname lookup for {mark_sensitive(normalized_domain, 'domain')}: {exc}"
         )
@@ -2881,6 +2972,7 @@ def resolve_pdc_hostname(
                 return fqdn.split(".")[0]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[dns] Failed reverse DNS hostname lookup for {mark_sensitive(pdc_ip, 'ip')}: {exc}"
             )
@@ -2922,6 +3014,7 @@ def resolve_pdc_hostname_best_effort(
             return _normalize_hostname_label(fqdn)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[dns] Failed best-effort hostname lookup for {mark_sensitive(pdc_ip, 'ip')}: {exc}"
         )
@@ -2970,6 +3063,29 @@ def finalize_domain_context(
         if hasattr(shell, "domains_data")
         else {}
     )
+
+    # Keep the ``shell.domains`` LIST in lockstep with ``domains_data``. This
+    # runs unconditionally for EVERY caller (like the ``domains_data`` fill
+    # above), NOT gated behind ``make_active`` — the list-vs-dict drift is
+    # independent of which domain is the operator's ACTIVE context.
+    #
+    # Why it matters: several scan phases guard on LIST membership, not on
+    # ``domains_data`` / ``shell.domain`` — Attack Paths Discovery
+    # (``attack_graph_reports.bloodhound_attack_paths``), the Timeroast
+    # candidate check (``timeroast.run_timeroast_candidate_check``) and LDAP
+    # Description Parsing (``ldap.run_ldap_descriptions``). The authenticated
+    # ``start_auth`` path populated only ``domains_data`` + ``shell.domain`` and
+    # never appended to this list, so those three phases were SILENTLY SKIPPED
+    # with a false "Domain is not configured" while still printing "Completed".
+    # The unauthenticated path already appends before calling us; finalizing the
+    # append at this SSOT makes both start paths behave identically. Append
+    # idempotently with the exact ``domains_data`` key so the two stores can
+    # never drift.
+    if not hasattr(shell, "domains") or not isinstance(shell.domains, list):
+        shell.domains = []
+    if domain not in shell.domains:
+        shell.domains.append(domain)
+
     if best_effort is None:
         best_effort = str(domain_info.get("dns_validation_mode", "")).strip().lower() == "best_effort"
     if pdc_hostname_hint is None:
@@ -2992,6 +3108,7 @@ def finalize_domain_context(
             set_active_domain(shell, domain)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[dns] Failed to set active domain context for {marked_domain}: {exc}"
             )
@@ -3049,6 +3166,7 @@ def finalize_domain_context(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[dns] Failed to update resolver for {marked_domain}: {exc}"
             )
@@ -3135,6 +3253,7 @@ def finalize_domain_context(
                 )
         except Exception as exc:  # noqa: BLE001 — best-effort; never break finalize
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[dns] Failed to derive DC FQDN keys for {marked_domain}: {exc}"
             )
@@ -3146,6 +3265,7 @@ def finalize_domain_context(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[dns] Failed to add /etc/hosts entry for {marked_domain}: {exc}"
             )

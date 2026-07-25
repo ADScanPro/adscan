@@ -27,6 +27,7 @@ from adscan_internal.services.graph_queries import (
     get_enabled_computers,
     get_enabled_users,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:
     from adscan_core.rich_output_collection import TacticalFinding
@@ -136,6 +137,7 @@ def _prepare_native_kerberos_credential(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[intelligence] Kerberos preparation failed: {exc}")
         return credential
 
@@ -176,6 +178,7 @@ def _prepare_native_kerberos_credential(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "native collection: ensure_user_ccache failed for "
             f"{mark_sensitive(credential.username, 'user')}: {exc}"
@@ -262,6 +265,7 @@ def _emit_collector_operation_progress(
         )
     except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 # Minimum wall-clock gap between two live "objects pulled" ticks. Throttles the
@@ -359,6 +363,7 @@ def _make_host_progress_callback(target_domain: str):
             )
         except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     return _callback
 
@@ -423,7 +428,9 @@ def run_native_collection(
             kerberos_target_hostname=dc_hostname,
         )
 
-        started = time.time()
+        # monotonic: the host wall clock is stepped mid-scan for DC sync, which
+        # would corrupt any wall-clock elapsed measured across the step.
+        started = time.monotonic()
         workspace_type = str(getattr(shell, "type", "ctf") or "ctf").lower()
         collection_scope = "audit" if workspace_type == "audit" else "ctf"
         from adscan_internal import get_console
@@ -510,7 +517,7 @@ def run_native_collection(
                     host_cap=_resolve_host_cap(shell),
                 )
             )
-        elapsed = time.time() - started
+        elapsed = time.monotonic() - started
         domain_counters = counters.get(target_domain, {})
         _emit_collector_operation_progress(
             target_domain,
@@ -566,6 +573,7 @@ def run_native_collection(
             _run_phase2_mssql_collection(shell, target_domain, credential)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Native collection failed: {exc}")
         # The collector long step ended (in error) — clear the live strip so the
         # "SMB collector" operation never freezes on its last tick after a
@@ -656,6 +664,7 @@ def _run_phase2_port_scan(shell: Any, target_domain: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 — scan failure must not abort collection
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[phase2-scan] unified port scan failed for "
             f"{mark_sensitive(target_domain, 'domain')}: {exc}"
@@ -700,6 +709,7 @@ def _run_phase2_mssql_collection(
         )
     except Exception as exc:  # noqa: BLE001 — MSSQL collection must not abort the phase
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[mssql-collector] Phase-2 authorization collection failed for "
             f"{mark_sensitive(target_domain, 'domain')}: {exc}"
@@ -728,6 +738,7 @@ def _emit_collection_performance_telemetry(
         telemetry.capture("native_collection_performance", properties)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _surface_host_enrichment_coverage(
@@ -787,41 +798,21 @@ def _surface_host_enrichment_coverage(
         )
     except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[intelligence] host-coverage persist failed: {exc}")
 
 
 def _ensure_shell_domain_context(shell: Any, target_domain: str) -> None:
     """Point the shell's logical domain context at ``target_domain`` (in-memory).
 
-    The automated scan / CTF collection path reaches ``run_native_collection``
-    without ever going through the interactive domain selection that calls
-    ``activate_domain`` (``workspaces/domains.py``), so ``current_domain`` /
-    ``current_domain_dir`` stay ``None`` for the whole scan. Every
-    ``save_domain_data()`` in the post-collection persist chain (collector
-    findings, machine-pwd rotation, ADCS detection state) is hard-wired to those
-    two attrs, so with them unset it trips the "No active domain selected ...
-    Cannot save domain data" guard (``workspaces/saver.py``) and silently drops
-    ``variables.json``. This helper sets them via the canonical ``activate_domain``
-    SSOT (in-memory only, no I/O); the resolved dir is identical to the one the
-    collector already wrote its graph/enabled_computers artifacts to. No-op when
-    the context is already on ``target_domain`` or no workspace dir is known.
+    Thin wrapper around the shared SSOT ``ensure_shell_domain_context``
+    (``adscan_internal/cli/common.py``) — kept as a local alias so existing call
+    sites in this module do not need to change. See the SSOT docstring for the
+    full rationale (which flows need this and why).
     """
-    ws_dir = getattr(shell, "current_workspace_dir", None)
-    if not ws_dir:
-        return
-    if (
-        getattr(shell, "current_domain_dir", None) is not None
-        and getattr(shell, "current_domain", None) == target_domain
-    ):
-        return
-    from adscan_internal.workspaces import activate_domain
+    from adscan_internal.cli.common import ensure_shell_domain_context
 
-    activate_domain(
-        shell,
-        workspace_dir=ws_dir,
-        domains_dir_name=getattr(shell, "domains_dir", "domains"),
-        domain=target_domain,
-    )
+    ensure_shell_domain_context(shell, target_domain)
 
 
 def _persist_collector_findings(
@@ -844,6 +835,7 @@ def _persist_collector_findings(
             from adscan_internal import telemetry as _tel
 
             _tel.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[intelligence] technical finding persist failed: {exc}")
 
     # ── Shadow credentials ────────────────────────────────────────────────
@@ -950,6 +942,7 @@ def _persist_machine_pwd_rotation_interval(shell: Any, domain: str, result: Any)
         domain_data["machine_pwd_rotation_disabled"] = disabled
     except Exception as exc:  # noqa: BLE001 — best-effort persistence
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _populate_adcs_metadata(shell: Any, domain: str, result: Any) -> None:
@@ -969,6 +962,7 @@ def _populate_adcs_metadata(shell: Any, domain: str, result: Any) -> None:
         populate_adcs_metadata_from_collection(shell, domain=domain, result=result)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[intelligence] ADCS metadata populate failed for "
             f"{mark_sensitive(domain, 'domain')}: {exc}"
@@ -1026,6 +1020,7 @@ def _print_collection_summary_from_graph(
         _print_tactical_findings(domain, nodes, edges)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[intelligence] collection summary failed: {exc}")
 
 
@@ -1042,6 +1037,7 @@ def _print_tactical_findings(
         print_tactical_findings(tf)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[intelligence] tactical findings failed: {exc}")
 
 
@@ -1898,6 +1894,7 @@ def run_native_identity_inventory(shell: Any, target_domain: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Native identity inventory failed: {exc}")
 
 
@@ -1934,6 +1931,7 @@ def run_native_host_inventory(shell: Any, target_domain: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Native host inventory failed: {exc}")
 
 

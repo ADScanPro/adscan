@@ -45,6 +45,7 @@ from adscan_core.rich_output import (
     print_success,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +728,7 @@ def _generate_affected_assets_appendix(
         return (str(result["csv_filename"]), str(result["json_filename"]))
     except Exception as exc:  # noqa: BLE001 — appendix is best-effort but logged
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Affected-assets appendix skipped: {exc}")
         return ()
 
@@ -921,6 +923,7 @@ def _generate_navigator_extras(
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"MITRE navigator artefacts skipped: {exc}")
         return ()
 
@@ -964,6 +967,7 @@ def _generate_navigator_extras(
         )
     except Exception as exc:  # noqa: BLE001 — best-effort, kit must still ship
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"MITRE navigator layer build failed: {exc}")
         return ()
 
@@ -986,6 +990,7 @@ def _generate_navigator_extras(
             )
         except (OSError, json.JSONDecodeError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Could not read previous Navigator snapshot {previous_snapshot_path}: {exc}"
             )
@@ -1001,6 +1006,7 @@ def _generate_navigator_extras(
             written.append(_NAVIGATOR_DIFF_FILE)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Navigator diff layer build failed: {exc}")
 
     # Interactive HTML bundle.
@@ -1018,6 +1024,7 @@ def _generate_navigator_extras(
         written.append(_NAVIGATOR_HTML_FILE)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Navigator interactive HTML failed: {exc}")
 
     # Snapshot the layer into history so the *next* deliver run can diff.
@@ -1025,6 +1032,7 @@ def _generate_navigator_extras(
         _save_history_snapshot(history_dir, layer)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Could not snapshot Navigator history: {exc}")
 
     # Lightweight telemetry — Hormozi: instrument what matters before
@@ -1221,6 +1229,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Kit generation failed: {exc}")
         return 1
 
@@ -1245,6 +1254,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
         _package_zip(staging_dir, zip_path, items, extras, appendix)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Could not package ZIP: {exc}")
         return 1
 
@@ -1260,6 +1270,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
         )
     except Exception as exc:  # noqa: BLE001 — manifest is best-effort but logged
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Manifest could not be written: {exc}")
 
     _render_closing_panel(

@@ -360,6 +360,7 @@ def select_reachable_dc_ip(
             )
         except Exception as exc:  # noqa: BLE001 — never let a probe failure crash selection.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             any_filtered = True
             continue
 
@@ -646,6 +647,7 @@ class DNSDiscoveryService:
                     continue
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     last_error = "command_failed"
                     print_info_debug(
                         f"[dns] Query failure for {mark_sensitive(normalized_qname, 'domain')} "
@@ -799,7 +801,7 @@ class DNSDiscoveryService:
         if attempted_resolvers:
             marked = [mark_sensitive(ns, "ip") for ns in attempted_resolvers]
             print_info_debug(
-                f"[dns] dig_srv_records_robust exhausted resolver fallbacks: {marked}"
+                f"[dns] dig_srv_records_robust exhausted resolver fallbacks: {', '.join(marked)}"
             )
 
         return [], err
@@ -883,7 +885,7 @@ class DNSDiscoveryService:
         if attempted_resolvers:
             marked = [mark_sensitive(ns, "ip") for ns in attempted_resolvers]
             print_info_debug(
-                f"[dns] resolve_ipv4_addresses_robust exhausted resolver fallbacks: {marked}"
+                f"[dns] resolve_ipv4_addresses_robust exhausted resolver fallbacks: {', '.join(marked)}"
             )
         return []
 
@@ -1050,7 +1052,7 @@ class DNSDiscoveryService:
         if attempted_resolvers:
             marked = [mark_sensitive(ns, "ip") for ns in attempted_resolvers]
             print_info_debug(
-                f"[dns] reverse_resolve_fqdn_robust exhausted resolver fallbacks: {marked}"
+                f"[dns] reverse_resolve_fqdn_robust exhausted resolver fallbacks: {', '.join(marked)}"
             )
         return None
 
@@ -1075,6 +1077,7 @@ class DNSDiscoveryService:
                                 nameservers.append(ns)
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[dns] Failed to read /etc/resolv.conf: {exc}")
         return nameservers
 

@@ -19,6 +19,7 @@ from typing import Iterable, Mapping
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ def _query_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> li
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[kerberos-target] unexpected A lookup error for {mark_sensitive(hostname, 'hostname')}: {exc}"
         )
@@ -187,6 +189,7 @@ def _query_ptr_record(ip: str, resolver_ip: str | None, timeout_s: float) -> str
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[kerberos-target] unexpected PTR lookup error for {mark_sensitive(ip_clean, 'ip')}: {exc}"
         )

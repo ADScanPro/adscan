@@ -33,6 +33,7 @@ from adscan_internal.services.cve_scanner.result import (
     Evidence,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.cve_scanner.runner import ScanContext, ScanTarget
@@ -185,6 +186,7 @@ class SMBGhostCheck:
             probe_result = await self._probe(host=target.host, timeout=self._timeout)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"[smbghost] probe crashed against {target.host}: {exc}")
             return [_error(target.host, str(exc))]
 

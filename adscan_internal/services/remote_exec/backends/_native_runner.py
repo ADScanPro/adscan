@@ -32,6 +32,7 @@ from adscan_internal.services.smb_transport import (
     SMBTransportError,
     smb_machine_with_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _failure(
@@ -106,11 +107,13 @@ async def run_streaming(
         return _failure(method, "network", str(exc)[:240], started=started)
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return _failure(
             method, "timeout", f"backend timed out after {timeout}s", started=started
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return _raise_auth_or_return(exc, method, started=started)
 
     stdout = b"".join(chunks).decode("utf-8", errors="replace").strip()
@@ -177,11 +180,13 @@ async def run_blind(
         return _failure(method, "network", str(exc)[:240], started=started)
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return _failure(
             method, "timeout", f"backend timed out after {timeout}s", started=started
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return _raise_auth_or_return(exc, method, started=started)
 
     if err is not None:

@@ -59,6 +59,7 @@ from adscan_internal.services.attack_step_support_registry import (
 )
 from adscan_internal.services.attack_step_catalog import (
     build_step_knowledge,
+    derive_step_display_status,
     get_exploitation_relation_vuln_keys,
     normalize_execution_relation,
 )
@@ -122,6 +123,19 @@ _NON_ACTIONABLE_SOURCE_FILTER_RELATIONS: frozenset[str] = frozenset(
         "contains",
         "gplink",
         "trustedby",
+    }
+)
+# Relations that cross a domain/forest boundary at the EDGE level (not via a
+# trust node): an MSSQL linked server lets a login on the source instance run
+# T-SQL on a target instance that may live in a DIFFERENT forest. A Tier-0
+# source reaching a DIFFERENT-domain target this way is a genuine cross-boundary
+# compromise finding, NOT the "you already own this domain" noise that the
+# Tier-0-source filter suppresses — so it is exempted when cross-domain (see
+# _edge_has_tier0_source). These relations did not exist as graph edges before
+# this exemption, so it changes no existing path counts.
+_CROSS_FOREST_LATERAL_RELATIONS: frozenset[str] = frozenset(
+    {
+        "mssqllinkedserverlateral",
     }
 )
 _DUPLICATE_LABEL_DEBUG_SAMPLE_LIMIT = 5
@@ -400,6 +414,7 @@ def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
             f"[membership] enabled users load failed for {marked_domain}: {exc}"
@@ -428,6 +443,7 @@ def _load_domain_users(shell: object, domain: str) -> list[str] | None:
         return users or None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
             f"[membership] users list load failed for {marked_domain}: {exc}"
@@ -508,6 +524,7 @@ def get_enabled_computers_for_domain(
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
             f"[membership] enabled computers load failed for {marked_domain}: {exc}"
@@ -781,6 +798,7 @@ def resolve_group_members_by_rid(
                 return sorted(set(members), key=str.lower)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[membership] BloodHound RID {rid} query failed for {marked_domain}: {exc}"
             )
@@ -1120,6 +1138,7 @@ def resolve_principal_groups(
                     }
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     print_info_debug(
         f"[membership] BloodHound unavailable for {marked_principal}@{marked_domain}; "
@@ -1156,6 +1175,7 @@ def resolve_principal_groups(
         }
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     return {"groups": [], "group_sids": [], "source": "none"}
 
@@ -1350,6 +1370,7 @@ def resolve_user_sid(shell: object, domain: str, username: str) -> str | None:
             return sid.strip()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     sid = _lookup_user_sid_via_ldap(shell, domain, username)
     if sid:
@@ -1661,6 +1682,7 @@ def resolve_group_name_by_rid(
                                     return group_name
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[membership] BloodHound group RID {rid} lookup failed for {marked_domain}: {exc}"
             )
@@ -1806,6 +1828,7 @@ def resolve_group_user_members(
                 return unique_members
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             marked_group = mark_sensitive(
                 _membership_label_to_name(canonical_group), "group"
             )
@@ -3197,6 +3220,7 @@ def _load_writable_attribute_report(
         return report if isinstance(report, dict) else None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -3213,6 +3237,7 @@ def _persist_writable_attribute_report(
         write_json_file(report_path, report)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _load_rodc_prp_report(
@@ -3227,6 +3252,7 @@ def _load_rodc_prp_report(
         return report if isinstance(report, dict) else None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -3243,6 +3269,7 @@ def _persist_rodc_prp_report(
         write_json_file(report_path, report)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _resolve_writable_attribute_report_from_graph(
@@ -3568,6 +3595,7 @@ def _resolve_current_token_principal_labels(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         recursive_groups = []
     for group_name in recursive_groups:
         label = _canonical_membership_label(domain_key, group_name)
@@ -4244,6 +4272,7 @@ def _load_acl_object_control_inventory_pairs(
         payload = read_json_file(path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[attack_graph] failed to read ACL object-control coverage sidecar: {exc}"
         )
@@ -4756,6 +4785,7 @@ def resolve_adcs_vulns_from_inventory(
         data = read_json_file(steps_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
     records = data.get("records")
@@ -4824,6 +4854,7 @@ def resolve_esc4_templates_from_inventory(
         data = read_json_file(steps_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
     records = data.get("records")
@@ -5063,7 +5094,19 @@ def _edge_has_tier0_source(
        (graph_extension / followup_terminal / future_followup) keeps its
        edges so chains can form.
     """
-    if not _relation_is_actionable_for_source_filter(relation):
+    relation_lc = str(relation or "").strip().lower()
+    is_cross_forest_lateral = relation_lc in _CROSS_FOREST_LATERAL_RELATIONS
+    # Cross-forest lateral relations (MssqlLinkedServerLateral) carry
+    # support_kind=context so the DFS/execution loop treats them as a pass-through
+    # pivot (the downstream step consumes the SQL session). That execution-level
+    # classification must NOT exempt them from the Tier-0-source suppression: a
+    # SAME-domain linked-server edge from a Tier-0 source is still "you already
+    # own this domain" noise. Keep them in scope for this filter even though they
+    # read as non-actionable for the DFS; the cross-domain carve-out below still
+    # rescues the genuine cross-forest finding.
+    if not is_cross_forest_lateral and not _relation_is_actionable_for_source_filter(
+        relation
+    ):
         return False
     nodes = graph.get("nodes")
     if not isinstance(nodes, dict):
@@ -5075,7 +5118,33 @@ def _edge_has_tier0_source(
     source_node = nodes.get(str(from_id or "").strip())
     if not isinstance(source_node, dict):
         return False
+    # Cross-forest lateral exemption: an MSSQL linked-server edge FROM a Tier-0
+    # source reaching a target in a DIFFERENT domain crosses the trust/forest
+    # boundary — a real compromise finding, not "already own this domain" noise.
+    # (DarkZero topology: SQL on the DC → linked server into a different forest.)
+    if to_id and is_cross_forest_lateral:
+        target_node = nodes.get(str(to_id).strip())
+        if isinstance(target_node, dict):
+            src_domain = _node_domain(source_node)
+            tgt_domain = _node_domain(target_node)
+            if src_domain and tgt_domain and src_domain != tgt_domain:
+                return False
     return _node_is_direct_compromise_source(source_node)
+
+
+def _node_domain(node: dict[str, Any]) -> str:
+    """Normalized (upper-case) domain of a graph node.
+
+    Reads the ``domain`` from the node's ``properties`` first, then the
+    top-level field. Used to tell a cross-forest lateral (e.g. an MSSQL linked
+    server into a different forest) apart from a same-domain one.
+    """
+    props = node.get("properties")
+    raw = ""
+    if isinstance(props, dict):
+        raw = props.get("domain") or ""
+    raw = raw or node.get("domain") or ""
+    return str(raw).strip().upper()
 
 
 def _node_is_direct_compromise_source(node: dict[str, Any]) -> bool:
@@ -5358,6 +5427,7 @@ def _attack_path_get_recursive_groups(
         return sorted(set(groups))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return []
 
 
@@ -6216,6 +6286,7 @@ def _inject_runtime_recursive_memberof_edges(
                 return _node_id(node_record)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         # Last resort: create a synthetic group node so at least the stitching works.
         return _ensure_group_node_for_domain(
@@ -6616,30 +6687,51 @@ def _compact_local_reuse_edge_notes(graph: dict[str, Any]) -> int:
     return changed
 
 
-def _is_tierzero_machine_forcechangepassword_target(
+def _policy_blocked_edge_notes(
     graph: dict[str, Any],
     *,
     relation: str,
     to_id: str,
-) -> bool:
-    """Return True when ForceChangePassword targets a Tier Zero computer object.
+    support: "RelationSupport",
+) -> dict[str, Any]:
+    """Return the notes marker for a ``policy_blocked`` graph edge.
 
-    Resetting machine-account passwords for Tier Zero assets such as DCs or
-    RODCs is intentionally blocked by policy because it is operationally
-    disruptive and can break domain services.
+    EVERY hard-refused safety abstention — a destructive reset
+    (ForceChangePassword against a computer/machine account) OR a disruptive
+    technique (Zerologon, NoPac, PrintNightmare, DNSAdmins abuse) — is routed
+    through the single :func:`classify_destructive` classifier and stamped
+    ``blocked_kind="dangerous_destructive"`` plus a client-safe reason, so the
+    client-facing render places all of them in the "Not executed for safety"
+    bucket. Only a policy_blocked step that is NOT hard-blocked (e.g. the
+    opt-in-only ForceChangePassword on a user) keeps ``blocked_kind="dangerous"``.
+    Only the notes are enriched — the ``blocked`` status token is unaffected.
     """
-    if normalize_execution_relation(relation) != "forcechangepassword":
-        return False
+    from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+        classify_destructive,
+    )
+
     nodes = graph.get("nodes")
-    if not isinstance(nodes, dict):
-        return False
-    target_node = nodes.get(str(to_id or "").strip())
-    if not isinstance(target_node, dict):
-        return False
-    target_kind = str(target_node.get("kind") or "").strip().lower()
-    if target_kind != "computer":
-        return False
-    return attack_graph_core._node_target_priority_class(target_node) == "tierzero"  # noqa: SLF001
+    target_node = (
+        nodes.get(str(to_id or "").strip()) if isinstance(nodes, dict) else None
+    )
+    target_kind = (
+        str(target_node.get("kind") or "").strip().lower()
+        if isinstance(target_node, dict)
+        else ""
+    )
+    verdict = classify_destructive(relation, target_kind)
+    if verdict.hard_blocked:
+        return {
+            "blocked_kind": "dangerous_destructive",
+            "reason": verdict.client_safe_reason or support.reason,
+            "client_safe_reason": verdict.client_safe_reason,
+            "exec_support": "policy_blocked",
+        }
+    return {
+        "blocked_kind": "dangerous",
+        "reason": support.reason,
+        "exec_support": "policy_blocked",
+    }
 
 
 def _classify_edge_execution_support(
@@ -6674,21 +6766,23 @@ def _classify_edge_execution_support(
             compromise_semantics=base_support.compromise_semantics,
             compromise_effort=base_support.compromise_effort,
         )
-    if _is_tierzero_machine_forcechangepassword_target(
-        graph,
-        relation=relation,
-        to_id=to_id,
-    ):
-        return RelationSupport(
-            kind="policy_blocked",
-            reason=(
-                "ForceChangePassword against Tier Zero machine accounts is "
-                "blocked by policy because changing DC/RODC passwords is "
-                "disruptive and can break domain services"
-            ),
-            compromise_semantics=base_support.compromise_semantics,
-            compromise_effort=base_support.compromise_effort,
-        )
+    # Safety hard-block: ForceChangePassword against ANY computer/machine account
+    # resets that host's password and is disruptive (not just Tier Zero DCs/RODCs).
+    # Routed through the destructive-action SSOT so the graph classification, the
+    # display, and the executor stay aligned.
+    from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+        classify_destructive,
+    )
+
+    if normalize_execution_relation(relation) == "forcechangepassword":
+        destructive_verdict = classify_destructive(relation, target_kind)
+        if destructive_verdict.hard_blocked:
+            return RelationSupport(
+                kind="policy_blocked",
+                reason=destructive_verdict.client_safe_reason,
+                compromise_semantics=base_support.compromise_semantics,
+                compromise_effort=base_support.compromise_effort,
+            )
     return base_support
 
 
@@ -6874,11 +6968,12 @@ def refresh_attack_graph_execution_support(
         if support.kind == "policy_blocked":
             desired_status = "blocked"
             desired_notes.update(
-                {
-                    "blocked_kind": "dangerous",
-                    "reason": support.reason,
-                    "exec_support": "policy_blocked",
-                }
+                _policy_blocked_edge_notes(
+                    graph,
+                    relation=relation,
+                    to_id=str(edge.get("to") or ""),
+                    support=support,
+                )
             )
         elif support.kind == "unsupported":
             desired_status = "unsupported"
@@ -6972,11 +7067,12 @@ def reset_attack_graph_execution_statuses(shell: object, domain: str) -> dict[st
         if support.kind == "policy_blocked":
             desired_status = "blocked"
             desired_notes.update(
-                {
-                    "blocked_kind": "dangerous",
-                    "reason": support.reason,
-                    "exec_support": "policy_blocked",
-                }
+                _policy_blocked_edge_notes(
+                    graph,
+                    relation=relation,
+                    to_id=str(edge.get("to") or ""),
+                    support=support,
+                )
             )
         elif support.kind == "unsupported":
             desired_status = "unsupported"
@@ -7278,6 +7374,7 @@ def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
         knowledge = build_step_knowledge({"relation": relation_norm})
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         knowledge = None
 
     baked: dict[str, Any] | None = None
@@ -7366,6 +7463,7 @@ def _personalize_edge_knowledge(
         return weave_specifics_into_knowledge(vuln_key, base, synthetic_details)
     except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return base
 
 
@@ -7410,9 +7508,12 @@ def upsert_edge(
         if support.kind == "policy_blocked":
             desired_status = "blocked"
             desired_notes = {
-                "blocked_kind": "dangerous",
-                "reason": support.reason,
-                "exec_support": "policy_blocked",
+                **_policy_blocked_edge_notes(
+                    graph,
+                    relation=relation_norm,
+                    to_id=to_id,
+                    support=support,
+                ),
                 "exec_support_version": version,
             }
         elif support.kind == "unsupported":
@@ -7571,6 +7672,7 @@ def upsert_edge(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     return entry
 
 
@@ -8446,6 +8548,91 @@ def update_edge_status_by_labels(
     return True
 
 
+def reconcile_dcsync_edges_after_domain_compromise(
+    shell: object,
+    domain: str,
+    *,
+    user: str | None = None,
+) -> int:
+    """Mark every ``DCSync -> Domain`` edge ``success`` after a proven DCSync.
+
+    Called when ADscan has replicated the domain's credential database from the
+    Domain Controller (a full NTDS "all" DCSync / krbtgt extraction — the
+    authoritative ``dcsync_all_done`` signal). The GetNCChanges replication
+    ADscan performed proves the *terminal* DCSync technique against the DC, so
+    every ``DCSync -> Domain`` edge — whichever principal it is sourced from —
+    now represents a proven replication capability rather than a theoretical
+    one.
+
+    This deliberately reconciles only the DCSync edge (the terminal step). It
+    does NOT touch the earlier control-acquisition edges of any path, so a path
+    is still rendered ``exploited`` only when its full chain is proven — the
+    fix reflects "DCSync works against this domain's DC", it does not fabricate
+    a whole attack path. Without it, a domain compromised via a standalone
+    DCSync run (e.g. from an already-Domain-Admin context) leaves its
+    attack-path DCSync steps stuck at ``attempted``/``discovered`` and no path
+    transitions to domain compromise, so the client report contradicts its own
+    "domain compromised" headline.
+
+    Best-effort: never raises. Returns the number of edges updated.
+    """
+    try:
+        graph = load_attack_graph(shell, domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return 0
+    if not isinstance(graph, dict):
+        return 0
+    nodes = graph.get("nodes")
+    edges = graph.get("edges")
+    if not isinstance(nodes, dict) or not isinstance(edges, list):
+        return 0
+
+    domain_node_ids = {
+        node_id
+        for node_id, node in nodes.items()
+        if isinstance(node, dict) and _node_is_domain(node)
+    }
+    if not domain_node_ids:
+        return 0
+
+    updated = 0
+    now = _utc_now_iso()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if _normalize_relation_key(edge.get("relation")) != "dcsync":
+            continue
+        to_id = str(edge.get("to") or edge.get("to_id") or "")
+        if to_id not in domain_node_ids:
+            continue
+        if str(edge.get("status") or "").strip().lower() == "success":
+            continue
+        edge["status"] = "success"
+        edge["last_seen"] = now
+        notes = edge.get("notes")
+        if not isinstance(notes, dict):
+            notes = {}
+            edge["notes"] = notes
+        notes["reconciled_from"] = "domain_compromise_dcsync"
+        # The synthetic DC-bridge carries ``theoretical: True`` to model an
+        # unexecuted replication; a proven DCSync is no longer theoretical.
+        if notes.get("theoretical") is True:
+            notes["theoretical"] = False
+        if user and not notes.get("user"):
+            notes["user"] = user
+        updated += 1
+
+    if updated:
+        save_attack_graph(shell, domain, graph)
+        print_info_debug(
+            "[attack-graph] Reconciled DCSync edges after domain compromise: "
+            f"domain={mark_sensitive(domain, 'domain')} edges={updated}"
+        )
+    return updated
+
+
 def get_node_by_label(
     shell: object, domain: str, *, label: str
 ) -> dict[str, Any] | None:
@@ -8591,6 +8778,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         for s in executable_steps
     ):
         derived_status = "blocked"
+    elif any(s == "closed_by_configuration" for s in statuses):
+        # A relay avenue ADscan observed to be CLOSED with certainty by the
+        # environment's configuration/topology (signing/CBT/no-ADCS/MAQ/single-DC
+        # reflection). A POSITIVE exposure fact — never a risk/held status.
+        derived_status = "closed_by_configuration"
     elif any(s == "unsupported" for s in statuses) or any(
         # Live support classification is the single source of truth: a relation
         # whose catalog ``support_kind`` is ``unsupported`` surfaces as such even
@@ -8605,7 +8797,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
 
     steps_for_ui: list[dict[str, Any]] = []
     for idx, step in enumerate(path.steps, start=1):
-        step_status = step.status
+        # A non-executed ``context_only`` hop (MemberOf, credential-reuse pivot)
+        # is a structural FACT — surface it as ``structural`` at the data SSOT so
+        # every consumer (snapshot/PDF/web) agrees; proven / blocked / config-close
+        # statuses are preserved unchanged (see ``derive_step_display_status``).
+        step_status = derive_step_display_status(step.relation, step.status)
         relation_key = str(step.relation or "").strip().lower()
         step_details = {
             "from": label(step.from_id),
@@ -8630,6 +8826,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                     "impact_target", str(step_details.get("to") or "")
                 )
                 step_details["display_to"] = display_to
+        from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+            safety_abstention_notes,
+        )
+
+        safety_notes = safety_abstention_notes(relation_key)
         steps_for_ui.append(
             {
                 "step": idx,
@@ -8637,20 +8838,32 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 "status": step_status,
                 "details": {
                     **step_details,
+                    # A hard-blocked safety abstention is stamped
+                    # ``dangerous_destructive`` (routed via the single classifier)
+                    # so it renders under "Not executed for safety"; never
+                    # downgrade it to ``dangerous`` here.
                     **(
-                        {
-                            "blocked_kind": "dangerous",
-                            "reason": "High-risk / potentially disruptive (disabled by design)",
-                        }
-                        if classify_relation_support(relation_key).kind
-                        == "policy_blocked"
-                        and str(step_status or "").strip().lower() == "blocked"
-                        else {}
+                        safety_notes
+                        if safety_notes is not None
+                        else (
+                            {
+                                "blocked_kind": "dangerous",
+                                "reason": "High-risk / potentially disruptive (disabled by design)",
+                            }
+                            if classify_relation_support(relation_key).kind
+                            == "policy_blocked"
+                            and str(step_status or "").strip().lower() == "blocked"
+                            else {}
+                        )
                     ),
                 },
             }
         )
     if synthetic_followup is not None:
+        from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+            safety_abstention_notes,
+        )
+
         synthetic_status = str(synthetic_followup.get("status") or "theoretical")
         steps_for_ui.append(
             {
@@ -8663,11 +8876,18 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                     "reason": str(synthetic_followup.get("reason") or ""),
                     "synthetic_followup": True,
                     "followup_source_group": label(path.target_id),
+                    # A blocked synthetic follow-up (e.g. DNSAdmins abuse) is a
+                    # safety abstention — stamp ``dangerous_destructive`` via the
+                    # single classifier so it renders under "Not executed for
+                    # safety", never a bare ``dangerous``.
                     **(
-                        {
-                            "blocked_kind": "dangerous",
-                            "reason": str(synthetic_followup.get("reason") or ""),
-                        }
+                        (
+                            safety_abstention_notes(str(synthetic_followup["relation"]))
+                            or {
+                                "blocked_kind": "dangerous",
+                                "reason": str(synthetic_followup.get("reason") or ""),
+                            }
+                        )
                         if synthetic_status.strip().lower() == "blocked"
                         else {}
                     ),
@@ -8858,6 +9078,7 @@ def _resolve_bloodhound_principal_node(
         service = shell._get_graph_service()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
     if not service:
         return None
@@ -8899,6 +9120,7 @@ def _resolve_bloodhound_principal_node(
                 return None
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     domain_upper = str(domain or "").strip().upper()
     candidates: list[tuple[int, dict[str, Any]]] = []
@@ -8943,6 +9165,7 @@ def _resolve_bloodhound_principal_node(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     if hasattr(service, "get_group_node_by_samaccountname"):
         try:
             _append_candidate(
@@ -8953,6 +9176,7 @@ def _resolve_bloodhound_principal_node(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     if hasattr(service, "get_computer_node_by_name"):
         try:
             _append_candidate(
@@ -8961,6 +9185,7 @@ def _resolve_bloodhound_principal_node(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     if not candidates:
         return None
@@ -9045,6 +9270,7 @@ def _resolve_special_principal_entry(
                         return _node_id(node_record)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(f"[{label_lower}] lookup failed for {marked_domain}: {exc}")
 
@@ -9242,6 +9468,7 @@ def resolve_domain_node_record_for_domain(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[domain_node] resolver failed for {marked_domain}; falling back to synthetic: {exc}"
         )
@@ -9417,6 +9644,7 @@ def _resolve_netexec_target_fqdn(
                 fqdn = dns_service.reverse_resolve_fqdn(ip_clean)  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         fqdn = None
 
     if not fqdn and target_hostname:
@@ -9616,6 +9844,7 @@ def upsert_netexec_privilege_edge(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_verbose(
             f"[netexec_edge] Failed to record NetExec-discovered step for {marked_domain}."
@@ -9852,6 +10081,7 @@ def upsert_local_admin_password_reuse_edges(
         return created
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_verbose(
             f"[local_reuse] Failed to persist local admin reuse edges for {marked_domain}."
@@ -10024,6 +10254,7 @@ def upsert_local_cred_to_domain_reuse_edges(
         return created
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_verbose(
             f"[sam_domain_reuse] Failed to persist SAM->domain reuse edges for {marked_domain}."
@@ -10235,6 +10466,7 @@ def upsert_domain_password_reuse_edges(
         return created
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_verbose(
             f"[domain_pass_reuse] Failed to persist DomainPassReuse edges for {marked_domain}."
@@ -10328,6 +10560,7 @@ def upsert_cve_host_edge(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_verbose(
             f"[netexec_edge] Failed to record CVE step for {marked_domain}."
@@ -10482,6 +10715,7 @@ def ensure_user_node_for_domain(
                     return _node_id(node_record)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(lookup_domain, "domain")
         marked_user = mark_sensitive(user_clean, "user")
         print_info_debug(
@@ -10623,6 +10857,7 @@ def ensure_computer_node_for_domain(
                     return _node_id(node_record)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain_clean, "domain")
         marked_comp = mark_sensitive(principal_clean, "host")
         print_info_debug(
@@ -12477,6 +12712,7 @@ def _load_ou_contained_tierzero_objects(
         return tuple(objects)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return ()
 
 
@@ -13527,7 +13763,7 @@ def compute_display_paths_for_domain(
     no_cache: bool = False,
     allow_owned_terminal_target: bool = False,
     display_friendly: bool | None = None,
-    keep_longest: bool = False,
+    keep_longest: bool = True,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain with optional high-value promotion.
 
@@ -14014,6 +14250,7 @@ def get_graph_service_access_pairs(
         graph = load_attack_graph(shell, domain)
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return frozenset()
 
     nodes = graph.get("nodes") if isinstance(graph, dict) else None
@@ -14369,7 +14606,7 @@ def get_attack_path_summaries(
     dev_workers_override: int | None = None,
     render_debug_tables: bool = True,
     display_friendly: bool | None = None,
-    keep_longest: bool = False,
+    keep_longest: bool = True,
 ) -> list[dict[str, Any]]:
     """Return user-facing attack-path summaries through the shell-aware layer.
 
@@ -14787,50 +15024,15 @@ def _compute_attack_path_summaries_inner(
 
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
-    statuses: list[str] = []
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        action = str(step.get("action") or "").strip().lower()
-        if action in _CONTEXT_RELATIONS_LOWER:
-            continue
-        value = step.get("status")
-        if isinstance(value, str) and value:
-            statuses.append(value.strip().lower())
+    """Derive a path's display status from its per-step statuses.
 
-    if statuses and all(status == "success" for status in statuses):
-        return "exploited"
-    if any(status in {"attempted", "failed", "error"} for status in statuses):
-        return "attempted"
-    if any(status == "unavailable" for status in statuses):
-        return "unavailable"
-    if any(status == "blocked" for status in statuses):
-        return "blocked"
-    if any(status == "unsupported" for status in statuses):
-        return "unsupported"
-    if any(
-        classify_relation_support(str(step.get("action") or "").strip().lower()).kind
-        == "policy_blocked"
-        for step in steps
-        if isinstance(step, dict)
-        and str(step.get("action") or "").strip().lower()
-        not in _CONTEXT_RELATIONS_LOWER
-    ):
-        # Policy-blocked steps should surface as blocked even before any execution attempt.
-        return "blocked"
-    if any(
-        # Live support classification is the single source of truth — surface an
-        # ``unsupported`` relation even when the persisted edge status still
-        # carries the pre-flip default (see CrackNTLMv1).
-        classify_relation_support(str(step.get("action") or "").strip().lower()).kind
-        == "unsupported"
-        for step in steps
-        if isinstance(step, dict)
-        and str(step.get("action") or "").strip().lower()
-        not in _CONTEXT_RELATIONS_LOWER
-    ):
-        return "unsupported"
-    return "theoretical"
+    SSOT — the logic (including the ``partial`` signal, doctrine-status
+    precedence, and the support-registry fallback) is maintained ONCE in
+    :func:`adscan_internal.services.attack_paths_core._derive_display_status_from_steps`.
+    This module previously carried a byte-drifting duplicate; it now delegates so
+    both display pipelines classify identically.
+    """
+    return attack_paths_core._derive_display_status_from_steps(steps)  # noqa: SLF001
 
 
 def _strip_leading_relations(
@@ -15229,6 +15431,7 @@ def compute_attack_path_metrics(
         }
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return _empty_path_metrics()
 
 

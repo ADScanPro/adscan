@@ -54,6 +54,7 @@ from adscan_internal.services.pivot_runtime_state_service import (
 from adscan_internal.services.pivot_auth_context_service import (
     build_persisted_pivot_auth_context,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(slots=True)
@@ -64,6 +65,59 @@ class PivotReachableSubnetSummary:
     hostnames: list[str]
     ips: list[str]
     reachable_ports: list[int]
+
+
+def is_pivoting_enabled(shell: Any) -> bool:
+    """Return whether ADscan should attempt network pivoting for this run.
+
+    SSOT accessor for the ``--scan-config`` ``pivoting.enabled`` toggle
+    (:class:`adscan_internal.services.scan_config.PivotingConfig`). This is a
+    GENERAL engagement-scope gate, not tied to any single pivot method — MSSQL
+    pivoting (``mssql.py``) is the first consumer, but WinRM-based and any
+    future pivot method must call this SAME function rather than growing a
+    parallel toggle.
+
+    Tri-state precedence, strongest first — mirrors
+    :func:`adscan_internal.services.background_jobs.scan_seam.maybe_launch_poisoning_job`'s
+    poisoning resolution:
+
+    1. ``scan_config.pivoting.enabled`` explicitly set (not ``None``) →
+       authoritative, overrides the workspace-type default in both directions.
+    2. Otherwise → the workspace-type default: ``ctf`` workspaces default to
+       ``True`` (no client-facing OPSEC concern in a lab/CTF engagement, so
+       ADscan attempts pivoting by default); every other workspace type
+       (``audit`` — a real client engagement) defaults to ``False``, matching
+       today's opt-in-only behavior.
+
+    Safe no-op default: returns ``False`` whenever ``shell`` has no
+    ``scan_config`` attribute, no ``scan_config.pivoting`` section, or a
+    malformed value, AND the workspace type cannot be resolved to ``ctf``.
+    Never raises.
+
+    Args:
+        shell: The active shell/session, expected to carry a ``scan_config``
+            attribute (``adscan_internal.services.scan_config.ScanConfig``)
+            when a ``--scan-config`` file was supplied, and a ``type``
+            attribute identifying the workspace kind (``"ctf"`` / ``"audit"``).
+
+    Returns:
+        ``True`` when explicitly enabled, or when unset and the workspace is
+        a CTF workspace. ``False`` otherwise.
+    """
+    try:
+        scan_config = getattr(shell, "scan_config", None)
+        pivoting = getattr(scan_config, "pivoting", None)
+        enabled = getattr(pivoting, "enabled", None)
+        if enabled is not None:
+            return bool(enabled)
+    except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
+        pass
+
+    try:
+        is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
+        return False
+    return is_ctf
 
 
 def _normalize_mssql_json_stdout(stdout: str) -> str:
@@ -891,8 +945,20 @@ def orchestrate_ligolo_pivot_tunnel(
     source_service: str = "winrm",
     pivot_method: str = "ligolo_winrm_pivot",
     pivot_kerberos_spn_host: str | None = None,
+    consent_default_override: bool | None = None,
 ) -> bool:
-    """Create one Ligolo tunnel for confirmed pivot subnets and verify the routes."""
+    """Create one Ligolo tunnel for confirmed pivot subnets and verify the routes.
+
+    Args:
+        consent_default_override: When given, overrides the CTF-workspace-based
+            default for the artifact-deployment consent prompt below. Callers
+            that reach this function through an automatic, scan-config-gated
+            hook (the operator already opted in via ``pivoting.enabled``) pass
+            ``True`` here so a non-interactive run proceeds instead of
+            defaulting to the manual/interactive CTF heuristic. ``None``
+            (the default) preserves today's ``shell.type == "ctf"`` behavior
+            unchanged for every existing manual caller.
+    """
 
     workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
     if not workspace_dir:
@@ -913,7 +979,11 @@ def orchestrate_ligolo_pivot_tunnel(
         f"{len(subnet_summaries)} subnet(s) behind {mark_sensitive(pivot_host, 'hostname')} appear suitable for a Ligolo tunnel. "
         "This will route the selected prefixes through the pivot so existing ADscan tooling can reach those hosts directly."
     )
-    default_confirm = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    default_confirm = (
+        consent_default_override
+        if consent_default_override is not None
+        else str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    )
 
     try:
         service = LigoloProxyService(workspace_dir=workspace_dir, current_domain=domain)
@@ -1146,8 +1216,9 @@ def orchestrate_ligolo_pivot_tunnel(
             keepalive_thread.start()
 
             result_reader = _build_result_reader_script(result_path)
-            poll_deadline = time.time() + 40.0
-            while time.time() < poll_deadline:
+            # monotonic: the host wall clock is stepped mid-scan for DC sync.
+            poll_deadline = time.monotonic() + 40.0
+            while time.monotonic() < poll_deadline:
                 time.sleep(2.0)
                 if keepalive_errors:
                     raise RuntimeError(
@@ -1369,6 +1440,7 @@ def orchestrate_ligolo_pivot_tunnel(
                         )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(f"[ligolo-cleanup] keepalive cleanup failed: {exc}")
                 try:
                     reconciliation = reconcile_domain_pivot_runtime_state(
@@ -1389,6 +1461,7 @@ def orchestrate_ligolo_pivot_tunnel(
                         )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(
                         "[pivot-runtime] failed to reconcile stale pivot after keepalive drop: "
                         f"{mark_sensitive(str(exc), 'detail')}"
@@ -1440,6 +1513,7 @@ def orchestrate_ligolo_pivot_tunnel(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         if remote_agent_path:
             print_info("Attempting to remove the staged Ligolo agent from the pivot host…")
             cleanup_result = cleanup_remote_ligolo_artifact(

@@ -20,6 +20,7 @@ from adscan_internal.services.privileged_group_classifier import (
     sid_rid,
 )
 from adscan_internal.workspaces import domain_subpath, write_json_file
+from adscan_core.rich_output import print_exception
 
 _ADCS_OBJECT_KINDS: frozenset[str] = frozenset(
     {
@@ -1569,6 +1570,7 @@ def _synthesize_well_known_group_node(
         return attack_graph_service._node_id(node_payload)  # noqa: SLF001
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             "Failed to synthesize Tier-0 target node "
             f"{mark_sensitive(label, 'domain')}: {exc}"

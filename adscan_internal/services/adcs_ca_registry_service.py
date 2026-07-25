@@ -16,6 +16,7 @@ from adscan_core.rich_output import print_info_debug
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.smb_transport import SMBConfig, smb_machine_for
+from adscan_core.rich_output import print_exception
 
 # ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 bit in EditFlags.
 EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x00040000
@@ -62,6 +63,7 @@ class ADCSCARegistryProbe:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[adcs-ca-probe] registry read failed: "
                 f"target={mark_sensitive(str(target_host), 'host')} "

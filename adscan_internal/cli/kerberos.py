@@ -71,6 +71,7 @@ from adscan_internal.workspaces import (
     domain_relpath,
     domain_subpath,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _resolve_dcsync_target_user(
@@ -266,6 +267,7 @@ def ensure_kerberos_output_dir(shell: KerberosShell, domain: str) -> str:
         os.makedirs(output_dir_abs, exist_ok=True)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
             f"Unable to prepare kerberos output directory for {marked_domain}: {exc}"
@@ -376,6 +378,7 @@ def auto_generate_kerberos_ticket(
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         marked_username = mark_sensitive(username, "user")
         marked_domain = mark_sensitive(domain, "domain")
         print_warning(
@@ -416,6 +419,7 @@ def auto_generate_kerberos_ticket_result(
         )
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         return None
 
 
@@ -489,6 +493,7 @@ def ensure_kerberos_environment_for_command(
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error ensuring Kerberos environment for {command_name}: {e}")
     return False
 
@@ -637,6 +642,7 @@ def _load_valid_roast_hash_entries(
         raw = Path(hashes_file_abs).read_text(encoding="utf-8", errors="ignore")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_path = mark_sensitive(hashes_file_abs, "path")
         print_info_debug(
             f"[kerberos] Could not read roast hashes file {marked_path}: "
@@ -1163,6 +1169,7 @@ def finalize_roast_results(
             telemetry.capture(f"{roast_type}_no_users_found", properties)
         except Exception as e:  # pragma: no cover - best effort
             telemetry.capture_exception(e)
+            print_exception(exception=e)
 
         report_field = roast_type.lower()
         if report_field:
@@ -1328,6 +1335,7 @@ def finalize_roast_results(
 
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
+        print_exception(exception=e)
 
     if not parsed_hash_entries:
         print_warning(
@@ -1485,6 +1493,7 @@ def finalize_roast_results(
         return cracking_hashes_file_rel
     except FileNotFoundError as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"No {roast_type}able users found in domain {marked_domain}")
         return None
@@ -1589,6 +1598,7 @@ def run_kerberoast(
         telemetry.capture("kerberoast_started", properties)
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
+        print_exception(exception=e)
 
     if not result_users:
         marked_domain = mark_sensitive(target_domain, "domain")
@@ -1705,6 +1715,7 @@ def run_asreproast(
         telemetry.capture("asreproast_started", properties)
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
+        print_exception(exception=e)
 
     return finalize_roast_results(
         shell,
@@ -1941,6 +1952,7 @@ def sync_clock_with_pdc(
             )
     except Exception as _ssot_exc:  # noqa: BLE001 — never block legacy fallback
         telemetry.capture_exception(_ssot_exc)
+        print_exception(exception=_ssot_exc)
         print_info_debug(
             f"[kerberos] SSOT clock guard raised; trying legacy paths: {_ssot_exc}"
         )
@@ -2036,6 +2048,7 @@ def sync_clock_with_pdc(
                     except RuntimeError as exc:
                         # Defense in depth: asyncio.run still refuses to nest.
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         print_info_debug(
                             "[clock-sync] DC-time read could not start a new event loop, "
                             f"falling back to legacy path: {exc}"
@@ -2083,12 +2096,14 @@ def sync_clock_with_pdc(
                     )
             except (HostHelperError, OSError) as _dctime_exc:
                 telemetry.capture_exception(_dctime_exc)
+                print_exception(exception=_dctime_exc)
                 print_info_debug(
                     "[clock-sync] dc_time path raised host-helper error, "
                     f"falling back to legacy path: {_dctime_exc}"
                 )
             except Exception as _dctime_exc:  # noqa: BLE001 — defensive
                 telemetry.capture_exception(_dctime_exc)
+                print_exception(exception=_dctime_exc)
                 print_info_debug(
                     "[clock-sync] dc_time path raised unexpected error, "
                     f"falling back to legacy path: {_dctime_exc}"
@@ -2151,6 +2166,7 @@ def sync_clock_with_pdc(
             return False
         except (HostHelperError, OSError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             stored_reason = _set_clock_sync_disabled_reason(
                 shell,
                 key=domain,
@@ -2605,6 +2621,7 @@ def _resolve_logon_capable_dcsync_credential(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         dc_host = ""
     if not dc_host:
         return username, password
@@ -2628,6 +2645,7 @@ def _resolve_logon_capable_dcsync_credential(
             return su, sp
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # 2. No scoped ticket — warn if the queued principal is known-denied (no
     #    silent failure; the operator/CI sees exactly why DRSUAPI will fail).
@@ -2647,6 +2665,7 @@ def _resolve_logon_capable_dcsync_credential(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return username, password
 
 
@@ -2692,22 +2711,35 @@ def do_dcsync(shell: KerberosShell, args: str) -> None:
 
     Args:
         shell: Shell instance with workspace and domain configuration.
-        args: Command arguments as string (format: "<domain> <username> <password>").
+        args: Command arguments as string.
 
     Usage:
         dcsync <domain> <username> <password>
+        dcsync -d <domain> -u <username> -p <password>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
     Requires that the domain is defined in the domains list and that a username and password
     have been specified for authentication.
     """
-    args_list = args.split()
-    if len(args_list) != 3:
-        print_warning("Usage: dcsync <domain> <username> <password>")
+    from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+    usage = "dcsync <domain> <username> <password>  |  dcsync -d <domain> -u <username> -p <password>"
+    parser = ReplArgumentParser(prog="dcsync", add_help=False)
+    parser.add_argument("-d", "--domain", required=True)
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password"),
+        parser=parser,
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain = args_list[0]
-    username = args_list[1]
-    password = args_list[2]
-    run_dcsync(shell, domain, username, password)
+    run_dcsync(shell, namespace.domain, namespace.username, namespace.password)
 
 
 def run_kerberoast_preauth(shell: KerberosShell, domain: str, user: str) -> None:

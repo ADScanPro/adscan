@@ -1,4 +1,7 @@
 import enum
+import struct
+
+from .asn1_structs import KERB_ERROR_DATA
 
 class KerberosError(Exception):
 	def __init__(self, krb_err_msg, extra_msg = ''):
@@ -11,10 +14,33 @@ class KerberosError(Exception):
 		except:
 			pass
 		self.extra_msg = extra_msg
-		
-		super(Exception, self).__init__('%s Error Name: %s Detail: "%s" ' % (extra_msg, self.errorcode.name, self.errormsg))
-	
-		
+
+		# KRB_ERR_GENERIC (0x3C) means "the description is in the e-data
+		# field" (RFC 4120) -- Windows KDCs use a Microsoft private
+		# extension there (KERB-ERROR-DATA: data-type [1], data-value [2])
+		# whose data-value's first 4 bytes are a little-endian NTSTATUS
+		# code carrying the REAL cause (e.g. an AP-exchange rejection
+		# during DCERPC/DRSUAPI auth). Without this decode every
+		# KRB_ERR_GENERIC failure is indistinguishable from every other.
+		# Mirrors impacket's krb5.kerberosv5.KerberosError.__str__.
+		self.nt_status_code = None
+		self.nt_status_hex = None
+		if self.errorcode == KerberosErrorCode.KRB_ERR_GENERIC:
+			try:
+				e_data = self.krb_err_msg.get('e-data')
+				if e_data:
+					data_value = KERB_ERROR_DATA.load(e_data).native.get('data-value')
+					if data_value and len(data_value) >= 4:
+						self.nt_status_code = struct.unpack('<L', data_value[:4])[0]
+						self.nt_status_hex = '0x%08X' % self.nt_status_code
+			except Exception:
+				pass
+
+		_msg = '%s Error Name: %s Detail: "%s" ' % (extra_msg, self.errorcode.name, self.errormsg)
+		if self.nt_status_hex is not None:
+			_msg += 'NTStatus: %s ' % self.nt_status_hex
+		super(Exception, self).__init__(_msg)
+
 
 # https://technet.microsoft.com/en-us/library/bb463166.aspx
 class KerberosErrorCode(enum.Enum):

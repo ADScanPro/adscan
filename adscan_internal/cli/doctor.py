@@ -15,7 +15,7 @@ Checks (each reuses an existing service — nothing is reimplemented here):
   PDC, the actual PDC is discovered and reported; the effective (corrected) DC
   IP flows into every downstream check. Never prompts, never loops.
 * **DC connectivity** — TCP reachability of the DC's AD ports via
-  ``assess_target_reachability`` (route + 53/88/389/445 probe).
+  ``assess_target_reachability`` (route + 53/88/389/445/636 probe).
 * **Authentication** — when credentials are supplied, an ISOLATED lightweight
   LDAP bind against the DC (posture-aware, LDAPS->LDAP fallback). It does NOT
   route through ``add_credential`` — that triggers the full authenticated scan
@@ -54,6 +54,7 @@ from adscan_internal.services.graph_queries.inventories import (
     ENABLED_REAL_COMPUTERS_LDAP_FILTER,
     ENABLED_REAL_USERS_LDAP_FILTER,
 )
+from adscan_core.rich_output import print_exception
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +138,7 @@ class DoctorReport:
                 self.on_check(check)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     @property
     def passed(self) -> bool:
@@ -214,6 +216,7 @@ def _check_preflight(report: DoctorReport, deps: DoctorDeps) -> None:
         ok = bool(deps.handle_check(deps.build_preflight_args()))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         report.add("Runtime preflight", "fail", "Preflight raised an error.")
         return
     report.add(
@@ -260,6 +263,7 @@ def _check_dns(report: DoctorReport, shell: Any, config: DoctorConfig) -> str:
             effective_ip = _discover_pdc_without_ip(report, shell, domain=domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         report.add("DNS resolution", "fail", f"DC discovery raised: {exc}")
         return ""
     return effective_ip
@@ -339,6 +343,7 @@ def _discover_pdc_without_ip(report: DoctorReport, shell: Any, *, domain: str) -
         resolver_ip = next((ns for ns in (nameservers or []) if ns), "")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     selected_ip = ""
     if resolver_ip:
@@ -349,6 +354,7 @@ def _discover_pdc_without_ip(report: DoctorReport, shell: Any, *, domain: str) -
             selected_ip = (selected_ip or "").strip()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             selected_ip = ""
 
     if not selected_ip:
@@ -371,6 +377,7 @@ def _discover_pdc_without_ip(report: DoctorReport, shell: Any, *, domain: str) -
         domain_data.setdefault("pdc", selected_ip)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # The SRV lookup above already returned a hostname (``_hostname``); still
     # route through the same helper so ``domains_data`` carries a recoverable
@@ -450,6 +457,7 @@ def _ensure_dc_fqdn(shell: Any, domain: str, pdc_ip: str) -> None:
             domain_data["pdc_hostname"] = hostname
     except Exception as exc:  # noqa: BLE001 — best-effort; never crash doctor
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _check_connectivity(report: DoctorReport, shell: Any, dc_ip: str) -> None:
@@ -459,18 +467,22 @@ def _check_connectivity(report: DoctorReport, shell: Any, dc_ip: str) -> None:
         return
     try:
         from adscan_internal.services.network_preflight_service import (  # noqa: PLC0415
+            DC_REACHABILITY_TCP_PORTS,
             assess_target_reachability,
         )
 
         # The shell satisfies the NetworkPreflightHost protocol (same call the
         # DNS preflight makes); pass it directly rather than reimplementing.
+        # Consume the SSOT port set so this check never drifts from the `start`
+        # preflight — both must recognise a hardened DC exposing only 88/636.
         assessment = assess_target_reachability(
             shell,
             target_ip=dc_ip,
             expected_interface=getattr(shell, "interface", None),
-            tcp_ports=(53, 88, 389, 445),
+            tcp_ports=DC_REACHABILITY_TCP_PORTS,
             timeout_seconds=3.0,
         )
+        probed_ports_label = "/".join(str(p) for p in DC_REACHABILITY_TCP_PORTS)
         open_ports = tuple(assessment.open_ports)
         if open_ports:
             report.add(
@@ -484,10 +496,11 @@ def _check_connectivity(report: DoctorReport, shell: Any, dc_ip: str) -> None:
                 "DC connectivity",
                 "fail",
                 f"No AD ports open on {mark_sensitive(dc_ip, 'ip')} "
-                "(53/88/389/445 all closed or filtered).",
+                f"({probed_ports_label} all closed or filtered).",
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         report.add("DC connectivity", "fail", f"Reachability probe raised: {exc}")
 
 
@@ -582,6 +595,7 @@ def _check_auth(report: DoctorReport, shell: Any, config: DoctorConfig) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         report.add(
             "Authentication",
             "fail",
@@ -654,6 +668,7 @@ def _check_enabled_counts(
             report.add(label, "info", detail=str(count), value=count)
         except Exception as exc:  # noqa: BLE001 — best-effort; never crash doctor
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             report.add(label, "skip", f"Count query failed: {exc}")
 
 
@@ -709,6 +724,7 @@ def _check_trusts(
         )
     except Exception as exc:  # noqa: BLE001 — best-effort; never crash doctor
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         report.add("Trust relationships", "skip", f"Trust enumeration failed: {exc}")
 
 
@@ -755,6 +771,7 @@ def _check_posture(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         report.add("Posture probe", "fail", f"Posture probe raised: {exc}")
 
 
@@ -1014,6 +1031,7 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
                     shutil.rmtree(shell.current_workspace_dir)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         try:
             shell.do_exit(exit=False)
         except Exception:  # noqa: BLE001

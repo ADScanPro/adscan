@@ -14,7 +14,7 @@ Inference hierarchy (highest → lowest confidence)
    (``htb.local``, ``megabank.local``) are handled by the PDC hostname rule.
    See :func:`lab_catalog.get_machine_domain_index`.
 2. **TLD rules** — ``.htb`` → HackTheBox (confidence 1.0),
-   ``.vl`` → HackTheBox/VulnLab (1.0), ``.thm`` → TryHackMe (1.0),
+   ``.vl`` → VulnLab (1.0), ``.thm`` → TryHackMe (1.0),
    ``.pg`` → Proving Grounds (0.95).
 3. **GOAD domain patterns** — ``sevenkingdoms.local``, ``essos.local``, etc.
    (confidence 0.98).
@@ -134,7 +134,7 @@ class DomainInferenceResult:
 # Add new CTF platforms here; order is irrelevant (all TLDs are checked).
 _TLD_RULES: Final[dict[str, tuple[str, float]]] = {
     ".htb": ("hackthebox", 1.0),
-    ".vl": ("hackthebox", 1.0),  # VulnLab machines (re-hosted on HTB)
+    ".vl": ("vulnlab", 1.0),  # VulnLab (vulnlab.com) — the .vl domain IS the VulnLab instance
     ".thm": ("tryhackme", 1.0),
     ".pg": ("proving_grounds", 0.95),
 }
@@ -387,9 +387,17 @@ def infer_from_domain(
         if not domain_lower.endswith(tld):
             continue
         machine_name = _extract_machine_name(domain_lower, tld)
-        whitelisted: bool | None = (
-            is_lab_whitelisted(provider, machine_name) if machine_name else None
-        )
+        # A lab-specific pseudo-TLD (.htb / .vl / .thm / .pg) is definitionally a
+        # public CTF-lab domain — it CANNOT be a real production domain (those use
+        # .local/.corp/.com, handled by the generic-internal path which stays
+        # whitelist-gated). So the machine name is SAFE to preserve in telemetry
+        # regardless of whether the specific box is in the curated AD-box catalog.
+        # This is the pattern-based whitelist: match a known lab provider by its
+        # TLD → keep the box name, so we can identify + reproduce the box. (Whether
+        # it is a *known AD* box is a separate lookup against _AD_LABS_BY_PROVIDER,
+        # not a precondition for preserving the name.) Previously only curated
+        # boxes kept their name; every other lab-TLD box was needlessly scrubbed.
+        whitelisted: bool | None = True if machine_name else None
         return DomainInferenceResult(
             workspace_type="ctf",
             lab_provider=provider,
@@ -414,7 +422,7 @@ def infer_from_domain(
     if workspace_name:
         workspace_lower = workspace_name.strip().lower()
         # Extend this tuple when new providers with name-based labs are added.
-        _providers_to_check = ("hackthebox", "tryhackme", "dockerlabs", "vulnhub")
+        _providers_to_check = ("hackthebox", "vulnlab", "tryhackme", "dockerlabs", "vulnhub")
         for provider in _providers_to_check:
             for lab in get_labs_for_provider(provider):
                 lab_lower = lab.lower()
@@ -764,7 +772,7 @@ def resolve_lab_from_text(text: str) -> tuple[str, str, bool] | None:
     # Normalise both separators so "VulnNet-Roasted" matches "VulnNet_Roasted".
     query_normalised = query.replace("-", "_")
 
-    _providers_to_check = ("hackthebox", "tryhackme", "dockerlabs", "vulnhub")
+    _providers_to_check = ("hackthebox", "vulnlab", "tryhackme", "dockerlabs", "vulnhub")
     for provider in _providers_to_check:
         for lab in get_labs_for_provider(provider):
             lab_lower = lab.lower()

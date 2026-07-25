@@ -282,9 +282,11 @@ def try_launch_rdp_on_host(
             )
     except HostHelperError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_verbose(f"[rdp] host-helper error: {exc}")
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_verbose(f"[rdp] host-helper exception: {exc}")
     return False
 
@@ -494,6 +496,7 @@ def run_rdp_service_access_sweep(
             posture_snapshot = get_posture(domains_data, domain=domain)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[rdp-aardwolf] posture wiring skipped: {exc}")
 
     # Pre-flight TCP probe on 3389 — RDP credential testing waits 5-10s per
@@ -594,6 +597,7 @@ def run_rdp_service_access_sweep(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     normalized_target_entries = {
         str(e).strip().lower() for e in target_entries if str(e).strip()
@@ -628,6 +632,7 @@ def run_rdp_service_access_sweep(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[rdp-aardwolf] failed to persist probe history: {exc}")
 
     if prompt and success_findings:

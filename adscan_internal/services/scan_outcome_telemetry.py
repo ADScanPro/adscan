@@ -41,7 +41,9 @@ from adscan_internal.services.session_compromise_state_service import (
     SESSION_COMPROMISE_STATUS_DOMAIN,
     SESSION_COMPROMISE_STATUS_USER,
     normalize_session_compromise_status,
+    session_reached_domain_compromise,
 )
+from adscan_core.rich_output import print_exception
 
 # Per-scan outcome tiers (PostHog-queryable enum).
 SCAN_OUTCOME_DOMAIN_COMPROMISED = "domain_compromised"
@@ -172,6 +174,14 @@ def build_scan_outcome_properties(shell: Any, command_name: str) -> dict[str, An
     status = normalize_session_compromise_status(
         getattr(shell, "_session_compromise_status", None)
     )
+    # SSOT reconciliation: promote to domain-compromise when ANY domain in the
+    # workspace is proven-pwned (e.g. a trusted secondary domain owned via a
+    # cross-domain path whose promotion never threaded the in-memory session
+    # marker). Never downgrade. Mirrors build_session_compromise_metadata.
+    if status != SESSION_COMPROMISE_STATUS_DOMAIN and session_reached_domain_compromise(
+        shell
+    ):
+        status = SESSION_COMPROMISE_STATUS_DOMAIN
     outcome = _derive_outcome(status)
 
     scan_start = getattr(shell, "scan_start_time", None)
@@ -233,5 +243,6 @@ def emit_scan_outcome(shell: Any, command_name: str) -> None:
     except Exception as exc:  # noqa: BLE001 - analytics must never break the scan
         try:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         except Exception:  # noqa: BLE001
             pass

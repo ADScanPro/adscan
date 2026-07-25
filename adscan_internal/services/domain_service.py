@@ -28,6 +28,7 @@ from adscan_internal.services.enumeration.trust_query import (
     query_trusted_domains,
 )
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,7 @@ class DomainService(BaseService):
                     progress_cb(event)
                 except Exception as cb_exc:  # noqa: BLE001
                     telemetry.capture_exception(cb_exc)
+                    print_exception(exception=cb_exc)
 
         # Pick the credential value badldap will receive.
         secret = nt_hash or password
@@ -243,6 +245,7 @@ class DomainService(BaseService):
                     entries = query_trusted_domains(conn, ldap_cfg.domain_dn)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 err_text = self._summarize_ldap_error(exc)
                 failed_domains[current_domain] = err_text
                 duration_ms = (time.monotonic() - t_start) * 1000.0
@@ -274,6 +277,7 @@ class DomainService(BaseService):
                         partner_pdc = resolve_pdc_ip(partner, current_pdc)
                     except Exception as rexc:  # noqa: BLE001
                         telemetry.capture_exception(rexc)
+                        print_exception(exception=rexc)
                         partner_pdc = None
                     if partner_pdc:
                         domain_controllers[partner] = partner_pdc
@@ -283,6 +287,7 @@ class DomainService(BaseService):
                         partner_host = resolve_dc_hostname(partner, current_pdc)
                     except Exception as hexc:  # noqa: BLE001
                         telemetry.capture_exception(hexc)
+                        print_exception(exception=hexc)
                         partner_host = None
                     if partner_host:
                         domain_hostnames[partner] = partner_host.strip()
@@ -329,6 +334,7 @@ class DomainService(BaseService):
                         )
                     except Exception as cexc:  # noqa: BLE001
                         telemetry.capture_exception(cexc)
+                        print_exception(exception=cexc)
                         connectivity = {}
                     if connectivity:
                         domain_connectivity[partner] = connectivity
@@ -459,6 +465,7 @@ class DomainService(BaseService):
             return is_reachable
         except (subprocess.TimeoutExpired, Exception) as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             self._emit_progress(
                 scan_id=scan_id,
                 phase="domain_connectivity",

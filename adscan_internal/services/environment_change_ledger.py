@@ -7,11 +7,18 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from adscan_internal import print_info, print_success, print_warning, telemetry
+from adscan_internal import (
+    print_info,
+    print_info_debug,
+    print_success,
+    print_warning,
+    telemetry,
+)
 from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.workspaces.io import read_json_file, write_json_file
+from adscan_core.rich_output import print_exception
 
 _LEDGER_FILENAME = "environment_changes.json"
 # Schema 1.0 → 1.1 adds the verified-revert taxonomy fields (verified_at,
@@ -384,6 +391,47 @@ class EnvironmentChangeLedger:
             f"Kept by operator · {entry['kind']} · {mark_sensitive(entry['target'], 'text')}"
         )
 
+    def discard_change(self, change_id: str) -> None:
+        """Drop a change that was register-before-touch'd but NEVER actually applied.
+
+        The ledger registers a change BEFORE mutating the environment (write-ahead,
+        so a crash mid-mutation is covered by the ``finalize()`` session-died
+        guarantee). When the mutation then fails ATOMICALLY with no partial change
+        (e.g. a denied ``RECONFIGURE`` when enabling ``xp_cmdshell`` for a
+        non-privileged SQL login — the batch aborts before touching config), the
+        registered record describes a change that never happened. Resolving it as
+        ``reverted_confirmed`` would inflate ``Total changes`` and render a
+        "Reverted" row for a no-op in the client cleanup appendix — a factual
+        inaccuracy the client sees in a paid deliverable.
+
+        This removes the record entirely: it disappears from :meth:`get_changes`,
+        the summary counts, and every cleanup-report surface (PDF appendix + web),
+        and emits NO "Reverted" message. Use it ONLY when the environment was
+        provably left untouched (the mutation batch failed atomically before any
+        change). For a change that WAS applied and then undone, use
+        :meth:`mark_reverted_confirmed`.
+
+        Args:
+            change_id: ID returned by :meth:`register_change`.
+        """
+        entry = self._find(change_id)
+        if entry is None:
+            return
+        self._state["changes"] = [
+            c for c in self._state["changes"] if c.get("change_id") != change_id
+        ]
+        self._recompute_summary()
+        self.flush()
+        emit_event(
+            "environment_change_discarded",
+            change_id=change_id,
+            kind=str(entry.get("kind") or ""),
+        )
+        print_info_debug(
+            f"Environment change discarded (never applied) · {entry.get('kind')} · "
+            f"{mark_sensitive(str(entry.get('target') or ''), 'text')}"
+        )
+
     def mark_failed(
         self,
         change_id: str,
@@ -612,6 +660,7 @@ class EnvironmentChangeLedger:
             write_json_file(self._path, self._state)
         except Exception as exc:  # pylint: disable=broad-except
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -629,6 +678,7 @@ class EnvironmentChangeLedger:
                     return data
             except Exception as exc:  # pylint: disable=broad-except
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         return {
             "schema_version": _SCHEMA_VERSION,
             "session_id": str(uuid.uuid4()),

@@ -18,6 +18,7 @@ from typing import Callable
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_error, print_info_verbose, print_warning
+from adscan_core.rich_output import print_exception
 
 
 def run_tui(
@@ -42,6 +43,7 @@ def run_tui(
         import textual  # noqa: F401
     except ImportError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             "TUI dependencies are not available in this runtime. "
             "Install/build a runtime image that includes Textual support."
@@ -53,6 +55,7 @@ def run_tui(
             _seed_demo_workspace()
         except Exception as exc:  # noqa: BLE001 — demo seeding is non-fatal
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Could not seed demo workspace: {exc}")
 
     # Reuse handle_start with tui=True. We force the flag on the namespace
@@ -65,6 +68,7 @@ def run_tui(
         return int(exc.code or 0)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"TUI exited with an error: {exc}")
         return 1
     return 0
@@ -85,6 +89,7 @@ def _seed_demo_workspace() -> None:
         from adscan_internal.cli import demo as demo_mod
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return
 
     seeder = getattr(demo_mod, "ensure_demo_workspace", None)

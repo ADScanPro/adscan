@@ -31,6 +31,7 @@ from typing import Callable
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_error, print_info_debug, print_warning
 from adscan_internal.sudo_utils import sudo_prefix_args, sudo_validate
+from adscan_core.rich_output import print_exception
 
 # Matches the signature of shell.spawn_command (accepts **kwargs forwarded to Popen).
 SpawnFn = Callable[..., "subprocess.Popen[str] | None"]
@@ -58,6 +59,7 @@ def _stream_background_output_to_debug(
                         print_info_debug(f"[background][{label}][{stream_name}] {line}")
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[background] {label} {stream_name} stream exception — {exc}"
                 )
@@ -125,6 +127,7 @@ def watch_background_process(
                             on_exit(returncode, expected_stop)
                         except Exception as callback_exc:  # noqa: BLE001
                             telemetry.capture_exception(callback_exc)
+                            print_exception(exception=callback_exc)
                             print_info_debug(
                                 f"[background] {label} watcher callback exception — "
                                 f"{callback_exc}"
@@ -133,6 +136,7 @@ def watch_background_process(
                 time.sleep(max(poll_interval_seconds, 0.1))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[background] watcher({label}) exception — {exc}")
 
     watcher = threading.Thread(
@@ -229,6 +233,7 @@ def launch_background(
         return process
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_info_debug(f"[DEBUG] launch_background({label}): exception — {e}")
         print_error(f"Error launching {label}.")
         return None
@@ -270,5 +275,6 @@ def stop_background(
         return True
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_error(f"Error stopping {label}.")
         return False

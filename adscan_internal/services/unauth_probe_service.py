@@ -47,6 +47,7 @@ from adscan_core.rich_output import (
 )
 from adscan_core.theme import ADSCAN_PRIMARY, ADSCAN_PRIMARY_DIM
 from adscan_internal.rich_output import mark_sensitive
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +195,7 @@ async def _probe_smb_session(
         factory = SMBConnectionFactory.from_url(url)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return SMBProbeResult(
             target=target,
             auth_label=auth_label,
@@ -296,6 +298,7 @@ async def _probe_smb_session(
                 error=msg,
             )
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return SMBProbeResult(
             target=target,
             auth_label=auth_label,
@@ -527,6 +530,7 @@ async def _probe_ldap_anonymous(
                 + "".join(_tb.format_tb(search_exc.__traceback__))
             )
             telemetry.capture_exception(search_exc)
+            print_exception(exception=search_exc)
             return LDAPAnonResult(
                 target=dc_ip,
                 status="error",

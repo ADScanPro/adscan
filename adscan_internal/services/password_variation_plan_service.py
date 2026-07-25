@@ -21,6 +21,7 @@ from adscan_internal.services.collector.models import (
 from adscan_internal.services.password_variation_generator import (
     generate_variations,
 )
+from adscan_core.rich_output import print_exception
 
 _LEGACY_AGE_THRESHOLD_DAYS: int = 730
 
@@ -441,6 +442,7 @@ def load_compliance_report_from_workspace(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[variation-spray] failed to parse password_compliance.json: {exc}")
         return None
 

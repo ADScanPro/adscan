@@ -11,6 +11,7 @@ from pathlib import Path
 import os
 import re
 import shutil
+import time
 import uuid
 from typing import Callable, Optional
 
@@ -31,6 +32,7 @@ from adscan_internal.cli.session_preflight import (
     run_session_preflight,
 )
 from adscan_internal.workspaces import (
+    activate_workspace,
     create_workspace_dir,
     write_initial_workspace_variables,
 )
@@ -108,12 +110,160 @@ class CiDeps:
     exit: Callable[[int], None]
 
 
+_ADCS_ESC_RELATION_RE = re.compile(r"^adcsesc\d+", re.IGNORECASE)
+
+
+def _build_ci_loot_card(
+    shell: object,
+    domain: str,
+    *,
+    elapsed_seconds: float,
+) -> SessionLootCard:
+    """Assemble a populated end-of-run loot card from the scan artifacts.
+
+    Reads the FRESH, re-materialized attack-path snapshot (persisted at the
+    scan-finalization seam just before this runs), the reconciled attack graph,
+    and the technical-report findings so the card reflects the real outcome
+    instead of the ``0 / 0 / ESC 0`` stub. Every read is best-effort — a missing
+    artifact degrades a single metric to its default, never blocks exit.
+    """
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    domain_info = (
+        domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+    ) or {}
+    owned = list(domain_info.get("owned_accounts", []) or [])
+
+    da_paths = 0
+    adcs_esc_count = 0
+    kerberoastable = 0
+    asreproastable = 0
+    critical = 0
+    high = 0
+    total_nodes = 0
+
+    ws_dir = getattr(shell, "current_workspace_dir", "") or ""
+    domains_dir = getattr(shell, "domains_dir", "domains") or "domains"
+
+    # --- attack-path snapshot: DA paths + ADCS ESC paths -------------------
+    # ``da_paths`` drives the "← PWNED" banner, so it counts only PROVEN
+    # domain-compromise paths (status/path_state in the _PROVEN_STATUSES SSOT) —
+    # a domain-breaker path that was only *attempted* must NOT render as PWNED
+    # (the exposure-validation doctrine: never claim a compromise we did not
+    # prove). ADCS ESC paths are a discovery count, not gated on execution.
+    try:
+        from adscan_internal.workspaces import domain_subpath
+        from adscan_internal.cli.attack_path_execution import (
+            ATTACK_PATH_SNAPSHOT_FILENAME,
+        )
+        from adscan_internal.services.exposure_score_service import (
+            _PROVEN_STATUSES,
+        )
+        import json as _json
+
+        snap_path = domain_subpath(
+            ws_dir, domains_dir, domain, ATTACK_PATH_SNAPSHOT_FILENAME
+        )
+        if os.path.exists(snap_path):
+            with open(snap_path, "r", encoding="utf-8") as fh:
+                snap = _json.load(fh)
+            for path in snap.get("paths", []) or []:
+                if not isinstance(path, dict):
+                    continue
+                is_breaker = str(
+                    path.get("compromise_class") or ""
+                ).strip().lower() == "domain_breaker"
+                proven = (
+                    str(path.get("status") or "").strip().lower() in _PROVEN_STATUSES
+                    or str(path.get("path_state") or "").strip().lower()
+                    in _PROVEN_STATUSES
+                )
+                if is_breaker and proven:
+                    da_paths += 1
+                relations = path.get("relations") or []
+                if isinstance(relations, list) and any(
+                    _ADCS_ESC_RELATION_RE.match(str(rel or "")) for rel in relations
+                ):
+                    adcs_esc_count += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- attack graph: node count + roastable counts -----------------------
+    try:
+        from adscan_internal.workspaces import domain_subpath
+        import json as _json
+
+        graph_path = domain_subpath(ws_dir, domains_dir, domain, "attack_graph.json")
+        if os.path.exists(graph_path):
+            with open(graph_path, "r", encoding="utf-8") as fh:
+                graph = _json.load(fh)
+            nodes = graph.get("nodes")
+            total_nodes = len(nodes) if isinstance(nodes, (list, dict)) else 0
+            kerb_targets: set[str] = set()
+            asrep_targets: set[str] = set()
+            for edge in graph.get("edges", []) or []:
+                if not isinstance(edge, dict):
+                    continue
+                rel = str(edge.get("relation") or edge.get("label") or "").strip().lower()
+                target = str(edge.get("target") or edge.get("to") or "")
+                if rel == "kerberoasting" and target:
+                    kerb_targets.add(target)
+                elif rel in {"asreproast", "asreproasting"} and target:
+                    asrep_targets.add(target)
+            kerberoastable = len(kerb_targets)
+            asreproastable = len(asrep_targets)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- technical report findings: critical / high rollup -----------------
+    try:
+        import json as _json
+
+        tr_path = os.path.join(ws_dir, "technical_report.json")
+        if os.path.exists(tr_path):
+            with open(tr_path, "r", encoding="utf-8") as fh:
+                tr = _json.load(fh)
+            tr_domains = tr.get("domains", {}) if isinstance(tr, dict) else {}
+            entry = (
+                tr_domains.get(domain, {}) if isinstance(tr_domains, dict) else {}
+            ) or {}
+            findings = entry.get("findings")
+            iterable = (
+                findings.values()
+                if isinstance(findings, dict)
+                else (findings if isinstance(findings, list) else [])
+            )
+            for finding in iterable:
+                if not isinstance(finding, dict):
+                    continue
+                sev = str(finding.get("severity") or "").strip().lower()
+                if sev == "critical":
+                    critical += 1
+                elif sev == "high":
+                    high += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    return SessionLootCard(
+        domain=domain,
+        elapsed_seconds=max(0.0, float(elapsed_seconds)),
+        da_paths=da_paths,
+        adcs_esc_count=adcs_esc_count,
+        kerberoastable=kerberoastable,
+        asreproastable=asreproastable,
+        critical_findings=critical,
+        high_findings=high,
+        total_nodes=total_nodes,
+        owned_accounts=owned,
+    )
+
+
 def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     """Run a non-interactive scan suitable for CI pipelines.
 
     Behaviour matches the original `handle_ci` implementation in `adscan.py`.
     """
     args = config.args
+    _ci_started_at = time.monotonic()
 
     deps.enable_auto_mode()
     preflight_result = run_session_preflight(
@@ -156,6 +306,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         shell.scan_config = load_scan_config(scan_config_path)
     except ScanConfigError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Invalid scan configuration: {exc}")
         deps.exit(2)
         return 2
@@ -197,16 +348,26 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 workspace_type=args.type,
             )
             created_workspace = True
-        shell.current_workspace = args.workspace
-        shell.current_workspace_dir = ws_dir
-        shell.load_workspace_data(ws_dir)
+        # Route activation through the SSOT so the environment-change ledger (and
+        # acl_cleanup_actions) is initialized. WITHOUT this, `ci` bypassed
+        # activate_workspace and shell.environment_change_ledger stayed None, so
+        # EVERY rollback/cleanup registration silently no-opped — and the paid
+        # deliverable + the web Enterprise product then FALSELY attested "no
+        # modifications to Active Directory" even after real AD writes (e.g. a
+        # shadow-cred KeyCredentialLink). activate_workspace only mutates
+        # in-memory state (no dir creation), so it is safe for an existing dir.
+        activate_workspace(
+            shell, workspaces_dir=shell.workspaces_dir, workspace_name=args.workspace
+        )
+        shell.load_workspace_data(shell.current_workspace_dir)
     else:
         ws = f"ci-{uuid.uuid4().hex[:6]}"
         ws_dir = os.path.join(shell.workspaces_dir, ws)
         os.makedirs(ws_dir, exist_ok=True)
-        shell.current_workspace = ws
-        shell.current_workspace_dir = ws_dir
-        shell.load_workspace_data(ws_dir)
+        activate_workspace(
+            shell, workspaces_dir=shell.workspaces_dir, workspace_name=ws
+        )
+        shell.load_workspace_data(shell.current_workspace_dir)
         created_workspace = True
 
     # --- Premium session header ---
@@ -258,6 +419,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         check_and_refresh_myip(shell, context="ci_start")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_verbose(
             "CI could not auto-configure myip from the selected interface: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -469,6 +631,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(f"Failed to copy report to artifacts directory: {exc}")
 
     if created_workspace and not getattr(args, "keep_workspace", False):
@@ -500,13 +663,11 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         _loot_domain = str(
             getattr(args, "domain", "") or getattr(shell, "current_domain", "") or ""
         )
-        _domains_data = getattr(shell, "domains_data", {}) or {}
-        _domain_info = _domains_data.get(_loot_domain, {}) or {}
-        _owned = list(_domain_info.get("owned_accounts", []) or [])
         print_session_loot_card(
-            SessionLootCard(
-                domain=_loot_domain,
-                owned_accounts=_owned,
+            _build_ci_loot_card(
+                shell,
+                _loot_domain,
+                elapsed_seconds=time.monotonic() - _ci_started_at,
             )
         )
     except Exception:  # noqa: BLE001

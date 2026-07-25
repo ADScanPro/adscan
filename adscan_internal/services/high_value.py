@@ -22,6 +22,7 @@ from adscan_internal.services.identity_risk_service import (
     CONTROL_EXPOSURE_IDENTITIES_FILENAME,
     get_identity_risk_record,
 )
+from adscan_core.rich_output import print_exception
 
 
 def normalize_samaccountname(value: str) -> str:
@@ -93,6 +94,7 @@ def _find_user_node_in_attack_graph(
         graph = load_attack_graph(shell, domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -192,6 +194,7 @@ def _try_user_node_from_bloodhound(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _debug_resolve_source(
             domain=domain,
             samaccountname=normalized_sam,
@@ -237,6 +240,7 @@ def _load_cached_user_list_file(
             raw_lines = [line.strip() for line in f if line.strip()]
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
     normalized: set[str] = set()
@@ -328,6 +332,7 @@ def is_user_tier0(shell: Any, *, domain: str, samaccountname: str) -> bool:
                 return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     _debug_resolve_source(
         domain=domain,
@@ -607,6 +612,7 @@ def classify_users_tier0_high_value(
                         results[candidate]["is_high_value"] = True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # Pass 2: memberships snapshot RID fallback for unresolved Tier-0 users.
     unresolved_tier0 = {
@@ -633,6 +639,7 @@ def classify_users_tier0_high_value(
                     results[user]["is_tier0"] = True
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Pass 3: positive-only control-exposure cache fallback.
     unresolved_high_value = {

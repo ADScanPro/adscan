@@ -28,6 +28,7 @@ from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConfig,
     ADscanLDAPConnection,
 )
+from adscan_core.rich_output import print_exception
 
 
 # msPKI-Enrollment-Flag bit: manager-approval required.
@@ -192,6 +193,7 @@ def snapshot_template(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"[template] Snapshot failed: {type(exc).__name__}: {exc}")
         return None
 
@@ -245,6 +247,7 @@ def make_template_esc1_vulnerable(
         return True, None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -307,6 +310,7 @@ def restore_template(
         return True, None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, f"{type(exc).__name__}: {exc}"
 
 

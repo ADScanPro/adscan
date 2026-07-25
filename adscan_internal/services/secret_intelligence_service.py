@@ -43,6 +43,7 @@ from adscan_internal.services.secret_scoring import (
     score_finding,
 )
 from adscan_internal.services.secret_stop_words import ALL_STOP_WORDS
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +293,7 @@ class SecretIntelligenceService:
                 indicators.extend(file_indicators)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning_debug(
                     f"[secret_intelligence] Skipping {path.name}: {type(exc).__name__}"
                 )

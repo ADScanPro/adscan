@@ -410,6 +410,7 @@ def exploit_delegation_constrained(
             telemetry.capture("delegation_exploitation_started", properties)
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
 
         # Native S4U: kerbad handles the S4U2Self+S4U2Proxy chain, including
         # protocol-transition branching when TRUSTED_TO_AUTH is set.
@@ -514,6 +515,7 @@ def _handle_constrained_native_result(
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         try:
             telemetry.capture(
                 "delegation_exploitation_success",
@@ -529,6 +531,7 @@ def _handle_constrained_native_result(
             )
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
         if result.ticket_path:
             _persist_service_ticket_after_s4u(
                 shell,
@@ -570,6 +573,7 @@ def _handle_constrained_native_result(
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         error_message = str(result.error_message or "unknown error")
         hint = _map_delegation_failure_hint(error_message)
         print_panel(
@@ -605,6 +609,7 @@ def exploit_delegation_rbcd(
             telemetry.capture("delegation_exploitation_started", properties)
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
 
         # First, check MAQ
         maq = shell.check_maq(domain, username, password)
@@ -685,6 +690,7 @@ def exploit_delegation_rbcd(
                 telemetry.capture("delegation_exploitation_failed", properties)
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
 
     except Exception as e:
         telemetry.capture_exception(e)
@@ -705,6 +711,7 @@ def exploit_delegation_rbcd(
             telemetry.capture("delegation_exploitation_failed", properties)
         except Exception as e2:
             telemetry.capture_exception(e2)
+            print_exception(exception=e2)
 
 
 def add_computer_to_domain(
@@ -782,6 +789,7 @@ def add_computer_to_domain(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 marked_machine = mark_sensitive(machine_account, "user")
                 print_info_debug(
                     "[delegations] failed to inject primary-group membership for "
@@ -802,6 +810,7 @@ def add_computer_to_domain(
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 marked_machine = mark_sensitive(machine_account, "user")
                 print_warning(
                     "The computer was created successfully, but ADscan could not "

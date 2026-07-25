@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from adscan_internal.services.attack_graph_service import load_attack_graph
+from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.graph_queries import (
     get_admincount_users,
     get_asreproastable_users,
@@ -21,6 +22,23 @@ from adscan_internal.services.graph_queries import (
     get_stale_users,
 )
 from adscan_internal.workspaces import domain_subpath, read_json_file
+
+# ``control``-kind edges that are NOT AD-object DACL primitives — share /
+# resource / file-credential access capabilities. BloodHound does not flag
+# these ``isacl=true``; ADscan classifies them ``control`` because a downstream
+# technique consumes the capability, but they are not object ACEs, so the ACL
+# enumeration surface excludes them. Everything else classified as
+# :data:`EdgeKind.CONTROL` is an ACE (single source of truth: ``edge_kind``).
+_ACL_ACE_EXCLUDED_RELATIONS: frozenset[str] = frozenset(
+    {
+        "ReadShare",
+        "WriteShare",
+        "FullControlShare",
+        "GPPPassword",
+        "PasswordInShare",
+        "PasswordInFile",
+    }
+)
 
 
 class LocalGraphService:
@@ -495,6 +513,239 @@ class LocalGraphService:
             return list(result or [])
         except Exception:  # noqa: BLE001
             return []
+
+    # ------------------------------------------------------------------
+    # Critical ACE enumeration (native attack-graph backed)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_acl_relation(relation: str, kind: str = "") -> bool:
+        """Return True when *relation* is an AD-object DACL/control ACE.
+
+        Mirrors BloodHound's ``r.isacl = true`` filter using ADscan's canonical
+        :func:`classify_edge_kind` SSOT, minus the non-object share/file-credential
+        access edges (see :data:`_ACL_ACE_EXCLUDED_RELATIONS`).
+        """
+        if not relation or relation in _ACL_ACE_EXCLUDED_RELATIONS:
+            return False
+        if kind == EdgeKind.CONTROL.value:
+            return True
+        return classify_edge_kind(relation) is EdgeKind.CONTROL
+
+    @staticmethod
+    def _ace_principal_name(node: dict[str, Any], properties: dict[str, Any]) -> str:
+        for value in (
+            properties.get("samaccountname"),
+            properties.get("name"),
+            node.get("label"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return text.split("@", 1)[0]
+        return ""
+
+    @staticmethod
+    def _ace_object_id(
+        ref: str, node: dict[str, Any], properties: dict[str, Any]
+    ) -> str:
+        for value in (
+            properties.get("objectid"),
+            properties.get("objectId"),
+            node.get("objectId"),
+            node.get("objectid"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return text
+        ref_text = str(ref or "")
+        return ref_text.split(":", 1)[1] if ref_text.startswith("name:") else ref_text
+
+    @staticmethod
+    def _node_is_high_value(node: dict[str, Any]) -> bool:
+        properties = node.get("properties") or {}
+        if node.get("highvalue") or node.get("is_high_value") or node.get("isTierZero"):
+            return True
+        if properties.get("highvalue") or properties.get("isTierZero"):
+            return True
+        tags = node.get("system_tags") or properties.get("system_tags") or []
+        return "admin_tier_0" in tags
+
+    def get_critical_aces(
+        self,
+        source_domain: str,
+        high_value: bool = False,
+        username: str = "all",
+        target_domain: str = "all",
+        relation: str = "all",
+        scan_id: str | None = None,  # noqa: ARG002 - signature parity (legacy CE)
+    ) -> list[dict[str, Any]]:
+        """Return critical ACEs (object-control edges) from the native graph.
+
+        Drop-in replacement for the removed BloodHound-CE ``get_critical_aces``.
+        Reads ``attack_graph.json`` for *source_domain* and, for every source
+        principal, follows ``MemberOf`` transitively (including nested groups —
+        equivalent to BloodHound's ``[:MemberOf*0..]``) so that a control edge
+        held by a group is attributed to each member principal. Only DACL/control
+        edges (:func:`classify_edge_kind` == CONTROL) are returned.
+
+        Args:
+            source_domain: Domain whose principals are treated as ACE holders.
+            high_value: Keep only edges whose target is a Tier 0 / high-value node.
+            username: Restrict source principals to this SAM/name, or ``"all"``.
+            target_domain: Filter targets by domain, or ``"all"`` / ``"high-value"``.
+            relation: Filter by ACE relation (e.g. ``GenericAll``), or ``"all"``.
+            scan_id: Accepted for signature parity with the legacy CE service; unused.
+
+        Returns:
+            A list of ACE dicts with the legacy CE keys: ``source``, ``sourceType``,
+            ``sourceDomain``, ``target``, ``targetType``, ``targetDomain``,
+            ``relation``, ``targetEnabled``, ``sourceObjectId``, ``targetObjectId``.
+        """
+        graph = self._graph(source_domain)
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        edges = graph.get("edges") if isinstance(graph, dict) else None
+        if not isinstance(nodes, dict) or not isinstance(edges, list):
+            return []
+
+        # Index nodes by every identifier an edge endpoint might use.
+        node_by_ref: dict[str, dict[str, Any]] = {}
+        for key, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            properties = node.get("properties") or {}
+            for candidate in (
+                key,
+                node.get("id"),
+                node.get("objectId"),
+                node.get("objectid"),
+                properties.get("objectid"),
+                properties.get("objectId"),
+            ):
+                ref = str(candidate or "").strip()
+                if ref:
+                    node_by_ref.setdefault(ref, node)
+
+        # Build membership + control adjacency in one pass over the edges.
+        member_of: dict[str, set[str]] = {}
+        control_out: dict[str, list[tuple[str, str]]] = {}
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            frm = str(edge.get("from") or "").strip()
+            to = str(edge.get("to") or "").strip()
+            if not frm or not to:
+                continue
+            edge_relation = str(edge.get("relation") or "")
+            edge_kind = str(edge.get("kind") or "")
+            if edge_kind == EdgeKind.MEMBERSHIP.value or edge_relation == "MemberOf":
+                member_of.setdefault(frm, set()).add(to)
+            if self._is_acl_relation(edge_relation, edge_kind):
+                control_out.setdefault(frm, []).append((to, edge_relation))
+
+        if not control_out:
+            return []
+
+        closure_cache: dict[str, set[str]] = {}
+
+        def _transitive_groups(start: str) -> set[str]:
+            cached = closure_cache.get(start)
+            if cached is not None:
+                return cached
+            seen: set[str] = set()
+            stack = [start]
+            while stack:
+                current = stack.pop()
+                for group in member_of.get(current, ()):  # noqa: PLR1704
+                    if group not in seen:
+                        seen.add(group)
+                        stack.append(group)
+            closure_cache[start] = seen
+            return seen
+
+        # Resolve source principals.
+        want_all = username.strip().lower() in ("", "all")
+        wanted_short = username.strip().split("@", 1)[0].rstrip("$").lower()
+        source_domain_lower = source_domain.strip().lower()
+
+        source_nodes: list[tuple[str, dict[str, Any]]] = []
+        for key, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            properties = node.get("properties") or {}
+            node_domain = str(properties.get("domain") or "").strip().lower()
+            if source_domain_lower and node_domain != source_domain_lower:
+                continue
+            if want_all:
+                if node.get("kind") in ("User", "Computer"):
+                    source_nodes.append((key, node))
+                continue
+            candidates = {
+                str(properties.get("samaccountname") or "").rstrip("$").lower(),
+                str(properties.get("name") or "").split("@", 1)[0].rstrip("$").lower(),
+                str(node.get("label") or "").split("@", 1)[0].rstrip("$").lower(),
+            }
+            if wanted_short in candidates:
+                source_nodes.append((key, node))
+
+        target_dom_filter = target_domain.strip().lower()
+        apply_target_dom = target_dom_filter not in ("", "all", "high-value")
+        rel_filter = relation.strip().lower()
+        apply_rel = rel_filter not in ("", "all")
+
+        results: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        limit = 1000
+
+        for key, node in source_nodes:
+            src_props = node.get("properties") or {}
+            src_name = self._ace_principal_name(node, src_props)
+            if not src_name:
+                continue
+            src_type = str(node.get("kind") or "Unknown")
+            src_domain = str(src_props.get("domain") or source_domain)
+            src_object_id = self._ace_object_id(key, node, src_props)
+
+            holders = {key} | _transitive_groups(key)
+            for holder in holders:
+                for target_ref, edge_relation in control_out.get(holder, ()):
+                    if apply_rel and edge_relation.lower() != rel_filter:
+                        continue
+                    target_node = node_by_ref.get(target_ref)
+                    if not target_node:
+                        continue
+                    if high_value and not self._node_is_high_value(target_node):
+                        continue
+                    tgt_props = target_node.get("properties") or {}
+                    tgt_domain = str(tgt_props.get("domain") or source_domain)
+                    if apply_target_dom and tgt_domain.lower() != target_dom_filter:
+                        continue
+                    tgt_name = self._ace_principal_name(target_node, tgt_props)
+                    if not tgt_name:
+                        continue
+                    dedup = (src_name.lower(), tgt_name.lower(), edge_relation)
+                    if dedup in seen_keys:
+                        continue
+                    seen_keys.add(dedup)
+                    results.append(
+                        {
+                            "source": src_name,
+                            "sourceType": src_type,
+                            "sourceDomain": src_domain.lower() if src_domain else "N/A",
+                            "target": tgt_name,
+                            "targetType": str(target_node.get("kind") or "Unknown"),
+                            "targetDomain": tgt_domain.lower() if tgt_domain else "N/A",
+                            "relation": edge_relation,
+                            "targetEnabled": bool(tgt_props.get("enabled", True)),
+                            "sourceObjectId": src_object_id,
+                            "targetObjectId": self._ace_object_id(
+                                target_ref, target_node, tgt_props
+                            ),
+                        }
+                    )
+                    if len(results) >= limit:
+                        return results
+
+        return results
 
 
 def _ad_time_to_epoch_seconds(value: object) -> int | None:

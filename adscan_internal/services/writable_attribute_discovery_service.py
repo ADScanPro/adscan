@@ -33,6 +33,7 @@ from adscan_internal.services.ldap_transport_service import (
     build_show_deleted_controls,
     execute_with_ldap_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 _SAFE_TOKEN_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
@@ -210,6 +211,7 @@ class WritableAttributeDiscoveryService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[writable-attrs] Native LDAP collection failed: "
                 f"{type(exc).__name__}: {exc}"
@@ -309,6 +311,7 @@ class WritableAttributeDiscoveryService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[tombstones] Native LDAP collection failed: {type(exc).__name__}: {exc}"
             )
@@ -369,6 +372,7 @@ class WritableAttributeDiscoveryService(BaseService):
             return result or {}
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[writable-attrs] Target resolution failed for dn={target_dn}: "
                 f"{type(exc).__name__}: {exc}"

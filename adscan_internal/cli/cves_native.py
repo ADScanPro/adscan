@@ -69,6 +69,7 @@ from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.ldap_transport_service import (
     async_connect_with_ldap_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 _USAGE = (
@@ -125,6 +126,7 @@ def dispatch(shell: Any, args: str) -> None:
             print_info(_USAGE)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"cves {sub} failed: {exc}")
 
 
@@ -502,6 +504,7 @@ def _insert_graph_edge(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to insert derived edge for {cve.aka}: {exc}")
 
 
@@ -709,6 +712,7 @@ def _resolve_listener_host(dc_ip: str | None) -> str | None:
             return probe.getsockname()[0]
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -750,6 +754,7 @@ def _build_smb_factory(*, cred_info: dict[str, Any], dc_ip: str | None) -> Any |
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"[cves] could not build SMB connection factory: {exc}; "
             "coercion checks will be unable to run."

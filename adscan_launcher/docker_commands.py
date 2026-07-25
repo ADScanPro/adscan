@@ -358,6 +358,7 @@ def _release_runtime_acquisition(acq: _RuntimeAcquisition) -> None:
             _stop_host_helper(acq.helper_proc)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         acq.helper_proc = None
 
     for handle_attr in ("resolver_ip_lock", "install_lock", "workspace_lock"):
@@ -377,6 +378,7 @@ def _prepare_runtime_session_dir(*, command_name: str) -> Path:
         _runtime_session.cleanup_stale_session_dirs()
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[runtime-session] stale-cleanup failed: {mark_sensitive(str(exc), 'error')}"
         )
@@ -785,6 +787,7 @@ def _get_docker_cli_runtime_flavor() -> tuple[str, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         command_output = str(exc)
 
     lowered = f"{package_hint}\n{command_output}".lower()
@@ -915,6 +918,7 @@ def _emit_docker_runtime_context(*, command_name: str) -> None:
                     )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         # Compose v2 plugin preferred.
         try:
@@ -932,6 +936,7 @@ def _emit_docker_runtime_context(*, command_name: str) -> None:
                 compose_version = _parse_compose_version(compose_v2_text)
         except Exception as exc:  # pragma: no cover - best effort only
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         if compose_mode == "missing" and compose_v1_bin:
             try:
@@ -953,6 +958,7 @@ def _emit_docker_runtime_context(*, command_name: str) -> None:
                     compose_version = _parse_compose_version(compose_v1_text)
             except (OSError, subprocess.TimeoutExpired) as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
             run_docker_command_func=_run_docker_status_command
@@ -973,6 +979,7 @@ def _emit_docker_runtime_context(*, command_name: str) -> None:
                     )
             except Exception as exc:  # pragma: no cover - best effort only
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         payload: dict[str, Any] = {
             "command_name": command_name,
@@ -1004,6 +1011,7 @@ def _emit_docker_runtime_context(*, command_name: str) -> None:
         telemetry.capture("docker_runtime_context", payload)
     except Exception as exc:  # pragma: no cover - best effort only
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _emit_docker_host_resources_context(*, command_name: str) -> None:
@@ -1040,6 +1048,7 @@ def _emit_docker_host_resources_context(*, command_name: str) -> None:
         telemetry.capture("docker_host_resources_context", payload)
     except Exception as exc:  # pragma: no cover - best effort only
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _select_existing_or_preferred_image() -> str:
@@ -1108,6 +1117,7 @@ def _run_docker_pull_dns_preflight(
         return False
     except Exception as exc:  # pragma: no cover - best effort only
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[docker] pull DNS preflight skipped after unexpected error: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -1365,6 +1375,13 @@ def _ensure_image_pulled_with_legacy_fallback(
             )
 
         first_failure = peek_last_failure()
+        if first_failure is not None and first_failure.kind == "user_interrupt":
+            # A user cancel is terminal — never auto-retry a pull the operator
+            # interrupted. The interrupt is normally re-raised at the pull
+            # boundary (`_handle_pull_failure`); this guard keeps the no-retry
+            # guarantee even if a future path records the diagnosis without
+            # raising, and re-raises so the launcher unwinds cleanly.
+            raise KeyboardInterrupt
         daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
             run_docker_command_func=_run_docker_status_command
         )
@@ -1543,6 +1560,7 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[docker] systemctl diagnostic command failed: "
                 f"stage={stage} cmd={shell_quote_cmd(cmd)} "
@@ -1907,6 +1925,7 @@ def _probe_docker_engine_without_docker_host() -> tuple[bool, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, f"probe_exception={exc}"
 
     if proc.returncode == 0:
@@ -2027,6 +2046,7 @@ def _attempt_start_user_podman_socket() -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[docker] podman socket auto-start failed: {exc}")
         return False
 
@@ -2443,6 +2463,7 @@ def _reset_host_helper_log() -> None:
             pass
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[host-helper] failed to reset log for this run: "
             f"path={mark_sensitive(str(log_path), 'path')} "
@@ -2463,6 +2484,7 @@ def _print_host_helper_log_tail(*, max_lines: int = 40) -> None:
         raw = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[host-helper] failed reading log tail: "
             f"path={mark_sensitive(str(log_path), 'path')} "
@@ -2755,6 +2777,7 @@ def _probe_sudo_noninteractive_status() -> tuple[str, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return "error", str(exc)
 
     if proc.returncode == 0:
@@ -2779,6 +2802,7 @@ def _collect_host_helper_runtime_diagnostics(*, socket_path: Path) -> dict[str, 
             diagnostics["log_size_bytes"] = str(log_path.stat().st_size)
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             diagnostics["log_size_bytes"] = f"error:{exc}"
     else:
         diagnostics["log_size_bytes"] = "0"
@@ -3027,12 +3051,13 @@ def _print_docker_install_summary() -> None:
 
     from adscan_core.rich_output import (
         _get_console,
-        _get_telemetry_console,
         BRAND_COLORS,
     )
 
+    # `console` is the shared `_TeeConsole`: every `console.print(...)` here is
+    # auto-mirrored into the telemetry recording, so there is no separate
+    # `telemetry_console.print(...)` — doing both would double-record the panels.
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
     renderables: list = []
 
     # Telemetry section
@@ -3071,13 +3096,12 @@ def _print_docker_install_summary() -> None:
         expand=True,
     )
 
+    # `console` is the shared `_TeeConsole`, which auto-mirrors every print to
+    # the telemetry recording. Do NOT also print to `telemetry_console` here —
+    # that double-records the panel (the manual-mirror-on-TeeConsole anti-pattern).
     console.print()
     console.print(panel)
     console.print()
-    if telemetry_console is not None:
-        telemetry_console.print()
-        telemetry_console.print(panel)
-        telemetry_console.print()
 
     print_success("ADscan installation complete")
 
@@ -3095,9 +3119,8 @@ def _print_docker_install_summary() -> None:
         border_style=BRAND_COLORS["info"],
         padding=(1, 2),
     )
+    # Auto-mirrored to telemetry by the `_TeeConsole` — no manual mirror.
     console.print(next_panel)
-    if telemetry_console is not None:
-        telemetry_console.print(next_panel)
 
 
 def handle_install_docker(
@@ -3328,6 +3351,7 @@ def handle_check_docker(
                             print_info_debug(f"[docker] probe stdout:\n{proc.stdout}")
                 except Exception as exc:  # pragma: no cover
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_warning(
                         "Docker-mode execution probe failed due to an exception."
                     )
@@ -3438,6 +3462,7 @@ def handle_start_docker(
             return int(proc.returncode)
         except subprocess.SubprocessError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to start ADscan in Docker.")
             print_info_debug(f"[docker] start exception: {exc}")
             return 1
@@ -3597,6 +3622,7 @@ def handle_ci_docker(
             return int(proc.returncode)
         except subprocess.SubprocessError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to run ADscan CI in Docker.")
             print_info_debug(f"[docker] ci exception: {exc}")
             return 1
@@ -3763,6 +3789,7 @@ def run_adscan_passthrough_docker(
             return int(proc.returncode)
         except subprocess.SubprocessError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to run ADscan in Docker.")
             print_info_debug(f"[docker] passthrough exception: {exc}")
             return 1

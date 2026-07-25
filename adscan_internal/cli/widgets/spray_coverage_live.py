@@ -13,6 +13,7 @@ Builders:
     * :func:`render_deferred_pending_panel` — §10.4 end-of-scan deferred queue.
     * :func:`render_ci_spray_report`       — §10.6 compact ci audit report.
     * :func:`lockout_disabled_note`        — §10.7 lockout-disabled inline note.
+    * :func:`lockout_unknown_note`         — pre-auth "threshold unknown" caution.
 
 Locked iconography (asserted verbatim by tests / spec §10):
     Per-type glyphs   ``▣ pre2k   ◆ useraspass   ⇄ reuse   ∅ blank``
@@ -108,6 +109,29 @@ def lockout_disabled_note() -> RenderableType:
     return note
 
 
+def lockout_unknown_note() -> RenderableType:
+    """Inline caution note shown when the lockout threshold is not yet known.
+
+    Distinct from :func:`lockout_disabled_note`: an UNKNOWN threshold — the
+    policy has not been read yet, e.g. a pre-auth spray with no LDAP read — is
+    NOT an observed "lockout disabled". Spraying can still lock real accounts,
+    so this note warns (amber) rather than reassures. Every combo is still
+    sprayed (there is no threshold to apply an eligibility margin against), but
+    the operator is told the count is unverified, not safe.
+
+    Returns:
+        A :class:`rich.text.Text` ready to print or embed in a Group.
+    """
+    note = Text(style=COLOR_AMBER)
+    note.append("⚠  ")
+    note.append(
+        "Lockout policy not yet read (pre-auth) — threshold unknown, not "
+        "disabled. Spraying will ask for confirmation before it proceeds, but "
+        "accounts could still lock; read the policy to spray within a safe margin."
+    )
+    return note
+
+
 # --------------------------------------------------------------------------- #
 # §10.1 — Spray Coverage plan panel (pre-execution overview)
 # --------------------------------------------------------------------------- #
@@ -142,11 +166,17 @@ def render_spray_coverage_panel(
     masked_domain = mark_sensitive(domain, "domain")
     by_type: dict[str, Any] = dict(getattr(plan, "by_type", {}) or {})
     lockout_disabled = bool(getattr(plan, "lockout_disabled", False))
+    lockout_unknown = bool(getattr(plan, "lockout_unknown", False))
+    # Both states spray every eligible combo with no margin, so the eligibility
+    # columns / budget line are meaningless in either — but the note differs.
+    no_eligibility_margin = lockout_disabled or lockout_unknown
 
     pieces: list[RenderableType] = []
 
     # --- Policy / governing constraint -------------------------------------
-    if lockout_disabled:
+    if lockout_unknown:
+        pieces.append(lockout_unknown_note())
+    elif lockout_disabled:
         pieces.append(lockout_disabled_note())
     else:
         threshold = policy.get("threshold")
@@ -168,7 +198,7 @@ def render_spray_coverage_panel(
     matrix.add_column(no_wrap=False)  # label
     matrix.add_column(justify="right")  # planned
     matrix.add_column(justify="right")  # covered
-    if not lockout_disabled:
+    if not no_eligibility_margin:
         matrix.add_column(justify="right")  # eligible now
         matrix.add_column(justify="right")  # deferred
     matrix.add_column(no_wrap=False)  # status
@@ -179,7 +209,7 @@ def render_spray_coverage_panel(
         Text("Planned", style="dim"),
         Text("Covered", style="dim"),
     ]
-    if not lockout_disabled:
+    if not no_eligibility_margin:
         header_cells.append(Text("Eligible now", style="dim"))
         header_cells.append(Text("Deferred", style="dim"))
     header_cells.append(Text("Status", style="dim"))
@@ -206,7 +236,7 @@ def render_spray_coverage_panel(
         status.append(status_text, style=status_style)
 
         cells: list[RenderableType] = [glyph, label, Text(str(planned)), Text(str(covered))]
-        if not lockout_disabled:
+        if not no_eligibility_margin:
             cells.append(Text(str(now_count) if now_count else "—"))
             cells.append(Text(str(defer_count) if defer_count else "—"))
         cells.append(status)
@@ -215,7 +245,7 @@ def render_spray_coverage_panel(
     pieces.append(Text())
 
     # --- Tightest lockout-budget line --------------------------------------
-    if not lockout_disabled:
+    if not no_eligibility_margin:
         pieces.append(_render_budget_line(plan=plan, policy=policy))
 
     # --- Projection line (always ends in "0 lockouts projected") -----------
@@ -645,6 +675,7 @@ def render_coverage_selector_panel(
     margin: Any,
     near_lockout: int,
     lockout_disabled: bool = False,
+    lockout_unknown: bool = False,
 ) -> Panel:
     """Build the coverage overview shown above the spray-type selector.
 
@@ -654,13 +685,20 @@ def render_coverage_selector_panel(
     sprayed within the lockout margin. Status: ✓ complete, ⏸ none eligible (all
     deferred near threshold), ◐ partial, ○ untouched.
 
+    ``lockout_disabled`` (observed ``lockoutThreshold <= 0``) and
+    ``lockout_unknown`` (policy not yet read, e.g. a pre-auth spray) each replace
+    the policy line with their own note. They are NOT the same: an unknown
+    threshold can still lock real accounts, so it must never read as "disabled".
+
     Returns:
         A :class:`rich.panel.Panel` (border ``cyan``).
     """
     masked_domain = mark_sensitive(domain, "domain")
     pieces: list[RenderableType] = []
 
-    if lockout_disabled:
+    if lockout_unknown:
+        pieces.append(lockout_unknown_note())
+    elif lockout_disabled:
         pieces.append(lockout_disabled_note())
     else:
         head = Text()
@@ -729,6 +767,7 @@ __all__ = [
     "render_deferred_pending_panel",
     "render_ci_spray_report",
     "lockout_disabled_note",
+    "lockout_unknown_note",
     "render_pre2k_education_panel",
     "render_coverage_selector_panel",
 ]

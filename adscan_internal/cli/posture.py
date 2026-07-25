@@ -24,6 +24,7 @@ from adscan_core.rich_output import (
 )
 from adscan_internal import get_console
 from adscan_internal.rich_output import mark_sensitive
+from adscan_core.rich_output import print_exception
 
 
 # --------------------------------------------------------------------------- #
@@ -74,6 +75,7 @@ def _do_posture_show(shell: Any, domain_arg: Optional[str]) -> None:
         get_console().print(render_posture_show(posture=posture, domain=domain))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to render posture for {domain}: {exc}")
 
 
@@ -105,6 +107,7 @@ def _do_posture_probe(shell: Any, domain_arg: Optional[str]) -> None:
                 password = cred_value
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             password = cred_value
 
     from adscan_internal.cli.posture_probe_lifecycle import run_posture_probe
@@ -121,6 +124,7 @@ def _do_posture_probe(shell: Any, domain_arg: Optional[str]) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Posture probe failed for {domain}: {exc}")
         return
 
@@ -133,6 +137,7 @@ def _do_posture_probe(shell: Any, domain_arg: Optional[str]) -> None:
         get_console().print(render_posture_show(posture=posture, domain=domain))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _do_posture_clear(shell: Any, domain_arg: Optional[str]) -> None:
@@ -181,6 +186,7 @@ def _do_posture_clear(shell: Any, domain_arg: Optional[str]) -> None:
         answer = questionary.confirm("Proceed?", default=False).ask()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info("Cancelled. Posture unchanged.")
         return
 
@@ -194,6 +200,7 @@ def _do_posture_clear(shell: Any, domain_arg: Optional[str]) -> None:
         pass
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to clear posture for {domain}: {exc}")
         return
 
@@ -201,6 +208,7 @@ def _do_posture_clear(shell: Any, domain_arg: Optional[str]) -> None:
         shell.save_workspace_data()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Posture cleared in memory but workspace save failed: {exc}")
         return
 

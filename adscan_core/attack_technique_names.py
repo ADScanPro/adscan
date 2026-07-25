@@ -123,7 +123,6 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "AllowedToDelegate",
         "AllowedToAct",
         "UnconstrainedDelegation",
-        "AddAllowedToAct",
         "ManageRODCPrp",
         "WriteLogonScript",
         "WriteAccountRestrictions",
@@ -193,6 +192,8 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "NTLMReflection",
         "Ntlmv1Enabled",
         "MssqlS4U2selfEscalation",
+        "XpCmdshell",
+        "MssqlOpenRowsetBulkRead",
         # Escalation
         "BackupOperatorsEscalation",
         "DnsAdminsEscalation",

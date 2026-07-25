@@ -62,6 +62,7 @@ from adscan_internal.subprocess_env import (
     get_clean_env_for_compilation,
 )
 from adscan_internal.text_utils import normalize_cli_output
+from adscan_core.rich_output import print_exception
 
 
 ExecutionResult = subprocess.CompletedProcess[str]
@@ -225,6 +226,7 @@ def _sync_ntlm_control_evidence(
         )
     except Exception as exc:  # pragma: no cover - best effort sync
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[auth-posture] Failed to sync NTLM control evidence: {exc}")
 
 
@@ -896,6 +898,7 @@ class ImpacketRunner:
 
         except subprocess.TimeoutExpired as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Impacket command timed out after {timeout if timeout is not None else 'unknown'}s: "
                 f"{command}"
@@ -907,6 +910,7 @@ class ImpacketRunner:
 
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_verbose(f"Error executing Impacket command: {command} - {exc}")
             return None
 

@@ -25,6 +25,7 @@ from adscan_internal.services.attack_graph_service import (
     resolve_domain_node_record_for_domain,
     update_edge_status_by_labels,
 )
+from adscan_core.rich_output import print_exception
 
 _EMPTY_NTLM_HASH = "31d6cfe0d16ae931b73c59d7e0c089c0"
 _MACHINE_HASH_RE = re.compile(
@@ -120,6 +121,7 @@ def _mark_sysvol_cleanup_pending(
             shell.save_workspace_data()  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to persist SYSVOL cleanup state.")
 
 
@@ -149,6 +151,7 @@ def _mark_backup_ops_attempted(
             shell.save_workspace_data()  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to persist Backup Operators attempt state.")
 
 
@@ -178,6 +181,7 @@ def _mark_backup_ops_success(
             shell.save_workspace_data()  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to persist Backup Operators success state.")
 
 
@@ -230,6 +234,7 @@ def _clear_sysvol_cleanup_pending(shell: Any, *, domain: str) -> None:
             shell.save_workspace_data()  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to persist SYSVOL cleanup state.")
 
 
@@ -295,6 +300,7 @@ async def _native_sysvol_hive_scan(
                 await delete_unc_file(machine, f"{unc_root}\\{name}")
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         return await _present(connection)
 
 
@@ -446,6 +452,7 @@ def _fallback_winrm_dump(
         shell.dump_sam_winrm(domain, username, password, host)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("Backup Operators WinRM fallback failed.")
 
 
@@ -710,6 +717,7 @@ def offer_backup_operators_escalation(
 
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("Backup Operators escalation encountered an error.")
         _update_backup_ops_da_edge(shell, domain=domain, status="failed",
                                    notes={"reason": "exception"})

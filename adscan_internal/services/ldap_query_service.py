@@ -17,6 +17,7 @@ from adscan_internal.services.ldap_transport_service import (
     LDAPEntry,
     execute_with_ldap_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 def domain_to_base_dn(domain: str) -> str:
@@ -213,6 +214,7 @@ def query_shell_ldap_attribute_values(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ldap-query] {operation_name} failed for {marked_domain}: "
             f"{mark_sensitive(str(exc), 'detail')}"

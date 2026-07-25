@@ -52,6 +52,7 @@ from adscan_internal.services.smb_transport import (
     run_smb_operation,
     smb_machine_for,
 )
+from adscan_core.rich_output import print_exception
 
 #: Default recursion depth for :func:`enumerate_writable_directories`. Depth 1
 #: means "share root + its direct sub-directories" — the empirically useful
@@ -334,6 +335,7 @@ async def _query_maximal_access_for_path(
         )
     except Exception as exc:  # noqa: BLE001 — boundary; never abort the sweep
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EffectiveAccess(
             succeeded=False,
             has_access=False,
@@ -516,10 +518,12 @@ async def _async_enumerate_writable_directories(
             return out
     except SMBTransportError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.error_message = str(exc)
         return out
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.error_message = str(exc)
         return out
 
@@ -623,6 +627,7 @@ async def _async_query_effective_root_access(
             )
     except SMBTransportError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EffectiveAccess(
             succeeded=False,
             has_access=False,
@@ -633,6 +638,7 @@ async def _async_query_effective_root_access(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EffectiveAccess(
             succeeded=False,
             has_access=False,

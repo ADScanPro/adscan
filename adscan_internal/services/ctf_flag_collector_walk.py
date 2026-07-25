@@ -22,6 +22,7 @@ from adscan_internal.services.ctf_flag_collector_catalog import (
     is_flag_candidate_name,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(slots=True)
@@ -106,6 +107,7 @@ async def walk_root(
         directory = _build_smb_directory(connection, root_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return WalkOutcome([], 0, 0, 0, 0, False, f"directory init failed: {exc}")
 
     try:
@@ -145,6 +147,7 @@ async def walk_root(
         raise
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         err_text = f"walk failed: {exc}"
 
     # If all entries errored (entries_errored > 0 but files=dirs=0), it means the
@@ -201,6 +204,7 @@ async def enumerate_top_level_dirs(
         directory = _build_smb_directory(connection, root_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return [], f"top-level directory init failed: {exc}"
 
     try:
@@ -218,6 +222,7 @@ async def enumerate_top_level_dirs(
         return [], f"top-level list timed out after {list_timeout_seconds:.0f}s"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ctf-flags] top-level list root={root_path} OUTCOME=error err={exc}"
         )

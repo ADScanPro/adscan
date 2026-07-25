@@ -24,6 +24,7 @@ from typing import Any
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_core.rich_output import print_exception
 
 # Re-export the canonical SD-flags control name lazily to avoid a hard import
 # cycle at module load; resolved inside the functions that need it.
@@ -161,6 +162,7 @@ def verify_group_membership_removed(conn: Any, *, group: str, member: str) -> bo
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"cleanup-verify group_membership re-read failed "
             f"({mark_sensitive(str(member), 'user')}): {exc}"
@@ -202,6 +204,7 @@ def verify_dacl_ace_removed(conn: Any, *, target: str, trustee_sid: str) -> bool
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"cleanup-verify dacl_ace re-read failed: {exc}")
         return False
 
@@ -230,6 +233,7 @@ def verify_owner_restored(conn: Any, *, target: str, original_owner_sid: str) ->
         return bool(current_owner) and current_owner == wanted
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"cleanup-verify owner re-read failed: {exc}")
         return False
 
@@ -247,6 +251,7 @@ def verify_spn_removed(conn: Any, *, target: str, spn: str) -> bool:
         return all(_norm(v) != wanted for v in values)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"cleanup-verify spn re-read failed: {exc}")
         return False
 
@@ -268,6 +273,7 @@ def verify_keycredential_removed(conn: Any, *, target: str, key_credential_value
         return all(wanted not in _norm(v) for v in values)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"cleanup-verify keycredential re-read failed: {exc}")
         return False
 
@@ -306,6 +312,7 @@ def verify_rbcd_removed(conn: Any, *, target_dn: str, delegate_sid: str | None =
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"cleanup-verify rbcd re-read failed: {exc}")
         return False
 
@@ -341,6 +348,7 @@ def verify_machine_account_gone(conn: Any, *, sam_account_name: str) -> bool:
         return bool(uac & 0x2)  # ACCOUNTDISABLE
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"cleanup-verify machine_account re-read failed "
             f"({mark_sensitive(str(sam_account_name), 'user')}): {exc}"

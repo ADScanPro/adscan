@@ -33,6 +33,7 @@ from adscan_internal.services.cracking_wordlist_policy import (
     resolve_effort,
     wordlist_tiers_for_workspace,
 )
+from adscan_core.rich_output import print_exception
 
 _KIND = "cracking"
 
@@ -153,6 +154,7 @@ def enqueue_cracking_job(
         return job.id
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -171,6 +173,7 @@ def _resolve_effort_tiers(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -211,6 +214,7 @@ def _mark_uncrackable_machine(registry, domain, user, ntlm_version, hash_file) -
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _mark_rainbow_pending(registry, domain, user, ntlm_version, hash_file) -> None:
@@ -231,6 +235,7 @@ def _mark_rainbow_pending(registry, domain, user, ntlm_version, hash_file) -> No
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _wordlists_dir(shell: Any) -> str:  # noqa: ARG001 — kept for parity with call-site shape

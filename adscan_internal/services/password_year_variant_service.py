@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 PwdLastSetSource = Literal["bloodhound"]
@@ -237,6 +238,7 @@ def resolve_bloodhound_pwdlastset_year(
         records = service.get_password_last_change(domain, user=username)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[password-year-variant] Graph pwdLastSet lookup failed for "
             f"{mark_sensitive(username, 'user')}@{mark_sensitive(domain, 'domain')}: {exc}"

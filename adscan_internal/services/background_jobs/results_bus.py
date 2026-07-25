@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.services.background_jobs.registry import BackgroundJobRegistry
+from adscan_core.rich_output import print_exception
 
 
 @dataclass
@@ -79,6 +80,7 @@ def make_registry_result_sink(
             )
         except Exception as exc:  # noqa: BLE001 — persistence is best-effort
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         try:
             # crack-sink: greppable, --debug-only. Confirms the result reached the
             # bus and was enqueued for the foreground drain — the checkpoint
@@ -91,14 +93,17 @@ def make_registry_result_sink(
             )
         except Exception as exc:  # noqa: BLE001 — a debug log must never break the enqueue
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         try:
             registry.enqueue_notification(result)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         if on_persist is not None:
             try:
                 on_persist(result)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     return _sink

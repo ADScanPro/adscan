@@ -26,6 +26,7 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.session_compromise_state_service import (
     mark_session_domain_compromised,
 )
+from adscan_core.rich_output import print_exception
 
 
 class CompromiseEvidence(StrEnum):
@@ -62,6 +63,15 @@ def mark_full_ntds_replicated(shell, domain: str) -> None:
 
     Single source of truth for the ``dcsync_all_done`` marker consumed by
     :func:`is_full_ntds_replicated`. Best-effort: never raises.
+
+    A full replication is the authoritative proof that DCSync (GetNCChanges)
+    works against this domain's Domain Controller, so it also reconciles every
+    ``DCSync -> Domain`` attack-graph edge to ``success``. This is what turns a
+    real, completed domain takeover — including one performed by a standalone
+    DCSync run from an already-Domain-Admin context, which never flows through
+    the per-path execution machinery — into ``exploited`` attack-path steps and
+    a domain-compromise verdict in the client report. Without it the report
+    renders a proven takeover as "probed but not fully executed".
     """
     dd = getattr(shell, "domains_data", None)
     if isinstance(dd, dict):
@@ -69,6 +79,20 @@ def mark_full_ntds_replicated(shell, domain: str) -> None:
             dd.setdefault(domain, {})["dcsync_all_done"] = True
         except Exception:  # noqa: BLE001
             pass
+
+    # Reconcile the attack graph so the proven DCSync is reflected on the
+    # DCSync attack-path steps (SSOT: the edge status in attack_graph.json).
+    # Lazy import — attack_graph_service is a heavy module and importing it at
+    # module load would create an import cycle.
+    try:
+        from adscan_internal.services.attack_graph_service import (
+            reconcile_dcsync_edges_after_domain_compromise,
+        )
+
+        reconcile_dcsync_edges_after_domain_compromise(shell, domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def promote_to_pwned(
@@ -147,6 +171,7 @@ def promote_to_pwned(
             properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         telemetry.capture("domain_compromise", properties)
 
         if (
@@ -161,6 +186,7 @@ def promote_to_pwned(
                 shell._session_victories.append("domain_compromise")
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         if summary_text is None:
             marked_domain = mark_sensitive(domain, "domain")
@@ -175,6 +201,7 @@ def promote_to_pwned(
                 )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # 2. Record technical event for the report writer.
     try:
@@ -203,8 +230,10 @@ def promote_to_pwned(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # 3. Victory hint + GitHub star CTA — defined in adscan.py at module
     # level. Imported lazily to avoid a circular import at package load.
@@ -256,6 +285,7 @@ def promote_to_pwned(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # 4. Insert derived edge in the attack graph.
     # TODO(adscan): add a clean primitive in attack_graph_service —
@@ -281,6 +311,7 @@ def promote_to_pwned(
             shell._ctf_execute_post_compromise_actions(domain)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     else:
         # Non-CTF: render the compromise panel here so callers do not
         # have to. Matches the legacy presentation in adscan.py:22011.
@@ -298,6 +329,7 @@ def promote_to_pwned(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         # Audit post-compromise hook (symmetric with the CTF branch above).
         # QUEUE — do not run inline: promote_to_pwned frequently fires mid
@@ -315,6 +347,7 @@ def promote_to_pwned(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     return True
 

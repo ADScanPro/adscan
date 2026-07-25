@@ -32,6 +32,7 @@ from adscan_internal.services.ldap_transport_service import (
 )
 
 import asyncio
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -179,6 +180,7 @@ def _delete_record_sync(config: ADIDNSConfig, record: ADIDNSRecord) -> bool:
             return bool(ok)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"ADIDNS: exception deleting {record.fqdn!r} — "
             f"manual cleanup required: {exc}"

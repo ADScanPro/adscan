@@ -18,6 +18,7 @@ from adscan_internal.services.smb_transport import (
     run_smb_operation,
     smb_machine_for,
 )
+from adscan_core.rich_output import print_exception
 
 
 KDC_REGISTRY_PATH = r"SYSTEM\CurrentControlSet\Services\Kdc"
@@ -98,6 +99,7 @@ class CertificateMappingService(BaseService):
             return state
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             error_text = f"{type(exc).__name__}: {exc}"
             print_info_debug(
                 "[cert-binding] registry state unavailable: "

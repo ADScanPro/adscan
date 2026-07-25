@@ -25,6 +25,7 @@ from adscan_internal.services.machine_account_quota_state_service import (
     is_machine_account_quota_exhausted,
     mark_machine_account_quota_exhausted,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +197,7 @@ def assess_machine_account_capacity(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return MachineAccountCapacity(
             domain_quota=None,
             actor_sid=None,

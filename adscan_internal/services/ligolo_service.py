@@ -62,6 +62,7 @@ from adscan_core.port_diagnostics import (
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces.io import read_json_file, write_json_file
+from adscan_core.rich_output import print_exception
 
 
 DEFAULT_LIGOLO_PROXY_LISTEN_ADDR = "0.0.0.0:443"
@@ -94,6 +95,9 @@ LIGOLO_API_CONTRACT_ENDPOINTS: tuple[str, ...] = (
     "POST /api/v1/routes",
     "POST /api/v1/tunnel/:id",
     "DELETE /api/v1/tunnel/:id",
+    "GET /api/v1/listeners",
+    "POST /api/v1/listeners",
+    "DELETE /api/v1/listeners",
 )
 
 
@@ -389,6 +393,7 @@ class LigoloProxyService:
             # Proxy API not reachable (no api_laddr in state, connection refused, etc.).
             # Fall back to file-based records with no live enrichment.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[ligolo] Proxy API unavailable while listing tunnels; "
                 f"returning persisted records only: {exc}"
@@ -967,6 +972,12 @@ class LigoloProxyService:
             elapsed_seconds=max(0.0, time.perf_counter() - started_at),
         )
         parsed = json.loads(response_text) if response_text.strip() else {}
+        if parsed is None:
+            # A JSON ``null`` body means "no data" (Ligolo serializes an empty
+            # slice/map that way — e.g. GET /api/v1/listeners with no listeners).
+            # Normalize to an empty mapping so callers get a stable empty result
+            # instead of a spurious "unexpected payload" failure.
+            return {}
         if isinstance(parsed, (dict, list)):
             return parsed
         raise RuntimeError(f"Ligolo API returned an unexpected payload for {path}.")
@@ -992,9 +1003,10 @@ class LigoloProxyService:
     def wait_for_api_ready(self, *, timeout_seconds: float = 15.0) -> None:
         """Poll the API until it becomes responsive."""
 
-        deadline = time.time() + timeout_seconds
+        # monotonic: the host wall clock is stepped mid-scan for DC sync.
+        deadline = time.monotonic() + timeout_seconds
         last_error: Exception | None = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
                 payload = self._api_request(method="GET", path="/api/v1/ping")
                 if isinstance(payload, dict) and str(payload.get("message") or "").strip().lower() == "pong":
@@ -1052,6 +1064,108 @@ class LigoloProxyService:
             )
         return sorted(agents, key=lambda item: int(item.get("id", 0)))
 
+    def add_agent_listener(
+        self,
+        *,
+        agent_id: int,
+        listener_addr: str,
+        redirect_addr: str,
+        network: str = "tcp",
+    ) -> dict[str, Any]:
+        """Create one agent-side listener that relays inbound connections home.
+
+        This is the reverse channel a pivot needs for an INBOUND callback. The
+        Ligolo agent (living in the target segment) binds ``listener_addr`` on
+        its OWN host; every connection a victim makes to it is tunneled back to
+        the proxy and forwarded to ``redirect_addr`` — an address LOCAL to the
+        ADscan proxy machine (typically our NTLM capture listener). So a victim
+        that can only reach hosts on the agent's segment can nonetheless connect
+        to a listener that physically lives on our machine.
+
+        Contract (Ligolo-ng ``POST /api/v1/listeners``): the payload keys are
+        ``AgentID`` / ``ListenerAddr`` / ``RedirectAddr`` / ``Network``. The API
+        acknowledges creation immediately (``{"message": "listener created"}``)
+        and starts the relay asynchronously — a bind failure on the agent (e.g.
+        the port is already served there) surfaces later in the proxy log, NOT
+        in this response. Callers that need the numeric listener id for teardown
+        must resolve it via :meth:`list_agent_listeners`.
+
+        Args:
+            agent_id: Numeric Ligolo agent id (see :meth:`list_agents`).
+            listener_addr: ``host:port`` the AGENT binds in the target segment
+                (e.g. ``0.0.0.0:445``).
+            redirect_addr: ``host:port`` LOCAL to the proxy the relayed
+                connection is forwarded to (e.g. ``127.0.0.1:445``).
+            network: ``tcp`` (default) or ``udp``.
+
+        Returns:
+            The parsed Ligolo API acknowledgement payload.
+        """
+
+        payload = {
+            "AgentID": int(agent_id),
+            "ListenerAddr": str(listener_addr or "").strip(),
+            "RedirectAddr": str(redirect_addr or "").strip(),
+            "Network": str(network or "tcp").strip().lower() or "tcp",
+        }
+        result = self._api_request(method="POST", path="/api/v1/listeners", payload=payload)
+        if not isinstance(result, dict):
+            raise RuntimeError("Ligolo API returned an unexpected listener-create payload.")
+        print_info_verbose(
+            f"Ligolo agent listener created: agent {agent_id} "
+            f"{payload['ListenerAddr']} -> {payload['RedirectAddr']} ({payload['Network']})."
+        )
+        return result
+
+    def list_agent_listeners(self) -> list[dict[str, Any]]:
+        """Return normalized agent-side listener entries from the Ligolo API.
+
+        An empty listener set is serialized by Ligolo as JSON ``null`` (an empty
+        Go slice); ``_api_request`` normalizes that to ``{}`` and this method maps
+        any non-list payload to an empty list, so "no listeners" is never an error.
+        """
+
+        payload = self._api_request(method="GET", path="/api/v1/listeners")
+        if not isinstance(payload, list):
+            return []
+        listeners: list[dict[str, Any]] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                listener_id = int(entry.get("ListenerID"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                entry_agent_id = int(entry.get("AgentID"))
+            except (TypeError, ValueError):
+                entry_agent_id = -1
+            listeners.append(
+                {
+                    "listener_id": listener_id,
+                    "agent_id": entry_agent_id,
+                    "agent": str(entry.get("Agent") or "").strip(),
+                    "remote_addr": str(entry.get("RemoteAddr") or "").strip(),
+                    "network": str(entry.get("Network") or "").strip(),
+                    "listener_addr": str(entry.get("ListenerAddr") or "").strip(),
+                    "redirect_addr": str(entry.get("RedirectAddr") or "").strip(),
+                    "online": bool(entry.get("Online")),
+                }
+            )
+        return listeners
+
+    def delete_agent_listener(self, *, agent_id: int, listener_id: int) -> None:
+        """Delete one agent-side listener by (agent id, listener id)."""
+
+        self._api_request(
+            method="DELETE",
+            path="/api/v1/listeners",
+            payload={"AgentID": int(agent_id), "ListenerID": int(listener_id)},
+        )
+        print_info_verbose(
+            f"Ligolo agent listener removed: agent {agent_id} listener {listener_id}."
+        )
+
     def wait_for_new_agent(
         self,
         *,
@@ -1063,10 +1177,11 @@ class LigoloProxyService:
         print_info_verbose(
             f"Waiting for Ligolo agent to connect (timeout {timeout_seconds:.0f}s)…"
         )
-        deadline = time.time() + timeout_seconds
+        # monotonic: the host wall clock is stepped mid-scan for DC sync.
+        deadline = time.monotonic() + timeout_seconds
         last_agents: list[dict[str, Any]] = []
         last_debug_tick = 0.0
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             agents = self.list_agents()
             last_agents = agents
             for agent in agents:
@@ -1078,7 +1193,7 @@ class LigoloProxyService:
                         f"remote={agent.get('remote_addr')}"
                     )
                     return agent
-            now = time.time()
+            now = time.monotonic()
             if now - last_debug_tick >= 5.0:
                 remaining = max(0.0, deadline - now)
                 agent_ids = ", ".join(str(a.get("id")) for a in agents) if agents else "none"
@@ -1387,10 +1502,11 @@ class LigoloProxyService:
         )
         print_info_debug(f"POST /api/v1/tunnel/{agent_id} accepted; polling for Running=True (timeout {timeout_seconds:.0f}s)…")
 
-        deadline = time.time() + timeout_seconds
+        # monotonic: the host wall clock is stepped mid-scan for DC sync.
+        deadline = time.monotonic() + timeout_seconds
         current_agent_id = agent_id
         last_issued_id = agent_id
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(2.0)
             try:
                 agents = self.list_agents()
@@ -1456,8 +1572,9 @@ class LigoloProxyService:
         except Exception:
             os.kill(int(pid), signal.SIGTERM)
 
-        deadline = time.time() + _LIGOLO_STOP_WAIT_SECONDS
-        while time.time() < deadline:
+        # monotonic: the host wall clock is stepped mid-scan for DC sync.
+        deadline = time.monotonic() + _LIGOLO_STOP_WAIT_SECONDS
+        while time.monotonic() < deadline:
             if not _is_pid_running(int(pid)):
                 break
             time.sleep(0.1)

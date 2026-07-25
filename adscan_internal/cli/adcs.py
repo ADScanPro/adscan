@@ -91,6 +91,7 @@ def _persist_adcs_domain_state(shell: Any) -> None:
         save_domain_data()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[adcs] Failed to persist ADCS domain state: {exc}")
 
 
@@ -195,6 +196,7 @@ def populate_adcs_metadata_from_collection(
         return detected
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[adcs] Phase 2 ADCS populate failed: {exc}")
         return None
 
@@ -476,6 +478,7 @@ def detect_adcs(
     except Exception as exc:
         if emit_telemetry:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
             print_error(
@@ -951,6 +954,7 @@ def _capture_adcs_discovered(
         telemetry.capture("adcs_discovered", properties)
     except Exception as telemetry_error:
         telemetry.capture_exception(telemetry_error)
+        print_exception(exception=telemetry_error)
 
 
 def _capture_adcs_not_discovered(shell: Any, domain_data: dict, *, error: bool) -> None:
@@ -966,6 +970,7 @@ def _capture_adcs_not_discovered(shell: Any, domain_data: dict, *, error: bool) 
         telemetry.capture("adcs_not_discovered", properties)
     except Exception as telemetry_error:
         telemetry.capture_exception(telemetry_error)
+        print_exception(exception=telemetry_error)
 
 
 def ask_for_search_adcs(shell: Any, domain: str) -> None:
@@ -1080,6 +1085,7 @@ def ask_for_adcs_esc(
             method(domain, username, password)
     except AttributeError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Function to exploit ESC{esc} not implemented")
     except Exception as exc:
         telemetry.capture_exception(exc)

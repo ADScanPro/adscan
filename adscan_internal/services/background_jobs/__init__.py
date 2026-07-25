@@ -22,6 +22,7 @@ from adscan_internal.services.background_jobs.cracking_enqueue import enqueue_cr
 from adscan_internal.services.background_jobs.scan_seam import (
     maybe_launch_poisoning_job,
     reconcile_jobs_at_scan_end,
+    writeshare_bait_enabled,
 )
 from adscan_internal.services.background_jobs.jobs_view import (
     format_cracking_summary,
@@ -42,6 +43,7 @@ __all__ = [
     "enqueue_cracking_job",
     "maybe_launch_poisoning_job",
     "reconcile_jobs_at_scan_end",
+    "writeshare_bait_enabled",
     "format_cracking_summary",
     "format_jobs_table",
     "format_notification_line",

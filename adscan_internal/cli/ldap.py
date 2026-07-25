@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional, Protocol, TYPE_CHECKING
 
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
@@ -90,6 +90,11 @@ from adscan_internal.services.attack_path_target_viability_service import (
 from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
 from adscan_internal.workspaces import domain_relpath, domain_subpath, read_json_file
 
+if TYPE_CHECKING:
+    from adscan_internal.services.enumeration.kerberos import (
+        KerberosEarlyStopSupervisor,
+    )
+
 
 class LdapShell(Protocol):
     """Minimal shell surface used by the LDAP CLI controller."""
@@ -153,6 +158,10 @@ class LdapShell(Protocol):
     def _questionary_select(
         self, message: str, options: list[str], default_idx: int = 0
     ) -> int | None: ...
+
+    def _questionary_confirm(
+        self, prompt: str, *, default: bool = False
+    ) -> bool | None: ...
 
     def _questionary_checkbox(
         self,
@@ -923,6 +932,7 @@ def _record_ldap_security_posture_finding(
             prefix="[ldap-security]",
         ):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[ldap-security] Failed to persist technical finding: "
                 f"{type(exc).__name__}: {exc}"
@@ -972,12 +982,13 @@ def _record_obsolete_computers_finding(
             prefix="[obsolete]",
         ):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[obsolete] Failed to persist technical finding: {type(exc).__name__}: {exc}"
             )
 
 
-def execute_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
+def execute_obsolete_os_audit(shell: LdapShell, *, domain: str) -> None:
     """Audit obsolete operating systems from the native collector inventory.
 
     Derives the obsolete-host list from the collected attack-graph Computer nodes
@@ -1027,7 +1038,7 @@ def execute_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
         print_exception(show_locals=False, exception=exc)
 
 
-def execute_netexec_ldap_security(
+def execute_ldap_security_audit(
     shell: LdapShell,
     *,
     domain: str,
@@ -1097,6 +1108,7 @@ def execute_netexec_ldap_security(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             combined_output_blocks.append(
                 f"# Target: {target_label}\n[exception]\n{type(exc).__name__}: {exc}"
             )
@@ -1138,7 +1150,7 @@ def execute_netexec_ldap_security(
     _render_ldap_security_summary(shell, domain=domain, summary=summary)
 
 
-def run_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
+def run_obsolete_os_audit(shell: LdapShell, *, domain: str) -> None:
     """Audit obsolete operating systems from the native collector's inventory.
 
     The obsolete-OS list is derived from the already-collected attack-graph
@@ -1150,17 +1162,17 @@ def run_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
     print_info_verbose(
         f"Auditing obsolete operating systems for domain {marked_domain}"
     )
-    execute_netexec_obsolete(shell, domain=domain)
+    execute_obsolete_os_audit(shell, domain=domain)
 
 
-def run_netexec_ldap_security(shell: LdapShell, *, domain: str) -> None:
+def run_ldap_security_audit(shell: LdapShell, *, domain: str) -> None:
     """Audit LDAP signing / channel-binding posture against known DCs natively."""
     targets = _build_ldap_security_targets(shell, domain=domain)
     marked_domain = mark_sensitive(domain, "domain")
     print_info_verbose(
         f"Auditing LDAP signing and channel binding posture for domain {marked_domain}"
     )
-    execute_netexec_ldap_security(shell, domain=domain, targets=targets)
+    execute_ldap_security_audit(shell, domain=domain, targets=targets)
 
 
 def derive_base_dn(domain: str) -> str:
@@ -1453,6 +1465,7 @@ def _save_ldap_anonymous_inventory_json(
         return json_file
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Failed to save anonymous LDAP inventory: {exc}")
         return None
 
@@ -1802,6 +1815,7 @@ def run_post_user_discovery_followups(
             telemetry.capture("user_discovery_followups", properties)
         except Exception as exc:  # pragma: no cover - best effort telemetry
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     current_auth = str(shell.domains_data.get(domain, {}).get("auth") or "unknown")
     print_info_debug(
@@ -1919,6 +1933,7 @@ def _run_ldap_anonymous_followups(shell: LdapShell, domain: str) -> None:
         results = run_unauth_enrichment(config)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Native LDAP anonymous enrichment failed: {exc}")
         return
 
@@ -1928,6 +1943,7 @@ def _run_ldap_anonymous_followups(shell: LdapShell, domain: str) -> None:
         _apply_unauth_enrichment_results(shell, domain=domain, results=results)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Failed to apply enrichment results for {domain}: {exc}")
 
 
@@ -1990,6 +2006,7 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         _run_ldap_anonymous_followups(shell, domain)
         try:
             from adscan_core.reporting.technical_report import record_technical_finding
@@ -2012,6 +2029,7 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
                 prefix="[ldap-anon]",
             ):
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
     else:
         print_warning("Anonymous LDAP bind denied.")
         shell.update_report_field(domain, "ldap_anonymous", False)
@@ -2107,6 +2125,7 @@ def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[ldap-computers] posture wiring skipped: {exc}")
 
         enum_service = EnumerationService()
@@ -2140,6 +2159,7 @@ def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None
         telemetry.capture("ldap_computers_enumerated", properties)
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
+        print_exception(exception=e)
 
     return hostnames
 
@@ -2505,6 +2525,7 @@ def run_ldap_admincount_and_signing(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ldap-admincount] Native LDAP adminCount query failed for {marked_username}: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -3078,6 +3099,7 @@ def _get_domain_admins_via_native_ldap(shell: LdapShell, domain: str) -> list[st
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
     return resolve_enabled_group_members_by_rid_native(
@@ -3183,6 +3205,20 @@ def get_domain_admins(shell: LdapShell, domain: str) -> list[str]:
         return []
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+class _KerberosEnumHandledSentinel:
+    """Sentinel: the strategy handler already ran the enumeration and persisted
+    users itself (the auto-detect broad sweep), so ``run_kerberos_enum_users``
+    must NOT run kerbrute again. Distinct from ``None`` ("skip / cancelled")."""
+
+    __slots__ = ()
+
+
+# Singleton sentinel returned by the auto-detect broad sweep when it has already
+# swept, persisted users.txt and run the followups itself.
+KERBEROS_ENUM_HANDLED = _KerberosEnumHandledSentinel()
 
 
 def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
@@ -3202,8 +3238,13 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
 
     shell.domains_data[domain]["auth"] = "user_enum"
 
-    # Wordlist selection via single-tree strategy selector
+    # Wordlist selection via single-tree strategy selector. The auto-detect
+    # branch may run the enumeration itself (broad live sweep + early-stop) and
+    # return the HANDLED sentinel; every other branch returns a candidate
+    # wordlist path (str) or None (skip/cancel).
     wordlist = _select_kerberos_wordlist_strategy(shell, domain)
+    if wordlist is KERBEROS_ENUM_HANDLED:
+        return
     if not wordlist:
         return
 
@@ -3289,10 +3330,44 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
             timeout=300,
             cancellation=user_enum_cancellation,
         )
-    _record_kerberos_wordlist_attempt(
-        domain=domain,
+    _finalize_kerberos_enum_users(
+        shell,
+        domain,
+        users,
         kerberos_dir=Path(kerberos_dir),
         wordlist_path=Path(wordlist),
+    )
+
+
+def _finalize_kerberos_enum_users(
+    shell: LdapShell,
+    domain: str,
+    users: list[str],
+    *,
+    kerberos_dir: Path,
+    wordlist_path: Path,
+) -> None:
+    """Record the attempt, persist discovered users to ``users.txt`` and follow up.
+
+    Single source of truth for the tail every Kerberos user-enum path shares:
+    the standard wordlist-driven run AND the auto-detect broad sweep (which
+    persists its confirmed users straight through here without re-running
+    kerbrute). It records the attempt for exact-match warnings, writes the
+    aggregated ``users.txt`` (merging with any existing list), triggers the
+    post-user-discovery followups (roast/spray candidate generation), offers a
+    relaunch, and prints the shortcut hint.
+
+    Args:
+        shell: Active LDAP shell.
+        domain: Target domain.
+        users: Usernames discovered this run (deduplicated/sorted internally).
+        kerberos_dir: Per-domain Kerberos workspace directory.
+        wordlist_path: Wordlist the run consumed, recorded in the attempt history.
+    """
+    _record_kerberos_wordlist_attempt(
+        domain=domain,
+        kerberos_dir=kerberos_dir,
+        wordlist_path=wordlist_path,
         valid_users_count=len(sorted(set(users))),
     )
 
@@ -3336,6 +3411,7 @@ def _compute_file_sha256(path: Path) -> str | None:
         return digest.hexdigest()
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_path = mark_sensitive(str(path), "path")
         print_info_debug(
             f"[ldap] Could not hash Kerberos wordlist {marked_path}: "
@@ -3359,6 +3435,7 @@ def _load_kerberos_enum_history(kerberos_dir: Path) -> dict:
         loaded = json.loads(history_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_path = mark_sensitive(str(history_path), "path")
         print_info_debug(
             f"[ldap] Could not load Kerberos enum history {marked_path}: "
@@ -3419,6 +3496,7 @@ def _record_kerberos_wordlist_attempt(
         print_info_debug(f"[ldap] Kerberos enum history updated at {marked_path}")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_path = mark_sensitive(str(history_path), "path")
         print_info_debug(
             f"[ldap] Could not persist Kerberos enum history {marked_path}: "
@@ -3505,34 +3583,88 @@ def _prompt_for_repeated_kerberos_wordlist_if_needed(
     return choice_idx == 0
 
 
-def _select_kerberos_wordlist_strategy(shell: LdapShell, domain: str) -> str | None:
+def _kerberos_autodetect_exhausted(shell: LdapShell, domain: str) -> bool:
+    """Return True when auto-detect already ran and found 0 users this session.
+
+    Session-scoped (a plain set on the shell, never persisted to
+    ``domains_data``): once the format-inference probe comes back empty for a
+    domain, re-running it in the same session is guaranteed to be equally
+    doomed, so the strategy selector stops offering it. Cleared by starting a
+    fresh session.
+    """
+    exhausted = getattr(shell, "_kerberos_autodetect_exhausted_domains", None)
+    if not isinstance(exhausted, set):
+        return False
+    return domain.strip().lower() in exhausted
+
+
+def _mark_kerberos_autodetect_exhausted(shell: LdapShell, domain: str) -> None:
+    """Record that auto-detect ran and found 0 valid users for ``domain``."""
+    exhausted = getattr(shell, "_kerberos_autodetect_exhausted_domains", None)
+    if not isinstance(exhausted, set):
+        exhausted = set()
+    exhausted.add(domain.strip().lower())
+    setattr(shell, "_kerberos_autodetect_exhausted_domains", exhausted)
+
+
+def _select_kerberos_wordlist_strategy(
+    shell: LdapShell, domain: str
+) -> "str | _KerberosEnumHandledSentinel | None":
     """Single-tree strategy selector for Kerberos username wordlist generation.
 
     Replaces the old two-level redundant menu (top-level + nested confirm) with one
     clean decision: how does the operator know (or not know) the username format?
     The "general common wordlist" option is intentionally absent — it is too slow
     (~300s+ timeout) and adds no value when targeted generation is available.
+
+    The auto-detect option is ALWAYS present (the operator may legitimately want
+    to re-run it, e.g. after fixing connectivity) and an explicit Skip/exit is
+    always offered. Once the inference probe has already run and found 0 valid
+    users this session (:func:`_kerberos_autodetect_exhausted`), the DEFAULT
+    shifts to Skip so a non-interactive / ``adscan ci`` run auto-resolves to a
+    clean exit instead of looping the doomed probe or blocking on a manual-input
+    branch; re-selecting auto-detect interactively then asks for confirmation
+    (default No) before re-running. (Revises dd6d23ab9, which dropped the
+    option entirely.)
     """
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     is_audit = workspace_type == "audit"
+    autodetect_exhausted = _kerberos_autodetect_exhausted(shell, domain)
 
     # ── Context panel ────────────────────────────────────────────────────────
-    strategy_rows = [
-        (
-            "[bold #1AA0AE]Detect format automatically[/bold #1AA0AE]",
-            "Runs a Kerberos probe (may take a few minutes) to identify\n"
-            "the naming convention, then generates a focused list.",
-        ),
+    # The three real strategies always describe themselves the same way; only
+    # the auto-detect row is de-emphasized once it has been proven fruitless
+    # this session, so the operator's eye lands on a productive path.
+    strategy_rows: list[tuple[str, str]] = []
+    if autodetect_exhausted:
+        strategy_rows.append(
+            (
+                "[dim]Detect format automatically[/dim]",
+                "[dim]Already ran this session and found 0 valid users.\n"
+                "Re-running is unlikely to help; pick a format or skip.[/dim]",
+            )
+        )
+    else:
+        strategy_rows.append(
+            (
+                "[bold #1AA0AE]Detect format automatically[/bold #1AA0AE]",
+                "Runs a Kerberos probe (may take a few minutes) to identify\n"
+                "the naming convention, then generates a focused list.",
+            )
+        )
+    strategy_rows.append(
         (
             "[bold #1AA0AE]I know the format[/bold #1AA0AE]",
             "Pick the naming pattern and choose sources:\n"
             "statistically-likely names, LinkedIn employees, or manual entry.",
-        ),
+        )
+    )
+    strategy_rows.append(
         (
             "[bold #1AA0AE]Use my own wordlist[/bold #1AA0AE]",
             "Provide a file; ADscan will pass it directly to kerbrute.",
-        ),
-    ]
+        )
+    )
     table = Table(show_header=False, box=None, padding=(0, 2), expand=False)
     table.add_column(style="bold", no_wrap=True)
     table.add_column(style="dim")
@@ -3547,41 +3679,368 @@ def _select_kerberos_wordlist_strategy(shell: LdapShell, domain: str) -> str | N
         spacing="before",
     )
 
-    options = [
-        "Detect the format automatically" + (" (Recommended)" if not is_audit else ""),
-        "I know the username format" + (" (Recommended)" if is_audit else ""),
-        "Use my own wordlist",
-    ]
-    choice_idx = shell._questionary_select("Select a strategy", options, default_idx=0)
-    if choice_idx is None:
-        print_error("Selection cancelled.")
+    # Build a stable, position-consistent option list. The auto-detect option is
+    # ALWAYS present and an explicit Skip/exit is ALWAYS offered, so the menu
+    # reads identically (same rows in the same order) in both the fresh and the
+    # exhausted state -- only the labels and the pre-selected default change.
+    #
+    # The default is DYNAMIC, and this is the load-bearing anti-infinite-loop
+    # guarantee: ``_questionary_select`` auto-resolves to ``default_idx`` in
+    # non-interactive / ``adscan ci`` mode, so once auto-detect is exhausted the
+    # default MUST point at Skip -- never at a manual-input branch (known /
+    # custom) that would block on stdin or loop the run. Fresh runs default to
+    # auto-detect, or to the known-format branch in an audit workspace.
+    if autodetect_exhausted:
+        recommended_handler = "skip"
+    elif is_audit:
+        recommended_handler = "known"
+    else:
+        recommended_handler = "auto"
+
+    def _strategy_label(base: str, handler: str) -> str:
+        text = base
+        if handler == "auto" and autodetect_exhausted:
+            text += " (already tried this session, 0 found)"
+        if handler == recommended_handler:
+            text += " (Recommended)"
+        return text
+
+    options: list[str] = []
+    handlers: list[str] = []
+    for base, handler in (
+        ("Detect the format automatically", "auto"),
+        ("I know the username format", "known"),
+        ("Use my own wordlist", "custom"),
+        ("Skip Kerberos enumeration", "skip"),
+    ):
+        options.append(_strategy_label(base, handler))
+        handlers.append(handler)
+    default_idx = handlers.index(recommended_handler)
+
+    while True:
+        choice_idx = shell._questionary_select(
+            "Select a strategy", options, default_idx=default_idx
+        )
+        if choice_idx is None:
+            print_error("Selection cancelled.")
+            return None
+        if not 0 <= choice_idx < len(handlers):
+            choice_idx = default_idx
+
+        handler = handlers[choice_idx]
+        if handler == "auto":
+            if autodetect_exhausted:
+                # Re-selected the exhausted probe interactively: confirm first,
+                # default No. Non-interactive mode auto-resolves to No and loops
+                # back to the menu (which now defaults to Skip), so a CI run can
+                # never re-enter the doomed probe.
+                rerun = shell._questionary_confirm(
+                    "Automatic detection already ran this session and found 0 "
+                    "valid users. Re-run it anyway?",
+                    default=False,
+                )
+                if not rerun:
+                    continue
+            return _kerberos_auto_detect_then_build(shell, domain)
+        if handler == "known":
+            return _kerberos_known_format_build(shell, domain)
+        if handler == "custom":
+            return _prompt_custom_kerberos_username_wordlist(shell, domain)
+
+        # handler == "skip": end the enum cleanly, exactly like the higher-level
+        # "Skip Kerberos" option and the custom-wordlist skip branch.
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info(
+            f"Skipping Kerberos user enumeration for {marked_domain}. "
+            f"You can rerun it later with `kerberos_enum_users {domain}`."
+        )
+        _show_kerberos_enum_shortcut_hint(shell, domain, had_results=False)
         return None
 
-    if choice_idx == 0:
-        return _kerberos_auto_detect_then_build(shell, domain)
-    if choice_idx == 1:
-        return _kerberos_known_format_build(shell, domain)
-    return _prompt_custom_kerberos_username_wordlist(shell, domain)
 
+def _kerberos_auto_detect_then_build(
+    shell: LdapShell, domain: str
+) -> "str | _KerberosEnumHandledSentinel | None":
+    """Stream the LARGE username wordlist live and stop as soon as we have enough.
 
-def _kerberos_auto_detect_then_build(shell: LdapShell, domain: str) -> str | None:
-    """Run the inference probe then build a focused wordlist from the result.
+    This is the "Detect the format automatically" branch. Rather than guessing
+    the naming pattern from a small inference list (which returned zero users
+    whenever the client's convention was not represented in it), it streams the
+    broadest general username wordlist through kerbrute LIVE and stops
+    dynamically the moment the early-stop policy fires (target users found /
+    idle after the first hit / hard time cap). The confirmed users are the
+    primary output — they are persisted straight to ``users.txt`` and feed
+    spraying/roasting immediately.
 
-    This is the "Detect format automatically" branch. It runs kerbrute with an
-    inference wordlist, identifies the dominant naming pattern, and hands
-    off to source selection. On failure it offers manual pattern selection or a
-    custom file — never the slow general wordlist.
+    When a dominant naming pattern is inferable from the confirmed users, it
+    additionally offers to widen the net with the matching statistically-likely
+    list (a SECONDARY step). In that case it returns the combined candidate
+    wordlist for ``run_kerberos_enum_users`` to run through the standard path;
+    otherwise it persists the found users itself and returns
+    :data:`KERBEROS_ENUM_HANDLED`. On a genuinely empty sweep it marks
+    auto-detect exhausted for the session and falls back to manual / custom /
+    skip.
     """
-    strategy, value = _infer_kerberos_username_pattern_via_runtime_probe(shell, domain)
-    if strategy == "pattern" and value:
-        return _build_focused_kerberos_wordlist_for_pattern(
-            shell, domain, pattern_key=value
+    from adscan_internal.services.enumeration.kerberos import (  # noqa: PLC0415
+        KerberosEarlyStopSupervisor,
+    )
+    from adscan_internal.services.cooperative_cancellation import (  # noqa: PLC0415
+        CooperativeCancellation,
+        cli_cooperative_stop,
+        cooperative_stop_sentinel_path,
+    )
+
+    marked_domain = mark_sensitive(domain, "domain")
+    wordlist_service = KerberosUsernameWordlistService()
+    large_wordlist = wordlist_service.get_general_common_wordlist_path()
+    if large_wordlist is None:
+        print_warning(
+            "The broad username wordlist is not available in this runtime; "
+            "falling back to manual username-format selection."
         )
-    if strategy == "manual":
         return _kerberos_known_format_build(shell, domain)
-    if strategy == "custom":
-        return _prompt_custom_kerberos_username_wordlist(shell, domain)
-    return None
+
+    kerbrute_path = os.path.join(TOOLS_INSTALL_DIR, "kerbrute", "kerbrute")
+    if not os.path.isfile(kerbrute_path) or not os.access(kerbrute_path, os.X_OK):
+        print_warning(
+            "Kerbrute is not available, so the broad sweep cannot run; "
+            "falling back to manual username-format selection."
+        )
+        return _kerberos_known_format_build(shell, domain)
+
+    kerberos_dir = Path(
+        domain_subpath(
+            shell._get_workspace_cwd(),
+            shell.domains_dir,
+            domain,
+            shell.kerberos_dir,
+        )
+    )
+    os.makedirs(kerberos_dir, exist_ok=True)
+    output_file = kerberos_dir / "enum_users_auto_detect.log"
+
+    supervisor = KerberosEarlyStopSupervisor()
+
+    try:
+        candidate_count = sum(
+            1 for _ in large_wordlist.open(encoding="utf-8", errors="ignore")
+        )
+    except OSError:
+        candidate_count = 0
+
+    wordlist_label = (
+        f"{large_wordlist.name} (~{candidate_count:,} candidates)"
+        if candidate_count
+        else large_wordlist.name
+    )
+    print_operation_header(
+        "Kerberos Username Auto-Detect · broad live sweep",
+        details={
+            "Domain": domain,
+            "PDC": shell.domains_data[domain]["pdc"],
+            "Wordlist": wordlist_label,
+            "Early stop": (
+                f"{supervisor.target_user_count} users found · "
+                f"{int(supervisor.idle_timeout_seconds)}s idle · "
+                f"{int(supervisor.hard_cap_seconds)}s cap"
+            ),
+            "Protocol": "Kerberos Pre-Authentication",
+        },
+        icon="🧠",
+    )
+    print_info(
+        "Sweeping the broad username list and stopping as soon as enough real "
+        "users are confirmed — no naming-convention guess required."
+    )
+
+    _workspace_root = getattr(shell, "current_workspace_dir", None)
+    cancellation = CooperativeCancellation(
+        operation="kerberos_user_enum",
+        sentinel_path=(
+            cooperative_stop_sentinel_path(_workspace_root, "kerberos_user_enum")
+            if _workspace_root
+            else None
+        ),
+    )
+
+    with cli_cooperative_stop(
+        cancellation,
+        shell=shell,
+        stop_message=(
+            "Kerberos auto-detect: stopping the broad sweep early and continuing "
+            "with the usernames found so far. Press Ctrl+C again to abort the "
+            "whole scan."
+        ),
+    ):
+        users = EnumerationService().kerberos.enumerate_users_kerberos(
+            domain=domain,
+            pdc=shell.domains_data[domain]["pdc"],
+            wordlist=str(large_wordlist),
+            kerbrute_path=kerbrute_path,
+            output_file=output_file,
+            executor=shell._get_service_executor(),
+            spawn=shell._get_service_spawner(),
+            scan_id=None,
+            timeout=int(supervisor.hard_cap_seconds),
+            auth_mode=AuthMode.UNAUTHENTICATED,
+            cancellation=cancellation,
+            early_stop=supervisor,
+        )
+
+    unique_users = sorted(set(users))
+    operator_stopped = supervisor.stop_reason is None and cancellation.should_stop()
+    _render_auto_detect_stop_summary(
+        domain, supervisor, unique_users, operator_stopped=operator_stopped
+    )
+
+    if not unique_users:
+        # The broad sweep found NOTHING. Remember it for this session so the
+        # strategy selector de-emphasises and never re-defaults to the (now
+        # rarely-fruitless) auto-detect on the next retry.
+        _mark_kerberos_autodetect_exhausted(shell, domain)
+        print_warning(
+            f"The broad sweep found no valid usernames for {marked_domain}."
+        )
+        fallback_options = [
+            "Choose the username format manually (Recommended)",
+            "Use my own wordlist",
+            "Skip Kerberos enumeration",
+        ]
+        fallback_idx = shell._questionary_select(
+            "No users found. How do you want to continue?",
+            fallback_options,
+            default_idx=0,
+        )
+        if fallback_idx == 1:
+            return _prompt_custom_kerberos_username_wordlist(shell, domain)
+        if fallback_idx == 2:
+            print_info(
+                f"Skipping Kerberos user enumeration for {marked_domain}. "
+                f"You can rerun it later with `kerberos_enum_users {domain}`."
+            )
+            _show_kerberos_enum_shortcut_hint(shell, domain, had_results=False)
+            return None
+        return _kerberos_known_format_build(shell, domain)
+
+    # SECONDARY step: when a dominant naming pattern is inferable from the
+    # confirmed users, offer to widen the net with the matching focused list.
+    # The confirmed users themselves are the win either way.
+    ranked = wordlist_service.rank_inferred_patterns_from_candidates(unique_users)
+    if ranked:
+        dominant = ranked[0][0]
+        pattern_label = format_supported_pattern_label(
+            dominant, sample_value="John Smith"
+        ).split("(")[0].strip()
+        stat_path = wordlist_service.get_statistically_likely_wordlist_path(dominant)
+        if stat_path is not None and shell._questionary_confirm(
+            f"Confirmed users match the '{pattern_label}' naming pattern. "
+            "Widen the net with the matching statistically-likely list?",
+            default=True,
+        ):
+            combined: set[str] = set(unique_users)
+            stat_candidates = _load_statistically_likely_candidates_with_cap(
+                shell, wordlist_service, stat_path, domain=domain
+            )
+            combined.update(stat_candidates)
+            metadata = [
+                KerberosWordlistSourceMetadata(
+                    source="kerberos_auto_detect_broad_sweep",
+                    pattern_key=None,
+                    candidate_count=len(unique_users),
+                    details={
+                        "wordlist": large_wordlist.name,
+                        "stop_reason": supervisor.stop_reason or "completed",
+                    },
+                ),
+                KerberosWordlistSourceMetadata(
+                    source="statistically_likely_usernames",
+                    pattern_key=dominant,
+                    candidate_count=len(stat_candidates),
+                    details={"path": str(stat_path)},
+                ),
+            ]
+            output_path = wordlist_service.write_generated_wordlist(
+                kerberos_dir=kerberos_dir,
+                output_name="kerberos_user_candidates.txt",
+                candidates=combined,
+                metadata=metadata,
+                domain=domain,
+            )
+            print_success(
+                f"Expanded to {len(combined):,} candidates "
+                f"(confirmed {len(unique_users)} + '{pattern_label}' list)."
+            )
+            # Caller runs the combined list through the standard persist path.
+            return str(output_path)
+
+    # No expansion: the confirmed users are the result — persist them straight to
+    # users.txt and run followups here, then tell the caller it is fully handled.
+    _finalize_kerberos_enum_users(
+        shell,
+        domain,
+        unique_users,
+        kerberos_dir=kerberos_dir,
+        wordlist_path=large_wordlist,
+    )
+    return KERBEROS_ENUM_HANDLED
+
+
+def _render_auto_detect_stop_summary(
+    domain: str,
+    supervisor: "KerberosEarlyStopSupervisor",
+    users: list[str],
+    *,
+    operator_stopped: bool,
+) -> None:
+    """Explain WHY the broad sweep stopped so the operator understands the result."""
+    from adscan_core.tui.progress_dashboard import format_eta  # noqa: PLC0415
+
+    marked_domain = mark_sensitive(domain, "domain")
+    reason = supervisor.stop_reason
+    if operator_stopped:
+        headline = "Stopped by operator"
+        detail = (
+            f"You stopped the sweep early — keeping the "
+            f"{len(users)} user(s) found so far."
+        )
+        border = BRAND_COLORS["warning"]
+    elif reason == "target":
+        headline = "Target reached"
+        detail = (
+            f"Found {supervisor.target_user_count} valid users — enough to seed "
+            "spraying/roasting and infer the naming convention."
+        )
+        border = BRAND_COLORS["success"]
+    elif reason == "idle":
+        headline = "Diminishing returns"
+        detail = (
+            f"No new valid user for {int(supervisor.idle_timeout_seconds)}s after the "
+            f"first hit ({len(users)} found) — the dense name-space looks exhausted."
+        )
+        border = BRAND_COLORS["success"] if users else BRAND_COLORS["info"]
+    elif reason == "hard_cap":
+        headline = "Time budget reached"
+        detail = (
+            f"Hit the {int(supervisor.hard_cap_seconds)}s budget with "
+            f"{len(users)} valid user(s) found so far."
+        )
+        border = BRAND_COLORS["success"] if users else BRAND_COLORS["info"]
+    else:
+        headline = "Sweep complete"
+        detail = f"Swept the broad list; {len(users)} valid user(s) found."
+        border = BRAND_COLORS["success"] if users else BRAND_COLORS["info"]
+
+    lines = [
+        f"[bold]{headline}[/bold] · {marked_domain}",
+        detail,
+        f"[dim]elapsed {format_eta(supervisor.elapsed_seconds())}[/dim]",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="[bold]Auto-detect broad sweep[/bold]",
+        border_style=border,
+        expand=False,
+    )
 
 
 def _kerberos_known_format_build(shell: LdapShell, domain: str) -> str | None:
@@ -3829,142 +4288,6 @@ def _prompt_validated_linkedin_company_slug(shell: LdapShell) -> str | None:
             return None
 
 
-def _infer_kerberos_username_pattern_via_runtime_probe(
-    shell: LdapShell,
-    domain: str,
-) -> tuple[str, str | None]:
-    """Run a Kerberos probe to infer the dominant username format."""
-    wordlist_service = KerberosUsernameWordlistService()
-    inference_wordlist = wordlist_service.get_format_inference_wordlist_path()
-    metadata_path = wordlist_service.get_format_inference_metadata_path()
-    marked_domain = mark_sensitive(domain, "domain")
-    if inference_wordlist is None or metadata_path is None:
-        print_warning(
-            "The Kerberos username-format inference assets are not available in this runtime."
-        )
-        return "manual", None
-
-    kerbrute_path = os.path.join(TOOLS_INSTALL_DIR, "kerbrute", "kerbrute")
-    if not os.path.isfile(kerbrute_path) or not os.access(kerbrute_path, os.X_OK):
-        print_warning(
-            "Kerbrute is not available, so username-format inference cannot run."
-        )
-        return "manual", None
-
-    kerberos_dir = domain_subpath(
-        shell._get_workspace_cwd(),
-        shell.domains_dir,
-        domain,
-        shell.kerberos_dir,
-    )
-    os.makedirs(kerberos_dir, exist_ok=True)
-    output_file = Path(os.path.join(kerberos_dir, "enum_users_format_inference.log"))
-
-    print_operation_header(
-        "Kerberos Username Format Inference",
-        details={
-            "Domain": domain,
-            "PDC": shell.domains_data[domain]["pdc"],
-            "Wordlist": inference_wordlist.name,
-            "Protocol": "Kerberos Pre-Authentication",
-        },
-        icon="🧠",
-    )
-
-    users = EnumerationService().kerberos.enumerate_users_kerberos(
-        domain=domain,
-        pdc=shell.domains_data[domain]["pdc"],
-        wordlist=str(inference_wordlist),
-        kerbrute_path=kerbrute_path,
-        output_file=output_file,
-        executor=shell._get_service_executor(),
-        spawn=shell._get_service_spawner(),
-        scan_id=None,
-        timeout=600,
-        auth_mode=AuthMode.UNAUTHENTICATED,
-    )
-    ranked_patterns = wordlist_service.rank_inferred_patterns_from_candidates(users)
-    if not ranked_patterns:
-        if users:
-            print_warning(
-                "Kerberos username format inference found valid usernames, but could not "
-                "identify a dominant pattern confidently."
-            )
-        else:
-            print_warning(
-                f"Could not infer a username format for {marked_domain}: no valid usernames "
-                "were discovered with the inference list."
-            )
-        fallback_options = [
-            "Choose the username format manually (Recommended)",
-            "Use my own wordlist",
-            "Skip Kerberos enumeration",
-        ]
-        fallback_idx = shell._questionary_select(
-            "No format detected. How do you want to continue?",
-            fallback_options,
-            default_idx=0,
-        )
-        if fallback_idx == 1:
-            return "custom", None
-        if fallback_idx == 2:
-            return "skip", None
-        return "manual", None
-
-    sample_name = "John Smith"
-    unique_count = len(set(users))
-
-    result_table = Table(
-        show_header=True,
-        header_style=f"bold {BRAND_COLORS['info']}",
-        box=None,
-        padding=(0, 2),
-    )
-    result_table.add_column("Format", style="bold")
-    result_table.add_column("Example", style="dim")
-    result_table.add_column(
-        "Hits", justify="right", style=f"bold {BRAND_COLORS['success']}"
-    )
-    for pattern_key, score in ranked_patterns[:5]:
-        label = format_supported_pattern_label(pattern_key, sample_value=sample_name)
-        result_table.add_row(
-            label.split("(")[0].strip(),
-            f"({label.split('(')[1].rstrip(')')})" if "(" in label else "",
-            str(score),
-        )
-
-    print_panel(
-        [
-            f"[dim]Confirmed usernames from probe:[/dim] [bold]{unique_count}[/bold]",
-            "",
-            result_table,
-        ],
-        title=f"[bold]Format detected · {marked_domain}[/bold]",
-        border_style=BRAND_COLORS["info"],
-        expand=False,
-    )
-
-    detected_pattern = ranked_patterns[0][0]
-    detected_label = format_supported_pattern_label(
-        detected_pattern, sample_value=sample_name
-    )
-    options = [
-        f"Use detected format: {detected_label} (Recommended)",
-        "Choose another format manually",
-        "Use my own wordlist",
-    ]
-    choice_idx = shell._questionary_select(
-        f"Format detected for {marked_domain}. How do you want to continue?",
-        options,
-        default_idx=0,
-    )
-    if choice_idx == 1:
-        return "manual", None
-    if choice_idx == 2:
-        return "custom", None
-    return "pattern", detected_pattern
-
-
 def _load_statistically_likely_candidates_with_cap(
     shell: LdapShell,
     wordlist_service: KerberosUsernameWordlistService,
@@ -4206,6 +4529,7 @@ def _build_focused_kerberos_wordlist_for_pattern(
                         )
                 except Exception as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_warning(f"LinkedIn employee discovery failed: {exc}")
 
     if not merged_candidates:
@@ -4229,7 +4553,9 @@ def _build_focused_kerberos_wordlist_for_pattern(
     return str(output_path)
 
 
-def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | None:
+def _build_targeted_kerberos_wordlist(
+    shell: LdapShell, domain: str
+) -> "str | _KerberosEnumHandledSentinel | None":
     """Legacy entry point — delegates to the unified strategy selector."""
     return _select_kerberos_wordlist_strategy(shell, domain)
 
@@ -4526,6 +4852,7 @@ def run_ldap_descriptions(
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(f"[ldap-desc] posture wiring skipped: {exc}")
 
         try:
@@ -4611,6 +4938,7 @@ def run_ldap_descriptions(
                     log_fp.write(f"{sam:<25} {desc}\n")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Failed to write descriptions.log: {exc}")
     else:
         try:
@@ -4658,6 +4986,7 @@ def run_ldap_descriptions(
                         )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Failed to write descriptions.log: {exc}")
 
     try:
@@ -4678,6 +5007,7 @@ def run_ldap_descriptions(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Failed to write descriptions.json: {exc}")
 
     # ── Render + analysis (sweep all four credential-bearing fields) ──────
@@ -4694,6 +5024,7 @@ def run_ldap_descriptions(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Description analysis failed: {exc}")
 
     # ── Surface sensitive findings into the report ───────────────────────
@@ -4737,6 +5068,7 @@ def run_ldap_descriptions(
                 prefix="[ldap-desc]",
             ):
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
 
 def _native_user_description_query(
@@ -4874,6 +5206,7 @@ def _native_user_description_query_anonymous(
             except Exception as exc:  # noqa: BLE001
                 # Bind OK but search denied — return what we have.
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[ldap-desc] anonymous search denied on "
                     f"{mark_sensitive(dc_ip, 'host')}: {exc}"
@@ -4973,6 +5306,7 @@ def _find_and_move_userdesc_log(shell: LdapShell, domain: str) -> Optional[str]:
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error finding/moving UserDesc log file: {e}")
         return None
 
@@ -5074,6 +5408,7 @@ def _save_ldap_descriptions_json(
         return json_file
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error saving LDAP descriptions JSON: {e}")
         return None
 
@@ -5393,6 +5728,7 @@ def _load_computer_hostnames_from_inventory(
         payload = read_json_file(inventory_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[ldap-computers] failed to read computers inventory: {exc}")
         return None
 
@@ -5451,6 +5787,7 @@ def _load_credential_fields_from_inventory(
         payload = read_json_file(inventory_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[ldap-desc] failed to read users inventory: {exc}")
         return {}
 
@@ -5790,6 +6127,7 @@ def _record_credential_in_ldap_attribute_finding(
             prefix="[ldap-desc]",
         ):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def _build_user_description_source_steps(
@@ -5916,8 +6254,8 @@ def execute_ldap_computers(
                     computers_file, "r", encoding="utf-8", errors="ignore"
                 ) as file:  # 'file' shadows built-in, but kept for consistency
                     computers = [line.strip() for line in file if line.strip()]
-                    marked_computers = [mark_sensitive(c, "host") for c in computers]
-                    print_info_debug(f"Computers: {marked_computers}")
+                    marked_computers = [mark_sensitive(c, "hostname") for c in computers]
+                    print_info_debug(f"Computers: {', '.join(marked_computers)}")
 
                 # Telemetry: track computer enumeration results
                 try:
@@ -5934,6 +6272,7 @@ def execute_ldap_computers(
                     telemetry.capture("computers_enumerated", properties)
                 except Exception as e:
                     telemetry.capture_exception(e)
+                    print_exception(exception=e)
 
                 if comp_file == "enabled_computers_with_laps.txt":
                     shell._display_items(computers, "Computers with LAPS")

@@ -33,6 +33,7 @@ genuinely helps.
 from __future__ import annotations
 
 import re
+import signal
 from dataclasses import dataclass
 from typing import Literal
 
@@ -114,8 +115,28 @@ PullFailureKind = Literal[
     "network_timeout",
     "daemon_unreachable",
     "runtime_unsupported",
+    "user_interrupt",
     "unknown",
 ]
+
+
+def is_user_interrupt_returncode(rc: int) -> bool:
+    """Return True when a ``docker pull`` return code means the operator cancelled.
+
+    A pull the user aborts with Ctrl-C surfaces one of two ways depending on
+    how the interrupt reaches the ``docker`` process:
+
+    * ``130`` — the shell convention ``128 + SIGINT`` when ``docker`` catches
+      SIGINT and exits on it.
+    * ``-signal.SIGINT`` (``-2``) — when Python reports the child was killed by
+      the signal directly (negative return code = terminated by that signal).
+
+    Both mean "the user cancelled", NOT a pull error. Classifying this outcome
+    from ``rc`` (rather than from captured stderr/stdout, which carries no
+    interrupt marker) is the only reliable signal, so it lives here as the
+    single source of truth and is consumed at the pull-failure boundary.
+    """
+    return rc in (130, -signal.SIGINT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +155,12 @@ class PullFailureDiagnosis:
             than Docker Engine. That refusal already prints its own
             explanation, so this is a distinct terminal outcome and
             never falls through to the generic "unclassified error"
-            panel.
+            panel. ``"user_interrupt"`` is likewise recorded directly by
+            the pull-failure boundary (``_handle_pull_failure`` in
+            ``docker_runtime.py``) from the process return code — a Ctrl-C
+            cancel, not a pull error — and re-raises ``KeyboardInterrupt``
+            for a clean launcher unwind, so it never reaches the retry loop
+            or the generic panel either.
         evidence: The cleaned, ANSI-stripped line(s) from the captured
             output that contain the actual error message. Safe to log
             and to display in a debug section of the failure panel.
@@ -468,6 +494,22 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
         ),
         fix_steps=(),
     ),
+    "user_interrupt": PullFailurePresentation(
+        glyph="✋",
+        title="Installation cancelled",
+        border_style="cyan",
+        what_lines=(
+            "You interrupted the image pull with Ctrl-C before it finished.",
+        ),
+        why_lines=(),
+        fix_steps=(
+            "adscan install                        # rerun when you are ready",
+        ),
+        followup=(
+            "If the pull was slow, try again on a faster or less-throttled "
+            "network."
+        ),
+    ),
     "unknown": PullFailurePresentation(
         glyph="❓",
         title="Docker pull failed (unclassified error)",
@@ -545,6 +587,7 @@ __all__ = (
     "classify_pull_failure",
     "consume_last_failure",
     "get_presentation",
+    "is_user_interrupt_returncode",
     "peek_last_failure",
     "record_last_failure",
     "strip_ansi",

@@ -57,6 +57,7 @@ from adscan_internal.services.gpo_writable_filter import (
     WritableGPOCandidate,
     discover_writable_gpos,
 )
+from adscan_core.rich_output import print_exception
 
 
 _console = get_console()
@@ -89,6 +90,7 @@ def _resolve_active_credential(
         return domain, username, password, dc_ip
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -327,7 +329,242 @@ def run_exploit_gpo_abuse(shell: Any) -> bool:
         return False
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"GPO abuse wizard crashed: {exc}")
+        return False
+
+
+def _match_gpo_candidate(
+    candidates: list[WritableGPOCandidate],
+    *,
+    target_dn: str | None,
+    target_object_id: str | None,
+    to_label: str,
+    target_sam_or_label: str,
+) -> WritableGPOCandidate | None:
+    """Return the single candidate that matches the path-fixed GPO, or None.
+
+    Matching precedence: distinguishedName (unambiguous) → objectId/GUID →
+    display-name / label. The label fallback also matches the raw GUID so a
+    node labelled with its ``{GUID}`` still resolves.
+    """
+    if not candidates:
+        return None
+    dn_cf = (target_dn or "").strip().casefold()
+    if dn_cf:
+        for c in candidates:
+            if c.gpo_dn and c.gpo_dn.strip().casefold() == dn_cf:
+                return c
+    oid_up = (target_object_id or "").strip().upper()
+    if oid_up:
+        for c in candidates:
+            if c.gpo_object_id and c.gpo_object_id.strip().upper() == oid_up:
+                return c
+    labels = {
+        v.strip().casefold()
+        for v in (to_label, target_sam_or_label)
+        if v and v.strip()
+    }
+    if labels:
+        for c in candidates:
+            cand_labels: set[str] = set()
+            if c.display_name:
+                cand_labels.add(c.display_name.strip().casefold())
+            if c.gpo_object_id:
+                cand_labels.add(c.gpo_object_id.strip().casefold())
+            if cand_labels & labels:
+                return c
+    return None
+
+
+def run_exploit_gpo_immediate_task_for_step(
+    shell: Any,
+    context: Any,
+    *,
+    target_dn: str | None = None,
+    target_object_id: str | None = None,
+) -> bool:
+    """Plant a GPO Immediate Scheduled Task for a single attack-path ACE step.
+
+    Non-interactive, single-target counterpart to :func:`run_exploit_gpo_abuse`.
+    The GPO is fixed by the attack path (via ``context``), so there is no
+    operator selection: ADscan resolves that one GPO into a
+    :class:`WritableGPOCandidate` — reusing the ``gpc_path`` resolution in
+    :func:`discover_writable_gpos` — plants the Immediate Scheduled Task with
+    the shipped exploitation service, and reverts it inline (``auto_rollback``)
+    so an autonomous audit run never leaves an unreverted change on the client
+    estate. Every mutation and its undo are recorded in the session
+    :class:`EnvironmentChangeLedger`, exactly like the operator wizard.
+
+    The plant proves the edge: write access to a GPO that (when linked to a
+    Tier-0 SOM) yields SYSTEM code execution on every affected host. The
+    benign marker payload never runs — the change is rolled back before the
+    next ``gpupdate`` cycle applies it.
+
+    Returns True only when the plant and its inline rollback both succeeded.
+    """
+    try:
+        target_domain = (
+            getattr(context, "target_domain", "")
+            or getattr(context, "domain", "")
+            or ""
+        ).strip()
+        exec_username = (getattr(context, "exec_username", "") or "").strip()
+        exec_password = getattr(context, "exec_password", "") or ""
+        auth_domain = (getattr(context, "domain", "") or target_domain).strip()
+        if not (target_domain and exec_username and exec_password):
+            print_error(
+                "GPO step: incomplete execution context (domain / user / "
+                "credential missing)."
+            )
+            return False
+
+        workspace_dir = _resolve_workspace_dir(shell)
+        if workspace_dir is None:
+            print_error(
+                "GPO step: no active workspace to read writable-GPO findings "
+                "from. Run the LDAP collector against this domain first."
+            )
+            return False
+
+        ledger = getattr(shell, "environment_change_ledger", None)
+        if ledger is None:
+            print_error(
+                "GPO step: no environment_change_ledger on the session; "
+                "refusing to plant a change that cannot be recorded for rollback."
+            )
+            return False
+
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        entry = (
+            domains_data.get(target_domain)
+            if isinstance(domains_data, dict)
+            else None
+        )
+        dc_ip = (resolve_dc_ip(entry) if isinstance(entry, dict) else None) or ""
+        if not dc_ip:
+            print_error(
+                "GPO step: could not resolve a DC IP for "
+                f"{mark_sensitive(target_domain, 'domain')}."
+            )
+            return False
+        dc_fqdn = _resolve_dc_fqdn(shell, target_domain) or dc_ip
+
+        # Resolve the single path-fixed GPO into a writable candidate. The
+        # filter also does the deterministic gpc_path (SYSVOL UNC) resolution,
+        # so we never re-implement it here. include_unlinked=True: the attack
+        # graph already grounds the edge, so even an unlinked-but-writable GPO
+        # is a valid target for the plant.
+        try:
+            candidates = asyncio.run(
+                discover_writable_gpos(
+                    workspace_dir=workspace_dir,
+                    domain=target_domain,
+                    principal=exec_username,
+                    include_unlinked=True,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_error(f"GPO step: writable-GPO discovery failed: {exc}")
+            return False
+
+        chosen = _match_gpo_candidate(
+            candidates,
+            target_dn=target_dn,
+            target_object_id=target_object_id,
+            to_label=getattr(context, "to_label", "") or "",
+            target_sam_or_label=getattr(context, "target_sam_or_label", "") or "",
+        )
+        if chosen is None:
+            print_warning(
+                "GPO step: the target GPO is not resolvable as writable from "
+                f"the current principal {mark_sensitive(exec_username, 'user')} "
+                "in the workspace attack graph. Re-run the LDAP collector to "
+                "refresh ACL state."
+            )
+            return False
+        if not chosen.gpc_path:
+            print_warning(
+                "GPO step: resolved the target GPO but could not determine its "
+                "SYSVOL path (gPCFileSysPath); cannot plant the Immediate Task."
+            )
+            return False
+
+        # Benign marker payload — the change is auto-rolled-back before any
+        # gpupdate cycle applies it, so this command never executes. It exists
+        # only so the plant is a well-formed Immediate Scheduled Task.
+        payload = GPOPayload(
+            kind="raw_command",
+            params={"command": "echo ADscan-attack-path-gpo-immediate-task"},
+        )
+
+        print_info(
+            "GPO Immediate Scheduled Task: planting (and immediately reverting) "
+            f"on {mark_sensitive(chosen.display_name or chosen.gpo_object_id, 'text')} "
+            f"as {mark_sensitive(exec_username, 'user')}."
+        )
+
+        service = ExploitationService()
+        try:
+            result: GPOImmediateTaskResult = asyncio.run(
+                service.gpo.run_exploit_gpo_immediate_task(
+                    ledger=ledger,
+                    domain=target_domain,
+                    dc_ip=dc_ip,
+                    dc_fqdn=dc_fqdn,
+                    auth_username=exec_username,
+                    auth_password=exec_password,
+                    auth_domain=auth_domain,
+                    gpo_dn=chosen.gpo_dn,
+                    gpo_display_name=chosen.display_name or chosen.gpo_object_id,
+                    gpc_path=chosen.gpc_path,
+                    payload=payload,
+                    task_name="ADscanPathTask",
+                    principal_dn_for_guard=None,
+                    # Attack-path execution policy: plant to prove the edge,
+                    # then revert inline. GPO application is asynchronous (next
+                    # gpupdate), so the chain cannot synchronously wield the
+                    # planted access anyway — inline rollback is the only path
+                    # with a working automatic undo and leaves no unreverted
+                    # destructive change on the client estate.
+                    auto_rollback=True,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_error(
+                f"GPO step: Immediate Scheduled Task plant failed: {exc}"
+            )
+            return False
+
+        if not result.success:
+            print_error(
+                "GPO step: Immediate Scheduled Task plant failed: "
+                f"{(result.error or 'unknown error').strip()}"
+            )
+            return False
+
+        rollback_note = (
+            "planted and reverted"
+            if result.rolled_back
+            else "planted (rollback recorded in the session ledger)"
+        )
+        print_success(
+            "GPO Immediate Scheduled Task "
+            f"{rollback_note} on "
+            f"{mark_sensitive(chosen.display_name or chosen.gpo_object_id, 'text')} "
+            f"({len(result.change_ids)} ledger entries)."
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_error(f"GPO step crashed: {exc}")
         return False
 
 
@@ -397,6 +634,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"GPO filter failed: {exc}")
         return False
 
@@ -417,6 +655,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_error(f"GPO filter (unlinked pass) failed: {exc}")
                 return False
 
@@ -574,6 +813,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
             progress.update(task, completed=1)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # Cause-mapped failure: try to surface common root causes inline so the
         # operator knows where to look without diving into the workspace logs.
         message = str(exc).lower()
@@ -835,6 +1075,7 @@ def run_exploit_gpo_rollback(shell: Any, ledger_id: str | None = None) -> bool:
             entries = ledger.get_changes()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Could not read the ledger: {exc}")
             return False
 
@@ -933,6 +1174,7 @@ def run_exploit_gpo_rollback(shell: Any, ledger_id: str | None = None) -> bool:
                 return True
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_error(f"Could not mark the entry: {exc}")
                 return False
         return False
@@ -941,12 +1183,14 @@ def run_exploit_gpo_rollback(shell: Any, ledger_id: str | None = None) -> bool:
         return False
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"GPO rollback handler crashed: {exc}")
         return False
 
 
 __all__ = [
     "run_exploit_gpo_abuse",
+    "run_exploit_gpo_immediate_task_for_step",
     "run_exploit_gpo_rollback",
 ]
 

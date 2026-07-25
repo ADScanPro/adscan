@@ -33,6 +33,7 @@ from enum import Enum
 from typing import Any, MutableMapping
 
 from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 
 
 class CredentialPrivilegeRole(str, Enum):
@@ -236,6 +237,7 @@ def set_credential_kerberos_material(
         meta_map[key] = current
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def set_credential_secret_kind(
@@ -266,6 +268,7 @@ def set_credential_secret_kind(
         meta_map[key] = current
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def set_credential_origin(
@@ -311,6 +314,7 @@ def set_credential_origin(
         meta_map[key] = current
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +344,7 @@ def _safe_get_identity_risk_record(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -359,6 +364,7 @@ def _safe_find_user_node(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
     return node if isinstance(node, dict) else None
 
@@ -375,6 +381,7 @@ def _safe_load_attack_graph(shell: Any, domain: str) -> dict[str, Any] | None:
         graph = load_attack_graph(shell, domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
     return graph if isinstance(graph, dict) else None
 
@@ -558,6 +565,7 @@ def _resolve_privilege_role_from_graph(
         return max(candidates, key=lambda r: ROLE_PRIORITY.get(r, 0))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return CredentialPrivilegeRole.STANDARD
 
 
@@ -596,6 +604,7 @@ def _resolve_is_enabled(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return True
 
 

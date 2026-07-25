@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 LSARPCStatus = Literal["done", "denied", "error"]
@@ -243,6 +244,7 @@ async def rid_cycle_via(
                             return
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     if _is_access_denied(exc):
                         denied_holder.append(True)
                         return
@@ -289,6 +291,7 @@ async def rid_cycle_via(
                             results.extend(batch_entries)
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     if not first_error_holder:
                         first_error_holder.append(f"parse error: {exc}")
 

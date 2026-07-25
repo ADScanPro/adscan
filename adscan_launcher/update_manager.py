@@ -29,6 +29,7 @@ from rich.console import Group
 from rich.text import Text
 
 from adscan_launcher.docker_commands import pull_runtime_image_with_diagnostics
+from adscan_core.rich_output import print_exception
 
 
 _UPDATE_HEALTH_FILENAME = "update_health.json"
@@ -179,6 +180,7 @@ def get_image_baked_version(ctx: "UpdateContext", image: str) -> str | None:
         return baked or None
     except Exception as exc:  # noqa: BLE001
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -421,6 +423,7 @@ def _record_update_health(
         payload["launcher_version"] = str(ctx.get_installed_version() or "").strip()
     except Exception as exc:  # pragma: no cover - defensive guard
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
     if ok:
         payload["last_success_at"] = now.isoformat()
         payload["last_success_launcher_updated"] = updated_launcher
@@ -429,6 +432,7 @@ def _record_update_health(
         _write_local_update_health(ctx.adscan_base_dir, payload)
     except Exception as exc:  # pragma: no cover - best effort persistence
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         ctx.print_info_debug(f"[update] Failed to persist local update health: {exc}")
 
 
@@ -469,6 +473,7 @@ def get_launcher_update_info(ctx: UpdateContext) -> dict:
         return info
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         info["error"] = str(exc)
         return info
 
@@ -593,6 +598,7 @@ def _get_remote_image_digest(ctx: UpdateContext, image: str) -> dict:
             info["error"] = proc.stderr.strip()
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         info["error"] = str(exc)
 
     # Fallback: `manifest inspect --verbose` carries the index digest in
@@ -617,6 +623,7 @@ def _get_remote_image_digest(ctx: UpdateContext, image: str) -> dict:
             info["error"] = "manifest inspect --verbose failed"
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         if not info.get("error"):
             info["error"] = str(exc)
     return info
@@ -715,6 +722,7 @@ def get_docker_update_info(ctx: UpdateContext) -> dict:
         return info
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         info["error"] = str(exc)
         return info
 
@@ -732,6 +740,7 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
             return True
         except Exception as exc:
             ctx.telemetry_capture_exception(exc)
+            print_exception(exception=exc)
             ctx.print_error("Failed to update the launcher via pipx.")
             ctx.print_instruction("Try: pipx upgrade adscan")
             return False
@@ -753,6 +762,7 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
         )
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         ctx.print_error("Failed to update the launcher via pip.")
         ctx.print_instruction("Try: python3 -m pip install --upgrade adscan")
         ctx.print_info_debug(f"[update] pip upgrade error: {exc}")
@@ -788,6 +798,7 @@ def _read_installed_version_clean(ctx: UpdateContext) -> str | None:
         )
     except Exception as exc:  # pragma: no cover - defensive guard
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         ctx.print_info_debug(f"[update] Clean-subprocess version re-read failed: {exc}")
         return None
     if proc.returncode != 0:
@@ -878,6 +889,7 @@ def _restart_into_upgraded_launcher(ctx: UpdateContext) -> None:
         os.execv(target, [target] + sys.argv[1:])
     except Exception as exc:  # pragma: no cover - defensive guard
         ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         ctx.print_info_debug(f"[update] Re-exec into {target!r} failed: {exc}")
         _print_launcher_restart_hint(ctx)
 

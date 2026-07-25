@@ -70,6 +70,7 @@ from adscan_internal.services.smb_sensitive_file_policy import (
 )
 from adscan_internal.services.xml_sanitization_service import create_analysis_temp_root
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,7 @@ class SpideringService(BaseService):
                     print_info_verbose(f"Log saved in {log_file}")
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_warning(
                         f"Error while saving manspider output to log file: {exc}"
                     )
@@ -299,6 +301,7 @@ class SpideringService(BaseService):
 
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error executing manspider password spidering.")
             print_error_debug(f"Error type: {type(exc).__name__}")
             return {}
@@ -883,6 +886,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning("Error processing GPP XML file.")
             return ArtifactProcessingRecord(
                 path=file_path,
@@ -934,6 +938,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error processing yml file.")
             return ArtifactProcessingRecord(
                 path=file_path,
@@ -1001,6 +1006,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning("Error processing NTLM hash dump file.")
             return ArtifactProcessingRecord(
                 path=file_path,
@@ -1052,6 +1058,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Error executing olevba on {filename}.")
             return ArtifactProcessingRecord(
                 path=file_path,
@@ -1111,6 +1118,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error processing DMP file.")
             return ArtifactProcessingRecord(
                 path=dmp_file,
@@ -1194,6 +1202,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error processing ZIP file.")
             return ArtifactProcessingRecord(
                 path=zip_file,
@@ -1322,6 +1331,7 @@ class SpideringService(BaseService):
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         skipped_entries += 1
                         skipped_internal_paths.append(str(info.filename))
 
@@ -1692,6 +1702,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error processing PFX file.")
             return ArtifactProcessingRecord(
                 path=file_path,
@@ -1742,6 +1753,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error processing KeePass artifact.")
             return ArtifactProcessingRecord(
                 path=file_path,
@@ -1793,6 +1805,7 @@ class SpideringService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Error processing encrypted Office artifact.")
             return ArtifactProcessingRecord(
                 path=file_path,

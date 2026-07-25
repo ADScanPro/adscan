@@ -47,6 +47,7 @@ from adscan_core.sensitive import mark_sensitive
 
 from adscan_internal.services.post_exploitation import FootholdContext
 from adscan_internal.services.posture_sink import PostureSink
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.domain_posture import DomainPosture
@@ -124,10 +125,12 @@ async def winrm_run_powershell(
         )
     except WinRMPSRPError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"[winrm_transport] PSRP failure on {masked_host}: {exc}")
         raise
     except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"[winrm_transport] unexpected error on {masked_host}: {exc}")
         raise
 

@@ -25,6 +25,7 @@ from adscan_internal.services.ldap_transport_service import (
     SD_FLAGS_DACL_CONTROL,
     execute_with_ldap_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 _ADS_RIGHT_DS_WRITE_PROP = 0x20
 _ACCESS_ALLOWED_ACE_TYPE = 0x00
@@ -101,6 +102,7 @@ class DomainWritableAttributeDetectionService(BaseService):
             return report
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "Domain writable-attribute detection report generation failed: "
                 f"{type(exc).__name__}: {exc}"
@@ -134,6 +136,7 @@ class DomainWritableAttributeDetectionService(BaseService):
             return str(UUID(bytes_le=raw_guid)).lower()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[writable-attrs] Failed to resolve schema GUID for {attribute_name}: "
                 f"{type(exc).__name__}: {exc}"

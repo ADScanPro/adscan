@@ -16,6 +16,7 @@ from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
 )
+from adscan_core.rich_output import print_exception
 
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str]]
@@ -106,6 +107,7 @@ def _native_anonymous_user_inventory(
                 # what we have (empty) instead of raising "Connected, but
                 # not bound." up the stack.
                 _telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning_debug(
                     f"[ldap] Anonymous LDAP search denied on "
                     f"{mark_sensitive(pdc, 'host')}: {exc}"

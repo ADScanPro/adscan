@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from adscan_core.rich_output import print_info_debug
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:
     from adscan_internal.services.credentials.credential_metadata import CredentialMetadata
@@ -55,6 +56,7 @@ def _derive_aes_keys(
         return CredentialMetadata(aes256_key=aes256, aes128_key=aes128)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[machine-account] AES key derivation failed: {exc}")
         return None
 

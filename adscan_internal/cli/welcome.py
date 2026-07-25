@@ -36,6 +36,7 @@ from adscan_core.branding import (
 from adscan_core.posture_score import PostureScore
 from adscan_core.rich_output import _get_console
 from adscan_core.theme import ADSCAN_PRIMARY, ADSCAN_PRIMARY_DIM
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +219,14 @@ def load_latest_posture() -> tuple[PostureScore | None, str | None, int | None]:
         )
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None, None, None
 
     try:
         summaries = list_workspaces()
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None, None, None
 
     # Pick the workspace whose technical_report.json was last modified most

@@ -22,6 +22,7 @@ from adscan_internal.rich_output import (
     mark_sensitive,
     print_panel_with_table,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _should_skip_ntlm_hash_validation_for_ctf_pwned(*, shell: Any, domain: str) -> bool:
@@ -33,6 +34,7 @@ def _should_skip_ntlm_hash_validation_for_ctf_pwned(*, shell: Any, domain: str) 
                 return True
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     auth_state = str(
         getattr(shell, "domains_data", {}).get(domain, {}).get("auth", "") or ""
@@ -87,6 +89,7 @@ def _classify_ntlm_principal_risk(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         risk_flags = {}
 
     for username in user_accounts:
@@ -119,6 +122,7 @@ def _classify_ntlm_principal_risk(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         is_tier0 = bool(is_node_tier0(node or {}))
         is_high_value = bool(is_node_high_value(node or {}))
         results[normalized] = {
@@ -152,6 +156,7 @@ def _persist_ntlm_hash_summary(
         return summary_path
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 

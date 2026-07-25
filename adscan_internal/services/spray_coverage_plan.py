@@ -37,7 +37,14 @@ class TypePlan:
 @dataclass(frozen=True)
 class SprayCoveragePlan:
     by_type: dict[str, TypePlan]
+    # ``lockout_disabled`` means the DC was OBSERVED to enforce no lockout
+    # (``lockoutThreshold <= 0``). ``lockout_unknown`` means the policy has not
+    # been read yet (``lockout_threshold is None``) — the two are NOT the same:
+    # an unknown threshold can still lock real accounts and must never be
+    # labelled "disabled". Behaviourally both spray every eligible combo (no
+    # eligibility margin to apply), but the caller renders a different note.
     lockout_disabled: bool = False
+    lockout_unknown: bool = False
 
 
 def _password_for(spec, user: str) -> str:
@@ -61,11 +68,17 @@ def build_spray_coverage_plan(
 ) -> SprayCoveragePlan:
     users = list(users)
     earliest_safe_by_user = earliest_safe_by_user or {}
-    lockout_disabled = not lockout_threshold or int(lockout_threshold) <= 0
+    # Split "observed disabled" (threshold <= 0) from "not yet known" (None).
+    # ``not None`` used to collapse UNKNOWN into "disabled" — the mislabel bug.
+    lockout_unknown = lockout_threshold is None
+    lockout_disabled = lockout_threshold is not None and int(lockout_threshold) <= 0
     attempted_norm = {(u.casefold(), p) for (u, p) in already_attempted}
 
     def _eligible(user: str) -> bool:
-        if lockout_disabled:
+        # No usable threshold (disabled OR unknown) → no eligibility margin to
+        # apply, so every combo is eligible. Behaviour is unchanged from before;
+        # only the rendered label distinguishes the two states.
+        if lockout_disabled or lockout_unknown:
             return True
         used = int(badpwd_by_user.get(user, 0))
         return (used + 1) <= (int(lockout_threshold) - int(margin))
@@ -94,7 +107,11 @@ def build_spray_coverage_plan(
             spray_type=t, spray_now=spray_now, defer=defer,
             covered_count=covered, planned_count=planned,
         )
-    return SprayCoveragePlan(by_type=by_type, lockout_disabled=lockout_disabled)
+    return SprayCoveragePlan(
+        by_type=by_type,
+        lockout_disabled=lockout_disabled,
+        lockout_unknown=lockout_unknown,
+    )
 
 
 _SEQUENCE = ("pre2k", "useraspass", "reuse", "blank")

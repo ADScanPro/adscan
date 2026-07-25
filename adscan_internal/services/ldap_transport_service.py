@@ -52,6 +52,7 @@ from adscan_internal.services.auth_error_classification import (
     is_unreachable_foreign_realm_error,
 )
 from adscan_internal.services.async_bridge import run_async_sync, run_sync_off_loop
+from adscan_core.rich_output import print_exception
 
 
 SD_FLAGS_DACL_CONTROL: str = "sd_flags_dacl"
@@ -280,6 +281,18 @@ class ADscanLDAPConfig:
     ccache — fixing the classic ``insufficientAccessRights`` after a
     successful privilege grant.  When ``None``, the legacy ``ccache_path`` /
     ``KRB5CCNAME`` path is used unchanged (no refresh)."""
+
+    ntlm_dcom_fallback_secret: str | None = field(default=None, repr=False)
+    """NTLM-usable secret preserved across the Kerberos salt-correct pre-mint.
+
+    Populated by the pre-mint from the original password / NT-hash-in-password,
+    because that pre-mint clears ``password`` / ``aes_key`` to force the
+    kerberos-ccache bind. Read ONLY by NTLM/PtH-only DCOM consumers of THIS
+    connection (GetCASecurity for ESC7, the ESC8 EPA channel-binding probe) —
+    those can't use a Kerberos ccache and would otherwise be silently skipped on
+    every password-auth Kerberos domain. The bind URL builder and the
+    expiry-reminter deliberately ignore it (it never influences the bind); it is
+    bind-inert. ``repr=False`` keeps the secret out of config reprs."""
 
     posture_sink: "PostureSink | None" = None
     """Optional callable invoked when this transport observes a domain-wide
@@ -942,6 +955,7 @@ class ADscanLDAPConnection:
         except Exception as exc:  # noqa: BLE001
             self.last_error = exc
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap] add failed for dn={mark_sensitive(dn, 'path')}: {exc}"
             )
@@ -994,6 +1008,7 @@ class ADscanLDAPConnection:
         except Exception as exc:  # noqa: BLE001
             self.last_error = exc
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap] modify failed for dn={mark_sensitive(dn, 'path')}: {exc}"
             )
@@ -1028,6 +1043,7 @@ class ADscanLDAPConnection:
         except Exception as exc:  # noqa: BLE001
             self.last_error = exc
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap] delete failed for dn={mark_sensitive(dn, 'path')}: {exc}"
             )
@@ -1087,6 +1103,7 @@ class ADscanLDAPConnection:
             raise
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap] modify_dn failed for dn={mark_sensitive(dn, 'path')}: {exc}"
             )
@@ -1484,6 +1501,7 @@ def prepare_kerberos_ldap_environment(
             sync_clock(domain_key)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[ldap] Kerberos clock sync failed before {marked_operation} for "
                 f"{mark_sensitive(domain_key, 'domain')}: {exc}"
@@ -1506,6 +1524,7 @@ def prepare_kerberos_ldap_environment(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ldap] Failed to prepare Kerberos LDAP environment for "
             f"{mark_sensitive(domain_key, 'domain')}: {exc}"
@@ -1523,6 +1542,7 @@ def prepare_kerberos_ldap_environment(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[ldap] Kerberos ticket validation failed for {marked_user}@"
                 f"{marked_auth_domain} during {marked_operation}: {exc}"
@@ -1588,6 +1608,7 @@ def prepare_kerberos_ldap_environment(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap] Kerberos ticket refresh raised during {marked_operation}: "
                 f"Cause: {_format_exception_chain_summary(exc)}"
@@ -1769,6 +1790,7 @@ def _emit_posture_signal(
         sink(signal)
     except Exception as sink_exc:
         telemetry.capture_exception(sink_exc)
+        print_exception(exception=sink_exc)
         print_info_debug(
             f"[ldap_transport] posture sink raised: "
             f"{type(sink_exc).__name__}: {sink_exc}"
@@ -2587,6 +2609,7 @@ async def _premint_kerberos_ccache_for_ldap(
         # Best-effort: do not mask the real error. Fall back to the original
         # config so the bind surfaces the authentic failure on its own path.
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[ldap_transport] Kerberos TGT pre-mint failed "
             f"({type(exc).__name__}: {exc}); falling back to the direct "
@@ -2602,6 +2625,7 @@ async def _premint_kerberos_ccache_for_ldap(
         _Path(tmp_path).chmod(0o600)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ldap_transport] failed to persist pre-minted ccache: {exc}; "
             "falling back to the direct kerberos bind path"
@@ -2620,6 +2644,11 @@ async def _premint_kerberos_ccache_for_ldap(
         ccache_path=tmp_path,
         password=None,
         aes_key=None,
+        # Preserve the original password / NT-hash-in-password (both NTLM-usable)
+        # so NTLM/PtH-only DCOM consumers (GetCASecurity, ESC8 EPA) still have a
+        # secret after the bind switched to kerberos-ccache. AES-only creds are
+        # deliberately NOT preserved (no NTLM secret -> DCOM read stays skipped).
+        ntlm_dcom_fallback_secret=(str(config.password) if config.password else None),
     )
     print_info_debug(
         f"[ldap_transport] pre-minted TGT written ({len(ccache_bytes)} B); "
@@ -2710,6 +2739,7 @@ async def _premint_via_credential_context(
         await cred_ctx.refresh_if_stale(force=True)
     except Exception as exc:  # noqa: BLE001 — never mask the real bind error
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[ldap_transport] CredentialContext pre-mint raised "
             f"{type(exc).__name__}: {exc}; falling back to the standalone "
@@ -2732,11 +2762,18 @@ async def _premint_via_credential_context(
     # and reuses this one salt-correct ticket — identical to the /tmp path,
     # except the path is the context's canonical per-user ccache, so the
     # pre-bind refresh and the expiry reminter all converge on the same file.
+    # Preserve an NTLM-usable secret for the NTLM/PtH-only DCOM consumers
+    # (GetCASecurity, ESC8 EPA) uniformly with the /tmp branch. This branch also
+    # retains ``credential_context`` (from which the same secret is recoverable),
+    # so this is belt-and-suspenders; prefer the context secret, else the config
+    # password (both plaintext OR NT-hash-in-password are NTLM-usable).
+    _ntlm_dcom_secret = getattr(cred_ctx, "password", None) or config.password
     rewritten = _dc_ctx_premint.replace(
         config,
         ccache_path=ctx_path,
         password=None,
         aes_key=None,
+        ntlm_dcom_fallback_secret=(str(_ntlm_dcom_secret) if _ntlm_dcom_secret else None),
     )
     print_info_debug(
         "[ldap_transport] pre-minted salt-correct TGT via CredentialContext; "
@@ -2796,6 +2833,27 @@ async def async_connect_with_ldap_fallback(
     """
     modules = _load_badldap_modules()
     LDAPConnectionFactory = modules["LDAPConnectionFactory"]
+
+    # Transversal PROACTIVE clock sync at the LDAP auth seam (mirror of
+    # smb_transport.smb_machine_for): before ANY Kerberos LDAP bind — and BEFORE
+    # the TGT pre-mint below — ensure the host clock is fresh vs the target DC.
+    # TTL-memoized (~1ms no-op when fresh), best-effort, shell-less via the
+    # session-registered shell. When no host-helper can physically step, the
+    # guard still seeds the measured offset into kerbad's realm cache, so this is
+    # what primes the skew correction EARLY (LDAP runs first in collection) for
+    # every later transport, not just LDAP itself.
+    if getattr(config, "use_kerberos", False):
+        try:
+            from adscan_internal.services.dc_time import (  # noqa: PLC0415
+                ensure_clock_synced_for_target,
+            )
+
+            await ensure_clock_synced_for_target(
+                str(getattr(config, "domain", "") or ""),
+                str(getattr(config, "dc_ip", "") or ""),
+            )
+        except Exception:  # noqa: BLE001 — never let the sync break the bind
+            pass
 
     # ---- FIX 1: salt-aware Kerberos TGT pre-mint ----------------------------
     # When the bind would mint a FRESH TGT (kerberos-password / -aes / -rc4),
@@ -3750,6 +3808,7 @@ def _execute_with_ldap_fallback_impl(
                 )
             except Exception as _emit_exc:  # noqa: BLE001
                 telemetry.capture_exception(_emit_exc)
+                print_exception(exception=_emit_exc)
         raise last_exc
     raise RuntimeError(f"{operation_name} failed without executing any LDAP attempt")
 

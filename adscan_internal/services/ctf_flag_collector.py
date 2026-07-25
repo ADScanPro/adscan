@@ -63,6 +63,7 @@ from adscan_internal.services.smb_transport import (
     SMBTransportError,
     smb_machine_with_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 FlagKind = Literal["user", "root", "system", "flag", "proof", "unknown"]
 FlagMethod = Literal["smb_read", "remote_exec"]
@@ -925,6 +926,7 @@ async def _smb_byte_read_strategy(
             return bool(carry), carry
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             errors.append(f"unexpected error: {exc}")
             carry = consecutive_net_paths + candidate_slice
             return bool(carry), carry
@@ -1080,6 +1082,7 @@ async def _remote_exec_fallback_strategy(
                 break  # auth is definitive
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 last_detail = f"cascade error ({exc})"
                 last_outcome = _classify_error(exc)
                 if _is_retryable(last_outcome) and attempt < max_attempts:
@@ -1182,6 +1185,7 @@ def _make_panel_callback(shell, host_intel_cache, workspace_type):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     return _cb
 
 
@@ -1434,6 +1438,7 @@ async def collect_ctf_flags(
                 errors.extend(fb_errors)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 errors.append(f"remote_exec fallback raised: {exc}")
 
     # PowerShell recursive search — runs after all SMB strategies when at
@@ -1483,6 +1488,7 @@ async def collect_ctf_flags(
             errors.append("ps_search cancelled at 50s timeout")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             errors.append(f"ps_search raised: {exc}")
 
     # Reduce: per (kind, owner) pick the best hit. Conventional wins over
@@ -1578,6 +1584,7 @@ async def collect_ctf_flags(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     result = FlagCollectionResult(
         hits=final_hits,

@@ -56,6 +56,7 @@ from typing import Any
 
 from adscan_core import telemetry
 from adscan_internal.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +258,7 @@ class _SPNEGOCaptureAdapter:
             raise
         except Exception as exc:  # noqa: BLE001 - a single bad connection must not crash the listener
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[smb-ntlm-capture] handshake/parse error on inbound "
                 f"connection (ignored, listener continues): {exc}"

@@ -28,6 +28,7 @@ from adscan_internal.integrations.mssql import queries
 from adscan_internal.integrations.mssql.native_backend import ImpacketMSSQLBackend
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.service_access_results import ServiceAccessFinding
+from adscan_core.rich_output import print_exception
 
 
 MSSQL_ACCESS_PROBE_BACKEND = "mssql-native"
@@ -125,6 +126,7 @@ def _probe_one_target(
         )
     except Exception as exc:  # noqa: BLE001 — probe must never raise
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return ServiceAccessFinding(
             service="mssql",
             host=host,

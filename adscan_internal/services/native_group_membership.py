@@ -7,6 +7,7 @@ from typing import Any, Literal
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
 from adscan_internal.services.ldap_query_service import query_shell_ldap_attribute_values
+from adscan_core.rich_output import print_exception
 
 _LDAP_MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"
 
@@ -59,6 +60,7 @@ def _resolve_group_dn_filter_by_rid(shell: Any, domain: str, rid_value: int) -> 
         domain_sid = _resolve_domain_sid(shell, domain, snapshot)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         domain_sid = None
 
     if domain_sid:
@@ -242,6 +244,7 @@ def is_principal_member_of_rid_native(
         return any(str(sid).strip().upper().endswith(target_suffix) for sid in group_sids)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         marked_principal = mark_sensitive(principal, "user")
         print_info_debug(

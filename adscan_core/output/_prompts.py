@@ -154,6 +154,7 @@ def prompt_ask(
     *,
     password: bool = False,
     shell: object | None = None,
+    prefill_default: bool = True,
     **kwargs: Any,
 ) -> str:
     """Ask a text prompt with centralized prompt logging and safe fallback.
@@ -162,6 +163,18 @@ def prompt_ask(
     empty string when no default is provided) instead of blocking on stdin,
     mirroring the questionary helpers. Pass ``shell`` so the non-interactive
     predicate can see ``shell.auto`` / the session command type.
+
+    ``prefill_default`` controls whether ``default`` is inserted as
+    pre-existing editable text in the *interactive* input buffer. Rich's
+    backend never pre-fills (it only shows the default as a bracketed
+    hint and starts the buffer empty). The Questionary/prompt_toolkit
+    backend used inside the container runtime (``ADSCAN_CONTAINER_RUNTIME=1``)
+    DOES insert the default text into the editable buffer by design,
+    forcing the operator to delete it before typing something else. Set
+    ``prefill_default=False`` for prompts where typing a fresh value is
+    the overwhelmingly common intent (e.g. naming a new workspace) —
+    pressing Enter on an empty buffer still resolves to ``default`` on
+    both backends.
     """
     if _state._should_disable_prompt_interaction(shell):
         resolved = "" if default is None else str(default)
@@ -180,7 +193,13 @@ def prompt_ask(
         install_prompt_logging_wrappers()
         from rich.prompt import Prompt
 
-        answer = Prompt.ask(prompt, default=default, password=password, **kwargs)
+        answer = Prompt.ask(
+            prompt,
+            default=default,
+            password=password,
+            prefill_default=prefill_default,
+            **kwargs,
+        )
         return "" if answer is None else str(answer)
     except Exception as exc:
         fallback = "" if default is None else str(default)

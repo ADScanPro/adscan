@@ -30,6 +30,7 @@ from typing import Iterable
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 # Registry value paths as they appear (case-insensitively) in [Registry Values].
 _NETLOGON = r"machine\system\currentcontrolset\services\netlogon\parameters"
@@ -185,6 +186,7 @@ async def read_machine_password_policy(
                     )
     except Exception as exc:  # noqa: BLE001 — best-effort, never break collection
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"machine-pwd-policy: SYSVOL read failed: {exc}")
         return None
 
@@ -233,6 +235,7 @@ def collect_machine_password_policy_sync(
             pool.submit(_run).result()
     except Exception as exc:  # noqa: BLE001 — best-effort, never break collection
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"machine-pwd-policy: sync wrapper failed: {exc}")
         return None
     return holder.get("r")

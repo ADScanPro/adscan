@@ -441,7 +441,20 @@ class PA_DATA(core.Sequence): #!!!! IT STARTS AT ONE!!!!
 		('padata-type', core.Integer, {'tag_type': TAG, 'tag': 1}),
 		('padata-value', core.OctetString, {'tag_type': TAG, 'tag': 2}),
 	]
-	
+
+# Microsoft private extension (not in RFC 4120). When a KRB-ERROR carries
+# error-code KRB_ERR_GENERIC (0x3C, "the description is in the e-data
+# field"), Windows KDCs encode the real cause here: data-value's first 4
+# bytes are a little-endian NTSTATUS. Same shape/tags as impacket's
+# krb5.asn1.KERB_ERROR_DATA — used by errors.py to decode KRB_ERR_GENERIC
+# e-data instead of surfacing an opaque generic error.
+class KERB_ERROR_DATA(core.Sequence):
+	_fields = [
+		('data-type', core.Integer, {'tag_type': TAG, 'tag': 1}),
+		('data-value', core.OctetString, {'tag_type': TAG, 'tag': 2, 'optional': True}),
+	]
+
+
 class ETYPE_INFO_ENTRY(core.Sequence):
 	_fields = [
 		('etype', krb5int32, {'tag_type': TAG, 'tag': 0}),

@@ -158,6 +158,7 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
         telemetry.capture("dcsync_cracking_summary", properties)
     except Exception as exc:  # pragma: no cover - telemetry best effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"[dcsync] Failed to emit cracking summary telemetry: {type(exc).__name__}"
         )
@@ -494,6 +495,7 @@ def _render_dcsync_batch_cracking_summary(
             }
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[dcsync] Unable to classify cracked users by risk tier: {type(exc).__name__}"
             )
@@ -1124,8 +1126,9 @@ def execute_dcsync_native(
         svc = NativeDumpService()
         print_info_debug(
             f"dcsync-native: config: target={smb_config.target_ip} "
-            f"domain={smb_config.domain} auth_domain={smb_config.auth_domain} "
-            f"user={smb_config.username} "
+            f"domain={mark_sensitive(smb_config.domain, 'domain')} "
+            f"auth_domain={mark_sensitive(smb_config.auth_domain, 'domain')} "
+            f"user={mark_sensitive(smb_config.username, 'user')} "
             f"has_hash={bool(smb_config.nt_hash)} has_pass={bool(smb_config.password)} "
             f"use_kerberos={smb_config.use_kerberos} kdc={smb_config.kdc_ip}"
         )
@@ -1363,6 +1366,7 @@ def execute_dcsync_native(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         creds_to_persist = add_credentials_batch(
             shell=shell,
@@ -1399,6 +1403,7 @@ def execute_dcsync_native(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             md = mark_sensitive(domain, "domain")
             print_warning(
                 f"Failed to persist DomainPassReuse context steps from DCSync-All credentials in {md}; continuing."
@@ -1508,6 +1513,7 @@ def execute_dcsync_native(
                 )
             except Exception as _ac_exc:  # noqa: BLE001
                 telemetry.capture_exception(_ac_exc)
+                print_exception(exception=_ac_exc)
 
     # A full ("all") DRSUAPI walk just replicated the entire NTDS — record it
     # (SSOT marker consumed by the CTF + audit post-compromise pipelines) so the
@@ -1557,6 +1563,7 @@ def execute_dcsync_native(
             )
         except Exception as exc:  # pragma: no cover - presentation must never fail dump
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         # Centralised domain compromise promotion. Idempotent: a no-op
         # when the domain was already promoted via a different vector
@@ -1582,6 +1589,7 @@ def execute_dcsync_native(
             )
         except Exception as _exc:  # noqa: BLE001
             telemetry.capture_exception(_exc)
+            print_exception(exception=_exc)
 
     # Built-in Administrator hash extracted: Tier 0 evidence even if
     # krbtgt was filtered out. Detection is RID-based (RID 500) so it
@@ -1619,6 +1627,7 @@ def execute_dcsync_native(
             )
         except Exception as _exc:  # noqa: BLE001
             telemetry.capture_exception(_exc)
+            print_exception(exception=_exc)
 
     # ── Persist DCSync dump as workspace inventory artefact ─────────────
     # Drives the web app's DCSync Intelligence KPIs (recovery rate,
@@ -1648,6 +1657,7 @@ def execute_dcsync_native(
         )
     except Exception as _exc:  # noqa: BLE001
         telemetry.capture_exception(_exc)
+        print_exception(exception=_exc)
         print_info_debug(f"dcsync-native: inventory dump failed: {_exc}")
 
     tier0_rids = {500, 512, 518, 519}

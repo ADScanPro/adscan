@@ -28,6 +28,7 @@ from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
 )
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger(__name__)
@@ -423,6 +424,7 @@ class CredentialService(BaseService):
 
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return _fail(CredentialStatus.ERROR, str(exc))
 
     async def _verify_via_ntlm(
@@ -606,6 +608,7 @@ class CredentialService(BaseService):
             # Anything we cannot classify (e.g. strongerAuthRequired / channel
             # binding) is not a credential verdict — fall through to SMB.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[verify] NTLM LDAP bind inconclusive: {type(exc).__name__}: {exc}; "
                 "trying SMB backstop."
@@ -676,6 +679,7 @@ class CredentialService(BaseService):
             # SMB also unreachable / inconclusive → no verdict; the caller keeps
             # the precise KDC-filtered diagnosis.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[verify] NTLM SMB bind unreachable/inconclusive: "
                 f"{type(exc).__name__}: {exc}."
@@ -899,6 +903,7 @@ class CredentialService(BaseService):
         except Exception as exc:
             from adscan_core import telemetry
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return PasswordChangeResult(
                 success=False,
                 username=username,
@@ -1346,6 +1351,7 @@ class CredentialService(BaseService):
 
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             self.logger.exception(
                 f"Error executing password spraying command for {domain}",
                 extra={"command": command, "domain": domain},

@@ -37,6 +37,7 @@ from adscan_internal.services.remote_exec import (
 )
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal import get_console
+from adscan_core.rich_output import print_exception
 
 
 def _load_flags_ip_hostname_inventory(shell: Any, domain: str) -> dict | None:
@@ -133,13 +134,32 @@ def get_flags(
 
 
 def do_get_flags(shell: Any, args: str) -> None:
-    """Shell handler: ``get_flags <domain> <username> <password>``."""
-    args_list = args.split()
-    if len(args_list) != 3:
-        print_error("Usage: get_flags <domain> <username> <password>")
+    """Shell handler.
+
+    Usage:
+        get_flags <domain> <username> <password>
+        get_flags -d <domain> -u <username> -p <password>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+    """
+    from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+    usage = "get_flags <domain> <username> <password>  |  get_flags -d <domain> -u <username> -p <password>"
+    parser = ReplArgumentParser(prog="get_flags", add_help=False)
+    parser.add_argument("-d", "--domain", required=True)
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password"),
+        parser=parser,
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain, username, password = args_list
-    get_flags(shell, domain, username, password)
+    get_flags(shell, namespace.domain, namespace.username, namespace.password)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +249,7 @@ def _save_flags_to_files(
             print_info(f"{label} saved to: {path}")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_verbose(f"Failed to save {label.lower()}: {exc}")
 
     _persist("user.txt", user_flag, "User flag")
@@ -406,6 +427,7 @@ def execute_get_flags(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Error obtaining flags from domain {marked_domain}: {exc}")
         return

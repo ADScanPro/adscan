@@ -30,6 +30,7 @@ from adscan_internal.services.background_jobs.results_bus import (
     JobResult,
     JobResultSink,
 )
+from adscan_core.rich_output import print_exception
 
 
 class PoisoningJobRuntime:
@@ -66,6 +67,12 @@ class PoisoningJobRuntime:
         interface = self.interface
         advertised_ip = self.advertised_ip
 
+        from adscan_internal.services.background_jobs.shared_capture_listener import (  # noqa: PLC0415
+            get_or_create_capture_broker,
+        )
+
+        broker = get_or_create_capture_broker(self.shell)
+
         def _async_thread() -> None:
             # The suite's LLMNR/NBT-NS/mDNS listener DEBUG runs on THIS worker
             # thread; route it off the live console (telemetry + deferred flush)
@@ -83,6 +90,7 @@ class PoisoningJobRuntime:
                             stop_event=self._stop_event,
                             ready_event=ready_event,
                             error_holder=error_holder,
+                            broker=broker,
                         )
                     )
                 finally:
@@ -148,6 +156,7 @@ class PoisoningJobRuntime:
                     _handle_capture_to_sink(self, item)
                 except Exception as exc:  # noqa: BLE001 — never let a bad capture kill the job
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
 
 def _handle_capture_to_sink(runtime: "PoisoningJobRuntime", item: dict) -> None:
@@ -218,3 +227,4 @@ def _handle_capture_to_sink(runtime: "PoisoningJobRuntime", item: dict) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)

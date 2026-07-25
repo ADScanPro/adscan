@@ -51,6 +51,7 @@ from adscan_internal.services.high_value import (
 )
 from adscan_internal.services.path_renderer import _path_compromise_class
 from adscan_internal.services.principal_tier_resolver import resolve_user_privilege_tier
+from adscan_core.rich_output import print_exception
 
 
 def classify_harvested_principal_tier(
@@ -95,6 +96,7 @@ def _machine_privilege_tier(
                 node = resolver(domain, hostname) or resolver(domain, f"{hostname}.{domain}")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         node = None
     # No computer node resolved (no graph / node not yet collected) → the tier
     # is UNDETERMINED, not a false TIER2. A machine's tier is entirely derived
@@ -161,6 +163,7 @@ def _attack_graph_has_data(shell: Any, domain: str) -> bool:
         return any(_edge_is_real(edge, synthetic_ids) for edge in edges)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -231,6 +234,7 @@ def classify_harvested_principals_reach(
         ordered = order_attack_paths_for_display(summaries)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # Recompute failed for the misses — return UNDETERMINED for them, do NOT
         # memoize a guessed value, and keep any reused hits.
         for user in misses:

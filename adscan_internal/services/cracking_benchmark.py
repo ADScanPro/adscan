@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 
 # The four hashcat modes ADscan cracks: NetNTLMv2, NetNTLMv1, Kerberoast
 # (TGS-REP, RC4), AS-REP Roasting (RC4). Etype-derived AES modes
@@ -168,6 +169,7 @@ def _load_cache() -> BenchmarkRecord | None:
         )
     except Exception as exc:  # noqa: BLE001 -- a corrupt cache is cold, never crashes
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -197,6 +199,7 @@ def _save_cache(record: BenchmarkRecord) -> None:
         )
     except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # Surface the failure LOUDLY, not just via telemetry: a benchmark cache
         # that never lands means ``hashcat -b`` re-sweeps every scan, and a
         # silent write error (perms / wrong path / serialisation) is otherwise
@@ -340,9 +343,16 @@ def _run_single_benchmark(shell: Any, mode: str, device_flag: str) -> float | No
     cmd = " ".join(shlex.quote(a) for a in argv)
     try:
         wrapped = maybe_wrap_hashcat_for_container(cmd)
-        result = shell.run_command(wrapped, timeout=120)
+        # untrusted_output: hashcat's --machine-readable benchmark line and the
+        # OpenCL device banner are raw tool chatter, not operator-authored
+        # content the pattern-sanitizer needs to preserve — suppress the
+        # debug head/tail preview so it doesn't pollute the session recording
+        # between unrelated interactive steps. The parsed speed result below
+        # is unaffected; only the recorded preview is suppressed.
+        result = shell.run_command(wrapped, timeout=120, untrusted_output=True)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
     if result is None:
         return None
@@ -359,9 +369,14 @@ def _probe_devices(shell: Any) -> str | None:
 
     try:
         wrapped = maybe_wrap_hashcat_for_container("hashcat -I")
-        result = shell.run_command(wrapped, timeout=30)
+        # untrusted_output: the OpenCL/CUDA device-info banner is raw tool
+        # chatter (not operator-authored content) that clutters the debug
+        # preview between unrelated interactive prompts — suppress it there;
+        # the full text is still returned to the caller below.
+        result = shell.run_command(wrapped, timeout=30, untrusted_output=True)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
     if result is None:
         return None
@@ -508,6 +523,7 @@ def get_or_run_benchmark(
         return rates
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return cached.rates if cached is not None else None
 
 
@@ -617,6 +633,7 @@ def write_benchmark_estimates(
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 -- artifact write is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _warm_benchmark_worker(shell: Any) -> None:
@@ -636,6 +653,7 @@ def _warm_benchmark_worker(shell: Any) -> None:
             write_benchmark_estimates(shell, rates)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def warm_benchmark_async(shell: Any) -> None:
@@ -661,6 +679,7 @@ def warm_benchmark_async(shell: Any) -> None:
         thread.start()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 __all__ = [

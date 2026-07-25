@@ -71,6 +71,7 @@ from adscan_internal.services.rodc_followup_planner import (
     resolve_rodc_krbtgt_key_plan,
 )
 from adscan_internal.models.domain import resolve_dc_ip
+from adscan_core.rich_output import print_exception
 
 
 _RODC_ALLOWED_GROUP = "Allowed RODC Password Replication Group"
@@ -1645,6 +1646,7 @@ def _save_rodc_key_list_output(
         path.write_text(output, encoding="utf-8")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[rodc] failed to save Kerberos Key List output: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -2389,6 +2391,7 @@ def offer_rodc_escalation(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[rodc][prp-readback] failed to re-read RODC PRP state: "
                     f"{type(exc).__name__}: {exc}"
@@ -2466,6 +2469,7 @@ def offer_rodc_escalation(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("RODC follow-up encountered an error.")
         print_info_debug(f"[rodc] escalation helper failed: {exc}")
         return False
@@ -2516,6 +2520,7 @@ def offer_rodc_escalation(
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(f"[rodc] failed to render PRP next steps: {exc}")
             else:
                 _print_rodc_cleanup_manual_guidance(
@@ -2535,6 +2540,7 @@ def offer_rodc_escalation(
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(f"[rodc] failed to render PRP next steps: {exc}")
         try:
             execute_cleanup_scope(shell, scope_id=cleanup_scope_id)

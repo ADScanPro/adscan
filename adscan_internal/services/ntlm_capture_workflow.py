@@ -689,11 +689,13 @@ class NativeListenerCapture:
     ) -> NtlmCaptureObservation | None:
         """Wait for the first matching NTLM capture from the native listener."""
 
-        deadline = time.time() + max(timeout_seconds, 1)
+        # monotonic, not time.time(): ADscan physically steps the host wall clock
+        # mid-scan for DC sync, which would corrupt a wall-clock deadline.
+        deadline = time.monotonic() + max(timeout_seconds, 1)
         expected = _normalize_expected_usernames(expected_usernames or [])
 
-        while time.time() < deadline:
-            remaining = deadline - time.time()
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             try:
                 obs = self._capture_queue.get(timeout=min(poll_interval_seconds, max(remaining, 0.01)))
             except _queue.Empty:
@@ -706,9 +708,124 @@ class NativeListenerCapture:
         return None
 
 
+def _run_probe_via_broker(
+    *,
+    broker: Any,
+    consumer_id: str,
+    bind_ip: str,
+    trigger: NativeCoercionTrigger,
+    target: str,
+    listener_ip: str,
+    username: str,
+    secret: str,
+    domain: str,
+    expected_usernames: Iterable[str],
+    capture_timeout_seconds: int,
+    trigger_timeout_seconds: int,
+    auth_type: str,
+    trigger_auth_mode: str,
+    trigger_env: dict[str, str] | None,
+    dc_ip: str | None,
+    method_filter: str | None,
+    proxies: list | None,
+    listener_ready_delay_seconds: float,
+    post_trigger_wait_seconds: float,
+    sleep_fn: Callable[[float], None],
+) -> NtlmCaptureProbeResult:
+    """Coercion-to-capture probe over the SHARED :445 broker (not a private bind).
+
+    Fixes the prod bug where broadcast poisoning already held :445 and the
+    sweep's own ``NativeListenerCapture`` could not bind (``[Errno 98]``), so the
+    NTLM auth-type classification was silently dropped from an audit. Captures
+    arrive via the broker's fan-out sink (filtered to ``expected_usernames``); a
+    ``threading.Event`` drives the trigger's early-stop ``capture_signal`` —
+    equivalent to ``make_capture_signal`` (which reads the append-only
+    ``_observed`` buffer, unaffected by the broker's queue drain). Only
+    ``wait_for_capture`` — which drains the queue and WOULD race the broker's
+    poll loop — is replaced here by the sink queue.
+    """
+    expected_list = list(expected_usernames)
+    expected_norm = _normalize_expected_usernames(expected_list)
+    captured: _queue.Queue = _queue.Queue()
+    capture_event = threading.Event()
+
+    def _sink(obs: Any) -> None:
+        try:
+            if expected_norm and str(getattr(obs, "clean_user", "")).casefold() not in expected_norm:
+                return
+            captured.put(obs)
+            capture_event.set()
+        except Exception:  # noqa: BLE001 — a bad sink must never break the broker fan-out
+            pass
+
+    if not broker.acquire(consumer_id, bind_ip=bind_ip, on_capture=_sink):
+        return NtlmCaptureProbeResult(
+            success=False, auth_type=None, observation=None,
+            reason="listener_start_failed", trigger_command=[],
+            trigger_auth_mode=None, attempted_trigger_auth_modes=(),
+            trigger_returncode=None, trigger_stdout="", trigger_stderr="",
+            trigger_error_kind=None, trigger_error_detail=None,
+            listener_returncode=None, listener_expected_stop=False,
+        )
+
+    trigger_command: list[str] = []
+    trigger_result: NativeCoercionExecution | None = None
+    trigger_error_kind: str | None = None
+    trigger_error_detail: str | None = None
+    observation: NtlmCaptureObservation | None = None
+    try:
+        sleep_fn(max(listener_ready_delay_seconds, 0.0))
+        trigger_execution = trigger.run(
+            target=target,
+            listener_ip=listener_ip,
+            username=username,
+            secret=secret,
+            domain=domain,
+            timeout_seconds=trigger_timeout_seconds,
+            auth_type=auth_type,
+            use_kerberos=trigger_auth_mode == "kerberos",
+            env=trigger_env,
+            dc_ip=dc_ip,
+            method_filter=method_filter,
+            proxies=proxies,
+            capture_signal=capture_event.is_set,
+        )
+        trigger_command = trigger_execution.command
+        trigger_result = trigger_execution
+        trigger_error_kind = trigger_execution.error_kind
+        trigger_error_detail = trigger_execution.error_detail
+        sleep_fn(max(post_trigger_wait_seconds, 0.0))
+        try:
+            observation = captured.get(timeout=max(int(capture_timeout_seconds), 1))
+        except _queue.Empty:
+            observation = None
+    finally:
+        try:
+            broker.release(consumer_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return NtlmCaptureProbeResult(
+        success=observation is not None,
+        auth_type=observation.ntlm_version if observation is not None else None,
+        observation=observation,
+        reason=None if observation is not None else "capture_not_observed",
+        trigger_command=trigger_command,
+        trigger_auth_mode=trigger_auth_mode,
+        attempted_trigger_auth_modes=(trigger_auth_mode,),
+        trigger_returncode=(trigger_result.returncode if trigger_result is not None else None),
+        trigger_stdout=trigger_result.stdout if trigger_result else "",
+        trigger_stderr=trigger_result.stderr if trigger_result else "",
+        trigger_error_kind=trigger_error_kind,
+        trigger_error_detail=trigger_error_detail,
+        listener_returncode=None,
+        listener_expected_stop=True,
+    )
+
+
 def run_ntlm_capture_probe(
     *,
-    listener: NativeListenerCapture,
+    listener: NativeListenerCapture | None = None,
     trigger: NativeCoercionTrigger,
     target: str,
     listener_ip: str,
@@ -727,6 +844,9 @@ def run_ntlm_capture_probe(
     listener_ready_delay_seconds: float = 2.0,
     post_trigger_wait_seconds: float = 2.0,
     sleep_fn: Callable[[float], None] = time.sleep,
+    broker: Any = None,
+    broker_consumer_id: str | None = None,
+    broker_bind_ip: str | None = None,
 ) -> NtlmCaptureProbeResult:
     """Run a coercion-to-capture probe and classify the observed NTLM auth type.
 
@@ -734,7 +854,41 @@ def run_ntlm_capture_probe(
     a ``capture_signal`` bound to the listener so it stops the instant a REAL
     inbound NTLM capture matching ``expected_usernames`` is observed. The
     listener queue then yields the authoritative observation for classification.
+
+    Two capture backends: pass ``broker`` (the shared :445 capture-listener
+    broker) + ``broker_consumer_id`` + ``broker_bind_ip`` to SHARE the one :445
+    listener with poisoning / the write-share bait (the robust path — no private
+    bind, no ``[Errno 98]`` collision); or pass a ``listener`` for the legacy
+    own-a-listener path (kept for direct callers/tests).
     """
+
+    if broker is not None:
+        return _run_probe_via_broker(
+            broker=broker,
+            consumer_id=broker_consumer_id or f"ntlm_sweep@{target}",
+            bind_ip=broker_bind_ip or listener_ip,
+            trigger=trigger,
+            target=target,
+            listener_ip=listener_ip,
+            username=username,
+            secret=secret,
+            domain=domain,
+            expected_usernames=expected_usernames,
+            capture_timeout_seconds=capture_timeout_seconds,
+            trigger_timeout_seconds=trigger_timeout_seconds,
+            auth_type=auth_type,
+            trigger_auth_mode=trigger_auth_mode,
+            trigger_env=trigger_env,
+            dc_ip=dc_ip,
+            method_filter=method_filter,
+            proxies=proxies,
+            listener_ready_delay_seconds=listener_ready_delay_seconds,
+            post_trigger_wait_seconds=post_trigger_wait_seconds,
+            sleep_fn=sleep_fn,
+        )
+
+    if listener is None:
+        raise ValueError("run_ntlm_capture_probe requires either a listener or a broker")
 
     if not listener.start():
         return NtlmCaptureProbeResult(

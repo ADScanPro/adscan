@@ -16,6 +16,24 @@ from __future__ import annotations
 
 from enum import Enum
 
+#: Statuses that count as PROVEN domain compromise — the single source of truth
+#: for "is this path proven?". Strict on purpose: only a demonstrably-reached
+#: Tier-0 target counts, so a failed post-ex is NOT presented as proven. The set
+#: deliberately spans all three status vocabularies' proven tokens (attack STEP
+#: ``success`` / attack PATH ``exploited`` / canonical ``PathState``
+#: ``domain_compromised``) — NEVER test ``status == "exploited"`` against a bare
+#: literal, always membership here (a proven path may be keyed
+#: ``domain_compromised`` or ``success``, not ``exploited``).
+#:
+#: Declared on this lean, import-safe leaf (no ``adscan_internal`` imports) so
+#: consumers that only need the proven-token set — e.g. the client-presentation
+#: ordering ``attack_path_presentation`` imported by the web backend — get a
+#: MINIMAL closure and do not drag ``exposure_score_service`` into it.
+#: ``exposure_score_service`` re-exports this name for full backward compat.
+_PROVEN_STATUSES: frozenset[str] = frozenset(
+    {"success", "exploited", "domain_compromised"}
+)
+
 
 class PathState(str, Enum):
     """Canonical lifecycle state of an attack path."""

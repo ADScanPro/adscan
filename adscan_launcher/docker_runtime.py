@@ -27,11 +27,14 @@ from typing import Callable, Sequence
 
 from adscan_core.version_context import RUNTIME_CONTRACT_VERSION
 from adscan_launcher.docker_pull_diagnostics import (
+    PullFailureDiagnosis,
     classify_pull_failure,
+    is_user_interrupt_returncode,
     record_last_failure,
     strip_ansi,
 )
 from adscan_launcher.output import (
+    print_info,
     print_info_debug,
     print_panel,
     print_warning,
@@ -39,6 +42,7 @@ from adscan_launcher.output import (
     print_instruction,
 )
 from adscan_launcher.paths import get_state_dir
+from adscan_core.rich_output import print_exception
 
 
 _DOCKER_PERMISSION_DENIED_RE = re.compile(
@@ -665,7 +669,29 @@ def _handle_pull_failure(
     intermediate attempts so the user only sees one coherent message
     per outcome (retrying / recovered / permanently failed) instead of
     a noisy chain of partial failures and warnings.
+
+    A user Ctrl-C during the pull is handled FIRST and separately: the
+    return code (``130`` / ``-SIGINT``) — not any stderr text — is the
+    only reliable interrupt signal, so it is detected here, recorded as a
+    dedicated ``user_interrupt`` diagnosis, shown as a calm cancellation
+    message (always, regardless of ``surface_failure`` — a cancel is
+    terminal), and re-raised as ``KeyboardInterrupt`` so the launcher
+    unwinds to its top-level handler and exits with the conventional
+    interrupt code. It is never misclassified as an "unclassified error"
+    and never handed to the retry loop.
+
+    Raises:
+        KeyboardInterrupt: when ``rc`` indicates the operator cancelled
+            the pull with Ctrl-C.
     """
+    if is_user_interrupt_returncode(rc):
+        record_last_failure(PullFailureDiagnosis(kind="user_interrupt", evidence=[]))
+        print_info_debug(f"docker pull interrupted by user: image={image} rc={rc}")
+        print_info(
+            "Installation cancelled. Rerun `adscan install` when ready; if the "
+            "pull was slow, try a faster or less-throttled network."
+        )
+        raise KeyboardInterrupt
     clean_stderr = strip_ansi(stderr or "")
     clean_stdout = strip_ansi(stdout or "")
     diagnosis = classify_pull_failure(clean_stderr, clean_stdout)
@@ -912,6 +938,7 @@ def probe_and_warn_reduced_runtime(cfg: DockerRunConfig) -> None:
             from adscan_core import telemetry  # noqa: PLC0415
 
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         except Exception:  # noqa: BLE001
             pass
 

@@ -27,14 +27,216 @@ from adscan_internal.services.background_jobs.registry import (
 from adscan_internal.services.background_jobs.results_bus import (
     make_registry_result_sink,
 )
+from adscan_internal.services.background_jobs.writeshare_bait_job import (
+    WriteShareBaitJobRuntime,
+)
+from adscan_core.rich_output import print_exception
 
 _CI_OPT_OUT_ENV = "ADSCAN_NO_POISONING"
 _POISONING_KIND = "poisoning"
+_WRITESHARE_BAIT_KIND = "writeshare_bait"
+
+# Hard opt-out for the write-share NTLMv2-bait background job (parity with
+# ``ADSCAN_NO_POISONING`` — a monitored / out-of-scope engagement kill switch).
+_WRITESHARE_BAIT_OPT_OUT_ENV = "ADSCAN_NO_WRITESHARE_BAIT"
+
+
+def _env_flag_set(name: str) -> bool:
+    """True when environment variable ``name`` is set to a truthy value."""
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes"}
 
 
 def _ci_opt_out() -> bool:
     """True when the non-interactive opt-OUT env disables the auto-launch."""
-    return str(os.environ.get(_CI_OPT_OUT_ENV, "")).strip().lower() in {"1", "true", "yes"}
+    return _env_flag_set(_CI_OPT_OUT_ENV)
+
+
+def writeshare_bait_enabled(shell: Any) -> bool:
+    """Return whether ADscan should run the write-share NTLMv2-bait job.
+
+    SSOT accessor for the ``--scan-config`` ``writeshare_bait.enabled`` toggle
+    (:class:`adscan_internal.services.scan_config.WriteShareBaitConfig`). The
+    write-share bait plants a coercing file on a writable share and waits for a
+    browsing user to leak a NetNTLMv2 — a wait-for-a-victim technique that runs
+    as a background job, so this resolver mirrors the poisoning / pivoting
+    enable resolution.
+
+    Precedence, strongest first:
+
+    1. ``ADSCAN_NO_WRITESHARE_BAIT=1`` (hard opt-out) → ``False``,
+       unconditionally — even over an explicit ``scan_config`` enable.
+    2. ``scan_config.writeshare_bait.enabled`` explicitly set (not ``None``) →
+       authoritative, overrides the workspace-type default in both directions.
+    3. Otherwise → the workspace-type default: ``ctf`` workspaces default to
+       ``True`` (a lab/CTF engagement has no client-facing OPSEC concern and can
+       wait for a share to be browsed); every other workspace type (``audit`` —
+       a real client engagement) defaults to ``False``, keeping a bait file left
+       on a client share opt-in only.
+
+    Safe no-op default: returns ``False`` whenever ``shell`` has no
+    ``scan_config`` attribute, no ``writeshare_bait`` section, or a malformed
+    value, AND the workspace type cannot be resolved to ``ctf``. Never raises.
+
+    Args:
+        shell: The active shell/session, expected to carry a ``scan_config``
+            attribute (:class:`~adscan_internal.services.scan_config.ScanConfig`)
+            when a ``--scan-config`` file was supplied, and a ``type`` attribute
+            identifying the workspace kind (``"ctf"`` / ``"audit"``).
+
+    Returns:
+        ``True`` when explicitly enabled (and not env-opted-out), or when unset
+        and the workspace is a CTF workspace. ``False`` otherwise.
+    """
+    # (1) Hard env opt-out — strongest precedence.
+    if _env_flag_set(_WRITESHARE_BAIT_OPT_OUT_ENV):
+        return False
+
+    # (2) Explicit scan_config toggle is authoritative.
+    try:
+        scan_config = getattr(shell, "scan_config", None)
+        writeshare_bait = getattr(scan_config, "writeshare_bait", None)
+        enabled = getattr(writeshare_bait, "enabled", None)
+        if enabled is not None:
+            return bool(enabled)
+    except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
+        pass
+
+    # (3) No explicit config → workspace-type default (ctf on, audit off).
+    try:
+        return str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
+        return False
+
+
+def _render_writeshare_bait_consent_panel(scope: str, bait_count: int) -> None:
+    """Concise didactic consent panel for the write-share-bait offer."""
+    from adscan_core.rich_output import print_panel  # noqa: PLC0415
+
+    print_panel(
+        f"ADscan can plant NTLMv2-capture bait on {bait_count} writable share(s) on "
+        f"[bold]{scope}[/bold]. A file whose icon points at ADscan's listener is "
+        "dropped in each; a user who simply BROWSES the folder is coerced into an "
+        "NTLM authentication ADscan captures — no click required.\n\n"
+        "[dim]This runs as a BACKGROUND job: the scan continues while the bait waits. "
+        "The bait is a modification to the client's share — it is tracked and removed "
+        "at scan end (or with 'stop_writeshare'). On a monitored / out-of-scope "
+        "engagement, decline.[/dim]",
+        title="[bold]Write-Share NTLMv2 Bait[/bold]",
+        title_align="left",
+        border_style="yellow",
+    )
+
+
+def maybe_launch_writeshare_bait_job(
+    shell: Any,
+    domain: str,
+    *,
+    target_host: str,
+    targets: list[Any],
+    creds: dict[str, Any],
+    listener_ip: str,
+    file_type: str = "url",
+    use_kerberos: bool = False,
+    kdc_host: Optional[str] = None,
+    spn_host: Optional[str] = None,
+    listener_bind_ip: Optional[str] = None,
+    pivot_plan: Any = None,
+) -> Optional[BackgroundJob]:
+    """Decide + launch a write-share NTLMv2-bait background job. Best-effort.
+
+    Mirrors :func:`maybe_launch_poisoning_job`: no-target guard → idempotency
+    (``(kind, scope=target_host)``) → hard env opt-out → the
+    :func:`writeshare_bait_enabled` gate (ctf default-on, audit default-off unless
+    the ``--scan-config`` toggle enables it) → interactive consent (default = the
+    resolved enable) / non-interactive auto-launch iff enabled → plant + register.
+    Returns the job on launch (or the existing active job), else ``None``. Never
+    raises — a launch failure must not abort the scan.
+    """
+    try:
+        if not target_host or not targets or not listener_ip:
+            return None
+        scope = str(target_host)
+        registry = get_or_create_registry(shell)
+
+        existing = registry.find_active(_WRITESHARE_BAIT_KIND, scope)
+        if existing is not None:
+            return existing
+
+        if _env_flag_set(_WRITESHARE_BAIT_OPT_OUT_ENV):
+            return None
+
+        enabled = writeshare_bait_enabled(shell)
+        if is_non_interactive(shell):
+            if not enabled:
+                return None
+        else:
+            _render_writeshare_bait_consent_panel(scope, len(targets))
+            consent = confirm_ask(
+                f"Plant NTLMv2 bait on {len(targets)} writable share(s) on {scope}?",
+                default=enabled,
+            )
+            if not consent:
+                print_instruction(
+                    "Skipped. The bait can be planted from the share-exposure step."
+                )
+                return None
+
+        job = registry.create(kind=_WRITESHARE_BAIT_KIND, scope=scope)
+        sink = make_registry_result_sink(registry)
+        runtime = WriteShareBaitJobRuntime(
+            shell,
+            domain=domain,
+            target_host=target_host,
+            listener_ip=listener_ip,
+            creds=creds,
+            targets=targets,
+            sink=sink,
+            job_id=job.id,
+            scope=scope,
+            file_type=file_type,
+            use_kerberos=use_kerberos,
+            kdc_host=kdc_host,
+            spn_host=spn_host,
+            listener_bind_ip=listener_bind_ip,
+            pivot_plan=pivot_plan,
+        )
+        if not runtime.start():
+            registry.mark(job.id, state="failed")
+            return None
+        registry.attach_runtime(job.id, runtime)
+        print_info(
+            f"Write-share NTLMv2 bait planted on {scope} ({len(targets)} share(s)). "
+            "Captures appear as users browse the share; 'jobs' for status, "
+            "'stop_writeshare' to stop and remove the bait."
+        )
+        return job
+    except Exception as exc:  # noqa: BLE001 — a launch failure must not abort the scan
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
+def stop_writeshare_bait_jobs(shell: Any) -> list[str]:
+    """Stop every active write-share-bait job — removes its bait + releases :445.
+
+    The convenience verb behind ``stop_writeshare`` (parity with
+    ``stop_poisoning``). Stopping via the registry drives each runtime's
+    ``stop()`` — which removes the planted bait (reconciling the env-change
+    ledger) and releases the shared :445 broker consumer, so :445 stays up only
+    if another consumer (poisoning) still holds it. Returns the scopes stopped.
+    Never raises.
+    """
+    stopped: list[str] = []
+    try:
+        registry = get_or_create_registry(shell)
+        for job in registry.active():
+            if job.kind == _WRITESHARE_BAIT_KIND:
+                registry.stop(job.id)
+                stopped.append(job.scope)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return stopped
 
 
 def _configured_poisoning_enabled(shell: Any) -> Optional[bool]:
@@ -110,6 +312,7 @@ def _render_poisoning_consent_panel(scope: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 — a panel must never block the offer
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def maybe_launch_poisoning_job(
@@ -199,6 +402,7 @@ def maybe_launch_poisoning_job(
         return job
     except Exception as exc:  # noqa: BLE001 — a launch failure must not abort the scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -271,6 +475,7 @@ def reconcile_jobs_at_scan_end(shell: Any) -> None:
             print_info("Stopped background poisoning.")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _render_scan_end_harvest_summary(shell: Any) -> None:

@@ -46,6 +46,7 @@ from adscan_internal.services.llm.external_cli_profiles import (
     normalize_external_cli_auth_check_command,
     normalize_external_cli_prompt_command_template,
 )
+from adscan_core.rich_output import print_exception
 
 
 class AIDependencyError(RuntimeError):
@@ -144,6 +145,7 @@ class AIService:
                 return client.get_runtime_info(timeout_seconds=8)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 return {}
         return {}
 
@@ -208,6 +210,7 @@ class AIService:
             return text_output
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(f"AI ask failed: {type(exc).__name__}: {exc}")
             self._last_response_metadata = {
                 "provider": self._config.provider.value,
@@ -250,6 +253,7 @@ class AIService:
                     self._maybe_update_history(result)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(f"AI stream failed: {type(exc).__name__}: {exc}")
             yield "AI streaming failed. Check model/provider configuration."
 
@@ -526,6 +530,7 @@ class AIService:
             return f"Codex app-server error: {exc}"
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(f"Codex app-server unexpected failure: {exc}")
             self._last_response_metadata = {
                 "provider": self._config.provider.value,
@@ -860,6 +865,7 @@ class AIService:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(
                 f"External CLI backend command failed: {type(exc).__name__}: {exc}"
             )
@@ -1070,6 +1076,7 @@ class AIService:
                 self._message_history = list(result.all_messages())
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to persist AI conversation history.")
 
     @staticmethod

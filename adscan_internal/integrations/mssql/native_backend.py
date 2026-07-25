@@ -17,13 +17,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from rich.markup import escape as rich_markup_escape
+
 from adscan_internal import print_info_debug
 from adscan_internal.command_runner import (
     build_execution_output_preview,
     build_text_preview,
     summarize_execution_result,
 )
-from adscan_internal.integrations.mssql.helpers import is_hash_authentication
+from adscan_internal.integrations.mssql.helpers import (
+    is_hash_authentication,
+    is_self_linked_server,
+)
 from adscan_internal.integrations.mssql.models import (
     CommandExecution,
     IdentityFingerprint,
@@ -75,6 +80,7 @@ class ImpacketMSSQLBackend:
         kerberos_target_hostname: str | None = None,
         domain: str | None = None,
         kdc_host: str | None = None,
+        ntlm_fallback_secret: str | None = None,
     ) -> None:
         from adscan_internal.services._kerberos_spn import (
             normalize_kerberos_target_hostname,
@@ -103,6 +109,26 @@ class ImpacketMSSQLBackend:
             or normalize_kerberos_target_hostname(self.host, domain)
             or self.host
         )
+        # Sticky NTLM fallback secret (password / NT hash) for a ccache-only
+        # credential. Resolved ONCE at construction by a connection point that
+        # has ``shell`` (posture + credential store) via the SSOT
+        # ``resolve_mssql_ntlm_fallback_secret``. Every ``execute_query`` from
+        # this backend then carries it as the default when the caller passes no
+        # explicit ``ntlm_fallback_secret`` — so an SPN-less instance (Kerberos
+        # → ``KDC_ERR_S_PRINCIPAL_UNKNOWN``) self-heals over NTLM everywhere the
+        # backend is used, without threading the secret through every call.
+        self._ntlm_fallback_secret = (
+            str(ntlm_fallback_secret) if ntlm_fallback_secret else None
+        )
+        # Sticky Kerberos-infra flag (per backend = per instance). Once a Kerberos
+        # attempt against THIS instance fails with an infra error (e.g. no
+        # ``MSSQLSvc`` SPN → ``KDC_ERR_S_PRINCIPAL_UNKNOWN``), every subsequent
+        # query would repeat the same doomed ~5s Kerberos attempt before falling
+        # back to NTLM. That silently blows the collector's per-instance
+        # ``asyncio.wait_for`` budget as the query count grows (each query pays the
+        # penalty), timing out the whole instance and emitting ZERO edges. Once set,
+        # ``execute_query`` skips the Kerberos attempt and goes straight to NTLM.
+        self._kerberos_infra_failed = False
 
     @staticmethod
     def _default_client_factory(host: str, port: int, remote_name: str) -> Any:
@@ -138,29 +164,46 @@ class ImpacketMSSQLBackend:
         when it is a password / NT hash. When ``secret`` is a ``.ccache`` path
         Kerberos-only credential, that ticket cannot drive an NTLM bind — so a
         password / NT hash for the same principal must be supplied via
-        ``ntlm_fallback_secret`` for the NTLM attempt to be queued. Without it
-        no NTLM attempt is made, and the "retrying with NTLM" log below is not
-        emitted (the log always reflects what is actually attempted). This is
-        what lets an instance with no ``MSSQLSvc`` SPN — where Kerberos fails
-        with ``KDC_ERR_S_PRINCIPAL_UNKNOWN`` — still be assessed over NTLM.
+        ``ntlm_fallback_secret`` for the NTLM attempt to be queued. When the
+        caller passes no explicit ``ntlm_fallback_secret``, the sticky value
+        resolved at construction (``self._ntlm_fallback_secret``) is used, so a
+        connection point that resolved it once has every query fall back
+        automatically. Without any fallback secret no NTLM attempt is made, and
+        the "retrying with NTLM" log below is not emitted (the log always
+        reflects what is actually attempted). This is what lets an instance with
+        no ``MSSQLSvc`` SPN — where Kerberos fails with
+        ``KDC_ERR_S_PRINCIPAL_UNKNOWN`` — still be assessed over NTLM.
         """
+        if ntlm_fallback_secret is None:
+            ntlm_fallback_secret = self._ntlm_fallback_secret
         final_query = self._wrap_linked_query(query, linked_server)
         started_at = time.perf_counter()
         final_error: Exception | None = None
-        # Each attempt is (use_kerberos, secret). The NTLM fallback slot is only
-        # appended when an NTLM attempt can genuinely be made, so the retry log
-        # below can never claim a fallback that was never queued.
-        auth_attempts: list[tuple[bool, str]] = [(use_kerberos, secret)]
+        # Resolve the NTLM fallback secret (password / NT hash) usable for an NTLM
+        # bind, if any. Only meaningful when Kerberos is being tried with fallback.
+        ntlm_secret: str | None = None
         if use_kerberos and allow_ntlm_fallback:
             if not self._is_ccache_secret(secret):
                 # Kerberos was tried with a password / NT hash — reuse it for NTLM.
-                auth_attempts.append((False, secret))
+                ntlm_secret = secret
             elif ntlm_fallback_secret and not self._is_ccache_secret(
                 ntlm_fallback_secret
             ):
                 # ccache-only Kerberos credential: NTLM needs a real password /
                 # NT hash for the same principal to attempt an SPN-less instance.
-                auth_attempts.append((False, ntlm_fallback_secret))
+                ntlm_secret = ntlm_fallback_secret
+
+        # Each attempt is (use_kerberos, secret). The NTLM fallback slot is only
+        # appended when an NTLM attempt can genuinely be made, so the retry log
+        # below can never claim a fallback that was never queued. Sticky skip: when
+        # Kerberos has already failed with an infra error for this instance and an
+        # NTLM fallback is available, drop the doomed Kerberos attempt entirely so
+        # this query does not pay the ~5s penalty again.
+        auth_attempts: list[tuple[bool, str]] = []
+        if not (use_kerberos and self._kerberos_infra_failed and ntlm_secret is not None):
+            auth_attempts.append((use_kerberos, secret))
+        if ntlm_secret is not None:
+            auth_attempts.append((False, ntlm_secret))
 
         for index, (attempt_use_kerberos, attempt_secret) in enumerate(auth_attempts):
             has_ntlm_fallback_next = index + 1 < len(auth_attempts)
@@ -211,8 +254,11 @@ class ImpacketMSSQLBackend:
                     and has_ntlm_fallback_next
                     and self._is_kerberos_infra_error(exc)
                 ):
+                    # Remember Kerberos is doomed for this instance so subsequent
+                    # queries skip it (see the sticky-skip in auth_attempts above).
+                    self._kerberos_infra_failed = True
                     print_info_debug(
-                        "[mssql_native] Kerberos infra error — retrying with NTLM"
+                        "mssql_native: Kerberos infra error — retrying with NTLM"
                     )
                     with contextlib.suppress(Exception):
                         client.disconnect()
@@ -738,10 +784,15 @@ class ImpacketMSSQLBackend:
     ) -> None:
         """Emit one debug summary for a native MSSQL operation."""
         try:
-            query_preview = build_text_preview(query, head=20, tail=20)
+            query_preview = build_text_preview(query, head=20, tail=20, max_line_length=300)
+            # Escape the raw SQL FIRST so Rich does not eat bracketed aliases
+            # (``AS [is_sysadmin]`` / ``AS [option]``) as console markup, then
+            # mark it sensitive for telemetry scrubbing. Escape-then-mark order
+            # matters: mark_sensitive wraps with zero-width markers that escape
+            # would otherwise pass through untouched.
             print_info_debug(
-                "[mssql_native] Query:\n"
-                + mark_sensitive(query_preview or query, "text"),
+                "mssql_native: Query:\n"
+                + mark_sensitive(rich_markup_escape(query_preview or query), "text"),
                 panel=True,
             )
             synthetic_result = subprocess.CompletedProcess(
@@ -759,7 +810,7 @@ class ImpacketMSSQLBackend:
                 [line for line in (query or "").splitlines() if line.strip()]
             )
             print_info_debug(
-                "[mssql_native] Result: "
+                "mssql_native: Result: "
                 f"host={mark_sensitive(self.host, 'hostname')}, "
                 f"user={mark_sensitive(username, 'user')}, "
                 f"linked_server={mark_sensitive(linked_server, 'hostname') if linked_server else 'none'}, "
@@ -777,11 +828,12 @@ class ImpacketMSSQLBackend:
                 stdout_tail=12,
                 stderr_head=12,
                 stderr_tail=12,
+                max_line_length=300,
             )
             if preview_text:
                 print_info_debug(
-                    "[mssql_native] Output preview:\n"
-                    + mark_sensitive(preview_text, "text"),
+                    "mssql_native: Output preview:\n"
+                    + mark_sensitive(rich_markup_escape(preview_text), "text"),
                     panel=True,
                 )
         except Exception:
@@ -978,7 +1030,11 @@ class ImpacketMSSQLBackend:
             )
 
         linked_servers = self.enumerate_linked_servers(
-            domain=domain, username=username, secret=secret, timeout=timeout
+            domain=domain,
+            username=username,
+            secret=secret,
+            timeout=timeout,
+            self_server_name=identity.server_name if identity else None,
         )
 
         return PrivilegeSweep(
@@ -1001,6 +1057,7 @@ class ImpacketMSSQLBackend:
         username: str,
         secret: str,
         timeout: int = 60,
+        self_server_name: str | None = None,
     ) -> tuple[LinkedServer, ...]:
         """Return the linked servers reachable from the current connection.
 
@@ -1009,6 +1066,16 @@ class ImpacketMSSQLBackend:
         merged on a best-effort basis — non-sysadmins frequently cannot
         read ``sp_helplinkedsrvlogin`` and we render those rows without the
         mapping rather than failing the whole enumeration.
+
+        Args:
+            self_server_name: The local instance's ``@@SERVERNAME`` (e.g.
+                ``sweep.identity.server_name``). When provided, the loopback
+                self-referential linked server (``name == @@SERVERNAME``) is
+                dropped here at the producer via
+                :func:`~adscan_internal.integrations.mssql.helpers.is_self_linked_server`,
+                so no downstream consumer wastes a round-trip trying to
+                enable / execute across it. When omitted the self-link (if any)
+                is returned unchanged.
         """
         detail = self.execute_query(
             domain=domain,
@@ -1022,6 +1089,8 @@ class ImpacketMSSQLBackend:
             for row in detail.rows:
                 name = str(row.get("linked_server") or "").strip()
                 if not name:
+                    continue
+                if is_self_linked_server(self_server_name, row):
                     continue
                 rows.append(
                     LinkedServer(
@@ -1045,6 +1114,8 @@ class ImpacketMSSQLBackend:
                 for row in fallback.rows:
                     name = str(row.get("SRV_NAME") or row.get("name") or "").strip()
                     if not name:
+                        continue
+                    if is_self_linked_server(self_server_name, row):
                         continue
                     rows.append(LinkedServer(name=name))
 
@@ -1273,7 +1344,11 @@ class ImpacketMSSQLBackend:
         cursor_login = entry_login
         seen: set[str] = {entry_label.lower()}
         next_links = self.enumerate_linked_servers(
-            domain=domain, username=username, secret=secret, timeout=timeout
+            domain=domain,
+            username=username,
+            secret=secret,
+            timeout=timeout,
+            self_server_name=entry_label,
         )
 
         for hop_index in range(1, max_hops + 1):
@@ -1617,6 +1692,68 @@ class ImpacketMSSQLBackend:
             stderr=result.stderr,
             error_message=result.error_message,
             method="xp_dirtree_native",
+        )
+
+    # ------------------------------------------------------------------
+    # Low-privilege filesystem review — local xp_dirtree directory listing
+    # ------------------------------------------------------------------
+
+    def enumerate_filesystem_via_xp_dirtree(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        root: str,
+        depth: int = 3,
+        timeout: int = 30,
+    ) -> NativeMSSQLQueryResult:
+        """List a local directory tree via ``xp_dirtree`` — no command execution required.
+
+        ``xp_dirtree`` is, by default, EXECUTE-granted to ``public``: every
+        authenticated login, even one with zero server roles, can walk the
+        SQL service account's filesystem view this way. This is a LOCAL
+        directory listing (``EXEC master..xp_dirtree '<path>', <depth>, 1``),
+        distinct from :meth:`coerce_ntlm_via_xp_dirtree`'s outbound-UNC
+        coercion use.
+        """
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.xp_dirtree_local(root, depth=depth, include_files=1),
+            timeout=timeout,
+        )
+        return NativeMSSQLQueryResult(
+            success=result.success,
+            query=result.query,
+            rows=result.rows,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            error_message=result.error_message,
+            method="xp_dirtree_local_native",
+        )
+
+    def probe_xp_dirtree_capability(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int = 30,
+    ) -> NativeMSSQLQueryResult:
+        """Probe EXECUTE permission on xp_dirtree/xp_fileexist/xp_subdirs.
+
+        Ground-truth for the low-privilege filesystem-review avenue. Parse
+        the returned rows with
+        :func:`adscan_internal.services.mssql_xp_dirtree_review_service.parse_xp_dirtree_capability_rows`.
+        """
+        return self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.XP_DIRTREE_CAPABILITY_PROBE,
+            timeout=timeout,
         )
 
     # ------------------------------------------------------------------

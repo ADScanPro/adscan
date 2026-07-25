@@ -313,8 +313,25 @@ class KerbrosClient:
 				preauth_rep = self.do_preauth(etype, with_pac=with_pac)
 				break
 			except KerberosError as e:
-				if e.errorcode != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP:
-					raise e	
+				# ADscan vendor fix: mirror aioclient.get_TGT — KDC_ERR_PREAUTH_FAILED
+				# can ALSO mean "the key we derived for this etype used the wrong
+				# salt", not necessarily "wrong password". Retry EXACTLY ONCE using
+				# the KDC-advertised salt/etype, gated on `self.server_salt is None`
+				# so a genuinely wrong password only costs one extra preauth attempt
+				# (bounded, same cost class as the existing ETYPE_NOTSUPP retry below).
+				# See aioclient.get_TGT for the full rationale (confirmed live against
+				# a real DC: an AS-REP-roastable account with the correct password
+				# still fails AES preauth when the default salt's username casing
+				# does not match the KDC's stored sAMAccountName casing).
+				is_salt_correctable_preauth_failure = (
+					e.errorcode == KerberosErrorCode.KDC_ERR_PREAUTH_FAILED
+					and self.server_salt is None
+				)
+				if (
+					e.errorcode != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP
+					and not is_salt_correctable_preauth_failure
+				):
+					raise e
 				logger.debug('Failed to get TGT with etype %s' % etype.name)
 				# If the server suggested encryption methods, we will use them
 				if e.krb_err_msg.get('e-data'):
@@ -639,11 +656,25 @@ class KerbrosClient:
 			S4UByteArray += user_to_impersonate.domain.encode()
 			S4UByteArray += auth_package_name.encode()
 			
-			chksum_data = _HMACMD5.checksum(self.kerberos_session_key, 17, S4UByteArray)
+			# ADscan vendor fix: the PA-FOR-USER checksum TYPE must match the TGT session-key
+			# etype. The original hardcoded HMAC_MD5 (RC4's checksum); after AES-first get_TGT
+			# the session key is AES, so an RC4 checksum over an AES key is inconsistent and the
+			# KDC rejects S4U2self with KDC_ERR_ETYPE_NOTSUPP. Mirror the DMSA branch for AES;
+			# keep the exact original path for RC4 (zero regression).
+			_sk_etype = self.kerberos_session_key.enctype
+			if _sk_etype in (Enctype.AES256, Enctype.AES128):
+				from kerbad.protocol.encryption import make_checksum, Cksumtype
+				_pa_ck = Cksumtype.SHA1_AES256 if _sk_etype == Enctype.AES256 else Cksumtype.SHA1_AES128
+				chksum_data = make_checksum(_pa_ck, self.kerberos_session_key, 17, S4UByteArray)
+				_pa_cksumtype_val = int(_pa_ck)
+			else:
+				chksum_data = _HMACMD5.checksum(self.kerberos_session_key, 17, S4UByteArray)
+				_pa_cksumtype_val = int(CKSUMTYPE('HMAC_MD5'))
+			logger.debug('[S4U2self] PA-FOR-USER checksum: session_key_etype=%s cksumtype=%s (AES->SHA1_AESxxx, RC4->HMAC_MD5)' % (_sk_etype, _pa_cksumtype_val))
 			
 			
 			chksum = {}
-			chksum['cksumtype'] = int(CKSUMTYPE('HMAC_MD5'))
+			chksum['cksumtype'] = _pa_cksumtype_val
 			chksum['checksum'] = chksum_data
 
 			###### Filling out PA-FOR-USER data for impersonation

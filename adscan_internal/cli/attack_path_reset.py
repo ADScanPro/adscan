@@ -28,6 +28,7 @@ from adscan_internal.services.attack_paths_materialized_cache import (
 )
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.manager import resolve_workspace_paths
+from adscan_core.rich_output import print_exception
 
 LOGGER = logging.getLogger("adscan")
 
@@ -226,6 +227,7 @@ def run_reset_attack_path_statuses(shell: Any, args: str) -> int:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         LOGGER.exception(
             "Failed to reset attack path statuses from interactive shell",
             extra={"workspace": workspace, "domain": domain},

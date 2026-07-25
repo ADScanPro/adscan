@@ -57,6 +57,7 @@ from adscan_internal.services.posture_sink import (  # noqa: E402,F401
     PostureSink,
     make_workspace_posture_sink,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +312,7 @@ def _emit_posture_signal(
         sink(signal)
     except Exception as sink_exc:
         telemetry.capture_exception(sink_exc)
+        print_exception(exception=sink_exc)
         print_info_debug(
             f"[kerberos_transport] posture sink raised: "
             f"{type(sink_exc).__name__}: {sink_exc}"
@@ -762,6 +764,7 @@ async def get_tgt(config: KerberosConfig) -> bytes:
     except Exception as exc:
         _emit_kerberos_failure_posture(config, exc)
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
 
 
@@ -866,6 +869,7 @@ async def get_tgs(
     except Exception as exc:
         _emit_kerberos_failure_posture(config, exc)
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
 
 
@@ -923,6 +927,7 @@ async def s4u2self(
         raise
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
 
 
@@ -977,6 +982,7 @@ async def s4u2proxy(
         raise
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
 
 
@@ -1030,6 +1036,7 @@ async def get_nt_from_pkinit(config: KerberosConfig) -> list[tuple[str, str]]:
         raise
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
 
 
@@ -1063,7 +1070,8 @@ def _maybe_emit_roast_progress(
     """
     import time as _time  # noqa: PLC0415
 
-    now = _time.time()
+    # monotonic throttle interval: immune to the mid-scan DC clock step.
+    now = _time.monotonic()
     if not force and now - emit_state.get("last_emit", 0.0) < 1.5:
         return
     emit_state["last_emit"] = now
@@ -1213,6 +1221,7 @@ async def kerberoast_users(
 
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
 
 
@@ -1304,4 +1313,5 @@ async def asreproast_users(
 
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)

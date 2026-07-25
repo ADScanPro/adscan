@@ -32,6 +32,7 @@ from adscan_internal.services.relay.adcs_esc8 import (
 )
 from adscan_internal.services.relay.core import RelayTargetResult
 from adscan_internal.services.relay.display import print_relay_captured
+from adscan_core.rich_output import print_exception
 
 
 class AdcsEsc8KrbRelayTarget:
@@ -72,6 +73,7 @@ class AdcsEsc8KrbRelayTarget:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return RelayTargetResult(
                 target_name=self.name,
                 success=False,

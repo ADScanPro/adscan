@@ -55,6 +55,7 @@ from adscan_internal.services.mitre_navigator import (
     build_navigator_layer,
     diff_summary,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +108,7 @@ def _load_report(workspace_dir: Path) -> dict[str, Any] | None:
             return json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to read technical_report.json: {exc}")
         return None
 
@@ -222,6 +224,7 @@ def _open_browser_safe(path: Path) -> None:
         webbrowser.open(path.as_uri())
     except Exception as exc:  # noqa: BLE001 — headless / no DISPLAY is fine
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Could not open browser: {exc}")
 
 
@@ -354,6 +357,7 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
             previous_layer = json.loads(previous_snapshot.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Could not read previous snapshot {previous_snapshot}: {exc}")
             previous_layer = None
 
@@ -376,6 +380,7 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Interactive HTML bundle unavailable: {exc}")
         else:
             html = build_interactive_html(
@@ -398,6 +403,7 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
             print_info_verbose(f"  history snapshot saved → {snapshot_path}")
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Could not write history snapshot: {exc}")
 
     return 0
@@ -412,6 +418,7 @@ def run_mitre_navigator_sync(args: argparse.Namespace) -> int:
         return 130
     except Exception as exc:  # noqa: BLE001 — top-level safety net
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"mitre-navigator failed: {exc}")
         return 1
 

@@ -537,7 +537,7 @@ class SprayShell(Protocol):
 
     def ask_for_pass_policy(self, domain: str) -> None: ...
 
-    def do_netexec_pass_policy(self, domain: str) -> None: ...
+    def do_password_policy(self, domain: str) -> None: ...
 
 
 _SPRAYING_UX_STATE_KEY = "_spraying_ux"
@@ -707,6 +707,7 @@ def _capture_spraying_ux_event(
         telemetry.capture(event, properties)
     except Exception as exc:  # pragma: no cover - telemetry must not break UX
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _mark_recommended_spraying_attempt(
@@ -1695,6 +1696,7 @@ def _persist_and_record_spray_hits(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     "[spray] Failed to record inherited credential provenance "
                     "steps in attack graph (continuing)."
@@ -1713,6 +1715,7 @@ def _persist_and_record_spray_hits(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     "[spray] Failed to record spray entry edge in attack graph (continuing)."
                 )
@@ -1743,6 +1746,7 @@ def _persist_and_record_spray_hits(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     "[spray] Failed to record artifact/share credential provenance edge (continuing)."
                 )
@@ -1800,6 +1804,7 @@ def _persist_and_record_spray_hits(
                     )
             except Exception as mint_exc:  # noqa: BLE001 — best-effort
                 telemetry.capture_exception(mint_exc)
+                print_exception(exception=mint_exc)
                 print_info_debug(
                     f"[spray] TGT mint raised for {mark_sensitive(username, 'user')}: "
                     f"{type(mint_exc).__name__}: {mint_exc}. Downstream auth will "
@@ -1931,6 +1936,7 @@ def validate_domain_reuse_with_ntlm_hash(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         result["error"] = str(exc)
         return result
 
@@ -2078,6 +2084,7 @@ def validate_domain_reuse_with_password(
         return result
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         result["error"] = str(exc)
         return result
     finally:
@@ -2164,6 +2171,7 @@ def validate_selected_domain_reuse_candidates(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         outcome_summary = _summarize_outcomes_for_table(
             outcomes, excluded_codes={"SUCCESS"}
@@ -2272,6 +2280,7 @@ def get_spraying_user_list_path(
         return None
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Unable to validate spraying user list for domain {domain}: {exc}")
         print_info_debug(
             f"[spray] Exception while validating user list: {type(exc).__name__}: {exc}"
@@ -2351,6 +2360,7 @@ def register_user_spray_attempts(
                     existing_modes.append(mode)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def find_already_attempted_combos(
@@ -2380,6 +2390,7 @@ def find_already_attempted_combos(
         return result
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {}
 
 
@@ -2516,6 +2527,7 @@ def confirm_with_history_check(
         return proposed_combos
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # If history check fails, do not block spraying
         return proposed_combos
 
@@ -2928,6 +2940,21 @@ def compute_spraying_eligibility(
     """
     try:
         file_users = read_user_list(user_list_file)
+    except FileNotFoundError:
+        # The user list was never generated — e.g. a prerequisite tool (kerbrute)
+        # is unavailable in this run, so the enumeration/spray step that produces
+        # the list never ran. This is an environment/prerequisite gap, not a
+        # failure to diagnose: skip the eligibility step cleanly with a short
+        # message instead of cascading into a raw file-not-found traceback.
+        print_warning(
+            "Skipping spraying eligibility: the user list has not been "
+            "generated yet."
+        )
+        print_info_debug(
+            "[spray] user list file absent, skipping eligibility: "
+            f"{mark_sensitive(str(user_list_file), 'path')}"
+        )
+        return None
     except OSError as exc:
         telemetry.capture_exception(exc)
         print_error("Unable to read the spraying user list file.")
@@ -3113,6 +3140,7 @@ def compute_spraying_eligibility(
                 )
         except Exception as _native_exc:  # noqa: BLE001
             telemetry.capture_exception(_native_exc)
+            print_exception(exception=_native_exc)
             print_warning_verbose(
                 f"Native policy fetch raised an exception: {_native_exc}. "
                 "Falling back to NetExec."
@@ -3177,6 +3205,7 @@ def _load_enabled_computer_sams(shell: SprayShell, domain: str) -> list[str]:
         )
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("Unable to read enabled_computers.txt.")
         print_info_debug(
             f"[spray] Failed reading enabled_computers.txt for {marked_domain}: {exc}"
@@ -3324,6 +3353,7 @@ def compute_computer_spraying_eligibility(
                 )
         except Exception as _native_exc:  # noqa: BLE001
             telemetry.capture_exception(_native_exc)
+            print_exception(exception=_native_exc)
             print_warning_verbose(
                 f"Native policy fetch raised an exception: {_native_exc}."
             )
@@ -3964,6 +3994,7 @@ def _load_pending_spraying_password_candidates(
             payload = json.load(handle)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"[spray] Failed to read pending password candidates file at {pending_path}: {exc}"
         )
@@ -4019,6 +4050,7 @@ def _save_pending_spraying_password_candidates(
         return pending_path
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             "Failed to persist deferred password spray candidates for later reuse."
         )
@@ -4128,6 +4160,7 @@ def _load_pending_domain_reuse_candidates(
             payload = json.load(handle)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"[spray] Failed to read pending domain reuse candidates at {pending_path}: {exc}"
         )
@@ -4202,6 +4235,7 @@ def _save_pending_domain_reuse_candidates(
         return pending_path
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             "Failed to persist deferred SAM-to-domain reuse candidates for later reuse."
         )
@@ -5285,6 +5319,7 @@ def _maybe_execute_adaptive_year_password_spraying(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[adaptive-year-spray] plan resolution failed for {marked_password}: {exc}"
         )
@@ -5480,6 +5515,7 @@ def _persist_adaptive_year_spray_manifest(
         return manifest_path
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning("Failed to persist adaptive year spray diagnostic manifest.")
         print_info_debug(f"[adaptive-year-spray] Manifest persistence failed: {exc}")
         return None
@@ -5759,6 +5795,7 @@ def _persist_variation_spray_manifest(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning("Failed to persist variation spray manifest.")
 
 
@@ -6361,6 +6398,7 @@ def spraying_with_blank_password(
                 pass
     except Exception as exc:  # noqa: BLE001 — streaming/LiveSession setup failed
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # Persist hits through the centralized path (credential store + TGT mint +
     # attack-graph provenance), then record the blank sentinel for coverage de-dup.
@@ -6711,6 +6749,7 @@ def spraying_with_passwords(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[batch-spray] plan resolution failed: {exc}")
             batch_plan = None
 
@@ -7241,7 +7280,8 @@ def _run_spray_with_dashboard(
     def _maybe_emit_spray_progress(*, force: bool = False, done: bool = False) -> None:
         import time as _time  # noqa: PLC0415
 
-        now = _time.time()
+        # monotonic throttle interval: immune to the mid-scan DC clock step.
+        now = _time.monotonic()
         if not force and now - _emit_state["last_emit"] < 1.5:
             return
         _emit_state["last_emit"] = now
@@ -7419,6 +7459,7 @@ def execute_spraying_command(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning_debug("[spray] Failed to parse a VALID LOGIN line.")
                 continue
 
@@ -7571,6 +7612,7 @@ async def _run_native_domain_spray(
                 return user, str(getattr(result.status, "value", result.status))
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 return user, "error"
 
     tasks = [asyncio.ensure_future(_verify_one(user)) for user in users]
@@ -7994,7 +8036,11 @@ def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
         owned = _owned_cleartext_passwords(shell, domain)
         owned_pwds = [pwd for (_owner, pwd) in owned]
         threshold = eligibility.lockout_threshold
-        lockout_disabled = (not threshold) or int(threshold) <= 0
+        # Split "observed disabled" (threshold <= 0) from "not yet read" (None):
+        # an unknown threshold (e.g. a pre-auth spray with no LDAP read) can
+        # still lock real accounts and must never be labelled "disabled".
+        lockout_unknown = threshold is None
+        lockout_disabled = threshold is not None and int(threshold) <= 0
         near_lockout = len(non_locked_excluded)
 
         rows: list[dict] = []
@@ -8054,9 +8100,11 @@ def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
             "margin": 2,
             "near_lockout": near_lockout,
             "lockout_disabled": lockout_disabled,
+            "lockout_unknown": lockout_unknown,
         }
     except Exception as exc:  # noqa: BLE001 — overview must never block spraying
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -8112,6 +8160,7 @@ def _run_pre2k_step(shell: "SprayShell", domain: str, *, interactive: bool) -> N
         get_console().print(render_pre2k_education_panel(domain, computer_count=count))
     except Exception as exc:  # noqa: BLE001 — panel must never block the spray
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     if interactive and not confirm_ask(
         "Run the pre2k computer-account spray now?", default=True
     ):
@@ -8197,10 +8246,12 @@ def _interactive_select_spray(
                 margin=overview["margin"],
                 near_lockout=overview["near_lockout"],
                 lockout_disabled=overview["lockout_disabled"],
+                lockout_unknown=overview.get("lockout_unknown", False),
             )
         )
     except Exception as exc:  # noqa: BLE001 — panel must never block the selector
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     keys: list[str] = []
     labels: list[str] = []
@@ -8299,6 +8350,7 @@ def _resolve_mined_spray_candidates(shell: "SprayShell", domain: str) -> list[st
         )
     except Exception as exc:  # noqa: BLE001 — mining is optional, never blocks spray
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return []
 
 
@@ -8432,6 +8484,7 @@ def run_spray_coverage(
             )
         except Exception as exc:  # noqa: BLE001 — one spray must not abort the loop
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Spray '{choice}' failed; continuing.")
 
     # Seed the deferred queue from the final near-threshold exclusions (best-effort).
@@ -8448,4 +8501,5 @@ def run_spray_coverage(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return queue

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from adscan_core.rich_output import print_info_debug, print_info_verbose
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ def _sync_parse_lsass_dump(dump_bytes: bytes) -> LSASSCredentials:
         mimi = Pypykatz.parse_minidump_buffer(buff)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise SecretsParserError(f"pypykatz minidump parse error: {exc}") from exc
 
     msv_creds: list[MsvCredential] = []
@@ -117,6 +119,7 @@ def _sync_parse_lsass_dump(dump_bytes: bytes) -> LSASSCredentials:
                 sha1 = msv.SHAHash.hex() if getattr(msv, "SHAHash", None) else ""
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[secrets_parser] failed to hex-encode hash for {username}: {exc}")
                 continue
             dedup_key = (username.lower(), nt_hash)
@@ -172,6 +175,7 @@ def _sync_parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUse
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise SecretsParserError(f"pypykatz SAM parse error: {exc}") from exc
 
     results: list[LocalUserCredential] = []
@@ -187,6 +191,7 @@ def _sync_parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUse
             lm_hash: str = secret.lm_hash.hex() if secret.lm_hash else ""
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[secrets_parser] skipping SAM secret due to parse error: {exc}")
             continue
         results.append(
@@ -246,6 +251,7 @@ def _sync_parse_lsa_secrets(
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise SecretsParserError(f"pypykatz SECURITY parse error: {exc}") from exc
 
     machine_nt_hash: str | None = None
@@ -362,11 +368,13 @@ def _sync_parse_lsa_secrets(
                             ]
                     except Exception as sqsa_exc:  # noqa: BLE001
                         telemetry.capture_exception(sqsa_exc)
+                        print_exception(exception=sqsa_exc)
                         print_info_debug(
                             f"[secrets_parser] L$_SQSA parse failed for {sid}: {sqsa_exc}"
                         )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[secrets_parser] error processing LSA secret: {exc}")
 
     for dcc in registry.security.dcc_hashes:
@@ -374,6 +382,7 @@ def _sync_parse_lsa_secrets(
             dcc_hashes.append(str(dcc))
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[secrets_parser] error processing DCC hash: {exc}")
 
     print_info_debug(

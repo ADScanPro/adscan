@@ -223,7 +223,7 @@ def select_capped_active_hosts(
     *,
     reachable_ips: list[str],
     open_ports_by_host: dict[str, set[int]],
-    service_ports: dict[str, int],
+    service_ports: dict[str, tuple[int, ...]],
     computers_props: list[dict[str, Any]],
     host_cap: int,
 ) -> CappedActiveHosts:
@@ -238,7 +238,9 @@ def select_capped_active_hosts(
         reachable_ips: All reachable IPs (the active universe — already complete from
             the port scan). NOT pre-capped.
         open_ports_by_host: ``{ip: {open tcp ports}}`` from the port scan.
-        service_ports: ``{service_name: tcp_port}`` (e.g. ``{"smb": 445, "winrm": 5985}``).
+        service_ports: ``{service_name: (tcp_ports...)}`` (e.g.
+            ``{"smb": (445,), "http": (80, 8080)}``). A host lands in a service list
+            when ANY of that service's ports is open.
         computers_props: Graph-JSON Computer property dicts (Phase-2 tier signals).
         host_cap: Max hosts in the active union. ``0`` (or negative) = unlimited — a
             no-op that keeps EVERY reachable host in every service list (legacy behavior).
@@ -270,13 +272,14 @@ def select_capped_active_hosts(
 
     active_set = set(active_ips)
     service_ips: dict[str, list[str]] = {}
-    for service, port in service_ports.items():
+    for service, ports in service_ports.items():
         # Preserve the representative-first order: walk active_ips, keep the ones
-        # whose port is open. Intersection is exactly capped ∩ service-open.
+        # with ANY of this service's ports open. Intersection is exactly
+        # capped ∩ service-open (a host counts if it exposes at least one port).
         service_ips[service] = [
             ip
             for ip in active_ips
-            if ip in active_set and port in (open_ports_by_host.get(ip) or set())
+            if ip in active_set and bool(set(ports) & (open_ports_by_host.get(ip) or set()))
         ]
 
     return CappedActiveHosts(

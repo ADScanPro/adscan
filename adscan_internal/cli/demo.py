@@ -49,6 +49,7 @@ from adscan_core import tier
 from adscan_core.paths import get_adscan_home_dir
 from adscan_internal.cli._sample_kit import all_samples, samples_dir
 from adscan_internal.services.host_open import display_host_path, prompt_and_open
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +533,7 @@ def _run_lite_demo(
         _copy_fixture_into_workspace(workspace_dir)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to stage demo workspace: {exc}")
         return 1
 
@@ -545,6 +547,7 @@ def _run_lite_demo(
                 shutil.copyfile(child, lite_dir / child.name)
     except Exception as exc:  # noqa: BLE001 — best-effort mirroring
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     if no_pdf:
         print_info("Skipping PDF generation (--no-pdf).")
@@ -555,6 +558,7 @@ def _run_lite_demo(
             print_warning("PRO sample kit not bundled with this build.")
     except Exception as exc:  # noqa: BLE001 — preview is non-fatal
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Could not stage PRO sample kit: {exc}")
 
     _render_lite_closing_panel(lite_dir=lite_dir, pro_preview_dir=pro_preview_dir)
@@ -758,6 +762,7 @@ def run_demo(args: argparse.Namespace) -> int:
                 cast_played = True
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(f"Cast playback failed ({exc}), falling back to scripted demo.")
 
             if cast_played:
@@ -774,6 +779,7 @@ def run_demo(args: argparse.Namespace) -> int:
                     full_report_pdf = _stage_demo_kit(workspace_dir)
                 except Exception as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error(f"Failed to stage demo kit: {exc}")
                     return 1
 
@@ -819,6 +825,7 @@ def run_demo(args: argparse.Namespace) -> int:
             technical_report_path = _copy_fixture_into_workspace(workspace_dir)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to stage demo workspace: {exc}")
             return 1
 
@@ -828,6 +835,7 @@ def run_demo(args: argparse.Namespace) -> int:
             demo_posture = _compute_demo_posture(technical_report_path)
         except Exception as exc:  # noqa: BLE001 — demo recap must not crash
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             demo_posture = compute_posture_score(PostureInputs())
 
         # Findings + paths counted from the fixture for honest recap copy.
@@ -860,6 +868,7 @@ def run_demo(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_error(f"Demo PDF generation failed: {exc}")
                 # Still print the recap and next-steps panel — the workspace was
                 # staged successfully and the operator may want to retry with
@@ -917,6 +926,7 @@ def run_demo(args: argparse.Namespace) -> int:
         return 130
     except Exception as exc:  # noqa: BLE001 — top-level safety net
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Demo failed: {exc}")
         return 1
 

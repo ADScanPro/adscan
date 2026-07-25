@@ -174,10 +174,20 @@ def logged_prompt_ask(
     info: LogMessage,
     **kwargs: Any,
 ) -> str:
-    """Prompt.ask wrapper with backend selection and centralized logging."""
+    """Prompt.ask wrapper with backend selection and centralized logging.
+
+    ``prefill_default`` (popped from ``kwargs`` so it never reaches Rich's
+    real ``Prompt.ask``, which does not accept it) controls whether
+    ``default`` is inserted as pre-existing editable text when the
+    Questionary/prompt_toolkit backend is active. Rich's own backend never
+    pre-fills — it only renders the default as a bracketed hint and starts
+    the input buffer empty — so this flag only changes behavior on the
+    Questionary path (see :func:`_ask_questionary_text`).
+    """
     prompt_message = str(prompt_args[0]) if prompt_args else "?"
     password_mode = bool(kwargs.get("password", False))
     default_value = kwargs.get("default")
+    prefill_default = bool(kwargs.pop("prefill_default", True))
 
     prompt_tag = "[prompt][password]" if password_mode else "[prompt]"
     telemetry(f"{prompt_tag} {prompt_message}")
@@ -216,6 +226,7 @@ def logged_prompt_ask(
             password_mode=password_mode,
             telemetry=telemetry,
             debug=debug,
+            prefill_default=prefill_default,
         )
     elif should_use_questionary_prompt():
         debug(
@@ -619,18 +630,41 @@ def _ask_questionary_text(
     password_mode: bool,
     telemetry: LogMessage,
     debug: LogMessage,
+    prefill_default: bool = True,
 ) -> Any:
-    """Ask a text prompt through Questionary when the backend is safe."""
+    """Ask a text prompt through Questionary when the backend is safe.
+
+    Unlike Rich's ``Prompt.ask`` (which only renders ``default`` as a
+    bracketed hint and always starts the input with an empty, editable
+    buffer), Questionary's own ``default=`` argument literally inserts that
+    text into the prompt_toolkit input buffer — the operator has to
+    backspace/delete it before typing something else. When
+    ``prefill_default`` is False, ``default_value`` is kept as the
+    blank-Enter/EOF fallback (so the prompt still auto-resolves the same
+    way Rich would) but is shown only as a hint appended to the prompt text,
+    never inserted into the editable buffer.
+    """
     try:
         import questionary  # type: ignore
     except Exception:
         return None
 
     default_text = "" if default_value is None else str(default_value)
+    buffer_text = default_text if prefill_default else ""
+    display_message = prompt_message
+    if not prefill_default and default_text:
+        display_message = f"{prompt_message} ({default_text})"
     try:
         if password_mode:
-            return questionary.password(prompt_message, default=default_text).ask()
-        return questionary.text(prompt_message, default=default_text).ask()
+            return questionary.password(display_message, default=buffer_text).ask()
+        answer = questionary.text(display_message, default=buffer_text).ask()
+        if (
+            not prefill_default
+            and default_value is not None
+            and (answer is None or not str(answer).strip())
+        ):
+            return default_value
+        return answer
     except EOFError:
         emit_prompt_interrupt_debug(
             kind="eof", source="rich_prompt.ask(container)", debug=debug

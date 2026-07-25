@@ -25,7 +25,6 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.services.ntlm_capture_workflow import (
     NativeCoercionTrigger,
-    NativeListenerCapture,
     NtlmCaptureProbeResult,
     build_socks5_proxies,
     looks_like_ntlm_hash,
@@ -917,6 +916,7 @@ def _persist_ntlm_probe_result(
                 )
             except Exception as exc:  # pragma: no cover - best effort sync
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[ntlm-capture] Failed to persist NTLM auth-type finding: {exc}"
                 )
@@ -926,6 +926,7 @@ def _persist_ntlm_probe_result(
             shell.save_workspace_data()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[ntlm-capture] failed to persist workspace data after probe update: "
                 f"{mark_sensitive(str(exc), 'detail')}"
@@ -993,7 +994,11 @@ def _execute_ntlm_capture_probe(
             spacing="none",
         )
 
-    listener = NativeListenerCapture(listen_host=shell.myip)
+    from adscan_internal.services.background_jobs.shared_capture_listener import (  # noqa: PLC0415
+        get_or_create_capture_broker,
+    )
+
+    capture_broker = get_or_create_capture_broker(shell)
     trigger = NativeCoercionTrigger()
 
     # Match the specific computer account only when we know the target hostname
@@ -1005,7 +1010,9 @@ def _execute_ntlm_capture_probe(
         expected_usernames = []
     try:
         result = run_ntlm_capture_probe(
-            listener=listener,
+            broker=capture_broker,
+            broker_consumer_id=f"ntlm_sweep@{prepared.pdc_ip}",
+            broker_bind_ip=shell.myip,
             trigger=trigger,
             target=prepared.pdc_ip,
             listener_ip=shell.myip,
@@ -1151,6 +1158,7 @@ def _materialize_ntlmv1_attack_steps(shell: NtlmCaptureShell, domain: str) -> No
             )
     except Exception as exc:  # noqa: BLE001 - materialization never blocks capture
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[ntlm-capture] NTLMv1 attack-step materialization failed: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -1617,6 +1625,7 @@ def _fire_sweep_coercion(
         )
     except Exception as exc:  # noqa: BLE001 - one host must never kill the sweep
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ntlm-capture][sweep] coercion raised for {mark_sensitive(target_ip, 'ip')}: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -1750,6 +1759,7 @@ def _maybe_build_sweep_dashboard(
         )
     except Exception as exc:  # noqa: BLE001 - dashboard is never load-bearing
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[ntlm-capture][sweep] live dashboard unavailable; falling back to "
             f"plain logging: {mark_sensitive(str(exc), 'detail')}"
@@ -1785,6 +1795,7 @@ def _print_sweep_results_table(
         )
     except Exception as exc:  # noqa: BLE001 - presentation must never break the sweep
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[ntlm-capture][sweep] failed to render final results table: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -1832,6 +1843,7 @@ def _run_sweep_fanout(
             )
         except Exception as exc:  # noqa: BLE001 - render must never abort the sweep
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _drive(session_dashboard: Any | None) -> None:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
@@ -1859,6 +1871,7 @@ def _run_sweep_fanout(
                         future.result()
                     except Exception as exc:  # noqa: BLE001 - one host never kills the sweep
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                 if session_dashboard is not None:
                     _poll_dashboard()
         finally:
@@ -1883,6 +1896,7 @@ def _run_sweep_fanout(
                 )
             except Exception as exc:  # noqa: BLE001 - render must never break the flow
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         with dashboard.live_session(summary=_summary_results_table) as live_dashboard:
             _drive(live_dashboard)
@@ -2135,6 +2149,33 @@ def run_check_dc_ntlm_auth_type(shell: NtlmCaptureShell, args: str) -> None:
     run_check_ntlm_auth(shell, args)
 
 
+def _find_active_poisoning_job(shell: NtlmCaptureShell) -> Any | None:
+    """Return the active Broadcast Poisoning background job, if any.
+
+    Broadcast Poisoning and this sweep both bind the SAME shared SMB NTLM
+    capture listener (``SMBNtlmCaptureSource`` on port 445 — see
+    ``services.relay.smb_ntlm_capture`` and ``services.background_jobs.poisoning_job``).
+    When the sweep's own listener bind fails with EADDRINUSE, the conflict is
+    almost always ADscan's own poisoning job already holding the port — not a
+    genuine external service — so callers use this to give the operator a
+    precise, actionable message instead of a generic bind-error string.
+
+    Best-effort: a lookup failure must never break the sweep, so any exception
+    is captured to telemetry and treated as "no poisoning job found".
+    """
+    try:
+        from adscan_internal.services.background_jobs import get_or_create_registry  # noqa: PLC0415
+
+        registry = get_or_create_registry(shell)
+        for job in registry.active():
+            if job.kind == "poisoning":
+                return job
+    except Exception as exc:  # noqa: BLE001 - diagnostic-only, never break the sweep
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return None
+
+
 def _execute_sweep_over_candidates(
     shell: NtlmCaptureShell,
     *,
@@ -2213,7 +2254,39 @@ def _execute_sweep_over_candidates(
     fired_ips: set[str] = set()
     fired_lock = threading.Lock()
     budget_exhausted = threading.Event()
-    listener = NativeListenerCapture(listen_host=listener_ip)
+
+    from adscan_internal.services.background_jobs.shared_capture_listener import (  # noqa: PLC0415
+        get_or_create_capture_broker,
+    )
+
+    capture_broker = get_or_create_capture_broker(shell)
+    sweep_consumer_id = f"ntlm_sweep@{domain}"
+    # Acquire the SHARED :445 capture listener instead of binding a private one:
+    # the broker refcounts, so this multi-host sweep coexists with an
+    # already-running poisoning / write-share-bait consumer instead of failing
+    # [Errno 98] and being dropped from the audit. The sweep reads the append-only
+    # _observed buffer (make_capture_signal + drain_observations) which the broker's
+    # queue-draining poll loop does NOT consume — so a no-op sink is correct here;
+    # the sweep does its own per-host attribution from _observed.
+    if not capture_broker.acquire(
+        sweep_consumer_id, bind_ip=listener_ip, on_capture=lambda _obs: None
+    ):
+        print_warning(
+            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: the shared SMB "
+            "capture listener could not be acquired (:445 bind failed)."
+        )
+        print_info_debug("NTLM sweep: shared :445 listener acquire failed")
+        summary["sweep_skipped_reason"] = "listener_start_failed"
+        return summary
+    listener = capture_broker.active_listener()
+    if listener is None:
+        capture_broker.release(sweep_consumer_id)
+        print_warning(
+            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: "
+            "shared capture listener unavailable."
+        )
+        summary["sweep_skipped_reason"] = "listener_start_failed"
+        return summary
 
     def _fire(ip: str) -> str | None:
         # A worker that picks this task up after the global budget is spent must
@@ -2248,18 +2321,9 @@ def _execute_sweep_over_candidates(
             fired_ips.add(ip)
         return ip
 
-    if not listener.start():
-        error_code, error_detail = listener.describe_start_error()
-        print_warning(
-            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: the shared SMB "
-            f"capture listener could not start — {error_detail}"
-        )
-        print_info_debug(
-            f"NTLM sweep listener start failure: code={error_code} detail={error_detail}"
-        )
-        summary["sweep_skipped_reason"] = "listener_start_failed"
-        summary["listener_start_error_code"] = error_code
-        return summary
+    # The :445 bind is handled by the shared-broker acquire above — poisoning /
+    # write-share-bait already holding :445 no longer blocks this sweep (the prod
+    # b11a138e collision). No private listener.start() / EADDRINUSE branch here.
 
     # Live dashboard gate. Only the "all reachable hosts" scope above the
     # threshold gets the premium per-host live classification dashboard; DC-only
@@ -2290,7 +2354,7 @@ def _execute_sweep_over_candidates(
             dashboard=dashboard,
         )
     finally:
-        listener.stop()
+        capture_broker.release(sweep_consumer_id)
 
     # Attribute every captured observation to its coerced host by computer
     # account. A host that fired but produced no matching capture stays unknown.
@@ -2374,6 +2438,7 @@ def _execute_sweep_over_candidates(
             shell.save_workspace_data()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[ntlm-capture][sweep] failed to persist workspace data: "
                 f"{mark_sensitive(str(exc), 'detail')}"

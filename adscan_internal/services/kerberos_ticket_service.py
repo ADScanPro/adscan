@@ -51,6 +51,7 @@ from adscan_internal.services.credential_store_service import (
     CredentialStoreService,
     KerberosKeyMaterial,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover - import-time decoupling only
     from adscan_internal.services.domain_posture import DomainPosture
@@ -1623,6 +1624,7 @@ class KerberosTicketService(BaseService):
             from adscan_internal import telemetry as _tel  # noqa: PLC0415
 
             _tel.capture_exception(exc)
+            print_exception(exception=exc)
             msg = _classify_s4u_error(str(exc))
             print_error(f"S4U forwardable ticket failed: {msg}")
             return KerberosServiceTicketResult(

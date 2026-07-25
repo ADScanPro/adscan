@@ -28,6 +28,7 @@ import socket
 from . import telemetry
 
 import logging
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger("adscan.agent_protocol")
@@ -163,6 +164,7 @@ class AgentSession:
                 rlist, _, _ = select.select([self._sock], [], [], 0.2)
             except (OSError, ValueError) as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 break
             if not rlist:
                 if seen_any and (time.monotonic() - last_activity) >= idle_after_first:
@@ -174,6 +176,7 @@ class AgentSession:
                 chunk = self._sock.recv(4096)
             except _socket.error as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 break
             if not chunk:
                 break
@@ -218,6 +221,7 @@ class AgentSession:
                 rlist, _, _ = select.select([self._sock], [], [], 0.2)
             except (OSError, ValueError) as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 break
             if not rlist:
                 continue
@@ -225,6 +229,7 @@ class AgentSession:
                 chunk = self._sock.recv(4096)
             except _socket.error as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 break
             if not chunk:
                 break
@@ -257,6 +262,7 @@ class AgentSession:
             return b"".join(output_chunks).decode("utf-8", errors="ignore")
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return f"[agent exec error] {exc}"
 
     def upload_file(
@@ -281,6 +287,7 @@ class AgentSession:
             return bool(messages.get(MessageType.FILE_UPLOAD_RESULT))
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return False
 
     def download_file(
@@ -311,4 +318,5 @@ class AgentSession:
             return b"".join(chunks)
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return None

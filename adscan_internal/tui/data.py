@@ -24,6 +24,7 @@ from adscan_core.posture_score import (
     compute_posture_score,
 )
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,7 @@ def _scan_labels(workspace_path: Path) -> list[str]:
                     candidates.append((f.stat().st_mtime, f.stem))
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     candidates.sort(reverse=True)
     seen: set[str] = set()
     out: list[str] = []
@@ -162,6 +164,7 @@ def _load_technical_report(workspace_path: Path) -> dict[str, Any]:
                 return data
         except (OSError, json.JSONDecodeError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"Could not read {candidate.name}: {exc}")
     return {}
 

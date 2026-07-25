@@ -29,6 +29,7 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import EnumerationService
 from adscan_internal.services.attack_graph_service import upsert_roast_entry_edge
 from adscan_internal.workspaces import domain_relpath, domain_subpath
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -301,6 +302,7 @@ def run_kerberoast_for_user(
         Path(usersfile_abs).write_text(f"{target_user}\n", encoding="utf-8")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_path = mark_sensitive(usersfile_abs, "path")
         print_error(f"Failed to write users file for Kerberoast: {marked_path}")
         return False
@@ -324,6 +326,7 @@ def run_kerberoast_for_user(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_user = mark_sensitive(target_user, "user")
         print_error(f"Kerberoast failed for {marked_user}.")
         return False
@@ -408,6 +411,7 @@ def run_asreproast_for_user(
         Path(usersfile_abs).write_text(f"{target_user}\n", encoding="utf-8")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_path = mark_sensitive(usersfile_abs, "path")
         print_error(f"Failed to write users file for ASREPRoast: {marked_path}")
         return False
@@ -427,6 +431,7 @@ def run_asreproast_for_user(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_user = mark_sensitive(target_user, "user")
         print_error(f"ASREPRoast failed for {marked_user}.")
         return False

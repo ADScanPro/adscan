@@ -22,6 +22,7 @@ from adscan_internal.services.credsweeper_service import (
 from adscan_internal.services.smb_sensitive_file_policy import (
     DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS,
 )
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ class CredSweeperLibraryService(BaseService):
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(
                     "CredSweeper library analysis failed for one in-memory ruleset."
                 )

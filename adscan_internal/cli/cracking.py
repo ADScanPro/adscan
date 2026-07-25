@@ -818,6 +818,7 @@ def _primary_user_for_hash_file(hash_file: str, mode: str, domain: str) -> str:
                         return embedded
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     users = _extract_hash_users(hash_file)
     if users:
         return users[0]
@@ -887,6 +888,7 @@ def _maybe_dispatch_audit_effort(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     if job_id:
         print_success(
             f"Cracking handed off to a background job at {selection.effort} effort — "
@@ -992,7 +994,11 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
 
     try:
         probe_cmd = maybe_wrap_hashcat_for_container("hashcat -I")
-        probe = shell.run_command(probe_cmd, timeout=30)
+        # untrusted_output: the OpenCL/CUDA device-info banner is raw hashcat
+        # chatter, not operator-authored content — suppress the routine
+        # debug-preview so it doesn't pollute the session recording; the full
+        # text is still parsed below via probe.stdout/stderr.
+        probe = shell.run_command(probe_cmd, timeout=30, untrusted_output=True)
         if probe is None:
             raise RuntimeError("hashcat -I probe returned no result")
 
@@ -1643,6 +1649,7 @@ def _preflight_fix_crack_hashfile(
             raw_lines = handle.read().splitlines()
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return 0
 
     extractor = rule.get("extractor")
@@ -1688,6 +1695,7 @@ def _preflight_fix_crack_hashfile(
                 handle.write("".join(f"{ln}\n" for ln in out_lines))
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 "Failed to rewrite the repaired hash file; cracking may fail to "
                 "parse the original bare lines."
@@ -1909,6 +1917,7 @@ def _build_targeted_custom_wordlist(
         objects = cwl.load_objects_from_inventory(workspace_dir, resolved_domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         objects = []
 
     try:
@@ -1934,6 +1943,7 @@ def _build_targeted_custom_wordlist(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"[cracking] targeted custom wordlist build failed: {type(exc).__name__}: {exc}"
         )
@@ -1968,6 +1978,7 @@ def _build_targeted_custom_wordlist(
         )
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"[cracking] could not write combined targeted wordlist: {exc}"
         )
@@ -2069,6 +2080,7 @@ def crack_captured_netntlm(
         os.makedirs(cracking_directory, exist_ok=True)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("Could not prepare the cracking workspace directory.")
         return
 
@@ -2090,6 +2102,7 @@ def crack_captured_netntlm(
             )
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Could not write the captured {version} hash file.")
             continue
 
@@ -2170,6 +2183,7 @@ def _split_roast_hashfile_by_mode(
             write_crack_hashfile(per_mode_path, pairs, mode=mode)
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             continue
         out[mode] = per_mode_path
     return out
@@ -2303,19 +2317,21 @@ def run_cracking(
     hash_count = _count_hashes_in_file(hash_file)
     backend_is_gpu = "GPU" in backend_selection.label
 
-    # A targeted custom wordlist (mined from this environment) is small, so it
-    # earns the mode-aware rule ladder: the big rule list on fast RC4/NTLM modes,
-    # best64 on the 20-40x-slower AES roast modes — each bounded by an interactive
-    # --runtime cap. Only auto-select when the operator picked the targeted list
-    # AND the caller did not already pass explicit rules (e.g. credsweeper).
-    if (
-        rules_path is None
-        and runtime_seconds is None
-        and hashcat_mode != "Unknown"
-        and _is_targeted_custom_wordlist(wordlist)
-    ):
+    # Mode-aware rule ladder: the big rule list on fast RC4/NTLM modes for a
+    # SMALL targeted custom wordlist, best64 on the 20-40x-slower AES roast
+    # modes regardless of wordlist size — each bounded by an interactive
+    # --runtime cap (see select_rules_for_crack's policy). This must run for
+    # EVERY wordlist, not only a targeted custom one: the AES-roast branch is
+    # documented to apply "regardless of wordlist size" precisely because a
+    # rules-mangled attack against the large bundled base wordlist is the
+    # common case, not the exception — gating the call behind
+    # _is_targeted_custom_wordlist made that branch unreachable for the
+    # standard bundled wordlist, leaving an AES-roast base-wordlist crack with
+    # NEITHER rules NOR a runtime cap (parity gap, fixed here). Only skip when
+    # the caller already passed explicit rules/runtime (e.g. credsweeper).
+    if rules_path is None and runtime_seconds is None and hashcat_mode != "Unknown":
         rules_path, runtime_seconds = select_rules_for_crack(
-            hashcat_mode, wordlist_is_custom=True
+            hashcat_mode, wordlist_is_custom=_is_targeted_custom_wordlist(wordlist)
         )
 
     announce_line = format_chosen_wordlist_line(
@@ -2349,6 +2365,7 @@ def run_cracking(
             _preflight_fix_crack_hashfile(shell, hash_file=hash_file, mode=hashcat_mode)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[cracking] hashfile pre-flight repair failed (continuing): {exc}"
             )
@@ -2430,6 +2447,7 @@ def run_cracking(
         telemetry.capture("cracking_started", properties)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     if hash_type in {"asreproast", "kerberoast"}:
         try:
@@ -2449,6 +2467,7 @@ def run_cracking(
                 )
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Live current-operation telemetry — surface the cracking step on the
     # platform's live operation strip. hashcat runs blocking and streams to its
@@ -3039,23 +3058,37 @@ def do_cracking(shell: CrackingShell, args: str) -> None:
     """
     Command to crack Active Directory hashes.
 
-    Usage: cracking <type> <domain> <hash>
+    Usage:
+        cracking <type> <domain> <hash>
+        cracking --type <type> -d <domain> --hash <hash>
 
     Where:
     - <type> is the type of hash to crack (asreproast, kerberoast, NTLMv2)
     - <domain> is the Active Directory domain of the hash
-    - <hash> is the hash to crack
+    - <hash> is the hash (or hash file path) to crack
+
+    Both forms are permanently supported. In the flag form, a value starting
+    with "-" needs the "=" spelling: --hash=-oddvalue
 
     This command uses hashcat to crack the hash with the wordlist selected by the user.
     """
-    args_list = args.split()
-    if len(args_list) != 3:
-        print_error("Usage: cracking <type> <domain> <hash>")
+    from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+    usage = "cracking <type> <domain> <hash>  |  cracking --type <type> -d <domain> --hash <hash>"
+    parser = ReplArgumentParser(prog="cracking", add_help=False)
+    parser.add_argument("--type", dest="hash_type", required=True)
+    parser.add_argument("-d", "--domain", required=True)
+    parser.add_argument("--hash", dest="hash_file", required=True)
+
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("hash_type", "domain", "hash_file"),
+        parser=parser,
+        usage=usage,
+    )
+    if namespace is None:
         return
-    hash_type = args_list[0]
-    domain = args_list[1]
-    hash_file = args_list[2]
-    shell.cracking(hash_type, domain, hash_file)
+    shell.cracking(namespace.hash_type, namespace.domain, namespace.hash_file)
 
 
 def run_cracking_history(
@@ -3469,6 +3502,7 @@ def _maybe_materialize_poison_capture_crack_edge(
         )
     except Exception as exc:  # noqa: BLE001 — materialization is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _maybe_materialize_ntlmv1_crack_edge(
@@ -3516,6 +3550,7 @@ def _maybe_materialize_ntlmv1_crack_edge(
         )
     except Exception as exc:  # noqa: BLE001 — materialization is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def execute_cracking(
@@ -3566,8 +3601,29 @@ def execute_cracking(
             # a real crack — it always eventually runs, never collides with
             # hashcat's single-instance lock, and the warm-up yields to it.
             with hashcat_slot(block=True):
+                # stdin=DEVNULL: detach hashcat from the operator's TTY. With an
+                # inherited terminal on stdin a real crack goes INTERACTIVE — it
+                # starts its own keypress/menu thread ([s]tatus [p]ause [b]ypass
+                # [c]heckpoint [f]inish [q]uit =>) and races the prompt_toolkit
+                # REPL for terminal input, stealing keystrokes and hanging the
+                # session on Ctrl+C (the child never sees it as a real signal
+                # while it owns the tty's raw-mode input). This mirrors the fix
+                # already applied to the streaming crack path in
+                # command_runner.py::CommandRunner._run_streaming — a non-TTY
+                # stdin makes hashcat fully non-interactive without affecting
+                # its output (this call already reads --status via stdout/stderr
+                # capture, not the interactive UI).
+                # untrusted_output: hashcat's own progress/status chatter is raw
+                # tool output, not operator-authored content — suppress
+                # run_command's routine debug-preview panel so it doesn't
+                # pollute the session recording; the failure-classification
+                # logic below reads the full stdout/stderr directly (unaffected
+                # by this flag) and prints its own targeted diagnostics.
                 completed_process_initial = shell.run_command(
-                    cracking_cmd, timeout=subprocess_timeout
+                    cracking_cmd,
+                    timeout=subprocess_timeout,
+                    stdin=subprocess.DEVNULL,
+                    untrusted_output=True,
                 )
 
             if completed_process_initial is None:
@@ -3617,7 +3673,13 @@ def execute_cracking(
                     print_warning(_hashcat_no_device_guidance())
                     try:
                         probe_cmd = maybe_wrap_hashcat_for_container("hashcat -I")
-                        probe = shell.run_command(probe_cmd, timeout=30)
+                        # untrusted_output: suppress run_command's own routine
+                        # preview of the device banner — the code below already
+                        # prints an intentional, capped (40-line) diagnostic dump
+                        # of this exact output, so this only removes a duplicate.
+                        probe = shell.run_command(
+                            probe_cmd, timeout=30, untrusted_output=True
+                        )
                         if probe is None:
                             raise RuntimeError("hashcat -I probe returned no result")
                         probe_out = (probe.stdout or "") + "\n" + (probe.stderr or "")
@@ -3696,8 +3758,23 @@ def execute_cracking(
         print_info_debug(f"Executing hashcat show command: {show_cmd}")
         # The --show read is a second hashcat launch — serialize it too so it
         # never collides with a concurrent crack or the benchmark warm-up.
+        # stdin=DEVNULL for the same reason as the crack invocation above: any
+        # hashcat launch inheriting a TTY on stdin can start its interactive
+        # keypress listener and race the REPL for input.
+        # untrusted_output=True: ``--show`` output is ``username:password``
+        # pairs in CLEARTEXT — the pattern-sanitizer has no structural marker
+        # to redact an arbitrary plaintext password by, so this is exactly the
+        # "arbitrary content the sanitizer cannot redact" case the flag exists
+        # for. Suppressing run_command's own debug-preview here keeps the
+        # cracked secret out of the session recording; the operator still sees
+        # it on screen via the existing mark_sensitive-wrapped display below.
         with hashcat_slot(block=True):
-            completed_process_show = shell.run_command(show_cmd, timeout=300)
+            completed_process_show = shell.run_command(
+                show_cmd,
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+                untrusted_output=True,
+            )
 
         # Layer 3 (continued) — the --show pass is a second hashcat invocation
         # over the same file; a parse error here is the same FORMAT class. Catch
@@ -3797,6 +3874,7 @@ def execute_cracking(
                         shell._session_victories.append("hash_cracked")
                 except Exception as e:
                     telemetry.capture_exception(e)
+                    print_exception(exception=e)
                 try:
                     if str(getattr(shell, "type", "") or "").strip().lower() == "audit":
                         audit_properties = {
@@ -3816,6 +3894,7 @@ def execute_cracking(
                         )
                 except Exception as exc:  # pragma: no cover - telemetry best effort
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
                 _render_cracked_credentials_panel(
                     shell,
@@ -3835,6 +3914,7 @@ def execute_cracking(
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                 # Persist credentials after displaying them
                 attempted_users = set(_extract_hash_users(hash))
                 cracked_users = set(creds.keys())
@@ -3858,6 +3938,7 @@ def execute_cracking(
                             )
                         except Exception as exc:  # pragma: no cover
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
                     # Centralized metadata: a cracked TGS/AS-REP is by
                     # definition a kerberoastable / asrep-roastable principal.
                     # Tag it so the privilege-role picker can rank it.
@@ -3877,6 +3958,7 @@ def execute_cracking(
                             )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
 
                     shell.add_credential(
                         domain, username, password, metadata=cred_metadata,
@@ -3925,6 +4007,7 @@ def execute_cracking(
                             )
                         except Exception as exc:  # pragma: no cover
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
                 return {"status": "success", "cracked_count": len(creds)}
             else:
                 _render_cracking_failure_panel(
@@ -3951,6 +4034,7 @@ def execute_cracking(
                 telemetry.capture("hash_not_cracked", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
 
             _render_cracking_failure_panel(
                 hash_type=hash_type,
@@ -3977,6 +4061,7 @@ def execute_cracking(
                         )
                 except Exception as exc:  # pragma: no cover
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
             from adscan_internal.interaction import is_non_interactive as _is_non_interactive
             _non_interactive = _is_non_interactive(shell)
             if hash_type == "asreproast":

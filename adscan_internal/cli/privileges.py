@@ -162,6 +162,7 @@ def _run_winrm_psrp_service_access_sweep(
         posture_snapshot = get_posture(shell.domains_data, domain=domain)
     except Exception as posture_exc:  # noqa: BLE001
         telemetry.capture_exception(posture_exc)
+        print_exception(exception=posture_exc)
         print_info_debug(
             f"[privileges] posture wiring skipped (non-fatal): {posture_exc}"
         )
@@ -255,6 +256,7 @@ def _run_winrm_psrp_service_access_sweep(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[service-access] failed to persist WinRM PSRP probe history: {exc}"
         )
@@ -276,6 +278,7 @@ def _run_winrm_psrp_service_access_sweep(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         _handle_confirmed_service_followups(
             shell,
             domain=domain,
@@ -317,6 +320,7 @@ def _resolve_service_sweep_posture(shell, *, domain):
         posture_snapshot = get_posture(shell.domains_data, domain=domain)
     except Exception as posture_exc:  # noqa: BLE001
         telemetry.capture_exception(posture_exc)
+        print_exception(exception=posture_exc)
         print_info_debug(
             f"[privileges] posture wiring skipped (non-fatal): {posture_exc}"
         )
@@ -345,6 +349,7 @@ def _ensure_service_sweep_posture_fresh(shell, *, domain) -> None:
         )
     except Exception as exc:  # noqa: BLE001 — posture guard is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[privileges] ensure_posture_fresh skipped (non-fatal): {exc}"
         )
@@ -388,6 +393,7 @@ def _build_service_target_hostname_map(shell, *, domain, targets):
                     break
     except Exception as exc:  # noqa: BLE001 — inventory is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return mapping
 
 
@@ -505,6 +511,7 @@ def _run_native_smb_service_access_sweep(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[service-access] failed to persist native SMB probe history: {exc}"
         )
@@ -526,6 +533,7 @@ def _run_native_smb_service_access_sweep(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         _handle_confirmed_service_followups(
             shell,
             domain=domain,
@@ -601,12 +609,31 @@ def run_mssql_authorization_collection(
             secret = mssql_cred.ccache_path
             is_ccache = True
 
+    # A ccache-only collector credential cannot drive an NTLM bind, so instances
+    # with no MSSQLSvc SPN (Kerberos → KDC_ERR_S_PRINCIPAL_UNKNOWN) would be left
+    # unassessed (connected=0). Resolve the principal's stored password / NT hash
+    # via the SSOT so the backend can still try NTLM there — gated on NTLM not
+    # being known-blocked by posture. Sticky on the backend: every collector
+    # query carries it.
+    from adscan_internal.services.mssql_auth import (
+        resolve_mssql_ntlm_fallback_secret,
+    )
+
+    ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
+        shell,
+        domain=domain,
+        username=username,
+        wire_secret=secret,
+        password=str(password or ""),
+    )
+
     config = MSSQLCollectorConfig(
         domain=domain,
         username=username,
         secret=secret,
         use_kerberos=use_kerberos,
         kdc_host=str(kdc_host) if kdc_host else None,
+        ntlm_fallback_secret=ntlm_fallback_secret,
     )
     summary = collect_mssql_authorization_sync(
         shell, domain, config, instances=instances
@@ -619,76 +646,6 @@ def run_mssql_authorization_collection(
         f"SQLAccess={summary.sqlaccess_edges} SQLAdmin={summary.sqladmin_edges}"
     )
     return summary
-
-
-def _resolve_mssql_ntlm_fallback_secret(
-    shell,
-    *,
-    domain: str,
-    username: str,
-    wire_secret: str,
-    password: str,
-) -> str | None:
-    """Resolve a password / NT hash for the NTLM fallback of a ccache-only sweep.
-
-    A Kerberos-only MSSQL sweep sends a ``.ccache`` on the wire, which forecloses
-    NTLM — so an instance with no ``MSSQLSvc`` SPN (Kerberos fails with
-    ``KDC_ERR_S_PRINCIPAL_UNKNOWN``) is left unassessed. This returns a
-    password / NT hash for the SAME principal so the backend can still try NTLM
-    against those instances. Returns ``None`` (no fallback) when:
-
-    - the wire secret is not a ccache (the primary attempt is already NTLM/SQL);
-    - domain posture reports NTLM known-blocked (HIGH + ``DISABLED``) — never
-      attempt NTLM the DC is known to reject;
-    - only a ccache is available for the principal (no NTLM-usable secret).
-
-    The sweep principal's domain password / NT hash lives in the generic
-    credential store — NOT a host-scoped service ticket or a local credential —
-    so the canonical resolver (:func:`_get_stored_domain_credential_for_user`)
-    is used, credential-store-first.
-    """
-    if not str(wire_secret or "").strip().lower().endswith(".ccache"):
-        return None
-
-    from adscan_internal.services.domain_posture import (
-        ConstraintCategory,
-        SignalConfidence,
-        TriState,
-        get_posture,
-    )
-
-    ntlm_state = get_posture(shell.domains_data, domain=domain).get(
-        ConstraintCategory.NTLM_AUTHENTICATION
-    )
-    if (
-        ntlm_state.confidence is SignalConfidence.HIGH
-        and ntlm_state.effective_state is TriState.DISABLED
-    ):
-        print_info_debug(
-            "[mssql_probe] NTLM known-blocked by posture — "
-            "skipping ccache-only NTLM fallback"
-        )
-        return None
-
-    # Prefer the in-hand sweep secret when it is a usable password / NT hash;
-    # otherwise fall back to the canonical credential-store resolver (covers the
-    # ccache-only case where ``password`` is itself a ticket path).
-    candidate = str(password or "").strip()
-    if not candidate or candidate.lower().endswith(".ccache"):
-        from adscan_internal.cli.attack_path_execution import (
-            _get_stored_domain_credential_for_user,
-        )
-
-        candidate = (
-            _get_stored_domain_credential_for_user(
-                shell, domain=domain, username=username
-            )
-            or ""
-        )
-    candidate = str(candidate).strip()
-    if not candidate or candidate.lower().endswith(".ccache"):
-        return None
-    return candidate
 
 
 def _run_native_mssql_service_access_sweep(
@@ -768,7 +725,11 @@ def _run_native_mssql_service_access_sweep(
     # with no MSSQLSvc SPN (Kerberos → KDC_ERR_S_PRINCIPAL_UNKNOWN) would be left
     # unassessed. Thread the principal's stored password / NT hash so the backend
     # can still try NTLM there — gated on NTLM not being known-blocked by posture.
-    mssql_ntlm_fallback_secret = _resolve_mssql_ntlm_fallback_secret(
+    from adscan_internal.services.mssql_auth import (
+        resolve_mssql_ntlm_fallback_secret,
+    )
+
+    mssql_ntlm_fallback_secret = resolve_mssql_ntlm_fallback_secret(
         shell,
         domain=domain,
         username=username,
@@ -819,6 +780,7 @@ def _run_native_mssql_service_access_sweep(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[service-access] failed to persist native MSSQL probe history: {exc}"
         )
@@ -834,6 +796,7 @@ def _run_native_mssql_service_access_sweep(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[service-access] MSSQL authorization collection skipped (non-fatal): {exc}"
         )
@@ -1113,7 +1076,7 @@ def run_enum_all_user_privs(shell: Any, args: str | None) -> None:
     run_enum_all_user_postauth_access(shell, args)
 
 
-def run_netexec_user_postauth_access(
+def run_user_postauth_access(
     shell: Any,
     *,
     domain: str,
@@ -1185,24 +1148,6 @@ def run_postauth_service_and_share_followup(
         mode=SharesViewMode.LIVE,
         username=username,
         credential=password,
-    )
-
-
-def run_netexec_user_privs(
-    shell: Any,
-    *,
-    domain: str,
-    username: str,
-    password: str,
-    hosts: list[str] | None = None,
-) -> None:
-    """Backward-compatible alias for post-auth user access enumeration."""
-    run_netexec_user_postauth_access(
-        shell,
-        domain=domain,
-        username=username,
-        password=password,
-        hosts=hosts,
     )
 
 
@@ -1572,7 +1517,7 @@ def run_user_postauth_access_with_orchestration(
     from rich.prompt import Confirm
 
     # First, run the basic privilege enumeration
-    run_netexec_user_postauth_access(
+    run_user_postauth_access(
         shell, domain=domain, username=username, password=password, hosts=hosts
     )
 
@@ -1608,6 +1553,7 @@ def run_user_postauth_access_with_orchestration(
                 )
     except Exception as _exc:  # noqa: BLE001
         telemetry.capture_exception(_exc)
+        print_exception(exception=_exc)
 
     # Check if there is ADCS in the domain
     if shell.domains_data[domain].get("adcs"):
@@ -1644,26 +1590,6 @@ def run_user_postauth_access_with_orchestration(
                 shell.spraying_with_password(domain, password)
     marked_username = mark_sensitive(username, "user")
     print_success(f"Complete enumeration for user {marked_username}")
-
-
-def run_netexec_user_privs_with_orchestration(
-    shell: Any,
-    *,
-    domain: str,
-    username: str,
-    password: str,
-    hosts: list[str] | None = None,
-    include_acl_enumeration: bool = True,
-) -> None:
-    """Backward-compatible alias for post-auth user access orchestration."""
-    run_user_postauth_access_with_orchestration(
-        shell,
-        domain=domain,
-        username=username,
-        password=password,
-        hosts=hosts,
-        include_acl_enumeration=include_acl_enumeration,
-    )
 
 
 def run_enum_adcs_privs(
@@ -1711,6 +1637,7 @@ def run_enum_adcs_privs(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 vulnerabilities = None
 
         if vulnerabilities is None:

@@ -19,6 +19,7 @@ from adscan_core.rich_output import (
     print_info_verbose,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,7 @@ async def _do_authenticate_with_cert(
             nt_hash = await _extract_nt_hash_u2u(kcomm)
         except Exception as exc_u2u:
             telemetry.capture_exception(exc_u2u)
+            print_exception(exception=exc_u2u)
             print_warning(f"  UnPAC-the-hash attempt failed (non-fatal): {exc_u2u}")
 
     _render_pkinit_result(principal, ccache_path, nt_hash)
@@ -311,5 +313,6 @@ async def authenticate_with_cert_native(
         return await _do_authenticate_with_cert(config, output_dir)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Certificate authentication (PKINIT) failed: {exc}")
         return CertAuthResult(success=False, error=str(exc))

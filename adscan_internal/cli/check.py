@@ -46,6 +46,7 @@ from adscan_internal.ligolo_manager import (
     get_ligolo_agent_local_path,
     get_ligolo_proxy_local_path,
 )
+from adscan_core.rich_output import print_exception
 
 
 _MINIMUM_HASHCAT_VERSION = (7, 1, 2)
@@ -668,6 +669,7 @@ def check_virtual_environment(
                 )
         except Exception as exc:  # noqa: BLE001 - must mirror legacy behaviour
             deps.telemetry_capture_exception(exc)
+            print_exception(exception=exc)
             deps.print_warning(
                 f"Found virtual environment, but couldn't verify Python version: {exc}"
             )
@@ -851,6 +853,7 @@ def check_core_dependencies(
                 missing_core_deps.append(package_name)
         except Exception as exc:  # noqa: BLE001
             deps.telemetry_capture_exception(exc)
+            print_exception(exception=exc)
             deps.print_warning(
                 f"Could not verify core dependency '{package_name}': {exc}"
             )
@@ -1782,6 +1785,7 @@ def _normalize_missing_system_packages_for_runtime(
                 )
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                print_exception(exception=exc)
                 deps.print_info_debug(
                     f"[check] Failed to probe john candidate {john_executable}: {exc}"
                 )
@@ -1829,6 +1833,7 @@ def _normalize_missing_system_packages_for_runtime(
                 )
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                print_exception(exception=exc)
             else:
                 combined_output = "\n".join(
                     [
@@ -1876,6 +1881,7 @@ def _normalize_missing_system_packages_for_runtime(
                 )
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                print_exception(exception=exc)
                 deps.print_info_debug(
                     f"[check] Failed to probe FreeRDP candidate {freerdp_executable}: {exc}"
                 )
@@ -2617,6 +2623,7 @@ def check_dns_resolver(
                 all_ok = False
     except Exception as e:
         deps.telemetry_capture_exception(e)
+        print_exception(exception=e)
         deps.print_info_debug(
             "[dns] Could not fully verify local DNS resolver services."
         )

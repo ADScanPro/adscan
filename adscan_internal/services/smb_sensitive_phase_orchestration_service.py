@@ -21,6 +21,7 @@ from adscan_internal.services.smb_sensitive_file_policy import (
     SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
     get_production_sensitive_scan_phase_sequence,
 )
+from adscan_core.rich_output import print_exception
 
 # Phases pre-selected when no posture signal suggests otherwise.
 # Heavy artifacts opt-in only — too slow and resource-intensive for a default.
@@ -150,6 +151,7 @@ def should_skip_sensitive_scan_prompt_for_ctf_pwned(*, shell: Any, domain: str) 
                 return True
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "CTF pwned-domain check failed during SMB prompt gating; "
                 f"falling back to domain auth state. error={type(exc).__name__}: {exc}"

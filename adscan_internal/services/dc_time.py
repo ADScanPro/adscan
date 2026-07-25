@@ -49,6 +49,7 @@ from adscan_core.rich_output import (
     print_success_verbose,
     print_warning_debug,
 )
+from adscan_core.rich_output import print_exception
 
 
 class DCTimeChannel(str, Enum):
@@ -633,6 +634,7 @@ async def get_dc_time(
             continue
         except Exception as exc:  # noqa: BLE001 — surface any unknown failure
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             failures.append(
                 f"{channel.value}: unexpected: {_describe_exception(exc)}"
             )
@@ -850,11 +852,31 @@ async def _read_offset_seconds(
         return (None, None)
     except Exception as exc:  # noqa: BLE001 — guard must never raise
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"clock-sync-guard DC-time read raised: {exc}")
         return (None, None)
     now_utc = datetime.now(timezone.utc)
     offset = (reading.when_utc - now_utc).total_seconds()
     return (offset, reading)
+
+
+def _seed_kerbad_offset(realm: str, offset: float) -> None:
+    """Best-effort: seed a MEASURED host↔DC offset into kerbad's realm skew cache.
+
+    Used when the guard measured a real offset but could NOT physically step the
+    host clock (no host helper). Seeding lets kerbad apply the correction
+    in-memory to every fresh AIOKerberosClient (LDAP + SMB + …) proactively,
+    instead of each transport having to re-learn the skew reactively. Never
+    raises — clock recovery must never break the auth it is trying to help.
+    """
+    try:
+        from adscan_internal.services._kerberos_recovery import (  # noqa: PLC0415
+            seed_realm_skew,
+        )
+
+        seed_realm_skew(realm, offset)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def ensure_clock_synced_fresh(
@@ -956,11 +978,17 @@ async def _ensure_clock_synced_fresh_locked(
 
     # Stepping the host clock requires the privileged host helper.
     if not sock_path:
+        # Cannot physically step, but we DID measure a real offset: seed it into
+        # kerbad's realm skew cache so every fresh Kerberos client (LDAP + SMB +
+        # …) applies the correction in-memory. Without this the SMB collector's
+        # member-server auth failed under skew where the LDAP path had reactively
+        # learned the offset first.
+        _seed_kerbad_offset(domain_norm, offset)
         return ClockSyncResult(
             outcome=ClockSyncOutcome.FELL_BACK_TO_REQUEST_SKEW,
             offset_seconds=offset,
             channel=reading.channel.value,
-            detail="host helper socket unavailable; cannot step clock",
+            detail="host helper socket unavailable; cannot step clock (seeded kerbad offset)",
         )
 
     from adscan_internal.host_privileged_helper import (
@@ -993,6 +1021,7 @@ async def _ensure_clock_synced_fresh_locked(
                 pass
     except (HostHelperError, OSError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"clock-sync-guard NTP-off host-helper error: {exc}")
         # Continue: we can still try to step the clock.
 
@@ -1015,7 +1044,11 @@ async def _ensure_clock_synced_fresh_locked(
         )
     except (HostHelperError, OSError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"clock-sync-guard set_system_time host-helper error: {exc}")
+        # Physical step failed but the reading passed sanity: seed the measured
+        # offset so kerbad still applies it in-memory across every transport.
+        _seed_kerbad_offset(domain_norm, offset)
         return ClockSyncResult(
             outcome=ClockSyncOutcome.FAILED,
             offset_seconds=offset,
@@ -1028,6 +1061,7 @@ async def _ensure_clock_synced_fresh_locked(
             f"rc={getattr(set_resp, 'returncode', None)} "
             f"msg={getattr(set_resp, 'message', None)!r}"
         )
+        _seed_kerbad_offset(domain_norm, offset)
         return ClockSyncResult(
             outcome=ClockSyncOutcome.FAILED,
             offset_seconds=offset,
@@ -1103,6 +1137,7 @@ def do_ensure_clock_synced_fresh(
         )
     except Exception as exc:  # noqa: BLE001 — guard must never raise
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"clock-sync-guard sync wrapper failed: {exc}")
         return ClockSyncResult(
             outcome=ClockSyncOutcome.FELL_BACK_TO_REQUEST_SKEW,
@@ -1113,6 +1148,43 @@ def do_ensure_clock_synced_fresh(
 # ---------------------------------------------------------------------------
 # PKINIT reactive backstop — register the physical clock-resync callback
 # ---------------------------------------------------------------------------
+
+
+#: Session shell registered for the TRANSVERSAL, shell-less proactive clock
+#: sync. Set once by ``register_clock_resync_for_shell`` (shell setup). Lets any
+#: Kerberos TRANSPORT (SMB/LDAP) sync the host clock before auth WITHOUT threading
+#: the shell — so clock sync is a property of the auth seam, not a per-caller
+#: responsibility a new path can forget (the exact gap that let the SMB collector
+#: under-collect member servers under DC clock skew).
+_ACTIVE_CLOCK_SHELL: Any = None
+
+
+async def ensure_clock_synced_for_target(
+    domain: str,
+    dc_ip: str,
+    *,
+    ttl_seconds: int = _CLOCK_FRESH_TTL_SECONDS,
+) -> None:
+    """Shell-less transversal clock-sync guard for the transport auth seam.
+
+    Delegates to :func:`ensure_clock_synced_fresh` using the session shell
+    registered via :func:`register_clock_resync_for_shell`. A no-op when no shell
+    is registered (unit/standalone) or when domain/dc_ip is missing. TTL-memoized
+    and best-effort (never raises), so a transport can call it on every Kerberos
+    connection at ~1ms cost when the clock is already fresh — the whole point is
+    that NO caller can bypass the sync.
+    """
+    shell = _ACTIVE_CLOCK_SHELL
+    if shell is None:
+        return
+    if not str(domain or "").strip() or not str(dc_ip or "").strip():
+        return
+    try:
+        await ensure_clock_synced_fresh(
+            shell, domain=domain, dc_ip=dc_ip, ttl_seconds=ttl_seconds
+        )
+    except Exception:  # noqa: BLE001 — best-effort; must never break auth
+        pass
 
 
 def register_clock_resync_for_shell(shell: Any) -> None:
@@ -1135,6 +1207,11 @@ def register_clock_resync_for_shell(shell: Any) -> None:
         shell: The active ``PentestShell`` (owns ``domains_data`` and the
             host-helper clock step).
     """
+    # Also register the shell for the transversal PROACTIVE sync
+    # (ensure_clock_synced_for_target) so the transport seam can reach it
+    # shell-lessly. Same session-scoped registration, one call site.
+    global _ACTIVE_CLOCK_SHELL  # noqa: PLW0603
+    _ACTIVE_CLOCK_SHELL = shell
 
     def _resync(realm: str) -> bool:
         """Physically resync the host clock for *realm*'s DC. True iff stepped."""
@@ -1166,6 +1243,7 @@ def register_clock_resync_for_shell(shell: Any) -> None:
             return result.outcome is ClockSyncOutcome.SYNCED
         except Exception as exc:  # noqa: BLE001 — backstop must never raise into kerbad
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"clock-resync backstop closure failed for {realm}: {exc}")
             return False
 
@@ -1176,4 +1254,5 @@ def register_clock_resync_for_shell(shell: Any) -> None:
         print_info_debug("PKINIT clock-resync backstop armed for the session.")
     except Exception as exc:  # noqa: BLE001 — never break shell startup
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"failed to arm PKINIT clock-resync backstop: {exc}")

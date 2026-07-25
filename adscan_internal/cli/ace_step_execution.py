@@ -20,6 +20,7 @@ from rich.text import Text
 from adscan_internal import print_info, print_warning, telemetry
 from adscan_internal.rich_output import (
     BRAND_COLORS,
+    confirm_ask,
     mark_sensitive,
     print_info_debug,
     print_panel,
@@ -32,6 +33,7 @@ from adscan_internal.services.attack_graph_service import (
     infer_directory_object_enabled_state,
     resolve_netexec_target_for_node_label,
 )
+from adscan_core.rich_output import print_exception
 
 
 def set_last_execution_outcome(shell: Any, outcome: dict[str, Any] | None) -> None:
@@ -123,6 +125,7 @@ def _infer_target_enabled(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_target = mark_sensitive(
             _normalize_account(_node_sam_or_label(to_node, to_label)) or to_label,
             "user",
@@ -406,6 +409,7 @@ def _resolve_execution_user_with_source(
                 )
         except Exception as _exc:  # noqa: BLE001
             telemetry.capture_exception(_exc)
+            print_exception(exception=_exc)
             print_info_debug(
                 f"[exec-user] Group-membership resolution failed: {type(_exc).__name__}; "
                 "falling back to affected_users intersection."
@@ -657,6 +661,15 @@ ACL_ACE_RELATIONS: set[str] = {
     "owns",
     "writespn",
     "dcsync",
+    # AddKeyCredentialLink grants exactly the msDS-KeyCredentialLink write →
+    # Shadow Credentials (the ONLY valid primitive for this edge). Routed to the
+    # existing shadow-creds path with forced_method="shadow".
+    "addkeycredentiallink",
+    # AllExtendedRights (null-GUID ControlAccess) is the SOLE edge on many paths
+    # (SharpHound emits the specific ForceChangePassword/DCSync/ReadLAPSPassword
+    # edges from DIFFERENT ACEs). Remapped by target class to the concrete
+    # extended-right it confers (see execute_ace_step). NOT a write (no shadow-creds).
+    "allextendedrights",
 }
 
 
@@ -685,8 +698,9 @@ def describe_ace_relation_support(
         # GenericAll implies WriteDACL + WriteOwner, so on a Domain head it can
         # be exploited through the DCSync-via-DACL pipeline (add DS-Replication
         # ACEs, then DCSync). On other supported objects it routes to the
-        # standard control-object handlers.
-        if target_kind_norm in {"user", "computer", "ou", "group", "domain"}:
+        # standard control-object handlers. On a GPO it routes to the Immediate
+        # Scheduled Task plant (SYSTEM code-exec on every linked host).
+        if target_kind_norm in {"user", "computer", "ou", "group", "domain", "gpo"}:
             return True, None
         return (
             False,
@@ -696,8 +710,11 @@ def describe_ace_relation_support(
     if relation == "genericwrite":
         # GenericWrite allows property writes but NOT DACL modification, so it
         # cannot be turned into DCSync on a Domain head. Keep it scoped to
-        # objects where a property-write primitive yields takeover.
-        if target_kind_norm in {"user", "computer", "ou", "group"}:
+        # objects where a property-write primitive yields takeover. A GPO is in
+        # scope: writing the SYSVOL Machine half plus the versionNumber /
+        # gPCMachineExtensionNames attributes is enough to plant an Immediate
+        # Scheduled Task (no DACL modification needed).
+        if target_kind_norm in {"user", "computer", "ou", "group", "gpo"}:
             return True, None
         if target_kind_norm == "domain":
             return (
@@ -922,6 +939,7 @@ def _acl_cleanup_register(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     if actions is not None:
         action: dict[str, Any] = {
@@ -939,6 +957,7 @@ def _acl_cleanup_register(
             actions.append(action)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def _capture_original_owner(shell: Any, context: AceStepContext) -> str | None:
@@ -985,6 +1004,7 @@ def _capture_original_owner(shell: Any, context: AceStepContext) -> str | None:
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -1081,6 +1101,49 @@ def _execute_genericall_domain_dcsync(
     )
 
 
+def _dispatch_gpo_immediate_task(shell: Any, context: AceStepContext) -> bool:
+    """Dispatch a GenericAll/GenericWrite→GPO step to the plant helper.
+
+    Resolves the target GPO node's distinguishedName / objectId from the
+    workspace attack graph (the unambiguous keys the shell helper matches the
+    writable-GPO candidate on), then delegates to the non-interactive,
+    single-target shell helper. Falls back to the node label when the
+    identifiers are absent (merged/cached nodes).
+    """
+    to_node = get_node_by_label(shell, context.domain, label=context.to_label)
+    props = _node_props(to_node)
+    node = to_node if isinstance(to_node, dict) else {}
+    target_dn = str(
+        node.get("distinguishedname")
+        or node.get("distinguished_name")
+        or props.get("distinguishedname")
+        or props.get("distinguished_name")
+        or ""
+    ).strip()
+    target_object_id = str(
+        node.get("objectId")
+        or node.get("objectid")
+        or props.get("objectid")
+        or props.get("objectId")
+        or ""
+    ).strip()
+
+    helper = getattr(shell, "exploit_gpo_immediate_task_for_step", None)
+    if not callable(helper):
+        print_warning(
+            "GPO Immediate Scheduled Task execution helper is unavailable in "
+            "this shell context."
+        )
+        return False
+    return bool(
+        helper(
+            context,
+            target_dn=target_dn or None,
+            target_object_id=target_object_id or None,
+        )
+    )
+
+
 def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
     """Execute an ACL/ACE relationship step using the best available primitive.
 
@@ -1099,6 +1162,37 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
     marked_to = mark_sensitive(context.to_label, "node")
 
     target_kind = context.target_kind.strip().lower()
+
+    if relation == "allextendedrights":
+        # AllExtendedRights = an ACE granting ControlAccess with a NULL ObjectType
+        # GUID (ALL extended / control-access rights). It is a distinct permission
+        # bit from WriteProperty, so it does NOT grant the msDS-KeyCredentialLink
+        # write (Shadow Credentials — empirically ACCESS_DENIED / LDAP 50) nor any
+        # attribute READ (gMSA password). It confers the object's extended rights,
+        # which — mirroring SharpHound's ACLProcessor per-target branching — reduce
+        # to ONE concrete abuse per target class. Remap to that supported technique
+        # and fall through to its branch (pure dispatch — no duplicated exploit code):
+        #   user     -> ForceChangePassword (User-Force-Change-Password)
+        #   domain   -> DCSync (Get-Changes + Get-Changes-All)
+        #   computer -> ReadLAPSPassword (SharpHound only emits a computer
+        #               AllExtendedRights edge when LAPS is present, so never a dead-end)
+        _all_ext_remap = {
+            "user": "forcechangepassword",
+            "domain": "dcsync",
+            "computer": "readlapspassword",
+        }
+        effective_relation = _all_ext_remap.get(target_kind)
+        if effective_relation is None:
+            print_warning(
+                f"AllExtendedRights on a '{target_kind}' target has no supported "
+                "extended-right abuse (only user, computer, and domain are actionable)."
+            )
+            return False
+        print_info_debug(
+            f"ace allextendedrights -> {effective_relation} "
+            f"(target_kind={target_kind})"
+        )
+        relation = effective_relation
 
     if relation == "dcsync":
         # GAP 3 — scoped-ticket-first: if a prior step (SPNJack, relay-RBCD)
@@ -1142,6 +1236,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         result = shell.dcsync(context.domain, dcsync_username, dcsync_password)
         # Edge semantics: DCSync → Domain means "compromise the domain by
@@ -1219,6 +1314,42 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         )
 
     if relation == "forcechangepassword":
+        from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+            classify_destructive,
+            is_machine_account_name,
+        )
+
+        # SAFETY HARD-BLOCK (defense-in-depth; the un-bypassable guard lives in
+        # ``run_exploit_force_change_password``). A ForceChangePassword against a
+        # computer/machine account resets that host's password and disrupts it,
+        # so ADscan refuses it in EVERY mode before any warning or prompt. A
+        # ``$``-suffixed sAMAccountName OR a computer/machine ``target_kind``
+        # triggers the block.
+        effective_target_kind = (
+            "computer"
+            if is_machine_account_name(context.target_sam_or_label)
+            or is_machine_account_name(context.to_label)
+            else target_kind
+        )
+        destructive_verdict = classify_destructive(
+            "forcechangepassword", effective_target_kind
+        )
+        if destructive_verdict.hard_blocked:
+            print_warning(
+                "ForceChangePassword not executed for safety: "
+                f"{destructive_verdict.client_safe_reason}"
+            )
+            set_last_execution_outcome(
+                shell,
+                {
+                    "key": "step_blocked_for_safety",
+                    "relation": "forcechangepassword",
+                    "blocked_kind": "dangerous_destructive",
+                    "reason": destructive_verdict.client_safe_reason,
+                },
+            )
+            return False
+
         marked_from = mark_sensitive(context.exec_username, "user")
         audit_context = (
             " This is particularly disruptive in audit mode." if _is_audit_mode(shell) else ""
@@ -1245,12 +1376,12 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 "Only continue if you are explicitly authorized to reset this credential during the engagement."
             ),
         )
-        # CTF workspaces: password changes are acceptable — the DC is owned by
-        # the operator. Skip the confirmation gate to keep the CTF flow fast.
-        # Audit workspaces always require explicit consent because the original
-        # password is lost permanently and needs client coordination.
-        _is_ctf = str(getattr(shell, "type", "") or "").lower() == "ctf"
-        if not _is_ctf and not Confirm.ask(
+        # Opt-in consent (default OFF, no CTF auto-execute). Resetting a user's
+        # password is irreversible, so it runs only on an explicit operator
+        # opt-in — including in CTF. The centralized helper auto-resolves to the
+        # default (skip) in non-interactive mode, so ``adscan ci`` / the web
+        # worker never hang and never auto-execute this.
+        if not confirm_ask(
             "Proceed with ForceChangePassword execution?",
             default=False,
         ):
@@ -1269,6 +1400,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             context.target_sam_or_label,
             context.target_domain,
             prompt_for_user_privs_after=False,
+            target_kind=effective_target_kind,
         )
         if not fcp_success:
             print_warning(
@@ -1302,9 +1434,67 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
         return True
 
+    if relation == "addkeycredentiallink":
+        # AddKeyCredentialLink authorizes exactly the msDS-KeyCredentialLink write
+        # → Shadow Credentials is the ONLY valid primitive (RBCD / password-reset
+        # would fail ACCESS_DENIED — this edge grants neither). Force shadow-creds
+        # through the existing computer/user control path (which handles the LDAP
+        # write, PKINIT hash recovery, cleanup + env-ledger registration).
+        if target_kind == "computer":
+            if context.target_enabled is False:
+                print_warning(
+                    f"Target {marked_to} is disabled — Shadow Credentials needs an "
+                    "enabled computer to authenticate via PKINIT."
+                )
+                return False
+            return shell.exploit_control_computer_object(
+                context.domain,
+                context.exec_username,
+                context.exec_password,
+                context.target_sam_or_label,
+                context.target_domain,
+                prompt_for_user_privs_after=False,
+                forced_method="shadow",
+            )
+        if target_kind == "user":
+            if context.target_enabled is False:
+                print_warning(
+                    f"Target {marked_to} is disabled — enable it before Shadow Credentials."
+                )
+                return False
+            # User shadow-creds: add a KeyCredentialLink to the user, PKINIT as
+            # them. ForceChangePassword is NOT offered (this edge does not grant it).
+            return shell.exploit_generic_all_user(
+                context.domain,
+                context.exec_username,
+                context.exec_password,
+                context.target_sam_or_label,
+                context.target_domain,
+                prompt_for_password_fallback=False,
+                prompt_for_user_privs_after=False,
+                prompt_for_method_choice=True,
+                allow_force_change_password=False,
+            )
+        print_warning(
+            f"AddKeyCredentialLink exploitation requires a user or computer target "
+            f"(got '{target_kind}')."
+        )
+        return False
+
     if relation in {"genericall", "genericwrite", "writeaccountrestrictions"}:
+        if target_kind == "gpo" and relation in {"genericall", "genericwrite"}:
+            # GenericAll/GenericWrite over a groupPolicyContainer routes to the
+            # native Immediate Scheduled Task plant. The GPO is fixed by the
+            # path, so this is a non-interactive, single-target counterpart of
+            # the operator wizard: resolve that one GPO into a
+            # WritableGPOCandidate and plant + auto-rollback via the shipped
+            # exploitation service (recording the change + undo in the session
+            # ledger like every other executed step). (container is a distinct,
+            # unimplemented technique and is intentionally left unsupported.)
+            return _dispatch_gpo_immediate_task(shell, context)
         if target_kind in {"user", "computer"}:
             if context.target_tombstoned and target_kind == "user":
                 print_warning(f"Target {marked_to} is a deleted (tombstoned) object.")
@@ -1377,6 +1567,26 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     shell, "exploit_control_computer_object", None
                 )
                 if callable(computer_helper):
+                    if relation == "writeaccountrestrictions":
+                        # WriteAccountRestrictions grants ONLY the
+                        # User-Account-Restrictions property-set write, which covers
+                        # msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD) but NOT
+                        # msDS-KeyCredentialLink (Shadow Credentials). On an
+                        # ADCS-present domain the helper auto-selects shadow-creds
+                        # first and would hit ACCESS_DENIED, so pin the technique to
+                        # RBCD (RBCD needs no PKINIT/enabled-computer guard the way
+                        # shadow does).
+                        return computer_helper(
+                            context.domain,
+                            context.exec_username,
+                            context.exec_password,
+                            context.target_sam_or_label,
+                            context.target_domain,
+                            prompt_for_user_privs_after=False,
+                            forced_method="rbcd",
+                        )
+                    # GenericAll/GenericWrite grant BOTH primitives → keep the
+                    # shadow-vs-RBCD method choice.
                     return computer_helper(
                         context.domain,
                         context.exec_username,

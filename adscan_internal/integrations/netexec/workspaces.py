@@ -12,6 +12,7 @@ from adscan_internal import (
     print_warning,
 )
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_exception
 
 
 def get_nxc_workspaces_dir(nxc_base_dir: str) -> str:
@@ -53,6 +54,7 @@ def clean_netexec_workspaces(
         return not os.path.exists(nxc_workspaces_dir)
     except PermissionError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "NetExec workspaces cleanup failed due to permissions: "
             f"{nxc_workspaces_dir}"
@@ -83,10 +85,12 @@ def clean_netexec_workspaces(
             return not os.path.exists(nxc_workspaces_dir)
         except Exception as inner_exc:
             telemetry.capture_exception(inner_exc)
+            print_exception(exception=inner_exc)
             print_warning("Failed to clean NetExec workspaces via sudo.")
             return False
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to clean NetExec workspaces: {exc}")
         return False
 

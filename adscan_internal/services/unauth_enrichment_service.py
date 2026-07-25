@@ -51,6 +51,7 @@ from rich.text import Text
 from adscan_core import telemetry
 from adscan_core.rich_output import (
     _get_console,
+    print_exception,
     print_info_debug,
     print_info_verbose,
 )
@@ -961,6 +962,7 @@ async def run_unauth_enrichment_async(
                 card.last_finding = "Anonymous user enumeration denied (hardened DC)"
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             msg = str(exc)
             results.errors["ldap_active_users"] = msg
             results.ldap_active_users_status = (
@@ -994,6 +996,7 @@ async def run_unauth_enrichment_async(
             connection = await _open_null_smb_connection(config.dc_ip, config.timeout)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             msg = str(exc)
             results.errors["smb_null_session"] = msg
             samr_card.status = "error"
@@ -1066,6 +1069,7 @@ async def run_unauth_enrichment_async(
                             )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     msg = str(exc)
                     results.errors["samr"] = msg
                     samr_card.status = "error"
@@ -1114,6 +1118,7 @@ async def run_unauth_enrichment_async(
                             gpp_card.last_finding = _truncate(gpp_err)
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     msg = str(exc)
                     results.errors["gpp"] = msg
                     gpp_card.status = "error"
@@ -1121,6 +1126,7 @@ async def run_unauth_enrichment_async(
                     gpp_card.last_finding = _truncate(msg)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             msg = str(exc)
             results.errors["smb_null_session"] = msg
             for c in (samr_card, desc_card, gpp_card):
@@ -1191,6 +1197,7 @@ async def run_unauth_enrichment_async(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             results.rid_cycling_status = "error"
             results.rid_cycling_reason = f"import failed: {exc}"
             card.status = "error"
@@ -1224,6 +1231,7 @@ async def run_unauth_enrichment_async(
                         results.errors["rid_cycling_deep"] = err2 or status2
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             results.rid_cycling_status = "error"
             results.rid_cycling_reason = str(exc)
             card.status = "error"

@@ -132,7 +132,31 @@ def _finding_catalog() -> dict[str, dict[str, Any]]:
             return _FINDING_CATALOG_PROVIDER()
         except Exception as exc:  # noqa: BLE001 - fall back to LITE-safe default
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     return _build_technical_finding_catalog_from_meta()
+
+
+def _coerce_positive_cvss(raw: Any) -> float | None:
+    """Return ``raw`` as a positive CVSS base score, or ``None``.
+
+    The finding catalog carries a formal CVSS base per key. A missing key (LITE
+    meta catalog) or a non-positive value (0.0 == "no catalog base for this
+    key") yields ``None`` so the recorder omits ``cvss_base`` cleanly rather
+    than emitting a meaningless 0.0 the web would treat as an unresolved base.
+
+    Args:
+        raw: The catalog's ``cvss_base`` value (float/int/str or absent).
+
+    Returns:
+        A positive float score, or ``None`` when absent / non-positive.
+    """
+    if raw is None:
+        return None
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return score if score > 0.0 else None
 
 
 def _utc_now_iso() -> str:
@@ -339,7 +363,27 @@ def record_technical_finding(
     # (meta-only catalog) yields no ``knowledge`` key — omitted cleanly.
     knowledge = catalog.get("knowledge") if isinstance(catalog, dict) else None
 
+    # Formal CVSS base score supplied by the PRO catalog provider. Emitted onto
+    # the finding so the web CTEM ingests the base straight from the artifact —
+    # the appliance backend ships only the cli_stubs + adscan_core, so it cannot
+    # re-resolve the PRO vuln catalog and would otherwise collapse the base to
+    # 0.0, hiding the base→contextual CVSS transparency. LITE's meta-only catalog
+    # carries no base (yields None) → the key is omitted cleanly, exactly like
+    # ``knowledge``. Only a positive score is emitted (0.0 == "no catalog base").
+    cvss_base = _coerce_positive_cvss(catalog.get("cvss_base")) if isinstance(catalog, dict) else None
+
     if finding is None:
+        # SSOT confirmation gate: only materialize a NEW finding when the probe
+        # actually confirmed the condition. A producer that ran the check and
+        # passed an explicit NEGATIVE value with no confirming evidence proved
+        # the condition ABSENT ("verified clear" coverage) and must NOT fabricate
+        # a false-positive finding. Branches that keep the finding:
+        #   - value is None      -> details-only producer (runs only on a hit)
+        #   - _is_positive_value -> positive boolean/truthy value
+        #   - bool(evidence)     -> confirming evidence attached
+        confirmed = (value is None) or _is_positive_value(value) or bool(evidence)
+        if not confirmed:
+            return
         resolved_from_attack_graph = (
             bool(from_attack_graph) if from_attack_graph is not None else False
         )
@@ -359,6 +403,8 @@ def record_technical_finding(
         }
         if isinstance(knowledge, dict) and knowledge:
             finding["knowledge"] = knowledge
+        if cvss_base is not None:
+            finding["cvss_base"] = cvss_base
         findings.append(finding)
     else:
         finding["status"] = status
@@ -373,6 +419,9 @@ def record_technical_finding(
         # already-recorded findings on the next scan/replay.
         if isinstance(knowledge, dict) and knowledge:
             finding["knowledge"] = knowledge
+        # Refresh the CVSS base too (a catalog re-score reaches prior findings).
+        if cvss_base is not None:
+            finding["cvss_base"] = cvss_base
 
     if summary:
         finding["details"].update(summary)
@@ -694,4 +743,5 @@ def summarize_findings(
         )
     except Exception as exc:  # noqa: BLE001 - best-effort reader, never breaks exit
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return FindingsSummary()

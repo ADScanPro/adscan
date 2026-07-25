@@ -31,6 +31,7 @@ from adscan_internal.services.compromise_class import (
     privilege_tier_for_principal,
 )
 from adscan_internal.services.high_value import normalize_samaccountname
+from adscan_core.rich_output import print_exception
 
 
 def _rid_from_sid(sid: str | None) -> int | None:
@@ -54,6 +55,7 @@ def _load_tier_membership_snapshot(shell: Any, domain: str) -> dict[str, Any] | 
         return snapshot if isinstance(snapshot, dict) else None
     except Exception as exc:  # noqa: BLE001 — a membership read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -149,6 +151,7 @@ def resolve_user_privilege_tier(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 

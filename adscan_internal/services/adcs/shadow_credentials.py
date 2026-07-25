@@ -9,6 +9,7 @@ from typing import Optional
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_info, print_success, print_warning
 from adscan_internal.services.ldap_transport_service import ADscanLDAPConfig, ADscanLDAPConnection
+from adscan_core.rich_output import print_exception
 
 
 @dataclass
@@ -107,6 +108,7 @@ def add_shadow_credentials_native(
 
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return ShadowCredsResult(success=False, error=f"{type(exc).__name__}: {exc}")
 
 
@@ -147,4 +149,5 @@ def remove_shadow_credentials_native(
             )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False

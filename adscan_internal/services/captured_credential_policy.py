@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 
 from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 
 AccountType = Literal["machine", "user"]
 CrackPolicy = Literal["wordlist", "rainbow_only", "no_crack"]
@@ -44,6 +45,7 @@ def classify_principal(
         return "user"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return "user"
 
 

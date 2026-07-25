@@ -49,6 +49,7 @@ from adscan_internal.services.host_intelligence.product_catalog import (
     SERVICES_BASE,
 )
 from adscan_internal.services.smb_transport import SMBConfig, smb_machine_with_fallback
+from adscan_core.rich_output import print_exception
 
 T = TypeVar("T")
 
@@ -156,12 +157,14 @@ class HostFingerprintService:
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             fp.error = str(exc)[:200]
             print_info_debug(f"[host_intel] error: {exc}")
         try:
             self._resolve_winrm_availability(config, fp)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] winrm availability error: {exc}")
         fp.elapsed_s = time.monotonic() - t0
         return fp
@@ -176,6 +179,7 @@ class HostFingerprintService:
                 print_info_debug(f"[host_intel] RemoteRegistry start: {ok} / {err}")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] RemoteRegistry start error: {exc}")
 
     async def _run_probe_with_fresh_machine(
@@ -194,6 +198,7 @@ class HostFingerprintService:
             return result
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] {probe_name} probe failed: {exc}")
             return fallback
 
@@ -218,6 +223,7 @@ class HostFingerprintService:
                 return int(val) == 0
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] Defender RTP read error: {exc}")
             return True
 
@@ -291,6 +297,7 @@ class HostFingerprintService:
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] LSARPC detection error: {exc}")
         return result
 
@@ -337,6 +344,7 @@ class HostFingerprintService:
                     result[product.name] = (found, svc_start)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] service detection error: {exc}")
         return result
 
@@ -375,6 +383,7 @@ class HostFingerprintService:
                 result[product.name] = running
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel] pipe detection error: {exc}")
         return result
 

@@ -356,6 +356,7 @@ def infer_domain_from_smb_banner(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[smb_infer] native SMB path raised unexpectedly: {exc}")
             domain, hostname = None, None
         if domain or hostname:
@@ -413,6 +414,7 @@ def infer_domain_from_ldap_banner(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[ldap_infer] native path raised unexpectedly: {exc}")
         return None, None
 

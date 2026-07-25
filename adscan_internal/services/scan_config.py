@@ -39,6 +39,10 @@ The schema (all keys optional)::
       wordlist: ''            # escape hatch: an explicit wordlist path, bypasses effort tiering
     poisoning:
       enabled: true           # broadcast poisoning on/off (absent = workspace-type default)
+    pivoting:
+      enabled: true           # allow ADscan to pivot (ligolo tunnels via MSSQL, WinRM, etc.) into newly-reachable networks (absent = workspace-type default: ctf on, audit off)
+    writeshare_bait:
+      enabled: true           # drop NTLMv2-bait files on writable shares (absent = workspace-type default: ctf on, audit off)
 
 Unknown keys raise :class:`ScanConfigError` — a typo must fail loud, never be
 silently ignored. The web mirrors this same valid-set so both sides validate
@@ -129,6 +133,8 @@ _TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "host_cap",
         "cracking",
         "poisoning",
+        "pivoting",
+        "writeshare_bait",
     }
 )
 _PHASES_KEYS: frozenset[str] = frozenset({"disabled", "steps"})
@@ -138,6 +144,8 @@ _AUDIT_EXTRAS_KEYS: frozenset[str] = frozenset({"target_scope"})
 _STEPS_KEYS: frozenset[str] = frozenset({"disabled"})
 _CRACKING_KEYS: frozenset[str] = frozenset({"effort", "wordlist"})
 _POISONING_KEYS: frozenset[str] = frozenset({"enabled"})
+_PIVOTING_KEYS: frozenset[str] = frozenset({"enabled"})
+_WRITESHARE_BAIT_KEYS: frozenset[str] = frozenset({"enabled"})
 
 
 class ScanConfigError(ValueError):
@@ -277,6 +285,75 @@ class PoisoningConfig:
 
 
 @dataclass(frozen=True)
+class PivotingConfig:
+    """Network-pivoting toggle — a GENERAL engagement-scope decision.
+
+    Controls whether ADscan may establish network pivots (ligolo tunnels via
+    MSSQL, WinRM, or future methods) to reach hosts/domains not directly
+    reachable from the scanning vantage. This is deliberately NOT
+    service-specific: MSSQL-driven pivoting is the first consumer, but every
+    future pivot method (WinRM, etc.) shares this SAME flag rather than
+    growing its own toggle.
+
+    Same tri-state shape as :class:`PoisoningConfig` — ``enabled`` is:
+
+    * ``None`` (default) — use the workspace-type default. ``ctf`` workspaces
+      default to ``True`` (a CTF/lab engagement has no client-facing OPSEC
+      concern, so ADscan attempts pivoting by default); every other workspace
+      type (``audit``, the real-client-engagement case) defaults to ``False``
+      — pivoting into a network outside the agreed scope stays opt-in only.
+      An absent section is therefore a no-op that reproduces today's audit
+      behavior exactly.
+    * ``True`` — force pivoting on, overriding the type default.
+    * ``False`` — force it off, overriding the type default.
+
+    The gate that consumes this is
+    :func:`adscan_internal.services.pivot_service.is_pivoting_enabled`.
+
+    Attributes:
+        enabled: ``None`` = workspace-type default (ctf on, audit off);
+            ``True`` = force on; ``False`` = force off.
+    """
+
+    enabled: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class WriteShareBaitConfig:
+    """Write-share NTLMv2-bait background-job toggle.
+
+    The write-share bait plants a coercing file (``.url`` / ``.lnk`` / ``.scf``
+    / ``.library-ms``) on a writable share and captures the NetNTLMv2 a browsing
+    user is coerced into sending. Like poisoning, it must **wait for a victim**
+    to trigger it, so it runs as a **background job**, never as a sequential
+    scan phase — a sibling of ``poisoning`` / ``pivoting``, NOT an entry in
+    ``phases.disabled``. ``enabled`` is tri-state:
+
+    * ``None`` (default) — use the workspace-type default. ``ctf`` workspaces
+      default to ``True`` (a CTF/lab engagement has no client-facing OPSEC
+      concern and can wait for a share to be browsed); every other workspace
+      type (``audit``, the real-client engagement) defaults to ``False`` —
+      leaving a bait file on a client share stays opt-in only. An absent
+      section is therefore a no-op that reproduces today's behavior exactly.
+    * ``True`` — force the background write-share bait job on, overriding the
+      type default.
+    * ``False`` — force it off, overriding the type default.
+
+    The gate that consumes this is
+    :func:`adscan_internal.services.background_jobs.scan_seam.writeshare_bait_enabled`.
+    The hard opt-out env var ``ADSCAN_NO_WRITESHARE_BAIT=1`` still takes
+    precedence over an explicit ``True`` (a monitored/out-of-scope engagement
+    kill switch).
+
+    Attributes:
+        enabled: ``None`` = workspace-type default (ctf on, audit off);
+            ``True`` = force on; ``False`` = force off.
+    """
+
+    enabled: Optional[bool] = None
+
+
+@dataclass(frozen=True)
 class ScanConfig:
     """A fully-resolved scan configuration.
 
@@ -300,6 +377,16 @@ class ScanConfig:
     # phase). ``enabled is None`` = workspace-type default (audit on, ctf off);
     # so an absent section is a no-op.
     poisoning: PoisoningConfig = field(default_factory=PoisoningConfig)
+    # Network-pivoting toggle (sibling of ``poisoning``, NOT service-specific —
+    # MSSQL/WinRM/future pivot methods all share this ONE flag). Opt-in, off by
+    # default regardless of workspace type; an absent section is a no-op.
+    pivoting: PivotingConfig = field(default_factory=PivotingConfig)
+    # Write-share NTLMv2-bait background-job toggle (sibling of ``poisoning`` /
+    # ``pivoting``, NOT a phase). ``enabled is None`` = workspace-type default
+    # (ctf on, audit off); so an absent section is a no-op.
+    writeshare_bait: WriteShareBaitConfig = field(
+        default_factory=WriteShareBaitConfig
+    )
 
     # -- convenience predicates used by the gated decision points -----------
 
@@ -316,6 +403,8 @@ class ScanConfig:
             and self.cracking.effort == CRACKING_EFFORT_DEFAULT
             and not self.cracking.wordlist
             and self.poisoning.enabled is None
+            and self.pivoting.enabled is None
+            and self.writeshare_bait.enabled is None
         )
 
     def disabled_phase_ids(self) -> frozenset[str]:
@@ -511,6 +600,30 @@ def _parse_poisoning(raw: Any) -> PoisoningConfig:
     return PoisoningConfig(enabled=enabled)
 
 
+def _parse_pivoting(raw: Any) -> PivotingConfig:
+    mapping = _require_mapping(raw, where="pivoting")
+    _reject_unknown_keys(mapping, _PIVOTING_KEYS, where="pivoting")
+    enabled = mapping.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ScanConfigError(
+            f"'pivoting.enabled' must be a boolean or absent, "
+            f"got {type(enabled).__name__}."
+        )
+    return PivotingConfig(enabled=enabled)
+
+
+def _parse_writeshare_bait(raw: Any) -> WriteShareBaitConfig:
+    mapping = _require_mapping(raw, where="writeshare_bait")
+    _reject_unknown_keys(mapping, _WRITESHARE_BAIT_KEYS, where="writeshare_bait")
+    enabled = mapping.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ScanConfigError(
+            f"'writeshare_bait.enabled' must be a boolean or absent, "
+            f"got {type(enabled).__name__}."
+        )
+    return WriteShareBaitConfig(enabled=enabled)
+
+
 def _parse_host_cap(raw: Any) -> int:
     """Parse the top-level ``host_cap`` scalar (a non-negative integer).
 
@@ -558,6 +671,8 @@ def parse_scan_config(data: Any) -> ScanConfig:
         host_cap=_parse_host_cap(mapping.get("host_cap")),
         cracking=_parse_cracking(mapping.get("cracking")),
         poisoning=_parse_poisoning(mapping.get("poisoning")),
+        pivoting=_parse_pivoting(mapping.get("pivoting")),
+        writeshare_bait=_parse_writeshare_bait(mapping.get("writeshare_bait")),
     )
 
 

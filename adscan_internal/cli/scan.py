@@ -26,6 +26,7 @@ from adscan_internal import (
 from adscan_internal.rich_output import (
     mark_sensitive,
 )
+from adscan_internal.cli.common import ensure_shell_domain_context
 from adscan_internal.cli.dns import (
     finalize_domain_context,
 )
@@ -64,6 +65,15 @@ def ask_for_unauth_scan(self, domain: str) -> None:
             interactive=False,
             make_active=False,
         )
+        # finalize_domain_context(make_active=False) only ever populates
+        # domains_data / shell.pdc — it deliberately never touches
+        # current_domain/current_domain_dir (that side effect is gated behind
+        # make_active, reserved for the primary start_unauth/start_auth entry
+        # points). Those two attrs are what save_domain_data() resolves the
+        # on-disk domain dir from, so without them any downstream
+        # save_domain_data() call in the unauth flow (e.g. ADCS state persist)
+        # silently drops variables.json. Set them here (in-memory only, no I/O).
+        ensure_shell_domain_context(self, domain)
     # Unauthenticated scanning has two valid uses:
     # 1) Start unauth (black-box / no creds): get a first credential quickly, then stop.
     # 2) Start auth (gray-box / creds): optionally run unauth checks too (audit), because
@@ -133,6 +143,11 @@ def do_unauth_scan(self, domain: str) -> None:
             interactive=False,
             make_active=False,
         )
+        # See the matching comment in ask_for_unauth_scan above: make_active=False
+        # never populates current_domain/current_domain_dir, so every
+        # save_domain_data() call reached further down this unauth flow (e.g.
+        # ADCS state persist) would otherwise silently drop variables.json.
+        ensure_shell_domain_context(self, domain)
 
     # In CTF, once we are authenticated/compromised, avoid additional unauth noise.
     if self.type == "ctf" and initial_auth in ["auth", "pwned"]:
@@ -870,6 +885,7 @@ def _run_unauth_followups_or_kerbrute(
             self.ask_for_kerberos_user_enum(domain)
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"Kerberos user enumeration failed: {e}")
         return
 
@@ -901,6 +917,7 @@ def _run_unauth_followups_or_kerbrute(
             self.ask_for_kerberos_user_enum(domain)
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"Kerberos user enumeration failed: {e}")
         # Refresh the count so the follow-up menu reflects the expanded user set.
         unauth_users_count = domain_data.get("unauth_users_count", unauth_users_count)
@@ -1004,6 +1021,7 @@ def _run_unauth_followups_or_kerbrute(
             fn()
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"Followup failed: {e}")
 
 
@@ -1058,6 +1076,7 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         results = run_unauth_probes(config)
     except Exception as e:  # noqa: BLE001
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_error(f"Concurrent unauth probes failed: {e}")
         return None
 
@@ -1091,6 +1110,7 @@ def _set_probe_flag(
         shell.update_report_field(domain, key, value)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _apply_unauth_probe_results(self: Any, *, domain: str, results: Any) -> None:
@@ -1152,6 +1172,7 @@ def _apply_unauth_probe_results(self: Any, *, domain: str, results: Any) -> None
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
             # LDAP anonymous enrichment (active users, descriptions, GPP) is
             # delegated to the Phase 2.5 native path (_run_unauth_enrichment →
@@ -1206,6 +1227,7 @@ def _run_unauth_enrichment(self: Any, *, domain: str, pdc: str) -> Any:
                 smb_guest_config = _smb_config_for_guest(self, domain)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[unauth-enrich] could not build guest SMBConfig: {exc}"
                 )
@@ -1227,6 +1249,7 @@ def _run_unauth_enrichment(self: Any, *, domain: str, pdc: str) -> Any:
         return enrichment_results
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Unauthenticated enrichment failed: {exc}")
         return None
 
@@ -1449,6 +1472,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             os.makedirs(d, exist_ok=True)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     domain_data = self.domains_data.setdefault(domain, {})
 
@@ -1519,6 +1543,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             _render_cn_inference_panel(self, domain, cn_result)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[unauth] CN inference failed: {exc}")
 
     # ── Persist canonical unified inventory (LDAP + SAMR + CN inference) ─
@@ -1530,6 +1555,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to persist unified user inventory: {exc}")
 
     # ── CredSweeper scan over description / fullName / comment ──────────
@@ -1561,6 +1587,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to persist description credentials: {exc}")
 
     # ── Interactive review — operator validates before credential store ──
@@ -1592,6 +1619,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to persist GPP leaks: {exc}")
 
     # ── GPP autologon credentials (Registry.xml DefaultPassword) ────────
@@ -1616,6 +1644,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Failed to persist GPP autologon credentials: {exc}")
 
     # ── AS-REP roastable target list ─────────────────────────────────────
@@ -1627,6 +1656,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 fh.write("\n".join(asrep_targets) + "\n")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to persist AS-REP targets: {exc}")
 
     # ── Register decrypted GPP credentials in domain credential store ────
@@ -1692,6 +1722,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[unauth-enrich] add_credential skipped for GPP leak: {exc}"
             )
@@ -1722,6 +1753,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[unauth-enrich] record_technical_finding skipped: {exc}")
 
     # ── Register GPP autologon credentials (Registry.xml plaintext) ──────
@@ -1765,6 +1797,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[unauth-enrich] add_credential skipped for GPP autologon: {exc}"
             )
@@ -1795,6 +1828,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[unauth-enrich] record_technical_finding skipped: {exc}")
 
     # ── Inject operator-accepted credentials into the credential store ──
@@ -1815,6 +1849,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[unauth-enrich] add_credential skipped for description leak: {exc}"
             )
@@ -1846,6 +1881,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[unauth-enrich] description-cred record skipped: {exc}")
 
     # ── Update report fields ─────────────────────────────────────────────
@@ -1865,6 +1901,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             self.update_report_field(domain, field_name, value)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Store per-task capability flags in domain_data so the Phase 3 followup
     # menu can show independent status for shares vs SAMR vs GPP vs LDAP users

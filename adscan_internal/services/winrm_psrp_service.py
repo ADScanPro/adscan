@@ -50,6 +50,7 @@ from adscan_internal.services.auth_plan import (
 from adscan_internal.services.auth_error_classification import (
     is_pypsrp_kerberos_infra_error,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.domain_posture import DomainPosture
@@ -328,7 +329,10 @@ class WinRMPSRPService:
         _cached = _WINRM_CCACHE_CACHE.get(_cache_key)
         if _cached:
             _cached_path, _cached_at = _cached
-            _fresh = time.time() - _cached_at < _CCACHE_TTL_SECONDS
+            # monotonic reuse window (in-memory, not persisted): a wall-clock TTL
+            # would be corrupted by the mid-scan DC clock step. The ccache's real
+            # Kerberos expiry is enforced separately by the KDC on use.
+            _fresh = time.monotonic() - _cached_at < _CCACHE_TTL_SECONDS
             if _fresh and os.path.exists(_cached_path):
                 self._tgt_ccache_path = _cached_path
                 print_info_debug(
@@ -380,7 +384,7 @@ class WinRMPSRPService:
             tmp.write(ccache_bytes)
             tmp.close()
             self._tgt_ccache_path = tmp.name
-            _WINRM_CCACHE_CACHE[_cache_key] = (tmp.name, time.time())
+            _WINRM_CCACHE_CACHE[_cache_key] = (tmp.name, time.monotonic())
             _secret_kind = "NT hash" if nt_hash else "password"
             print_info_debug(
                 f"[winrm_psrp] {_secret_kind} → TGT+TGS obtained for "
@@ -427,6 +431,7 @@ class WinRMPSRPService:
                 self.auth_mode = plan.attempt.auth_mode
         except Exception as plan_exc:  # pragma: no cover - defensive
             telemetry.capture_exception(plan_exc)
+            print_exception(exception=plan_exc)
             print_info_debug(
                 f"[winrm_psrp] posture plan resolution failed (ignored): "
                 f"{type(plan_exc).__name__}: {plan_exc}"
@@ -757,7 +762,7 @@ class WinRMPSRPService:
             "returncode": result.returncode,
             "default_principal": default_principal,
             "server_principals": server_principals,
-            "raw_preview": build_text_preview(output, head=8, tail=8),
+            "raw_preview": build_text_preview(output, head=8, tail=8, max_line_length=300),
         }
 
     def _log_ccache_diagnostics(
@@ -1178,6 +1183,7 @@ class WinRMPSRPService:
                 stdout_tail=12,
                 stderr_head=12,
                 stderr_tail=12,
+                max_line_length=300,
             )
             if preview_text:
                 print_info_debug(
@@ -1223,6 +1229,7 @@ class WinRMPSRPService:
             self._posture_sink(signal)
         except Exception as sink_exc:  # noqa: BLE001
             telemetry.capture_exception(sink_exc)
+            print_exception(exception=sink_exc)
             print_info_debug(
                 f"[winrm_psrp] posture sink failed: "
                 f"{type(sink_exc).__name__}: {sink_exc}"

@@ -49,6 +49,7 @@ import tempfile
 from adscan_internal import print_info, print_info_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.base_service import BaseService
+from adscan_core.rich_output import print_exception
 
 # Guest-relative paths of the credential-bearing artifacts inside a Windows volume.
 _NTDS_GUEST_PATH = "Windows/NTDS/ntds.dit"
@@ -393,6 +394,7 @@ class VMArtifactService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001 - any dissect open failure is non-fatal
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return VMArtifactExtractionResult(
                 source_path=label,
                 artifact_kind="disk",
@@ -536,6 +538,7 @@ class VMArtifactService(BaseService):
                 )
         except Exception as exc:  # noqa: BLE001 - any SMB/open failure is non-fatal
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return VMArtifactExtractionResult(
                 source_path=label,
                 artifact_kind="disk",
@@ -821,6 +824,7 @@ class VMArtifactService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001 - a failed plugin is non-fatal
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"Volatility plugin {plugin} failed: {exc}")
             return None
         stdout = (proc.stdout or "").strip()
@@ -911,6 +915,7 @@ class VMArtifactService(BaseService):
                 extracted[name] = local_path
             except Exception as exc:  # noqa: BLE001 - one missing artifact is non-fatal
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"VM artifact: could not extract {name}: {mark_sensitive(str(exc), 'detail')}"
                 )
@@ -946,6 +951,7 @@ class VMArtifactService(BaseService):
                 notes.extend(ntds_notes)
             except Exception as exc:  # noqa: BLE001 - NTDS parse failure is non-fatal
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 notes.append(f"NTDS.dit parsing failed: {exc}")
 
         deduped = _dedupe_credentials(credentials)
@@ -982,6 +988,7 @@ class VMArtifactService(BaseService):
             boot_key = local_operations_cls(extracted["SYSTEM"]).getBootKey()
         except Exception as exc:  # noqa: BLE001 - bootkey read failure is non-fatal
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return [], None, [f"Bootkey read failed: {exc}"]
         bootkey = boot_key.hex() if isinstance(boot_key, (bytes, bytearray)) else None
 
@@ -1003,6 +1010,7 @@ class VMArtifactService(BaseService):
                     pass
             except Exception as exc:  # noqa: BLE001 - SAM parse failure is non-fatal
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 notes.append(f"SAM hive parsing failed: {exc}")
             for line in collected:
                 parsed = _parse_secretsdump_ntlm_line(line, kind="local", source="SAM")

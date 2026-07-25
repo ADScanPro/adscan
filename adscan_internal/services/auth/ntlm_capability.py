@@ -56,7 +56,7 @@ class NtlmCapabilityCache:
             entry = self._entries.get(self._key(realm, dc_host))
             if entry is None:
                 return None
-            if (time.time() - entry.last_probed_at) > self._ttl:
+            if (time.monotonic() - entry.last_probed_at) > self._ttl:
                 # Stale — drop and report as unknown.
                 self._entries.pop(self._key(realm, dc_host), None)
                 return None
@@ -72,7 +72,7 @@ class NtlmCapabilityCache:
     def mark_available(self, realm: str, dc_host: str) -> None:
         with self._lock:
             self._entries[self._key(realm, dc_host)] = NtlmCapability(
-                available=True, last_probed_at=time.time()
+                available=True, last_probed_at=time.monotonic()
             )
         print_info_debug(
             "[ntlm-cap] marked available: "
@@ -86,7 +86,7 @@ class NtlmCapabilityCache:
         with self._lock:
             self._entries[self._key(realm, dc_host)] = NtlmCapability(
                 available=False,
-                last_probed_at=time.time(),
+                last_probed_at=time.monotonic(),
                 failure_reason=reason,
             )
         print_info_debug(

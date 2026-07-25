@@ -37,6 +37,7 @@ from adscan_internal.services.privileged_group_classifier import (
     is_tier_zero_group_sid,
     is_tier_zero_user_sid,
 )
+from adscan_core.rich_output import print_exception
 
 _RODC_GROUP_IDS = {516, 521}
 
@@ -401,6 +402,7 @@ def _parse_trustee_sd_edges(
         from winacl.dtyp.security_descriptor import SECURITY_DESCRIPTOR  # type: ignore
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(f"[ldap-collector] winacl unavailable for {method}: {exc}")
         return []
 
@@ -408,6 +410,7 @@ def _parse_trustee_sd_edges(
         sd = SECURITY_DESCRIPTOR.from_bytes(sd_bytes)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[ldap-collector] Failed to parse {method} SD: {exc}")
         return []
     return _trustee_edges_from_descriptor(
@@ -1006,6 +1009,7 @@ class ADscanLDAPCollector:
                 sealing_mechanism = conn.mechanism
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             from adscan_internal.services.auth_error_classification import (
                 is_unreachable_foreign_realm_error,
             )
@@ -1097,6 +1101,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[ldap-collector] cleartext advisory skipped: {exc}")
 
     def _collect_domain_node(
@@ -1156,6 +1161,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(f"[ldap-collector] _collect_domain_node failed: {exc}")
 
     def _collect_domain_policy(
@@ -1187,6 +1193,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_domain_policy failed: {exc}"
             )
@@ -1280,6 +1287,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(f"[ldap-collector] _collect_psos failed: {exc}")
             return
 
@@ -1426,6 +1434,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             # Diagnostic (bracket-free). When this fires with a 'Connection
             # closed!' exc on a sealed channel, cross-reference the badldap
             # 'ldap-conn-closed:' debug line (recv_buffer_pending / mid_response)
@@ -1541,6 +1550,7 @@ class ADscanLDAPCollector:
                             )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[ldap-collector] entry processing failed: {exc}")
 
     def _collect_deleted_objects(
@@ -1572,6 +1582,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:  # noqa: BLE001 - never abort the sweep
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_deleted_objects search failed: {exc}"
             )
@@ -1594,6 +1605,7 @@ class ADscanLDAPCollector:
                         result.add_fsp_placeholder(trustee_sid, "unknown")
             except Exception as exc:  # noqa: BLE001 - one bad tombstone is non-fatal
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[ldap-collector] deleted-entry processing failed: {exc}"
                 )
@@ -1613,6 +1625,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_group_memberships search failed: {exc}"
             )
@@ -1646,6 +1659,7 @@ class ADscanLDAPCollector:
                     )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[ldap-collector] group membership entry failed: {exc}"
                 )
@@ -1665,6 +1679,7 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_gpo_links search failed: {exc}"
             )
@@ -1700,6 +1715,7 @@ class ADscanLDAPCollector:
                     )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[ldap-collector] gpo link entry failed: {exc}")
 
     def _collect_trusts(
@@ -1716,6 +1732,7 @@ class ADscanLDAPCollector:
             entries = query_trusted_domains(conn, config.domain_dn)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(f"[ldap-collector] _collect_trusts query failed: {exc}")
             return
 
@@ -1747,6 +1764,7 @@ class ADscanLDAPCollector:
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[ldap-collector] trust entry failed: {exc}")
 
     def _collect_adcs(
@@ -1776,4 +1794,5 @@ class ADscanLDAPCollector:
                 result.add_edge(edge)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[ldap-collector] ADCS collection skipped: {exc}")

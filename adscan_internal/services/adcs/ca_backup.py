@@ -42,6 +42,7 @@ from adscan_core.rich_output import (
     print_info_verbose,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 
 # Default service-creation strategy parameters.
@@ -426,6 +427,7 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
             conn, scm = await _open_smb_and_scm(config)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             result = CABackupResult(
                 success=False,
                 error=f"SMB/SCM bootstrap failed: {type(exc).__name__}: {exc}",
@@ -536,6 +538,7 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
         return result
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"CA backup raised: {type(exc).__name__}: {exc}")
         result = CABackupResult(success=False, error=str(exc))
         _render_result(result)

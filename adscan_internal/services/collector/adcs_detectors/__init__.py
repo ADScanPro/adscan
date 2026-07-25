@@ -26,6 +26,7 @@ from adscan_internal.services.collector.adcs_detectors.esc13 import detect_esc13
 from adscan_internal.services.collector.adcs_detectors.esc14 import detect_esc14
 from adscan_internal.services.collector.adcs_detectors.esc15 import detect_esc15
 from adscan_internal.services.collector.models import CollectorEdge, CollectorNode
+from adscan_core.rich_output import print_exception
 
 __all__ = [
     "detect_esc1",
@@ -75,6 +76,7 @@ def _safe_run(detector, **kwargs) -> list[CollectorEdge]:
         from adscan_internal import telemetry
 
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[adcs_detector] {detector.__name__} failed: {exc}")
         return []
 

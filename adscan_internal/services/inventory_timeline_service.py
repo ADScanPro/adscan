@@ -40,6 +40,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.workspaces import domain_subpath, write_json_file
 from adscan_internal.workspaces.io import read_json_file
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +585,7 @@ def record_inventory_snapshot(
         payload = read_json_file(report_path)
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[inventory-timeline] failed to read reachability report for "
             f"{mark_sensitive(domain_value, 'domain')}: {exc}"
@@ -632,6 +634,7 @@ def record_inventory_snapshot(
         write_json_file(snapshot_full_path, enriched)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[inventory-timeline] failed to write snapshot for "
             f"{mark_sensitive(domain_value, 'domain')}: {exc}"
@@ -673,6 +676,7 @@ def record_inventory_snapshot(
         _write_index(shell, domain=domain_value, entries=entries)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[inventory-timeline] failed to update index for "
             f"{mark_sensitive(domain_value, 'domain')}: {exc}"
@@ -932,6 +936,7 @@ def mark_diff_seen(shell: Any, *, domain: str, snapshot_id: str) -> None:
             saver()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[inventory-timeline] failed to persist last-seen snapshot for "
                 f"{mark_sensitive(domain, 'domain')}: {exc}"

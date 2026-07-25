@@ -41,6 +41,7 @@ from adscan_internal.services.cve_scanner.result import (
     Evidence,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.cve_scanner.runner import ScanContext, ScanTarget
@@ -353,10 +354,12 @@ class NoPacCheck:
             )
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"[nopac] Kerberos transport failed: {exc}")
             return [_error(target.host, f"Kerberos transport error: {exc}")]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             err_text = str(exc)
             err_lower = err_text.lower()
             # Cross-realm credential failures degrade to SKIP per the

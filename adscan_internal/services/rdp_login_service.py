@@ -44,6 +44,7 @@ from adscan_internal.services.domain_posture import (
     TriState,
 )
 from adscan_internal.services.posture_sink import PostureSink
+from adscan_core.rich_output import print_exception
 
 RDPLoginVerdict = Literal["TRUE", "FALSE", "MAYBE", "ERROR"]
 
@@ -164,6 +165,7 @@ def _emit_posture_signal(
         sink(signal)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[rdp_login] posture sink failed: {exc}")
 
 
@@ -422,6 +424,7 @@ async def _probe_one(
 
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return RDPLoginResult(host=host, verdict="ERROR", error=str(exc))
 
 
@@ -462,6 +465,24 @@ async def scan_rdp_hosts(
             Defaults to ``domain``. Pass explicitly for cross-domain scenarios
             where the auth domain differs from the target domain.
     """
+    # Transversal PROACTIVE clock sync at the RDP auth seam, ONCE before the
+    # per-host fan-out (mirror of smb_transport / ldap_transport). RDP is the one
+    # transport NOT covered by the sweep-premint SSOT (aardwolf is CredSSP+NTLM/PtH
+    # by default), so its Kerberos fallback (rdp+kerberos-password / -rc4, used in
+    # hardened NTLM-disabled envs) had no proactive clock sync of its own. When a
+    # DC/KDC is in scope, converge through the guard here — TTL-memoized, so the
+    # first host syncs and the rest no-op; best-effort; seeds the kerbad offset
+    # host-helper-less. Keyed on the auth domain (== the Kerberos realm).
+    if dc_ip and str(domain or "").strip():
+        try:
+            from adscan_internal.services.dc_time import (  # noqa: PLC0415
+                ensure_clock_synced_for_target,
+            )
+
+            await ensure_clock_synced_for_target(str(domain), str(dc_ip))
+        except Exception:  # noqa: BLE001 — never let the sync break the sweep
+            pass
+
     sem = asyncio.Semaphore(max_workers)
 
     async def _guarded(host: str) -> RDPLoginResult:

@@ -12,7 +12,9 @@ import asyncio
 import time
 from typing import Any
 
-from adscan_internal import print_info, print_warning, telemetry
+from rich.markup import escape
+
+from adscan_internal import print_info, print_info_debug, print_warning, telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.services.cleanup_credential_resolver import (
@@ -39,6 +41,7 @@ from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConfig,
     ADscanLDAPConnection,
 )
+from adscan_core.rich_output import print_exception
 
 # Remediation templates are the SSOT in cleanup_taxonomy; re-exported here only
 # for back-compat references.
@@ -49,7 +52,13 @@ _MANUAL_SPN = _tax.MANUAL_SPN
 _MANUAL_PASSWORD = _tax.MANUAL_PASSWORD
 _MANUAL_GROUP_MEMBERSHIP = _tax.MANUAL_GROUP_MEMBERSHIP
 
-_TRANSIENT_EXC = (TimeoutError, asyncio.TimeoutError, ConnectionResetError, ConnectionError)
+_TRANSIENT_EXC = (
+    TimeoutError,
+    asyncio.TimeoutError,
+    asyncio.CancelledError,
+    ConnectionResetError,
+    ConnectionError,
+)
 _TRANSIENT_MARKERS = (
     "timeout",
     "timed out",
@@ -57,17 +66,58 @@ _TRANSIENT_MARKERS = (
     "connection reset",
     "connection refused",
     "connection aborted",
+    "connectionerror",
+    "connection error",
     "broken pipe",
     "temporarily unavailable",
+    "cancelled",
 )
 _REVERT_BACKOFF_SECONDS = 1.5
 
 
+def _walk_exception_chain(error: BaseException) -> list[BaseException]:
+    """Return ``error`` followed by its ``__cause__``/``__context__`` chain.
+
+    ``asyncio.timeout()``/``asyncio.wait_for()`` (Python 3.11+) re-raise a bare
+    ``TimeoutError`` chained ``from`` the ``CancelledError`` that cancellation
+    produced — ``error.__cause__`` is the ``CancelledError``. A top-level
+    ``isinstance`` check alone still classifies this correctly (the outer
+    exception IS a ``TimeoutError``), but walking the chain makes the
+    classifier robust to any future wrapper that surfaces the transient cause
+    one level down instead of at the top.
+    """
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
 def _is_transient_failure(error: BaseException | str | None) -> bool:
-    """Classify a revert failure as transient (retry) vs definitive (manual)."""
-    if isinstance(error, _TRANSIENT_EXC):
-        return True
-    text = str(error or "").strip().lower()
+    """Classify a revert failure as transient (retry) vs definitive (manual).
+
+    Two input shapes reach here: a raised ``BaseException`` (when the revert
+    callable itself raises) or a plain string (the common case — every
+    ``service.acl.*`` revert callable swallows its exception into a
+    ``result.raw_output``/``error_message`` string rather than raising; see
+    ``adscan_internal.services.exploitation.acl._format_ldap_error``). Both
+    paths must classify a transient TimeoutError/ConnectionError the same way,
+    so the string carries the exception's ``type(...).__name__`` even when the
+    instance's own ``str()`` is empty (a bare ``TimeoutError()`` — the
+    Python 3.11+ ``asyncio.timeout()`` cancellation shape).
+    """
+    if isinstance(error, BaseException):
+        if any(isinstance(candidate, _TRANSIENT_EXC) for candidate in _walk_exception_chain(error)):
+            return True
+        text = " ".join(
+            f"{type(candidate).__name__}: {candidate}".strip().lower()
+            for candidate in _walk_exception_chain(error)
+        )
+    else:
+        text = str(error or "").strip().lower()
     if not text:
         return False
     if looks_like_access_denied(text):
@@ -143,6 +193,7 @@ def execute_acl_cleanup(shell: Any) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             if ledger is not None and change_id:
                 try:
                     ledger.mark_manual_required(
@@ -201,6 +252,7 @@ def _execute_one_action(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # password_changed has NO automatic revert — the original secret is gone.
     if kind == "password_changed":
@@ -454,6 +506,7 @@ def _build_verification_conn(
         return ADscanLDAPConnection(config)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -472,6 +525,7 @@ def _verify_revert(
             return bool(verify_fn(live))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -502,6 +556,7 @@ def _drive_revert_with_verify(
                 ledger.mark_revert_in_progress(change_id)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         transient = False
         try:
             result = plan["revert"](
@@ -511,15 +566,36 @@ def _drive_revert_with_verify(
             raw = str(getattr(result, "raw_output", "") or "").strip()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             success = False
             raw = str(exc)
             # Track transience from the EXCEPTION TYPE, not the (often opaque)
             # string — a TimeoutError must never be misclassified as definitive.
             transient = _is_transient_failure(exc)
+            print_info_debug(
+                f"acl-cleanup: classify kind={escape(kind)} raised "
+                f"exc_type={type(exc).__name__} transient={transient} "
+                "exc_repr=" + escape(repr(exc))
+            )
 
         if not success:
             last_error = raw or last_error
-            transient = transient or _is_transient_failure(last_error)
+            if not transient:
+                transient = _is_transient_failure(last_error)
+            # Diagnostic instrumentation for the retry/no-retry decision itself —
+            # without this, a misclassified failure (retry never engaged) is
+            # indistinguishable post-hoc from a correctly-classified definitive
+            # failure. Debug-only so it costs nothing on the hot path. The error
+            # text is uncontrolled (an OSError str() can literally read
+            # "[Errno 104] Connection reset by peer") so it is markup-escaped
+            # before interpolation — see CLAUDE.md "Square brackets in
+            # log/print messages".
+            print_info_debug(
+                "acl-cleanup: classify kind="
+                + escape(kind)
+                + f" transient={transient} last_error="
+                + escape(repr(last_error))
+            )
             # Lazy DA escalation only on a real ACCESS_DENIED (not transient).
             if (
                 not transient
@@ -642,6 +718,7 @@ def _resolve_cleanup_actions(shell: Any) -> list[dict[str, Any]]:
         changes = get_changes()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return actions
     if not isinstance(changes, list):
         return actions

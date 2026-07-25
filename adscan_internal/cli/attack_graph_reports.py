@@ -419,6 +419,7 @@ def _sanitize_acl_paths_for_attack_graph(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[bloodhound] failed to write ACL object-control coverage: {exc}"
             )
@@ -465,6 +466,7 @@ def _sanitize_acl_paths_for_attack_graph(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[bloodhound] failed to write ACL object-control coverage: {exc}"
             )
@@ -613,6 +615,7 @@ def _sanitize_acl_paths_for_attack_graph(
         write_json_file(output_path, report)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[bloodhound] failed to write ACL sanitization report: {exc}")
 
     try:
@@ -625,6 +628,7 @@ def _sanitize_acl_paths_for_attack_graph(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[bloodhound] failed to write ACL object-control coverage: {exc}"
         )
@@ -1173,6 +1177,7 @@ class BloodHoundShell(Protocol):
         target_domain: str,
         *,
         prompt_for_user_privs_after: bool = True,
+        target_kind: str | None = None,
     ) -> bool: ...
 
     def exploit_generic_all_user(
@@ -1404,6 +1409,7 @@ def _load_writable_user_attribute_discovery(
         paths = get_writable_user_attribute_paths(shell, target_domain, graph=graph)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[writable-attrs] Writable-attribute discovery load failed: {exc}"
         )
@@ -1426,6 +1432,7 @@ def _load_rodc_prp_control_discovery(
         paths = get_rodc_prp_control_paths(shell, target_domain, graph=graph)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[rodc-prp] Delegated RODC PRP discovery load failed: {exc}")
     return paths
 
@@ -1433,15 +1440,33 @@ def _load_rodc_prp_control_discovery(
 def run_enumerate_user_aces(shell: BloodHoundShell, args: str) -> None:
     """Parse arguments and initiate user ACE enumeration.
 
+    Usage:
+        enumerate_user_aces <domain> <user> <password>
+        enumerate_user_aces -d <domain> -u <user> -p <password>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+
     Mirrors the legacy ``do_enumerate_user_aces`` entrypoint but keeps argument
     parsing and CLI usage/help text outside of `adscan.py`.
     """
-    parts = args.split()
-    if len(parts) != 3:
-        shell.console.print("Usage: enumerate_user_aces <domain> <user> <password>")  # type: ignore[attr-defined]
+    from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+    usage = "enumerate_user_aces <domain> <user> <password>  |  enumerate_user_aces -d <domain> -u <user> -p <password>"
+    parser = ReplArgumentParser(prog="enumerate_user_aces", add_help=False)
+    parser.add_argument("-d", "--domain", required=True)
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password"),
+        parser=parser,
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain, username, password = parts
-    shell.ask_for_enumerate_user_aces(domain, username, password)  # type: ignore[attr-defined]
+    shell.ask_for_enumerate_user_aces(namespace.domain, namespace.username, namespace.password)  # type: ignore[attr-defined]
 
 
 def run_attack_paths(
@@ -1549,6 +1574,7 @@ def run_cross_domain_attack_paths(
                 persist_attack_path_snapshot(shell, primary, summaries)  # pylint: disable=too-many-function-args,missing-kwoa
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         return
 
     marked_count = len(all_owned)
@@ -1571,6 +1597,7 @@ def run_cross_domain_attack_paths(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Cross-domain attack path calculation failed: {exc}")
 
 
@@ -1712,18 +1739,21 @@ def persist_bloodhound_membership_snapshot(
         user_edges = _append_graph_data(user_graph, label="user")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     try:
         computer_graph = client.execute_query_with_relationships(computer_query)
         computer_edges = _append_graph_data(computer_graph, label="computer")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     try:
         group_graph = client.execute_query_with_relationships(group_query)
         group_edges = _append_graph_data(group_graph, label="group")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     workspace_cwd = (
         shell._get_workspace_cwd()
@@ -1735,6 +1765,40 @@ def persist_bloodhound_membership_snapshot(
     )
     write_json_file(output_path, membership_graph)
     return user_edges, group_edges, computer_edges
+
+
+def _execution_allowed_for_start(
+    *,
+    allow_execution: bool,
+    start_user_norm: str,
+    start_users: list[str] | None,
+    domain_auth: str,
+    owned_norm: set[str],
+) -> bool:
+    """Whether attack-path EXECUTION may be offered for this start selection.
+
+    Execution only makes sense from a principal we already CONTROL (owned): you
+    cannot run an attack path from a start node you have not compromised. Allowed
+    when the ``owned`` scope is used (all owned users), the domain is already
+    ``pwned``, OR the explicit start principal(s) are themselves owned — e.g.
+    ``attack_paths manager.htb raven`` when ``raven`` is in the domain's owned
+    set. A non-owned explicit start user still LISTS paths but is never offered
+    execution. ``owned_norm`` is the sAMAccountName-normalised (lowercased,
+    ``@domain`` stripped) owned set; ``start_user_norm`` is the already-lowered
+    single start token; ``start_users`` is the multi-user (principals) list.
+    """
+    if not allow_execution:
+        return False
+    if start_user_norm == "owned" or domain_auth == "pwned":
+        return True
+    if start_users:  # principals (multi-user) scope: every start must be owned
+        return bool(owned_norm) and all(
+            (u or "").split("@", 1)[0].strip().lower() in owned_norm
+            for u in start_users
+        )
+    if start_user_norm and start_user_norm != "owned":
+        return start_user_norm.split("@", 1)[0] in owned_norm
+    return False
 
 
 def run_show_attack_paths(
@@ -1941,6 +2005,7 @@ def run_show_attack_paths(
                     )
                 except Exception as _annotate_exc:
                     telemetry.capture_exception(_annotate_exc)
+                    print_exception(exception=_annotate_exc)
                 _sorted = print_attack_paths_summary(
                     target_domain,
                     path_refs,
@@ -1965,6 +2030,17 @@ def run_show_attack_paths(
                 if not attack_paths:
                     return
                 from adscan_internal import print_info_debug as _dbg
+                # Mirror the interactive gate: only EXECUTE when the start
+                # principal is owned (scope=owned / domain pwned / explicit owned
+                # user). A non-owned start user lists paths but is not executed —
+                # you cannot run an attack path from a principal you don't control.
+                if not execution_allowed_for_scope:
+                    _dbg(
+                        f"[attack_paths] non-interactive: listing only, execution "
+                        f"NOT offered (start principal not owned): "
+                        f"start_user={start_user_norm!r} domain={target_domain}"
+                    )
+                    return
                 _dbg(
                     f"[attack_paths] non-interactive execution: "
                     f"is_ci={is_ci!r} isatty={sys.stdin.isatty()!r} "
@@ -2141,8 +2217,24 @@ def run_show_attack_paths(
         .strip()
         .lower()
     )
-    execution_allowed_for_scope = bool(
-        allow_execution and (start_user_norm == "owned" or domain_auth == "pwned")
+    # Execution is only meaningful from a principal we already CONTROL (owned):
+    # you cannot run an attack path starting at a node you have not compromised.
+    # Offered when the `owned` scope (all owned users) is used, the domain is
+    # already pwned, OR the explicit start principal(s) are themselves owned
+    # (e.g. `attack_paths manager.htb raven` when raven is in domains_data
+    # owned). A non-owned explicit start user still LISTS paths but is never
+    # offered execution.
+    _owned_norm = {
+        (u or "").split("@", 1)[0].strip().lower()
+        for u in get_owned_domain_usernames_for_attack_paths(shell, target_domain)
+    }
+    _owned_norm.discard("")
+    execution_allowed_for_scope = _execution_allowed_for_start(
+        allow_execution=allow_execution,
+        start_user_norm=start_user_norm,
+        start_users=start_users,
+        domain_auth=domain_auth,
+        owned_norm=_owned_norm,
     )
     max_paths_compute = _resolve_attack_paths_compute_cap(max_display)
 
@@ -2290,6 +2382,7 @@ def run_show_attack_paths(
         )
     except Exception as _annotate_exc:
         telemetry.capture_exception(_annotate_exc)
+        print_exception(exception=_annotate_exc)
         # Non-fatal: fall through with un-annotated paths so the table still
         # renders. The viability deboost is lost for this call but the
         # execution-selector will still annotate later.
@@ -2317,6 +2410,7 @@ def run_show_attack_paths(
             )
     except Exception as _fanout_exc:  # noqa: BLE001 - never block the listing
         telemetry.capture_exception(_fanout_exc)
+        print_exception(exception=_fanout_exc)
 
     _sorted_refs = print_attack_paths_summary(
         target_domain,
@@ -2523,6 +2617,7 @@ def run_show_attack_steps(
         graph = load_attack_graph(shell, target_domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return
     if isinstance(graph, dict):
         _render_local_cred_domain_reuse_clusters(
@@ -3056,6 +3151,7 @@ def _process_aces_for_exploitation(
 
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             continue
 
 
@@ -3192,6 +3288,7 @@ def run_users(shell: BloodHoundShell, target_domain: str) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def run_all_users(shell: BloodHoundShell, target_domain: str) -> None:
@@ -3921,6 +4018,7 @@ def _load_workspace_user_list(
             return [line.strip() for line in handle if line.strip()]
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[user-lists] failed to read {file_path}: {exc}")
         return []
 
@@ -4422,6 +4520,7 @@ def execute_stale_enabled_users(
                 prefix="[stale-users]",
             ):
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[stale-users] Failed to persist technical finding: {exc}"
                 )
@@ -4515,6 +4614,7 @@ def execute_tier0_highvalue_sprawl(
                 prefix="[identity-sprawl]",
             ):
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[identity-sprawl] Failed to persist technical finding: {exc}"
                 )
@@ -4666,6 +4766,7 @@ def execute_dc_access(
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
             f"Exception during execution of bloodhound command for domain {marked_domain}: {str(e)}"
@@ -4760,6 +4861,7 @@ def execute_krbtgt(
             )
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_error(f"Error retrieving krbtgt password age data: {e}")
         return
 

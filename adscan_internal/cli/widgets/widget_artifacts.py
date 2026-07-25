@@ -24,6 +24,7 @@ from adscan_core import telemetry
 
 from adscan_internal.cli.widgets.widget_contract import Widget
 from adscan_internal.workspaces import domain_subpath, write_json_file
+from adscan_core.rich_output import print_exception
 
 
 def _widgets_dir(shell: object, domain: str) -> str | None:
@@ -65,6 +66,7 @@ def persist_widget(shell: object, *, domain: str, widget: Widget) -> str | None:
         return path
     except Exception as exc:  # noqa: BLE001 — persistence never breaks the scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -91,6 +93,7 @@ def publish_widget(shell: object | None, *, domain: str | None, widget: Widget) 
         )
     except Exception as exc:  # noqa: BLE001 — emission never breaks the scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # Post-scan half — persisted artifact for re-view + reconciling ingest.
     if shell is not None and domain:

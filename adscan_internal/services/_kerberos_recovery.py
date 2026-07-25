@@ -444,6 +444,37 @@ def _sync_skew_to_cache(client: Any) -> None:
         pass
 
 
+def seed_realm_skew(realm: str, offset_seconds: float) -> None:
+    """Proactively seed the realm clock-skew cache from a MEASURED DC offset.
+
+    Called by the proactive clock-sync guard (``dc_time``) when it measured a
+    real host↔DC offset but could NOT physically step the host clock (no
+    privileged host helper — the source-mount harness, or any environment
+    without one). Seeding here makes kerbad's Patch-A ``__init__`` pre-seed
+    apply the correction IN-MEMORY to EVERY fresh ``AIOKerberosClient`` — LDAP,
+    SMB, and every other Kerberos auth — without waiting for a reactive
+    ``KRB_AP_ERR_SKEW`` round-trip (which the SMB collector path did not always
+    get before a member-server auth, so it failed under skew where LDAP
+    recovered).
+
+    Sign matches kerbad's ``now + clock_skew`` timestamp convention: the guard's
+    ``offset = DC_time - host_time`` (positive when the DC is ahead) is exactly
+    the timedelta to add to the host clock to reach DC time.
+    """
+    try:
+        key = (realm or "").upper()
+        if not key:
+            return
+        _REALM_SKEW_CACHE[key] = datetime.timedelta(seconds=offset_seconds)
+        logger.debug(
+            "Realm skew cache SEEDED from clock-sync guard: %s → %+.1fs",
+            key,
+            offset_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Patch A — kerbad AIOKerberosClient.__init__ pre-seeding from realm cache
 # ---------------------------------------------------------------------------

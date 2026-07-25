@@ -46,6 +46,7 @@ from adscan_internal.services.domain_posture import (
     TriState,
 )
 from adscan_internal.services.posture_probe import ProbePhase, ProbeResult
+from adscan_core.rich_output import print_exception
 
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +137,19 @@ _PROBE_PERMISSIVE_LABEL: dict[tuple[ConstraintCategory, TriState], str] = {
     ),
     (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.DISABLED): (
         "LDAP channel binding not enforced"
+    ),
+    # Signing categories are polarity-symmetric with channel binding: the probe
+    # emits a definitive DISABLED/HIGH "not required" verdict (unsigned bind
+    # accepted -> LDAP_BIND_NO_SIGN_OK; NEGOTIATE without signing-required ->
+    # SMB_SIGNING_NEGOTIATED_NOT_REQUIRED). Without these permissive labels that
+    # observed weakness matched NEITHER map and was silently dropped from the
+    # panel — the exact gap that hid "LDAP signing not required" on a DC where
+    # signing is off while "channel binding not enforced" still rendered.
+    (ConstraintCategory.LDAP_SIGNING, TriState.DISABLED): (
+        "LDAP signing not required"
+    ),
+    (ConstraintCategory.SMB_SIGNING, TriState.DISABLED): (
+        "SMB signing not required"
     ),
 }
 
@@ -329,6 +343,7 @@ class PostureProbeLiveView:
                 self._session.__enter__()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 self._session = None
         return self
 
@@ -338,10 +353,12 @@ class PostureProbeLiveView:
                 self._session.update(self._render(), refresh=True)
             except Exception as upd_exc:  # noqa: BLE001
                 telemetry.capture_exception(upd_exc)
+                print_exception(exception=upd_exc)
             try:
                 self._session.__exit__(exc_type, exc, tb)
             except Exception as ext_exc:  # noqa: BLE001
                 telemetry.capture_exception(ext_exc)
+                print_exception(exception=ext_exc)
             self._session = None
 
     def _print_final_panel(self, console: Any) -> None:
@@ -409,6 +426,7 @@ class PostureProbeLiveView:
         except Exception as exc:  # noqa: BLE001
             # Widget MUST NOT raise into the probe engine.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     @property
     def all_results(self) -> list[ProbeResult]:
@@ -424,6 +442,7 @@ class PostureProbeLiveView:
             self._session.update(self._render())
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _render(self) -> RenderableType:
         masked_domain = mark_sensitive(self.domain, "domain")

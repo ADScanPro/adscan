@@ -25,6 +25,7 @@ from adscan_internal.services.cve_scanner.result import (
     CVEStatus,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -189,9 +190,11 @@ class CVEScanRunner:
                     cve_results = list(raw) if isinstance(raw, list) else [raw]
                 except asyncio.TimeoutError as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     cve_results = [_error_result(cve, target, "check timed out")]
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error(f"CVE check {cve.id} failed on {target.host}: {exc}")
                     cve_results = [_error_result(cve, target, str(exc))]
                 duration = time.monotonic() - started
@@ -244,8 +247,10 @@ class CVEScanRunner:
                     )
                 except asyncio.TimeoutError as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error(f"Coercion sweep failed on {target.host}: {exc}")
                 duration = time.monotonic() - started
 

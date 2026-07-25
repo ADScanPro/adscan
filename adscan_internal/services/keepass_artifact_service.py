@@ -15,6 +15,7 @@ from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.john_artifact_cracking_service import (
     JohnArtifactCrackingService,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ class KeePassArtifactService(BaseService):
             database = pykeepass_cls(source_path, password=password)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 "Could not open KeePass database with cracked password: "
                 f"{mark_sensitive(source_path, 'path')}"

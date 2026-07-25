@@ -17,6 +17,49 @@ from kerbad.aioclient import AIOKerberosClient
 from kerbad.protocol.errors import KerberosError, KerberosErrorCode
 
 
+def _ccache_has_self_tgt(ccache_credentials, auth_principal:str) -> bool:
+	"""Return True only when the ccache holds a TGT for ``auth_principal``.
+
+	This is the discriminator behind the fresh-TGS gate's capability-bearing /
+	scoped-ticket carve-out (CLAUDE.md § credential storage + § ensure_user_ccache).
+
+	The fresh-TGS re-mint (get_TGS force_fresh_tgs=True) is a FAITHFUL
+	reproduction of the wanted ticket ONLY when the ccache holds a TGT for the
+	SAME principal we are authenticating as — i.e. a *generic* credential. A
+	SCOPED ccache (S4U2Proxy / RBCD / silver / constrained delegation) holds an
+	IMPERSONATION service ticket whose client is ``auth_principal`` but a TGT
+	that belongs to a DIFFERENT principal (the delegator) — or no TGT at all.
+	Re-minting from that foreign TGT would drop the impersonation, and when the
+	impersonated principal owns no TGT, kerbad falls through to an AS-REQ that a
+	ccache-only credential cannot satisfy ("There is no key for AES256
+	encryption"). Such a scoped ticket IS the capability and must be consumed
+	as-is, so the gate must stay OFF for it — this helper returns False.
+
+	When ``auth_principal`` is empty (a lenient ``from_ccache`` where no
+	principal was named), fall back to the historical "any TGT present"
+	behaviour: that caller intentionally uses whatever TGT is in the ccache and
+	is never a scoped/impersonation ccache.
+	"""
+	principal = str(auth_principal or '').strip().lower()
+
+	def _client_name(cred) -> str:
+		try:
+			return cred.client.to_string().split('@', 1)[0].strip().lower()
+		except Exception:
+			return ''
+
+	def _is_tgt(cred) -> bool:
+		try:
+			return cred.server.to_string(separator='/').lower().find('krbtgt') != -1
+		except Exception:
+			return False
+
+	return any(
+		_is_tgt(cred) and (not principal or _client_name(cred) == principal)
+		for cred in ccache_credentials
+	)
+
+
 class KerberosClientNative:
 	def __init__(self, credential:KerberosCredential):
 		self.credential = credential
@@ -165,14 +208,38 @@ class KerberosClientNative:
 					# the KDC and bypasses its cached-TGS short-circuit) instead of
 					# reusing the cached service ticket.
 					#
-					# Scoped ccaches (S4U2Proxy / RBCD / silver) hold NO TGT — only the
-					# one service ticket that IS the capability — so they keep reusing
-					# that cached service ticket (ccache_has_tgt is False → gate off).
-					# A request whose SPN is the krbtgt (spn_is_tgt) also keeps the
+					# Scoped ccaches (S4U2Proxy / RBCD / silver / constrained
+					# delegation) hold the service ticket that IS the capability —
+					# reusing it as-is is mandatory, never re-mint. The original gate
+					# assumed such ccaches hold NO TGT at all, so a bare
+					# ``any(krbtgt)`` was enough to tell "generic" apart from "scoped".
+					# That assumption is FALSE for a full constrained-delegation / S4U
+					# chain, which ADscan persists as a SINGLE ccache holding THREE
+					# creds: the DELEGATOR's own TGT (e.g. jon.snow), the S4U2Self
+					# ticket, and the S4U2Proxy service ticket whose CLIENT is the
+					# IMPERSONATED principal (e.g. administrator -> CIFS/host).
+					# ``any(krbtgt)`` then sees the delegator's TGT and mis-fires the
+					# gate; the fresh re-mint asks get_TGT for the IMPERSONATED
+					# principal (strict, from_ccache set username=administrator), finds
+					# no TGT for it, falls through to an AS-REQ, and dies with
+					# "There is no key for AES256 encryption" (a ccache-only credential
+					# has no long-term key). Even if a long-term key existed, minting
+					# from the delegator's TGT would silently DROP the impersonation.
+					#
+					# The correct discriminator (the capability-bearing / scoped-ticket
+					# carve-out — CLAUDE.md § credential storage + § ensure_user_ccache):
+					# a fresh re-mint is a FAITHFUL reproduction ONLY when the ccache
+					# holds a TGT for the SAME principal we are authenticating AS. When
+					# the auth principal owns no TGT here (its only ticket is a scoped /
+					# impersonation service ticket someone else minted for it), the
+					# ccache is a capability ccache and must be consumed as-is — gate
+					# OFF. A request whose SPN is the krbtgt (spn_is_tgt) also keeps the
 					# cached path: there is nothing fresher to mint.
-					ccache_has_tgt = any(
-						cred.server.to_string(separator='/').lower().find('krbtgt') != -1
-						for cred in self.ccred.ccache.credentials
+					# Only a TGT owned by the auth principal makes the ccache
+					# generically re-mintable (see _ccache_has_self_tgt below).
+					_auth_principal = str(getattr(self.ccred, 'username', '') or '')
+					ccache_has_tgt = _ccache_has_self_tgt(
+						self.ccred.ccache.credentials, _auth_principal
 					)
 					spn_is_tgt = (
 						str(getattr(spn, 'service', '') or '').lower() == 'krbtgt'

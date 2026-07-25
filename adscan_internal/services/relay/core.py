@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from adscan_core import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_error_debug
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ class RelayEngine:
             raise
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(
                 f"[relay] target {mark_sensitive(target.name, 'text')} raised unexpected exception: {exc}"
             )

@@ -53,6 +53,7 @@ from adscan_internal.services.inventory_timeline_service import (
 from adscan_internal.services.post_pivot_followup_service import (
     maybe_offer_trust_followup_for_newly_reachable_domains,
 )
+from adscan_core.rich_output import print_exception
 
 CURRENT_VANTAGE_INVENTORY_STALE_AFTER_SECONDS = 24 * 60 * 60
 CURRENT_VANTAGE_INVENTORY_PROMPT_COOLDOWN_SECONDS = 12 * 60 * 60
@@ -359,6 +360,7 @@ def refresh_current_vantage_inventory(
         refresh_callable(domain, computers_file, _nmap_dir(shell, domain=domain))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"The current-vantage inventory refresh for {marked_domain} failed."
         )
@@ -378,6 +380,7 @@ def refresh_current_vantage_inventory(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[current-vantage-refresh] failed to record inventory snapshot for {marked_domain}: {exc}"
             )
@@ -447,6 +450,7 @@ def maybe_offer_workspace_current_vantage_refresh(
                 diff = diff_against_last_seen(shell, domain=status.domain)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     "[current-vantage-refresh] failed to compute pending diff for "
                     f"{mark_sensitive(status.domain, 'domain')}: {exc}"
@@ -476,6 +480,7 @@ def maybe_offer_workspace_current_vantage_refresh(
             mark_diff_seen(shell, domain=status.domain, snapshot_id=diff.after_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[current-vantage-refresh] failed to render diff for "
                 f"{mark_sensitive(status.domain, 'domain')}: {exc}"

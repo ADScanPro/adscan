@@ -1250,14 +1250,7 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
 
     if statuses and all(status == "success" for status in statuses):
         return "exploited"
-    if any(status in {"attempted", "failed", "error"} for status in statuses):
-        return "attempted"
-    if any(status == "unavailable" for status in statuses):
-        return "unavailable"
-    if any(status == "blocked" for status in statuses):
-        return "blocked"
-    if any(status == "unsupported" for status in statuses):
-        return "unsupported"
+
     # Use support registry (not a hardcoded list) for policy-blocked relations.
     from adscan_internal.services.attack_step_support_registry import (
         classify_relation_support,
@@ -1270,6 +1263,38 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         and str(step.get("action") or "").strip().lower()
         not in _CONTEXT_RELATIONS_LOWER
     ]
+
+    # PARTIAL — a chain with >=1 VALIDATED (success) step that did NOT execute
+    # end-to-end. The proven segment must never be flattened into
+    # ``theoretical``/``attempted``: that hides ADscan's "validated, not
+    # estimated" evidence, and in domain scope it is how a real, partially-proven
+    # finding silently disappears (e.g. a theoretical entry prefix + a proven
+    # AllowedToDelegate suffix). Guarded so a doctrine-critical status keeps
+    # precedence and is NEVER masked — a safety abstention (``blocked``), an
+    # observed-config close (``closed_by_configuration``), or an
+    # availability/support verdict (``unavailable``/``unsupported``, literal OR
+    # the support-registry fallback) all outrank the partial signal.
+    _doctrine_critical = {
+        "blocked",
+        "unavailable",
+        "unsupported",
+        "closed_by_configuration",
+    }
+    has_doctrine_status = any(s in _doctrine_critical for s in statuses) or any(
+        classify_relation_support(action).kind in {"policy_blocked", "unsupported"}
+        for action in non_context_actions
+    )
+    if any(status == "success" for status in statuses) and not has_doctrine_status:
+        return "partial"
+
+    if any(status in {"attempted", "failed", "error"} for status in statuses):
+        return "attempted"
+    if any(status == "unavailable" for status in statuses):
+        return "unavailable"
+    if any(status == "blocked" for status in statuses):
+        return "blocked"
+    if any(status == "unsupported" for status in statuses):
+        return "unsupported"
     if any(
         classify_relation_support(action).kind == "policy_blocked"
         for action in non_context_actions
@@ -2601,7 +2626,7 @@ def compute_display_paths_for_domain(
     expand_terminal_memberships: bool = True,
     start_node_ids: set[str] | None = None,
     materialized_artifacts: dict[str, Any] | None = None,
-    keep_longest: bool = False,
+    keep_longest: bool = True,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)

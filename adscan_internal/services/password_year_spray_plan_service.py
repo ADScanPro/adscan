@@ -17,6 +17,7 @@ from adscan_internal.services.password_year_variant_service import (
     extract_password_year_candidates,
     replace_password_year_candidate,
 )
+from adscan_core.rich_output import print_exception
 
 
 PwdLastSetSource = Literal["bloodhound"]
@@ -159,6 +160,7 @@ def resolve_bloodhound_pwdlastset_years(
                 )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[adaptive-year-spray] BloodHound pwdLastSet batch lookup failed for "
             f"{mark_sensitive(domain, 'domain')}: {exc}"

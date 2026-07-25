@@ -138,6 +138,12 @@ def start_poisoning(shell: PoisoningShell) -> None:
     interface = shell.interface
     advertised_ip = shell.myip
 
+    from adscan_internal.services.background_jobs.shared_capture_listener import (  # noqa: PLC0415
+        get_or_create_capture_broker,
+    )
+
+    broker = get_or_create_capture_broker(shell)
+
     def _async_thread() -> None:
         loop = asyncio.new_event_loop()
         loop_holder.append(loop)
@@ -151,6 +157,7 @@ def start_poisoning(shell: PoisoningShell) -> None:
                     stop_event=stop_event,
                     ready_event=ready_event,
                     error_holder=error_holder,
+                    broker=broker,
                 )
             )
         finally:
@@ -239,6 +246,7 @@ def stop_poisoning(shell: PoisoningShell) -> None:
             stopped_scopes.append(str(job.scope or "?"))
     except Exception as exc:  # noqa: BLE001 — a registry hiccup must not block the suite stop
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # (2) Legacy in-process suite (the manual `poisoning` command).
     runtime: _PoisoningRuntime | None = getattr(shell, "_poisoning_runtime", None)
@@ -287,6 +295,27 @@ def clear_poisoning_state(shell: PoisoningShell) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _obs_to_poisoning_dict(obs: Any) -> dict[str, str]:
+    """Adapt a broker ``NtlmCaptureObservation`` to the poisoning capture dict.
+
+    The shared broker's listener packs the captured principal as ``raw_user`` =
+    ``DOMAIN\\user`` (NetBIOS domain preserved) with ``clean_user`` the bare
+    name; the poisoning consumer expects ``{username, domain_netbios, fullhash,
+    version}``. This mirrors, verbatim, the old inline mapping from
+    ``extract_ntlm_hash`` this coroutine used before the :445 capture moved to
+    the broker.
+    """
+    raw = str(getattr(obs, "raw_user", "") or "")
+    netbios = raw.split("\\", 1)[0] if "\\" in raw else ""
+    version = "v1" if getattr(obs, "ntlm_version", "") == "NTLMv1" else "v2"
+    return {
+        "username": str(getattr(obs, "clean_user", "") or ""),
+        "domain_netbios": netbios,
+        "fullhash": str(getattr(obs, "fullhash", "") or ""),
+        "version": version,
+    }
+
+
 async def _run_suite(
     *,
     interface_name: str,
@@ -295,62 +324,67 @@ async def _run_suite(
     stop_event: threading.Event,
     ready_event: threading.Event,
     error_holder: list[Exception],
+    broker: Any,
 ) -> None:
-    """Async coroutine that owns the lifecycle of suite + SMB capture."""
+    """Run the broadcast poisoning suite; :445 capture comes from the broker.
+
+    The :445 SMB NTLM capture is NOT owned here — it is acquired from the shared
+    capture-listener broker (``services.background_jobs.shared_capture_listener``)
+    so poisoning, the write-share bait job, and the NTLM auth-type sweep all
+    consume ONE :445 listener instead of each binding independently (which
+    collides: ``[Errno 98] address already in use``). The broker fans each
+    capture out to our ``on_capture`` sink, adapted to the ``capture_queue`` dict
+    the existing consumer drains — so the consumer is unchanged. Only the
+    LLMNR/NBT-NS/mDNS spoofers (``PoisoningSuite``, which do NOT bind :445) stay
+    here. The broker is refcounted, so ``stop_poisoning`` releasing our consumer
+    never tears :445 down while another consumer (e.g. the write-share bait) still
+    holds it.
+    """
 
     from adscan_internal.services.poisoning import PoisonerConfig, PoisoningSuite  # noqa: PLC0415
-    from adscan_internal.services.relay.smb_ntlm_capture import (  # noqa: PLC0415
-        SMBNtlmCaptureConfig,
-        SMBNtlmCaptureSource,
-        extract_ntlm_hash,
-    )
 
     poisoner_config = PoisonerConfig(
         interface_name=interface_name,
         our_ipv4=advertised_ipv4,
     )
     suite = PoisoningSuite(poisoner_config)
-    capture_config = SMBNtlmCaptureConfig(
-        listen_host=advertised_ipv4 or "0.0.0.0", listen_port=445
-    )
-    gssapi_queue: asyncio.Queue[object] = asyncio.Queue()
-    capture_source = SMBNtlmCaptureSource(capture_config, gssapi_queue)
+    consumer_id = f"poisoning@{interface_name}"
+    acquired = False
 
     try:
         await suite.start()
-        await capture_source.start()
+        acquired = broker.acquire(
+            consumer_id,
+            bind_ip=advertised_ipv4 or "0.0.0.0",
+            on_capture=lambda obs: capture_queue.put(_obs_to_poisoning_dict(obs)),
+        )
+        if not acquired:
+            raise RuntimeError(
+                "shared :445 capture listener could not be acquired (bind failed)"
+            )
     except Exception as exc:  # noqa: BLE001
         error_holder.append(exc)
         with contextlib.suppress(Exception):
             await suite.stop()
-        with contextlib.suppress(Exception):
-            await capture_source.stop()
+        if acquired:
+            with contextlib.suppress(Exception):
+                broker.release(consumer_id)
         ready_event.set()
         return
 
     ready_event.set()
-    print_info_debug(f"[poisoning] suite + SMB capture ready on iface {interface_name}")
+    print_info_debug(
+        f"[poisoning] broadcast suite + shared :445 capture ready on iface {interface_name}"
+    )
 
     try:
+        # Capture is handled off-thread by the broker's fan-out; here we only hold
+        # the broadcast spoofers alive until asked to stop.
         while not stop_event.is_set():
-            try:
-                gssapi = await asyncio.wait_for(gssapi_queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            result = extract_ntlm_hash(gssapi)
-            if result is None:
-                continue
-            capture_queue.put(
-                {
-                    "username": result.username or "",
-                    "domain_netbios": result.domain or "",
-                    "fullhash": result.fullhash,
-                    "version": "v1" if result.ntlm_version == "NTLMv1" else "v2",
-                }
-            )
+            await asyncio.sleep(0.3)
     finally:
         with contextlib.suppress(Exception):
-            await capture_source.stop()
+            broker.release(consumer_id)
         with contextlib.suppress(Exception):
             await suite.stop()
 
@@ -405,6 +439,7 @@ def _record_poison_captured_ntlmv2_user(
             captured.append(user_clean)
     except Exception as exc:  # noqa: BLE001 — provenance is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _handle_capture(
@@ -496,6 +531,7 @@ def _handle_capture(
         )
     except Exception as exc:  # pragma: no cover - presentation must never fail capture
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     shell.ask_for_cracking(f"{user}.NTLM{version}", domain, hash_file)
 

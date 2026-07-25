@@ -67,6 +67,7 @@ from adscan_internal.services.smb_transport import (
     SMBTransportError,
     smb_machine_with_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(slots=True)
@@ -125,6 +126,7 @@ async def probe_conventional(
         out.errors.append(f"smb connect failed: {exc}")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors.append(f"conventional strategy: {exc}")
     return out
 
@@ -176,6 +178,7 @@ async def probe_alternative(
         out.errors.append(f"smb connect failed: {exc}")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors.append(f"alternative strategy: {exc}")
     return out
 
@@ -239,6 +242,7 @@ async def _walk_root_logged(
         return WalkOutcome([], 0, 0, 0, 0, False, f"walk timed out after {per_root_timeout:.0f}s")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ctf-flags] walk root={root_path} OUTCOME=error "
             f"files=0 dirs=0 errored=0 candidates=0 err={exc}"
@@ -417,6 +421,7 @@ async def smb_walk_bounded(
             raise
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             out.errors.append(f"top-level discovery: {exc}")
             top_results = []
         return deep_results + top_results
@@ -597,6 +602,7 @@ async def smb_walk_bounded(
         raise
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors.append(f"smb walk strategy: {exc}")
 
     elapsed_ms = int((asyncio.get_event_loop().time() - started_loop) * 1000)
@@ -746,6 +752,7 @@ async def powershell_search(
         return out
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors.append(f"ps_search exec failed: {exc}")
         return out
 

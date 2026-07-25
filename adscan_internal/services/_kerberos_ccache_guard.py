@@ -40,6 +40,7 @@ from typing import Optional
 
 from adscan_internal import print_warning, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_core.rich_output import print_exception
 
 # ---------------------------------------------------------------------------
 # Escalation toggle
@@ -235,6 +236,7 @@ def assert_ccache_principal_matches(
         )
     except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     if _REFUSE_ON_MISMATCH:
         raise CcachePrincipalMismatchError(

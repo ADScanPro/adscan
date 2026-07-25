@@ -451,18 +451,52 @@ class AIOKerberosClient:
 				preauth_rep = await self.do_preauth(etype, with_pac=with_pac)
 				break
 			except KerberosError as e:
-				if e.errorcode != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP:
+				# ADscan vendor fix: KDC_ERR_PREAUTH_FAILED can ALSO mean "the key we
+				# derived for this etype used the wrong salt" -- not necessarily "wrong
+				# password". This happens whenever the ETYPE-INFO2 salt probe above
+				# could not learn the real salt (e.g. an account with "Do not require
+				# Kerberos preauthentication" set answers the probe's unauthenticated
+				# AS-REQ with a full AS-REP instead of KDC_ERR_PREAUTH_REQUIRED, so the
+				# probe block never runs and self.server_salt stays None). The default
+				# fallback salt (REALM + username-as-typed) can then mismatch the KDC's
+				# real salt whenever the account's actual sAMAccountName casing differs
+				# from what the caller supplied (Kerberos string-to-key salts are
+				# case-sensitive on the principal name) -- confirmed live against a real
+				# DC: 'fsmith' vs the stored 'FSmith' produces exactly this failure, and
+				# the KDC's PREAUTH_FAILED response carries the SAME e-data (correct
+				# salt/etypes) whether the failure was salt-driven or a genuinely wrong
+				# password -- the two are indistinguishable without retrying.
+				# So: treat KDC_ERR_PREAUTH_FAILED the same as KDC_ERR_ETYPE_NOTSUPP
+				# below, gated strictly on `self.server_salt is None` -- this fires only
+				# on the FIRST rejection (before we have ever learned a KDC-confirmed
+				# salt), so it costs at most ONE extra preauth attempt against the KDC
+				# (same bounded cost the existing ETYPE_NOTSUPP self-correction below
+				# already accepts) -- never an unbounded loop through every candidate
+				# etype, which would multiply badPwdCount hits on a genuinely wrong
+				# password. Once server_salt is populated (either by the probe or by a
+				# prior correction here), a further PREAUTH_FAILED is treated as
+				# terminal exactly as before.
+				is_salt_correctable_preauth_failure = (
+					e.errorcode == KerberosErrorCode.KDC_ERR_PREAUTH_FAILED
+					and self.server_salt is None
+				)
+				if (
+					e.errorcode != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP
+					and not is_salt_correctable_preauth_failure
+				):
 					raise e
 				logger.debug('Failed to get TGT with etype %s' % etype.name)
 				# ADscan diagnostic: the KDC rejected this etype. Record the rejected
 				# etype + whether the KDC supplied e-data so an intermittent
-				# KDC_ERR_ETYPE_NOTSUPP is diagnosable. The advertised supported etypes
-				# are logged below, AFTER the existing (single) select_preferred call
-				# parses them — this branch must NOT call it (extra call = side effects).
+				# KDC_ERR_ETYPE_NOTSUPP/KDC_ERR_PREAUTH_FAILED is diagnosable. The
+				# advertised supported etypes are logged below, AFTER the existing
+				# (single) select_preferred call parses them — this branch must NOT
+				# call it (extra call = side effects).
 				try:
 					logger.debug(
-						'kdc-etype-notsupp: rejected_etype=%s has_edata=%s server_salt=%s' % (
+						'kdc-etype-notsupp: rejected_etype=%s errorcode=%s has_edata=%s server_salt=%s' % (
 							etype.name,
+							e.errorcode,
 							bool(e.krb_err_msg.get('e-data')),
 							self.server_salt,
 						)
@@ -824,11 +858,25 @@ class AIOKerberosClient:
 			S4UByteArray += user_to_impersonate.domain.encode()
 			S4UByteArray += auth_package_name.encode()
 			
-			chksum_data = _HMACMD5.checksum(self.kerberos_session_key, 17, S4UByteArray)
+			# ADscan vendor fix: the PA-FOR-USER checksum TYPE must match the TGT session-key
+			# etype. The original hardcoded HMAC_MD5 (RC4's checksum); after AES-first get_TGT
+			# the session key is AES, so an RC4 checksum over an AES key is inconsistent and the
+			# KDC rejects S4U2self with KDC_ERR_ETYPE_NOTSUPP. Mirror the DMSA branch for AES;
+			# keep the exact original path for RC4 (zero regression).
+			_sk_etype = self.kerberos_session_key.enctype
+			if _sk_etype in (Enctype.AES256, Enctype.AES128):
+				from kerbad.protocol.encryption import make_checksum, Cksumtype
+				_pa_ck = Cksumtype.SHA1_AES256 if _sk_etype == Enctype.AES256 else Cksumtype.SHA1_AES128
+				chksum_data = make_checksum(_pa_ck, self.kerberos_session_key, 17, S4UByteArray)
+				_pa_cksumtype_val = int(_pa_ck)
+			else:
+				chksum_data = _HMACMD5.checksum(self.kerberos_session_key, 17, S4UByteArray)
+				_pa_cksumtype_val = int(CKSUMTYPE('HMAC_MD5'))
+			logger.debug('[S4U2self] PA-FOR-USER checksum: session_key_etype=%s cksumtype=%s (AES->SHA1_AESxxx, RC4->HMAC_MD5)' % (_sk_etype, _pa_cksumtype_val))
 			
 			
 			chksum = {}
-			chksum['cksumtype'] = int(CKSUMTYPE('HMAC_MD5'))
+			chksum['cksumtype'] = _pa_cksumtype_val
 			chksum['checksum'] = chksum_data
 
 			###### Filling out PA-FOR-USER data for impersonation
@@ -860,7 +908,22 @@ class AIOKerberosClient:
 		krb_tgs_body['realm'] = self.credential.domain.upper()
 		krb_tgs_body['till'] = (now + datetime.timedelta(days=1)).replace(microsecond=0)
 		krb_tgs_body['nonce'] = nonce
-		krb_tgs_body['etype'] = [self.kerberos_session_key.enctype] #[supp_enc.value] #selecting according to server's preferences
+		# ADscan vendor fix: offer RC4 (etype 23) as a fallback alongside the TGT
+		# session-key etype, mirroring get_TGS (see the `[self.kerberos_cipher_type, 23]`
+		# body there). The S4U2self service ticket is encrypted with the TARGET
+		# service account's own long-term key, so the KDC selects the ticket etype
+		# from the intersection of this list and the account's supported etypes
+		# (msDS-SupportedEncryptionTypes). When the TGT session key is AES (the
+		# AES-first get_TGT ordering makes this the norm) but the target account has
+		# only an RC4 key, a single-element AES-only list has no common etype and the
+		# KDC replies KDC_ERR_ETYPE_NOTSUPP. Adding 23 lets the KDC fall back to RC4;
+		# on an AES-only KDC the 23 is simply ignored and AES is used, so this is
+		# safe in both directions. #selecting according to server's preferences
+		_s4u_self_etype = self.kerberos_session_key.enctype
+		if _s4u_self_etype == 23:
+			krb_tgs_body['etype'] = [23]
+		else:
+			krb_tgs_body['etype'] = [_s4u_self_etype, 23]
 		
 		
 		krb_tgs_req = {}

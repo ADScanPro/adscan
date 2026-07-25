@@ -22,6 +22,7 @@ from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConfig,
     async_connect_with_ldap_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 # Safety margin (seconds) added to the lockout observation window before an
 # account's stored badPwdCount is treated as effectively reset. Only relaxes
@@ -297,6 +298,7 @@ async def _fetch_domain_policy(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(f"[spray_policy] Failed to fetch domain policy: {exc}")
     return policy
 
@@ -418,6 +420,7 @@ async def _fetch_user_badpwdcounts(
                     pass
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(f"[spray_policy] Failed to fetch user badPwdCounts: {exc}")
 
     return badpwd_by_user, pso_dn_by_user, badpwdtime_by_user, locked_users
@@ -599,6 +602,7 @@ async def fetch_spray_policy_native(
 
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         msg = f"Native policy fetch failed: {exc}"
         result.fetch_errors.append(msg)
         print_warning_debug(f"[spray_policy] {msg}")

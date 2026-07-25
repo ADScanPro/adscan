@@ -33,6 +33,7 @@ from adscan_internal.services.cve_scanner.result import (
     Evidence,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.cve_scanner.runner import ScanContext, ScanTarget
@@ -195,6 +196,7 @@ def evaluate_findings(
             sd.fromString(sd_bytes)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             continue
         for ace in sd["Dacl"]["Data"] if sd["Dacl"] else []:
             if not _matches_principal(ace):
@@ -217,6 +219,7 @@ def evaluate_findings(
             sd.fromString(sd_bytes)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             continue
         if sd["OwnerSid"] and sd["OwnerSid"].getData() in principal_sids:
             dmsa_hits.append(BadSuccessorDmsa(dn=dmsa_dn, granting_ace="Owns"))
@@ -261,6 +264,7 @@ class BadSuccessorCheck:
             findings = await asyncio.to_thread(self._collect_sync, target, creds, ctx)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"[badsuccessor] LDAP collection failed: {exc}")
             return [_error(target.host, str(exc))]
         return [_result_from_findings(target.host, findings)]

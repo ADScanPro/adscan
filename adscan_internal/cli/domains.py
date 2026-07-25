@@ -37,6 +37,7 @@ from adscan_internal.cli.nmap import probe_host_reachability_with_nmap
 from adscan_internal.services.domain_connectivity_service import (
     merge_domain_connectivity,
 )
+from adscan_core.rich_output import print_exception
 
 
 class DomainShell(Protocol):
@@ -181,6 +182,7 @@ def domain_select(shell: DomainShell) -> None:
     except Exception as exc:  # noqa: BLE001
         try:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         except Exception:
             pass
 
@@ -490,6 +492,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
                 shell.save_workspace_data()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(
                     "Failed to persist trusted-domain reachability state to the workspace."
                 )
@@ -839,6 +842,7 @@ def _remote_trust_scope_selection(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return origin_default
 
     if not selected_values:
@@ -919,6 +923,7 @@ def _persist_scope_selection(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[scope] Failed to persist scope.json: {exc}")
 
 
@@ -1025,6 +1030,7 @@ def _handle_trust_enumeration_result(
                         shell._clean_domain_entries(main_domain)
                     except Exception as cexc:  # noqa: BLE001
                         telemetry.capture_exception(cexc)
+                        print_exception(exception=cexc)
                         print_warning_debug(
                             "cross_domain_cleanup failed for "
                             f"{mark_sensitive(main_domain, 'domain')}"
@@ -1320,6 +1326,39 @@ def _handle_trust_enumeration_result(
         print_error(
             "An unexpected error occurred while processing trust enumeration output."
         )
-        from adscan_internal.rich_output import print_exception
-
         print_exception(show_locals=False, exception=exc)
+
+        # A failure provisioning a DISCOVERED TRUST PARTNER (e.g. it has no
+        # confirmed DC IP and DNS resolution cannot be configured for it) must
+        # not silently abandon the PRIMARY domain's scan. By the time this
+        # function runs, the primary domain's own auth/PDC/setup already
+        # succeeded independently (``run_enum_trusts`` requires
+        # ``shell.domains_data[domain]["pdc"]`` before calling this handler),
+        # so resume it via the SAME path the normal "no reachable trusted
+        # domains" flow above uses instead of swallowing the exception.
+        try:
+            failed_partner = main_domain  # noqa: F821 — set if the failure hit the per-domain loop
+        except NameError:
+            failed_partner = None
+        marked_domain = mark_sensitive(domain, "domain")
+        if failed_partner and failed_partner != domain:
+            marked_partner = mark_sensitive(failed_partner, "domain")
+            print_warning(
+                f"Trust partner {marked_partner} could not be provisioned; "
+                f"continuing the scan for the primary domain {marked_domain}."
+            )
+        else:
+            print_warning(
+                f"Trust-partner provisioning failed; continuing the scan for "
+                f"the primary domain {marked_domain}."
+            )
+        try:
+            shell.domains_data.setdefault(domain, {})["auth"] = "auth"
+            shell.ask_for_enum_domain_auth(domain)
+        except Exception as resume_exc:  # noqa: BLE001
+            telemetry.capture_exception(resume_exc)
+            print_exception(exception=resume_exc)
+            print_error(
+                f"Failed to resume enumeration for the primary domain {marked_domain} "
+                "after the trust-partner provisioning error."
+            )

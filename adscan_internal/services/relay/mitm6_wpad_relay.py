@@ -44,6 +44,7 @@ from adscan_internal.services.relay.http_ntlm_source import (
     HTTPNtlmRelaySource,
     HTTPNtlmRelaySourceConfig,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ async def run_mitm6_wpad_relay(
         await http_source.start()
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise
 
     # Small delay so asyncio processes the bind before we start advertising.
@@ -143,6 +145,7 @@ async def run_mitm6_wpad_relay(
         await suite.start()
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         await http_source.stop()
         raise
 

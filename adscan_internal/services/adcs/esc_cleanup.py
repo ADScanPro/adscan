@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_error
+from adscan_core.rich_output import print_exception
 
 
 class RollbackQueue:
@@ -27,6 +28,7 @@ class RollbackQueue:
                     await result
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 errors.append(str(exc))
         return errors
 
@@ -63,6 +65,7 @@ def register_ldap_change(
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -75,6 +78,7 @@ def mark_reverted(shell: Any, change_id: Optional[str]) -> None:
             ledger.mark_reverted(change_id)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def mark_revert_failed(
@@ -88,3 +92,4 @@ def mark_revert_failed(
             ledger.mark_failed(change_id, error=error, manual_cleanup_instructions=instructions)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)

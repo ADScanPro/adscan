@@ -35,6 +35,7 @@ from adscan_internal.services.cve_scanner.result import (
     Evidence,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.cve_scanner.runner import ScanContext, ScanTarget
@@ -72,6 +73,7 @@ class CoercionCVECheck:
             run_result = await self._invoke_engine(target, creds, ctx)
         except Exception as exc:  # noqa: BLE001 — surface as error result
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Coercion sweep failed for {target.host}: {exc}")
             return [
                 _error_result_for_technique(

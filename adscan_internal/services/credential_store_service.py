@@ -25,6 +25,7 @@ from typing import Any, MutableMapping, Optional
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.models.domain import Domain
+from adscan_core.rich_output import print_exception
 
 
 @dataclass
@@ -781,6 +782,7 @@ def persist_service_ticket(
         return stored
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"service_tickets: failed to persist {mark_sensitive(normalized_ccache, 'path')}: "
             f"{type(exc).__name__}: {mark_sensitive(str(exc), 'detail')}"

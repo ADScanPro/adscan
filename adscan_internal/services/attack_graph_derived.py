@@ -46,6 +46,7 @@ from adscan_internal.services.attack_paths_materialized_cache import (
 )
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.workspaces import domain_subpath
+from adscan_core.rich_output import print_exception
 
 
 # Allow-list of relations callers may insert. Anything outside this set is
@@ -210,6 +211,7 @@ def insert_derived_edge(
         )
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"[attack_graph_derived] failed to write attack_graph.json: {exc}")
         return False
 
@@ -219,6 +221,7 @@ def insert_derived_edge(
         invalidate_attack_path_artifacts(shell, domain)
     except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     print_info_verbose(
         f"[attack_graph_derived] inserted derived edge "

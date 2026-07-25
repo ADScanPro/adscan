@@ -536,6 +536,7 @@ def _admin_to_skip_user_via_risk(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
     if not record:
         return False
@@ -567,6 +568,7 @@ def _admin_to_skip_user_via_rid(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
     if not isinstance(node, dict):
         return False
@@ -661,6 +663,7 @@ def add_runtime_admin_to_edge(
             return False
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # Defensive: if the skip check fails, do not write the edge —
         # we cannot prove the user is non-DA, and a false-positive
         # explicit edge for a DA pollutes the graph.
@@ -672,6 +675,7 @@ def add_runtime_admin_to_edge(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
     try:
@@ -685,6 +689,7 @@ def add_runtime_admin_to_edge(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
     if recorded:

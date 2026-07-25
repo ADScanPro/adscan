@@ -36,6 +36,7 @@ from adscan_internal.services.cve_scanner.result import (
     Evidence,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.cve_scanner.runner import ScanContext, ScanTarget
@@ -189,6 +190,7 @@ class PrinterBugSurfaceCheck:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"[printerbug-surface] probe crashed against {target.host}: {exc}"
             )

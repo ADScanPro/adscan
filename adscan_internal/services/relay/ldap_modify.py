@@ -43,6 +43,7 @@ from adscan_internal.services.relay.identity import extract_ntlm_identity
 from adscan_internal.services.relay.ldap_relay_session import (
     establish_relay_ldap_session,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class LDAPRBCDRelayTarget:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return RelayTargetResult(
                 target_name=self.name,
                 success=False,
@@ -341,6 +343,7 @@ class LDAPShadowCredsRelayTarget:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return RelayTargetResult(
                 target_name=self.name,
                 success=False,

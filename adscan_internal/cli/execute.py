@@ -42,6 +42,7 @@ from typing import Any, Callable, Optional
 
 from adscan_internal import (
     print_error,
+    print_exception,
     print_info,
     print_success,
     print_warning,
@@ -75,6 +76,13 @@ class ExecuteVerbSpec:
             (attack graph, enumerated users). ``execute`` cannot synthesise this
             in a one-shot run; the verb is offered but fails gracefully with a
             pointer to ``adscan ci`` / the prerequisite when the data is absent.
+        auth_from_workspace_owned: When ``needs_auth`` is set, allow the run to
+            proceed WITHOUT explicit ``-u/-p`` if the positional start principal
+            is already OWNED in the kept workspace with a resolvable stored
+            credential (password / NT hash / ccache). Used by ``attack_paths``
+            so the L3.5 loop can re-run a path from an owned principal without
+            re-typing its password. ``-u/-p`` are still required when the start
+            principal is not owned or has no stored secret.
         summary: One-line operator-facing description for ``--list``. Falls back
             to the ``do_<verb>`` docstring first line when empty.
     """
@@ -82,6 +90,7 @@ class ExecuteVerbSpec:
     needs_domain: bool = False
     needs_auth: bool = False
     needs_collection: bool = False
+    auth_from_workspace_owned: bool = False
     summary: str = ""
 
 
@@ -123,7 +132,33 @@ EXECUTE_SAFE_VERBS: dict[str, ExecuteVerbSpec] = {
         needs_auth=True,
         summary="Enumerate ADCS templates and ESC findings.",
     ),
+    "attack_paths": ExecuteVerbSpec(
+        needs_domain=True,
+        needs_auth=True,
+        auth_from_workspace_owned=True,
+        summary="Compute + execute attack paths from a collected workspace "
+        "(execution offered only from OWNED start principals: the `owned` "
+        "scope, or an explicit user that is owned). The L3.5 rung — run one "
+        "attack (e.g. ESC7) from a kept workspace without a full `ci`.",
+    ),
+    "reset_attack_path_statuses": ExecuteVerbSpec(
+        needs_domain=True,
+        # Local workspace op (no DC auth): clears persisted attack-path outcomes
+        # back to the fresh-run `theoretical` baseline. Needed before re-running
+        # `execute attack_paths` for L3.5 — the non-interactive executor is
+        # theoretical-only, so an already-attempted/exploited path is skipped
+        # until it is reset.
+        summary="Reset a domain's persisted attack-path statuses to the "
+        "`theoretical` baseline (L3.5: re-arm a path for re-execution).",
+    ),
 }
+
+
+# REPL scan-entry verbs that are intentionally NOT allowlisted: a full scan is
+# not a "clearly-safe quick verb". When rejected they get bespoke recovery text
+# routing to ``adscan ci`` (the non-interactive one-shot a user who typed
+# ``adscan execute`` actually wants) rather than the generic allowlist advice.
+_SCAN_ENTRY_VERBS: frozenset[str] = frozenset({"start_unauth", "start_auth"})
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +291,27 @@ def resolve_execute_verb(
         return VerbResolution(True, verb, spec)
 
     if verb in known_verbs:
+        if verb in _SCAN_ENTRY_VERBS:
+            # Scan-entry verbs are deliberately not on the allowlist — a full
+            # scan is not a "clearly-safe quick verb". A user who typed
+            # ``adscan execute start_unauth`` wants a non-interactive one-shot
+            # scan, whose true equivalent is ``adscan ci <mode>``. Name the
+            # exact mode (auth/unauth) the verb maps to and point at the
+            # runtime help for the required --type/--interface, then at the
+            # interactive session.
+            ci_mode = "unauth" if verb == "start_unauth" else "auth"
+            return VerbResolution(
+                False,
+                verb,
+                None,
+                (
+                    f"'{verb}' launches a full scan, which is not a standalone "
+                    f"`execute` verb. For a non-interactive one-shot scan run "
+                    f"`adscan ci {ci_mode}` (run `adscan ci --help` for the "
+                    f"required --type/--interface and auth flags); for an "
+                    f"interactive session run `adscan start`."
+                ),
+            )
         return VerbResolution(
             False,
             verb,
@@ -499,6 +555,123 @@ def _establish_credentials(shell: Any, config: ExecuteConfig) -> bool:
     return True
 
 
+# Value-taking flags in ``do_attack_paths`` (mirror of adscan.py); every other
+# ``--flag`` is boolean. Used only to skip flags when locating the positional
+# start principal for the workspace-owned credential gate.
+_ATTACK_PATHS_VALUE_FLAGS: frozenset[str] = frozenset(
+    {"--max", "--depth", "--path-steps"}
+)
+
+
+def _attack_paths_start_principals(
+    passthrough: tuple[str, ...], *, domain: str
+) -> tuple[list[str], bool]:
+    """Extract the start principal(s) from an ``attack_paths`` passthrough.
+
+    Mirrors the positional parsing in ``PentestShell.do_attack_paths``: the
+    first positional is the domain, a trailing integer is a path index, and the
+    remaining non-flag tokens are start principals. Flags (and the values of
+    value-taking flags) are skipped so a start principal that follows a flag is
+    still found.
+
+    Args:
+        passthrough: The verb passthrough tokens (what ``do_attack_paths`` parses).
+        domain: The resolved target domain — dropped when it is the first
+            positional (``attack_paths <domain> <user>``).
+
+    Returns:
+        ``(explicit_users, owned_scope)`` where ``owned_scope`` is True when the
+        special ``owned`` token was requested.
+    """
+    positionals: list[str] = []
+    tokens = list(passthrough)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _ATTACK_PATHS_VALUE_FLAGS:
+            i += 2  # skip the flag and its value
+            continue
+        if tok.startswith("--"):
+            i += 1  # boolean flag (or --flag=value)
+            continue
+        positionals.append(tok)
+        i += 1
+
+    start = positionals[1:] if positionals and positionals[0] == domain else positionals
+    if start and start[-1].isdigit():
+        start = start[:-1]  # trailing path index
+    users = [t for t in start if not t.isdigit() and t.lower() != "owned"]
+    owned_scope = any(t.lower() == "owned" for t in start)
+    return users, owned_scope
+
+
+def _resolve_workspace_owned_auth(shell: Any, config: ExecuteConfig) -> bool:
+    """Whether the run may proceed WITHOUT ``-u/-p`` from the workspace store.
+
+    Returns True only when the positional start principal is already OWNED in
+    the loaded workspace AND has a resolvable stored credential — i.e. the
+    attack-path execution can authenticate as it without any secret typed on the
+    command line. Reuses the owned SSOT
+    (``get_owned_domain_usernames_for_attack_paths``), the same owned-execution
+    gate ``run_show_attack_paths`` applies (``_execution_allowed_for_start``),
+    and the stored-credential resolver (``_get_stored_domain_credential_for_user``).
+    A non-owned start principal, or one with no stored secret, returns False so
+    the caller keeps requiring ``-u/-p``.
+    """
+    passthrough = tuple(config.passthrough)
+    domain = (config.domain or "").strip() or (passthrough[0] if passthrough else "")
+    if not domain:
+        return False
+
+    from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+        get_owned_domain_usernames_for_attack_paths,
+    )
+    from adscan_internal.cli.attack_graph_reports import (  # noqa: PLC0415
+        _execution_allowed_for_start,
+    )
+    from adscan_internal.cli.attack_path_execution import (  # noqa: PLC0415
+        _get_stored_domain_credential_for_user,
+    )
+
+    owned = get_owned_domain_usernames_for_attack_paths(shell, domain)
+    owned_norm = {u.split("@", 1)[0].strip().lower() for u in owned}
+    users, owned_scope = _attack_paths_start_principals(passthrough, domain=domain)
+
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+    domain_auth = str(domain_data.get("auth", "") or "").strip().lower()
+
+    if owned_scope:
+        start_user_norm, start_users = "owned", None
+    elif len(users) > 1:
+        start_user_norm, start_users = "", users
+    elif len(users) == 1:
+        start_user_norm, start_users = users[0].split("@", 1)[0].strip().lower(), None
+    else:
+        start_user_norm, start_users = "", None  # domain scope
+
+    # Gate: execution is only offered from principals we already control. This is
+    # the exact predicate run_show_attack_paths uses — do not re-derive it.
+    if not _execution_allowed_for_start(
+        allow_execution=True,
+        start_user_norm=start_user_norm,
+        start_users=start_users,
+        domain_auth=domain_auth,
+        owned_norm=owned_norm,
+    ):
+        return False
+
+    def _resolvable(user: str) -> bool:
+        return bool(
+            _get_stored_domain_credential_for_user(shell, domain=domain, username=user)
+        )
+
+    # owned scope / domain-pwned scope run from ANY owned user → one must be
+    # resolvable; an explicit selection needs every named principal resolvable.
+    if owned_scope or not users:
+        return any(_resolvable(user) for user in owned)
+    return all(_resolvable(user) for user in users)
+
+
 def _check_collection_prerequisite(shell: Any, config: ExecuteConfig) -> bool:
     """Fail gracefully when a verb needs a prior scan's collected data.
 
@@ -712,9 +885,24 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
         # 1) Domain → DC context (DNS + posture) when the verb needs it.
         if spec.needs_domain and not _establish_domain_context(shell, config):
             return 2
-        # 2) Credentials when the verb authenticates.
-        if spec.needs_auth and not _establish_credentials(shell, config):
-            return 2
+        # 2) Credentials when the verb authenticates. When -u/-p are absent and
+        #    the verb allows it, an OWNED start principal already in the kept
+        #    workspace (with a resolvable stored secret) authenticates from the
+        #    store — no need to re-type its password. Falls through to the
+        #    require-`-u/-p` error otherwise.
+        if spec.needs_auth:
+            explicit_absent = not (config.username or config.password)
+            if (
+                explicit_absent
+                and spec.auth_from_workspace_owned
+                and _resolve_workspace_owned_auth(shell, config)
+            ):
+                print_info(
+                    "Authenticating as the owned start principal using its "
+                    "stored workspace credential (no -u/-p needed)."
+                )
+            elif not _establish_credentials(shell, config):
+                return 2
         # 3) Prior-collection guard (graceful, points at the prerequisite).
         if spec.needs_collection and not _check_collection_prerequisite(shell, config):
             return 3
@@ -752,6 +940,12 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
         exit_code = 130
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        # Always write the full traceback to adscan.debug.log (DEBUG-on-disk,
+        # unconditional) so an `execute` failure is diagnosable from the log;
+        # the console stays generic unless --debug/SECRET_MODE is on. Without
+        # this the traceback reached ONLY PostHog and every `execute` error was
+        # an opaque one-liner in the debug log.
+        print_exception(exception=exc)
         print_error(f"Error executing '{verb}'.")
         exit_code = 1
     finally:

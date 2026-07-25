@@ -28,6 +28,7 @@ from adscan_core.rich_output import (
     print_error,
     print_info_verbose,
 )
+from adscan_core.rich_output import print_exception
 
 
 # Microsoft OIDs reused from certipy.lib.certificate (kept local so this
@@ -268,6 +269,7 @@ def forge_certificate_native(config: ForgeConfig, output_dir: Path) -> ForgeResu
         return _do_forge(config, output_dir)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Certificate forge failed: {exc}")
         return ForgeResult(success=False, error=str(exc))
 

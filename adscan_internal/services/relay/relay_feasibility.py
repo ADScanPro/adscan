@@ -55,6 +55,17 @@ from adscan_internal.services.domain_posture import (
 
 VerdictStatus = Literal["ok", "blocking", "warning"]
 
+# The exact `why` for an RBCD block caused by an exhausted machine-account quota.
+# Shared SSOT so a consumer can distinguish a PARTIAL close (MAQ==0 blocks only
+# minting a NEW delegate account — RBCD via an already-controlled computer account
+# still works) from a CERTAIN full close. A partial close must NOT be surfaced as
+# the positive ``closed_by_configuration`` status (that would over-credit a defense
+# the client does not fully have). See CLAUDE.md § Status vocabularies.
+MAQ_EXHAUSTED_REASON = (
+    "MachineAccountQuota is 0; a new delegate machine account cannot be "
+    "created for RBCD."
+)
+
 RelayTargetKind = Literal[
     "ldap_389_dropmic",
     "ldaps_636",
@@ -579,8 +590,7 @@ def check_machine_account_quota(
             check_id="machine_account_quota",
             status="blocking" if is_rbcd else "warning",
             observed=f"MAQ={maq}",
-            why="MachineAccountQuota is 0; a new delegate machine account cannot be "
-            "created for RBCD.",
+            why=MAQ_EXHAUSTED_REASON,
             remediation="Use an existing controlled account (SID) instead of minting one.",
             confidence=SignalConfidence.MEDIUM,
         )

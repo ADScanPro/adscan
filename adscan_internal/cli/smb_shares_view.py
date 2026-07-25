@@ -75,6 +75,7 @@ from adscan_internal.services.views.share_view_composer import (
     compose_share_views,
 )
 from adscan_internal.workspaces.subpaths import domain_path
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +329,7 @@ def _run_live_probe(
         # raw multi-frame Rich traceback. Classify it (the same Kerberos-posture
         # mapping the enumerator's errors use) and render a clean one-line card.
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         if not suppress_rich():
             print_remediation_card(
                 error=f"Live SMB share probe failed: {exc}",
@@ -363,6 +365,7 @@ def _load_graph(*, shell: Any, domain: str, host: str) -> Optional[GraphShareSna
         return load_graph_share_snapshot(graph_path=graph_path, host=host)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -642,6 +645,7 @@ def _persist_snapshot(
         return out_path
     except Exception as exc:  # noqa: BLE001 — UX-best-effort, not fatal
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         if not suppress_rich():
             print_warning(f"Could not persist shares snapshot: {exc}")
         return None
@@ -682,6 +686,7 @@ def _load_ip_hostname_inventory(shell: Any, domain: str) -> Dict[str, List[str]]
         )
     except Exception as exc:  # noqa: BLE001 — inventory is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {}
 
 

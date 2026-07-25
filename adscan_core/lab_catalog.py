@@ -11,6 +11,7 @@ from adscan_core.lab_context import normalize_lab_provider
 
 CTF_LAB_PROVIDER_OPTIONS: tuple[str, ...] = (
     "HackTheBox",
+    "VulnLab",
     "TryHackMe",
     "Certifications",
     "Training Labs",
@@ -23,6 +24,7 @@ CTF_LAB_PROVIDER_OPTIONS: tuple[str, ...] = (
 
 _PROVIDER_DISPLAY_TO_CANONICAL: dict[str, str] = {
     "HackTheBox": "hackthebox",
+    "VulnLab": "vulnlab",
     "TryHackMe": "tryhackme",
     "Certifications": "certifications",
     "Training Labs": "training_labs",
@@ -110,6 +112,42 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "XEN",
         "Orion",
         "FullHouse",
+        # Additional well-known AD machines (source: seriotonctf/HackTheBox-AD-Machines).
+        "Authority",
+        "EscapeTwo",
+        "Flight",
+        "Absolute",
+        "Timelapse",
+        "Return",
+        "Object",
+        "Acute",
+        "Anubis",
+        "Multimaster",
+        "Rabbit",
+        "PivotAPI",
+        "APT",
+        "Hathor",
+        "Office",
+        "Analysis",
+        "Mist",
+        "Ghost",
+        "Freelancer",
+        "Infiltrator",
+        "University",
+        "Certificate",
+        "Puppy",
+        "Scepter",
+        "Haze",
+        "TheFrizz",
+        "DarkCorp",
+        "Mirage",
+        "NanoCorp",
+        "Hercules",
+        "Odyssey",
+        "Ghostlink",
+        "TrustFall",
+        "DanglingTree",
+        "DarkZeroReturns",
         # Pro Labs / Endgames
         "Genesis",
         "Zephyr",
@@ -133,7 +171,37 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "Enterprise",
         "Exploiting_Active_Directory",
         "Persisting_Active_Directory",
-        "Soupedecode"
+        "Soupedecode",
+        # Additional well-known AD-focused rooms/networks (source: tryhackme.com room list).
+        "Zerologon",
+        "Holo",
+        "Throwback",
+    ),
+    # VulnLab (vulnlab.com) is a distinct, AD-heavy platform with its own ``.vl``
+    # domains.  Some boxes (Baby, Retro) also exist on HTB — the crossover is
+    # expected; the ``.vl`` DOMAIN identifies the VulnLab instance.  Only boxes
+    # confirmed to be Active Directory (single boxes and multi-host "chains") are
+    # whitelisted here (sources: vulnlab.com/machines and public chain writeups).
+    "vulnlab": (
+        # Single AD boxes
+        "Baby",
+        "Breach",
+        "Sendai",
+        "Retro",
+        "Retro2",
+        "Delegate",
+        "Phantom",
+        "Redelegate",
+        # AD chains (multi-host domain-compromise environments)
+        "Trusted",
+        "Reflection",
+        "Hybrid",
+        "Lustrous",
+        "Heron",
+        "Tengu",
+        "Puppet",
+        "Kaiju",
+        "Mythical",
     ),
     # Certification paths frequently include AD-specific lab sets. This list is
     # intentionally curated rather than exhaustive; operators can still enter a
@@ -230,6 +298,9 @@ _MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
     # Scrambled (HTB) — domain: scrm.local, DC: DC1.scrm.local
     # SLD "scrm" and PDC "dc1" both fail → only explicit fingerprint works.
     "scrm.local": ("hackthebox", "scrambled"),
+    # Multimaster (HTB) — domain: megacorp.local, DC: MULTIMASTER.megacorp.local
+    # SLD "megacorp" doesn't match catalog entry "multimaster".
+    "megacorp.local": ("hackthebox", "multimaster"),
     # VulnNet_Roasted (THM) — domain: vulnnet-rst.local, DC: WIN-2BO8M1OE1M1.vulnnet-rst.local
     # SLD "vulnnet-rst" and PDC hostname don't match the catalog entry.
     "vulnnet-rst.local": ("tryhackme", "vulnnet_roasted"),
@@ -239,13 +310,14 @@ _MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
     # VulnNet_Active (THM) — domain: vulnnet.local, DC: VULNNET-BC3TCK1.vulnnet.local
     # SLD "vulnnet" doesn't match the catalog entry; PDC hostname is random.
     "vulnnet.local": ("tryhackme", "vulnnet_active"),
-    # Retrotwo (HTB/VulnLab) — domain: retro2.vl, DC: BLN01.retro2.vl
-    # SLD "retro2" doesn't match catalog entry "retrotwo"; PDC hostname also differs.
-    "retro2.vl": ("hackthebox", "retrotwo"),
-    # Mythical (HTB/VulnLab) — two-forest lab: mythical-eu.vl + mythical-us.vl
+    # Retro2 (VulnLab) — domain: retro2.vl, DC: BLN01.retro2.vl
+    # The ``.vl`` domain identifies the VulnLab instance (Retro2 also has an HTB
+    # presence, but this domain is the VulnLab one).  PDC hostname differs too.
+    "retro2.vl": ("vulnlab", "retro2"),
+    # Mythical (VulnLab chain) — two-forest lab: mythical-eu.vl + mythical-us.vl
     # SLD "mythical-eu"/"mythical-us" don't match catalog entry "mythical".
-    "mythical-eu.vl": ("hackthebox", "mythical"),
-    "mythical-us.vl": ("hackthebox", "mythical"),
+    "mythical-eu.vl": ("vulnlab", "mythical"),
+    "mythical-us.vl": ("vulnlab", "mythical"),
     # CRTP (Altered Security) — lab: dollarcorp.moneycorp.local (child), moneycorp.local (parent)
     # Parent "moneycorp.local" covers both direct input and subdomain-stripped input.
     # SLD "moneycorp" doesn't match catalog entry "crtp".

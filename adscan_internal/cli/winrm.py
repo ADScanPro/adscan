@@ -1172,6 +1172,7 @@ def check_pivot_reachability_via_winrm(
                         )
     except (WinRMPSRPError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"WinRM pivot reachability check failed on {mark_sensitive(host, 'hostname')}: {rich_escape(str(exc))}"
         )
@@ -1290,30 +1291,52 @@ def ask_for_winrm_access(
                 ),
                 (
                     "firefox_credentials",
-                    lambda: shell.do_check_firefox_credentials(
-                        domain, host, username, password
+                    lambda: check_firefox_credentials(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
                     ),
                 ),
                 (
                     "powershell_history",
-                    lambda: shell.do_show_powershell_history(
-                        domain, host, username, password
+                    lambda: show_powershell_history(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
                     ),
                 ),
                 (
                     "powershell_transcripts",
-                    lambda: shell.do_check_powershell_transcripts(
-                        domain, host, username, password
+                    lambda: check_powershell_transcripts(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
                     ),
                 ),
                 (
                     "autologon",
-                    lambda: shell.do_check_autologon(domain, host, username, password),
+                    lambda: check_autologon(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
+                    ),
                 ),
                 (
                     "sensitive_data_scan",
-                    lambda: shell.do_check_winrm_sensitive_data(
-                        domain, host, username, password
+                    lambda: run_winrm_sensitive_data_scan(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
                     ),
                 ),
             ]
@@ -1324,7 +1347,8 @@ def ask_for_winrm_access(
 
         total_phases = len(followup_steps)
         phases_run = 0
-        session_started = time.time()
+        # monotonic: the host wall clock is stepped mid-scan for DC sync.
+        session_started = time.monotonic()
         for action_label, action in followup_steps:
             if _should_skip_winrm_followup_for_ctf_pwned(
                 shell=shell,
@@ -1340,7 +1364,7 @@ def ask_for_winrm_access(
                 status="live",
             )
             action()
-        elapsed = time.time() - session_started
+        elapsed = time.monotonic() - session_started
         elapsed_label = (
             f"{elapsed:.0f}s"
             if elapsed < 60
@@ -1351,6 +1375,110 @@ def ask_for_winrm_access(
             phases_total=total_phases,
             extra_metrics=((elapsed_label, "elapsed"),),
         )
+
+
+def _parse_domain_host_username_password_args(
+    args: str, *, usage: str
+) -> tuple[str, str, str, str] | None:
+    """Parse a REPL argument string into ``(domain, host, username, password)``.
+
+    Mirrors the space-separated positional-argument convention used by every
+    other REPL command in ``adscan.py`` (e.g. ``dump_lsa``/``dump_lsass`` in
+    :mod:`adscan_internal.cli.dumps`): the REPL dispatcher always calls a
+    ``do_*`` method with a single joined string, never separate positional
+    args, so each REPL entry point is responsible for splitting it itself.
+    Prints a ``Usage:`` message and returns ``None`` when the token count is
+    wrong.
+    """
+    args_list = args.split()
+    if len(args_list) != 4:
+        print_warning(usage)
+        return None
+    return args_list[0], args_list[1], args_list[2], args_list[3]
+
+
+def run_do_check_autologon(shell: Any, args: str) -> None:
+    """REPL entry point for ``check_autologon``.
+
+    Usage: check_autologon <domain> <host> <username> <password>
+    """
+    parsed = _parse_domain_host_username_password_args(
+        args, usage="Usage: check_autologon <domain> <host> <username> <password>"
+    )
+    if parsed is None:
+        return
+    domain, host, username, password = parsed
+    check_autologon(
+        shell, domain=domain, host=host, username=username, password=password
+    )
+
+
+def run_do_show_powershell_history(shell: Any, args: str) -> None:
+    """REPL entry point for ``show_powershell_history``.
+
+    Usage: show_powershell_history <domain> <host> <username> <password>
+    """
+    parsed = _parse_domain_host_username_password_args(
+        args,
+        usage="Usage: show_powershell_history <domain> <host> <username> <password>",
+    )
+    if parsed is None:
+        return
+    domain, host, username, password = parsed
+    show_powershell_history(
+        shell, domain=domain, host=host, username=username, password=password
+    )
+
+
+def run_do_check_firefox_credentials(shell: Any, args: str) -> None:
+    """REPL entry point for ``check_firefox_credentials``.
+
+    Usage: check_firefox_credentials <domain> <host> <username> <password>
+    """
+    parsed = _parse_domain_host_username_password_args(
+        args,
+        usage="Usage: check_firefox_credentials <domain> <host> <username> <password>",
+    )
+    if parsed is None:
+        return
+    domain, host, username, password = parsed
+    check_firefox_credentials(
+        shell, domain=domain, host=host, username=username, password=password
+    )
+
+
+def run_do_check_powershell_transcripts(shell: Any, args: str) -> None:
+    """REPL entry point for ``check_powershell_transcripts``.
+
+    Usage: check_powershell_transcripts <domain> <host> <username> <password>
+    """
+    parsed = _parse_domain_host_username_password_args(
+        args,
+        usage="Usage: check_powershell_transcripts <domain> <host> <username> <password>",
+    )
+    if parsed is None:
+        return
+    domain, host, username, password = parsed
+    check_powershell_transcripts(
+        shell, domain=domain, host=host, username=username, password=password
+    )
+
+
+def run_do_check_winrm_sensitive_data(shell: Any, args: str) -> None:
+    """REPL entry point for ``check_winrm_sensitive_data``.
+
+    Usage: check_winrm_sensitive_data <domain> <host> <username> <password>
+    """
+    parsed = _parse_domain_host_username_password_args(
+        args,
+        usage="Usage: check_winrm_sensitive_data <domain> <host> <username> <password>",
+    )
+    if parsed is None:
+        return
+    domain, host, username, password = parsed
+    run_winrm_sensitive_data_scan(
+        shell, domain=domain, host=host, username=username, password=password
+    )
 
 
 def check_dpapi(
@@ -1703,6 +1831,7 @@ def show_powershell_history(
                 history_lines = [line.rstrip("\r\n") for line in handle if line.strip()]
         except OSError as file_err:
             telemetry.capture_exception(file_err)
+            print_exception(exception=file_err)
             print_error(f"Error reading downloaded PowerShell history file: {file_err}")
             return
 
@@ -1754,71 +1883,19 @@ def show_powershell_history(
             )
             return
 
-        seen_passwords: set[str] = set()
-        found_count = 0
-
-        for _, entries in credentials.items():
-            for value, ml_probability, context_line, line_num, file_path in entries:
-                if not value:
-                    continue
-                password_value = value.strip()
-                if not password_value or password_value in seen_passwords:
-                    continue
-                seen_passwords.add(password_value)
-                found_count += 1
-
-                confidence_display = (
-                    f"{float(ml_probability):.2%}"
-                    if isinstance(ml_probability, (int, float))
-                    else "N/A"
-                )
-                marked_username = mark_sensitive(username, "user")
-                marked_domain = mark_sensitive(domain, "domain")
-                marked_host = mark_sensitive(host, "hostname")
-                marked_file_path = mark_sensitive(file_path, "path")
-                marked_password = mark_sensitive(password_value, "password")
-                marked_suffix = mark_sensitive(
-                    "..." if len(password_value) > 50 else "", "password"
-                )
-                print_info(
-                    f"[PSHistory] Potential password for {marked_username}@{marked_domain} "
-                    f"on {marked_host}: '{marked_password[:50]}{marked_suffix}' "
-                    f"(confidence: {confidence_display}, line: {line_num}, file: {marked_file_path})"
-                )
-
-                if _should_skip_winrm_followup_for_ctf_pwned(
-                    shell=shell,
-                    domain=domain,
-                    action_label="powershell_history_spraying_prompt",
-                ):
-                    return
-                answer = Confirm.ask(
-                    "Would you like to perform a password spraying with this password?",
-                    default=True,
-                )
-                if answer:
-                    shell.spraying_with_password(domain, password_value)
-
-        if found_count > 0:
-            marked_username = mark_sensitive(username, "user")
-            print_success(
-                f"Added {found_count} potential credential(s) from PowerShell history for user {marked_username}."
-            )
-        else:
-            render_no_extracted_findings_preview(
-                loot_dir=os.path.dirname(history_local_path),
-                loot_rel=os.path.relpath(
-                    os.path.dirname(history_local_path),
-                    shell._get_workspace_cwd(),
-                ),
-                analyzed_count=1,
-                category="credential",
-                phase_label="PowerShell history review",
-                candidate_paths=[os.path.basename(history_local_path)],
-                report_root_abs=os.path.dirname(history_local_path),
-                scope_label="WinRM PowerShell history",
-                preview_limit=5,
-            )
+        # Route findings through the shared credential funnel (identical to the
+        # SMB / MSSQL paths) so they get PowerShell SecureString + GPP cpassword
+        # recovery, the PasswordInShare edge, dedup, the non-sprayable filter,
+        # and the display + spray offer. The ``winrm`` share marker drives the
+        # ``artifact_filesystem`` provenance origin for any recovered credential.
+        shell.handle_found_credentials(
+            credentials,
+            domain,
+            source_hosts=[host],
+            source_shares=["winrm"],
+            auth_username=username,
+            source_artifact=history_local_path,
+        )
 
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
@@ -1941,68 +2018,28 @@ def check_powershell_transcripts(
             f"to {transcripts_download_dir}"
         )
 
-        total_found = 0
-        seen_passwords: set[str] = set()
-
+        # Aggregate findings across every downloaded transcript, then route them
+        # through the shared credential funnel (identical to the SMB / MSSQL
+        # paths) so they get PowerShell SecureString + GPP cpassword recovery,
+        # the PasswordInShare edge, dedup, the non-sprayable filter, and the
+        # display + spray offer. The ``winrm`` share marker drives the
+        # ``artifact_filesystem`` provenance origin for any recovered credential.
+        aggregated_credentials: dict[str, list] = {}
         for local_path in downloaded_files:
             credentials = shell.analyze_log_with_credsweeper(local_path)
             if not credentials:
                 continue
+            for cred_type, entries in credentials.items():
+                aggregated_credentials.setdefault(cred_type, []).extend(entries)
 
-            for _, entries in credentials.items():
-                for (
-                    value,
-                    ml_probability,
-                    context_line,
-                    line_num,
-                    file_path,
-                ) in entries:
-                    if not value:
-                        continue
-                    password_value = value.strip()
-                    if not password_value or password_value in seen_passwords:
-                        continue
-                    seen_passwords.add(password_value)
-                    total_found += 1
-
-                    confidence_display = (
-                        f"{float(ml_probability):.2%}"
-                        if isinstance(ml_probability, (int, float))
-                        else "N/A"
-                    )
-                    marked_username = mark_sensitive(username, "user")
-                    marked_domain = mark_sensitive(domain, "domain")
-                    marked_host = mark_sensitive(host, "hostname")
-                    marked_file_path = mark_sensitive(file_path, "path")
-                    marked_password = mark_sensitive(password_value, "password")
-                    marked_suffix = mark_sensitive(
-                        "..." if len(password_value) > 50 else "", "password"
-                    )
-                    print_info(
-                        f"[PSTranscripts] Potential password for {marked_username}@{marked_domain} "
-                        f"on {marked_host}: '{marked_password[:50]}{marked_suffix}' "
-                        f"(confidence: {confidence_display}, line: {line_num}, file: {marked_file_path})"
-                    )
-
-                    if _should_skip_winrm_followup_for_ctf_pwned(
-                        shell=shell,
-                        domain=domain,
-                        action_label="powershell_transcripts_spraying_prompt",
-                    ):
-                        return
-                    answer = Confirm.ask(
-                        "Would you like to perform a password spraying with this password?",
-                        default=True,
-                    )
-                    if answer:
-                        shell.spraying_with_password(domain, password_value)
-
-        if total_found > 0:
-            marked_username = mark_sensitive(username, "user")
-            marked_host = mark_sensitive(host, "hostname")
-            print_success(
-                f"Added {total_found} potential credential(s) from PowerShell transcripts "
-                f"for user {marked_username} on host {marked_host}."
+        if aggregated_credentials:
+            shell.handle_found_credentials(
+                aggregated_credentials,
+                domain,
+                source_hosts=[host],
+                source_shares=["winrm"],
+                auth_username=username,
+                source_artifact=transcripts_download_dir,
             )
         else:
             render_no_extracted_findings_preview(
@@ -2026,6 +2063,7 @@ def check_powershell_transcripts(
 
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_host = mark_sensitive(host, "hostname")
         print_error(
             f"Error checking or analyzing PowerShell transcripts on host {marked_host}: {str(exc)}"
@@ -2110,6 +2148,7 @@ def winrm_upload(
         result = service.upload_file(local_path, remote_path)
     except WinRMPSRPError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"WinRM upload failed: {exc}")
         return False
     if result:

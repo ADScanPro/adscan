@@ -24,12 +24,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 import asyncio
 import os
 import re
 
 from rich.prompt import Confirm
+
+if TYPE_CHECKING:
+    from adscan_internal.cli.repl_args import ReplArgumentParser
 
 from adscan_internal import (
     print_error,
@@ -775,6 +778,7 @@ def _resolve_dump_kerberos_ccache(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[dump] ensure_user_ccache failed for "
             f"{mark_sensitive(username, 'user')}: {exc}"
@@ -1145,6 +1149,7 @@ def _load_native_bulk_hosts(path: str) -> list[str]:
                 hosts.append(host)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"Could not read native dump target file: {mark_sensitive(path, 'path')}"
         )
@@ -1646,6 +1651,7 @@ def _load_dpapi_ad_users(shell: Any, domain: str) -> set[str]:
             return {line.strip().lower() for line in fh if line.strip()}
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return set()
 
 
@@ -1707,6 +1713,7 @@ def _persist_dpapi_result(
             fh.write("\n".join(lines) + "\n")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[dpapi] persist file failed: {exc}")
 
     # Backup key PVK (DA branch)
@@ -1719,6 +1726,7 @@ def _persist_dpapi_result(
             print_info_verbose(f"Backup key saved: {pvk_path}")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Credentials store — STORE-FIRST: persist every recovered AD-candidate
     # plaintext, regardless of whether an immediate TGT verification succeeded.
@@ -1759,6 +1767,7 @@ def _persist_dpapi_result(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
     else:
         # Fallback: no enrichment → persist all with a password (old behaviour).
         for cred in result.credentials:
@@ -1782,6 +1791,7 @@ def _persist_dpapi_result(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
 
 def _run_optional_local_admin_reuse_validation(
@@ -1937,6 +1947,7 @@ def _run_optional_local_admin_reuse_validation(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Local admin reuse validation failed for {marked_user}; continuing."
             )
@@ -2171,6 +2182,7 @@ def _run_single_host_local_admin_reuse_validation(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Local admin reuse validation failed for {marked_user}; continuing."
             )
@@ -3954,6 +3966,7 @@ async def _run_lsass_campaign_async(
                             )
                         except Exception as exc:
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
             else:
                 _CONSOLE.print(
                     f"  [{_LAVA}]✗[/{_LAVA}] [{_MUTED}]{r.host}[/{_MUTED}]"
@@ -4222,6 +4235,7 @@ def _native_execute_dump_lsass_bulk(
             _render_fingerprint_panel(fp_sample, ranked)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         fp_sample = None
 
     ranked = LsassMethodSelector.rank(
@@ -4478,6 +4492,7 @@ async def _run_native_local_admin_reuse_check_async(
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
     else:
         summary_lines = [
             f"[{_MUTED}]  {username} is not local admin on any reachable host.[/{_MUTED}]",
@@ -4608,6 +4623,7 @@ def _native_execute_dump_sam(
         result = _run_native_async(svc.dump_sam(config, workspace_dir=workspace_dir))
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         display.phase_error(f"SAM dump failed: {exc}")
         return
 
@@ -4679,6 +4695,7 @@ def _native_execute_dump_sam(
             )
         except Exception as add_exc:
             telemetry.capture_exception(add_exc)
+            print_exception(exception=add_exc)
             print_warning(
                 f"Could not persist credential for {cred.username}: {add_exc}"
             )
@@ -4728,6 +4745,7 @@ def _native_execute_dump_lsa(
         result = _run_native_async(svc.dump_lsa(config, workspace_dir=workspace_dir))
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         display.phase_error(f"LSA dump failed: {exc}")
         return
 
@@ -4814,6 +4832,7 @@ def _native_execute_dump_lsa(
             )
         except Exception as add_exc:
             telemetry.capture_exception(add_exc)
+            print_exception(exception=add_exc)
 
     # Phase 3: persist service secrets (plaintext passwords from LSA).
     # These include DefaultPassword (attributed to the real user via Winlogon
@@ -4835,6 +4854,7 @@ def _native_execute_dump_lsa(
             )
         except Exception as svc_exc:
             telemetry.capture_exception(svc_exc)
+            print_exception(exception=svc_exc)
 
     display.summary(counts, sum(counts.values()), host, elapsed=0)
 
@@ -4862,6 +4882,7 @@ def _native_execute_dump_lsass(
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         display.phase_error(f"LSASS dump failed: {exc}")
         return
 
@@ -4919,6 +4940,7 @@ def _native_execute_dump_lsass(
                 )
             except Exception as add_exc:
                 telemetry.capture_exception(add_exc)
+                print_exception(exception=add_exc)
 
 
 def _native_execute_dump_dpapi(
@@ -4953,6 +4975,7 @@ def _native_execute_dump_dpapi(
                 known_da = current_user in [u.lower() for u in da_list]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Determine mode label for header (may be updated after live probe)
     mode_label = (
@@ -5301,6 +5324,7 @@ def run_dump_host(
         tracker.complete_step(details="SAM extraction completed")
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         tracker.fail_step(details=f"SAM dump error: {str(e)[:50]}")
 
     # Step 2: LSA Secrets Dump
@@ -5317,6 +5341,7 @@ def run_dump_host(
         tracker.complete_step(details="LSA extraction completed")
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         tracker.fail_step(details=f"LSA dump error: {str(e)[:50]}")
 
     # Step 3: DPAPI Credentials
@@ -5333,6 +5358,7 @@ def run_dump_host(
         tracker.complete_step(details="DPAPI extraction completed")
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         tracker.fail_step(details=f"DPAPI dump error: {str(e)[:50]}")
 
     # Step 4: LSASS Process Dump
@@ -5356,6 +5382,7 @@ def run_dump_host(
             tracker.complete_step(details="LSASS dump completed")
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         tracker.fail_step(details=f"LSASS dump error: {str(e)[:50]}")
 
     # Print workflow summary
@@ -5647,38 +5674,65 @@ def run_ask_for_post_da_host_dumps(
     )
 
 
+def _build_dump_parser(prog: str) -> "ReplArgumentParser":
+    """Shared flag grammar for the four SMB-dump commands.
+
+    All four (``dump_lsa``, ``dump_lsass``, ``dump_sam``, ``dump_dpapi``) take
+    the identical 5-field shape: domain, username, password, host, islocal.
+    Extracted once so the flag surface cannot drift between the four call
+    sites.
+    """
+    from adscan_internal.cli.repl_args import ReplArgumentParser
+
+    parser = ReplArgumentParser(prog=prog, add_help=False)
+    parser.add_argument("-d", "--domain", required=True)
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument("--host", required=True, help="Target host, or 'All' for every host in the domain.")
+    parser.add_argument(
+        "--islocal",
+        required=True,
+        choices=["true", "false"],
+        help="'true' for a local dump, 'false' for remote.",
+    )
+    return parser
+
+
 def run_do_dump_lsa(shell: Any, args: str) -> None:
     """
     Dumps the LSA credentials from specified hosts within a domain.
 
-    Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        args: A string containing space-separated arguments:
-            - domain (str): The domain name.
-            - username (str): The username for authentication.
-            - password (str): The password for the specified username.
-            - host (str): The target host or 'All' for all hosts in the domain.
-            - islocal (str): Indicates if the operation is local ('true') or remote ('false').
+    Usage:
+        dump_lsa <domain> <username> <password> <host> <islocal>
+        dump_lsa -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
     The function dumps LSA credentials using the native async SMB path.
     Bulk targets are executed by the native async batch orchestrator.
     """
-    args_list = args.split()
-    if len(args_list) != 5:
-        print_warning("Usage: dump_lsa <domain> <username> <password> <host> <islocal>")
+    from adscan_internal.cli.repl_args import parse_command_args
+
+    usage = (
+        "dump_lsa <domain> <username> <password> <host> <islocal>  |  "
+        "dump_lsa -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>"
+    )
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password", "host", "islocal"),
+        parser=_build_dump_parser("dump_lsa"),
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain = args_list[0]
-    username = args_list[1]
-    password = args_list[2]
-    host = args_list[3]
-    islocal = args_list[4]
     run_dump_lsa(
         shell,
-        domain=domain,
-        username=username,
-        password=password,
-        host=host,
-        islocal=islocal,
+        domain=namespace.domain,
+        username=namespace.username,
+        password=namespace.password,
+        host=namespace.host,
+        islocal=namespace.islocal,
     )
 
 
@@ -5686,40 +5740,38 @@ def run_do_dump_lsass(shell: Any, args: str) -> None:
     """
     Dumps LSASS credentials from specified hosts within a domain.
 
-    Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        args: A string containing space-separated arguments:
-            - domain (str): The domain name.
-            - username (str): The username for authentication.
-            - password (str): The password for the specified username.
-            - host (str): The target host or 'All' for all hosts in the domain.
-            - islocal (str): Indicates if the operation is local ('true') or remote ('false').
+    Usage:
+        dump_lsass <domain> <username> <password> <host> <islocal>
+        dump_lsass -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
 
     The function dumps LSASS via the native async SMB stack (PPL-aware backend
     selection: WerFaultSecure / SilentProcessExit / comsvcs / nanodump). Bulk
     targets are executed by the native async batch orchestrator.
-
-    Usage:
-        dump_lsass <domain> <username> <password> <host> <islocal>
     """
-    args_list = args.split()
-    if len(args_list) != 5:
-        print_warning(
-            "Usage: dump_lsass <domain> <username> <password> <host> <islocal>"
-        )
+    from adscan_internal.cli.repl_args import parse_command_args
+
+    usage = (
+        "dump_lsass <domain> <username> <password> <host> <islocal>  |  "
+        "dump_lsass -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>"
+    )
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password", "host", "islocal"),
+        parser=_build_dump_parser("dump_lsass"),
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain = args_list[0]
-    username = args_list[1]
-    password = args_list[2]
-    host = args_list[3]
-    islocal = args_list[4]
     run_dump_lsass(
         shell,
-        domain=domain,
-        host=host,
-        username=username,
-        password=password,
-        islocal=islocal,
+        domain=namespace.domain,
+        host=namespace.host,
+        username=namespace.username,
+        password=namespace.password,
+        islocal=namespace.islocal,
     )
 
 
@@ -5727,34 +5779,34 @@ def run_do_dump_sam(shell: Any, args: str) -> None:
     """
     Parses the given arguments and initiates the SAM credential dumping process.
 
-    Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        args: A string containing space-separated arguments:
-            - domain (str): The domain name.
-            - username (str): The username for authentication.
-            - password (str): The password for the specified username.
-            - host (str): The target host or 'All' for all hosts in the domain.
-            - islocal (str): Indicates if the operation is local ('true') or remote ('false').
-
     Usage:
         dump_sam <domain> <username> <password> <host> <islocal>
+        dump_sam -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
     """
-    args_list = args.split()
-    if len(args_list) != 5:
-        print_warning("Usage: dump_sam <domain> <username> <password> <host> <islocal>")
+    from adscan_internal.cli.repl_args import parse_command_args
+
+    usage = (
+        "dump_sam <domain> <username> <password> <host> <islocal>  |  "
+        "dump_sam -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>"
+    )
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password", "host", "islocal"),
+        parser=_build_dump_parser("dump_sam"),
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain = args_list[0]
-    username = args_list[1]
-    password = args_list[2]
-    host = args_list[3]
-    islocal = args_list[4]
     run_dump_sam(
         shell,
-        domain=domain,
-        username=username,
-        password=password,
-        host=host,
-        islocal=islocal,
+        domain=namespace.domain,
+        username=namespace.username,
+        password=namespace.password,
+        host=namespace.host,
+        islocal=namespace.islocal,
     )
 
 
@@ -5762,36 +5814,34 @@ def run_do_dump_dpapi(shell: Any, args: str) -> None:
     """
     Parses the given arguments and initiates the DPAPI credential dumping process.
 
-    Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        args: A string containing space-separated arguments:
-            - domain (str): The domain name.
-            - username (str): The username for authentication.
-            - password (str): The password for the specified username.
-            - host (str): The target host or 'All' for all hosts in the domain.
-            - islocal (str): Indicates if the operation is local ('true') or remote ('false').
-
     Usage:
         dump_dpapi <domain> <username> <password> <host> <islocal>
+        dump_dpapi -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
     """
-    args_list = args.split()
-    if len(args_list) != 5:
-        print_warning(
-            "Usage: dump_dpapi <domain> <username> <password> <host> <islocal>"
-        )
+    from adscan_internal.cli.repl_args import parse_command_args
+
+    usage = (
+        "dump_dpapi <domain> <username> <password> <host> <islocal>  |  "
+        "dump_dpapi -d <domain> -u <username> -p <password> --host <host> --islocal <true|false>"
+    )
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password", "host", "islocal"),
+        parser=_build_dump_parser("dump_dpapi"),
+        usage=usage,
+    )
+    if namespace is None:
         return
-    domain = args_list[0]
-    username = args_list[1]
-    password = args_list[2]
-    host = args_list[3]
-    islocal = args_list[4]
     run_dump_dpapi(
         shell,
-        domain=domain,
-        username=username,
-        password=password,
-        host=host,
-        islocal=islocal,
+        domain=namespace.domain,
+        username=namespace.username,
+        password=namespace.password,
+        host=namespace.host,
+        islocal=namespace.islocal,
     )
 
 
@@ -5944,6 +5994,7 @@ async def run_intelligent_lsass_dump(
                     saved += 1
                 except Exception as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
         # Register uploaded artifacts in the ledger and report cleanup status.
         dr = result.dump_result

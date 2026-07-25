@@ -112,16 +112,29 @@ async def hCertServerRequest(dce, service, csr, dwFlags = 0, pdwRequestId = 1, p
 	request['pwszAuthority'] = checkNullString(service)
 	request['pdwRequestId'] = pdwRequestId
 
-	pctbAttribs = checkNullString(pctbAttribs)
-	pctbAttribs = pctbAttribs.encode('utf-16-le')
+	# An EMPTY blob MUST marshal as a NULL pointer (cb=0, pb=NULL), NOT as a
+	# non-NULL pointer to a zero-length array. On a RETRIEVE (empty CSR, real
+	# pdwRequestId) the CA branches on pctbRequest.pb: NULL -> retrieve by
+	# request id; non-NULL (even cb=0) -> treat as a NEW submit and ASN.1-parse
+	# the empty body -> 0x80093102 CRYPT_E_ASN1_EOD (the ESC7 retrieve failure,
+	# HTB Manager 2026-07-24). Mirror certipy/impacket: empty -> NULL.
 	attribsblob = CERTTRANSBLOB()
-	attribsblob['cbData'] = len(pctbAttribs)
-	attribsblob['pbData'] = pctbAttribs
+	if pctbAttribs:
+		enc_attribs = checkNullString(pctbAttribs).encode('utf-16-le')
+		attribsblob['cbData'] = len(enc_attribs)
+		attribsblob['pbData'] = enc_attribs
+	else:
+		attribsblob['cbData'] = 0
+		attribsblob['pbData'] = NULL
 	request['pctbAttribs'] = attribsblob
-	
+
 	csr_request = CERTTRANSBLOB()
-	csr_request['cbData'] = len(csr)
-	csr_request['pbData'] = csr
+	if csr:
+		csr_request['cbData'] = len(csr)
+		csr_request['pbData'] = csr
+	else:
+		csr_request['cbData'] = 0
+		csr_request['pbData'] = NULL
 	request['pctbRequest'] = csr_request
 
 	return await dce.request(request)

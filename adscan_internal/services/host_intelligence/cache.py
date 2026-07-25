@@ -22,6 +22,7 @@ from adscan_internal.services.host_intelligence.models import (
     HostFingerprint,
 )
 from adscan_internal.services.smb_transport import SMBConfig
+from adscan_core.rich_output import print_exception
 
 
 class _FingerprintProto(Protocol):
@@ -80,6 +81,7 @@ class HostIntelligenceCache:
             self._path.write_text(json.dumps(self._data, indent=2, default=str))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[host_intel_cache] save error: {exc}")
         # Mirror the cache state into the per-domain Defensive Posture
         # inventory file consumed by the web app. Best-effort — the
@@ -95,6 +97,7 @@ class HostIntelligenceCache:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return
         # Cache stores by IP; we use IP as the host_object_id fallback
         # because SID / objectGUID are not visible at this layer. The
@@ -106,6 +109,7 @@ class HostIntelligenceCache:
                 fingerprints[ip] = self._deserialize(raw)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 continue
         # The cache file lives at ``<workspace>/host_intel.json`` — the
         # workspace root is its parent directory.

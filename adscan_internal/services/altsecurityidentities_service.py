@@ -16,6 +16,7 @@ from adscan_internal.services.high_value import (
     classify_users_tier0_high_value,
     normalize_samaccountname,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class AltSecurityIdentitiesService:
             raw_entries = list(getattr(connection.connection, "entries", []) or [])
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return []
 
         weak_candidates: list[AltSecurityIdentityUser] = []
@@ -146,6 +148,7 @@ class AltSecurityIdentitiesService:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 risk_flags = {}
 
         results: list[AltSecurityIdentityUser] = []

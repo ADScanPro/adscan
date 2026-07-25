@@ -26,6 +26,7 @@ from adscan_internal.services.attack_graph_service import (
     load_attack_graph,
     save_attack_graph,
 )
+from adscan_core.rich_output import print_exception
 
 
 HIGH_VALUE_GROUP_ENRICHMENT_MAX_DEPTH = 4
@@ -398,6 +399,7 @@ def _offer_group_tier_zero_enrichment(
         service = service_getter()
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[acct-ops] BloodHound service unavailable: {exc}")
         return False
 
@@ -413,6 +415,7 @@ def _offer_group_tier_zero_enrichment(
             )
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[acct-ops] query failed: {exc}")
         return False
 
@@ -460,6 +463,7 @@ def _offer_group_tier_zero_enrichment(
             user_node = resolver(domain, username)
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         user_node = None
 
     user_label = username

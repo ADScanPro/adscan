@@ -21,7 +21,7 @@ from aiosmb.dcerpc.v5.dcom.remunknown import IRemUnknown
 from aiosmb.dcerpc.v5.dcom.interface import INTERFACE
 from aiosmb.dcerpc.v5.dcom.dcomrt import DCOMCALL, DCOMANSWER
 from aiosmb.dcerpc.v5.ndr import NDRSTRUCT, NDRPOINTER, NDRUniConformantArray
-from aiosmb.dcerpc.v5.dtypes import DWORD, LPWSTR, ULONG, LONG
+from aiosmb.dcerpc.v5.dtypes import DWORD, LPWSTR, ULONG, LONG, PBYTE
 from aiosmb.dcerpc.v5.uuid import string_to_bin, uuidtup_to_bin
 
 
@@ -85,7 +85,14 @@ class CERTTRANSBLOB(NDRSTRUCT):
     """
     structure = (
         ('cb', ULONG),      # Size of the pb field in bytes
-        ('pb', BYTE_ARRAY), # Data bytes
+        # [MS-WCCE] 2.2.2.2: pb is `[size_is(cb)] BYTE *pb` — a POINTER to a
+        # conformant byte array, NOT an inline array. Modelling it as a bare
+        # NDRUniConformantArray (BYTE_ARRAY) omits the NDR referent, misaligning
+        # the unmarshaled bytes so `b''.join(resp['pctbSD']['pb'])` yields empty/
+        # garbage (GetCASecurity parsed 0 ACEs against a live CA, 2026-07-24).
+        # PBYTE (= LPBYTE: NDRPOINTER -> NDRUniConformantArray) matches impacket's
+        # CERTTRANSBLOB and Certipy exactly.
+        ('pb', PBYTE),      # Data bytes (pointer to conformant array)
     )
 
 
@@ -282,7 +289,11 @@ class ICertRequestD(IRemUnknown):
             logger.debug(f'CSR size: {len(csr_der)} bytes')
             
             # Send request
-            resp, err = await self._request(req, IID_ICertRequestD, self.get_ipidRemUnknown())
+            # Direct opnum call on the ACTIVATED ICertRequestD interface — target the
+            # interface's own IPID (get_iPid), NOT the IRemUnknown IPID (opnums 0-6);
+            # a direct opnum vs get_ipidRemUnknown yields RPC fault 0x800706D1. Same
+            # bug/fix as certadmin.py; mirrors impacket's `iface.get_iPid()`.
+            resp, err = await self._request(req, IID_ICertRequestD, self.get_iPid())
             if err is not None:
                 raise err
             
@@ -370,7 +381,11 @@ class ICertRequestD(IRemUnknown):
             logger.debug(f'Retrieving certificate from CA: {ca_name}, Request ID: {request_id}')
             
             # Send request
-            resp, err = await self._request(req, IID_ICertRequestD, self.get_ipidRemUnknown())
+            # Direct opnum call on the ACTIVATED ICertRequestD interface — target the
+            # interface's own IPID (get_iPid), NOT the IRemUnknown IPID (opnums 0-6);
+            # a direct opnum vs get_ipidRemUnknown yields RPC fault 0x800706D1. Same
+            # bug/fix as certadmin.py; mirrors impacket's `iface.get_iPid()`.
+            resp, err = await self._request(req, IID_ICertRequestD, self.get_iPid())
             if err is not None:
                 raise err
             
@@ -436,7 +451,11 @@ class ICertRequestD(IRemUnknown):
             
             logger.debug(f'Retrieving CA certificate: {ca_name}')
             
-            resp, err = await self._request(req, IID_ICertRequestD, self.get_ipidRemUnknown())
+            # Direct opnum call on the ACTIVATED ICertRequestD interface — target the
+            # interface's own IPID (get_iPid), NOT the IRemUnknown IPID (opnums 0-6);
+            # a direct opnum vs get_ipidRemUnknown yields RPC fault 0x800706D1. Same
+            # bug/fix as certadmin.py; mirrors impacket's `iface.get_iPid()`.
+            resp, err = await self._request(req, IID_ICertRequestD, self.get_iPid())
             if err is not None:
                 raise err
             

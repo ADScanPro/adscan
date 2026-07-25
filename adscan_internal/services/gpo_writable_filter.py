@@ -54,6 +54,7 @@ from typing import Any, Iterable
 
 from adscan_core.rich_output import print_info_debug, print_info_verbose
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_exception
 
 
 # ACL relations the GPO Immediate Scheduled Task technique can leverage.
@@ -287,6 +288,7 @@ def _load_graph(workspace_dir: Path, domain: str) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[gpo-filter] failed to load {path}: {exc}")
         return {"nodes": {}, "edges": []}
     if not isinstance(data, dict):

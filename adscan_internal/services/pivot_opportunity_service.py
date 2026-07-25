@@ -45,6 +45,7 @@ from adscan_internal.workspaces.computers import (
     load_target_entries,
     resolve_domain_service_target_file,
 )
+from adscan_core.rich_output import print_exception
 
 
 # Graph-affinity tiers for ``PivotProbeCandidate.graph_affinity``.
@@ -378,6 +379,7 @@ def _load_active_pivot_hosts(shell: Any) -> set[str]:
         records = service.list_tunnel_records()
     except Exception as exc:  # pragma: no cover - best effort only
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[pivot-opportunity] failed to load Ligolo tunnel state: {exc}"
         )
@@ -472,6 +474,7 @@ def _load_computer_inventory_index(
         payload = json.loads(inventory_path.read_text(encoding="utf-8", errors="ignore"))
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[pivot-opportunity] failed to load computer inventory: {exc}"
         )

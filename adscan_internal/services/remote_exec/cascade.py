@@ -29,6 +29,7 @@ import asyncio
 import time
 from typing import Any, Callable
 
+from adscan_core.rich_output import print_exception
 from adscan_internal import print_info_debug, telemetry
 from adscan_internal.services.host_intelligence.cache import HostIntelligenceCache
 from adscan_internal.services.host_intelligence.fingerprint_service import (
@@ -162,6 +163,7 @@ async def _resolve_methods(
             on_intel_resolved(fp, list(ranked_methods))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     return ranked_methods, fp, from_cache
 
@@ -271,6 +273,7 @@ async def execute_with_fallback(
                 on_method_attempt(method)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         backend = BACKEND_REGISTRY.get(method)
         if backend is None:
@@ -293,6 +296,7 @@ async def execute_with_fallback(
             raise
         except asyncio.TimeoutError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             failures.append(
                 MethodFailure(
                     method=method,
@@ -304,6 +308,7 @@ async def execute_with_fallback(
             continue
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             failure = MethodFailure(
                 method=method,
                 error_kind="other",
@@ -390,6 +395,7 @@ def _maybe_record_catch(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _emit_choice_telemetry(
@@ -420,6 +426,7 @@ def _emit_choice_telemetry(
             print_info_debug(f"[remote_exec.adaptive_choice] {payload}")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def raise_if_failed(result: RemoteExecResult) -> RemoteExecResult:

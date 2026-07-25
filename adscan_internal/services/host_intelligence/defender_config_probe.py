@@ -32,6 +32,7 @@ from typing import Any
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +142,7 @@ class DefenderConfigProbe:
             return self._parse(raw)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[defender_config_probe] query failed: {exc}")
             return DefenderConfig(probe_error=str(exc)[:120])
 

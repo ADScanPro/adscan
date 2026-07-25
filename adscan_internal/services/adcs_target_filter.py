@@ -8,6 +8,7 @@ from adscan_internal.services.privileged_group_classifier import (
     is_adcs_followup_group,
     normalize_sid,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _extract_target_sid_like(target: object) -> str | None:
@@ -125,6 +126,7 @@ def domain_has_adcs_for_attack_steps(shell: object, domain: str) -> bool:
             return bool(detect_adcs(domain))
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[adcs-target-filter] ADCS fallback detection failed for "
                 f"{mark_sensitive(domain, 'domain')}: {exc}"

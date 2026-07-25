@@ -16,6 +16,7 @@ from adscan_internal.services.adcs.cert_auth import (
     authenticate_with_cert_native,
 )
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
+from adscan_core.rich_output import print_exception
 
 # OID that makes a cert usable as an enrollment agent (ESC15)
 _ENROLLMENT_AGENT_OID = "1.3.6.1.4.1.311.20.2.1"
@@ -118,6 +119,7 @@ async def _pkinit(
         )
     except Exception as exc:  # pragma: no cover - presentation must never fail exploit
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # Centralised compromise-event emission. Every ESC that ends in PKINIT
     # converges here, so this is the single point that:
@@ -177,6 +179,7 @@ def _emit_pkinit_compromise(config: EscConfig, nt_hash: str | None) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     try:
         from adscan_internal.cli.attack_step_followups import (  # pylint: disable=no-name-in-module
@@ -197,6 +200,7 @@ def _emit_pkinit_compromise(config: EscConfig, nt_hash: str | None) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # Transition the active attack-path step to "success" directly.  ESC
     # handlers set the edge to "attempted" before calling run_esc_sync; the
@@ -220,6 +224,7 @@ def _emit_pkinit_compromise(config: EscConfig, nt_hash: str | None) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _on_behalf_of_str(config: EscConfig) -> str:
@@ -243,6 +248,7 @@ async def run_esc6(config: EscConfig) -> EscResult:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=6, error=str(exc))
     if not req.success:
         return EscResult(success=False, esc=6, error=req.error or "cert request failed")
@@ -257,6 +263,7 @@ async def run_esc2(config: EscConfig) -> EscResult:
         req1 = await request_certificate_native(_request_cfg(config), out)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=2, error=str(exc))
     if not req1.success:
         return EscResult(
@@ -284,6 +291,7 @@ async def run_esc2(config: EscConfig) -> EscResult:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=2, error=str(exc))
     if not req2.success:
         return EscResult(
@@ -305,6 +313,7 @@ async def run_esc15(config: EscConfig) -> EscResult:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=15, error=str(exc))
     if not req1.success:
         return EscResult(
@@ -334,6 +343,7 @@ async def run_esc15(config: EscConfig) -> EscResult:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=15, error=str(exc))
     if not req2.success:
         return EscResult(
@@ -369,6 +379,7 @@ async def run_esc5(config: EscConfig) -> EscResult:
         backup = await ca_backup_native(backup_cfg, out)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=5, error=str(exc))
     if not backup.success:
         return EscResult(success=False, esc=5, error=backup.error or "CA backup failed")
@@ -383,6 +394,7 @@ async def run_esc5(config: EscConfig) -> EscResult:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=5, error=f"forge failed: {exc}")
     if not forge or not forge.pfx_path:
         return EscResult(success=False, esc=5, error="forge produced no certificate")
@@ -406,6 +418,7 @@ async def run_esc13(config: EscConfig) -> EscResult:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return EscResult(success=False, esc=13, error=str(exc))
     if not req.success:
         return EscResult(

@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping, Protocol
 import os
+import platform
 import re
 
 from adscan_internal import telemetry
@@ -41,6 +42,18 @@ KNOWN_PUBLIC_DNS_RESOLVERS = {
     "9.9.9.9",
     "149.112.112.112",
 }
+
+
+def _dhcpcd_supported() -> bool:
+    """Return whether the dhcpcd DHCP client is a relevant target on this host.
+
+    ``dhcpcd`` (and its ``/etc/dhcpcd.conf`` / enter-hook machinery) is a
+    Linux-only DHCP client. Probing for it on macOS/BSD is pointless noise —
+    worse, ``ps -C`` is a Linux-only flag, so the diagnostic probe emits a raw
+    ``ps: illegal argument: dhcpcd`` line on first run. Gate every dhcpcd
+    interaction behind this so those probes never run off Linux.
+    """
+    return platform.system() == "Linux"
 
 
 def get_public_dns_mode() -> str:
@@ -566,6 +579,7 @@ class DNSResolverService(BaseService):
             return nameservers
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return []
 
     def configure_system_dns_for_unbound(self, fallback_nameservers: list[str]) -> bool:
@@ -592,6 +606,7 @@ class DNSResolverService(BaseService):
                     return bool(first_ns == local_resolver_ip)
                 except OSError as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     return False
 
             safe_fallbacks = [
@@ -650,11 +665,12 @@ class DNSResolverService(BaseService):
                 return True
 
             dhcpcd_running = False
-            try:
-                dhcpcd_proc = self._host.run_command("pgrep -x dhcpcd", timeout=5, ignore_errors=True)
-                dhcpcd_running = bool(dhcpcd_proc and dhcpcd_proc.returncode == 0)
-            except Exception:
-                dhcpcd_running = False
+            if _dhcpcd_supported():
+                try:
+                    dhcpcd_proc = self._host.run_command("pgrep -x dhcpcd", timeout=5, ignore_errors=True)
+                    dhcpcd_running = bool(dhcpcd_proc and dhcpcd_proc.returncode == 0)
+                except Exception:
+                    dhcpcd_running = False
 
             resolv_lines = [f"nameserver {local_resolver_ip}"]
             resolv_lines.extend([f"nameserver {ns}" for ns in safe_fallbacks])
@@ -696,6 +712,7 @@ class DNSResolverService(BaseService):
                     self._restart_dhcpcd_best_effort()
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[dns] Failed to verify resolv.conf after update: {exc}")
 
             return True
@@ -726,6 +743,7 @@ class DNSResolverService(BaseService):
                         self.restart_unbound()
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning_debug(f"[DNS] Could not clean Unbound forward-zone for {marked_domain}")
 
             # /etc/hosts cleanup (best effort, managed by markers).
@@ -916,6 +934,7 @@ class DNSResolverService(BaseService):
             return True
         except PermissionError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             marked_hosts = mark_sensitive(hosts_path, "path")
             print_error(
                 f"Error: Superuser permissions are required to modify {marked_hosts}"
@@ -965,6 +984,7 @@ class DNSResolverService(BaseService):
             return True
         except PermissionError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             marked_hosts = mark_sensitive(hosts_path, "path")
             print_error(
                 f"Error: Superuser permissions are required to clean {marked_hosts}"
@@ -1043,6 +1063,7 @@ class DNSResolverService(BaseService):
                     self._host._run_privileged_command("systemctl stop dnsmasq", timeout=30, ignore_errors=True)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug("[dns] Failed to stop dnsmasq automatically.")
 
     def log_dns_management_debug(self, context: str) -> None:
@@ -1063,10 +1084,16 @@ class DNSResolverService(BaseService):
                 f"(symlink={is_symlink}, realpath={marked_target})"
             )
 
-            probes: dict[str, str] = {
-                "dhcpcd.proc": "pgrep -x dhcpcd",
-                "dhcpcd.cmdline": "ps -o pid,args -C dhcpcd",
-            }
+            probes: dict[str, str] = {}
+            if _dhcpcd_supported():
+                # dhcpcd is Linux-only; `ps -C` is a Linux-only flag that prints
+                # `ps: illegal argument: dhcpcd` on macOS/BSD. Only probe on Linux.
+                probes.update(
+                    {
+                        "dhcpcd.proc": "pgrep -x dhcpcd",
+                        "dhcpcd.cmdline": "ps -o pid,args -C dhcpcd",
+                    }
+                )
             if self._rt.is_systemd_available():
                 probes.update(
                     {
@@ -1091,6 +1118,7 @@ class DNSResolverService(BaseService):
                 print_info_debug(f"[dns] {context}: {label} rc={status} {details}".rstrip())
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[dns] Failed to collect DNS management context: {exc}")
 
     def ensure_dhcpcd_preserves_resolv_conf(self) -> bool:

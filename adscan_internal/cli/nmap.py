@@ -1408,7 +1408,8 @@ def _stream_nmap_scan_into_dashboard(
         return int(derived)
 
     def _maybe_emit_port_scan_progress(percent: float | None) -> None:
-        now = time.time()
+        # monotonic throttle interval: immune to the mid-scan DC clock step.
+        now = time.monotonic()
         if percent is not None:
             _op_state["last_percent"] = percent
         last_emit = _op_state["last_emit"] or 0.0
@@ -2147,6 +2148,7 @@ def _show_network_reachability_summary(
         )
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     likely_down_entries = [
         entry
@@ -2309,22 +2311,25 @@ def save_host_to_file(shell: NmapShell, host: str, service_dir: str) -> None:
             f.write(f"{host}\n")
 
 
-# Service name -> (shell service-dir attribute, tcp port). SSOT for the per-service
+# Service name -> (shell service-dir attribute, tcp ports). SSOT for the per-service
 # {service}/ips.txt write surface AND the active-host cap intersection, so the cap
 # and the writer can never drift on which port maps to which service directory.
-_SERVICE_DIR_PORTS: tuple[tuple[str, str, int], ...] = (
-    ("smb", "smb_dir", 445),
-    ("winrm", "winrm_dir", 5985),
-    ("rdp", "rdp_dir", 3389),
-    ("mssql", "mssql_dir", 1433),
-    ("ftp", "ftp_dir", 21),
-    ("ssh", "ssh_dir", 22),
-    ("dns", "dns_dir", 53),
-    ("http", "http_dir", 80),
-    ("https", "https_dir", 443),
-    ("ldap", "ldap_dir", 389),
-    ("vnc", "vnc_dir", 5900),
-    ("kerberos", "kerberos_dir", 88),
+# Multi-port per service: a host is written to the service dir if ANY of the listed
+# ports is open (e.g. http also carries the 8080 web-alt port, https the 8443 one),
+# so a host exposing only an alternate web port still lands in the right service dir.
+_SERVICE_DIR_PORTS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
+    ("smb", "smb_dir", (445,)),
+    ("winrm", "winrm_dir", (5985,)),
+    ("rdp", "rdp_dir", (3389,)),
+    ("mssql", "mssql_dir", (1433,)),
+    ("ftp", "ftp_dir", (21,)),
+    ("ssh", "ssh_dir", (22,)),
+    ("dns", "dns_dir", (53,)),
+    ("http", "http_dir", (80, 8080)),
+    ("https", "https_dir", (443, 8443)),
+    ("ldap", "ldap_dir", (389,)),
+    ("vnc", "vnc_dir", (5900,)),
+    ("kerberos", "kerberos_dir", (88,)),
 )
 
 
@@ -2363,6 +2368,7 @@ def _load_domain_computer_props(shell: "NmapShell", domain: str) -> list[dict]:
         return list(get_enabled_computers(graph, domain))
     except Exception as exc:  # noqa: BLE001 — graph load must never abort the scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return []
 
 
@@ -2390,14 +2396,14 @@ def _write_capped_service_ips(
         select_capped_active_hosts,
     )
 
-    service_ports = {name: port for name, _attr, port in _SERVICE_DIR_PORTS}
+    service_ports = {name: ports for name, _attr, ports in _SERVICE_DIR_PORTS}
     # The active universe is exactly the hosts that would land in SOME
     # {service}/ips.txt under the legacy writer: every host with at least one
     # targeted service port open. A host with an open port IS reachable for that
     # service (the open-ports map is the port scan's reachability signal), so this
     # set equals the legacy write universe — making host_cap=0 a byte-for-byte
     # no-op.
-    targeted_ports = set(service_ports.values())
+    targeted_ports = {p for ports in service_ports.values() for p in ports}
     active_universe = [
         ip for ip, ports in open_ports_by_host.items() if ports & targeted_ports
     ]
@@ -2413,7 +2419,7 @@ def _write_capped_service_ips(
         host_cap=host_cap,
     )
 
-    for service, attr, _port in _SERVICE_DIR_PORTS:
+    for service, attr, _ports in _SERVICE_DIR_PORTS:
         for host_ip in capped.service_ips.get(service, []):
             save_domain_host_to_file(shell, host_ip, getattr(shell, attr), domain)
 
@@ -2825,7 +2831,7 @@ def convert_hostnames_to_ips_and_scan(
             for ip in unique_ips:
                 f.write(f"{ip}\n")
         shell.consolidate_domain_computers("")
-        important_ports = [21, 22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985]
+        important_ports = [21, 22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985, 8080, 8443]
         important_ports_csv = ",".join(str(port) for port in important_ports)
         ip_count = len(unique_ips)
         marked_domain = mark_sensitive(domain, "domain")

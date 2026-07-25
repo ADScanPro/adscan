@@ -149,6 +149,7 @@ def collect_attack_path_snapshot_counts(shell: PostDAShell, domain: str) -> tupl
         return int(metrics.total or 0), int(metrics.unresolved or 0)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return 0, 0
 
 
@@ -307,6 +308,7 @@ def _pick_best_da_credential(
             return picked_user, picked_secret
     except Exception as exc:  # noqa: BLE001 — best effort, never block the flow
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return fallback_user, fallback_secret
 
 
@@ -411,6 +413,7 @@ def execute_audit_post_compromise(
             shell.ask_for_dcsync(domain, picked_user, picked_secret)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 "Audit post-compromise DCSync failed. "
                 "Continuing with the graph refresh and host dump campaign."
@@ -426,6 +429,7 @@ def execute_audit_post_compromise(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             "Audit post-compromise graph refresh failed. "
             "Continuing with the host dump campaign."
@@ -436,6 +440,7 @@ def execute_audit_post_compromise(
         shell.ask_for_post_da_host_dumps(domain, picked_user, picked_secret)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 __all__ = [

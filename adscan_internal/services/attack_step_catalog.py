@@ -61,6 +61,11 @@ SourceContextRequirement = Literal[
     "none",                  # No auth needed (coercion, ASREPRoasting, Timeroasting)
     "local_admin_session",   # Admin shell on host required (dump-type edges)
     "machine_credential",    # Machine account TGT/hash required (AllowedToDelegate, RBCD)
+    "mssql_rce_session",     # OS-command RCE channel on the SQL host (XpCmdshell)
+                             # established. Required by the MSSQL SYSTEM-escalation
+                             # follow-ups (SeImpersonate / token-theft), which run
+                             # THROUGH that channel and are recorded only after it
+                             # (mssql.py:run_xpcmdshell_system_escalation_followup).
 ]
 
 _COMPLEXITY_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "very_high": 3}
@@ -116,6 +121,13 @@ class AttackStepCatalogEntry:
     # this edge can be traversed.  Used by the DFS to block semantically-wrong
     # chains (e.g. AdminTo → AllowedToDelegate).
     source_context_requirement: SourceContextRequirement = "user_credentials"
+    # What credential/session context this edge PRODUCES for the next edge in the
+    # path, overriding the default derived from ``compromise_semantics`` (see
+    # :func:`provides_context_for_entry`).  Only set when the semantics-derived
+    # context is too coarse — e.g. ``XpCmdshell`` produces an ``mssql_rce_session``
+    # that the MSSQL SYSTEM-escalation follow-ups require, which the generic
+    # ``direct_target_compromise`` → ``credential_recovered`` mapping cannot express.
+    provides_context: str | None = None
 
 
 def _entry(
@@ -145,6 +157,7 @@ def _entry(
     short_narrative_template: str = "",
     remediation_steps: tuple[str, ...] = (),
     source_context_requirement: SourceContextRequirement = "user_credentials",
+    provides_context: str | None = None,
 ) -> AttackStepCatalogEntry:
     """Build a normalized catalog entry."""
     return AttackStepCatalogEntry(
@@ -175,6 +188,7 @@ def _entry(
         short_narrative_template=short_narrative_template.strip(),
         remediation_steps=tuple(remediation_steps),
         source_context_requirement=source_context_requirement,
+        provides_context=provides_context,
     )
 
 
@@ -599,25 +613,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         execution_target_access_requirement="computer_reachable",
     ),
     _entry(
-        "addallowedtoact",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
-        category="delegation",
-        description="Write msDS-AllowedToActOnBehalfOfOtherIdentity rights",
-        vuln_key="rbcd_exploitable",
-        remediation_complexity="medium",
-        remediation_effort=(
-            "Remove write access to the msDS-AllowedToActOnBehalfOfOtherIdentity attribute "
-            "from non-privileged principals on computer objects."
-        ),
-        can_fully_mitigate=True,
-        mitre_technique_id="T1134.001",
-        mitre_technique_name="Access Token Manipulation: Token Impersonation/Theft",
-        detection_event_ids=("5136",),
-        bh_native=True,
-        bh_cypher_names=("AddAllowedToAct",),
-    ),
-    _entry(
         "coercetotgt",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
@@ -724,9 +719,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136",),
         bh_cypher_names=("HasShadowCredentials",),
         remediation_steps=(
-            "Enumerate: ldapsearch -b <domain_dn> '(msDS-KeyCredentialLink=*)' "
-            "msDS-KeyCredentialLink",
-            "Remove unexpected entries via ADSIEdit or: "
+            "Enumerate every object carrying a key credential: "
+            "Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' "
+            "-Properties msDS-KeyCredentialLink | "
+            "Select-Object DistinguishedName, msDS-KeyCredentialLink",
+            "Remove unexpected entries: "
             "Set-ADObject -Identity <DN> -Clear msDS-KeyCredentialLink",
             "Enable DS Access auditing on msDS-KeyCredentialLink (Event ID 5136) "
             "in Default Domain Controller Policy.",
@@ -835,6 +832,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         bh_native=False,
         bh_cypher_names=("MssqlSeImpersonateEscalation",),
         execution_target_access_requirement="computer_reachable",
+        # Post-ex escalation that runs THROUGH the XpCmdshell RCE channel — must
+        # chain only AFTER XpCmdshell on the same host, never directly off the
+        # MssqlLinkedServerLateral / SQLAdmin arrival. XpCmdshell is the sole
+        # producer of ``mssql_rce_session``.
+        source_context_requirement="mssql_rce_session",
     ),
     _entry(
         "mssql_token_theft_escalation",
@@ -872,15 +874,30 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         bh_native=False,
         bh_cypher_names=("MssqlTokenTheftEscalation",),
         execution_target_access_requirement="computer_reachable",
+        # Post-ex escalation that runs THROUGH the XpCmdshell RCE channel — must
+        # chain only AFTER XpCmdshell on the same host, never directly off the
+        # MssqlLinkedServerLateral / SQLAdmin arrival. XpCmdshell is the sole
+        # producer of ``mssql_rce_session``.
+        source_context_requirement="mssql_rce_session",
     ),
     _entry(
         "mssql_linked_server_lateral",
-        support_kind="supported",
+        # CONTEXT at execution level — the linked-server hop is not a discrete
+        # executable action; it is a SQL-session pivot that the DOWNSTREAM step
+        # consumes (the XpCmdshell/escalation step runs its T-SQL "AT [link]").
+        # So the execution engine passes through it, exactly like MemberOf /
+        # LocalAdminPassReuse (which are also real capabilities marked context).
+        # It stays an EdgeKind.AUTH edge + a real finding with its own narrative /
+        # remediation (the over-privileged login mapping); only its EXECUTION is
+        # subsumed by the next step.
+        support_kind="context",
         support_reason=(
-            "MSSQL linked server chain: sysadmin on source SQL instance executes "
-            "EXEC ('...') AT [linked_server], gaining sysadmin-equivalent access on "
-            "a second SQL Server instance. Combined with SeImpersonate or token theft "
-            "on the target instance, this extends the blast radius across multiple hosts."
+            "MSSQL linked server: a login on the source instance runs Transact-SQL "
+            "on a second instance through the configured login mapping. The lateral "
+            "hop itself is not executed as a standalone action — the downstream "
+            "MSSQL execution step (e.g. xp_cmdshell) routes its statement through the "
+            "link. The finding is the linked-server login mapping to a privileged "
+            "remote account."
         ),
         compromise_semantics="access_capability_only",
         compromise_effort="low",
@@ -907,6 +924,92 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624", "4648"),
         bh_native=False,
         bh_cypher_names=("MssqlLinkedServerLateral",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
+        "xp_cmdshell",
+        support_kind="supported",
+        support_reason=(
+            "Sysadmin on the SQL instance (directly, or as the mapped sysadmin login "
+            "of a linked server) allows enabling and running xp_cmdshell to execute "
+            "operating-system commands under the SQL Server service account."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="execution",
+        description=(
+            "The SQL Server service can execute operating-system commands on its host "
+            "when a session holds sysadmin. Any principal that reaches sysadmin on the "
+            "instance — a direct sysadmin login, or a linked-server login mapping that "
+            "lands as a sysadmin login on the remote instance — can therefore run "
+            "commands on the host as the SQL Server service account, a full host "
+            "code-execution capability."
+        ),
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable OS command execution on the instance: "
+            "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE. "
+            "Restrict sysadmin membership to the minimum set of accounts, and run the "
+            "SQL Server service under a low-privilege account. "
+            "For linked servers, map the remote login to a least-privilege account "
+            "rather than a sysadmin login."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1059",
+        mitre_technique_name="Command and Scripting Interpreter",
+        detection_event_ids=("4688", "15457"),
+        bh_native=False,
+        bh_cypher_names=("XpCmdshell",),
+        execution_target_access_requirement="computer_reachable",
+        # XpCmdshell establishes the OS-command RCE channel on the SQL host. The
+        # MSSQL SYSTEM-escalation follow-ups (SeImpersonate / token-theft) run
+        # THROUGH this channel and are recorded only after it, so they require
+        # this produced context — which stops them from chaining directly off the
+        # MssqlLinkedServerLateral / SQLAdmin arrival as a sibling of XpCmdshell.
+        provides_context="mssql_rce_session",
+    ),
+    _entry(
+        "mssql_openrowset_bulk_read",
+        support_kind="supported",
+        support_reason=(
+            "ADMINISTER BULK OPERATIONS on the SQL instance (sysadmin, the "
+            "bulkadmin fixed server role, or an explicit grant — directly, or "
+            "as the mapped login of a linked server) allows reading arbitrary "
+            "files the SQL Server service account can reach, without any "
+            "operating-system command-execution surface."
+        ),
+        compromise_semantics="credential_access_only",
+        compromise_effort="low",
+        category="collection",
+        description=(
+            "SQL Server can read the raw content of any file the SQL Server "
+            "service account can access on its host, without executing a "
+            "single operating-system command. Any principal holding ADMINISTER "
+            "BULK OPERATIONS — sysadmin, the bulkadmin fixed server role, an "
+            "explicit grant, or a linked-server login mapping that lands on the "
+            "same permission remotely — can pull configuration files, backup "
+            "files, and scripts off the host and recover any credentials or "
+            "connection strings stored in them."
+        ),
+        remediation_complexity="low",
+        remediation_effort=(
+            "Revoke the permission from logins that do not need it: "
+            "REVOKE ADMINISTER BULK OPERATIONS FROM [login]; "
+            "and remove unnecessary membership from the bulkadmin fixed server "
+            "role: ALTER SERVER ROLE bulkadmin DROP MEMBER [login]. "
+            "Restrict sysadmin membership to the minimum set of accounts, and "
+            "run the SQL Server service under a low-privilege account so a "
+            "file read through this avenue exposes as little as possible. "
+            "For linked servers, map the remote login to a least-privilege "
+            "account rather than one with ADMINISTER BULK OPERATIONS or "
+            "sysadmin."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1005",
+        mitre_technique_name="Data from Local System",
+        detection_event_ids=("15457",),
+        bh_native=False,
+        bh_cypher_names=("MssqlOpenRowsetBulkRead",),
         execution_target_access_requirement="computer_reachable",
     ),
     _entry(
@@ -1487,9 +1590,12 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="Full object control over target principal/object",
         remediation_complexity="medium",
         remediation_effort=(
-            "Remove GenericAll permission from the target object ACL. "
-            "Audit AD ACLs regularly using tools such as BloodHound or ADACLScanner. "
-            "Apply least-privilege delegation."
+            "Remove the GenericAll ACE from the target object's ACL: inspect it with "
+            "`dsacls \"<targetDN>\"` (or `(Get-Acl \"AD:\\<targetDN>\").Access`), then strip the "
+            "offending entry with `dsacls \"<targetDN>\" /R \"<DOMAIN\\principal>\"`. Audit AD ACLs "
+            "regularly with the native `Get-Acl`/`dsacls` tooling and enforce least-privilege "
+            "delegation — grant only the specific rights required (Delegation of Control wizard or "
+            "scoped ACEs), never full control."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1098",
@@ -1863,8 +1969,16 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "addkeycredentiallink",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason=(
+            "Shadow Credentials: write msDS-KeyCredentialLink on the target "
+            "(computer or user), then PKINIT with the minted self-signed "
+            "certificate to recover the target's NT hash / TGT. Fully native; the "
+            "KeyCredentialLink is removed afterwards and the change recorded in "
+            "the environment-change ledger. No offline crack."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
         category="acl_ace",
         description="Write msDS-KeyCredentialLink to add shadow credentials",
         remediation_complexity="low",
@@ -1882,8 +1996,15 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "allextendedrights",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason=(
+            "All extended (control-access) rights over the target. Reduces to the "
+            "one concrete abuse the object's extended rights confer, by object "
+            "class: a user → force-change its password; a domain → replicate its "
+            "secrets (DCSync); a computer → read its LAPS local-admin password. "
+            "It does NOT grant attribute writes (no Shadow Credentials) or reads "
+            "(no gMSA password)."
+        ),
         category="acl_ace",
         description="Broad extended rights over directory object",
         vuln_key="all_extended_rights",
@@ -2607,6 +2728,12 @@ _CONTEXT_COMPAT: dict[str, frozenset[str]] = {
     "user_credentials":     frozenset({"user_credentials", "none"}),
     "credential_recovered": frozenset({"user_credentials", "none", "machine_credential"}),
     "local_admin_session":  frozenset({"local_admin_session", "none"}),
+    # An established XpCmdshell RCE channel on the SQL host. Only the MSSQL
+    # SYSTEM-escalation follow-ups require it; nothing "credential-recovered" is
+    # produced by the RCE alone, so it satisfies only its own requirement (plus
+    # the always-satisfiable "none"). Mirrors the local_admin_session pattern:
+    # a session, not credentials.
+    "mssql_rce_session":    frozenset({"mssql_rce_session", "none"}),
     "none":                 frozenset({"none"}),
 }
 
@@ -2637,6 +2764,41 @@ def edges_chain_compatible(
         provides = "user_credentials"
     else:
         provides = _SEMANTICS_TO_PROVIDES.get(str(prev_compromise_semantics or ""), "none")
+    allowed = _CONTEXT_COMPAT.get(provides, frozenset())
+    return next_source_context_requirement in allowed
+
+
+def provides_context_for_entry(entry: AttackStepCatalogEntry) -> str:
+    """Return the credential/session context an edge PRODUCES for the next edge.
+
+    Prefers the explicit per-edge ``provides_context`` override (set only where the
+    semantics-derived context is too coarse — e.g. ``XpCmdshell`` →
+    ``mssql_rce_session``); otherwise falls back to the context derived from
+    ``compromise_semantics``.  Keeping the fallback means every existing edge is
+    unchanged; only edges that set the override differ.
+    """
+    if entry.provides_context:
+        return entry.provides_context
+    return provides_context_from_semantics(entry.compromise_semantics)
+
+
+def context_requirement_satisfied(
+    prev_provides: str | None,
+    next_source_context_requirement: str,
+) -> bool:
+    """Return True when an edge PROVIDING ``prev_provides`` may be immediately
+    followed by an edge REQUIRING ``next_source_context_requirement``.
+
+    Unlike :func:`edges_chain_compatible` (which maps ``compromise_semantics`` →
+    provides internally, so it cannot honour a per-edge ``provides_context``
+    override), this takes the already-resolved produced context directly — the DFS
+    resolves it via :func:`provides_context_for_entry` so the ``XpCmdshell`` →
+    ``mssql_rce_session`` override is respected.
+
+    ``prev_provides is None`` means the start of a path (or an all-transparent
+    prefix), which implicitly provides ``user_credentials``.
+    """
+    provides = "user_credentials" if prev_provides is None else prev_provides
     allowed = _CONTEXT_COMPAT.get(provides, frozenset())
     return next_source_context_requirement in allowed
 
@@ -2715,7 +2877,11 @@ _RELATION_ALIASES_BY_KEY: dict[str, str] = {
     "adcsesc10b": "adcsesc10",
     # Delegation relation names in CE.
     "allowedtoactonbehalfofotheridentity": "allowedtoact",
-    "addallowedtoactonbehalfofotheridentity": "addallowedtoact",
+    # Writing msDS-AllowedToActOnBehalfOfOtherIdentity is the User-Account-
+    # Restrictions property-set write the native collector emits as
+    # WriteAccountRestrictions (the former standalone AddAllowedToAct edge was
+    # consolidated into it).
+    "addallowedtoactonbehalfofotheridentity": "writeaccountrestrictions",
     # KeyCredentialLink typo variants (BloodHound uses various spellings).
     "addkeycreatentiallink": "addkeycredentiallink",
     "addkeycredentiallinks": "addkeycredentiallink",
@@ -2744,8 +2910,117 @@ def normalize_relation(relation: str) -> str:
 
 
 def get_attack_step_entry(relation: str) -> AttackStepCatalogEntry | None:
-    """Return one catalog entry by relation name."""
-    return ATTACK_STEP_CATALOG.get(normalize_relation(relation))
+    """Return one catalog entry by relation name.
+
+    Falls back to a punctuation-insensitive match so a PascalCase BloodHound
+    relation (e.g. ``MssqlLinkedServerLateral``) resolves to a snake_case catalog
+    key (``mssql_linked_server_lateral``). ``normalize_relation`` only l-cases, so
+    without this fallback the multi-word MSSQL entries could never be looked up by
+    their emitted relation name. The secondary index has no key collisions
+    (asserted by tests).
+    """
+    normalized = normalize_relation(relation)
+    entry = ATTACK_STEP_CATALOG.get(normalized)
+    if entry is not None:
+        return entry
+    return _CATALOG_BY_LOOKUP_KEY.get(_relation_lookup_key(normalized))
+
+
+#: Per-step display statuses that a ``structural`` reclassification must NEVER
+#: overwrite — a proven step, a safety abstention, an observed configuration
+#: close, or an availability/support verdict always outranks ``structural``.
+#: (Doctrine: ``structural`` applies ONLY when the step would otherwise be a
+#: non-executed / theoretical context hop.)
+_STRUCTURAL_PRESERVED_STATUSES: frozenset[str] = frozenset(
+    {
+        "success",
+        "succeeded",
+        "exploited",
+        "domain_compromised",
+        "partial",
+        "blocked",
+        "safety_blocked",
+        "closed_by_configuration",
+        "unavailable",
+        "unsupported",
+    }
+)
+
+
+def derive_step_display_status(relation: str, raw_status: object) -> object:
+    """Return the per-step display status, upgrading a non-executed structural hop.
+
+    A step whose edge is ``compromise_semantics="context_only"`` (MemberOf and the
+    other structural / credential-reuse context pivots) is a FACT that requires no
+    execution — it must render as ``structural``, never ``theoretical`` (which
+    reads as a contradiction inside an exploited chain). This is the single source
+    of truth for that reclassification; consumers (the display record / snapshot,
+    the PDF, the web) read the baked ``structural`` status rather than
+    re-deriving it per surface.
+
+    Doctrine-guarded: the override applies ONLY when the step would otherwise be
+    non-executed / theoretical. A proven step (``success`` / ``domain_compromised``),
+    a safety abstention (``blocked`` / ``safety_blocked``), an observed config close
+    (``closed_by_configuration``), or an availability/support verdict always
+    outranks ``structural`` and is returned unchanged. A non-``context_only``
+    relation is returned unchanged.
+
+    Args:
+        relation: The edge relation (BloodHound-style name, any casing).
+        raw_status: The step's underlying status (may be ``None`` / empty).
+
+    Returns:
+        ``"structural"`` for a non-executed ``context_only`` step; otherwise
+        ``raw_status`` unchanged.
+    """
+    status_key = str(raw_status or "").strip().lower()
+    if status_key in _STRUCTURAL_PRESERVED_STATUSES:
+        return raw_status
+    entry = get_attack_step_entry(relation)
+    if entry is not None and entry.compromise_semantics == "context_only":
+        return "structural"
+    return raw_status
+
+
+# ── Credential-context lookups keyed by the punctuation-insensitive relation ──
+# form the DFS emits (BloodHound PascalCase ``MssqlTokenTheftEscalation`` →
+# ``mssqltokentheftescalation``).  Keyed the SAME way as ``get_attack_step_entry``'s
+# secondary index so the underscored MSSQL entries resolve from their emitted
+# relation label — otherwise the credential-context gate silently misses them and
+# every MSSQL escalation defaults to ``user_credentials`` (the DarkZero ordering
+# bug: the SYSTEM-escalation chained directly off the linked-server hop instead of
+# after XpCmdshell).
+_RELATION_PROVIDES_BY_LOOKUP: dict[str, str] = {
+    _relation_lookup_key(e.relation): provides_context_for_entry(e)
+    for e in _CATALOG_ENTRIES
+    if e.relation
+}
+_RELATION_REQUIRES_BY_LOOKUP: dict[str, str] = {
+    _relation_lookup_key(e.relation): e.source_context_requirement
+    for e in _CATALOG_ENTRIES
+    if e.relation
+}
+
+
+def provides_context_for_relation(relation: str) -> str | None:
+    """Return the context an edge PRODUCES, resolved from its emitted relation label.
+
+    Punctuation-insensitive so a PascalCase ``XpCmdshell`` resolves to the
+    snake_case ``xp_cmdshell`` catalog key.  Returns ``None`` for an unknown
+    relation so the caller can pick its own default.
+    """
+    return _RELATION_PROVIDES_BY_LOOKUP.get(_relation_lookup_key(relation))
+
+
+def required_context_for_relation(relation: str) -> str:
+    """Return the context an edge REQUIRES of its source, from its emitted label.
+
+    Punctuation-insensitive (see :func:`provides_context_for_relation`).  Unknown
+    relations default to ``user_credentials`` — the safest default (most edges).
+    """
+    return _RELATION_REQUIRES_BY_LOOKUP.get(
+        _relation_lookup_key(relation), "user_credentials"
+    )
 
 
 def normalize_execution_relation(relation: str) -> str:
@@ -2762,12 +3037,26 @@ def list_attack_step_entries() -> list[AttackStepCatalogEntry]:
 
 
 def get_relation_notes_by_support_kind(support_kind: SupportKind) -> dict[str, str]:
-    """Return relation->reason map for one support kind."""
-    return {
-        relation: entry.support_reason
-        for relation, entry in ATTACK_STEP_CATALOG.items()
-        if entry.support_kind == support_kind
-    }
+    """Return relation->reason map for one support kind.
+
+    Keyed by BOTH the snake_case catalog key AND its punctuation-stripped lookup
+    form (e.g. ``mssql_linked_server_lateral`` AND ``mssqllinkedserverlateral``).
+    The execution engine looks these maps up by the raw BloodHound relation label
+    lowercased (``step_action.lower()`` → ``mssqllinkedserverlateral``), which only
+    matched catalog keys that happen to be punctuation-free (``memberof``,
+    ``localadminpassreuse``). Underscored keys (``xp_cmdshell``,
+    ``mssql_linked_server_lateral``, ``mssql_seimpersonate_escalation`` …) silently
+    missed — so a context relation was NOT passed through and a supported relation
+    hit the "unknown supported step" fallthrough. The stripped alias closes that
+    gap for every relation; the punctuation-free keys are unchanged (alias == key).
+    """
+    out: dict[str, str] = {}
+    for relation, entry in ATTACK_STEP_CATALOG.items():
+        if entry.support_kind != support_kind:
+            continue
+        out[relation] = entry.support_reason
+        out.setdefault(_relation_lookup_key(relation), entry.support_reason)
+    return out
 
 
 def relation_requires_execution_context(relation: str) -> bool:
@@ -3224,6 +3513,57 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Add tier-0 accounts to Protected Users or flag 'Account is sensitive and cannot be delegated'.",
         ),
     },
+    "mssql_linked_server_lateral": {
+        "short": (
+            "Linked server from {source} lets a login on {source} run "
+            "Transact-SQL on {target} under the linked-server login mapping."
+        ),
+        "long": (
+            "A SQL Server linked server is configured from {source} to {target}, "
+            "so a login authenticated to {source} can run Transact-SQL statements "
+            "on {target} through the linked-server login mapping. The mapping runs "
+            "those statements on {target} as {execution_identity} — so the "
+            "effective operator on {target} is that account, not the user who "
+            "reached {source}. Where that account is privileged on {target}, this "
+            "provides a lateral-movement path onto {target}, and where outbound "
+            "remote procedure calls are enabled it extends to native command "
+            "execution on the remote host. The capability is configured and "
+            "reachable but has not yet been exercised."
+        ),
+        "remediation": (
+            "Audit the linked servers configured on {source} and remove any that "
+            "are no longer required.",
+            "Where a linked server is needed, map its login to a dedicated "
+            "low-privilege account rather than a shared or administrative login, "
+            "and avoid impersonating the caller's security context.",
+            "Disable outbound remote procedure calls (RPC Out) on the linked "
+            "server unless a business process depends on it.",
+        ),
+    },
+    "xp_cmdshell": {
+        "short": (
+            "Sysadmin on the SQL Server hosted by {target} allows running "
+            "operating-system commands on {target} as the SQL Server service "
+            "account — {xp_cmdshell_plan}."
+        ),
+        "long": (
+            "The SQL Server instance on {target} can execute operating-system "
+            "commands when a session holds sysadmin. Having reached sysadmin on "
+            "that instance, an attacker runs commands on {target} as "
+            "{execution_identity} — a full host code-execution capability. In "
+            "this path, {xp_cmdshell_plan}. When the sysadmin session was "
+            "obtained through a linked-server login mapping, that account is the "
+            "effective operator on {target} rather than the originating user."
+        ),
+        "remediation": (
+            "Disable operating-system command execution on the instance: "
+            "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE.",
+            "Restrict sysadmin membership to the minimum set of accounts and run "
+            "the SQL Server service under a low-privilege account.",
+            "For linked servers, map the remote login to a least-privilege "
+            "account rather than a sysadmin login.",
+        ),
+    },
 }
 
 
@@ -3246,6 +3586,15 @@ for _rel, _entry_obj in ATTACK_STEP_CATALOG.items():
     else:
         _CATALOG_WITH_NARRATIVES[_rel] = _entry_obj
 ATTACK_STEP_CATALOG = _CATALOG_WITH_NARRATIVES  # type: ignore[assignment]
+
+# Secondary index for punctuation-insensitive relation lookup: a PascalCase
+# BloodHound relation ("MssqlLinkedServerLateral") must resolve to its snake_case
+# catalog key ("mssql_linked_server_lateral"). ``get_attack_step_entry`` consults
+# this after the exact lowercased lookup misses. No key collisions (locked by a
+# test that asserts the stripped keys are unique).
+_CATALOG_BY_LOOKUP_KEY: dict[str, AttackStepCatalogEntry] = {
+    _relation_lookup_key(_key): _val for _key, _val in ATTACK_STEP_CATALOG.items()
+}
 
 
 def _infer_node_type(display: str) -> str:
@@ -3306,19 +3655,72 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     except Exception:
         relation_label = str(relation_raw or "Step")
 
+    # ADCS certificate-template name for the {template} placeholder (ESC1-ESC16
+    # narratives + remediation). The step details rarely carry a flat "template"
+    # string — the ADCS surface stores the abused template under
+    # templates_summary / templates / vulnerable_resources — so resolve via the
+    # SSOT extractor first, then fall back to the flat key. Reading only the flat
+    # "template" key rendered a blank slot ("on template , ...") in the ESC1 step
+    # remediation even though Section 03 prints the name.
     template = ""
     if isinstance(details, dict):
-        tmpl = details.get("template")
-        if isinstance(tmpl, str):
-            template = tmpl.strip()
+        try:
+            from adscan_internal.services.adcs_path_display import (
+                extract_adcs_template_names,
+            )
+
+            template = ", ".join(extract_adcs_template_names(details))
+        except Exception:
+            template = ""
+        if not template:
+            tmpl = details.get("template")
+            if isinstance(tmpl, str):
+                template = tmpl.strip()
+
+    # MSSQL linked-server identity switch — the mapped remote login the SQL
+    # session runs as on the target instance (from the edge notes spread into
+    # details). Rendered so the pentester and client see WHO the effective
+    # operator is (e.g. a linked-server service account), not the originating
+    # user. Degrades to a client-safe generic phrase when the concrete login is
+    # not known, so the templates never leak a literal placeholder.
+    execution_identity = ""
+    if isinstance(details, dict):
+        execution_identity = str(
+            details.get("execution_identity") or details.get("remote_login") or ""
+        ).strip()
+    connecting_login = ""
+    if isinstance(details, dict):
+        connecting_login = str(details.get("connecting_login") or "").strip()
+
+    # xp_cmdshell execution plan — whether OS-command execution is already
+    # available on the instance or the attacker must enable it first (and revert
+    # it afterward). Carried from the overlay notes into details. Always resolves
+    # to a non-empty client-safe clause so the template never leaks a literal
+    # placeholder; degrades to a neutral phrase when the state is unknown.
+    if isinstance(details, dict) and details.get("xp_cmdshell_already_enabled"):
+        xp_cmdshell_plan = (
+            "xp_cmdshell is already enabled on the host, so commands run directly"
+        )
+    elif isinstance(details, dict) and details.get("requires_enable"):
+        xp_cmdshell_plan = (
+            "the attacker enables xp_cmdshell (and disables it again afterward), "
+            "then runs commands"
+        )
+    else:
+        xp_cmdshell_plan = "commands run through the SQL Server service"
 
     return {
         "source": source,
         "target": target,
         "source_type": _infer_node_type(source),
         "target_type": _infer_node_type(target),
-        "template": template,
+        # Degrade to a neutral phrase so an ADCS step remediation never renders a
+        # blank "on template , ..." slot when the name could not be resolved.
+        "template": template or "the affected certificate template",
         "relation": relation_label,
+        "execution_identity": execution_identity or "the SQL Server service account",
+        "connecting_login": connecting_login or "the connecting login",
+        "xp_cmdshell_plan": xp_cmdshell_plan,
     }
 
 
@@ -3537,7 +3939,13 @@ def build_step_knowledge(step: dict[str, Any]) -> dict[str, Any] | None:
 _STATUS_PHRASE: dict[str, str] = {
     "exploited": "was successfully exploited during active testing",
     "attempted": "was probed but not fully executed in the engagement window",
-    "blocked": "was attempted but stopped by an existing control",
+    # A "blocked" path is one ADscan withheld from live execution for safety (a
+    # destructive/disruptive technique). Never phrased as "a control stopped it" —
+    # ADscan validates exposure, not defensive tooling.
+    "blocked": "was withheld from live execution as a safety precaution",
+    "closed_by_configuration": (
+        "targets an avenue your environment's configuration already closes"
+    ),
     "unsupported": "is mapped as a viable route but was not executed in this engagement",
     "theoretical": "is a theoretical route derived from configuration analysis",
 }

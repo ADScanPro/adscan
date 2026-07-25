@@ -21,6 +21,7 @@ from adscan_internal.services.winrm_psrp_service import (
     WinRMPSRPExecutionResult,
     WinRMPSRPService,
 )
+from adscan_core.rich_output import print_exception
 
 _RUNASCS_REMOTE_DIR: Final[str] = r"C:\Windows\Temp"
 _RUNASCS_REMOTE_PATH: Final[str] = rf"{_RUNASCS_REMOTE_DIR}\adscan_runascs.exe"
@@ -121,6 +122,7 @@ class WinRMLogonBypassService:
             remote_runascs_path = self._ensure_runascs_uploaded()
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "WinRM logon bypass setup failed; falling back to plain PSRP: "
                 f"operation={mark_sensitive(normalized_operation, 'text')} "

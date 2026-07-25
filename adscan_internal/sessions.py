@@ -40,6 +40,7 @@ from .rich_output import (
     print_success,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 logger = logging.getLogger("adscan.sessions")
 
@@ -173,6 +174,7 @@ class SessionManager:
             sock = socket.create_connection((host, port), timeout=10)
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to connect to {host}:{port}: {exc}")
             return None
 
@@ -223,6 +225,7 @@ class SessionManager:
             session.close()
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error_debug(f"Error closing session #{session_id}: {exc}")
         print_success(
             f"Session #{session_id} "
@@ -279,6 +282,7 @@ class SessionManager:
             listen_sock.listen(5)
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to start listener on {host}:{port}: {exc}")
             return False
 
@@ -298,6 +302,7 @@ class SessionManager:
                 except OSError as exc:
                     # Socket closed or other fatal error – exit loop.
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error_debug(
                         f"[sessions] Listener accept failed: {type(exc).__name__}: {exc}"
                     )
@@ -312,6 +317,7 @@ class SessionManager:
                     )
                 except Exception as exc:  # pragma: no cover - defensive
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error_debug(
                         f"[sessions] Error registering new session from "
                         f"{addr[0]}:{addr[1]}: {exc}"
@@ -392,6 +398,7 @@ class SessionManager:
             old_settings = termios.tcgetattr(fd)
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Failed to configure terminal for interactive mode.")
             return
 
@@ -405,6 +412,7 @@ class SessionManager:
                     rlist, _, _ = select.select([fd, sock], [], [])
                 except (OSError, ValueError) as exc:
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error_debug(
                         f"[sessions] select() failed in interactive mode: {exc}"
                     )
@@ -415,6 +423,7 @@ class SessionManager:
                         data = sock.recv(4096)
                     except OSError as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         print_error_debug(
                             f"[sessions] recv() failed in interactive mode: {exc}"
                         )
@@ -439,6 +448,7 @@ class SessionManager:
                         chunk = os.read(fd, 1024)
                     except OSError as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         print_error_debug(
                             f"[sessions] os.read() failed in interactive mode: {exc}"
                         )
@@ -457,6 +467,7 @@ class SessionManager:
                         sock.sendall(chunk)
                     except OSError as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         console.print(
                             "\n[bold red]Failed to send data to remote host.[/bold red]\n"
                         )
@@ -467,6 +478,7 @@ class SessionManager:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[arg-type]
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_error_debug(
                     f"[sessions] Failed to restore terminal settings: {exc}"
                 )

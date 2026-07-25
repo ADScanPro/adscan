@@ -221,7 +221,7 @@ def print_ci_autonomous_callout() -> None:
         f"[bold {_STEEL}]If wrong[/]",
         (
             f"Re-run with [bold]--debug[/] for verbose telemetry, then "
-            f"open an issue at [{_STEEL}]https://adscanpro.com/docs[/]. "
+            f"open an issue at [{_STEEL}]github.com/ADscanPro/adscan/issues[/]. "
             f"For operator-in-the-loop control switch to "
             f"[{_STEEL}]adscan start[/]."
         ),

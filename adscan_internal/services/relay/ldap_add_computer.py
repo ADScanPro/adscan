@@ -33,6 +33,7 @@ from adscan_internal.services.machine_account_provisioning_service import (
     generate_machine_account_name,
     generate_machine_account_password,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class LDAPAddComputerTarget:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return RelayTargetResult(
                 target_name=self.name,
                 success=False,
@@ -231,6 +233,7 @@ async def _relay_can_create_machine(
         return True, None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[ldap-add-computer] MAQ preflight skipped: {exc}")
         return None, None
 
@@ -402,6 +405,7 @@ def _write_result(
         return str(path)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 

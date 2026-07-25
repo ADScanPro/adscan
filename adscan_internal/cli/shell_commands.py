@@ -28,6 +28,7 @@ import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +450,7 @@ def bind_registered_shell_commands(cls: type) -> type:
                     return
                 except Exception as exc:  # noqa: BLE001 — shell loop must survive
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_error(f"Couldn't run {captured.verb}: {exc}")
 
             _do.__doc__ = captured.long_help

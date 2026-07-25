@@ -102,6 +102,10 @@ from adscan_internal.services.attack_step_support_registry import (
     describe_path_target_outcome,
     normalize_search_mode_label,
 )
+from adscan_internal.services.destructive_action_policy import (
+    classify_destructive,
+    is_machine_account_name,
+)
 from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
 )
@@ -127,6 +131,7 @@ from adscan_internal.services.pivot_opportunity_service import (
     ensure_host_bound_workflow_target_viable,
     maybe_offer_pivot_opportunity_for_host_viability,
 )
+from adscan_internal.services.pivot_service import is_pivoting_enabled
 from adscan_internal.services.logon_script_payload_service import (
     build_force_change_password_logon_script,
 )
@@ -150,6 +155,36 @@ from adscan_internal.models.domain import resolve_dc_ip
 
 
 ATTACK_PATH_SNAPSHOT_FILENAME = "attack_paths_snapshot.json"
+
+# Re-materialization recompute params. Mirror
+# ``report_service._compute_attack_paths_for_report`` (max_depth=10,
+# target="highvalue", target_mode="object") EXACTLY so the persisted snapshot
+# the paid web backend consumes matches the PDF report's live computation with
+# zero drift — both surfaces then render the same reconciled truth.
+_REMATERIALIZE_MAX_DEPTH = 10
+
+
+def _summary_path_state(summary: dict[str, Any], *, display_status: str) -> str | None:
+    """Return the canonical ``PathState`` value for one path summary.
+
+    Honors an explicit ``path_state`` already stamped on the summary (e.g. by
+    the post-exploitation execution sidecar via ``enrich_paths_with_executions``).
+    Otherwise derives it from the display status so a proven full-compromise
+    path renders as ``domain_compromised``: an ``exploited`` ``domain_breaker``
+    path is, by definition, a validated path that terminates in domain
+    compromise. This is what surfaces a standalone-DCSync takeover (whose
+    terminal DCSync edge is reconciled to ``success`` on full NTDS replication)
+    as ``domain_compromised`` in the client report / web, instead of leaving it
+    silently at ``theoretical``.
+    """
+    explicit = str(summary.get("path_state") or "").strip().lower()
+    if explicit:
+        return explicit
+    status = str(display_status or "").strip().lower()
+    compromise_class = str(summary.get("compromise_class") or "").strip().lower()
+    if status == "exploited" and compromise_class == "domain_breaker":
+        return "domain_compromised"
+    return None
 
 
 def _summary_target_priority_class(summary: dict[str, Any]) -> str:
@@ -288,6 +323,32 @@ def _get_pending_writelogonscript_manual_validations(
     pending: list[dict[str, Any]] = []
     setattr(shell, "_pending_writelogonscript_manual_validations", pending)
     return pending
+
+
+def _step_destructive_safety_block(step: dict[str, Any]) -> tuple[bool, str]:
+    """Return ``(hard_blocked, client_safe_reason)`` for one path step.
+
+    Target-aware safety check for a destructive step that the relation-NAME-only
+    classifier cannot catch: a ForceChangePassword whose TARGET is a computer /
+    machine account (resetting a host password is disruptive). The four
+    statically ``policy_blocked`` techniques are already handled by the
+    name-based classifier and are intentionally excluded here so this only adds
+    the target-dependent block. Uses the destructive-action SSOT so the display
+    "blocked" and the executor never disagree.
+    """
+    if not isinstance(step, dict):
+        return False, ""
+    action = str(step.get("action") or "").strip()
+    key = action.lower()
+    if not key or key in POLICY_BLOCKED_RELATIONS:
+        return False, ""
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    target_kind = str(details.get("target_kind") or "")
+    to_label = str(details.get("to") or "")
+    if is_machine_account_name(to_label):
+        target_kind = "computer"
+    verdict = classify_destructive(action, target_kind)
+    return verdict.hard_blocked, verdict.client_safe_reason
 
 
 def _update_attack_path_step_status_at_index(
@@ -659,6 +720,7 @@ def persist_attack_path_snapshot(
                     step_copy["knowledge"] = knowledge
                 enriched_steps.append(step_copy)
             steps = enriched_steps
+            display_status = str(summary.get("status") or "theoretical")
             snapshot_paths.append(
                 {
                     "id": str(
@@ -669,7 +731,13 @@ def persist_attack_path_snapshot(
                     "source": str(summary.get("source") or ""),
                     "target": str(summary.get("target") or ""),
                     "length": int(summary.get("length") or 0),
-                    "status": str(summary.get("status") or "theoretical"),
+                    "status": display_status,
+                    # Canonical PathState lifecycle value (serialized so the web /
+                    # report consume it directly). ``None`` when the path is not
+                    # in a proven state.
+                    "path_state": _summary_path_state(
+                        summary, display_status=display_status
+                    ),
                     "is_high_value": bool(summary.get("target_is_high_value")),
                     "is_tier_zero": _summary_target_priority_class(summary)
                     == "tierzero",
@@ -710,6 +778,102 @@ def persist_attack_path_snapshot(
     except Exception as exc:  # pragma: no cover - best effort only
         telemetry.capture_exception(exc)
         print_info_debug(f"[attack_paths] snapshot persistence failed: {exc}")
+
+
+def rematerialize_attack_path_snapshot(
+    shell: Any, domain: str
+) -> list[dict[str, Any]] | None:
+    """Recompute the attack-path snapshot as a PURE PROJECTION of the reconciled graph.
+
+    The on-disk snapshot (``attack_paths_snapshot.json``) is what the paid web
+    backend ingests (``attack_paths_service._derive_followup_status``) to decide
+    whether each path is actionable/``exploited`` vs ``theoretical``. Previously
+    the snapshot was written from a caller-held ``summaries`` list, so its status
+    FROZE at the pre-execution state whenever downstream phase flows reconciled
+    ``attack_graph.json`` edges to ``success`` without re-calling persist — a
+    fully-compromised domain then ingested into the web dashboard as
+    all-theoretical, silently erasing ADscan's "validated, not estimated" edge.
+
+    This entry point removes that drift class: it recomputes fresh summaries from
+    the on-disk, RECONCILED graph via the SAME production recompute the PDF report
+    uses (:func:`attack_graph_service.compute_display_paths_for_domain`), then
+    persists them. Because the source is always the reconciled graph — never a
+    stale copy — a stale status is now structurally impossible.
+
+    Best-effort: never raises, never affects the scan flow. Returns the freshly
+    computed summaries (so a caller can reuse them, e.g. the loot card) or ``None``.
+    """
+    try:
+        from adscan_internal.services import attack_graph_service
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        graph_path = attack_graph_service._graph_path(shell, domain)  # noqa: SLF001
+        if not os.path.exists(graph_path):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # ``no_cache=True`` forces a read of the reconciled on-disk graph even if a
+        # pre-reconciliation compute is still cached this process — freshness is the
+        # whole point of this seam.
+        summaries = attack_graph_service.compute_display_paths_for_domain(
+            shell,
+            domain,
+            max_depth=_REMATERIALIZE_MAX_DEPTH,
+            target="highvalue",
+            target_mode="object",
+            display_friendly=True,
+            # Holistic keep_longest domain listing (matches the CLI/report default)
+            # so the persisted snapshot the web ingests carries the same distinct
+            # entry points + preserved PROVEN paths the operator sees.
+            keep_longest=True,
+            no_cache=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[attack_paths] snapshot re-materialization compute failed: "
+            f"domain={mark_sensitive(domain, 'domain')}: {exc}"
+        )
+        return None
+    if not isinstance(summaries, list):
+        return None
+    persist_attack_path_snapshot(
+        shell,
+        domain,
+        summaries=summaries,
+        scope="domain",
+        target="highvalue",
+        target_mode="object",
+    )
+    return summaries
+
+
+def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
+    """Re-materialize the attack-path snapshot for every in-scope domain at scan end.
+
+    Single scan-finalization seam — called once from ``run_start_auth`` /
+    ``run_start_unauth`` (which BOTH ``adscan ci`` and ``adscan start`` pass
+    through), AFTER all attack-step execution and graph reconciliation, BEFORE the
+    loot card / web handoff. Iterating here once, from the reconciled on-disk
+    graph, keeps the web-consumed snapshot in lockstep with reality without
+    scattering per-step incremental writes (the scattered-writer pattern that
+    produced the stale-status bug). Best-effort: never raises.
+    """
+    try:
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        if not isinstance(domains_data, dict):
+            return
+        for domain in list(domains_data.keys()):
+            if not isinstance(domain, str) or not domain.strip():
+                continue
+            rematerialize_attack_path_snapshot(shell, domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[attack_paths] scan-end snapshot re-materialization failed: {exc}"
+        )
 
 
 def _attack_path_event_id(summary: dict[str, Any]) -> str:
@@ -5159,6 +5323,198 @@ def _select_candidate_executor_user(
     return candidates[selected][0]
 
 
+def _extract_linked_server_from_step(step: dict[str, Any]) -> str | None:
+    """Best-effort extraction of the linked-server name from a lateral step.
+
+    The MSSQLLinkedServerLateral edge stamps ``linked_server`` in its notes; the
+    materialization can surface that as a top-level field, a nested ``details``
+    field, a ``notes`` dict, or a compact ``notes`` summary string
+    (``linked_server=DC02 …``) depending on the summary path, so probe each shape.
+    """
+    val = str(step.get("linked_server") or "").strip()
+    if val:
+        return val
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    val = str(details.get("linked_server") or "").strip()
+    if val:
+        return val
+    for container in (details.get("notes"), step.get("notes")):
+        if isinstance(container, dict):
+            candidate = str(container.get("linked_server") or "").strip()
+            if candidate:
+                return candidate
+        elif isinstance(container, str) and container:
+            match = re.search(r"linked_server=([^\s]+)", container)
+            if match:
+                return match.group(1).strip()
+    return None
+
+
+def _resolve_xpcmdshell_source_and_link(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    current_step_index: int,
+    fallback_to_label: str,
+) -> tuple[str | None, str | None]:
+    """Resolve the SOURCE MSSQL host + optional linked server for an XpCmdshell step.
+
+    Walks BACK from the XpCmdshell step (``current_step_index`` is 1-based) to the
+    most recent SQLAccess/SQLAdmin step and takes its target host as the instance
+    to connect to. If a MSSQLLinkedServerLateral step sits between that access
+    step and this one, the command runs ``AT [linked_server]`` on the linked
+    instance reached via that host. Falls back to the XpCmdshell step's own target
+    host when no prior access step is found (the implicit self-loop overlay).
+
+    Returns:
+        ``(source_host, linked_server)`` — ``source_host`` may be None when no
+        target resolves; ``linked_server`` is None for a local execution.
+    """
+    access_array_index: int | None = None
+    source_host: str | None = None
+    # steps[current_step_index - 1] is the current XpCmdshell step; walk earlier.
+    for index in range(current_step_index - 2, -1, -1):
+        step = steps[index]
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        if action in {"sqlaccess", "sqladmin"}:
+            details = (
+                step.get("details") if isinstance(step.get("details"), dict) else {}
+            )
+            access_to_label = str(details.get("to") or "").strip()
+            resolved = resolve_netexec_target_for_node_label(
+                shell, domain, node_label=access_to_label
+            )
+            if isinstance(resolved, str) and resolved.strip():
+                source_host = resolved.strip()
+            access_array_index = index
+            break
+
+    linked_server: str | None = None
+    if access_array_index is not None:
+        for index in range(access_array_index + 1, current_step_index - 1):
+            step = steps[index]
+            if not isinstance(step, dict):
+                continue
+            action = str(step.get("action") or "").strip().lower().replace("_", "")
+            if action == "mssqllinkedserverlateral":
+                linked_server = _extract_linked_server_from_step(step)
+                if linked_server:
+                    break
+
+    if not source_host:
+        resolved = resolve_netexec_target_for_node_label(
+            shell, domain, node_label=fallback_to_label
+        )
+        if isinstance(resolved, str) and resolved.strip():
+            source_host = resolved.strip()
+
+    return source_host, linked_server
+
+
+def _run_post_xpcmdshell_success_chain(
+    shell: Any,
+    *,
+    domain: str,
+    source_host: str,
+    linked_server: str | None,
+    exec_username: str,
+    password: str,
+    from_label: str,
+    to_label: str,
+    xp_result: Any,
+    summary: dict[str, Any] | None,
+) -> None:
+    """Run the two best-effort follow-ups after a graph-driven xp_cmdshell success.
+
+    Order is load-bearing, not incidental — do not reorder without re-reading
+    this docstring:
+
+    1. **General pivot-opportunity hook** (``maybe_pivot_after_xpcmdshell_success``,
+       gated on ``pivoting.enabled``): mirrors how the manual MSSQL takeover flow
+       (``run_mssql_takeover``) probes pivot candidacy BEFORE escalating.
+    2. **SYSTEM-escalation follow-up** (``run_xpcmdshell_system_escalation_followup``).
+
+    The pivot probe MUST run first: ``run_xpcmdshell_system_escalation_followup``
+    is documented as ALWAYS reverting the deferred ``xp_cmdshell`` exactly once
+    before it returns (success, failure, declined consent, or precondition miss
+    all funnel through its ``finally`` revert). By the time that call returns,
+    the RCE channel the pivot probe depends on is already disabled -- probing
+    after it would race a channel that's already torn down. Running the probe
+    here, while xp_cmdshell is still guaranteed deferred-enabled (the caller
+    keeps it on via ``revert=False``), avoids that race entirely.
+
+    The shared pivot helper owns its own per-session dedup guard keyed on the
+    origin host, so a second probe call from inside the escalation follow-up
+    (the cross-domain-unreachable-credential rescue) targeting the SAME host
+    is a safe no-op.
+
+    Never raises -- this runs after the terminal xp_cmdshell step has already
+    succeeded and must never fail that already-succeeded step.
+    """
+    try:
+        if is_pivoting_enabled(shell):
+            from adscan_internal.cli.mssql import (  # noqa: PLC0415
+                maybe_pivot_after_xpcmdshell_success,
+            )
+
+            maybe_pivot_after_xpcmdshell_success(
+                shell,
+                domain=domain,
+                host=source_host,
+                username=exec_username,
+                password=password,
+                linked_server=linked_server or None,
+                identity=xp_result.execution_identity,
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    # Post-ex chain: escalate the confirmed RCE to SYSTEM and, ONLY on proven
+    # SYSTEM, record a derived escalation edge. The follow-up owns the single
+    # deferred xp_cmdshell revert (kept ON via revert=False by the caller) and
+    # must NEVER crash the already-succeeded step.
+    try:
+        from adscan_internal.cli.mssql import (  # noqa: PLC0415
+            run_xpcmdshell_system_escalation_followup,
+        )
+
+        run_xpcmdshell_system_escalation_followup(
+            shell,
+            domain=domain,
+            source_host=source_host,
+            linked_server=linked_server or None,
+            username=exec_username,
+            password=password,
+            from_label=from_label,
+            to_label=to_label,
+            xp_result=xp_result,
+            summary=summary,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(f"MSSQL SYSTEM escalation follow-up raised: {exc}.")
+        # Fallback: still revert the deferred xp_cmdshell we kept enabled so
+        # the client's SQL Server is not left modified.
+        try:
+            from adscan_internal.cli.mssql import (  # noqa: PLC0415
+                revert_deferred_xp_cmdshell,
+            )
+
+            revert_deferred_xp_cmdshell(
+                shell,
+                domain=domain,
+                host=source_host,
+                username=exec_username,
+                password=password,
+                xp_result=xp_result,
+            )
+        except Exception as revert_exc:  # noqa: BLE001
+            telemetry.capture_exception(revert_exc)
+
+
 def _find_previous_adminto_exec_user_for_host(
     shell: Any,
     *,
@@ -6619,7 +6975,28 @@ def execute_selected_attack_path(
             if classify_relation_support(a).kind == "unsupported"
         ]
 
-        if blocked:
+        # Target-aware safety hard-block: a ForceChangePassword whose TARGET is a
+        # computer/machine account resets that host's password and is disruptive.
+        # The relation NAME alone is target-blind (FCP is statically "supported"),
+        # so route the per-step decision through the destructive-action SSOT. This
+        # closes the display-vs-execution gap — the executor refuses these AND the
+        # panel shows them as blocked-for-safety.
+        destructive_blocked_reasons: dict[str, str] = {}
+        if isinstance(steps, list):
+            for step in steps:
+                is_hard_blocked, safety_reason = _step_destructive_safety_block(
+                    step if isinstance(step, dict) else {}
+                )
+                if not is_hard_blocked:
+                    continue
+                destructive_action = str(step.get("action") or "").strip().lower()
+                if destructive_action:
+                    destructive_blocked_reasons[destructive_action] = safety_reason
+
+        if blocked or destructive_blocked_reasons:
+            all_blocked_actions = list(blocked) + [
+                a for a in sorted(destructive_blocked_reasons) if a not in blocked
+            ]
             _record_attack_path_execution_event(
                 shell,
                 domain=domain,
@@ -6627,13 +7004,19 @@ def execute_selected_attack_path(
                 event_stage="path_blocked",
                 message="Attack path execution blocked by policy-protected steps.",
                 step_status="blocked",
-                reason=", ".join(blocked),
+                reason=", ".join(all_blocked_actions),
             )
             _mark_blocked_steps(
                 kinds={k: v for k, v in dangerous_actions.items()},
                 kind_label="dangerous",
                 default_reason="High-risk / potentially disruptive",
             )
+            if destructive_blocked_reasons:
+                _mark_blocked_steps(
+                    kinds=destructive_blocked_reasons,
+                    kind_label="dangerous_destructive",
+                    default_reason="Disruptive action not executed for safety.",
+                )
             table = Table(
                 title=Text(
                     "Steps in this path", style=f"bold {BRAND_COLORS['warning']}"
@@ -6655,7 +7038,10 @@ def execute_selected_attack_path(
                         else ""
                     )
                     key = action.lower()
-                    if key in supported_actions:
+                    if key in destructive_blocked_reasons:
+                        executable_label = Text("No", style="bold yellow")
+                        notes = destructive_blocked_reasons.get(key, "")
+                    elif key in supported_actions:
                         executable_label = Text("Yes", style="bold green")
                         notes = supported_actions.get(key, "")
                     elif key in non_executable_actions:
@@ -6685,9 +7071,9 @@ def execute_selected_attack_path(
                 "You can still inspect the steps and decide if you want to perform them manually.\n",
                 style="dim",
             )
-            if blocked:
+            if all_blocked_actions:
                 message.append(
-                    f"\nBlocked actions: {', '.join(blocked)}\n",
+                    f"\nBlocked actions: {', '.join(all_blocked_actions)}\n",
                     style="dim",
                 )
 
@@ -7234,6 +7620,27 @@ def execute_selected_attack_path(
             if key in dangerous_actions:
                 # High-risk step intentionally disabled.
                 return execution_started
+            # Target-aware safety backstop (defense-in-depth; the pre-execution
+            # gate already stops a path containing this step). A ForceChangePassword
+            # against a computer/machine account is disruptive and never executed.
+            _safety_hard_blocked, _safety_reason = _step_destructive_safety_block(step)
+            if _safety_hard_blocked:
+                _safety_details = (
+                    step.get("details")
+                    if isinstance(step.get("details"), dict)
+                    else {}
+                )
+                _mark_blocked_step(
+                    action,
+                    str(_safety_details.get("from") or ""),
+                    str(_safety_details.get("to") or ""),
+                    kind="dangerous_destructive",
+                    reason=_safety_reason,
+                )
+                print_warning(
+                    "ForceChangePassword not executed for safety: " + _safety_reason
+                )
+                return execution_started
             relation_support = classify_relation_support(key)
             set_attack_path_step_context(
                 shell,
@@ -7582,6 +7989,563 @@ def execute_selected_attack_path(
                     if callable(followup) and idx == last_executable_idx:
                         followup(domain, target_host, exec_username, password)
                 continue
+
+            if key == "xpcmdshell":
+                # Terminal MSSQL RCE step. The SOURCE instance (+ optional linked
+                # server) was already reached by the earlier SQLAccess/SQLAdmin
+                # (+ MSSQLLinkedServerLateral) steps, so this step runs ONLY its
+                # own piece — enable-if-needed + one xp_cmdshell command — and
+                # records ITS OWN edge status. It must NOT re-verify the access
+                # already proven upstream.
+                source_host, linked_server = _resolve_xpcmdshell_source_and_link(
+                    shell,
+                    domain=domain,
+                    steps=steps,
+                    current_step_index=idx,
+                    fallback_to_label=to_label,
+                )
+                if not source_host:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no source MSSQL instance resolved.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="mssql_source_host_unresolved",
+                    )
+                    print_warning(
+                        f"Cannot execute {action}: could not resolve the source MSSQL instance host."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Source MSSQL instance host not resolvable",
+                    )
+                    return execution_started
+
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not exec_username or not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no usable credential context was available.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_execution_credential",
+                    )
+                    print_warning(
+                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential context for execution",
+                    )
+                    return execution_started
+
+                marked_user = mark_sensitive(exec_username, "user")
+                marked_target = mark_sensitive(source_host, "hostname")
+                _link_label = (
+                    f" AT [{mark_sensitive(linked_server, 'hostname')}]"
+                    if linked_server
+                    else ""
+                )
+                print_info_verbose(
+                    f"Executing xp_cmdshell on {marked_target}{_link_label} as {marked_user}."
+                )
+
+                execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} on {to_label or source_host}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                    actor=exec_username,
+                    target_host=source_host,
+                )
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "target": source_host,
+                        "linked_server": linked_server or "",
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={"username": exec_username, "target": source_host},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    from adscan_internal.cli.mssql import (  # noqa: PLC0415
+                        execute_xp_cmdshell_on_instance,
+                    )
+
+                    xp_result = None
+                    try:
+                        xp_result = execute_xp_cmdshell_on_instance(
+                            shell,
+                            domain=domain,
+                            host=source_host,
+                            username=exec_username,
+                            password=password,
+                            linked_server=linked_server or None,
+                            # Keep xp_cmdshell ON for the SYSTEM-escalation
+                            # follow-up below; the deferred revert runs once
+                            # afterward via run_xpcmdshell_system_escalation_followup.
+                            revert=False,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        print_warning(f"xp_cmdshell execution raised: {exc}.")
+
+                    if xp_result is not None and xp_result.ok:
+                        success_notes: dict[str, Any] = {
+                            "username": exec_username,
+                            "target": source_host,
+                            "execution_identity": xp_result.execution_identity,
+                            "enabled_by_us": xp_result.enabled_by_us,
+                            "already_enabled": xp_result.already_enabled,
+                        }
+                        if linked_server:
+                            success_notes["linked_server"] = linked_server
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action,
+                                to_label=to_label,
+                                status="success",
+                                notes=success_notes,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_succeeded",
+                            message=f"{action} succeeded against {to_label or source_host}.",
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status="success",
+                            actor=exec_username,
+                            target_host=source_host,
+                        )
+                        _identity = (
+                            mark_sensitive(xp_result.execution_identity, "user")
+                            if xp_result.execution_identity
+                            else "an unknown identity"
+                        )
+                        print_info(
+                            f"xp_cmdshell command executed on {marked_target}{_link_label} "
+                            f"as {_identity}."
+                        )
+
+                        _run_post_xpcmdshell_success_chain(
+                            shell,
+                            domain=domain,
+                            source_host=source_host,
+                            linked_server=linked_server,
+                            exec_username=exec_username,
+                            password=password,
+                            from_label=from_label,
+                            to_label=to_label,
+                            xp_result=xp_result,
+                            summary=summary,
+                        )
+                        return True
+
+                    # Not ok: classify WHY. An auth/credential/reachability issue
+                    # (or an operator-declined enable) is not an edge defect →
+                    # "attempted"; anything else is a real "failed".
+                    reason = (
+                        xp_result.reason if xp_result is not None else "execution_error"
+                    )
+                    lowered = reason.lower()
+                    auth_or_unavailable = (
+                        reason == "operator_declined_enable"
+                        or any(
+                            token in lowered
+                            for token in (
+                                "auth",
+                                "login failed",
+                                "credential",
+                                "logon",
+                                "unreachable",
+                                "timed out",
+                                "timeout",
+                                "connection",
+                                "refused",
+                            )
+                        )
+                    )
+                    edge_status_on_fail = "attempted" if auth_or_unavailable else "failed"
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status=edge_status_on_fail,
+                            notes={
+                                "username": exec_username,
+                                "target": source_host,
+                                "fail_reason": reason,
+                                "enabled_by_us": bool(
+                                    xp_result.enabled_by_us if xp_result else False
+                                ),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_failed",
+                        message=(
+                            f"{action} did not confirm command execution on "
+                            f"{to_label or source_host}. Reason: {reason}."
+                        ),
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status=edge_status_on_fail,
+                        actor=exec_username,
+                        target_host=source_host,
+                        reason=reason,
+                    )
+                    print_warning(
+                        f"xp_cmdshell did not confirm command execution on "
+                        f"{marked_target}. Reason: {reason}."
+                    )
+                return True
+
+            if key == "mssqlopenrowsetbulkread":
+                # Terminal MSSQL data-exposure step. The SOURCE instance (+
+                # optional linked server) was already reached by the earlier
+                # SQLAccess/SQLAdmin (+ MSSQLLinkedServerLateral) steps, so this
+                # step runs ONLY its own piece — live-confirm ADMINISTER BULK
+                # OPERATIONS, discover files via xp_dirtree, read their content
+                # via OPENROWSET(BULK ..., SINGLE_BLOB) — and records ITS OWN
+                # edge status. It must NOT re-verify the access already proven
+                # upstream. Unlike XpCmdshell this needs no enable/revert dance
+                # (OPENROWSET(BULK ...) requires no configuration change).
+                source_host, linked_server = _resolve_xpcmdshell_source_and_link(
+                    shell,
+                    domain=domain,
+                    steps=steps,
+                    current_step_index=idx,
+                    fallback_to_label=to_label,
+                )
+                if not source_host:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no source MSSQL instance resolved.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="mssql_source_host_unresolved",
+                    )
+                    print_warning(
+                        f"Cannot execute {action}: could not resolve the source MSSQL instance host."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Source MSSQL instance host not resolvable",
+                    )
+                    return execution_started
+
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not exec_username or not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no usable credential context was available.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_execution_credential",
+                    )
+                    print_warning(
+                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential context for execution",
+                    )
+                    return execution_started
+
+                marked_user = mark_sensitive(exec_username, "user")
+                marked_target = mark_sensitive(source_host, "hostname")
+                _link_label = (
+                    f" AT [{mark_sensitive(linked_server, 'hostname')}]"
+                    if linked_server
+                    else ""
+                )
+                print_info_verbose(
+                    f"Reading files via OPENROWSET(BULK ...) on {marked_target}{_link_label} as {marked_user}."
+                )
+
+                execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} on {to_label or source_host}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                    actor=exec_username,
+                    target_host=source_host,
+                )
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "target": source_host,
+                        "linked_server": linked_server or "",
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={"username": exec_username, "target": source_host},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    from adscan_internal.cli.mssql import (  # noqa: PLC0415
+                        run_openrowset_bulk_read_on_instance,
+                    )
+
+                    bulk_result = None
+                    try:
+                        bulk_result = run_openrowset_bulk_read_on_instance(
+                            shell,
+                            domain=domain,
+                            host=source_host,
+                            username=exec_username,
+                            password=password,
+                            linked_server=linked_server or None,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        print_warning(f"OPENROWSET(BULK ...) content read raised: {exc}.")
+
+                    if bulk_result is not None and bulk_result.ok:
+                        success_notes: dict[str, Any] = {
+                            "username": exec_username,
+                            "target": source_host,
+                            "entry_count": bulk_result.entry_count,
+                        }
+                        if linked_server:
+                            success_notes["linked_server"] = linked_server
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action,
+                                to_label=to_label,
+                                status="success",
+                                notes=success_notes,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_succeeded",
+                            message=f"{action} succeeded against {to_label or source_host}.",
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status="success",
+                            actor=exec_username,
+                            target_host=source_host,
+                        )
+                        print_info(
+                            f"OPENROWSET(BULK ...) content read completed on {marked_target}{_link_label}: "
+                            f"{bulk_result.entry_count} file(s) reviewed."
+                        )
+                        return True
+
+                    # Not ok: classify WHY. An auth/credential/reachability issue,
+                    # or the login lacking ADMINISTER BULK OPERATIONS, is not an
+                    # edge defect → "attempted"; anything else is a real "failed".
+                    reason = (
+                        bulk_result.reason if bulk_result is not None else "execution_error"
+                    )
+                    lowered = reason.lower()
+                    auth_or_unavailable = any(
+                        token in lowered
+                        for token in (
+                            "not_bulk_capable",
+                            "capability_probe_failed",
+                            "auth",
+                            "login failed",
+                            "credential",
+                            "logon",
+                            "unreachable",
+                            "timed out",
+                            "timeout",
+                            "connection",
+                            "refused",
+                        )
+                    )
+                    edge_status_on_fail = "attempted" if auth_or_unavailable else "failed"
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status=edge_status_on_fail,
+                            notes={
+                                "username": exec_username,
+                                "target": source_host,
+                                "fail_reason": reason,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_failed",
+                        message=(
+                            f"{action} did not confirm content read on "
+                            f"{to_label or source_host}. Reason: {reason}."
+                        ),
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status=edge_status_on_fail,
+                        actor=exec_username,
+                        target_host=source_host,
+                        reason=reason,
+                    )
+                    print_warning(
+                        f"OPENROWSET(BULK ...) did not confirm content read on "
+                        f"{marked_target}. Reason: {reason}."
+                    )
+                return True
 
             if key == "writelogonscript":
                 if not from_label or not to_label:
@@ -10001,6 +10965,16 @@ def execute_selected_attack_path(
                     )
                     return execution_started
                 esc7_target_upn = f"{esc7_target_user}@{domain}"
+                # ESC7 abuses the CA-management right and issues from the
+                # built-in SubCA template — there is no operator-selected
+                # template like the ESC2/4/6/13 branches have. Bind ``template``
+                # explicitly so the shared ``notes`` dicts below resolve a real
+                # value: without this, referencing the function-local
+                # ``template`` here raised UnboundLocalError (or leaked a stale
+                # value from a prior loop iteration) AFTER the NT hash was
+                # already recovered, aborting the run before the credential was
+                # persisted and the edge marked success.
+                template = "SubCA"
                 execution_started = True
                 with _active_step_context(
                     action="ADCSESC7",
@@ -12976,7 +13950,7 @@ def _apply_attack_path_policy(
     return summaries
 
 
-def offer_attack_paths_for_execution_summaries(
+def _offer_attack_paths_for_execution_summaries_impl(
     shell: Any,
     domain: str,
     *,
@@ -12995,8 +13969,17 @@ def offer_attack_paths_for_execution_summaries(
     snapshot_target: str = "highvalue",
     snapshot_target_mode: str = "object",
     auto_continue_theoretical_in_non_interactive: bool = True,
+    _refresh_deferred_sink: list[bool] | None = None,
 ) -> bool:
     """Shared UX loop for showing/executing already computed path summaries.
+
+    Implementation SSOT behind :func:`offer_attack_paths_for_execution_summaries`
+    (the public seam). New code MUST call the public wrapper, never this impl
+    directly — the wrapper adds the guaranteed post-execution snapshot
+    ``finally`` that keeps ``attack_paths_snapshot.json`` in lockstep with the
+    reconciled graph even when the loop exits via an early return or an
+    exception. The per-attempt snapshot persists below stay (live/incremental
+    UX refresh); the wrapper's ``finally`` is the correctness backstop.
 
     When ``show_sections=True`` the table renders Tier-0 first, then
     high-value paths, then pivots. Callers must pass summaries pre-grouped
@@ -13856,6 +14839,16 @@ def offer_attack_paths_for_execution_summaries(
                     f"domain={marked_domain} affected_users={affected_count} "
                     f"threshold={_AUTO_REFRESH_AFFECTED_USERS_THRESHOLD}"
                 )
+                # Signal the seam wrapper that the post-execution refresh was
+                # DELIBERATELY deferred for perf on this large-affected-set
+                # domain, so its correctness ``finally`` skips the snapshot
+                # regeneration too (regenerating would force the exact
+                # expensive ``get_attack_path_summaries`` recompute this
+                # threshold exists to avoid). The steps are already persisted to
+                # the graph; the operator re-runs ``attack_paths`` to refresh,
+                # and scan-end re-materializes for ci/start.
+                if _refresh_deferred_sink is not None:
+                    _refresh_deferred_sink.append(True)
                 return True
             print_info_verbose(
                 "Refreshing attack-path summaries after execution "
@@ -13986,3 +14979,175 @@ def offer_attack_paths_for_execution_summaries(
         continue
 
     return executed
+
+
+def _finalize_post_execution_snapshot(
+    shell: Any,
+    domain: str,
+    *,
+    snapshot_scope: str,
+    snapshot_target: str,
+    snapshot_target_mode: str,
+    search_mode_label: str | None,
+    recompute_summaries: Callable[[], list[dict[str, Any]]] | None,
+) -> None:
+    """Regenerate ``attack_paths_snapshot.json`` from the RECONCILED graph.
+
+    Correctness backstop for the shared execution seam
+    (:func:`offer_attack_paths_for_execution_summaries`). The per-attempt
+    snapshot persists inside
+    :func:`_offer_attack_paths_for_execution_summaries_impl` are the
+    live/incremental UX refresh, but several exit paths skip them and freeze
+    the on-disk snapshot at the PRE-execution state:
+
+    * the early ``return`` after the domain flips to ``pwned``,
+    * the ``single_pass`` return,
+    * the affected-count auto-refresh deferral, and — the class this guards
+      hardest —
+    * an exception propagating out of ``execute_selected_attack_path``
+      mid-loop (e.g. the ESC7 ``UnboundLocalError`` that aborted the run AFTER
+      the ESC7 edge already reconciled to ``success``).
+
+    Any of those leaves the web/report ingesting a compromised domain as
+    all-``theoretical`` — erasing ADscan's "validated, not estimated" evidence.
+
+    The refresh reads the reconciled graph (never a stale in-memory copy) and
+    persists with the SAME ``scope``/``target``/``target_mode`` the seam used,
+    so it never clobbers the snapshot with a differently-scoped projection.
+    Best-effort: never raises, never masks the execution result.
+    """
+    try:
+        if recompute_summaries is not None:
+            # Scope-aware refresh: the caller's recompute callback rebuilds
+            # summaries with its exact scope/target from the reconciled on-disk
+            # graph. Drop every attack-path cache layer first so the recompute
+            # cannot serve pre-execution paths (same freshness contract as
+            # ``_refresh_summaries``).
+            from adscan_internal.services.attack_graph_service import (
+                force_fresh_attack_paths_recompute,
+            )
+
+            force_fresh_attack_paths_recompute(
+                domain, reason="post_execution_finalize"
+            )
+            fresh = list(recompute_summaries() or [])
+            # Re-derive each path's top-level status from its reconciled
+            # per-step statuses (the shared SSOT) so a step that transitioned
+            # to ``success`` is reflected in the persisted path status.
+            autocorrect_summary_statuses_from_steps(fresh, domain=domain)
+            persist_attack_path_snapshot(
+                shell,
+                domain,
+                summaries=fresh,
+                scope=snapshot_scope,
+                target=snapshot_target,
+                target_mode=snapshot_target_mode,
+                search_mode_label=search_mode_label,
+            )
+        else:
+            # No scope-aware recompute available — fall back to the domain SSOT,
+            # which recomputes the canonical holistic projection directly from
+            # the reconciled graph (identical to the scan-end seam).
+            rematerialize_attack_path_snapshot(shell, domain)
+    except Exception as exc:  # noqa: BLE001 - best-effort backstop
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def offer_attack_paths_for_execution_summaries(
+    shell: Any,
+    domain: str,
+    *,
+    summaries: list[dict[str, Any]] | None,
+    max_display: int = 20,
+    search_mode_label: str | None = None,
+    show_sections: bool = False,
+    context_username: str | None = None,
+    context_password: str | None = None,
+    allow_execute_all: bool = False,
+    default_execute_all: bool = False,
+    execute_only_statuses: set[str] | None = None,
+    retry_attempted: bool = False,
+    recompute_summaries: Callable[[], list[dict[str, Any]]] | None = None,
+    snapshot_scope: str = "domain",
+    snapshot_target: str = "highvalue",
+    snapshot_target_mode: str = "object",
+    auto_continue_theoretical_in_non_interactive: bool = True,
+) -> bool:
+    """Shared execution seam for showing/executing computed attack-path summaries.
+
+    Thin wrapper around
+    :func:`_offer_attack_paths_for_execution_summaries_impl` (the behavioural
+    SSOT — see its docstring for the full contract) that guarantees ONE
+    post-execution snapshot regeneration in a ``finally``. Every caller
+    (``adscan ci``, ``adscan start``, ``adscan execute attack_paths``) routes
+    through here, so the on-disk ``attack_paths_snapshot.json`` converges to
+    the reconciled graph regardless of how the loop exited — normal return,
+    early return after compromise, the affected-count deferral, or an exception
+    mid-execution. This closes the exception-exit / early-return staleness
+    class (an ESC7 path stuck ``theoretical`` while its graph edge is
+    ``success``) that per-mutation persistence alone misses.
+
+    The finalize fires ONLY when an execution actually ran (``executed`` is
+    truthy) or the loop exited via an exception (which, at this seam, means we
+    were mid-execution and an edge may have already reconciled). A pure
+    display/listing call (``executed`` is False, no exception) pays no
+    recompute — preserving the perf profile of a plain ``attack_paths`` listing
+    at scale, where ``rematerialize`` / ``get_attack_path_summaries`` is
+    expensive.
+
+    NOTE: keep this signature in lockstep with
+    ``_offer_attack_paths_for_execution_summaries_impl`` (locked behaviourally
+    by ``tests/unit/cli/test_attack_path_execution_defaults.py``).
+    """
+    executed = False
+    raised = False
+    # Populated by the impl ONLY when it deliberately deferred the
+    # post-execution refresh for perf (large affected-set domain). When set, the
+    # ``finally`` skips the regeneration so we do not force the exact expensive
+    # recompute the deferral avoided.
+    refresh_deferred: list[bool] = []
+    try:
+        executed = _offer_attack_paths_for_execution_summaries_impl(
+            shell,
+            domain,
+            summaries=summaries,
+            max_display=max_display,
+            search_mode_label=search_mode_label,
+            show_sections=show_sections,
+            context_username=context_username,
+            context_password=context_password,
+            allow_execute_all=allow_execute_all,
+            default_execute_all=default_execute_all,
+            execute_only_statuses=execute_only_statuses,
+            retry_attempted=retry_attempted,
+            recompute_summaries=recompute_summaries,
+            snapshot_scope=snapshot_scope,
+            snapshot_target=snapshot_target,
+            snapshot_target_mode=snapshot_target_mode,
+            auto_continue_theoretical_in_non_interactive=(
+                auto_continue_theoretical_in_non_interactive
+            ),
+            _refresh_deferred_sink=refresh_deferred,
+        )
+        return executed
+    except Exception:
+        # An exception at this seam means the execution loop aborted mid-flight
+        # (the ESC7-class exception-exit) — a graph edge may already have
+        # reconciled to ``success`` before the raise, so the snapshot MUST be
+        # regenerated. Re-raise unchanged so the caller still sees the real
+        # failure. (Deliberately NOT BaseException: a KeyboardInterrupt /
+        # SystemExit should abort immediately, not pay a recompute.)
+        raised = True
+        raise
+    finally:
+        if raised or (executed and not refresh_deferred):
+            _finalize_post_execution_snapshot(
+                shell,
+                domain,
+                snapshot_scope=snapshot_scope,
+                snapshot_target=snapshot_target,
+                snapshot_target_mode=snapshot_target_mode,
+                search_mode_label=search_mode_label,
+                recompute_summaries=recompute_summaries,
+            )

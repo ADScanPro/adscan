@@ -30,6 +30,14 @@ SESSION_COMPROMISE_STATUS_VALUES = frozenset(
     }
 )
 
+# Per-domain proven-full-compromise marker written to
+# ``domains_data[domain]["auth"]``. This is the single source of truth set by
+# ``domain_compromise_promotion.promote_to_pwned`` and read across the CLI and
+# report surfaces (e.g. ``post_scan_suggestions``) to mean "this domain has
+# been fully owned". A domain carrying this auth-state is a proven full-domain
+# compromise regardless of whether it is the primary/active domain.
+DOMAIN_AUTH_STATE_PWNED = "pwned"
+
 # Credential-provenance origins that identify a SELF-INTRODUCED credential —
 # the scan's own STARTING credential (the INPUT to ``adscan ci auth`` /
 # ``start_auth``) and a manually entered one (``creds save`` / ``creds add``).
@@ -159,12 +167,52 @@ def iter_compromised_credentials(shell: Any, domain: str) -> dict[str, str]:
         return out
 
 
+def session_reached_domain_compromise(shell: Any) -> bool:
+    """Return True when ANY domain in the workspace reached full compromise.
+
+    The per-domain single source of truth for a proven full-domain compromise
+    is ``domains_data[domain]["auth"] == "pwned"`` (:data:`DOMAIN_AUTH_STATE_PWNED`,
+    written by :func:`domain_compromise_promotion.promote_to_pwned`). The
+    session-level compromise status must reflect the compromise of ANY domain
+    in the workspace — including a TRUSTED SECONDARY domain fully owned via a
+    cross-domain path — not just the primary/active domain. A code path that
+    promotes a secondary domain in a context that never threads the in-memory
+    session marker onto the uploading shell (e.g. a trust-enum subworkspace)
+    would otherwise leave the session mis-attributed as a mere first-credential
+    win, even though the aggregated ``domains_data`` records the domain as
+    pwned. Pure read; never raises.
+    """
+    try:
+        domains_data = getattr(shell, "domains_data", None)
+        if not isinstance(domains_data, dict):
+            return False
+        for entry in domains_data.values():
+            if isinstance(entry, dict) and entry.get("auth") == DOMAIN_AUTH_STATE_PWNED:
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - pure read, never breaks callers
+        return False
+
+
 def build_session_compromise_metadata(shell: Any) -> dict[str, Any]:
     """Return telemetry-safe compromise metadata for one shell session."""
     _ensure_session_compromise_state(shell)
     status = normalize_session_compromise_status(
         getattr(shell, "_session_compromise_status", None)
     )
+
+    # SSOT reconciliation: the in-memory session marker can be missed when a
+    # secondary/trusted domain is compromised in a context that never threads
+    # ``mark_session_domain_compromised`` onto the uploading shell. The
+    # workspace state is authoritative — if ANY domain is proven-pwned, the
+    # session's highest-value signal is a full domain compromise. Promote (never
+    # downgrade) so the funnel never mis-buckets a cross-domain domain-compromise
+    # as a mere first-credential win.
+    if status != SESSION_COMPROMISE_STATUS_DOMAIN and session_reached_domain_compromise(
+        shell
+    ):
+        status = SESSION_COMPROMISE_STATUS_DOMAIN
+
     compromised_users = getattr(shell, "_session_compromised_users", set())
     if not isinstance(compromised_users, set):
         compromised_users = set()

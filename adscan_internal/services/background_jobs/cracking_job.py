@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -28,6 +29,7 @@ from adscan_internal.services.background_jobs.results_bus import (
     JobResultSink,
 )
 from adscan_internal.services.cracking_wordlist_policy import EffortTier
+from adscan_core.rich_output import print_exception
 
 # NetNTLM hashcat modes (fixed per protocol version, unlike the etype-dependent
 # Kerberoast/AS-REP modes): 5500 = NetNTLMv1, 5600 = NetNTLMv2. Mirrors
@@ -188,6 +190,7 @@ def _nice_prefix() -> list[str]:
             return ["nice", "-n", _BACKGROUND_NICENESS]
     except Exception as exc:  # noqa: BLE001 — the priority hint is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return []
 
 
@@ -212,6 +215,7 @@ def _gpu_only_device_args() -> list[str]:
             return ["-D", _GPU_DEVICE_TYPE]
     except Exception as exc:  # noqa: BLE001 — GPU detection is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return []
 
 
@@ -259,6 +263,7 @@ def _cpu_reservation_prefix() -> list[str]:
         return ["taskset", "-c", f"0-{last_usable_core}"]
     except Exception as exc:  # noqa: BLE001 — core reservation is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return []
 
 
@@ -361,6 +366,7 @@ def _make_status_line_handler(status_sink: StatusSink) -> Callable[[str], None]:
                 status_sink(parsed)
         except Exception as exc:  # noqa: BLE001 — live status parsing is best-effort
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     return _on_line
 
@@ -386,6 +392,7 @@ def _emit_last_status(crack_result: Any, status_sink: StatusSink) -> None:
             status_sink(last)
     except Exception as exc:  # noqa: BLE001 — status parsing is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _run_hashcat_tier(
@@ -499,7 +506,21 @@ def _run_hashcat_tier(
         # output-SILENCE watchdog — killed only if hashcat emits nothing at all
         # for the silence window, which reliably means wedged while a
         # steadily-progressing crack keeps emitting --status-json ticks.
-        crack_kwargs: dict[str, Any] = {"timeout": None}
+        # stdin=DEVNULL: belt-and-suspenders — the streaming path
+        # (_run_streaming, used whenever ``on_line`` is set below) already
+        # forces a non-TTY stdin internally, but this also covers the rare
+        # case where ``status_sink`` is None and the call falls through to the
+        # blocking path, which otherwise inherits the operator's real TTY and
+        # can go interactive exactly like the foreground crack in
+        # cli/cracking.py::execute_cracking.
+        # untrusted_output=True: suppress run_command's own raw stdout/stderr
+        # debug-preview for this hashcat launch (progress/status chatter is
+        # tool noise, not operator content) so it doesn't flood the debug log.
+        crack_kwargs: dict[str, Any] = {
+            "timeout": None,
+            "stdin": subprocess.DEVNULL,
+            "untrusted_output": True,
+        }
         if status_sink is not None:
             crack_kwargs["on_line"] = _make_status_line_handler(status_sink)
             crack_kwargs["silence_timeout"] = _CRACK_SILENCE_TIMEOUT_SECONDS
@@ -517,7 +538,18 @@ def _run_hashcat_tier(
                 slot_state_sink(True)
             try:
                 crack_result = run_command(crack_cmd, **crack_kwargs)
-                show_result = run_command(show_cmd, timeout=_SHOW_PASS_TIMEOUT_SECONDS)
+                # stdin=DEVNULL for the same TTY-hijack reason as the crack
+                # invocation above; untrusted_output=True because ``--show``
+                # output is ``username:password`` pairs in CLEARTEXT — the
+                # pattern-sanitizer has no structural marker to redact an
+                # arbitrary plaintext password by, so leaving this unset would
+                # leak the recovered secret into the debug/telemetry preview.
+                show_result = run_command(
+                    show_cmd,
+                    timeout=_SHOW_PASS_TIMEOUT_SECONDS,
+                    stdin=subprocess.DEVNULL,
+                    untrusted_output=True,
+                )
             finally:
                 if slot_state_sink is not None:
                     slot_state_sink(False)
@@ -557,6 +589,7 @@ def _run_hashcat_tier(
         return creds
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {}
     finally:
         try:
@@ -564,6 +597,7 @@ def _run_hashcat_tier(
                 os.remove(show_file)
         except OSError as exc:  # noqa: BLE001 — cleanup is best-effort
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def _normalize_tiers(
@@ -713,6 +747,7 @@ class CrackingJobRuntime:
             )
         except Exception as exc:  # noqa: BLE001 — a debug log must never break the emit
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         self.sink(result)
 
     # ── live in-flight tier tracking (for the in-progress harvest row) ────────
@@ -720,8 +755,10 @@ class CrackingJobRuntime:
     def _begin_tier(self, method: str, estimate: Optional[float]) -> None:
         with self._live_lock:
             self._live = {
+                # monotonic: a benchmark elapsed measured across the mid-scan DC
+                # clock step would jump; this is an in-memory reuse-only value.
+                "started": time.monotonic(),
                 "method": method,
-                "started": time.time(),
                 "estimate": float(estimate) if estimate else None,
             }
             self._last_status = {}
@@ -746,7 +783,8 @@ class CrackingJobRuntime:
         with self._live_lock:
             self._holds_slot = bool(held)
             if held and self._live:
-                self._live["started"] = time.time()
+                # monotonic (see _begin_tier): step-immune in-memory benchmark clock.
+                self._live["started"] = time.monotonic()
 
     def _end_tier(self) -> None:
         with self._live_lock:
@@ -793,7 +831,7 @@ class CrackingJobRuntime:
             and isinstance(estimate, (int, float))
             and estimate > 0
         ):
-            elapsed = max(0.0, time.time() - started)
+            elapsed = max(0.0, time.monotonic() - started)
             progress_pct = max(0.0, min(100.0, 100.0 * elapsed / estimate))
             eta_seconds = max(0, int(estimate - elapsed))
         return method, progress_pct, eta_seconds
@@ -824,6 +862,7 @@ def _run_crack_tiers(runtime: "CrackingJobRuntime") -> None:
             _run_crack_tiers_impl(runtime)
         except Exception as exc:  # noqa: BLE001 — never let a worker thread die silently
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             if not runtime._terminal_emitted:
                 # crack-complete: the ladder crashed before emitting its terminal
                 # result — emit a terminal ``failed`` so the job leaves active()
@@ -835,6 +874,7 @@ def _run_crack_tiers(runtime: "CrackingJobRuntime") -> None:
                     )
                 except Exception as log_exc:  # noqa: BLE001
                     telemetry.capture_exception(log_exc)
+                    print_exception(exception=log_exc)
                 runtime._end_tier()
                 runtime._emit_terminal_result(
                     JobResult(
@@ -889,6 +929,7 @@ def _persist_matches(runtime: "CrackingJobRuntime", matches: dict) -> list[str]:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         cracked_users.append(user)
     return cracked_users
 
@@ -917,6 +958,7 @@ def _run_crack_tiers_impl(runtime: "CrackingJobRuntime") -> None:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             matches = {}
         cracked_users = _persist_matches(runtime, matches) if matches else []
         if cracked_users:

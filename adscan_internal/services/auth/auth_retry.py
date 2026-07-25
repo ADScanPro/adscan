@@ -38,6 +38,7 @@ from adscan_internal.rich_output import (
     print_info_verbose,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 T = TypeVar("T")
 
@@ -150,6 +151,7 @@ async def auth_aware_modify(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[auth-retry] force-refresh raised {type(exc).__name__}: {exc}"
             )
@@ -224,6 +226,7 @@ async def auth_aware_modify(
                     )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"[auth-retry] NTLM fallback layer raised {type(exc).__name__}: {exc}"
             )

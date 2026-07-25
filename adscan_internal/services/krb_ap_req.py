@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 from adscan_core import telemetry
 from adscan_internal.rich_output import print_info_debug, print_warning_debug
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +419,7 @@ def _krb_cred_to_ccache(krb_cred_bytes: bytes) -> bytes | None:
     except Exception as exc:
         try:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         except Exception:
             pass
         print_warning_debug(f"[krb_ap_req] KRB_CRED → ccache conversion failed: {exc}")

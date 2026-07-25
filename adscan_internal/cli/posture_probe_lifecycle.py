@@ -22,6 +22,7 @@ from adscan_core.rich_output import print_warning
 from adscan_internal import get_console
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.posture_probe import ProbeResult
+from adscan_core.rich_output import print_exception
 
 
 def is_posture_probe_disabled() -> bool:
@@ -79,6 +80,7 @@ def _publish_posture_widget_best_effort(
         publish_widget(shell, domain=domain, widget=widget)
     except Exception as exc:  # noqa: BLE001 — widget publication never aborts the scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _emit_posture_findings_best_effort(shell: Any, domain: str) -> None:
@@ -109,12 +111,14 @@ def _emit_posture_findings_best_effort(shell: Any, domain: str) -> None:
     except Exception as exc:  # noqa: BLE001
         # LITE build (no pro/) — silently skip.
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return
 
     try:
         emit_findings_from_posture(shell, domain=domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def run_posture_probe(
@@ -157,6 +161,7 @@ def run_posture_probe(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"Posture probe failed for {mark_sensitive(domain, 'domain')}: "
             f"{type(exc).__name__}. Continuing with conservative defaults."
@@ -224,6 +229,7 @@ async def arun_posture_probe(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     console = get_console()
     # The probe phase has its own dedicated UX: the 🔍 PostureProbeLiveView
@@ -325,6 +331,7 @@ async def arun_posture_probe(
                 await _drive(live.on_progress, live.on_phase_start)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(
                     f"Posture probe failed for {mark_sensitive(domain, 'domain')}: "
                     f"{type(exc).__name__}. Continuing with conservative defaults."
@@ -347,6 +354,7 @@ async def arun_posture_probe(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         _publish_posture_widget_best_effort(shell, domain, results)
         _emit_posture_findings_best_effort(shell, domain)
         return results
@@ -356,6 +364,7 @@ async def arun_posture_probe(
         await _drive(lambda *_a, **_k: None, lambda *_a, **_k: None)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"Posture probe failed for {mark_sensitive(domain, 'domain')}: "
             f"{type(exc).__name__}. Continuing with conservative defaults."

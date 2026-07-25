@@ -15,6 +15,7 @@ from rich.prompt import Prompt
 from adscan_internal import print_info_debug, print_warning, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_internal.services.attack_graph_service import resolve_group_members_by_rid
+from adscan_core.rich_output import print_exception
 
 
 def _deduplicate_preserving_order(values: list[str]) -> list[str]:
@@ -60,6 +61,7 @@ def _resolve_protected_users(shell: Any, domain: str) -> list[str]:
             return _deduplicate_preserving_order([str(item) for item in resolved])
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return []
 
 
@@ -154,6 +156,7 @@ def resolve_privileged_target_candidates(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(
                     f"Could not enumerate Domain Admins for {marked_domain} ({purpose})."
                 )
@@ -171,6 +174,7 @@ def resolve_privileged_target_candidates(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     if exclude_protected_users:
         for user in _resolve_protected_users(shell, domain):

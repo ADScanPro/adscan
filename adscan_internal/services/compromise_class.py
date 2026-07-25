@@ -1064,8 +1064,21 @@ def domain_takeover_kpi_tone(state: DomainTakeoverKpiState) -> str:
     return _DOMAIN_TAKEOVER_KPI_TONE[state]
 
 
+#: Everyone-/most-Tier-0 guard threshold. When the Tier-0 population is at least
+#: this SHARE of the enabled domain-user population, the WHOLE domain is
+#: effectively privileged — everyone-Tier-0 (all in Account/Print Operators, or a
+#: bloated Domain Admins) is ~100% ransomware exposure BY CONSTRUCTION, so the KPI
+#: is forced CRITICAL and never reads as a green baseline. Conservative default;
+#: tune in the ransomware-exposure joint session.
+_TIER0_DOMINANCE_THRESHOLD: float = 0.50
+
+
 def domain_takeover_kpi_state(
-    *, escalator_count: int, tier0_count: int, total: int
+    *,
+    escalator_count: int,
+    tier0_count: int,
+    total: int,
+    domain_user_count: int | None = None,
 ) -> DomainTakeoverKpiState:
     """Return the KPI severity state from the escalator / tier-0 / total counts.
 
@@ -1073,16 +1086,45 @@ def domain_takeover_kpi_state(
 
     * ``escalator_count >= 1``  -> :attr:`DomainTakeoverKpiState.CRITICAL`
       (an ordinary account can seize the domain — rule 2).
+    * Tier-0 population dominates the enabled domain-user population
+      (``tier0_count >= _TIER0_DOMINANCE_THRESHOLD * domain_user_count``)
+      -> :attr:`DomainTakeoverKpiState.CRITICAL` (the everyone-Tier-0 guard).
     * ``escalator_count == 0`` and ``tier0_count >= 1``
       -> :attr:`DomainTakeoverKpiState.BASELINE` (only the expected admins —
       rule 1, Domain Breaker -> Domain = INFO).
     * ``total == 0`` -> :attr:`DomainTakeoverKpiState.CLEAN`.
 
-    Driven by the ESCALATOR count, never the total: a domain with nine
+    Driven by the ESCALATOR count, never the raw total: a domain with nine
     takeover-capable accounts that are all expected administrators is a clean
-    baseline, not a red headline.
+    baseline, not a red headline. The one exception is the everyone-/most-Tier-0
+    guard: when (nearly) every domain user is ALREADY Tier-0, ``escalator_count``
+    is zero (there are no lower-tier accounts left to escalate), yet the domain is
+    the WORST possible ransomware posture — practically the entire population can
+    encrypt the domain. Reading that as a green baseline is a client-risk
+    misrepresentation, so a dominant Tier-0 share forces CRITICAL. The guard only
+    engages when ``domain_user_count`` is known (``> 0``); callers that cannot
+    supply the population keep the escalator-driven behaviour unchanged.
+
+    Args:
+        escalator_count: Lower-tier (Tier 1 + Tier 2) accounts with a validated
+            domain-compromise path.
+        tier0_count: Already-Tier-0 accounts with a domain-compromise path.
+        total: The honest takeover blast radius (drives CLEAN only).
+        domain_user_count: Enabled domain-user population, the denominator for the
+            everyone-Tier-0 guard. ``None`` / ``<= 0`` disables the guard.
+
+    Returns:
+        The :class:`DomainTakeoverKpiState`.
     """
     if escalator_count >= 1:
+        return DomainTakeoverKpiState.CRITICAL
+    # Everyone-/most-Tier-0 guard: a dominant Tier-0 share is ~100% ransomware
+    # exposure by construction — never a green baseline.
+    if (
+        domain_user_count is not None
+        and domain_user_count > 0
+        and tier0_count >= _TIER0_DOMINANCE_THRESHOLD * domain_user_count
+    ):
         return DomainTakeoverKpiState.CRITICAL
     if tier0_count >= 1:
         return DomainTakeoverKpiState.BASELINE
@@ -1091,7 +1133,12 @@ def domain_takeover_kpi_state(
 
 
 def domain_takeover_kpi_segments(
-    *, total: int, tier0: int, tier1: int, tier2: int
+    *,
+    total: int,
+    tier0: int,
+    tier1: int,
+    tier2: int,
+    domain_user_count: int | None = None,
 ) -> dict[str, Any]:
     """Segment the domain-takeover KPI into its canonical parts + severity state.
 
@@ -1108,6 +1155,9 @@ def domain_takeover_kpi_segments(
         tier0: Accounts already inside Tier 0 (expected administrators).
         tier1: Tier 1 accounts (server / application admins) reaching Tier 0.
         tier2: Tier 2 accounts (standard) reaching Tier 0.
+        domain_user_count: Enabled domain-user population — the denominator for
+            the everyone-/most-Tier-0 guard in :func:`domain_takeover_kpi_state`.
+            ``None`` / ``<= 0`` disables the guard (escalator-driven behaviour).
 
     Returns:
         A flat dict both surfaces render directly:
@@ -1124,6 +1174,7 @@ def domain_takeover_kpi_segments(
         escalator_count=escalator_count,
         tier0_count=tier0_count,
         total=max(0, int(total)),
+        domain_user_count=domain_user_count,
     )
     return {
         "total": max(0, int(total)),
@@ -1131,6 +1182,82 @@ def domain_takeover_kpi_segments(
         "tier0_count": tier0_count,
         "state": state.value,
         "tone": domain_takeover_kpi_tone(state),
+    }
+
+
+def derive_ordinary_breaker_stat(
+    *, tier0: int, tier1: int, tier2: int, domain_user_count: int
+) -> dict[str, Any]:
+    """Derive the tier-aware, NON-CIRCULAR ordinary-account domain-compromise stat.
+
+    This is the SSOT for the domain-breaker blast-radius HEADLINE both the PDF
+    report and the web dashboard render. It answers the question a CISO actually
+    cares about: how many ORDINARY (non-Tier-0) domain users hold a validated
+    path to FULL domain compromise, out of the total ordinary domain population.
+
+    Why exclude the already-Tier-0 accounts. When the domain-compromise path
+    originates at a broad group (Domain Users / Authenticated Users), 100% of
+    domain users "hold" the path — including the handful of accounts that ARE
+    the domain (Domain Admins, the built-in Administrator, the DC computer
+    accounts). Counting "they have a path TO compromising the domain" for an
+    account that already IS Tier 0 is circular: it inflates and confuses the
+    headline. The finding is the ordinary users, so the numerator and the
+    denominator both drop the Tier-0 population.
+
+    Denominator. ``ordinary_total`` is the domain's non-Tier-0 user population,
+    ``domain_user_count - tier0``. When the whole domain is in scope (the broad
+    group case), the affected Tier-0 count equals the domain's Tier-0 count, so
+    ``domain_user_count - tier0`` equals the ordinary users that hold the path
+    and the stat reads X of X (100% of non-administrative accounts). In a
+    partial-scope case the affected Tier-0 count is a lower bound of the
+    domain's Tier-0 population, so the denominator is an upper bound of the true
+    ordinary total — a conservative percentage that never overstates the alarm.
+    The denominator is floored at ``ordinary_with_breaker`` so a degenerate
+    input (unknown / zero ``domain_user_count``) can never report more affected
+    than the population.
+
+    Args:
+        tier0: Tier-0 accounts with a validated domain-compromise path (the
+            already-privileged baseline, i.e. the compromise target itself).
+        tier1: Tier-1 accounts with a validated domain-compromise path.
+        tier2: Tier-2 accounts with a validated domain-compromise path.
+        domain_user_count: Total enabled domain users (the population). ``0`` /
+            unknown disables the percentage denominator gracefully.
+
+    Returns:
+        A flat dict both surfaces render directly:
+
+        * ``ordinary_with_breaker`` — ``tier1 + tier2`` (the FINDING numerator:
+          non-administrative accounts with a full-compromise path).
+        * ``ordinary_total`` — the denominator (non-Tier-0 domain population).
+        * ``pct_non_admin`` — ``ordinary_with_breaker / ordinary_total * 100``.
+        * ``total_with_breaker`` — ``tier0 + tier1 + tier2`` (context: every
+          account with the path, ordinary + already-privileged).
+        * ``tier0_with_breaker`` — ``tier0`` (context: already-privileged, the
+          compromise target itself — never the alarming number).
+        * ``tier_breakdown`` — ``{tier0, tier1, tier2}`` echoed (the tuple the
+          web-mirror contract test compares against).
+        * ``available`` — whether there is anything to render.
+    """
+    t0 = max(0, int(tier0))
+    t1 = max(0, int(tier1))
+    t2 = max(0, int(tier2))
+    total_users = max(0, int(domain_user_count))
+    ordinary_with_breaker = t1 + t2
+    ordinary_total = max(total_users - t0, ordinary_with_breaker)
+    pct_non_admin = (
+        round(ordinary_with_breaker / ordinary_total * 100.0, 1)
+        if ordinary_total > 0
+        else 0.0
+    )
+    return {
+        "ordinary_with_breaker": ordinary_with_breaker,
+        "ordinary_total": ordinary_total,
+        "pct_non_admin": pct_non_admin,
+        "total_with_breaker": t0 + t1 + t2,
+        "tier0_with_breaker": t0,
+        "tier_breakdown": {"tier0": t0, "tier1": t1, "tier2": t2},
+        "available": (t0 + t1 + t2) > 0,
     }
 
 

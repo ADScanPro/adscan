@@ -83,6 +83,7 @@ def _detect_distribution() -> Dict[str, str | None]:
 
     except (OSError, IOError, FileNotFoundError, KeyError, ValueError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {
             "id": "debian",
             "id_like": "debian",
@@ -150,6 +151,7 @@ def _get_debian_base_version(distro_id: str, version_codename: str | None) -> st
 
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     return "bookworm"
 

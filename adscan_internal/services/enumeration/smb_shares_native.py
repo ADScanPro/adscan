@@ -43,6 +43,7 @@ from adscan_internal.services.smb_transport import (
     SMBSigningRequiredError,
     smb_machine_with_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 NativeSharesStatus = Literal["ok", "denied", "error", "partial"]
@@ -299,6 +300,7 @@ async def _probe_share_access(
         return labels, None
     except Exception as exc:  # noqa: BLE001 — boundary; re-emit as soft error
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return [], str(exc)
 
 
@@ -404,6 +406,7 @@ async def enumerate_shares_native(
         result.error = f"Share enumeration timed out after {timeout}s"
     except Exception as exc:  # noqa: BLE001 — outer boundary
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         result.status = "error"
         result.error = str(exc)
         print_info_debug(f"[native-shares] unexpected error: {exc}")
@@ -522,6 +525,7 @@ async def enumerate_sessions_native(
         result.error = f"Session enumeration timed out after {timeout}s"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         result.status = "error"
         result.error = str(exc)
         print_info_debug(f"[native-sessions] unexpected error: {exc}")

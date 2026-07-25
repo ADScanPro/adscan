@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_info, print_info_debug
+from adscan_core.rich_output import print_exception
 
 # ---------------------------------------------------------------------------
 # SMB2 constants (minimal set for NEGOTIATE + SESSION_SETUP)
@@ -250,6 +251,7 @@ async def _handle_smb_connection(
     except Exception as exc:
         try:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         except Exception:
             pass
         print_info_debug(f"[smb-krb-capture] error from {peer_ip}: {exc}")

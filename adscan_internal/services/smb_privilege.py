@@ -35,6 +35,7 @@ from adscan_internal.services.smb_transport import (
     SMBConnectionError,
     smb_machine_with_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.domain_posture import DomainPosture
@@ -242,6 +243,7 @@ async def check_smb_privilege(config: SMBPrivilegeConfig) -> SMBPrivilegeResult:
 
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[smb_privilege] {config.username}@{host_label}: unexpected error — {exc}"
         )
@@ -420,6 +422,7 @@ async def verify_domain_user_local_admin(
         return await check_smb_privilege(cfg)
     except Exception as exc:  # noqa: BLE001 — must never raise to caller
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return SMBPrivilegeResult(
             target_ip=host,
             target_hostname=target_hostname,

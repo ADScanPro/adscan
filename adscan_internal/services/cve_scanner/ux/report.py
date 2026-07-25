@@ -26,6 +26,7 @@ from adscan_internal.services.cve_scanner.result import (
     CVEStatus,
     Severity,
 )
+from adscan_core.rich_output import print_exception
 
 
 _SAFE_FS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -51,6 +52,7 @@ def persist_report(workspace_dir: str | Path, report: CVEScanReport) -> Path:
             _persist_evidence(scan_dir, result)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"[cve_scanner] failed to persist report: {exc}")
     print_info_verbose(f"[cve_scanner] report persisted to {scan_dir}")
     return scan_dir
@@ -80,6 +82,7 @@ def load_report_summary(scan_dir: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 

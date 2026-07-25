@@ -21,6 +21,7 @@ from typing import Any
 from adscan_core import telemetry
 from adscan_internal.services.credential_harvest_record import HarvestedPrincipal
 from adscan_internal.workspaces.io import read_json_file, write_json_file
+from adscan_core.rich_output import print_exception
 
 HARVEST_ARTIFACT_FILENAME = "credential_harvest.json"
 _SCHEMA_VERSION = "1.0"
@@ -42,6 +43,7 @@ def load_harvest_records(shell: Any) -> list[HarvestedPrincipal]:
         raw = read_json_file(path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return []
     principals = raw.get("principals") if isinstance(raw, dict) else None
     if not isinstance(principals, list):
@@ -84,6 +86,7 @@ def append_harvest_records(shell: Any, records: list[HarvestedPrincipal]) -> Non
         write_json_file(path, payload)
     except Exception as exc:  # noqa: BLE001 — persistence is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 __all__ = [

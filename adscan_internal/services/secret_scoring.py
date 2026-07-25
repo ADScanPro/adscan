@@ -251,6 +251,8 @@ _CS_CUSTOM_RULE_EXTRACTION_WEIGHTS: dict[str, float] = {
     "CMD Net Use":                        0.10,
     "DOC Password To":                    0.10,
     "DOC Password Inline":                0.10,
+    # PowerShell key-encrypted SecureString blob — magic-anchored, near-certain
+    "PS ConvertFrom-SecureString KeyEncrypted": 0.90,
 }
 
 

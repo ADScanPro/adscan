@@ -42,6 +42,7 @@ from typing import Any, Literal
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 SAMRStatus = Literal["done", "denied", "error"]
@@ -154,6 +155,7 @@ async def list_users_in_domain_handle(
         return users, "done", None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         msg = str(exc)
         if _is_access_denied(exc):
             return users, "denied", msg
@@ -195,6 +197,7 @@ async def query_user_all_info(
         return user, "done", None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return user, ("denied" if _is_access_denied(exc) else "error"), str(exc)
     finally:
         if uhandle is not None:
@@ -267,6 +270,7 @@ async def _open_samrpc_and_pick_domain(
         return samrpc, domain_handle, "done", None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         await _safe_close(samrpc)
         msg = str(exc)
         return None, None, ("denied" if _is_access_denied(exc) else "error"), msg
@@ -416,6 +420,7 @@ async def _list_alias_members_into(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return (
             members,
             ("denied" if _is_access_denied(exc) else "error"),
@@ -491,6 +496,7 @@ async def enumerate_alias_members_via(
                     print_info_debug(f"[native-samr] alias rid={rid} error: {err_msg}")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return (
             result,
             ("denied" if _is_access_denied(exc) else "error"),
@@ -572,6 +578,7 @@ async def get_local_admin_rids_via(
             return admin_rids, st, err_msg
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return (
             admin_rids,
             ("denied" if _is_access_denied(exc) else "error"),
@@ -625,6 +632,7 @@ async def get_user_flags_for_rids_via(
         return flags, "done", last_error_holder[0] if last_error_holder else None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return flags, "error", str(exc)
     finally:
         await _safe_close(samrpc)

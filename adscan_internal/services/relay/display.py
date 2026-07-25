@@ -119,6 +119,17 @@ def print_relay_cert_result(
     get_console().print(panel)
 
 
+def print_relay_not_viable(technique: str, reason: str) -> None:
+    """Report that a relay technique is not viable, so no coercion was attempted.
+
+    Used when a pre-flight probe already proved the avenue cannot yield a
+    result (e.g. the CA web-enrollment endpoint is not listening). Aborting
+    before coercion avoids an OPSEC-costly, EDR-visible authentication attempt
+    against a target that can never complete the relay.
+    """
+    print_warning(f"{technique}: {reason} Coercion was not attempted.")
+
+
 def print_relay_no_auth(technique: str, timed_out: bool, coercion_success: bool) -> None:
     if timed_out:
         print_warning(

@@ -38,6 +38,7 @@ import json
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Any, Iterable
+from adscan_core.rich_output import print_exception
 
 
 @dataclass
@@ -210,6 +211,7 @@ def scan_description_credentials(
         from adscan_core import telemetry
 
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"Description credsweeper scan skipped: {type(exc).__name__}: {exc}"
         )

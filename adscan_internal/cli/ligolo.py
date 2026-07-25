@@ -301,6 +301,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(
                         f"[ligolo] Failed to reconcile workspace state after tunnel stop: {exc}"
                     )
@@ -452,6 +453,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[ligolo] Failed to reconcile workspace state after proxy stop: {exc}"
             )

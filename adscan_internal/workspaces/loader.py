@@ -238,6 +238,7 @@ def _refresh_domain_dc_metadata(
                         }
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[workspace_load] Failed to refresh DC metadata for {mark_sensitive(domain, 'domain')}: {exc}"
             )
@@ -296,6 +297,7 @@ def _refresh_domain_dc_metadata(
             )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[workspace_load] Failed writing dcs.txt for {mark_sensitive(domain, 'domain')}: {exc}"
         )
@@ -397,6 +399,7 @@ def _sync_tunnel_pivot_host_ip(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[workspace_load] Failed to sync tunnel pivot_host for {mark_sensitive(domain, 'domain')}: {exc}"
         )
@@ -421,6 +424,7 @@ def _sync_tunnel_pivot_host_ip(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[workspace_load] Failed to update IP in {mark_sensitive(rpath, 'path')}: {exc}"
             )
@@ -562,6 +566,7 @@ def _build_workspace_dns_repair_network_context(shell: WorkspaceLoaderShell) -> 
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[workspace_dns_repair] network context check failed: {exc}")
         lines.append("Current interface IP: [dim]unknown[/dim] (probe failed)")
         return "\n".join(lines)
@@ -738,6 +743,7 @@ def _attempt_workspace_dns_repair_interactive(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             f"Interactive DNS repair failed for {marked_domain}. "
             "Continuing without blocking workspace load."
@@ -778,6 +784,7 @@ def _pdc_directly_reachable(pdc_ip: str) -> bool:
         probe = run_async_sync(tcp_probe_multi(pdc_ip, [445, 389, 88], timeout=2.0))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
     return getattr(probe, "status", "") == "open"
 
@@ -900,6 +907,7 @@ def _classify_workspace_pivot_domains(
 
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[workspace_load] pivot domain classification failed: {exc}")
 
     return relaunch_domains, pivot_dns_domains
@@ -1108,6 +1116,7 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[workspace_load] pivot runtime reconciliation failed: {exc}"
                 )
@@ -1262,6 +1271,7 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(f"[workspace_load] pivot relaunch offer failed: {exc}")
 
             # ── Phase 3: DNS for pivot-dependent domains ─────────────────────────
@@ -1305,6 +1315,7 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[workspace_load] current-vantage refresh offer failed: {exc}"
                 )
@@ -1344,6 +1355,7 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             maybe_offer_incomplete_scan_resume(shell)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[workspace_load] incomplete-scan resume offer failed: {exc}")
     else:
         print_error(

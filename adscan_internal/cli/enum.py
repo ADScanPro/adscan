@@ -53,7 +53,7 @@ def ask_for_enum_shares(self, domain: str, username: str, password: str) -> None
         default=True,
         icon="📁",
     ):
-        self.netexec_auth_shares(domain, username, password)
+        self.smb_auth_shares(domain, username, password)
 
 
 def ask_for_found_credentials(self, domain: str) -> None:
@@ -266,10 +266,10 @@ def do_enum_configs(self, domain: str) -> None:
     # Step 9: Password Policy
     tracker.start_step(
         "Password Policy Audit",
-        details="Capturing domain password policy from NetExec --pass-pol",
+        details="Reading the domain password policy from the native posture system",
     )
     try:
-        self.do_netexec_pass_policy(domain)
+        self.do_password_policy(domain)
         tracker.complete_step(details="Password policy captured")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Password policy error: {str(e)[:50]}")
@@ -277,10 +277,10 @@ def do_enum_configs(self, domain: str) -> None:
     # Step 10: Obsolete Operating Systems
     tracker.start_step(
         "Obsolete Operating Systems Audit",
-        details="Capturing obsolete hosts from NetExec LDAP obsolete module",
+        details="Capturing obsolete hosts from the native collector's LDAP inventory",
     )
     try:
-        self.do_netexec_obsolete(domain)
+        self.do_obsolete_os_audit(domain)
         tracker.complete_step(details="Obsolete operating system audit completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Obsolete OS audit error: {str(e)[:50]}")
@@ -291,7 +291,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Capturing LDAP signing and channel binding posture on Domain Controllers",
     )
     try:
-        self.do_netexec_ldap_security(domain)
+        self.do_ldap_security_audit(domain)
         tracker.complete_step(
             details="LDAP signing and channel binding posture captured"
         )
@@ -304,7 +304,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Capturing hosts that still expose SMBv1 across the selected SMB scope",
     )
     try:
-        self.do_netexec_smbv1(domain)
+        self.do_smbv1_audit(domain)
         tracker.complete_step(details="SMBv1 exposure audit completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"SMBv1 audit error: {str(e)[:50]}")
@@ -345,6 +345,7 @@ def _is_dc_relay_target(self, domain: str, host: str) -> bool:
             return bool(self.is_computer_dc(domain, host))
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     domain_data = (
         self.domains_data.get(domain, {}) if hasattr(self, "domains_data") else {}
@@ -613,6 +614,7 @@ def execute_generate_relay_list(self, domain: str) -> None:
                             prefix="[relay-list]",
                         ):
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
                 if comps:
                     self.update_report_field(
                         domain,

@@ -42,6 +42,7 @@ from adscan_internal.services.posture_sink import (  # noqa: F401  (re-exported)
     PostureSink,
     make_workspace_posture_sink,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +526,7 @@ def _emit_posture_signal(
         sink(signal)
     except Exception as sink_exc:
         telemetry.capture_exception(sink_exc)
+        print_exception(exception=sink_exc)
         print_info_debug(
             f"[smb_transport] posture sink raised: "
             f"{type(sink_exc).__name__}: {sink_exc}"
@@ -636,6 +638,7 @@ def _emit_smb_success_posture(
             )
     except Exception as attr_exc:
         telemetry.capture_exception(attr_exc)
+        print_exception(exception=attr_exc)
         print_info_debug(
             f"[smb_transport] signing attribute read failed: "
             f"{type(attr_exc).__name__}: {attr_exc}"
@@ -723,6 +726,7 @@ async def smb_probe_ntlm_session_setup(config: SMBConfig) -> SMBSessionSetupOutc
         from aiosmb.commons.connection.factory import SMBConnectionFactory
     except ImportError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise SMBConnectionError(
             f"aiosmb is not available in this runtime environment: {exc}"
         ) from exc
@@ -774,6 +778,7 @@ async def smb_probe_ntlm_session_setup(config: SMBConfig) -> SMBSessionSetupOutc
             await connection.disconnect()
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
+            print_exception(exception=disc_exc)
 
 
 async def smb_negotiate_signing(config: SMBConfig) -> SMBSigningNegotiation:
@@ -813,6 +818,7 @@ async def smb_negotiate_signing(config: SMBConfig) -> SMBSigningNegotiation:
         from aiosmb.commons.connection.factory import SMBConnectionFactory
     except ImportError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise SMBConnectionError(
             f"aiosmb is not available in this runtime environment: {exc}"
         ) from exc
@@ -847,6 +853,7 @@ async def smb_negotiate_signing(config: SMBConfig) -> SMBSigningNegotiation:
             await connection.disconnect()
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
+            print_exception(exception=disc_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -933,9 +940,30 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
         from aiosmb.commons.interfaces.machine import SMBMachine
     except ImportError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise SMBConnectionError(
             f"aiosmb is not available in this runtime environment: {exc}"
         ) from exc
+
+    # Transversal PROACTIVE clock sync at the auth seam: before ANY Kerberos SMB
+    # auth, ensure the host clock is fresh vs the target DC. TTL-memoized (~1ms
+    # no-op when fresh), best-effort (never raises), shell-less via the
+    # session-registered shell (dc_time SSOT). Without this the SMB collector's
+    # member-server Kerberos auth failed under DC clock skew where the DC/LDAP
+    # path recovered — clock sync now belongs to the SMB transport seam, so no
+    # caller (collector, coercion, dumps, exec) can bypass it.
+    if config.use_kerberos:
+        try:
+            from adscan_internal.services.dc_time import (  # noqa: PLC0415
+                ensure_clock_synced_for_target,
+            )
+
+            await ensure_clock_synced_for_target(
+                str(config.domain or ""),
+                str(config.kdc_ip or config.target_kdc_ip or ""),
+            )
+        except Exception:  # noqa: BLE001 — never let the sync break the connection
+            pass
 
     # Self-healing retry budget: at most one retry per call, scoped to
     # the recovery key (sign-flag flip). Identical pattern to the LDAP
@@ -1008,12 +1036,14 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
         except asyncio.TimeoutError as exc:
             # Network-level — not posture-relevant.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             raise SMBConnectionError(
                 f"SMB connection to {effective_config.target_ip} timed out "
                 f"after {effective_config.timeout}s"
             ) from exc
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             _emit_smb_failure_posture(
                 effective_config,
                 exc=exc,
@@ -1283,6 +1313,7 @@ async def download_admin_file_bytes(machine: Any, remote_win_path: str) -> bytes
         await smb_file.close()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[smb-transport] close failed (ignored): {exc}")
 
     # Best-effort remote cleanup — surface failures visibly so the operator
@@ -1298,6 +1329,7 @@ async def download_admin_file_bytes(machine: Any, remote_win_path: str) -> bytes
             print_info_debug(f"[smb-transport] del_file error: {derr}")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         from adscan_core.rich_output import print_warning as _pw
         _pw(
             f"Remote file not deleted (exception): {admin_path}\n"
@@ -1349,6 +1381,7 @@ async def read_unc_file_bytes(
             await smb_file.close()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[smb-transport] close failed (ignored): {exc}")
 
     return bytes(buf)
@@ -1414,6 +1447,7 @@ async def upload_unc_file_from_local(
             await smb_file.flush()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[smb-transport] flush failed (ignored): {exc}")
         return int(written or 0)
     finally:
@@ -1421,6 +1455,7 @@ async def upload_unc_file_from_local(
             await smb_file.close()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[smb-transport] close failed (ignored): {exc}")
 
 
@@ -1456,6 +1491,7 @@ async def upload_unc_file_bytes(machine: Any, remote_unc_path: str, data: bytes)
             await smb_file.flush()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[smb-transport] flush failed (ignored): {exc}")
         return int(written or 0)
     finally:
@@ -1463,6 +1499,7 @@ async def upload_unc_file_bytes(machine: Any, remote_unc_path: str, data: bytes)
             await smb_file.close()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[smb-transport] close failed (ignored): {exc}")
 
 
@@ -1549,6 +1586,7 @@ async def create_unc_directory(machine: Any, remote_unc_path: str) -> None:
                 await machine.connection.close(tree_id, file_id)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[smb-transport] close after mkdir failed (ignored): {exc}"
                 )
@@ -1557,6 +1595,7 @@ async def create_unc_directory(machine: Any, remote_unc_path: str) -> None:
             await machine.connection.tree_disconnect(tree_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[smb-transport] tree_disconnect after mkdir failed (ignored): {exc}"
             )

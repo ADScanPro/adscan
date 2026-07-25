@@ -35,6 +35,10 @@ from aiosmb.dcerpc.v5.dcom.wmiutils.cmdexec import wmi_cmd_exec
 from aiosmb.dcerpc.v5.dcom.mmc import MMC20Application, CLSID_MMC20, IID_IDispatch
 from aiosmb.dcerpc.v5.dcom.shellwindows import ShellWindows, CLSID_ShellWindows, ShellBrowserWindow, CLSID_ShellBrowserWindow, CLSID_ShellWindows
 from aiosmb.dcerpc.v5.dcom.certreq import ICertRequestD, CLSID_ICertRequest, IID_ICertRequestD
+from aiosmb.dcerpc.v5.dcom.certadmin import (
+	ICertAdminD2, CLSID_ICertAdmin, IID_ICertAdminD2,
+	ICertAdminD, CLSID_ICertAdminD, IID_ICertAdminD,
+)
 from aiosmb.dcerpc.v5.interfaces.icprmgr import ICPRRPC
 
 from aiosmb.dcerpc.v5 import tsch, scmr
@@ -1562,6 +1566,88 @@ class SMBMachine:
 					raise err
 				async with ICertRequestD(iInterface) as cert_request:
 					return await cert_request.get_ca_cert(ca_name, get_chain=get_chain)
+		except Exception as e:
+			return None, e
+
+	async def get_ca_security_dcom(self, ca_name: str) -> Tuple[bytes, Union[Exception, None]]:
+		"""
+		Read a CA's authoritative security descriptor via DCOM (ICertAdminD2 GetCASecurity).
+
+		Side-effect-free MS-CSRA read (opnum 36, no SetCASecurity/ACL mutation).
+		Kerberos-native: the DCOM connection is opened off this SMB connection's
+		GSSAPI context, so it reuses the connection's Kerberos ticket. Surfaces
+		DELEGATED ManageCA / ManageCertificates holders (ESC7) that the CA object's
+		LDAP nTSecurityDescriptor omits.
+
+		Args:
+			ca_name: CA name in format "hostname\\CA-Name" (e.g., "DC01\\MyCA")
+
+		Returns:
+			(sd_bytes, None) on success - raw self-relative security-descriptor bytes
+			(None, Exception) on failure
+		"""
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdmin, IID_ICertAdminD2)
+				if err is not None:
+					raise err
+				async with ICertAdminD2(iInterface) as cert_admin:
+					sd_bytes = await cert_admin.get_ca_security(ca_name)
+					return sd_bytes, None
+		except Exception as e:
+			return None, e
+
+	async def set_ca_security_dcom(self, ca_name: str, sd_bytes: bytes) -> Tuple[int, Union[Exception, None]]:
+		"""
+		Write a CA's authoritative security descriptor via DCOM (ICertAdminD2 SetCASecurity).
+
+		MS-CSRA write (opnum 37) used by ESC7 to grant/revoke ManageCA /
+		ManageCertificates. Kerberos-native: the DCOM connection is opened off
+		this SMB connection's GSSAPI context.
+
+		Args:
+			ca_name: CA name in format "hostname\\CA-Name" (e.g., "DC01\\MyCA")
+			sd_bytes: The raw self-relative security-descriptor bytes to write.
+
+		Returns:
+			(error_code, None) on success — the CA's ErrorCode (0 = success)
+			(None, Exception) on failure
+		"""
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdmin, IID_ICertAdminD2)
+				if err is not None:
+					raise err
+				async with ICertAdminD2(iInterface) as cert_admin:
+					error_code = await cert_admin.set_ca_security(ca_name, sd_bytes)
+					return error_code, None
+		except Exception as e:
+			return None, e
+
+	async def resubmit_cert_request_dcom(self, ca_name: str, request_id: int) -> Tuple[int, Union[Exception, None]]:
+		"""
+		Force-issue a pending/denied request via DCOM (ICertAdminD ResubmitRequest).
+
+		MS-CSRA write (opnum 5, ICertAdminD) used by ESC7 to issue the SubCA
+		request the CA held for approval. Requires the ManageCertificates
+		(officer) right. Kerberos-native.
+
+		Args:
+			ca_name: CA name in format "hostname\\CA-Name" (e.g., "DC01\\MyCA")
+			request_id: The pending request ID to resubmit.
+
+		Returns:
+			(disposition, None) on success — CR_DISP_* (3 = issued, 0 = incomplete)
+			(None, Exception) on failure
+		"""
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdminD, IID_ICertAdminD)
+				if err is not None:
+					raise err
+				async with ICertAdminD(iInterface) as cert_admin:
+					disposition = await cert_admin.resubmit_request(ca_name, request_id)
+					return disposition, None
 		except Exception as e:
 			return None, e
 

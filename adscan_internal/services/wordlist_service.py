@@ -18,6 +18,7 @@ from adscan_internal.rich_output import print_error, print_info
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
 from adscan_internal import path_utils
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,7 @@ class WordlistService(BaseService):
             return os.path.exists(final_wl_path)
         except Exception as exc:  # pragma: no cover - network/env dependent
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return False
 
     def install_all(self) -> Tuple[bool, Dict[str, str]]:

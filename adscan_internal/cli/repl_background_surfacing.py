@@ -50,6 +50,7 @@ import enum
 from typing import Callable
 
 from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 
 
 class ForegroundState(enum.Enum):
@@ -177,9 +178,11 @@ def schedule_idle_prompt_wake(*, is_idle: Callable[[], bool]) -> bool:
                 app.exit(result=BACKGROUND_DRAIN_SENTINEL)
             except Exception as exc:  # noqa: BLE001 — a wake must never crash the loop
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         loop.call_soon_threadsafe(_invoke)
         return True
     except Exception as exc:  # noqa: BLE001 — fall back to the queued drain
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False

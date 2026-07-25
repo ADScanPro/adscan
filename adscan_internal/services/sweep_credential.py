@@ -54,6 +54,7 @@ from typing import Any
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.rich_output import mark_sensitive
+from adscan_core.rich_output import print_exception
 
 __all__ = [
     "SweepCredential",
@@ -247,6 +248,7 @@ def resolve_sweep_credential(
         )
     except Exception as exc:  # noqa: BLE001 — best-effort; classified below
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         mint_exc = exc
         mint_note = f"pre-mint raised: {exc}"
         notes.append(mint_note)

@@ -29,6 +29,12 @@ from typing import Any, Callable
 
 from rich.console import Console
 
+from adscan_core.cli_passthrough_spec import (
+    CI_PASSTHROUGH,
+    DOCTOR_PASSTHROUGH,
+    EXECUTE_PASSTHROUGH,
+    render_passthrough_epilog,
+)
 from adscan_core.interrupts import emit_interrupt_debug
 from adscan_core.theme import ADSCAN_THEME
 from adscan_launcher import __version__
@@ -74,6 +80,7 @@ from adscan_launcher.update_manager import (
     offer_updates_for_command,
     run_update_command,
 )
+from adscan_core.rich_output import print_exception
 
 
 ADSCAN_SUDO_ALIAS_MARKER = "# ADscan auto-sudo alias"
@@ -447,6 +454,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "If autonomous decisions look wrong on your engagement, re-run with "
             "`--debug` and report the trace at https://adscanpro.com/docs."
         ),
+        # The scan arguments below are forwarded to the container runtime through
+        # argparse.REMAINDER (`args`), so argparse cannot list them natively. The
+        # epilog renders them (and real invocation examples) from the shared SSOT
+        # so `adscan ci --help` shows what the run actually requires. The launcher
+        # never re-declares them, so there is no drift; the contract test
+        # (tests/unit/launcher/test_passthrough_spec_contract.py) keeps the SSOT
+        # in lockstep with the container `ci` parser.
+        epilog=render_passthrough_epilog(CI_PASSTHROUGH),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ci.add_argument(
@@ -547,6 +562,11 @@ def _build_parser() -> argparse.ArgumentParser:
     execute_p = sub.add_parser(
         "execute",
         help="Run a single REPL command non-interactively (scripting / smoke-test).",
+        description="Run ONE ADscan REPL verb non-interactively, then exit.",
+        # Forwarded verbatim via REMAINDER; the epilog surfaces the container
+        # flags + examples from the shared SSOT (no drift, no re-declaration).
+        epilog=render_passthrough_epilog(EXECUTE_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     execute_p.add_argument(
         "execute_args",
@@ -556,6 +576,11 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_p = sub.add_parser(
         "doctor",
         help="Fast one-shot health check (DNS, connectivity, auth, posture).",
+        description="Run the pre-engagement validations and print a GREEN/RED matrix.",
+        # Forwarded verbatim via REMAINDER; the epilog surfaces the container
+        # flags + examples from the shared SSOT (no drift, no re-declaration).
+        epilog=render_passthrough_epilog(DOCTOR_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     doctor_p.add_argument(
         "doctor_args",
@@ -1030,6 +1055,7 @@ def _emit_launcher_privilege_context(command: str | None) -> None:
         capture("launcher_privilege_context", context)
     except Exception as exc:  # pragma: no cover - best effort only
         capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _guard_root_shell_without_user_context(command: str | None) -> None:
@@ -1338,6 +1364,7 @@ def _emit_launcher_system_context(command: str | None) -> None:
         capture("telemetry_system_context", event_payload)
     except Exception as exc:  # pragma: no cover - best effort only
         capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _seed_session_environment_from_host() -> None:
@@ -1358,6 +1385,7 @@ def _seed_session_environment_from_host() -> None:
             )
     except Exception as exc:  # pragma: no cover - best effort only
         capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _seed_session_trace_id() -> None:
@@ -1370,6 +1398,7 @@ def _seed_session_trace_id() -> None:
         print_info_debug(f"Seeded ADSCAN_SESSION_TRACE_ID: {trace_id!r}")
     except Exception as exc:  # pragma: no cover - best effort only
         capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _build_launcher_telemetry_console() -> Console:
@@ -1674,6 +1703,7 @@ def _run_pro_passthrough_with_upsell_gate(
             return 0
         except Exception as exc:  # noqa: BLE001 — best-effort upsell render
             capture_exception(exc)
+            print_exception(exception=exc)
             return rc
 
     # Defensive: a malformed exit 42 (e.g. PRO container emitting 42 by
@@ -1778,6 +1808,7 @@ def main(argv: list[str] | None = None) -> None:
             _render_host_welcome()
         except Exception as exc:
             capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Could not render welcome screen.")
         raise SystemExit(0)
 
@@ -1786,6 +1817,7 @@ def main(argv: list[str] | None = None) -> None:
             from adscan_launcher.host_privileged_helper import run_host_helper_server
         except Exception as exc:
             capture_exception(exc)
+            print_exception(exception=exc)
             print_error("Host helper is unavailable in this launcher build.")
             raise SystemExit(2) from exc
         raise SystemExit(run_host_helper_server(str(getattr(ns, "socket", ""))))

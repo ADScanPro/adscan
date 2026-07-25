@@ -245,10 +245,19 @@ class Domain:
 def resolve_dc_ip(domain_data: dict) -> str | None:
     """Return the best-available DC/KDC IP from a domains_data entry.
 
-    Fallback chain: pdc → dc_ip → dcs[0] → None.
+    Fallback chain: pdc → dc_ip → dcs[0] → connectivity.summary.pdc_ip → None.
     'pdc' is the authoritative IP set at scan start and is the most reliably
     populated field. 'dc_ip' is the model field. 'dcs[0]' is the last resort
-    from the discovered DC list.
+    from the discovered DC list. 'connectivity.summary.pdc_ip' covers a
+    domain ADscan has NEVER directly enumerated -- a trust-partner realm
+    discovered only through the cross-domain connectivity precheck
+    (``domain_connectivity_service.merge_domain_connectivity``, run during
+    trust enumeration). That precheck resolves the partner's OWN DC via a real
+    DNS SRV/A lookup against the foreign realm (never the auth domain's DC),
+    so it is a safe last resort -- without it, a caller resolving a trust
+    partner's DC IP (e.g. a cross-domain credential handoff after a
+    linked-server pivot) silently falls back to nothing, or worse, to the
+    WRONG (auth) domain's DC.
 
     Use this everywhere a KDC or DC IP must be resolved from domains_data
     instead of hand-rolling .get("dc_ip") / .get("pdc") chains at each call site.
@@ -264,7 +273,40 @@ def resolve_dc_ip(domain_data: dict) -> str | None:
         first = str(dcs[0]).strip()
         if first:
             return first
+    connectivity = domain_data.get("connectivity")
+    if isinstance(connectivity, dict):
+        summary = connectivity.get("summary")
+        if isinstance(summary, dict):
+            connectivity_pdc_ip = str(summary.get("pdc_ip") or "").strip()
+            if connectivity_pdc_ip:
+                return connectivity_pdc_ip
     return None
+
+
+def resolve_dc_reachability(domain_data: dict) -> bool | None:
+    """Return whether this domain's DC is known-reachable from the current vantage.
+
+    Sourced from the cross-domain connectivity precheck
+    (``domain_connectivity_service.merge_domain_connectivity``), which is the
+    only place ADscan records reachability for a trust-partner domain it has
+    never directly enumerated (e.g. a cross-forest MSSQL linked-server target).
+
+    Returns:
+        ``True``/``False`` when a connectivity observation exists.
+        ``None`` when there is no such observation -- notably the PRIMARY
+        scanned domain, whose own reachability is never in question. Callers
+        should treat ``None`` as "no reason to skip normal live verification",
+        not as "known unreachable".
+    """
+    connectivity = domain_data.get("connectivity")
+    if not isinstance(connectivity, dict):
+        return None
+    summary = connectivity.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    if "reachable" not in summary:
+        return None
+    return bool(summary.get("reachable"))
 
 
 def qualify_host_fqdn(hostname: str | None, domain: str | None) -> str | None:

@@ -41,6 +41,7 @@ from adscan_internal.services.adcs_ca_registry_service import (
 from adscan_internal.services.adcs_web_enrollment_probe import (
     ADCSWebEnrollmentProbe,
     WebEnrollmentProbeResult,
+    WebProbeCredential,
 )
 from adscan_internal.services.collector.acl_parser import ACLParser
 from adscan_internal.services.collector.adcs_detectors import (
@@ -49,6 +50,7 @@ from adscan_internal.services.collector.adcs_detectors import (
 )
 from adscan_internal.services.collector.models import (
     CollectionResult,
+    CollectorEdge,
     CollectorNode,
     NodeKind,
 )
@@ -57,6 +59,7 @@ from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConnection,
 )
 from adscan_internal.services.smb_transport import SMBConfig
+from adscan_core.rich_output import print_exception
 
 # ---------------------------------------------------------------------------
 # Attribute lists per kind
@@ -450,6 +453,7 @@ class ADCSCollector:
             entries = list(self._connection.entries)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[adcs-collector] {label} search failed at {search_base}: {exc}"
             )
@@ -472,6 +476,7 @@ class ADCSCollector:
                         result.add_edge(edge)
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[adcs-collector] {label} entry processing failed: {exc}"
                 )
@@ -502,6 +507,7 @@ class ADCSCollector:
             entries = list(self._connection.entries)
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[adcs-collector] OID-to-group link query failed at {oid_base}: {exc}"
             )
@@ -534,6 +540,7 @@ class ADCSCollector:
                     group_dn = str(raw_group).strip()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 continue
             if oid_value and group_dn:
                 mapping[oid_value] = group_dn
@@ -593,6 +600,7 @@ class ADCSCollector:
             ca_probes, domain_binding = run_async_sync(self._run_probes(cas))
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"[adcs-collector] probe phase failed: {exc}")
 
         cert_mapping_methods, strong_cert_binding_enforced = (
@@ -638,6 +646,7 @@ class ADCSCollector:
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[adcs-collector] esc detection failed for {template.object_id}: {exc}"
                 )
@@ -667,6 +676,7 @@ class ADCSCollector:
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[adcs-collector] esc5 detection failed for {pki_node.object_id}: {exc}"
                 )
@@ -696,8 +706,15 @@ class ADCSCollector:
         # Per-CA detection (ESC7 + probe-driven ESC8 / ESC11).
         ca_added = 0
         for ca in cas:
-            ca_edges = edges_by_target.get(ca.object_id, [])
             probe = ca_probes.get(ca.object_id)
+            # Merge the LDAP-derived CA ACL edges with the ManageCA /
+            # ManageCertificates edges read from the CA's own security
+            # descriptor (MS-CSRA). detect_esc7 dedups by SID, so the overlap
+            # with the LDAP defaults collapses; the delta is the delegated
+            # (non-default) management holders LDAP alone cannot see.
+            ca_edges = list(edges_by_target.get(ca.object_id, []))
+            if probe is not None and probe.ca_security_edges:
+                ca_edges = ca_edges + probe.ca_security_edges
             web_enabled = (
                 probe.web.web_enrollment_enabled
                 if probe is not None and probe.web is not None
@@ -727,6 +744,7 @@ class ADCSCollector:
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[adcs-collector] esc detection failed for CA {ca.object_id}: {exc}"
                 )
@@ -796,12 +814,267 @@ class ADCSCollector:
                 f"(ESC targets → Tier-0 BFS terminals)"
             )
 
+    def _build_web_probe_credential(self) -> WebProbeCredential | None:
+        """Derive an NTLM-usable credential for the EPA test from the connection.
+
+        The EPA (channel-binding) differential test relays NTLM, so it needs a
+        password or NT hash — a Kerberos-only / ccache credential (or an
+        unauthenticated scan) cannot drive it. Returns None in that case, which
+        leaves the EPA state unknown and ESC8 emission unchanged.
+        """
+        config = getattr(self._connection, "config", None)
+        if config is None:
+            return None
+        username = getattr(config, "username", None)
+        password = getattr(config, "password", None)
+        # The Kerberos pre-mint clears config.password to force the ccache bind;
+        # recover the NTLM-usable secret it preserved so the EPA test still runs
+        # on a password-auth Kerberos domain (plaintext OR NT-hash-in-password
+        # both drive the NTLM relay). No credential_context fallback here today.
+        if not password:
+            password = getattr(config, "ntlm_dcom_fallback_secret", None)
+        if not username or not password:
+            return None
+        domain = (
+            getattr(config, "auth_domain", None)
+            or getattr(config, "domain", None)
+            or self._domain
+        )
+        return WebProbeCredential(
+            username=str(username),
+            domain=str(domain),
+            password=str(password),
+        )
+
+    def _build_ca_security_credential(
+        self,
+    ) -> tuple[str, str | None, str | None, str] | None:
+        """Derive ``(username, password, nt_hash, domain)`` for GetCASecurity.
+
+        Mirrors :meth:`_build_web_probe_credential` (reads the connection's
+        ``config``), but also surfaces a pass-the-hash secret: an NT hash stored
+        either in a dedicated ``nt_hash`` field or, for LDAP pass-the-hash, in
+        the ``password`` field (detected via ``_is_nt_hash``). Returns ``None``
+        on a Kerberos-only / unauthenticated scan (no password AND no NT hash),
+        so the CA-security read is skipped cleanly with no error — the same
+        spirit as the EPA credential returning ``None``.
+
+        Credential-context fallback: when the caller authenticated with a
+        password, the LDAP transport pre-mints a Kerberos TGT and rewrites the
+        config via ``dataclasses.replace(config, ccache_path=..., password=None,
+        aes_key=None)`` — so ``config.password`` / ``config.nt_hash`` are
+        ``None`` on exactly the path this DCOM (NTLM/PtH-only) read needs. The
+        retained ``config.credential_context`` (a ``CredentialContext``) still
+        holds the original secret after the pre-mint — that is how the
+        expiry-reminter re-mints. So when the config secret is empty, fall back
+        to that context; without it, delegated ManageCA holders (surfaced only
+        via GetCASecurity over DCOM) would be silently skipped on every
+        Kerberos-capable domain. An explicit config secret still wins; the
+        context is a fallback only, and a Kerberos-ccache-only / unauth
+        credential with no re-mintable secret still yields ``None``.
+        """
+        config = getattr(self._connection, "config", None)
+        if config is None:
+            return None
+        username = getattr(config, "username", None)
+
+        password = getattr(config, "password", None)
+        nt_hash = getattr(config, "nt_hash", None)
+        secret_source = "config-secret" if (password or nt_hash) else "none"
+
+        # The Kerberos pre-mint clears config.password/nt_hash but retains
+        # config.credential_context — recover the secret from there.
+        if not password and not nt_hash:
+            cred_ctx = getattr(config, "credential_context", None)
+            if cred_ctx is not None:
+                password = getattr(cred_ctx, "password", None)
+                nt_hash = getattr(cred_ctx, "nt_hash", None)
+                if not username:
+                    username = getattr(cred_ctx, "username", None)
+                if password or nt_hash:
+                    secret_source = "credential_context"
+
+        # Third fallback: the bind-inert secret the /tmp (no-credential-context)
+        # pre-mint preserved before clearing config.password/aes_key. Without it
+        # a password-auth Kerberos domain with no CredentialContext yields no
+        # NTLM secret and delegated ManageCA holders are silently skipped.
+        if not password and not nt_hash:
+            fallback_secret = getattr(config, "ntlm_dcom_fallback_secret", None)
+            if fallback_secret:
+                password = fallback_secret
+                secret_source = "ntlm_dcom_fallback"
+
+        print_info_debug(
+            f"adcs GetCASecurity credential source={secret_source}"
+        )
+
+        if not username:
+            return None
+
+        # LDAP pass-the-hash carries the NT hash in the password field — applies
+        # to a config secret AND a credential-context-sourced one.
+        if password and not nt_hash:
+            try:
+                from adscan_internal.services.ldap_transport_service import _is_nt_hash
+
+                if _is_nt_hash(str(password)):
+                    nt_hash = str(password)
+                    password = None
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not password and not nt_hash:
+            return None
+
+        domain = (
+            getattr(config, "auth_domain", None)
+            or getattr(config, "domain", None)
+        )
+        if not domain:
+            cred_ctx = getattr(config, "credential_context", None)
+            if cred_ctx is not None:
+                domain = getattr(cred_ctx, "auth_domain", None)
+        domain = domain or self._domain
+        return (
+            str(username),
+            str(password) if password else None,
+            str(nt_hash) if nt_hash else None,
+            str(domain),
+        )
+
+    async def _fetch_ca_security_edges(
+        self, ca: CollectorNode
+    ) -> list[CollectorEdge]:
+        """Read the CA's authoritative security descriptor and parse ESC7 edges.
+
+        Uses the NATIVE async aiosmb DCOM stack (ICertAdminD2::GetCASecurity)
+        driven off ``smb_machine_with_fallback`` — Kerberos-native (reuses the
+        collector's pre-minted TGT ccache) and posture-aware (Kerberos-AES →
+        RC4 → NTLM prioritization). Kerberos-ccache is primary; the recovered
+        NTLM/PtH secret is carried only as the posture-pruned fallback leg.
+
+        Best-effort: any failure (no usable auth, DCOM/CSRA error, parse
+        failure) yields ``[]`` so ADCS collection is never aborted. Consulting
+        the CA security descriptor surfaces ManageCA / ManageCertificates
+        holders that were delegated after CA install and are therefore absent
+        from the CA object's LDAP ``nTSecurityDescriptor``.
+        """
+        import rich.markup
+
+        from adscan_internal.services._kerberos_spn import is_ip_address
+        from adscan_internal.services.collector.adcs_detectors._ca_security import (
+            parse_ca_security_edges,
+        )
+        from adscan_internal.services.smb_transport import smb_machine_with_fallback
+
+        ca_name = ca.name.split("@", 1)[0] if ca.name else ""
+
+        # Kerberos DCOM binds to the CA over cifs/<host> — the SPN must be an
+        # FQDN (§9bis). dns_hostname is the CA's FQDN; if it is missing or an
+        # IP we do NOT synthesize one, we skip cleanly.
+        ca_host = str(ca.properties.get("dns_hostname") or "").strip()
+        if not ca_host or not ca_name:
+            return []
+        if is_ip_address(ca_host):
+            print_info_debug(
+                f"adcs GetCASecurity skipped for {ca_name}: only an IP is "
+                "available for the CA host (need an FQDN for Kerberos DCOM)"
+            )
+            return []
+
+        config = getattr(self._connection, "config", None)
+        ccache_path = getattr(config, "ccache_path", None) if config else None
+
+        # Recover the NTLM/PtH secret (may be None) as the posture-pruned
+        # fallback leg. Kerberos-ccache stays primary.
+        credential = self._build_ca_security_credential()
+        username = password = nt_hash = domain = None
+        if credential is not None:
+            username, password, nt_hash, domain = credential
+        # ccache-only scan: no NTLM secret recovered, but the ccache still
+        # authenticates — resolve username/domain from the LDAP config.
+        if not username and config is not None:
+            username = getattr(config, "username", None)
+        if not domain:
+            domain = (
+                (getattr(config, "auth_domain", None) if config else None)
+                or (getattr(config, "domain", None) if config else None)
+                or self._domain
+            )
+
+        if not username or (not ccache_path and not password and not nt_hash):
+            print_info_debug(
+                f"adcs GetCASecurity skipped for {ca_name}: no Kerberos ccache "
+                "and no NTLM/PtH secret recoverable (unauthenticated scan)"
+            )
+            return []
+
+        posture_snapshot = getattr(config, "posture_snapshot", None) if config else None
+        dc_ip = getattr(config, "dc_ip", None) if config else None
+
+        smb_config = SMBConfig(
+            target_ip=ca_host,
+            target_hostname=ca_host,
+            domain=str(domain),
+            auth_domain=str(domain),
+            username=str(username),
+            password=password,
+            nt_hash=nt_hash,
+            ccache_path=ccache_path,
+            kdc_ip=str(dc_ip) if dc_ip else None,
+            use_kerberos=bool(ccache_path),
+            posture_snapshot=posture_snapshot,
+        )
+
+        source = (
+            "kerberos-ccache (native aiosmb DCOM)"
+            if ccache_path
+            else "ntlm/pth (native aiosmb DCOM)"
+        )
+        print_info_debug(
+            f"adcs GetCASecurity read attempted ca_host="
+            f"{mark_sensitive(ca_host, 'hostname')} ca_name={ca_name} source={source}"
+        )
+
+        sd_bytes = None
+        try:
+            async with smb_machine_with_fallback(smb_config) as machine:
+                sd_bytes, err = await machine.get_ca_security_dcom(ca_name)
+                if err is not None:
+                    raise err
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"adcs GetCASecurity read failed for {ca_name}: "
+                f"{type(exc).__name__}: {rich.markup.escape(str(exc))}"
+            )
+            return []
+
+        edges = parse_ca_security_edges(sd_bytes, ca.object_id)
+        if sd_bytes is None:
+            print_info_debug(
+                f"adcs GetCASecurity read failed for {ca_name}: no security "
+                "descriptor returned (DCOM read error)"
+            )
+        else:
+            print_info_debug(
+                f"adcs GetCASecurity parsed {len(edges)} ManageCA/ManageCertificates "
+                f"edge(s) for {ca_name}"
+            )
+        return edges
+
     async def _run_probes(
         self, cas: list[CollectorNode]
     ) -> tuple[dict[str, "_CAProbeBundle"], tuple[int, bool] | None]:
         """Run all CA-host and DC binding probes concurrently."""
         registry_probe = ADCSCARegistryProbe()
         web_probe = ADCSWebEnrollmentProbe()
+
+        # Scan credential for the active EPA (channel-binding) test on the CA's
+        # HTTPS /certsrv endpoint. None on unauthenticated / Kerberos-only scans
+        # -> the EPA state stays unknown and ESC8 emission is unchanged.
+        web_credential = self._build_web_probe_credential()
 
         ca_probes: dict[str, _CAProbeBundle] = {}
 
@@ -815,9 +1088,12 @@ class ADCSCollector:
             # Web probe — host-only, no credentials needed.
             if ca_host:
                 try:
-                    web_result = await web_probe.probe(host=ca_host)
+                    web_result = await web_probe.probe(
+                        host=ca_host, credential=web_credential
+                    )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(
                         f"[adcs-collector] web probe failed for "
                         f"{mark_sensitive(ca_host, 'host')}: {exc}"
@@ -838,13 +1114,31 @@ class ADCSCollector:
                         )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(
                         f"[adcs-collector] registry probe failed for "
                         f"{mark_sensitive(ca_host, 'host')}: {exc}"
                     )
 
+            # CA security descriptor (MS-CSRA GetCASecurity) — authoritative
+            # ManageCA / ManageCertificates holders, including non-default
+            # (delegated) ones the CA object's LDAP nTSecurityDescriptor omits.
+            # Best-effort: a failure here must never abort ADCS collection.
+            ca_security_edges: list[CollectorEdge] = []
+            try:
+                ca_security_edges = await self._fetch_ca_security_edges(ca)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_info_debug(
+                    "[adcs-collector] CA security read failed for "
+                    f"{mark_sensitive(ca_host, 'host')}: {exc}"
+                )
+
             ca_probes[ca.object_id] = _CAProbeBundle(
-                registry=registry_result, web=web_result
+                registry=registry_result,
+                web=web_result,
+                ca_security_edges=ca_security_edges,
             )
 
         # DC binding probe — single per-domain call for ESC10 inputs.
@@ -854,6 +1148,7 @@ class ADCSCollector:
                 domain_binding = await self._dc_binding_probe(self._domain)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     "[adcs-collector] DC binding probe failed for "
                     f"{mark_sensitive(self._domain, 'domain')}: {exc}"
@@ -864,13 +1159,15 @@ class ADCSCollector:
 
 # Internal probe-result aggregate. Not exported.
 class _CAProbeBundle:
-    __slots__ = ("registry", "web")
+    __slots__ = ("registry", "web", "ca_security_edges")
 
     def __init__(
         self,
         *,
         registry: CARegistryProbeResult | None,
         web: WebEnrollmentProbeResult | None,
+        ca_security_edges: list["CollectorEdge"] | None = None,
     ) -> None:
         self.registry = registry
         self.web = web
+        self.ca_security_edges: list["CollectorEdge"] = ca_security_edges or []

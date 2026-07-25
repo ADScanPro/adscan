@@ -24,6 +24,7 @@ from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from adscan_core import telemetry
 from adscan_internal.workspaces.io import read_json_file, write_json_file
+from adscan_core.rich_output import print_exception
 
 _JOBS_FILENAME = "background_jobs.json"
 _SCHEMA_VERSION = "1.0"
@@ -110,6 +111,7 @@ class BackgroundJobRegistry:
                     return {"schema": _SCHEMA_VERSION, "jobs": list(raw["jobs"])}
         except Exception as exc:  # noqa: BLE001 — a corrupt file must not break load
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         return {"schema": _SCHEMA_VERSION, "jobs": []}
 
     def flush(self) -> None:
@@ -118,6 +120,7 @@ class BackgroundJobRegistry:
                 write_json_file(self._path, dict(self._state))
             except Exception as exc:  # noqa: BLE001 — persistence is best-effort
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     # ── job records ─────────────────────────────────────────────────────────
 
@@ -208,11 +211,13 @@ class BackgroundJobRegistry:
                 summary = runtime.snapshot()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 summary = None
             try:
                 runtime.stop()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
             self.mark(job_id, state="stopped", result_summary=summary)
         else:
             self.mark(job_id, state="stopped")
@@ -242,6 +247,7 @@ class BackgroundJobRegistry:
                 hook()
             except Exception as exc:  # noqa: BLE001 — the wake hook must never break enqueue
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     def drain_notifications(self) -> list[Any]:
         with self._lock:
@@ -285,10 +291,12 @@ class BackgroundJobRegistry:
                 runtime.stop()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
             try:
                 summaries[job_id] = dict(runtime.snapshot())
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         # Phase 3 — re-acquire and stamp ``stopped``; the consumers have now
         # terminated, so no late mark can flip these back to ``running``.
         with self._lock:
@@ -319,4 +327,5 @@ def get_or_create_registry(shell: Any) -> BackgroundJobRegistry:
         shell._background_jobs = registry  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return registry

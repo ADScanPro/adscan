@@ -61,6 +61,7 @@ from adscan_internal.services.smb_transport import (
     smb_machine_with_fallback,
     upload_unc_file_bytes,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +329,7 @@ class GPOExploitationMixin:
                         await ldap_client.disconnect()
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                 if in_pu:
                     raise RuntimeError(
                         "Authenticating principal is a member of Protected Users; "
@@ -351,6 +353,7 @@ class GPOExploitationMixin:
                     original_gpt_ini = gpt_ini_local.read_bytes()
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     raise RuntimeError(
                         f"Failed to read existing gpt.ini at {gpt_ini_unc}: {exc}"
                     ) from exc
@@ -388,6 +391,7 @@ class GPOExploitationMixin:
                     await ldap_client.disconnect()
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
             new_version = compute_next_machine_version(current_version)
             new_extensions = merge_machine_extension_names(current_extensions)
@@ -534,12 +538,14 @@ class GPOExploitationMixin:
 
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"GPO immediate-task plant failed: {exc}")
             # Best-effort rollback of whatever did succeed.
             try:
                 await _rollback(undo_stack, ledger)
             except Exception as rb_exc:  # noqa: BLE001
                 telemetry.capture_exception(rb_exc)
+                print_exception(exception=rb_exc)
                 print_error(f"GPO rollback also failed: {rb_exc}")
             return GPOImmediateTaskResult(
                 success=False,
@@ -572,6 +578,7 @@ def _make_dir_undo(
             ledger.mark_reverted(change_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             ledger.mark_failed(
                 change_id,
                 error=str(exc),
@@ -596,6 +603,7 @@ def _make_file_undo(
             ledger.mark_reverted(change_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             ledger.mark_failed(
                 change_id,
                 error=str(exc),
@@ -623,6 +631,7 @@ def _make_gptini_undo(
             ledger.mark_reverted(change_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             import base64
 
             ledger.mark_operator_required(
@@ -659,6 +668,7 @@ def _make_ldap_undo(
             ledger.mark_reverted(change_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             ledger.mark_operator_required(
                 change_id,
                 manual_cleanup_instructions=(
@@ -709,6 +719,7 @@ async def _ldap_modify_versions(
             await client.disconnect()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 async def _rollback(
@@ -731,4 +742,5 @@ async def _rollback(
             await undo()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"Rollback step failed (continuing): {description}: {exc}")

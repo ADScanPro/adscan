@@ -32,7 +32,7 @@ class AIPolicyExecutor:
         "show_domain_info": "info",
         "start_authenticated_scan": "start_auth",
         "enumerate_kerberos_users": "kerberos_enum_users",
-        "enumerate_shares": "netexec_auth_shares",
+        "enumerate_shares": "smb_auth_shares",
         "run_kerberoast": "kerberoast",
         "run_dcsync": "dcsync",
     }

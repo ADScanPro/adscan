@@ -44,6 +44,7 @@ from adscan_internal.services.posture_probe import (
     ProbePhase,
     ProbeResult,
 )
+from adscan_core.rich_output import print_exception
 
 
 # Categories each phase covers — used by the freshness check to decide
@@ -233,6 +234,7 @@ async def ensure_posture_fresh(
             posture = get_posture(domains_data, domain=domain_str)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             posture = None
 
         relevant = (
@@ -275,6 +277,7 @@ async def ensure_posture_fresh(
             results = await runner(shell, **kwargs)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Posture freshness guard failed: {type(exc).__name__}. "
                 "Continuing with conservative defaults."

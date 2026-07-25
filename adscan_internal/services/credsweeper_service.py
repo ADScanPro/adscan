@@ -49,6 +49,7 @@ from adscan_internal import (
     print_warning_debug,
 )
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger(__name__)
@@ -466,6 +467,7 @@ def _build_profiled_rules_variant(
         return str(output_path)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         logger.exception(
             "Failed to build CredSweeper rules variant for profile %s from %s",
             profile,
@@ -792,6 +794,7 @@ class CredSweeperService(BaseService):
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning(f"Credential analysis failed for path ({label} rules).")
                 print_warning_debug(
                     f"[credsweeper] Library analysis failed ({label}): {type(exc).__name__}: {exc}"
@@ -1021,6 +1024,7 @@ class CredSweeperService(BaseService):
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_warning_debug(
                     f"[credsweeper] Failed to prepare sanitized XML copy for {file_path}: {type(exc).__name__}"
                 )

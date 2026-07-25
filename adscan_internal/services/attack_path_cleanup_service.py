@@ -28,6 +28,7 @@ from adscan_internal.services.ldap_transport_service import (
 from adscan_internal.services.membership_snapshot import (
     remove_runtime_user_group_membership,
 )
+from adscan_core.rich_output import print_exception
 
 _CLEANUP_SCOPE_ATTR = "_attack_path_cleanup_scopes"
 
@@ -299,6 +300,7 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         if not (
             target_group and added_user and exec_username and exec_password and pdc_host
@@ -379,6 +381,7 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
             print_info(
                 "Attack-path cleanup completed and verified: "
                 f"removed {mark_sensitive(added_user, 'user')} from "
@@ -437,6 +440,7 @@ def _build_verification_conn(
         return ADscanLDAPConnection(config)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -471,6 +475,7 @@ def _revert_group_membership_with_verify(
                 ledger.mark_revert_in_progress(change_id)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         try:
             result = ExploitationService().acl.remove_group_member(
                 pdc_host=pdc_host,
@@ -485,6 +490,7 @@ def _revert_group_membership_with_verify(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             last_error = str(exc)
             if _is_transient_failure(exc) and ledger is not None and change_id:
                 used = ledger.mark_revert_retry(change_id, error=last_error)
@@ -581,4 +587,5 @@ def _verify_group_membership_revert(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False

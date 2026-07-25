@@ -71,6 +71,24 @@ def _coerce_timeout_output_text(output: str | bytes | None) -> str:
     return str(output)
 
 
+def _cap_line(line: str, max_line_length: int | None) -> str:
+    """Truncate one line to ``max_line_length`` chars with a ``[…N chars]`` suffix.
+
+    Shared by every preview builder in this module (``build_text_preview``,
+    ``build_execution_output_preview``) so a single line-width policy applies
+    to any debug preview, whether it wraps a script/query/payload string or a
+    command's captured stdout/stderr. A payload embedding a large inline blob
+    on one physical line (e.g. a hex-encoded ``CREATE ASSEMBLY`` statement, a
+    base64 chunk read back from stdout) would otherwise produce a single
+    multi-KB log line that chokes line-oriented tooling (grep, terminal
+    wrapping, log viewers) even though the head/tail LINE COUNT cap looks
+    small.
+    """
+    if max_line_length and len(line) > max_line_length:
+        return line[:max_line_length] + f" […{len(line)} chars]"
+    return line
+
+
 def build_text_preview(
     text: str | None,
     *,
@@ -105,16 +123,11 @@ def build_text_preview(
     )
     omitted_lines = len(lines) - len(head_lines) - len(tail_lines)
 
-    def _cap(line: str) -> str:
-        if max_line_length and len(line) > max_line_length:
-            return line[:max_line_length] + f" […{len(line)} chars]"
-        return line
-
     preview_lines: list[str] = []
-    preview_lines.extend(_cap(ln) for ln in head_lines)
+    preview_lines.extend(_cap_line(ln, max_line_length) for ln in head_lines)
     if include_omission_notice and omitted_lines > 0:
         preview_lines.append(f"... ({omitted_lines} line(s) omitted) ...")
-    preview_lines.extend(_cap(ln) for ln in tail_lines)
+    preview_lines.extend(_cap_line(ln, max_line_length) for ln in tail_lines)
     return "\n".join(preview_lines)
 
 
@@ -151,8 +164,26 @@ def build_execution_output_preview(
     stdout_tail: int = 10,
     stderr_head: int = 10,
     stderr_tail: int = 10,
+    max_line_length: int | None = None,
 ) -> str:
-    """Build a compact output preview text (head/tail) for debug logs."""
+    """Build a compact output preview text (head/tail) for debug logs.
+
+    Args:
+        result: The completed process (or timeout-synthesized) result to preview.
+        stdout_head: Number of leading non-empty stdout lines to keep.
+        stdout_tail: Number of trailing non-empty stdout lines to keep.
+        stderr_head: Number of leading non-empty stderr lines to keep.
+        stderr_tail: Number of trailing non-empty stderr lines to keep.
+        max_line_length: When set, individual stdout/stderr lines longer than
+            this are truncated with a ``[…N chars]`` suffix — see
+            :func:`_cap_line`. A command whose captured output embeds a large
+            single-line blob (e.g. a base64 file chunk read back from stdout)
+            would otherwise still produce a multi-KB debug line even though
+            the head/tail LINE COUNT is small.
+
+    Returns:
+        A newline-joined preview string, empty when both streams are empty.
+    """
     stdout_lines = _extract_non_empty_lines(result.stdout)
     stderr_lines = _extract_non_empty_lines(result.stderr)
 
@@ -166,16 +197,18 @@ def build_execution_output_preview(
     )
     if head:
         preview_lines.append("STDOUT (head):")
-        preview_lines.extend(head)
+        preview_lines.extend(_cap_line(ln, max_line_length) for ln in head)
     omitted_stdout = len(stdout_lines) - len(head) - len(tail)
     if omitted_stdout > 0:
         preview_lines.append(f"... ({omitted_stdout} stdout line(s) omitted) ...")
     if tail:
         preview_lines.append("STDOUT (tail):")
-        preview_lines.extend(tail)
+        preview_lines.extend(_cap_line(ln, max_line_length) for ln in tail)
     if stderr_lines:
         preview_lines.append("STDERR (head):")
-        preview_lines.extend(stderr_lines[:stderr_head])
+        preview_lines.extend(
+            _cap_line(ln, max_line_length) for ln in stderr_lines[:stderr_head]
+        )
         stderr_tail_lines = (
             stderr_lines[-stderr_tail:]
             if len(stderr_lines) > (stderr_head + stderr_tail)
@@ -188,7 +221,9 @@ def build_execution_output_preview(
             )
         if stderr_tail_lines:
             preview_lines.append("STDERR (tail):")
-            preview_lines.extend(stderr_tail_lines)
+            preview_lines.extend(
+                _cap_line(ln, max_line_length) for ln in stderr_tail_lines
+            )
 
     return "\n".join(preview_lines)
 
@@ -200,6 +235,7 @@ def build_timeout_output_preview(
     stdout_tail: int = 10,
     stderr_head: int = 10,
     stderr_tail: int = 10,
+    max_line_length: int | None = None,
 ) -> str:
     """Build a compact output preview from one ``TimeoutExpired`` exception."""
     timeout_result = subprocess.CompletedProcess(
@@ -214,6 +250,7 @@ def build_timeout_output_preview(
         stdout_tail=stdout_tail,
         stderr_head=stderr_head,
         stderr_tail=stderr_tail,
+        max_line_length=max_line_length,
     )
 
 

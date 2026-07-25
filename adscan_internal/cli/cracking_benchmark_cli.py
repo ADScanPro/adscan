@@ -19,6 +19,7 @@ from adscan_internal.services.cracking_benchmark import (
     BENCHMARK_MODES,
     get_or_run_benchmark,
 )
+from adscan_core.rich_output import print_exception
 
 # Human-readable label for each hashcat mode ADscan benchmarks -- keeps the
 # table readable without forcing the operator to memorize hashcat mode IDs.
@@ -101,6 +102,7 @@ def handle_benchmark_command(shell: Any, args: str) -> None:
         rates = get_or_run_benchmark(shell, force=force)
     except Exception as exc:  # noqa: BLE001 -- a REPL command must never crash the shell
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Benchmark failed: {exc}")
         return
 

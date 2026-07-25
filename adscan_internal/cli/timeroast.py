@@ -36,6 +36,7 @@ from adscan_internal.rich_output import (
 from adscan_internal.services.privileged_group_classifier import sid_rid
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 from adscan_internal.workspaces.computers import count_enabled_computer_accounts
+from adscan_core.rich_output import print_exception
 
 
 # Default machine-account password rotation interval. Microsoft default is 30
@@ -426,6 +427,7 @@ def _get_timeroast_candidates(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_warning(
             f"Graph Timeroast candidate query failed for {marked_domain}."
@@ -525,6 +527,7 @@ def _write_timeroast_candidate_artifact(
             handle.write("\n")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning("Failed to persist Timeroast candidate metadata.")
         return None
     return artifact_abs, artifact_rel
@@ -684,6 +687,7 @@ def _write_timeroast_hash_files(
                 raw_handle.write(f"{parsed.rid}:{parsed.hash_value}\n")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning("Failed to persist raw Timeroast hashes.")
 
     normalized_lines: list[str] = []
@@ -704,6 +708,7 @@ def _write_timeroast_hash_files(
             handle.write("\n".join(normalized_lines) + "\n")
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("Failed to persist filtered Timeroast hashes.")
         return None, []
 
@@ -762,6 +767,7 @@ def _collect_timeroast_hashes(
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Native timeroast failed: {exc}")
         return None
 
@@ -878,6 +884,7 @@ def run_timeroast_quick_win(shell: TimeroastShell, target_domain: str) -> bool:
         )
     except Exception as exc:  # pragma: no cover - telemetry best effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     cracking_cli.run_cracking(
         shell,

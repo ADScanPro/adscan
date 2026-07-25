@@ -43,6 +43,12 @@ SELECT
 IS_SYSADMIN = "SELECT IS_SRVROLEMEMBER('sysadmin') AS [is_sysadmin]"
 
 
+#: The local instance's ``@@SERVERNAME`` (e.g. ``DC01\SQLEXPRESS``) in one
+#: column. Cheap, permission-free — used to identify and drop the loopback
+#: self-referential linked server during read-only inventory collection.
+SERVER_NAME = "SELECT CAST(@@SERVERNAME AS NVARCHAR(256)) AS [server_name]"
+
+
 #: Returns 1/0 for arbitrary roles. Caller substitutes the role name; we
 #: keep it parametric to enforce single-quote escaping at one site.
 def is_srvrolemember(role: str) -> str:
@@ -213,6 +219,119 @@ WHERE s.is_linked = 1
 LINKED_SERVERS_LOGIN_MAP = "EXEC sp_helplinkedsrvlogin"
 
 
+def linked_server_sysadmin_probe(linked_server: str, *, via_rpc: bool) -> str:
+    """Build a READ-ONLY probe of whether the mapped login is sysadmin on a link.
+
+    Runs ``IS_SRVROLEMEMBER('sysadmin')`` **on the remote (linked) instance**,
+    executed through the source instance's linked server so it resolves under the
+    configured login mapping — i.e. it answers "does the identity this link lands
+    as have sysadmin on the target?", the exact signal that decides whether
+    ``xp_cmdshell`` RCE is reachable across the link. Pure read, no state change.
+
+    Args:
+        linked_server: The linked-server name (``sys.servers.name``).
+        via_rpc: True to use ``EXEC (...) AT [server]`` (requires *RPC Out*);
+            False to use ``OPENQUERY`` (requires *Data Access*). The caller picks
+            based on the link's enabled capabilities.
+
+    Returns:
+        A single-column (``is_sysadmin``) probe query.
+    """
+    safe = str(linked_server).replace("]", "]]")
+    if via_rpc:
+        return f"EXEC ('SELECT IS_SRVROLEMEMBER(''sysadmin'') AS [is_sysadmin]') AT [{safe}]"
+    # OPENQUERY carries the SELECT as a SINGLE string literal — exactly one nesting
+    # level, same as EXEC(...) AT — so the inner quotes are DOUBLED, not quadrupled.
+    # (An earlier quadruple over-escaped by one level, sending a malformed
+    # ``IS_SRVROLEMEMBER(''sysadmin'')`` to the remote in the data-access fallback.)
+    return (
+        f"SELECT is_sysadmin FROM OPENQUERY([{safe}], "
+        "'SELECT IS_SRVROLEMEMBER(''sysadmin'') AS is_sysadmin')"
+    )
+
+
+#: READ-ONLY probe of whether the CURRENT principal holds ADMINISTER BULK
+#: OPERATIONS capability — directly, via the fixed ``bulkadmin`` server role, or
+#: implicitly via sysadmin (which bypasses this permission check entirely).
+#: Feeds the OPENROWSET(BULK ...) arbitrary-file-read attack step: unlike
+#: xp_cmdshell (sysadmin-only), this capability is reachable by a plain
+#: ``bulkadmin`` member or an explicitly-granted login WITHOUT ever being
+#: sysadmin — the exact below-sysadmin ``SQLAccess`` case this feeds.
+BULK_OPERATIONS_CAPABILITY_PROBE = """
+SELECT CASE
+    WHEN IS_SRVROLEMEMBER('sysadmin') = 1 THEN 1
+    WHEN IS_SRVROLEMEMBER('bulkadmin') = 1 THEN 1
+    WHEN EXISTS (
+        SELECT 1 FROM fn_my_permissions(NULL, 'SERVER')
+        WHERE permission_name = 'ADMINISTER BULK OPERATIONS'
+    ) THEN 1
+    ELSE 0
+END AS [bulk_admin]
+""".strip()
+
+
+def linked_server_bulk_admin_probe(linked_server: str, *, via_rpc: bool) -> str:
+    """Build a READ-ONLY probe of whether the mapped login has ADMINISTER BULK
+    OPERATIONS capability on a link (mirrors :func:`linked_server_sysadmin_probe`).
+
+    Runs :data:`BULK_OPERATIONS_CAPABILITY_PROBE` **on the remote (linked)
+    instance**, executed through the source instance's linked server so it
+    resolves under the configured login mapping — the exact signal that
+    decides whether the OPENROWSET(BULK ...) arbitrary-file-read step is
+    reachable across the link. Pure read, no state change.
+
+    Args:
+        linked_server: The linked-server name (``sys.servers.name``).
+        via_rpc: True to use ``EXEC (...) AT [server]`` (requires *RPC Out*);
+            False to use ``OPENQUERY`` (requires *Data Access*). The caller
+            picks based on the link's enabled capabilities.
+
+    Returns:
+        A single-column (``bulk_admin``) probe query.
+    """
+    safe = str(linked_server).replace("]", "]]")
+    # One nesting level (EXEC(...) AT / OPENQUERY carry the SELECT as a single
+    # string literal), so the inner single quotes are doubled exactly once —
+    # same escaping discipline as xp_cmdshell_state_at_link.
+    inner = BULK_OPERATIONS_CAPABILITY_PROBE.replace("'", "''")
+    if via_rpc:
+        return f"EXEC ('{inner}') AT [{safe}]"
+    return f"SELECT bulk_admin FROM OPENQUERY([{safe}], '{inner}')"
+
+
+def xp_cmdshell_state_at_link(linked_server: str, *, via_rpc: bool) -> str:
+    """Build a READ-ONLY probe of whether ``xp_cmdshell`` is CURRENTLY enabled on a link.
+
+    Runs the existing :data:`XP_CMDSHELL_STATE` ``SELECT`` (a pure read of
+    ``sys.configurations``) **on the remote (linked) instance** through the source
+    instance's linked server, so it answers "is ``xp_cmdshell`` already enabled on
+    the target?" under the configured login mapping. This is strictly observational:
+    NO ``sp_configure`` / ``RECONFIGURE`` / enable — it only reports the current
+    ``run_value``; the remote configuration is never changed.
+
+    Args:
+        linked_server: The linked-server name (``sys.servers.name``).
+        via_rpc: True to use ``EXEC (...) AT [server]`` (requires *RPC Out*);
+            False to use ``OPENQUERY`` (requires *Data Access*). The caller picks
+            based on the link's enabled capabilities.
+
+    Returns:
+        A query returning the ``sys.configurations`` rows for ``xp_cmdshell`` /
+        ``show advanced options`` (columns ``[option]`` / ``[config_value]`` /
+        ``[run_value]``) as observed on the remote instance.
+    """
+    safe = str(linked_server).replace("]", "]]")
+    if via_rpc:
+        # Inline the SELECT as a single string literal; its own single quotes
+        # (the ``IN ('xp_cmdshell', ...)`` list) are doubled for one nesting level.
+        inner = XP_CMDSHELL_STATE.replace("'", "''")
+        return f"EXEC ('{inner}') AT [{safe}]"
+    # OPENQUERY carries the SELECT as a single string literal too — one nesting
+    # level — so the inner single quotes are doubled exactly once.
+    inner = XP_CMDSHELL_STATE.replace("'", "''")
+    return f"SELECT * FROM OPENQUERY([{safe}], '{inner}')"
+
+
 # ---------------------------------------------------------------------------
 # xp_cmdshell lifecycle
 # ---------------------------------------------------------------------------
@@ -326,6 +445,54 @@ def xp_dirtree_unc(unc_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Low-privilege filesystem review — local xp_dirtree directory listing
+# ---------------------------------------------------------------------------
+
+
+def xp_dirtree_local(path: str, *, depth: int = 3, include_files: int = 1) -> str:
+    """Build a LOCAL ``xp_dirtree`` directory-listing call.
+
+    Distinct from :func:`xp_dirtree_unc`, which targets an attacker UNC path
+    to trigger outbound NTLM coercion. This variant lists a local directory
+    on the SQL Server host itself — a credential-hygiene review avenue
+    available to any authenticated login (``public`` has EXECUTE on
+    ``xp_dirtree`` by default), with no command-execution surface required.
+
+    ``depth`` bounds the recursion (SQL Server semantics: ``0`` means
+    unlimited recursion, ``N`` limits to ``N`` levels); ``include_files``
+    controls whether file rows (the ``file`` bit column) are returned
+    alongside directory rows.
+    """
+    safe_path = str(path).replace("'", "''")
+    return f"EXEC master..xp_dirtree '{safe_path}', {int(depth)}, {int(include_files)}"
+
+
+#: Ground-truth EXECUTE-permission probe for the three low-privilege
+#: filesystem-read extended procedures (``xp_dirtree``, ``xp_fileexist``,
+#: ``xp_subdirs``). ``fn_my_permissions`` resolves the EFFECTIVE permission
+#: for the CURRENT principal — including role membership and chained grants
+#: — unlike a raw ``sys.database_permissions`` join, which only surfaces
+#: explicit per-principal grants and would miss a grant reaching the login
+#: through role membership. Batched into one round-trip; the caller should
+#: parse the returned rows with
+#: ``adscan_internal.services.mssql_xp_dirtree_review_service.parse_xp_dirtree_capability_rows``.
+XP_DIRTREE_CAPABILITY_PROBE = """
+USE master;
+SELECT 'xp_dirtree' AS [proc_name], permission_name AS [permission_name]
+FROM fn_my_permissions(N'xp_dirtree', 'OBJECT')
+WHERE permission_name = 'EXECUTE'
+UNION ALL
+SELECT 'xp_fileexist', permission_name
+FROM fn_my_permissions(N'xp_fileexist', 'OBJECT')
+WHERE permission_name = 'EXECUTE'
+UNION ALL
+SELECT 'xp_subdirs', permission_name
+FROM fn_my_permissions(N'xp_subdirs', 'OBJECT')
+WHERE permission_name = 'EXECUTE'
+""".strip()
+
+
+# ---------------------------------------------------------------------------
 # Authorization collector — read-only server-scope authorization facts
 # ---------------------------------------------------------------------------
 #
@@ -390,6 +557,7 @@ ORDER BY p.grantee_principal_id
 __all__ = [
     "IDENTITY_FINGERPRINT",
     "IS_SYSADMIN",
+    "SERVER_NAME",
     "is_srvrolemember",
     "EFFECTIVE_SERVER_PERMISSIONS",
     "IMPERSONABLE_PRINCIPALS",
@@ -399,6 +567,10 @@ __all__ = [
     "LINKED_SERVERS_BASIC",
     "LINKED_SERVERS_DETAIL",
     "LINKED_SERVERS_LOGIN_MAP",
+    "linked_server_sysadmin_probe",
+    "BULK_OPERATIONS_CAPABILITY_PROBE",
+    "linked_server_bulk_admin_probe",
+    "xp_cmdshell_state_at_link",
     "ENABLE_XP_CMDSHELL",
     "DISABLE_XP_CMDSHELL",
     "enable_xp_cmdshell_on_link",
@@ -407,6 +579,8 @@ __all__ = [
     "execute_as_login",
     "execute_as_user",
     "xp_dirtree_unc",
+    "xp_dirtree_local",
+    "XP_DIRTREE_CAPABILITY_PROBE",
     "ENUM_SERVER_LOGINS",
     "SERVER_LEVEL_IMPERSONATION_MAP",
     "database_level_impersonation_map",

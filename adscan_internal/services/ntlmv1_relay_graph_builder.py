@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_error, print_info_verbose
+from adscan_core.rich_output import print_error, print_exception, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.attack_paths_materialized_cache import (
     invalidate_attack_path_artifacts,
@@ -53,15 +53,25 @@ _RBCD_BADGE = "Local Admin via NTLMv1→RBCD relay"
 _SHADOW_BADGE = "Computer credential via NTLMv1→Shadow Creds relay"
 _CRACK_BADGE = "Machine credential via NTLMv1 offline crack"
 
-# The exact reflection blocked-reason string (refinement 1). Shared with the
-# report renderer and the L1 tests — keep it as the single source of truth.
-REFLECTION_BLOCKED_REASON = "single DC — self-relay reflection-mitigated"
+# Relay status / blocked-reason strings live in the lean ``relay_status_constants``
+# leaf so client-facing report code can reference them without importing this
+# heavy relay-graph engine (the appliance-backend bundling taproot). Re-exported
+# here for backward-compat — internal uses below and the L1 tests import them
+# from this module. See ``relay_status_constants`` for the doctrine comments.
+from adscan_internal.services.relay_status_constants import (  # noqa: F401,E402
+    CONFIGURATION_CLOSE_STATUS,
+    NO_RELAY_TARGET_REASON,
+    REFLECTION_BLOCKED_REASON,
+)
 
-# Emitted when an eligible relay target exists topologically but has no usable
-# LDAP endpoint (missing/empty FQDN on the selected DC node). Like the
-# reflection case, this must surface the relay edges as ``blocked`` with a
-# reason — never as a silently-broken ``theoretical`` edge with no relay target.
-NO_RELAY_TARGET_REASON = "no DC LDAP relay target available"
+# The RBCD block reason that is a PARTIAL close (MAQ==0 → cannot mint a new
+# delegate account, but RBCD via an already-controlled computer account still
+# works). Imported from the feasibility SSOT so there is no second copy of the
+# string; the builder routes it to ``theoretical`` (conditionally open), NEVER the
+# positive ``closed_by_configuration``.
+from adscan_internal.services.relay.relay_feasibility import (  # noqa: E402
+    MAQ_EXHAUSTED_REASON as _MAQ_EXHAUSTED_REASON,
+)
 
 
 # A per-host feasibility verdict supplied by Task 4 / R3. ``None`` for a method
@@ -140,9 +150,29 @@ def _escalation_edge(
     if relay_target_fqdn:
         notes["relay_target"] = relay_target_fqdn
     status = "theoretical"
-    if blocked_reason:
-        status = "blocked"
+    if blocked_reason == NO_RELAY_TARGET_REASON:
+        # ADscan data-gap (no usable relay target resolved) — not a client
+        # control. Surface as a data-gap, never as a defensive close.
         notes["blocked_reason"] = blocked_reason
+        status = "unsupported"
+    elif blocked_reason == _MAQ_EXHAUSTED_REASON:
+        # PARTIAL close only: MAQ==0 blocks minting a NEW delegate account, but
+        # RBCD via an already-controlled computer account still works — the avenue
+        # is NOT closed. Keep it theoretical (conditionally open) with a caveat,
+        # NEVER the positive closed_by_configuration (that would over-credit a
+        # defense the client does not fully have). No ``blocked_reason`` is set so
+        # the render never frames it as "attack surface reduced".
+        notes["caveat"] = (
+            "Requires an already-controlled computer account: MachineAccountQuota "
+            "is 0, so a new delegate account cannot be minted, but an existing "
+            "owned computer account still enables this avenue."
+        )
+    elif blocked_reason:
+        # Closed by configuration/topology observed with certainty (LDAP signing +
+        # channel binding, no ADCS, single-DC reflection). A POSITIVE exposure fact
+        # — never claim a defensive tool stopped it.
+        notes["blocked_reason"] = blocked_reason
+        status = CONFIGURATION_CLOSE_STATUS
     # The DFS adjacency reads ``from`` / ``to`` (the universal edge convention in
     # attack_graph.json); ``source`` / ``target`` are kept as aliases for callers
     # that read either form.
@@ -356,6 +386,7 @@ def persist_ntlmv1_relay_edges(
         )
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"[ntlmv1_relay_graph_builder] failed to write attack_graph.json: {exc}"
         )
@@ -365,6 +396,7 @@ def persist_ntlmv1_relay_edges(
         invalidate_attack_path_artifacts(shell, domain)
     except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     print_info_verbose(
         f"[ntlmv1_relay_graph_builder] materialized {written} NTLMv1 attack "
@@ -595,6 +627,7 @@ def _machine_account_quota_for(
             return 0
     except Exception as exc:  # noqa: BLE001 — best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return None
 
 
@@ -652,6 +685,7 @@ def materialize_ntlmv1_relay_edges(shell: object, domain: str) -> int:
                 return 0
         except (OSError, ValueError, TypeError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return 0
 
         ip_to_node_id, domain_users_node_id, dc_nodes = _resolve_graph_resolvers(graph)
@@ -716,6 +750,7 @@ def materialize_ntlmv1_relay_edges(shell: object, domain: str) -> int:
         return persist_ntlmv1_relay_edges(shell=shell, domain=domain, edges=edges)
     except Exception as exc:  # noqa: BLE001 — best-effort, never abort the caller
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             "[ntlmv1_relay_graph_builder] NTLMv1 materialization failed: "
             f"{mark_sensitive(str(exc), 'detail')}"

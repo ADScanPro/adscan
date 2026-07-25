@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 # --------------------------------------------------------------------------- #
@@ -639,6 +640,7 @@ def update_posture(
         return finding
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
 
@@ -691,6 +693,7 @@ def persist_password_policy(
         )
     except Exception as exc:  # noqa: BLE001 - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -760,6 +763,7 @@ def _hydrate_password_policy(
         )
     except Exception as exc:  # noqa: BLE001 - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _resolve_state_transition(

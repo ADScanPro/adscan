@@ -30,6 +30,7 @@ from adscan_core import telemetry
 from adscan_core.rich_output import print_error
 from adscan_internal.core.events import Event, EventBus
 from adscan_internal.services.cve_scanner.result import CVEResult, CVEStatus
+from adscan_core.rich_output import print_exception
 
 
 _STATUS_VERB: dict[str, str] = {
@@ -112,6 +113,7 @@ class ScanLogWriter:
             self._fh.close()
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def __enter__(self) -> ScanLogWriter:
         return self
@@ -130,6 +132,7 @@ class ScanLogWriter:
             self._fh.write(line + "\n")
         except OSError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"[cve_scanner] failed to write scan log: {exc}")
 
 

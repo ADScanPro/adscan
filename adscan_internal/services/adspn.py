@@ -28,6 +28,7 @@ from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConfig,
     ADscanLDAPConnection,
 )
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ def _modify_spn_sync(
             return False, f"LDAP modify failed for {target_dn} (tried servicePrincipalName + msDS-AdditionalDnsHostName)"
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, str(exc)
 
 

@@ -24,6 +24,7 @@ from adscan_internal.services.host_intelligence.models import (
     DetectedProduct,
     HostFingerprint,
 )
+from adscan_core.rich_output import print_exception
 
 INVENTORY_SCHEMA_VERSION = "inventory-1.0"
 RECORD_TYPE = "defensive_posture"
@@ -130,6 +131,7 @@ def write_defensive_posture_inventory(
         return target_path
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[defensive_posture_writer] write error: {exc}")
         return None
 

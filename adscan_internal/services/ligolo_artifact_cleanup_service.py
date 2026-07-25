@@ -28,6 +28,7 @@ from adscan_internal.services.exploitation.remote_windows_execution import (
     RemoteWindowsExecutionService,
 )
 from adscan_internal.services.pivot_auth_context_service import resolve_pivot_auth_secret
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +212,7 @@ def cleanup_remote_ligolo_artifact(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return LigoloArtifactCleanupResult(
             tunnel_id=tunnel_id,
             domain=domain,
@@ -337,6 +339,7 @@ def _refresh_expired_ccache_for_cleanup(
             return secret
     except Exception as exc:  # noqa: BLE001 - carve-out probe is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     try:
         from adscan_internal.services.kerberos_ticket_service import ensure_user_ccache
@@ -361,6 +364,7 @@ def _refresh_expired_ccache_for_cleanup(
         )
     except Exception as exc:  # noqa: BLE001 - refresh is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[ligolo-cleanup] pre-cleanup TGT refresh failed (ignored): {exc}"
         )

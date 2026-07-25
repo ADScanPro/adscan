@@ -34,6 +34,7 @@ from adscan_internal.rich_output import (
     print_success,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,7 @@ def _persist_myip_update(shell: Any, *, context: str) -> None:
         saver()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[myip] Failed to persist automatic myip update context={context!r}: {exc}"
         )

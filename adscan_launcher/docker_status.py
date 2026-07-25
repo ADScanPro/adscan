@@ -17,6 +17,7 @@ import subprocess
 from typing import Callable, Tuple
 
 from adscan_launcher import telemetry
+from adscan_core.rich_output import print_exception
 
 
 _DOCKER_SERVICE_UNIT_MISSING_RE = re.compile(
@@ -53,6 +54,7 @@ def is_official_docker_installed() -> Tuple[bool, str]:
         return False, "Docker version check timed out"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, f"Error checking Docker: {exc}"
 
 
@@ -79,6 +81,7 @@ def is_docker_compose_plugin_available() -> Tuple[bool, str]:
         return False, "Docker Compose version check timed out"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, f"Error checking Docker Compose plugin: {exc}"
 
 
@@ -114,6 +117,7 @@ def is_docker_daemon_running(
         return False, "Docker daemon check timed out"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False, f"Error checking Docker daemon: {exc}"
 
 
@@ -194,6 +198,7 @@ def ensure_docker_daemon_running(
                         )
             except Exception as exc:  # pragma: no cover - best effort diagnostics
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug_func(
                     f"[docker] Unable to inspect docker.service status: {exc}"
                 )

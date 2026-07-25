@@ -37,6 +37,7 @@ from .runascs_manager import get_runascs_local_path
 from .rich_output import print_info, print_warning, print_error, print_success
 from .services.winrm_backend_service import build_winrm_backend
 from .services.winrm_psrp_service import WinRMPSRPError
+from adscan_core.rich_output import print_exception
 
 
 logger = logging.getLogger("adscan.session_shell")
@@ -213,6 +214,7 @@ class SessionShell:
                         )
                     except OSError as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         self.console.print(
                             f"[red]Failed to save downloaded file:[/red] {exc}"
                         )
@@ -244,6 +246,7 @@ class SessionShell:
                             data = f.read()
                     except OSError as exc:
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         self.console.print(
                             f"[red]Failed to read local file:[/red] {exc}"
                         )
@@ -463,6 +466,7 @@ class SessionShell:
             )
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(
                 f"[red]Failed to build WinRM backend from session metadata:[/red] {exc}"
             )
@@ -480,6 +484,7 @@ class SessionShell:
             result = backend.execute_powershell(command)
         except WinRMPSRPError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(f"[red]WinRM backend execution failed:[/red] {exc}")
             return False
         if result.stdout:
@@ -499,6 +504,7 @@ class SessionShell:
             backend.fetch_file(remote_path, local_path)
         except WinRMPSRPError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(f"[red]WinRM backend download failed:[/red] {exc}")
             return False
         self.console.print(f"[green]Downloaded via WinRM backend to[/green] {local_path}")
@@ -513,6 +519,7 @@ class SessionShell:
             ok = backend.upload_file(local_path, remote_path)
         except WinRMPSRPError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(f"[red]WinRM backend upload failed:[/red] {exc}")
             return False
         if ok:
@@ -554,6 +561,7 @@ class SessionShell:
             helper = getattr(winrm_cli, helper_name)
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(
                 f"[red]Failed to resolve WinRM helper '{helper_name}':[/red] {exc}"
             )
@@ -570,6 +578,7 @@ class SessionShell:
             return True
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(
                 f"[red]WinRM helper '{helper_name}' failed:[/red] {exc}"
             )
@@ -588,6 +597,7 @@ class SessionShell:
             return agent_client
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.console.print(
                 f"[red]Failed to attach agent client automatically:[/red] {exc}"
             )
@@ -706,6 +716,7 @@ class SessionShell:
             )
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Failed to build NetExec auth for upgrade: {exc}")
             return
 
@@ -724,6 +735,7 @@ class SessionShell:
             os.makedirs(log_dir, exist_ok=True)
         except OSError as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             log_dir = os.path.join("domains", domain, "winrm")
 
         log_file = os.path.join(log_dir, f"{host}_{username}_runascs_upgrade.log")
@@ -773,6 +785,7 @@ class SessionShell:
                     )
             except Exception as exc:  # pragma: no cover - defensive
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 logger.debug(
                     "[session_shell] Failed to collect NetExec output for "
                     "RunasCs launcher %r: %s",

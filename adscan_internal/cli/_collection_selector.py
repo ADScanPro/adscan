@@ -32,6 +32,7 @@ from typing import Any
 from adscan_core.rich_output import questionary_checkbox_values
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_core.rich_output import print_exception
 
 # The phase id whose ``phases.steps[...].disabled`` set constrains the
 # collectors. Shared verbatim with the scan plan (scan_phases.py) and the web.
@@ -97,6 +98,7 @@ def prompt_collection_selection(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         selected = None
 
     # Helper returned None (cancelled / EOF / error) -> safe default = ALL.

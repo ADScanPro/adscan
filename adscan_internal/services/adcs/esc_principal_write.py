@@ -32,6 +32,7 @@ from adscan_internal.services.machine_account_provisioning_service import (
     record_machine_account_creation_result,
     register_managed_machine_account,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _ldap_cfg(config: EscConfig) -> ADscanLDAPConfig:
@@ -102,6 +103,7 @@ def _remove_shadow_creds(config: EscConfig) -> None:
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 async def _add_computer(ldap_cfg: ADscanLDAPConfig):
@@ -158,6 +160,7 @@ async def run_esc9(config: EscConfig) -> EscResult:
                 print_success("ESC9: shadow credentials removed.")
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 mark_revert_failed(
                     config.shell,
                     sc_change_id,
@@ -438,6 +441,7 @@ async def run_esc14(config: EscConfig) -> EscResult:
                     raise RuntimeError("LDAP delete returned False")
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 mark_revert_failed(
                     config.shell,
                     comp_change_id,

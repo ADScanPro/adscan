@@ -36,6 +36,7 @@ from adscan_core.rich_output import (
     prompt_ask,
 )
 from adscan_internal.interaction import is_non_interactive
+from adscan_core.rich_output import print_exception
 
 # Format contract for a partner tag: starts with a lowercase letter or digit,
 # then 1-40 more of lowercase letters, digits, or hyphens (2-41 chars total).
@@ -224,6 +225,7 @@ def ensure_partner_tag_for_pro(license_mode: object) -> bool:
         telemetry.refresh_partner_tag()
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             "Could not save the partner tag to the ADscan volume. "
             "Check that ~/.adscan is writable and try again."

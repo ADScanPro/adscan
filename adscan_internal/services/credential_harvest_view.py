@@ -32,6 +32,7 @@ from adscan_internal.services.credential_harvest_classification import (
 from adscan_internal.services.credential_harvest_record import HarvestedPrincipal
 from adscan_internal.services.credential_harvest_store import load_harvest_records
 from adscan_internal.services.high_value import normalize_samaccountname
+from adscan_core.rich_output import print_exception
 
 # Which harvest source a still-running crack most likely came from, inferred
 # from the hashcat mode on its job scope (the running job does not carry the
@@ -102,6 +103,7 @@ def build_in_progress_harvest_records(
         active = [j for j in registry.active() if j.kind == _CRACKING_JOB_KIND]
     except Exception as exc:  # noqa: BLE001 — a registry read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return []
     if not active:
         return []
@@ -136,6 +138,7 @@ def build_in_progress_harvest_records(
         )
     except Exception as exc:  # noqa: BLE001 — graph read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         reach_by_user = {}
 
     records: list[HarvestedPrincipal] = []
@@ -152,6 +155,7 @@ def build_in_progress_harvest_records(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             tier = None
         # ``tier`` / ``reach`` may be None (UNDETERMINED — no membership/graph
         # data yet); persist the None so the row renders "Unknown"/"Not
@@ -208,6 +212,7 @@ def _crack_runtime_finished(registry: Any, job: Any) -> bool:
         return not runtime.is_alive()
     except Exception as exc:  # noqa: BLE001 — a runtime liveness read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -234,6 +239,7 @@ def _live_crack_status(registry: Any, job: Any) -> tuple[str, str, str, str]:
             return "cracking", "", "", ""
     except Exception as exc:  # noqa: BLE001 — a runtime read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return "cracking", "", "", ""
     from adscan_internal.services.background_jobs.cracking_job import (  # noqa: PLC0415
         format_eta_seconds,
@@ -278,6 +284,7 @@ def _rederive_tier_and_reach(
         )
     except Exception as exc:  # noqa: BLE001 — graph read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         reach_by_user = {}
 
     out: list[HarvestedPrincipal] = []
@@ -291,6 +298,7 @@ def _rederive_tier_and_reach(
             tier_value = tier.value if tier is not None else None
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             tier_value = rec.privilege_tier
         if key in reach_by_user:
             reach = reach_by_user[key]
@@ -326,6 +334,7 @@ def load_effective_harvest_records(
         persisted = load_harvest_records(shell)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         persisted = []
     in_progress = build_in_progress_harvest_records(shell, domain)
     if not in_progress:

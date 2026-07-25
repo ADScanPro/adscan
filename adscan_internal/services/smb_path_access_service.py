@@ -39,6 +39,7 @@ from adscan_internal.services.smb_transport import (
     smb_machine_for,
     run_smb_operation,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _looks_like_ntlm_hash(value: str | None) -> bool:
@@ -486,6 +487,7 @@ class SMBPathAccessService(BaseService):
             )
         except SMBTransportError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "[smb-path] ACL snapshot collection failed: "
                 f"host={marked_host} share={marked_share} path={marked_directory} "
@@ -512,6 +514,7 @@ class SMBPathAccessService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "[smb-path] ACL snapshot collection failed: "
                 f"host={marked_host} share={marked_share} path={marked_directory} "
@@ -645,6 +648,7 @@ class SMBPathAccessService(BaseService):
             )
         except SMBTransportError as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "[smb-path] write probe failed: "
                 f"host={marked_host} share={marked_share} path={marked_directory} "
@@ -669,6 +673,7 @@ class SMBPathAccessService(BaseService):
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "[smb-path] write probe failed: "
                 f"host={marked_host} share={marked_share} path={marked_directory} "

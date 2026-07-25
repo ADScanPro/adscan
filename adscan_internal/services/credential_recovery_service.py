@@ -47,6 +47,7 @@ from adscan_core.rich_output import (
 
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.credentials.privilege_role import set_credential_origin
+from adscan_core.rich_output import print_exception
 
 # OPSEC: at most this many DISTINCT accounts are tested with one auth attempt
 # each during the fuzzy fast path. One attempt per account keeps the fast path
@@ -81,6 +82,7 @@ def _resolve_workspace_cwd(shell: object) -> str:
                 return str(resolved)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     fallback = getattr(shell, "current_workspace_dir", None)
     return str(fallback) if fallback else os.getcwd()
 
@@ -129,6 +131,7 @@ def _load_users_json(shell: object, domain: str) -> list[str]:
         return names
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[credential_recovery] users.json load failed for "
             f"{mark_sensitive(domain, 'domain')}: {exc}"
@@ -172,6 +175,7 @@ def load_recovery_candidates(shell: object, domain: str) -> list[str]:
             return _dedupe_preserving_order(list(users_txt))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[credential_recovery] authenticated user-list load failed for "
             f"{mark_sensitive(domain, 'domain')}: {exc}"
@@ -343,6 +347,7 @@ def recover_user_not_found(
                 is_valid = bool(verify_candidate(candidate.username))
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[credential_recovery] candidate verification raised for "
                     f"{marked_candidate}: {exc}"
@@ -361,6 +366,7 @@ def recover_user_not_found(
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(
                         f"[credential_recovery] persisting resolved credential "
                         f"failed for {marked_candidate}: {exc}"
@@ -406,6 +412,7 @@ def recover_user_not_found(
             wants_spray = bool(confirm_spray())
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             wants_spray = False
 
         if wants_spray:
@@ -418,6 +425,7 @@ def recover_user_not_found(
                 spray()
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     f"[credential_recovery] spray fallback raised: {exc}"
                 )
@@ -441,6 +449,7 @@ def recover_user_not_found(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[credential_recovery] persisting manual credential failed for "
                 f"{marked_manual}: {exc}"

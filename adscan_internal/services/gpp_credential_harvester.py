@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 
 TaskStatus = Literal["done", "denied", "error", "skipped"]
 
@@ -333,6 +334,7 @@ async def harvest_gpp_on_connection(
                             entries = parse_cpasswd(path.unc_path, text)
                         except Exception as parse_exc:  # noqa: BLE001
                             telemetry.capture_exception(parse_exc)
+                            print_exception(exception=parse_exc)
                             entries = []
                         for entry in entries:
                             cpw = entry.get("cpassword", "") or ""
@@ -342,6 +344,7 @@ async def harvest_gpp_on_connection(
                                 cleartext = decrypt_gpp_cpassword(cpw)
                             except Exception as decrypt_exc:  # noqa: BLE001
                                 telemetry.capture_exception(decrypt_exc)
+                                print_exception(exception=decrypt_exc)
                                 cleartext = ""
                             result.cpassword_leaks.append(
                                 GPPCpasswordLeak(
@@ -389,6 +392,7 @@ async def harvest_gpp_on_connection(
         return result
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         msg = str(exc)
         if "ACCESS_DENIED" in msg.upper():
             result.status = "denied"
@@ -449,6 +453,7 @@ async def harvest_gpp_across_targets(
                 connection = await open_connection(target)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 r = GPPHarvestResult(status="error", error=f"{target}: {exc}")
                 r.targets_walked.append(target)
                 return r
@@ -468,6 +473,7 @@ async def harvest_gpp_across_targets(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 r = GPPHarvestResult(status="error", error=f"{target}: {exc}")
                 r.targets_walked.append(target)
                 return r

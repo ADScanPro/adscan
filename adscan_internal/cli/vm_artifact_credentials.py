@@ -23,6 +23,7 @@ from typing import Any
 
 from adscan_internal import get_console, print_info, print_success, print_warning, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_panel
+from adscan_core.rich_output import print_exception
 
 # NT hash of the empty string — disabled / blank-password accounts. Skipped on
 # persistence exactly like the Backup-Operators escalation does.
@@ -214,6 +215,7 @@ def _persist_dc_all(
         )
     except Exception as exc:  # noqa: BLE001 - persistence failure is non-fatal
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Batch credential persistence failed: {exc}")
         return VMArtifactPersistResult(
             handled=True, is_domain_controller=True, stored=0, error_message=str(exc)
@@ -256,6 +258,7 @@ def _persist_dc_single(
         )
     except Exception as exc:  # noqa: BLE001 - persistence failure is non-fatal
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"Could not store credential for {target_user}: {exc}")
         return VMArtifactPersistResult(
             handled=True, is_domain_controller=True, stored=0, error_message=str(exc)
@@ -305,6 +308,7 @@ def _persist_member_server(
             stored += 1
         except Exception as exc:  # noqa: BLE001 - one failure must not abort the rest
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Could not store local credential {mark_sensitive(cred.principal, 'user')}: {exc}"
             )

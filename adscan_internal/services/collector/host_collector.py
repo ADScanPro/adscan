@@ -67,6 +67,7 @@ from adscan_internal.services.collector.well_known_sids import (
     NON_GRANTEE_SIDS,
     _node_primary_group_id,
 )
+from adscan_core.rich_output import print_exception
 
 
 # Domain Controllers (516) + Read-only DCs (521) are the identity control plane —
@@ -749,6 +750,7 @@ async def _do_negotiate(
             out.smb_props.update(props)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors["negotiate"] = f"{type(exc).__name__}: {exc}"
     finally:
         timing.negotiate += time.monotonic() - t
@@ -809,6 +811,7 @@ async def _do_samr(
             out.errors["sessions"] = "timeout"
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             out.errors["sessions"] = f"{type(exc).__name__}: {exc}"
 
     async def _collect_builtin_stage() -> None:
@@ -823,6 +826,7 @@ async def _do_samr(
             out.errors["builtin_groups"] = "timeout"
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             out.errors["builtin_groups"] = f"{type(exc).__name__}: {exc}"
 
     t = time.monotonic()
@@ -864,6 +868,7 @@ async def _do_shares(
         out.errors["shares"] = "timeout"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors["shares"] = f"{type(exc).__name__}: {exc}"
     finally:
         timing.shares += time.monotonic() - t
@@ -927,6 +932,7 @@ async def _do_shares_with_retry(
                 await machine_cm.__aexit__(None, None, None)  # pylint: disable=no-member
     except Exception as exc:  # noqa: BLE001 — retry is best-effort; keep the abort recorded
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors["shares"] = original_err
     finally:
         timing.shares += time.monotonic() - t
@@ -1027,6 +1033,7 @@ async def collect_one_host(
         out.errors["auth"] = f"{type(exc).__name__}: {exc}"
         if "AP_REP" in str(exc) or "asn1_structs" in str(exc):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             # NOT a parser bug: a Kerberos AP/KDC rejection — typically a stale-DNS
             # wrong-host SPN (the IP's live host differs from the targeted name).
             # The transport SPN retry + the dedupe gate normally heal this; if it
@@ -1052,6 +1059,7 @@ async def collect_one_host(
         out.errors["connect"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         out.errors["unexpected"] = f"{type(exc).__name__}: {exc}"
 
     return out
@@ -1471,6 +1479,7 @@ async def _gate_reachable_445(
         return reachable_nodes
     except Exception as exc:  # noqa: BLE001 -- FAIL-OPEN: never reduce coverage
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"collector-timing gate failed open ({type(exc).__name__}: {exc}); "
             "collecting all hosts (no coverage loss)"
@@ -1576,6 +1585,7 @@ async def _collect_domain_hosts_async(
             _on_sweep_start(hosts_total_for_resume)
         except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Skip hosts already enriched in a prior interrupted run. The done-set is the
     # durable projection of that sweep's merges, keyed by graph ``object_id`` (SID,
@@ -1637,6 +1647,7 @@ async def _collect_domain_hosts_async(
             dashboard.update(**kwargs)
         except Exception as exc:  # noqa: BLE001 — presentation must never break the fan-out
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Determinate host-phase progress to the platform's current-operation strip.
     # Reads rate/ETA/elapsed straight off the SAME dashboard the CLI rich.live
@@ -1666,6 +1677,7 @@ async def _collect_domain_hosts_async(
             )
         except Exception as exc:  # noqa: BLE001 — progress emit must never abort collection
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     cancellation = getattr(config, "cancellation", None)
 
@@ -1752,6 +1764,7 @@ async def _collect_domain_hosts_async(
                         _mark_done(_oid)
                     except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
         finally:
             progress["inflight"] -= 1
             # A host skipped by the early stop was never swept: release its slot
@@ -1843,6 +1856,7 @@ async def _collect_domain_hosts_async(
                     _checkpoint()
                 except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
         if had_error:
             progress["err"] += 1
         else:

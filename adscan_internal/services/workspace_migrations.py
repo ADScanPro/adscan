@@ -9,6 +9,7 @@ from typing import Any
 from adscan_core.rich_output import print_info_debug, print_info_verbose
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive
+from adscan_core.rich_output import print_exception
 
 
 def migrate_bh_directory_to_graph(
@@ -80,6 +81,7 @@ def migrate_bh_directory_to_graph(
         return {"renamed": True, "moved_to_legacy": True}
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[migration] failed for {marked_domain}: {exc}")
         return {"renamed": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -113,6 +115,7 @@ def backup_pre_migration_attack_graph(
         return {"backed_up": True}
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {"backed_up": False, "error": f"{type(exc).__name__}: {exc}"}
 
 

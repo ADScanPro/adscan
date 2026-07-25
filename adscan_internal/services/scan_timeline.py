@@ -131,7 +131,12 @@ def phase_span(
     On exception, the row is still emitted with ``status="error"`` and the
     exception is re-raised — the timeline always reflects what happened.
     """
-    started_at = time.time()
+    # Elapsed is measured with ``time.monotonic()`` (NOT ``time.time()``): ADscan
+    # physically steps the host wall clock mid-scan for DC time sync, so a
+    # wall-clock delta spanning that step is corrupted. ``started_iso`` below is
+    # a wall-clock absolute timestamp ("when did this phase start") and stays on
+    # ``datetime.now`` — the two clocks answer different questions.
+    started_at = time.monotonic()
     started_iso = _utc_now_iso()
     try:
         start_metrics = capture_phase_metrics(shell, domain)
@@ -139,6 +144,7 @@ def phase_span(
         start_metrics = PhaseMetrics()
 
     error: BaseException | None = None
+    abandoned = False
     try:
         yield
     except GeneratorExit:
@@ -148,14 +154,26 @@ def phase_span(
         # suspended generator is closed/GC'd and Python throws ``GeneratorExit``
         # in here. That is a clean teardown, NOT a phase error — recording it as
         # ``status="error"`` mislabels a healthy phase (e.g. domain_analysis with
-        # +9 users / +4 edges showed up as an error). Re-raise so the generator
-        # protocol stays correct, but leave ``error`` unset so the row reads ok.
+        # +9 users / +4 edges showed up as an error).
+        #
+        # Crucially, this ``finally`` fires whenever the generator is GC'd — for
+        # an abandoned span that is at REPL teardown, potentially HOURS after the
+        # phase's work actually returned. The elapsed measured here therefore
+        # spans idle session time (the prod ``386115.3s`` / ``107.3 hours`` bug on
+        # a phase that took ~86s) and is meaningless. Flag it so the row below
+        # carries NO duration and the footer is suppressed: a known-bogus
+        # measurement must never reach ``timeline.jsonl`` → the web timeline → the
+        # client report. Re-raise so the generator protocol stays correct.
+        abandoned = True
         raise
     except BaseException as exc:  # noqa: BLE001 — captured to enrich timeline row
         error = exc
         raise
     finally:
-        elapsed = time.time() - started_at
+        # For the normal/error path this resumes synchronously the instant the
+        # phase's work returns (the caller's ``__exit__`` fires in its own
+        # ``finally``), so the monotonic delta is the real phase duration.
+        elapsed: float | None = time.monotonic() - started_at
         try:
             end_metrics = capture_phase_metrics(shell, domain)
         except Exception:  # noqa: BLE001
@@ -163,6 +181,11 @@ def phase_span(
 
         delta = _compute_delta(start_metrics, end_metrics)
         status = "error" if error is not None else "ok"
+
+        if abandoned:
+            # Discard the GC-time measurement — we only know the span was
+            # abandoned, not when its work truly ended.
+            elapsed = None
 
         _append_timeline_row(
             shell,
@@ -177,12 +200,13 @@ def phase_span(
             end_metrics=end_metrics,
             delta=delta,
             error_text=str(error) if error is not None else None,
+            abandoned=abandoned,
         )
 
-        if status == "ok":
+        if status == "ok" and not abandoned:
             _render_phase_footer(
                 phase_title=phase_title,
-                elapsed_seconds=elapsed,
+                elapsed_seconds=elapsed if elapsed is not None else 0.0,
                 delta=delta,
                 end_metrics=end_metrics,
             )
@@ -306,17 +330,24 @@ def _append_timeline_row(
     phase_title: str,
     status: str,
     started_iso: str,
-    elapsed_seconds: float,
+    elapsed_seconds: float | None,
     start_metrics: PhaseMetrics,
     end_metrics: PhaseMetrics,
     delta: PhaseDelta,
     error_text: str | None,
+    abandoned: bool = False,
 ) -> None:
     """Persist + emit one structured timeline row.
 
     The on-disk file is ``<workspace>/<domains_dir>/<domain>/timeline.jsonl``.
     The structured-event sink mirror uses event type ``timeline`` so the web
     service receives the exact same payload as the file.
+
+    When ``abandoned`` is True the span was closed at generator GC (REPL
+    teardown), not when the phase's work returned, so ``elapsed_seconds`` and
+    ``ended_at`` are unknowable — both are emitted as ``null`` and the row is
+    tagged ``abandoned`` so downstream (web timeline, client report) renders no
+    bogus duration instead of the idle-session wall-clock delta.
     """
     payload: dict[str, Any] = {
         "run_id": run_id,
@@ -325,12 +356,16 @@ def _append_timeline_row(
         "phase_title": phase_title,
         "status": status,
         "started_at": started_iso,
-        "ended_at": _utc_now_iso(),
-        "elapsed_seconds": round(elapsed_seconds, 3),
+        # ``ended_at`` is meaningful only when the span closed at the phase's real
+        # end; on the abandoned/GC path it would be the teardown timestamp.
+        "ended_at": None if abandoned else _utc_now_iso(),
+        "elapsed_seconds": round(elapsed_seconds, 3) if elapsed_seconds is not None else None,
         "start_metrics": asdict(start_metrics),
         "end_metrics": asdict(end_metrics),
         "delta": asdict(delta),
     }
+    if abandoned:
+        payload["abandoned"] = True
     if error_text:
         payload["error"] = error_text[:500]
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiosmb.commons.connection.factory import SMBConnectionFactory
@@ -30,6 +31,7 @@ from adscan_internal.services.relay.adcs_esc8_krb import AdcsEsc8KrbRelayTarget
 from adscan_internal.services.relay.display import (
     print_relay_cert_result,
     print_relay_no_auth,
+    print_relay_not_viable,
     print_relay_preflight,
 )
 from adscan_internal.services.relay.smb_krb_capture import SMBKrbCaptureConfig, SMBKrbCaptureListener
@@ -49,46 +51,141 @@ _SMB_PORT = 445
 _CRED_MARSHAL_SUFFIX = "1UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA"
 
 
-async def _resolve_esc8_scheme(config: EscConfig) -> tuple[str, int]:
+# Honest, client-safe abort reasons for a non-viable ESC8 avenue. These are the
+# EXISTENCE-condition case (no ESC8 vulnerability at all), NOT a closed avenue of
+# a still-existing weakness — so they are surfaced as a neutral "not viable"
+# outcome, never as ``closed_by_configuration`` (see CLAUDE.md § "Status
+# vocabularies" → orthogonal-avenue vs existence-condition).
+_ESC8_NOT_LISTENING_REASON = (
+    "ADCS web enrollment is not listening on the CA — ESC8 is not viable; "
+    "no certificate is obtainable from this host."
+)
+_ESC8_EPA_REASON = (
+    "ADCS web enrollment is reachable only over HTTPS with Extended Protection "
+    "for Authentication (channel binding) enforced — the relayed authentication "
+    "is rejected, so ESC8 is not viable against this host."
+)
+
+
+@dataclass
+class _Esc8SchemeDecision:
+    """Result of the ESC8 relay pre-flight probe.
+
+    Either a viable relay transport (``scheme`` + ``port``), or an
+    ``abort_reason`` when the probe PROVED the CA web-enrollment avenue cannot
+    yield a certificate. In the abort case the caller skips the coercion
+    entirely — firing an OPSEC-costly, EDR-visible coercion against an endpoint
+    that can never complete the relay is false effort, and the surviving
+    "listener timed out" message would misdiagnose the cause.
+    """
+
+    scheme: str | None = None
+    port: int | None = None
+    abort_reason: str | None = None
+
+    @property
+    def viable(self) -> bool:
+        return self.abort_reason is None
+
+
+async def _resolve_esc8_scheme(config: EscConfig) -> _Esc8SchemeDecision:
     """Decide the certsrv scheme/port for the relay from a live HTTP-aware probe.
 
     The collector probe runs at collection time, not exploitation time, so its
     result is not reachable from this call site. We re-probe here — it is
     host-only (no credentials), fast, and HTTP-aware: it confirms the
     ``/certsrv/`` endpoint answers with a 401 + NTLM/Negotiate per scheme.
-    HTTPS is preferred when both schemes qualify (operator-preferred transport;
-    avoids the historical hardcode that always relayed to ``:80``). When the
-    probe cannot confirm either scheme, fall back to HTTP so behaviour matches
-    the previous default rather than aborting a chain the operator launched.
+
+    The probe's own viability verdict is honored BEFORE any coercion:
+
+    * Both TCP/80 and TCP/443 closed (certain, ADscan-observed) → the CA is not
+      listening for web enrollment → ABORT: there is no ESC8 vulnerability here.
+    * The sole avenue is HTTPS with EPA (channel binding) enforced, and HTTP is
+      not available → the relay is defeated → ABORT.
+    * A scheme answered with NTLM/Negotiate → relay to it (HTTPS preferred when
+      both qualify; avoids the historical hardcode that always relayed to ``:80``).
+    * Genuinely AMBIGUOUS (a port is OPEN but NTLM/Negotiate could not be
+      confirmed, or the probe itself errored) → default to HTTP rather than
+      aborting a chain the operator launched.
     """
     probe_host = config.ca_fqdn or config.ca_host
     if not probe_host:
-        return "http", _HTTP_PORT
+        # No host to probe — cannot prove non-viability. Preserve the legacy
+        # "default to http" behaviour for this ambiguous case.
+        return _Esc8SchemeDecision(scheme="http", port=_HTTP_PORT)
 
     try:
         result: WebEnrollmentProbeResult = await ADCSWebEnrollmentProbe().probe(
             host=probe_host
         )
-    except Exception:  # noqa: BLE001 — probe is best-effort; never abort the chain
-        return "http", _HTTP_PORT
+    except Exception:  # noqa: BLE001 — probe is best-effort; ambiguous → default http
+        return _Esc8SchemeDecision(scheme="http", port=_HTTP_PORT)
 
     masked = mark_sensitive(probe_host, "host")
+
+    # CERTAIN non-viability: BOTH web-enrollment ports ACTIVELY REFUSED the
+    # connection — nothing is listening, so there is no certsrv endpoint to relay
+    # to. Abort before the coercion. Crucially this keys on ``*_refused`` (a
+    # ConnectionRefusedError), NOT on ``*_enabled`` (which is also False on a mere
+    # TIMEOUT): a flaky/slow CA that times out is NOT a certain closure, and
+    # treating it as one would false-abort a genuinely viable ESC8 whenever the
+    # CA is momentarily unresponsive. A timeout falls through to the legacy
+    # default-to-http below (attempt rather than false-abort).
+    if result.https_refused and result.http_refused:
+        print_info_debug(
+            f"[esc8] web enrollment actively refused on 80+443 — aborting: host={masked}"
+        )
+        return _Esc8SchemeDecision(abort_reason=_ESC8_NOT_LISTENING_REASON)
+
+    # CERTAIN non-viability: the only avenue is HTTPS and EPA is enforced. The
+    # probe encodes this as web_enrollment_enabled=False with epa_enforced=True
+    # while HTTP offers no NTLM avenue of its own.
+    if (
+        not result.web_enrollment_enabled
+        and result.epa_enforced is True
+        and result.https_ntlm
+        and not result.http_ntlm
+    ):
+        print_info_debug(
+            f"[esc8] only HTTPS avenue is EPA-enforced — aborting: host={masked}"
+        )
+        return _Esc8SchemeDecision(abort_reason=_ESC8_EPA_REASON)
+
     if result.answering_scheme == "https":
         print_info_debug(
             f"[esc8] relay scheme=https (certsrv offered NTLM/Negotiate over TLS): host={masked}"
         )
-        return "https", _HTTPS_PORT
+        return _Esc8SchemeDecision(scheme="https", port=_HTTPS_PORT)
     if result.answering_scheme == "http":
         print_info_debug(
             f"[esc8] relay scheme=http (certsrv offered NTLM/Negotiate): host={masked}"
         )
-        return "http", _HTTP_PORT
+        return _Esc8SchemeDecision(scheme="http", port=_HTTP_PORT)
 
+    # A port is open but NTLM/Negotiate could not be confirmed — genuinely
+    # ambiguous. Keep the legacy default rather than aborting.
     print_info_debug(
         f"[esc8] probe did not confirm an NTLM/Negotiate certsrv endpoint; "
         f"defaulting relay to http: host={masked}"
     )
-    return "http", _HTTP_PORT
+    return _Esc8SchemeDecision(scheme="http", port=_HTTP_PORT)
+
+
+def _esc8_not_viable_result(technique: str, reason: str) -> EscResult:
+    """Build the honest, neutral EscResult for an aborted-before-coercion ESC8.
+
+    No coercion ran and nothing was changed on the domain, so ``rollback_ok``
+    stays True. ``not_viable`` marks this as an existence-condition non-outcome
+    (there is no ESC8 vulnerability), distinct from an ``attempted`` step that
+    ran and failed.
+    """
+    print_relay_not_viable(technique=technique, reason=reason)
+    return EscResult(
+        success=False,
+        esc=8,
+        error=reason,
+        evidence={"not_viable": True, "coercion_attempted": False},
+    )
 
 
 async def run_esc8(config: EscConfig) -> EscResult:
@@ -98,7 +195,10 @@ async def run_esc8(config: EscConfig) -> EscResult:
     output_dir = Path(config.workspace_dir or ".") / "adcs" / "esc8"
     template = config.template or "DomainController"
 
-    scheme, port = await _resolve_esc8_scheme(config)
+    decision = await _resolve_esc8_scheme(config)
+    if not decision.viable:
+        return _esc8_not_viable_result("ESC8 — ADCS Web Enrollment", decision.abort_reason)
+    scheme, port = decision.scheme, decision.port
 
     print_relay_preflight(
         technique=f"ESC8 — ADCS Web Enrollment ({scheme.upper()})",
@@ -237,6 +337,15 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
     output_dir = Path(config.workspace_dir or ".") / "adcs" / "esc8_krb"
     template = config.template or "DomainController"
 
+    # Honor the probe's viability verdict BEFORE creating the ADIDNS record or
+    # coercing — both are OPSEC-costly and pointless if the CA cannot answer.
+    decision = await _resolve_esc8_scheme(config)
+    if not decision.viable:
+        return _esc8_not_viable_result(
+            "ESC8 — Kerberos relay", decision.abort_reason
+        )
+    scheme, port = decision.scheme, decision.port
+
     # Relay alias: <ca_short_hostname><CredMarshalTargetInfo suffix>
     # The fixed suffix causes Windows Kerberos to canonicalize the SPN to
     # cifs/<ca_hostname>.<domain> (existing SPN on the CA machine account).
@@ -269,7 +378,6 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
         password=config.effective_secret or "",
     )
 
-    scheme, port = await _resolve_esc8_scheme(config)
     krb_target = AdcsEsc8KrbRelayTarget(
         AdcsEsc8RelayConfig(
             ca_host=config.ca_host,

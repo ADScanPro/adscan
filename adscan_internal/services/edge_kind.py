@@ -81,14 +81,14 @@ _CONTROL_EDGES: Final[frozenset[str]] = frozenset(
         # Unconstrained Kerberos delegation — TrustedForDelegation=True on a
         # computer object.  Any user authenticating to this host leaks their TGT.
         "UnconstrainedDelegation",
-        # Writes msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD setup)
-        "AddAllowedToAct",
         # ADscan synthetic / writable-attribute control edges
         "ManageRODCPrp",
         "WriteLogonScript",
-        # Writes msDS-AllowedToActOnBehalfOfOtherIdentity for RBCD —
-        # same control class as WriteLogonScript (writable-attribute
-        # primitive enabling delegation/code execution).
+        # Writes the User-Account-Restrictions property set, which includes
+        # msDS-AllowedToActOnBehalfOfOtherIdentity for RBCD — same control class
+        # as WriteLogonScript (writable-attribute primitive enabling
+        # delegation/code execution). This is the RBCD-write edge the native
+        # collector emits (the former AddAllowedToAct alias was consolidated here).
         "WriteAccountRestrictions",
         # Write servicePrincipalName — enables targeted Kerberoasting abuse
         "WriteSPN",
@@ -123,6 +123,18 @@ _AUTH_EDGES: Final[frozenset[str]] = frozenset(
         "SQLAdmin",
         # SQL Server access (session-level, below sysadmin)
         "SQLAccess",
+        # MSSQL linked-server lateral movement — extends the SQL SESSION reach
+        # from the source instance to a second (often cross-forest) instance via
+        # the configured login mapping. It is an ACCESS pivot, not a privilege
+        # escalation on the source host: the login mapping lands you AS the mapped
+        # remote login on the target instance (frequently a different, higher-
+        # privileged identity — the identity switch is carried on the edge notes:
+        # local_login/remote_login/self_mapping/remote_is_sysadmin). Classifying
+        # it AUTH lets the DFS chain it after an MSSQL access arrival (SQLAccess/
+        # SQLAdmin) exactly like the OS session edges chain a foothold; the
+        # positive MSSQL-lane gate in attack_graph_core withholds it after a
+        # non-MSSQL (AdminTo/CanRDP) arrival.
+        "MssqlLinkedServerLateral",
         # Anonymous / null sessions
         "GuestSession",
         "LDAPAnonymousBind",
@@ -221,6 +233,41 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         # edge (post-ex success: a confirmed DA-sysadmin login), not the
         # structural escalation surface in _ESCALATION_EDGES.
         "MssqlS4U2selfEscalation",
+        # MSSQL-hosted OS command execution — the terminal RCE technique reached
+        # once you hold sysadmin on a SQL instance (SQLAdmin locally, or a linked-
+        # server login mapping that lands as a sysadmin login on the remote). A
+        # DERIVED self-loop overlay minted by attack_graph_core.
+        # _build_implicit_xpcmdshell_overlay (mirrors the DumpLSA overlay): the
+        # host self-loop is where OS execution happens, terminal so a kill chain
+        # ends at RCE. NOT a graph edge the collector emits.
+        "XpCmdshell",
+        # MSSQL SYSTEM-escalation follow-ups: a self-loop on the SAME host that
+        # already has XpCmdshell RCE, recorded ONLY on proven SYSTEM (post-ex
+        # model, mssql.py:run_xpcmdshell_system_escalation_followup). Same
+        # class as MssqlS4U2selfEscalation just above — a derived post-ex
+        # follow-up on an already-reached host, not the structural escalation
+        # surface in _ESCALATION_EDGES. Classifying these as ESCALATION made
+        # them a host-control EdgeKind, so the access-edge host-control gate
+        # (_host_control_withheld_after_access in attack_graph_core.py)
+        # withheld them after the MssqlLinkedServerLateral/XpCmdshell arrival
+        # that legitimately unlocks them — the exact HTB DarkZero regression
+        # (JOHN.W -> MssqlTokenTheftEscalation -> dc02, disconnected from the
+        # XpCmdshell chain instead of chaining after it).
+        "MssqlSeImpersonateEscalation",
+        "MssqlTokenTheftEscalation",
+        # OPENROWSET(BULK ...) arbitrary-file-read — the terminal MSSQL-hosted
+        # data-exposure technique reached once a session holds ADMINISTER BULK
+        # OPERATIONS on a SQL instance (SQLAdmin locally — sysadmin always has
+        # it; or a below-sysadmin SQLAccess login / linked-server login mapping
+        # that holds the permission or ``bulkadmin`` role membership, a PER-EDGE
+        # fact). A DERIVED self-loop overlay minted by attack_graph_core.
+        # _build_implicit_openrowset_bulk_overlay (mirrors the XpCmdshell
+        # overlay): unlike xp_cmdshell (RCE, sysadmin-only), this is a
+        # credential/data-exposure read, not host code execution — same DERIVED
+        # class as DumpSAM/DumpDPAPI (a lateral-credential follow-up, not a
+        # self-credential/host-control bridge). NOT a graph edge the collector
+        # emits directly.
+        "MssqlOpenRowsetBulkRead",
     }
 )
 
@@ -258,13 +305,12 @@ _ESCALATION_EDGES: Final[frozenset[str]] = frozenset(
         "UserAsPass",
         "BlankPassword",
         "ComputerPre2k",
-        # MSSQL post-exploitation escalation (ADscan native, not in BloodHound CE)
-        # SeImpersonatePrivilege present  → CLR potato chain (GodPotato/SweetPotato)
-        "MssqlSeImpersonateEscalation",
-        # SeImpersonatePrivilege absent   → Forshaw shared logon session recovery
-        "MssqlTokenTheftEscalation",
-        # MSSQL linked-server lateral movement (sysadmin hop to a second SQL instance)
-        "MssqlLinkedServerLateral",
+        # NOTE: MssqlSeImpersonateEscalation / MssqlTokenTheftEscalation moved to
+        # _DERIVED_EDGES (see the block above, next to MssqlS4U2selfEscalation) —
+        # both are post-ex self-loop follow-ups on an already-reached host, not a
+        # structural escalation surface.
+        # NOTE: MssqlLinkedServerLateral moved to _AUTH_EDGES — it is a SQL-session
+        # ACCESS pivot to a second instance, not an escalation on the source host.
         # MSSQL privilege escalation via EXECUTE AS LOGIN (e.g. low-priv → sa)
         "MssqlImpersonateLogin",
         # MSSQL privilege escalation via TRUSTWORTHY database dbo impersonation
@@ -469,6 +515,11 @@ _CONTROL_STRENGTH_BY_RELATION: Final[dict[str, ControlStrength]] = {
     "sqladmin": ControlStrength.CONDITIONAL_EXEC,
     # DB session, usually no host code-execution.
     "sqlaccess": ControlStrength.LOW,
+    # Linked-server lateral: lands a SQL session on the remote instance as the
+    # mapped login. Host code-execution is reachable only when that login is
+    # sysadmin AND the extra xp_cmdshell step succeeds — same conditional-exec
+    # class as SQLAdmin.
+    "mssqllinkedserverlateral": ControlStrength.CONDITIONAL_EXEC,
 }
 
 

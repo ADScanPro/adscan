@@ -160,8 +160,8 @@ _VALID_SMB_MAPPING_MODES = {
 _SMB_RCLONE_MAPPING_CACHE_MAX_AGE_AUDIT = timedelta(hours=4)
 
 
-def parse_netexec_smbv1_output(output: str) -> dict[str, object]:
-    """Parse NetExec SMB banner lines to identify hosts with SMBv1 enabled."""
+def parse_smbv1_banner_output(output: str) -> dict[str, object]:
+    """Parse SMB banner lines to identify hosts with SMBv1 enabled."""
     normalized = strip_ansi_codes(output or "").strip()
     if not normalized:
         return {}
@@ -316,6 +316,7 @@ def _record_smbv1_finding(
             prefix="[smbv1]",
         ):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[smbv1] Failed to persist technical finding: {type(exc).__name__}: {exc}"
             )
@@ -901,6 +902,7 @@ def execute_smb_rid_cycling(
             entries, status, error = asyncio.run(_drive(max_rid))
         except (SMBAuthError, SMBAccessDeniedError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             if not has_local_auth:
                 execute_smb_rid_cycling(
                     shell, domain=domain, rid_max=rid_max, local_auth=True
@@ -912,6 +914,7 @@ def execute_smb_rid_cycling(
             return
         except (SMBConnectionError, SMBTransportError) as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(
                 f"RID cycling connection error on domain {marked_domain}: {exc}"
             )
@@ -953,6 +956,7 @@ def execute_smb_rid_cycling(
                         user_entries = expanded_users
             except Exception as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         seen: set[str] = set()
         users: list[str] = []
@@ -1517,6 +1521,7 @@ def run_auth_shares(
         username=username,
         password=password,
         view_sets=view_sets,
+        guard=lockout_guard,
     )
 
 
@@ -1527,6 +1532,7 @@ def _render_live_share_exposure_surface(
     username: str,
     password: str,
     view_sets: list[Any],
+    guard: Any | None = None,
 ) -> None:
     """Render the consolidated premium share-exposure surface (live per-user).
 
@@ -1537,6 +1543,12 @@ def _render_live_share_exposure_surface(
     (writable-share capture) and Step 2 (readable-share credential hunt)
     substeps. The substeps are source-agnostic: they operate on rows / explicit
     targets and carry the audit/CTF capture defaults unchanged.
+
+    ``guard`` is the SAME :class:`~adscan_internal.services.sweep_credential.
+    SweepLockoutGuard` the caller's live per-host share enumeration loop fed —
+    one credential, one guard across the WHOLE sweep (enumeration + both
+    substeps). If that loop already tripped it, both substeps skip instead of
+    starting a fresh round of SMB auth attempts with a dead credential.
     """
     from adscan_internal.cli.smb_live_share_rows import build_live_share_rows  # noqa: PLC0415
     from adscan_internal.cli.share_exposure_phase import (  # noqa: PLC0415
@@ -1581,6 +1593,7 @@ def _render_live_share_exposure_surface(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     writable, readable = _split_share_rows(rows)
 
@@ -1598,9 +1611,11 @@ def _render_live_share_exposure_surface(
             domain_data=domain_data,
             username=username,
             credential=password,
+            guard=guard,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     try:
         _run_readable_hunt_substep(
             shell,
@@ -1608,9 +1623,11 @@ def _render_live_share_exposure_surface(
             readable=readable,
             username=username,
             credential=password,
+            guard=guard,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def run_rid_cycling(shell: Any, *, domain: str) -> None:
@@ -1783,6 +1800,7 @@ def run_smb_descriptions(shell: Any, *, domain: str) -> None:
                 )
             except Exception as analysis_exc:  # noqa: BLE001
                 telemetry.capture_exception(analysis_exc)
+                print_exception(exception=analysis_exc)
                 print_warning(f"SMB description analysis failed: {analysis_exc}")
 
     try:
@@ -1796,10 +1814,11 @@ def run_smb_descriptions(shell: Any, *, domain: str) -> None:
             fh.write(synthetic_output)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[smb-desc] failed to persist null_descriptions.log: {exc}")
 
 
-def execute_netexec_pass_policy(shell: Any, *, domain: str) -> None:
+def execute_password_policy(shell: Any, *, domain: str) -> None:
     """Display the domain password policy from ADscan's native posture data.
 
     The default domain password policy is already fetched and persisted over
@@ -1849,6 +1868,7 @@ def execute_netexec_pass_policy(shell: Any, *, domain: str) -> None:
                 )
             except Exception as probe_exc:  # noqa: BLE001 - best-effort guard
                 telemetry.capture_exception(probe_exc)
+                print_exception(exception=probe_exc)
                 print_info_debug(
                     "[pass-pol] posture freshness guard skipped (non-fatal): "
                     f"{type(probe_exc).__name__}"
@@ -1992,6 +2012,7 @@ def _record_password_policy_finding(
                 fh.write("\n".join(summary_lines) + "\n")
         except Exception as write_exc:  # noqa: BLE001 - evidence is best-effort
             telemetry.capture_exception(write_exc)
+            print_exception(exception=write_exc)
 
         record_technical_finding(
             shell,
@@ -2015,6 +2036,7 @@ def _record_password_policy_finding(
             prefix="[pass-pol]",
         ):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"[pass-pol] Failed to persist technical finding: {type(exc).__name__}: {exc}"
             )
@@ -2023,8 +2045,8 @@ def _record_password_policy_finding(
 def run_pass_policy(shell: Any, *, domain: str) -> None:
     """Display the default domain password policy from ADscan's posture data.
 
-    This encapsulates the former ``do_netexec_pass_policy`` logic. The policy is
-    read from the native posture system (LDAP), not a subprocess tool.
+    This encapsulates the ``do_password_policy`` REPL command's logic. The
+    policy is read from the native posture system (LDAP), not a subprocess tool.
     """
     domain_creds = (
         shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
@@ -2039,7 +2061,7 @@ def run_pass_policy(shell: Any, *, domain: str) -> None:
 
     marked_domain = mark_sensitive(domain, "domain")
     print_info_verbose(f"Displaying password policy for domain {marked_domain}")
-    execute_netexec_pass_policy(shell, domain=domain)
+    execute_password_policy(shell, domain=domain)
 
 
 async def _probe_smbv1_hosts(
@@ -2132,6 +2154,7 @@ def _record_smbv1_audit(
                         prefix="[smb-null]",
                     ):
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
             if is_dc:
                 dc_hosts.append(host)
             else:
@@ -2298,7 +2321,7 @@ def run_smb_scan(shell: Any, *, domain: str) -> None:
         "[smb] Null session probe handled by native unauth sweep — skipping legacy path."
     )
     shell.do_rid_cycling(domain)
-    shell.do_netexec_guest(domain)
+    shell.do_smb_guest_shares(domain)
 
 
 def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
@@ -2342,6 +2365,7 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
         samr_users, status, error = asyncio.run(_run())
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Error enumerating SMB users in domain {marked_domain}: {exc}")
         return
 
@@ -2368,6 +2392,7 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
             fh.write("\n".join(users) + ("\n" if users else ""))
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[smb-null-users] failed to persist users_null.log: {exc}")
 
     shell._write_user_list_file(
@@ -2577,6 +2602,7 @@ async def _harvest_gpp_for_domain(
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             r = GPPHarvestResult(status="error", error=f"{target}: {exc}")
             r.targets_walked.append(target)
             return r
@@ -2745,6 +2771,7 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
             result = asyncio.run(_harvest_gpp_for_domain(shell, target_domain=target_domain))
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(f"Error harvesting GPP autologon on {marked_target_domain}: {exc}")
         return
@@ -2784,7 +2811,15 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
             fh.write(synthetic_stdout)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[gpp] failed to persist gpp_autologin.log: {exc}")
+
+    if result.status == "error":
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"GPP autologon harvest failed on {marked_target_domain}: {result.error or '-'}"
+        )
+        return
 
     if result.status == "denied" and not result.has_findings:
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -2811,6 +2846,7 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
         print_info_debug("[gpp-autologon] execute_netexec_gpp returned OK")
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[gpp-autologon] execute_netexec_gpp raised: {exc}")
     finally:
         if original_run_command is not None:
@@ -2899,6 +2935,7 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
             result = asyncio.run(_harvest_gpp_for_domain(shell, target_domain=target_domain))
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(f"Error harvesting GPP passwords on {marked_target_domain}: {exc}")
         return
@@ -2960,7 +2997,15 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
             fh.write(synthetic_stdout)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[gpp] failed to persist gpp_password.log: {exc}")
+
+    if status == "error":
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"GPP password harvest failed on {marked_target_domain}: {error or '-'}"
+        )
+        return
 
     if status == "denied":
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -3113,6 +3158,7 @@ def run_local_cred_reuse(
             handle.write(synthetic_output)
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[local_reuse] failed to persist {log_rel}: {exc}"
         )
@@ -4161,20 +4207,34 @@ def _enumerate_ntlm_bait_targets(
     target_host: str,
     creds: dict[str, Any],
     domain: str,
-) -> list[Any]:
+) -> tuple[list[Any], str | None]:
     """Enumerate writable (share, folder) drop targets across writable shares.
 
     Granular per-folder enumeration (Part 1): for each writable share, MxAc-walk
     its directory tree (bounded depth + folder cap, read-only) and collect the
     folders — including the root — where the current token has effective WRITE.
-    Returns a list of ``DropTarget`` (share, directory_path). Bounded and
-    non-intrusive per adscan-ad-constraints § 10.
+
+    Returns ``(targets, auth_error)``. ``targets`` is a list of ``DropTarget``
+    (share, directory_path). ``auth_error`` is the raw auth-error string (e.g.
+    an NTStatus like ``NTStatus.ACCOUNT_LOCKED_OUT`` / ``STATUS_LOGON_FAILURE``)
+    the FIRST time a share's probe connection is classified as an authentication
+    failure by :func:`classify_sweep_auth_error`, or ``None`` when every probed
+    share authenticated cleanly. Authentication happens once per SMB session
+    (session-setup, before tree-connect) — a credential that fails to auth on
+    one share on this host WILL fail identically on every other share on the
+    SAME host, so the loop stops at the first classified failure instead of
+    hammering the DC with the same dead credential once per remaining share
+    (the exact pattern that re-asserted a domain lockout in a real audit).
     """
     from adscan_internal.services.post_exploitation.ntlmv2_share_capture_service import (  # noqa: PLC0415
         DropTarget,
     )
     from adscan_internal.services.smb_effective_access_service import (  # noqa: PLC0415
         enumerate_writable_directories,
+    )
+    from adscan_internal.services.sweep_credential import (  # noqa: PLC0415
+        SweepAuthOutcome,
+        classify_sweep_auth_error,
     )
 
     username = str(creds.get("username") or "").strip()
@@ -4196,6 +4256,16 @@ def _enumerate_ntlm_bait_targets(
             )
         except Exception as exc:  # noqa: BLE001 — enumeration must never break the offer
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            outcome = classify_sweep_auth_error(str(exc))
+            if outcome in (SweepAuthOutcome.LOCKED_OUT, SweepAuthOutcome.LOGON_FAILURE):
+                print_warning(
+                    "[!] Authentication failed enumerating "
+                    f"{mark_sensitive(share, 'share')} on "
+                    f"{mark_sensitive(target_host, 'hostname')}: {exc}. Stopping "
+                    "further share probes on this host with this credential."
+                )
+                return targets, str(exc)
             print_info_debug(
                 f"ntlmv2-share-capture: writable-folder enumeration failed on "
                 f"{mark_sensitive(share, 'share')}: {exc}. Falling back to root drop."
@@ -4210,14 +4280,28 @@ def _enumerate_ntlm_bait_targets(
                 "for write access and are excluded from targeting."
             )
 
+        if not enumeration.succeeded and enumeration.error_message:
+            outcome = classify_sweep_auth_error(enumeration.error_message)
+            if outcome in (SweepAuthOutcome.LOCKED_OUT, SweepAuthOutcome.LOGON_FAILURE):
+                print_warning(
+                    "[!] Authentication failed enumerating "
+                    f"{mark_sensitive(share, 'share')} on "
+                    f"{mark_sensitive(target_host, 'hostname')}: "
+                    f"{enumeration.error_message}. Stopping further share probes "
+                    "on this host with this credential."
+                )
+                return targets, enumeration.error_message
+
         if enumeration.writable_paths:
             for rel in enumeration.writable_paths:
                 targets.append(DropTarget(share=share, directory_path=rel))
         elif not enumeration.succeeded:
-            # MxAc undetermined — the share itself was already gated as writable
-            # upstream, so keep the root as a target (the upload is the test).
+            # MxAc undetermined for a NON-auth reason (transport hiccup, MxAc
+            # unsupported, parse failure) — the share itself was already gated
+            # as writable upstream, so keep the root as a target (the upload is
+            # the test).
             targets.append(DropTarget(share=share, directory_path=""))
-    return targets
+    return targets, None
 
 
 def _render_ntlm_bait_targets_panel(targets: list[Any], target_host: str) -> None:
@@ -4256,7 +4340,7 @@ def run_ntlmv2_capture_for_writable_shares(
     writable_share_names: Any,
     username: str,
     credential: str,
-) -> None:
+) -> str | None:
     """Single-source NTLMv2 share-drop capture core — name-driven, no ShareViews.
 
     This is the canonical capture implementation reused by both the live
@@ -4287,10 +4371,20 @@ def run_ntlmv2_capture_for_writable_shares(
             or blank names are silently skipped; an empty result returns early.
         username: Authenticating username.
         credential: Password or NT hash for the authenticating principal.
+
+    Returns:
+        The raw auth-error string (e.g. an NTStatus) the FIRST time this host's
+        SMB session-setup is classified as an authentication failure
+        (``ACCOUNT_LOCKED_OUT`` / ``LOGON_FAILURE``), or ``None`` when no
+        classified authentication failure was observed — including every early
+        gate/skip/decline path, where no live SMB auth was even attempted.
+        Callers feed this into a shared :class:`SweepLockoutGuard` so a
+        multi-host sweep stops on a dead credential instead of re-asserting a
+        lockout host by host.
     """
     writable_share_names = [str(n).strip() for n in (writable_share_names or []) if str(n).strip()]
     if not writable_share_names:
-        return
+        return None
 
     listener_ip = str(getattr(shell, "myip", "") or "").strip()
     if not listener_ip:
@@ -4298,7 +4392,7 @@ def run_ntlmv2_capture_for_writable_shares(
             "ntlmv2-share-capture: writable share(s) found but no listener IP "
             "(shell.myip unset); skipping the bait offer."
         )
-        return
+        return None
 
     target_host = str(host or "").strip()
     if not target_host:
@@ -4306,7 +4400,7 @@ def run_ntlmv2_capture_for_writable_shares(
             "ntlmv2-share-capture: writable share(s) found but no target host; "
             "skipping the bait offer."
         )
-        return
+        return None
 
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     is_ctf = workspace_type == "ctf"
@@ -4318,7 +4412,7 @@ def run_ntlmv2_capture_for_writable_shares(
             "ntlmv2-share-capture: audit + non-interactive session; skipping the "
             "bait offer (never drop unattended on a real client)."
         )
-        return
+        return None
 
     creds = {
         "username": str(username or "").strip(),
@@ -4342,7 +4436,7 @@ def run_ntlmv2_capture_for_writable_shares(
         "enumerated (SMB2 MxAc) to choose drop targets.",
         default=is_ctf,
     ):
-        return
+        return None
 
     # ── Part 1: enumerate writable folders (root + sub-folders) per share ────
     print_info(
@@ -4350,18 +4444,23 @@ def run_ntlmv2_capture_for_writable_shares(
         f"{len(writable_share_names)} writable share(s) on "
         f"{mark_sensitive(target_host, 'hostname')}."
     )
-    targets = _enumerate_ntlm_bait_targets(
+    targets, auth_error = _enumerate_ntlm_bait_targets(
         writable_share_names=writable_share_names,
         target_host=target_host,
         creds=creds,
         domain=domain,
     )
+    if auth_error:
+        # A classified auth failure was observed enumerating this host — never
+        # proceed to drop bait (another live SMB auth attempt) with a credential
+        # just seen failing/locked out.
+        return auth_error
     if not targets:
         print_info(
             "[~] No writable folders confirmed for the current credentials — "
             "NTLM share-drop capture skipped."
         )
-        return
+        return None
 
     from adscan_internal.rich_output import (  # noqa: PLC0415
         questionary_checkbox_values,
@@ -4424,7 +4523,7 @@ def run_ntlmv2_capture_for_writable_shares(
 
     if not selected_targets:
         print_info("[~] No folders selected — NTLM share-drop capture skipped.")
-        return
+        return None
 
     # ── Part 5: audit-interactive no-capture iteration provider ──────────────
     # On a no-capture round, offer to widen to the remaining writable folders.
@@ -4483,7 +4582,15 @@ def run_ntlmv2_capture_for_writable_shares(
         telemetry.capture_exception(exc)
         print_error("Error running NTLM share-drop capture.")
         print_exception(show_locals=False, exception=exc)
-        return
+        from adscan_internal.services.sweep_credential import (  # noqa: PLC0415
+            SweepAuthOutcome,
+            classify_sweep_auth_error,
+        )
+
+        drop_outcome = classify_sweep_auth_error(str(exc))
+        if drop_outcome in (SweepAuthOutcome.LOCKED_OUT, SweepAuthOutcome.LOGON_FAILURE):
+            return str(exc)
+        return None
 
     # ── Part 6: offer to crack the captured hash(es) with the existing path ──
     # Reuses the standard hashcat cracking entry point (run_cracking via
@@ -4492,6 +4599,7 @@ def run_ntlmv2_capture_for_writable_shares(
     # runs confirm_ask auto-resolves to the default and run_cracking is itself
     # CI-safe (default wordlist + bounded hashcat timeout), so CI never hangs.
     _offer_crack_for_captured_netntlm(shell, domain=domain, result=capture_result)
+    return None
 
 
 def _offer_ntlmv2_share_drop_capture(
@@ -5846,6 +5954,7 @@ def _mount_cifs_targets_via_host_helper(
         from adscan_internal.host_privileged_helper import host_helper_client_request
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             "CIFS host-helper mount skipped: could not import host helper client."
         )
@@ -5880,6 +5989,7 @@ def _mount_cifs_targets_via_host_helper(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             failed_count += 1
             print_warning_debug(
                 "CIFS host-helper mount request failed: "
@@ -5985,6 +6095,7 @@ def _unmount_cifs_targets_via_host_helper(
         from adscan_internal.host_privileged_helper import host_helper_client_request
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug("CIFS unmount skipped: cannot import host helper client.")
         return
 
@@ -6000,6 +6111,7 @@ def _unmount_cifs_targets_via_host_helper(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             failed += 1
             marked_mount = mark_sensitive(mount_point, "path")
             print_warning_debug(
@@ -6083,6 +6195,7 @@ def run_smb_share_tree_mapping_with_cifs(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             "CIFS host-helper mount orchestration failed unexpectedly; continuing "
             "with pre-existing mount state."
@@ -6197,6 +6310,7 @@ def run_smb_share_tree_mapping_with_cifs(
             _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "CIFS unmount cleanup failed unexpectedly after mapping workflow."
             )
@@ -6328,6 +6442,7 @@ async def _native_walk_host_share_tree(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "share-tree walk error on "
                 f"{mark_sensitive(uncroot, 'path')}: {type(exc).__name__}"
@@ -6427,6 +6542,7 @@ async def _native_build_share_tree_host_json(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "share-tree walk could not build SMB config for "
                 f"{mark_sensitive(host_key, 'hostname')}: {type(exc).__name__}"
@@ -6457,6 +6573,7 @@ async def _native_build_share_tree_host_json(
             continue
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "share-tree walk failed to connect to "
                 f"{mark_sensitive(host_key, 'hostname')}: {type(exc).__name__}"
@@ -6629,6 +6746,7 @@ def run_smb_share_tree_mapping_with_spider_plus(
                 )
             except Exception as triage_exc:  # noqa: BLE001
                 telemetry.capture_exception(triage_exc)
+                print_exception(exception=triage_exc)
                 print_warning(
                     "SMB share mapping completed, but post-mapping sensitive-data analysis "
                     "failed and was skipped."
@@ -7485,6 +7603,7 @@ def _run_deterministic_vm_disk_scan(
         return stored_total
     except Exception as exc:  # noqa: BLE001 - VM disk scan must never abort the share scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(f"VM disk artifact scan failed (non-fatal): {exc}")
         return 0
 
@@ -7566,6 +7685,34 @@ def _normalize_smb_host_for_resolution(host: str, domain: str) -> str:
     return f"{candidate}.{domain_clean}" if domain_clean else candidate
 
 
+def resolve_connectable_share_host(
+    host_label: str, host_ip: str | None, domain: str
+) -> str:
+    """SSOT for the CONNECTABLE SMB host of a share-exposure row.
+
+    A graph-derived row's ``host`` is the computer's DISPLAY label
+    (``HOST$@REALM``), which does NOT SMB-connect. Resolution order, most robust
+    first:
+
+    1. ``host_ip`` — the node's collected IP / DNS hostname (DNS-INDEPENDENT: works
+       even when the container cannot resolve AD names). Preferred.
+    2. the FQDN derived from the AD-identity label
+       (:func:`_normalize_smb_host_for_resolution`, ``HOST$@REALM`` → ``host.realm``)
+       — DNS-dependent fallback for rows without a collected IP.
+    3. the raw label, last resort.
+
+    Used by BOTH the read credential-hunt and the write bait/capture so neither
+    ever authenticates against the non-routable account-principal string
+    (the audit LOGON_FAILURE / connection-failure bug). Live-enumerated rows whose
+    ``host`` is already an IP fall straight through (2)/(3) unchanged.
+    """
+    ip = str(host_ip or "").strip()
+    if ip:
+        return ip
+    label = str(host_label or "").strip()
+    return _normalize_smb_host_for_resolution(label, domain) or label
+
+
 def run_smb_share_credential_hunt(
     shell: Any,
     *,
@@ -7601,12 +7748,30 @@ def run_smb_share_credential_hunt(
         print_warning("No domain credentials available — cannot scan shares for credentials.")
         return {"completed": False, "credential_findings": 0, "phases_run": []}
 
-    hosts = sorted({
-        normalized
-        for t in targets
-        if (normalized := _normalize_smb_host_for_resolution(t.get("host", ""), domain))
-    })
-    shares = sorted({t["share"] for t in targets if t.get("share")})
+    # Preserve the caller's exact host<->share pairing as a share_map instead of
+    # flattening into separate hosts/shares sets. Without it,
+    # _resolve_cifs_host_share_targets() has no per-host membership to work
+    # from and falls back to a full hosts x shares cross-product — hitting
+    # hosts for shares they never actually exposed (STATUS_BAD_NETWORK_NAME
+    # storms, wasted engagement time). Every pair here already passed the
+    # caller's effective-READ-access filter (share_exposure_phase.py), so a
+    # constant "READ" marker is sufficient — _resolve_cifs_host_share_targets
+    # only checks for "read"/"write" substrings, it never needs the exact level.
+    share_map: dict[str, dict[str, str]] = {}
+    for t in targets:
+        # SSOT connectable-host resolution: prefer the collected IP (host_ip,
+        # DNS-independent), fall back to the FQDN derived from the HOST$@REALM
+        # label. Shared with the write bait/capture path.
+        normalized_host = resolve_connectable_share_host(
+            t.get("host", ""), t.get("host_ip"), domain
+        )
+        share_name = str(t.get("share") or "").strip()
+        if not normalized_host or not share_name:
+            continue
+        share_map.setdefault(normalized_host, {})[share_name] = "READ"
+
+    hosts = sorted(share_map.keys())
+    shares = sorted({share_name for host_shares in share_map.values() for share_name in host_shares})
     if not hosts or not shares:
         return {"completed": False, "credential_findings": 0, "phases_run": []}
 
@@ -7616,7 +7781,7 @@ def run_smb_share_credential_hunt(
         domain=domain,
         shares=shares,
         hosts=hosts,
-        share_map=None,
+        share_map=share_map,
         username=username,
         password=password,
         backend="rclone_direct",
@@ -8843,6 +9008,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             "CIFS mount orchestration for deterministic scan failed unexpectedly."
         )
@@ -9019,6 +9185,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
         }
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning("CIFS deterministic share analysis failed unexpectedly.")
         print_warning_debug(
             f"CIFS deterministic scan exception: {type(exc).__name__}: {exc}"
@@ -9030,6 +9197,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
             _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "CIFS unmount cleanup failed unexpectedly after deterministic scan."
             )
@@ -9083,6 +9251,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning_debug(
             f"CIFS artifact phase mount exception: {type(exc).__name__}: {exc}"
         )
@@ -9129,6 +9298,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning("CIFS artifact phase failed unexpectedly.")
         print_warning_debug(
             f"CIFS artifact phase exception: {type(exc).__name__}: {exc}"
@@ -9140,6 +9310,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
             _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"CIFS artifact phase unmount exception: {type(exc).__name__}: {exc}"
             )
@@ -9390,6 +9561,7 @@ def _run_post_mapping_ai_triage(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         marked_map = mark_sensitive(aggregate_map_rel, "path")
         print_warning(
             f"AI triage skipped: could not load consolidated mapping from {marked_map}."
@@ -9506,6 +9678,7 @@ def _run_post_mapping_ai_triage(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(
             "AI triage skipped: could not prepare a bounded share-map view for the model."
         )
@@ -10110,6 +10283,7 @@ def _run_ai_prioritized_file_analysis(
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
                         extracted_entries = 0
                         print_warning(
                             f"Could not process KeePass artifact {marked_path} deterministically."
@@ -10537,6 +10711,7 @@ def _select_action_index(
             return selector(title, options, default_idx)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 "Questionary selector failed in prioritized findings action flow."
             )
@@ -10745,7 +10920,7 @@ def ask_for_smb_scan(shell: Any, *, domain: str) -> None:
     return run_ask_for_smb_scan(shell, domain=domain)
 
 
-def run_netexec_auth_shares_from_args(shell: Any, args: str) -> None:
+def run_smb_auth_shares_from_args(shell: Any, args: str) -> None:
     """Execute authenticated SMB share enumeration from command-line arguments.
 
     Args:
@@ -10753,25 +10928,36 @@ def run_netexec_auth_shares_from_args(shell: Any, args: str) -> None:
         args: Space-separated string containing domain, username, and password.
 
     Usage:
-        run_netexec_auth_shares_from_args(shell, "example.local admin Passw0rd!")
+        smb_auth_shares <domain> <username> <password>
+        smb_auth_shares -d <domain> -u <username> -p <password>
+
+    Both forms are permanently supported. In the flag form, a secret value
+    starting with "-" needs the "=" spelling: --password=-Str0ngP@ss!
     """
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
+    from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
+    usage = (
+        "smb_auth_shares <domain> <username> <password>  |  "
+        "smb_auth_shares -d <domain> -u <username> -p <password>"
+    )
+    parser = ReplArgumentParser(prog="smb_auth_shares", add_help=False)
+    parser.add_argument("-d", "--domain", required=True)
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+
+    namespace = parse_command_args(
+        tokens_source=args,
+        legacy_field_order=("domain", "username", "password"),
+        parser=parser,
+        usage=usage,
+    )
+    if namespace is None:
         return
-    args_list = args.split()
-    if len(args_list) != 3:
-        print_error("Usage: netexec_shares <domain> <username> <password>")
-        return
-    target_domain = args_list[0]
-    username = args_list[1]
-    password = args_list[2]
     run_auth_shares(
         shell,
-        domain=target_domain,
-        username=username,
-        password=password,
+        domain=namespace.domain,
+        username=namespace.username,
+        password=namespace.password,
     )
 
 
@@ -10874,9 +11060,11 @@ def execute_manspider(
         if hosts or shares:
             marked_hosts = [mark_sensitive(h, "hostname") for h in (hosts or [])]
             marked_shares = [mark_sensitive(s, "path") for s in (shares or [])]
+            hosts_repr = ", ".join(marked_hosts) if marked_hosts else "N/A"
+            shares_repr = ", ".join(marked_shares) if marked_shares else "N/A"
             print_info_debug(
                 "Manspider context: "
-                f"hosts={marked_hosts or 'N/A'} shares={marked_shares or 'N/A'}"
+                f"hosts={hosts_repr} shares={shares_repr}"
             )
         if scan_type == "passw":
             log_dir = "smb"

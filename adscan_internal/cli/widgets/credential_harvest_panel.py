@@ -292,6 +292,7 @@ from typing import Any  # noqa: E402
 from adscan_core import telemetry  # noqa: E402
 from adscan_core.rich_output import (  # noqa: E402
     confirm_ask,
+    print_exception,
     print_info,
     print_info_debug,
     print_instruction,
@@ -355,6 +356,7 @@ def offer_credential_harvest_actions(
         _show_rainbow_pending_hashes(records)
     except Exception as exc:  # noqa: BLE001 — foreground actions are best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 _TIER0_VALUES: frozenset[str] = frozenset(
@@ -444,6 +446,7 @@ def _activate_record(shell: Any, domain: str, record: HarvestedPrincipal) -> Non
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _render_tier0_captured_panel(records: list[HarvestedPrincipal]) -> None:
@@ -468,6 +471,7 @@ def _render_tier0_captured_panel(records: list[HarvestedPrincipal]) -> None:
         )
     except Exception as exc:  # noqa: BLE001 — a panel must never block activation
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _offer_add_credential_and_scan(
@@ -587,6 +591,7 @@ def _offer_retry_uncracked(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     print_info(
         f"Queued {len(escalatable)} retry-crack job(s) at the "
         f"'{_EFFORT_LEVELS[-1]}' effort tier — check status with 'jobs'."
@@ -690,6 +695,7 @@ def _ci_classify_against_graph(
         )
     except Exception as exc:  # noqa: BLE001 — graph read is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         reach_by_user = {}
     out: dict[str, tuple[PrivilegeTier | None, CompromiseClass]] = {}
     for record in records:
@@ -703,6 +709,7 @@ def _ci_classify_against_graph(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             tier = _tier_from_value(record.privilege_tier)
         reach = reach_by_user.get(key)
         if reach is None:
@@ -756,6 +763,7 @@ def activate_and_escalate_harvest_ci(
         _ci_escalate_thorough_by_value(shell, domain, records, classification)
     except Exception as exc:  # noqa: BLE001 — the whole CI path is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _ci_default_class(
@@ -844,6 +852,7 @@ def _ci_escalate_thorough_by_value(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     print_info(
         f"Queued {len(prioritized)} value-prioritized retry-crack job(s) at the "
         f"'{_EFFORT_LEVELS[-1]}' effort tier (Tier 0 / attack-path-to-Tier-0 first) "
@@ -935,6 +944,7 @@ def render_harvest_review_at_drain(
             )
     except Exception as exc:  # noqa: BLE001 — the drain review is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def render_harvest_command(shell: Any, domain: str) -> None:
@@ -968,6 +978,7 @@ def render_harvest_command(shell: Any, domain: str) -> None:
         offer_credential_harvest_actions(shell, domain, records)
     except Exception as exc:  # noqa: BLE001 — the harvest command is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 # --- Phase 2d: mid-scan between-phase break points -------------------------
@@ -1143,3 +1154,4 @@ def maybe_surface_high_value_cracks_between_phases(shell: Any, domain: str) -> N
                 pass
     except Exception as exc:  # noqa: BLE001 — the break point must never break the scan
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)

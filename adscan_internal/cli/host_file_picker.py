@@ -37,6 +37,7 @@ def is_full_container_runtime(shell: object) -> bool:
             return bool(method())
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     try:
         from adscan_internal.cli.tools_env import _is_full_adscan_container_runtime

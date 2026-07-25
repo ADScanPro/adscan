@@ -40,6 +40,7 @@ from adscan_internal.tui.widgets.console_panel import ConsolePanel
 from adscan_internal.tui.widgets.context_panel import ContextPanel
 from adscan_internal.tui.widgets.header import ADscanHeader
 from adscan_internal.tui.widgets.workspace_sidebar import WorkspaceSidebar
+from adscan_core.rich_output import print_exception
 
 
 # ── CSS (generated from brand constants) ─────────────────────────────────────
@@ -502,6 +503,7 @@ class ADscanApp(App):
             from adscan_internal import telemetry
 
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             self.post_message(
                 _ConsoleOutput(
                     f"\x1b[31mError executing '{command_name}': {exc}\x1b[0m\n"

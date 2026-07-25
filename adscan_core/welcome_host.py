@@ -34,6 +34,7 @@ from adscan_core.posture_score import (
     compute_posture_score,
 )
 from adscan_core.theme import ADSCAN_PRIMARY, ADSCAN_PRIMARY_DIM
+from adscan_core.rich_output import print_exception
 
 
 WELCOME_HEADLINE = "Find every path to Domain Admin. Close every one before they do."
@@ -153,6 +154,7 @@ def load_latest_posture_host() -> tuple[PostureScore | None, str | None, int | N
         root = get_workspaces_dir()
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None, None, None
 
     if not root.exists():
@@ -174,6 +176,7 @@ def load_latest_posture_host() -> tuple[PostureScore | None, str | None, int | N
                 best = (mtime, entry)
     except OSError as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None, None, None
 
     if best is None:
@@ -184,6 +187,7 @@ def load_latest_posture_host() -> tuple[PostureScore | None, str | None, int | N
         report_data = json.loads((ws_path / "technical_report.json").read_text())
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None, ws_path.name, None
 
     findings = _count_findings(report_data)
@@ -203,6 +207,7 @@ def load_latest_posture_host() -> tuple[PostureScore | None, str | None, int | N
         )
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None, ws_path.name, None
 
     age_days = int(max(0.0, time.time() - mtime) // 86400)
@@ -231,6 +236,7 @@ def _load_pro_license_metadata() -> tuple[str, str]:
         data = json.loads(license_path.read_text())
     except Exception as exc:  # noqa: BLE001 — defensive: never fail the intro
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return org, expires
 
     if not isinstance(data, dict):

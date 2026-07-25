@@ -20,6 +20,7 @@ from adscan_internal import print_info, print_info_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.ligolo_service import LigoloProxyService
 from adscan_internal.workspaces import domain_subpath
+from adscan_core.rich_output import print_exception
 
 _PIVOT_RUNTIME_STATE_DIR = ".pivot_runtime_state"
 _DIRECT_VANTAGE_SNAPSHOT_DIR = "direct_vantage_snapshot"
@@ -256,6 +257,7 @@ def reconcile_workspace_pivot_runtime_state(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[pivot-runtime] failed to inspect Ligolo state: "
                 f"domain={mark_sensitive(domain, 'domain')} "
@@ -303,6 +305,7 @@ def reconcile_workspace_pivot_runtime_state(
             shell.save_workspace_data()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[pivot-runtime] failed to persist reconciled workspace state: "
                 f"{mark_sensitive(str(exc), 'detail')}"

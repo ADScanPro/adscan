@@ -17,10 +17,30 @@ produced by
 ``attack_graph_service.get_attack_path_summaries(scope=…, target="highvalue",
 target_mode="tier0")``; this module only weights and aggregates them.
 
-Model (v1) — union-saturating exposure:
+Model (v2) — union of per-path (evidence × exploitability):
 
-    w(p)      = proof_weight(status) * ease_weight(hops)
-    exposure  = 1 - Π_p (1 - w(p))           over all included S→Tier-0 paths
+    w(p)              = proof_base(status) × exploitability(p)
+    exploitability(p) = Π_step  P(a capable attacker executes that step)
+                      = Π_step  effort_to_rate(compromise_effort(relation))
+    exposure          = 1 - Π_p (1 - w(p))     over all included S→Tier-0 paths
+
+Two orthogonal axes, never collapsed into one flat per-status weight:
+
+* ``proof_base(status)`` — how much WE demonstrated (the evidence axis).
+  ``success`` / ``exploited`` / ``domain_compromised`` OVERRIDE to 1.0 (proof
+  beats the technique prior — a cracked Kerberoast is 100%, not 30%).
+  ``attempted`` is a NEGATIVE observation (below the theoretical prior — we tried
+  and it did not land). ``blocked`` gated on the ``dangerous_destructive`` marker
+  shares the theoretical base: a safety abstention is a CONFIRMED-precondition
+  avenue we withheld (e.g. Zerologon whose all-zero bypass we PROVED over the
+  wire, stopping before the destructive reset), NOT "unknown".
+* ``exploitability(p)`` — how executable the TECHNIQUE(s) are for a real
+  attacker, as the PER-STEP PRODUCT over the path's relations. A 1-hop Kerberoast
+  (crack required) is harder than a 3-hop GenericAll chain (deterministic) — hop
+  COUNT is not difficulty. The product naturally encodes length (more hops →
+  lower weight, each weighted by its real difficulty), which REPLACES the old
+  crude ``ease_weight(hops)``. It sources ``compromise_effort`` already authored
+  per technique in ``attack_step_catalog`` (the SSOT), so it never drifts.
 
 Properties (acceptance criteria, see spec §5):
 
@@ -30,12 +50,6 @@ Properties (acceptance criteria, see spec §5):
 * Theoretical-only paths saturate below 100%; multiplicity adds but saturates.
 * ``Proven Exposure ≤ Total Exposure`` always; theoretical is never counted as
   proven.
-
-The spec assumed ``compromise_effort`` / ``confidence`` were emitted per path;
-in practice they are ``None`` on the records, so the model relies on the fields
-that ARE reliably present (``status`` for proof, ``length`` for ease,
-``compromise_class`` for the breakdown) and degrades gracefully if the optional
-ones ever appear (``compromise_effort`` would refine ``ease_weight``).
 """
 
 from __future__ import annotations
@@ -44,51 +58,175 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from adscan_internal.services.path_state import PathState
+from adscan_internal.services.attack_step_support_registry import (
+    classify_relation_support,
+)
+from adscan_internal.services.path_state import _PROVEN_STATUSES, PathState
 
 # --------------------------------------------------------------------------- #
 # Tunables — the weights/shape are the only thing to tune; the union form and
 # the acceptance properties above must NOT change.
 # --------------------------------------------------------------------------- #
 
-#: Proof weight by rolled-up path status. ``None`` => exclude the path entirely
-#: (an unsupported/unavailable path contributes nothing to exposure). Covers
-#: BOTH the edge-status vocabulary (theoretical/attempted/success/blocked/…)
-#: and the executed PathState vocabulary (domain_compromised/foothold_obtained/…).
+#: EVIDENCE axis — ``proof_base(status)``: how much WE demonstrated, INDEPENDENT
+#: of how hard the technique is (that is the exploitability axis below). The final
+#: per-path weight is ``proof_base × exploitability`` (except proven statuses,
+#: which override to 1.0). ``None`` => exclude the path entirely. Covers BOTH the
+#: edge-status vocabulary (theoretical/attempted/success/blocked/…) and the
+#: executed PathState vocabulary (domain_compromised/foothold_obtained/…).
 _PROOF_WEIGHT: dict[str, float | None] = {
-    # Proven domain compromise — we demonstrably reached the Tier-0 target.
+    # Proven domain compromise — we demonstrably reached the Tier-0 target. This
+    # OVERRIDES exploitability to 1.0 (proof beats the technique prior: a cracked
+    # Kerberoast is 100%, not 30%).
     "success": 1.0,
     "exploited": 1.0,
     "domain_compromised": 1.0,
-    # Executed and on the way, reality demonstrated but not full domain yet.
-    "foothold_obtained": 0.6,
-    "post_ex_in_progress": 0.6,
-    # Attempted but did not land (tried against the real DC, no compromise).
-    "attempted": 0.6,
-    "failed": 0.6,
-    "error": 0.6,
-    "post_ex_failed": 0.6,
-    # Supported but never executed — LDAP-derived theoretical path.
-    "theoretical": 0.4,
-    "discovered": 0.4,
-    # A control actively stopped this path (still a residual signal, not zero).
-    "blocked": 0.1,
+    # Partially validated — a chain with a DEMONSTRATED (success) segment that did
+    # not execute end-to-end. Above theoretical (a segment is validated, not merely
+    # theorized). Deliberately NOT in ``_PROVEN_STATUSES`` — not a full compromise,
+    # so it never inflates the strict Proven-Exposure headline.
+    "partial": 0.9,
+    # Executed and on the way — reality demonstrated but not full domain yet.
+    "foothold_obtained": 0.85,
+    "post_ex_in_progress": 0.85,
+    # Supported but never executed — LDAP-derived theoretical path. The technique
+    # prior (exploitability) IS our estimate here; this base only discounts for
+    # "not demonstrated".
+    "theoretical": 0.8,
+    "discovered": 0.8,
+    # ``blocked`` = an avenue ADscan chose NOT to run — NOT "tried and failed".
+    # It carries NO negative signal, so it is theoretical-tier (a supported,
+    # un-executed avenue), NOT attempted-tier. The safety-abstention destructive
+    # case (``dangerous_destructive`` marker) is elevated ABOVE theoretical in
+    # ``_proof_base`` — for those (e.g. Zerologon) we CONFIRMED the exploit over
+    # the wire and withheld only the detonation.
+    "blocked": 0.8,
+    # Attempted but did NOT land (tried against the real DC, no compromise). A
+    # NEGATIVE observation — below the theoretical prior, because a confirmed
+    # non-result is weaker exposure than an untried structural edge. Still nonzero:
+    # an attacker with more resources (bigger wordlist / GPU / time) might succeed.
+    "attempted": 0.4,
+    "failed": 0.4,
+    "error": 0.4,
+    "post_ex_failed": 0.4,
+    # Avenue ADscan observed CLOSED with certainty by the environment's own
+    # configuration (LDAP signing/CBT, no ADCS, MAQ==0, single-DC reflection).
+    # Not presently exploitable → excluded from the exposure score (positive fact).
+    "closed_by_configuration": None,
     # Not runnable / no reachable surface — excluded from the score.
     "unsupported": None,
     "unavailable": None,
 }
 
-#: Statuses that count as PROVEN domain compromise for the Proven Exposure
-#: number. Strict on purpose: only a demonstrably-reached Tier-0 target counts,
-#: so a failed post-ex is NOT presented as proven (honesty acceptance crit. §5.4).
-_PROVEN_STATUSES: frozenset[str] = frozenset(
-    {"success", "exploited", "domain_compromised"}
-)
+#: Evidence base for a safety-abstention destructive avenue (``blocked`` +
+#: ``dangerous_destructive``). ABOVE ``theoretical`` (0.8) because for these
+#: (Zerologon/NoPac/PrintNightmare, FCP-on-computer) the precondition is
+#: CONFIRMED — e.g. Zerologon's all-zero bypass succeeded over the wire and we
+#: withheld only the destructive reset — which is stronger evidence than an
+#: LDAP-derived theoretical edge. Below a full proven compromise (kept out of
+#: ``_PROVEN_STATUSES``: we did not complete the destructive action).
+_CONFIRMED_DESTRUCTIVE_BASE: float = 0.9
 
-#: ease_weight(hops) = 1 / (1 + EASE_ALPHA * (hops - 1)). A 1-hop path scores
-#: 1.0 (maximally exposing); longer chains decay. α=0.25 → 2-hop 0.80,
-#: 3-hop 0.67, 5-hop 0.50, 9-hop 0.33.
-EASE_ALPHA: float = 0.25
+#: EXPLOITABILITY axis — maps the per-technique ``compromise_effort`` (authored in
+#: ``attack_step_catalog``, the SSOT, and read per relation via
+#: ``classify_relation_support``) to ``P(a capable attacker executes this step)``.
+#: Deterministic control edges (GenericAll/DCSync/FCP — ``low``) are set HIGH so a
+#: uniform-easy multi-hop chain decays GENTLY under the per-step product (0.95⁵ ≈
+#: 0.77), reserving the low values for genuinely probabilistic techniques
+#: (Kerberoast/ASREPRoast — ``high`` — need an offline crack). Setting the
+#: deterministic rate high is what keeps the independent-product assumption from
+#: over-penalizing correlated same-technique chains.
+_EFFORT_TO_EXPLOITABILITY: dict[str, float] = {
+    "none": 1.0,       # you already ARE the principal (pure membership terminal)
+    "immediate": 1.0,  # single deterministic control edge to compromise
+    "low": 0.95,       # GenericAll / GenericWrite / DCSync / ForceChangePassword
+    "medium": 0.6,     # needs a condition (coercion target present, config)
+    "high": 0.3,       # Kerberoast / ASREPRoast — offline crack required
+    "other": 0.5,      # unknown technique — neutral prior
+}
+
+#: Per-technique exploitability, authored SPECIFICALLY for the exposure score
+#: (the "P(a capable attacker executes this step)" axis), keyed by lower-cased
+#: relation. This is DELIBERATELY DECOUPLED from the catalog ``compromise_effort``:
+#: that field drives attack-path ORDERING (its own priority semantics) and is
+#: under-authored for exploitability (DCSync/Zerologon/ESC1 resolve to ``other``
+#: or do not resolve at all), so overloading it would both mis-score AND perturb
+#: ordering. A relation absent here falls back to the ``compromise_effort``-derived
+#: rate above. VALUES ARE THE EXPOSURE SEMANTICS — review before shipping; the
+#: long-term home is a dedicated ``exploitability`` field on the catalog entry
+#: (see BACKLOG), which this map seeds.
+_RELATION_EXPLOITABILITY: dict[str, float] = {
+    # Deterministic ACL / control edges — near-certain given the ACL is real.
+    "genericall": 0.97,
+    "allextendedrights": 0.95,
+    "forcechangepassword": 0.95,
+    "addself": 0.95,
+    "addmember": 0.97,
+    "addmembers": 0.97,
+    "genericwrite": 0.9,
+    "writedacl": 0.9,
+    "writeowner": 0.9,
+    "owns": 0.9,
+    "writeaccountrestrictions": 0.85,
+    "addkeycredentiallink": 0.85,  # shadow creds — needs a PKINIT-capable KDC
+    "writespn": 0.35,              # targeted Kerberoast — still needs an offline crack
+    # DCSync (replication rights) — deterministic domain-secret extraction.
+    "dcsync": 0.97,
+    "getchanges": 0.9,
+    "getchangesall": 0.95,
+    # CVE domain takeover — confirmed over-the-wire BEFORE the safety block.
+    "zerologon": 1.0,
+    "nopac": 0.95,
+    "printnightmare": 0.85,
+    # Delegation.
+    "allowedtodelegate": 0.8,
+    "allowedtoact": 0.8,
+    # ADCS ESCs (BloodHound relation spellings — verified against live graphs).
+    "adcsesc1": 0.9,
+    "adcsesc2": 0.85,
+    "adcsesc3": 0.85,
+    "adcsesc4": 0.85,
+    "adcsesc5": 0.85,
+    "adcsesc6": 0.85,
+    "adcsesc7": 0.85,
+    "adcsesc8": 0.7,   # relay-dependent
+    "adcsesc9": 0.7,
+    "adcsesc10": 0.7,
+    "adcsesc13": 0.9,
+    # Secret-read edges — deterministic given the right (verified on live graphs).
+    "readlapspassword": 0.95,
+    "synclapspassword": 0.9,
+    "readgmsapassword": 0.95,
+    "dumplsa": 0.85,   # needs a local-admin session first, then deterministic
+    # Crack-dependent — PROBABILISTIC (offline crack required). NOTE the live
+    # relation spellings are `Kerberoasting` / `ASREPRoasting` (the `-ing` form);
+    # both spellings kept so neither falls through to the coarse effort default.
+    "kerberoasting": 0.3,
+    "kerberoast": 0.3,
+    "asreproasting": 0.35,
+    "asreproast": 0.35,
+    "asreproastable": 0.35,
+    # Access / session edges (usually tier0_foothold terminals).
+    "adminto": 0.9,
+    "hassession": 0.7,
+    "canrdp": 0.7,
+    "canpsremote": 0.7,
+    "executedcom": 0.7,
+    "sqladmin": 0.6,
+    "sqlaccess": 0.5,   # DB session, usually no host code-exec
+    # Coercion — needs a reachable relay target.
+    "coerce": 0.75,
+    "coercetorelay": 0.75,
+    "printerbug": 0.75,
+    "petitpotam": 0.75,
+}
+
+# ``_PROVEN_STATUSES`` (statuses that count as PROVEN domain compromise for the
+# Proven Exposure number) is now owned by the lean leaf ``path_state`` and
+# imported at the top of this module — so it is re-exported here unchanged for
+# full backward compat (every ``exposure_score_service._PROVEN_STATUSES``
+# reference, including the documented SSOT name, keeps working). Do NOT
+# re-declare the value here; the import above IS the re-export.
 
 #: Compromise classes that constitute reaching domain compromise (Tier-0). A
 #: path whose terminal is one of these counts toward exposure; enabler/pivot
@@ -634,15 +772,62 @@ class ExposureScore:
 # --------------------------------------------------------------------------- #
 
 
-def _proof_weight(status: str) -> float | None:
-    """Return the proof weight for a path status, or ``None`` to exclude it."""
-    return _PROOF_WEIGHT.get((status or "").strip().lower(), 0.4)
+def _proof_base(status: str, record: Mapping[str, Any]) -> float | None:
+    """Return the EVIDENCE-axis base for a path, or ``None`` to exclude it.
+
+    Handles the ``blocked`` marker gate: a ``blocked`` path carrying the
+    ``dangerous_destructive`` marker is a safety abstention over a
+    CONFIRMED-precondition avenue (e.g. Zerologon whose over-the-wire bypass we
+    PROVED, stopping before the destructive reset), so it scores ABOVE a purely
+    LDAP-derived theoretical path (:data:`_CONFIRMED_DESTRUCTIVE_BASE`). A bare
+    ``blocked`` (no marker) is an un-executed but supported avenue — no negative
+    signal — so it is theoretical-tier, NOT attempted-tier. Every other status
+    maps straight through ``_PROOF_WEIGHT`` (unknown → theoretical base, since it
+    IS a supported Tier-0 path).
+    """
+    key = (status or "").strip().lower()
+    if key == "blocked":
+        marker = str(record.get("blocked_kind") or "").strip().lower()
+        if marker == "dangerous_destructive":
+            return _CONFIRMED_DESTRUCTIVE_BASE
+        return _PROOF_WEIGHT["blocked"]
+    if key in _PROOF_WEIGHT:
+        return _PROOF_WEIGHT[key]
+    return _PROOF_WEIGHT["theoretical"]
 
 
-def _ease_weight(hops: int) -> float:
-    """Return the ease weight: shorter paths are more exposing."""
-    h = max(1, int(hops or 1))
-    return 1.0 / (1.0 + EASE_ALPHA * (h - 1))
+def _path_exploitability(record: Mapping[str, Any]) -> float:
+    """Return P(a capable attacker executes this path) as the per-step product.
+
+    Reads each of the path's ``relations``, looks up the technique's
+    ``compromise_effort`` (``attack_step_catalog`` SSOT via
+    ``classify_relation_support``), maps it to a rate, and MULTIPLIES across the
+    actionable steps. ``context`` steps (MemberOf/Contains/GpLink — structural,
+    no attacker action) are skipped. The product encodes length: more hops →
+    lower weight, each weighted by its real difficulty (replaces ``ease_weight``).
+    An all-context / relation-less path is deterministic (1.0).
+    """
+    relations = record.get("relations")
+    if not isinstance(relations, list) or not relations:
+        return 1.0
+    product = 1.0
+    saw_actionable = False
+    for rel in relations:
+        raw = str(rel or "")
+        support = classify_relation_support(raw)
+        if support.kind == "context":
+            continue  # structural (MemberOf/Contains/GpLink) — no attacker action
+        saw_actionable = True
+        key = raw.strip().lower()
+        rate = _RELATION_EXPLOITABILITY.get(key)
+        if rate is None:
+            # Fallback: the catalog compromise_effort mapping (coarser).
+            effort = (support.compromise_effort or "other").strip().lower()
+            rate = _EFFORT_TO_EXPLOITABILITY.get(
+                effort, _EFFORT_TO_EXPLOITABILITY["other"]
+            )
+        product *= rate
+    return product if saw_actionable else 1.0
 
 
 def _is_proven_status(status: str) -> bool:
@@ -760,13 +945,16 @@ def compute_exposure_score(
         if not _is_tier0_target(rec):
             continue
         status = str(rec.get("status") or "theoretical").strip().lower()
-        pw = _proof_weight(status)
-        if pw is None:  # unsupported / unavailable — excluded from the score
+        base = _proof_base(status, rec)
+        if base is None:  # unsupported / unavailable / closed_by_configuration
             continue
-        w = pw * _ease_weight(_record_hops(rec))
+        proven = _is_proven_status(status)
+        # Proven paths override to their base (1.0): demonstrated compromise beats
+        # the technique prior. Everything else = evidence × per-step exploitability.
+        w = base if proven else base * _path_exploitability(rec)
         if w <= 0.0:
             continue
-        weighted.append((w, _is_proven_status(status), rec))
+        weighted.append((w, proven, rec))
 
     overall = _union([w for w, _, _ in weighted]) * 100.0
     proven = _union([w for w, is_p, _ in weighted if is_p]) * 100.0
@@ -858,8 +1046,10 @@ def _build_explanation(
     )
     return (
         f"Exposure {overall:.0f}%: {path_count} supported attack path(s) reach "
-        f"{tier0_label} from {start_label}. Shorter, higher-proof paths weigh "
-        f"more; the score saturates as paths multiply. {proven_clause} "
+        f"{tier0_label} from {start_label}. Paths weigh more the more we proved "
+        f"them and the more executable their techniques are (a deterministic "
+        f"one-hop control edge outweighs a multi-step or crack-dependent chain); "
+        f"the score saturates as paths multiply. {proven_clause} "
         "0% is reached only when every such path is remediated."
     )
 
@@ -869,5 +1059,4 @@ __all__ = [
     "ExposureContributor",
     "compute_exposure_score",
     "compute_exposure_kpis",
-    "EASE_ALPHA",
 ]

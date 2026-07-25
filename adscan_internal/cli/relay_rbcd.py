@@ -71,6 +71,7 @@ from adscan_internal.rich_output import (
 from adscan_internal.services.environment_change_ledger import (
     CHANGE_CLASS_OPERATOR_CONFIRMED,
 )
+from adscan_core.rich_output import print_exception
 
 # Supported write methods (selector + feasibility key).
 _METHOD_RBCD = "rbcd"
@@ -231,6 +232,20 @@ def _resolve_listener_ip(shell: Any, dc_ip: str, override: Optional[str]) -> Opt
     candidate = str(override or "").strip()
     if candidate:
         return candidate
+    # Per-target egress resolution: on a multi-NIC host the routing table already
+    # knows which NIC's source IP reaches the victim's segment (and a Ligolo pivot
+    # yields the target-segment redirector candidate) — more correct than a single
+    # global myip. Falls through to myip / the socket heuristic when undeterminable.
+    try:
+        from adscan_internal.services.egress_resolver import (  # noqa: PLC0415
+            resolve_egress_for_target,
+        )
+
+        vantage = resolve_egress_for_target(shell, dc_ip)
+        if vantage.callback_ip:
+            return vantage.callback_ip
+    except Exception:  # noqa: BLE001 — best-effort; fall back below
+        pass
     myip = str(getattr(shell, "myip", "") or "").strip()
     if myip:
         return myip
@@ -563,6 +578,7 @@ def run_relay_ldap(
             )
     except Exception as exc:  # noqa: BLE001 - report + still clean up
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         success["ok"] = False
         print_error(f"relay_ldap chain failed: {exc}")
     finally:
@@ -669,6 +685,7 @@ def _assess_maq(
         return capacity.domain_quota
     except Exception as exc:  # noqa: BLE001 - preflight is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[relay-ldap] MAQ preflight failed: {exc}")
         return None
 
@@ -803,6 +820,7 @@ def _run_chain(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # The durable RBCD grant has landed: a SUCCESS from here keeps it.
     success["ok"] = True
@@ -905,6 +923,7 @@ def _run_chain_shadow(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # The durable KeyCredentialLink has landed: a SUCCESS from here keeps it.
     success["ok"] = True
@@ -1050,6 +1069,7 @@ def _provision_delegate(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     if not delegate.sid:
         return None
@@ -1085,6 +1105,7 @@ def _provision_delegate(
         )
     except Exception as exc:  # noqa: BLE001 - persistence is best-effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[relay-rbcd] could not persist minted delegate credential: {exc}"
         )
@@ -1185,6 +1206,7 @@ def _resolve_delegate_sid(
             return _resolve_principal_sid(conn, sam)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[relay-ldap] delegate SID resolution failed: {exc}")
         return None
 
@@ -1358,6 +1380,7 @@ def _pkinit_nt_hash_from_pfx(
         from kerbad.protocol.external import ticketutil  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"PKINIT import failed: {exc}")
         return None
 
@@ -1377,6 +1400,7 @@ def _pkinit_nt_hash_from_pfx(
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_warning(f"PKINIT->NT-hash failed: {exc}")
         return None
 
@@ -1437,6 +1461,7 @@ def _resolve_victim_spn_host(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return None
 
     spn_host = getattr(resolution, "spn_host", None)
@@ -1557,6 +1582,7 @@ def _run_s4u(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(f"S4U ticket request failed for {svc_spn}: {exc}")
             continue
 
@@ -1848,6 +1874,7 @@ def _cleanup(
             _delete_delegate(conn, ledger=ledger, state=state)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Cleanup connection failed: {exc}")
         _mark_cleanup_failed_manual(ledger, state, error=str(exc))
 
@@ -1867,6 +1894,7 @@ def _mark_kept_on_success(ledger: Any, state: _RbcdLedgerState) -> None:
             ledger.mark_kept(change_id)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 def _cleanup_manual_reason(error: Any) -> str:
@@ -1899,6 +1927,7 @@ def _confirm_rbcd_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState) 
             confirmed = True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         confirmed = False
     if confirmed:
         ledger.mark_reverted_confirmed(
@@ -1936,6 +1965,7 @@ def _confirm_shadow_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState
             confirmed = len(values) == len(prior)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         confirmed = False
     if confirmed:
         ledger.mark_reverted_confirmed(
@@ -1965,6 +1995,7 @@ def _verify_machine_neutralized(conn: Any, *, sam: str | None) -> bool:
         return verify_machine_account_gone(conn, sam_account_name=sam)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return False
 
 
@@ -2022,6 +2053,7 @@ def _revert_rbcd(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         if ledger is not None and state.rbcd_change_id:
             ledger.mark_manual_required(
                 state.rbcd_change_id,
@@ -2067,6 +2099,7 @@ def _revert_shadow_creds(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> 
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         if ledger is not None and state.shadow_change_id:
             ledger.mark_manual_required(
                 state.shadow_change_id,
@@ -2118,6 +2151,7 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # A low-privilege MachineAccountQuota creator can CREATE a computer but
         # usually CANNOT DELETE it (no Delete right → ACCESS_DENIED). Best-effort
         # neutralize by DISABLING it: the creator can typically write
@@ -2134,6 +2168,7 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
                 )
             except Exception as dexc:  # noqa: BLE001
                 telemetry.capture_exception(dexc)
+                print_exception(exception=dexc)
         if disabled:
             print_warning(
                 f"[~] Could not delete delegate {mark_sensitive(target or '?', 'user')} "
@@ -2193,6 +2228,7 @@ def _mark_cleanup_failed_manual(ledger: Any, state: _RbcdLedgerState, *, error: 
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     if state.shadow_change_id:
         try:
             ledger.mark_manual_required(
@@ -2206,6 +2242,7 @@ def _mark_cleanup_failed_manual(ledger: Any, state: _RbcdLedgerState, *, error: 
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     delegate = state.delegate
     if delegate is not None and delegate.created and delegate.ledger_change_id:
         try:
@@ -2221,6 +2258,7 @@ def _mark_cleanup_failed_manual(ledger: Any, state: _RbcdLedgerState, *, error: 
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -2366,6 +2404,7 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
         entries = ledger.get_operator_confirmed_pending()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return
     if not entries:
         return
@@ -2385,6 +2424,7 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
                 ledger.mark_kept(str(entry.get("change_id")))
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
     if not to_revert:
         return
@@ -2426,6 +2466,7 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
             continue
 
         is_nt = _looks_like_nt_hash(secret)
@@ -2447,6 +2488,7 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
                     _revert_one_ledger_entry(conn, ledger=ledger, entry=entry)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Exit cleanup connection failed: {exc}")
             for entry in chosen:
                 try:
@@ -2466,6 +2508,7 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
                     )
                 except Exception as iexc:  # noqa: BLE001
                     telemetry.capture_exception(iexc)
+                    print_exception(exception=iexc)
 
 
 __all__ = [

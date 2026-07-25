@@ -179,6 +179,10 @@ class ICPRRPC:
 			(None, Exception) on failure
 		"""
 		try:
+			# Retrieve by request id: dwFlags=0 + empty CSR + pdwRequestId, exactly
+			# like certipy/impacket. The retrieve is driven by pdwRequestId; the
+			# empty CSR/attribs must marshal as NULL blobs (handled in
+			# hCertServerRequest) so the CA does not treat this as a new submit.
 			data, err = await icpr.hCertServerRequest(
 				self.dce,
 				ca_name,

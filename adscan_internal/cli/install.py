@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ def install_system_packages(
             deps.print_success("Kerberos pre-configuration applied.")
         except Exception as exc:  # noqa: BLE001 - must mirror legacy behaviour
             deps.telemetry_capture_exception(exc)
+            print_exception(exception=exc)
             deps.print_warning(f"Failed to pre-configure Kerberos: {exc}")
             deps.print_info("Installation will continue with default settings.")
 
@@ -188,6 +190,7 @@ def install_system_packages(
                 successfully_installed.append("freerdp3-x11")
             except subprocess.CalledProcessError as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                print_exception(exception=exc)
                 deps.print_warning(
                     "Failed to install freerdp3-x11 due to unmet dependencies, "
                     "falling back to freerdp2-x11"
@@ -207,6 +210,7 @@ def install_system_packages(
                     unique_packages_to_install.append("freerdp2-x11")
                 except subprocess.CalledProcessError as fallback_error:  # noqa: BLE001
                     deps.telemetry_capture_exception(fallback_error)
+                    print_exception(exception=fallback_error)
                     deps.print_error(
                         f"Failed fallback installation freerdp2-x11: {fallback_error}"
                     )
@@ -225,6 +229,7 @@ def install_system_packages(
                 unique_packages_to_install.remove("hashcat")
             except subprocess.CalledProcessError as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                print_exception(exception=exc)
                 error_output = getattr(exc, "stderr", None) or getattr(
                     exc, "stdout", ""
                 )
@@ -259,6 +264,7 @@ def install_system_packages(
                         unique_packages_to_install.remove("hashcat")
                     except subprocess.CalledProcessError as fix_error:  # noqa: BLE001
                         deps.telemetry_capture_exception(fix_error)
+                        print_exception(exception=fix_error)
                         deps.print_warning(
                             "Failed to fix and install hashcat: "
                             f"{fix_error}. Continuing with other packages..."
@@ -498,6 +504,7 @@ def install_system_packages(
         )
     except FileNotFoundError as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         deps.print_error("'apt-get' not found. Cannot install system packages.")
 
 
@@ -709,6 +716,7 @@ def install_external_python_tools(
                             download_success = True
                         except Exception as download_exc:  # noqa: BLE001
                             deps.telemetry_capture_exception(download_exc)
+                            print_exception(exception=download_exc)
                             deps.print_error(
                                 f"Failed to download get-pip.py: {download_exc}"
                             )
@@ -741,6 +749,7 @@ def install_external_python_tools(
                                     venv_created = True
                                 except Exception as pip_install_exc:  # noqa: BLE001
                                     deps.telemetry_capture_exception(pip_install_exc)
+                                    print_exception(exception=pip_install_exc)
                                     deps.print_warning(
                                         "Failed to install pip in "
                                         f"{tool_dir_name} venv: {pip_install_exc}"
@@ -762,6 +771,7 @@ def install_external_python_tools(
                             )
                     except Exception as venv_fallback_exc:  # noqa: BLE001
                         deps.telemetry_capture_exception(venv_fallback_exc)
+                        print_exception(exception=venv_fallback_exc)
                         deps.print_error(
                             "Failed to create venv for "
                             f"{tool_dir_name} even with fallback: "
@@ -777,6 +787,7 @@ def install_external_python_tools(
                     continue
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                print_exception(exception=exc)
                 deps.print_error(
                     f"Failed to create virtual environment for {tool_dir_name}: {exc}"
                 )
@@ -1224,6 +1235,7 @@ def install_go_and_htb_cli(
                     deps.print_success("Go installed via apt (fallback)")
                 except Exception as exc:  # noqa: BLE001
                     deps.telemetry_capture_exception(exc)
+                    print_exception(exception=exc)
                     deps.print_warning(f"Failed to install Go via apt: {exc}")
                     deps.print_info(
                         "You can install Go manually: apt install golang-go"
@@ -1236,6 +1248,7 @@ def install_go_and_htb_cli(
             deps.print_warning("Go installed but verification failed")
     except Exception as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         deps.print_warning(f"Error installing Go: {exc}")
 
     # htb-cli installation (CI-only)
@@ -1309,6 +1322,7 @@ def install_go_and_htb_cli(
                             deps.print_success(f"Go verified: {go_version}")
                     except Exception as exc:  # noqa: BLE001
                         deps.telemetry_capture_exception(exc)
+                        print_exception(exception=exc)
                         deps.print_warning(f"Failed to install Go via apt: {exc}")
                         deps.print_info(
                             "You can install Go manually: apt install golang-go"
@@ -1424,6 +1438,7 @@ def install_go_and_htb_cli(
                     }
         except Exception as exc:  # noqa: BLE001
             deps.telemetry_capture_exception(exc)
+            print_exception(exception=exc)
             deps.print_warning(f"Error installing htb-cli: {exc}")
             deps.install_summary["htb_cli"] = {
                 "installed": False,
@@ -1570,6 +1585,7 @@ def install_unbound_resolver(
             )
     except Exception as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
         deps.print_warning(
             f"Failed to finalize Unbound installation/configuration: {exc}"
         )
@@ -1824,6 +1840,7 @@ def run_install(
             deps.print_info(f"Using apt target from backports: {codename}")
     except Exception as e:
         deps.telemetry_capture_exception(e)
+        print_exception(exception=e)
         apt_target = []
 
     # Update package lists
@@ -1834,6 +1851,7 @@ def run_install(
         deps.print_success("Package lists refreshed")
     except Exception as e:
         deps.telemetry_capture_exception(e)
+        print_exception(exception=e)
         if isinstance(e, FileNotFoundError):
             deps.telemetry_capture_installation_failed(e)
             deps.print_error(

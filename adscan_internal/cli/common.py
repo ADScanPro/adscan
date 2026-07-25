@@ -29,6 +29,7 @@ from rich.text import Text
 # CLI modules should import this from here instead of adscan.py.
 # This will be initialized by adscan.py on startup.
 import os
+from adscan_core.rich_output import print_exception
 
 SECRET_MODE: bool = os.getenv("ADSCAN_SECRET_MODE") == "1"  # pylint: disable=invalid-name
 
@@ -103,17 +104,15 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "mssql_impersonate": "requires_initialized_domain",
     "mssql_steal_ntlmv2": "requires_initialized_domain",
     "mv": "exempt",
-    "netexec_auth_shares": "requires_initialized_domain",
     "netexec_cve_all": "requires_initialized_domain",
     "netexec_cve_dcs": "requires_initialized_domain",
-    "netexec_user_postauth_access": "requires_initialized_domain",
-    "netexec_user_privs": "requires_initialized_domain",
     "quit": "exempt",
     "raise_child": "requires_initialized_domain",
     "poisoning": "exempt",
     "rm": "exempt",
     "session": "exempt",
     "set": "exempt",
+    "smb_auth_shares": "requires_initialized_domain",
     "start_auth": "exempt",
     "start_unauth": "exempt",
     "stop_poisoning": "exempt",
@@ -123,6 +122,7 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "update_domain_data": "exempt",
     "update_resolv_conf": "exempt",
     "upload": "exempt",
+    "user_postauth_access": "requires_initialized_domain",
     "validate_attack_graph": "requires_initialized_domain",
     "workspace": "exempt",
 }
@@ -144,14 +144,14 @@ _AUTH_INIT_RECOMMENDED_COMMANDS = {
     "mssql_check_impersonate",
     "mssql_impersonate",
     "mssql_steal_ntlmv2",
-    "netexec_auth_shares",
-    "netexec_gpp_autologin",
-    "netexec_gpp_passwords",
-    "netexec_smb_descriptions",
+    "gpp_autologin",
+    "gpp_passwords",
+    "smb_user_descriptions",
     "search_adcs",
     "show_adcs_cache",
     "secretsdump_registries",
     "show_powershell_history",
+    "smb_auth_shares",
 }
 _UNAUTH_INIT_RECOMMENDED_COMMANDS = {
     "asreproast",
@@ -160,7 +160,7 @@ _UNAUTH_INIT_RECOMMENDED_COMMANDS = {
     "kerberoast_preauth",
     "kerberos_enum_users",
     "ldap_anonymous",
-    "netexec_guest",
+    "smb_guest_shares",
     "rid_cycling",
     "smb_scan",
     "spraying",
@@ -413,6 +413,74 @@ def resolve_command_context_domain(
     return None, "none"
 
 
+def resolve_repl_domain_or_default(shell: Any, provided: str | None) -> str | None:
+    """Resolve the domain a bare REPL command should act on (single source of truth).
+
+    Every domain-taking ``do_*`` REPL command routes its first positional through
+    this helper so the "no explicit domain" fallback behaves identically across
+    the whole shell. Before this SSOT, only ``spraying`` / ``pre2k`` fell back to
+    the active domain; the rest (``kerberoast``, ``asreproast``, ``timeroast``,
+    the GPP scanners, the identity/computer inventories, ...) passed the empty
+    positional straight to their ``run_*`` delegate, which then failed with
+    ``Domain '' is not configured`` even when a domain was already selected.
+
+    Resolution order (first match wins):
+
+    1. ``provided`` — an explicit ``<domain>`` argument always wins (stripped).
+    2. ``shell.domain`` — the active domain written by ``set_active_domain`` (the
+       canonical bare-command default set by ``start_unauth`` / ``start_auth`` /
+       ``creds`` on every entry point).
+    3. ``shell.current_domain`` — the logical domain set by interactive domain
+       selection / native collection (``activate_domain``). Checked as a second
+       net so a workspace whose active context was established only through the
+       selection UI still resolves.
+    4. The single configured domain — when the workspace has EXACTLY ONE domain
+       (in ``shell.domains``, else the loaded ``domains_data``), that domain is
+       unambiguous and is adopted. This is the key generalization beyond the old
+       ``spraying`` / ``pre2k`` behavior.
+    5. ``None`` — genuinely ambiguous (multiple domains and none selected) or no
+       domain configured at all. The caller keeps its existing "please
+       select / configure a domain" path unchanged; this helper never silently
+       picks one of several domains.
+
+    Args:
+        shell: The interactive shell instance.
+        provided: The raw ``<domain>`` positional the operator passed (may be
+            empty / ``None`` when the command was typed bare).
+
+    Returns:
+        The resolved domain string, or ``None`` when the choice is ambiguous.
+    """
+    explicit = str(provided or "").strip()
+    if explicit:
+        return explicit
+
+    # The active domain context — prefer the SSOT ``shell.domain`` (the writer is
+    # ``set_active_domain``), then the selection-UI ``shell.current_domain``.
+    for attr in ("domain", "current_domain"):
+        candidate = str(getattr(shell, attr, None) or "").strip()
+        if candidate:
+            return candidate
+
+    # Exactly one configured domain -> unambiguous, adopt it. Prefer the
+    # ``shell.domains`` list (what the ``run_*`` delegates validate against), and
+    # fall back to ``domains_data`` to heal a workspace reloaded before the list
+    # was repopulated.
+    domains = getattr(shell, "domains", None)
+    if isinstance(domains, (list, tuple)) and len(domains) == 1:
+        only = str(domains[0] or "").strip()
+        if only:
+            return only
+
+    domains_data = getattr(shell, "domains_data", None)
+    if isinstance(domains_data, dict) and len(domains_data) == 1:
+        only = str(next(iter(domains_data)) or "").strip()
+        if only:
+            return only
+
+    return None
+
+
 def set_active_domain(shell: Any, domain: str | None) -> None:
     """Set the shell's active domain context (single source of truth).
 
@@ -447,6 +515,51 @@ def set_active_domain(shell: Any, domain: str | None) -> None:
         pass
 
 
+def ensure_shell_domain_context(shell: Any, target_domain: str) -> None:
+    """Point the shell's logical domain context at ``target_domain`` (in-memory).
+
+    ``shell.current_domain`` / ``shell.current_domain_dir`` are a SEPARATE pair of
+    attributes from ``shell.domain`` (set by ``set_active_domain`` above) — they are
+    what ``save_domain_data()`` (``workspaces/saver.py``) reads to resolve the
+    on-disk domain directory for ``variables.json``. They are otherwise populated
+    ONLY by the interactive domain-selection / workspace-UI commands and by
+    ``run_native_collection`` (the authenticated collection path), via the
+    canonical ``activate_domain`` SSOT (``workspaces/domains.py``).
+
+    Any scan flow that reaches a ``save_domain_data()`` call (collector findings,
+    machine-pwd rotation, ADCS detection state, …) without ever going through one
+    of those entry points — most notably the UNAUTHENTICATED scan path
+    (``do_unauth_scan`` / ``ask_for_unauth_scan``, ``cli/scan.py``), which only
+    calls ``finalize_domain_context(make_active=False)`` and never touches
+    ``current_domain``/``current_domain_dir`` — trips the "No active domain
+    selected ... Cannot save domain data" guard and silently drops
+    ``variables.json`` for the whole flow. Call this helper right after the
+    domain/PDC IP is resolved (e.g. right after ``finalize_domain_context``) so
+    every path that can reach ``save_domain_data()`` has the context set first.
+
+    This helper is in-memory only (no I/O, safe on an unauthenticated context —
+    ``activate_domain`` only resolves a filesystem path from the workspace dir +
+    domain name, it does not assume any authenticated state). It is a no-op when
+    the context is already on ``target_domain`` or no workspace dir is known.
+    """
+    ws_dir = getattr(shell, "current_workspace_dir", None)
+    if not ws_dir:
+        return
+    if (
+        getattr(shell, "current_domain_dir", None) is not None
+        and getattr(shell, "current_domain", None) == target_domain
+    ):
+        return
+    from adscan_internal.workspaces import activate_domain  # noqa: PLC0415
+
+    activate_domain(
+        shell,
+        workspace_dir=ws_dir,
+        domains_dir_name=getattr(shell, "domains_dir", "domains"),
+        domain=target_domain,
+    )
+
+
 # Per-command secret POSITIONAL indices for the command-dispatch echo.
 #
 # The interactive shell echoes every dispatched command under ``--debug``. The
@@ -458,28 +571,119 @@ def set_active_domain(shell: Any, domain: str | None) -> None:
 # sanitizer scrubs exactly that value before upload.
 #
 # Index is into ``args_list`` (the tokens AFTER the command verb), counting
-# POSITIONALS only (flags like ``-k`` / ``--debug`` are skipped when counting).
-# A command absent from this map has no secret positional → every arg cleartext.
+# POSITIONALS only (flags like ``-k`` / ``--debug`` are skipped when counting —
+# see ``_FLAG_FREE_SECRET_COMMANDS`` below for the commands where that
+# skipping is deliberately disabled). A command absent from this map has no
+# secret positional → every arg cleartext.
 #
-# Built from the real command grammar (grep ``do_*`` signatures + their Usage):
-#   - ``creds save|add <domain> <username> <credential> [host] [service]``
-#     → after the ``save``/``add`` subcommand, the credential is positional 2.
-#   - Legacy positional auth entry points kept defensively:
-#       ``start_auth <domain> <ip> <user> <password>``  → password at index 3
-#       ``authenticate <domain> <user> <password>``     → password at index 2
+# Built from a full survey of every ``do_*``/CLI-helper grammar that accepts a
+# password, NT hash, or other credential as a raw positional (grep ``args =
+# args.split()`` + the ``Usage:`` docstrings across ``adscan.py`` and
+# ``adscan_internal/cli/*.py``):
+#   - ``start_auth <domain> <ip> <user> <password>``            → index 3
+#   - ``get_flags <domain> <username> <password>``               → index 2
+#   - ``mssql_check_impersonate <domain> <host> <user> <pass>``  → index 3
+#   - ``dump_sam <domain> <user> <password> <host> <islocal>``   → index 2
+#   - ``dump_dpapi <domain> <user> <password> <host> <islocal>`` → index 2
+#   - ``dump_lsa <domain> <user> <password> <host> <islocal>``   → index 2
+#   - ``dump_lsass <domain> <user> <password> <host> <islocal>`` → index 2
+#   - ``dcsync <domain> <username> <password>``                  → index 2
+#   - ``cracking <type> <domain> <hash>``                         → index 2
+#   - ``smb_auth_shares <domain> <username> <password>``         → index 2
+#   - ``user_postauth_access <domain> <user> <pass>``            → index 2
+#   - ``enumerate_user_aces <domain> <user> <password>``         → index 2
+#   - ``enum_adcs_privs <domain> <user> <password>``             → index 2
 _SECRET_POSITIONAL_INDICES: dict[str, tuple[int, ...]] = {
     "start_auth": (3,),
-    "authenticate": (2,),
+    "get_flags": (2,),
+    "mssql_check_impersonate": (3,),
+    "dump_sam": (2,),
+    "dump_dpapi": (2,),
+    "dump_lsa": (2,),
+    "dump_lsass": (2,),
+    "dcsync": (2,),
+    "cracking": (2,),
+    "smb_auth_shares": (2,),
+    "user_postauth_access": (2,),
+    "enumerate_user_aces": (2,),
+    "enum_adcs_privs": (2,),
 }
 
 # Commands whose FIRST positional is a subcommand that shifts the secret index.
 # Maps ``command -> {subcommand: (secret positional indices counted from arg0)}``.
+#   - ``creds save|add <domain> <username> <credential> [host] [service]``
+#     → after the ``save``/``add`` subcommand, the credential is positional 3
+#     (the subcommand token itself counts as positional 0).
+#   - ``session launch <smb|winrm> <host> <domain> <user> <password> [os]``
+#     → after the ``launch`` subcommand, the password is positional 5.
+#   - ``set password <value>`` / ``set hash <value>``
+#     → the value is positional 1 (the ``password``/``hash`` token is 0).
 _SECRET_POSITIONAL_BY_SUBCOMMAND: dict[str, dict[str, tuple[int, ...]]] = {
     "creds": {
         "save": (3,),
         "add": (3,),
     },
+    "session": {
+        "launch": (5,),
+    },
+    "set": {
+        "password": (1,),
+        "hash": (1,),
+        # `set` is a generic <variable> <value> config setter (adscan.py
+        # do_set) — NOT migrated to the flag grammar (see
+        # docs/superpowers/plans/2026-07-21-repl-flag-argument-grammar.md
+        # Investigation § 1: converting a 15-branch generic setter for 2
+        # secret branches is not a real UX win). The variable name (the
+        # first token) already acts as the "flag name" here, so this
+        # dict is the equivalent robust-by-construction mechanism for
+        # `set`. RULE: any NEW `set <variable>` branch added to
+        # `adscan.py do_set` that stores a password/hash/secret MUST add
+        # its variable name here in the SAME change — this is the one
+        # place a future secret `set` variable can still silently drift,
+        # exactly like the original bug this map fixed.
+    },
 }
+
+# Commands whose entire grammar is raw ``args.split()`` positionals with a
+# strict arg-count check — they have NO flag syntax at all. For these, a
+# leading ``-`` in a positional VALUE (a strong password like
+# ``-Str0ngP@ss!``, or a hash/credential that happens to start with a
+# hyphen-shaped token) must NOT be misread as a CLI flag: the
+# ``token.startswith("-")`` heuristic below exists only to skip REAL flags
+# (``-k``, ``--debug``) on commands that mix flags and positionals, and
+# misapplying it here shifts the positional count and lets the secret slip
+# through unmarked. Every command key in the two maps above is flag-free
+# today, so this is simply their union.
+_FLAG_FREE_SECRET_COMMANDS: frozenset[str] = frozenset(_SECRET_POSITIONAL_INDICES) | frozenset(
+    _SECRET_POSITIONAL_BY_SUBCOMMAND
+)
+
+# Global secret-bearing FLAG NAMES, recognized regardless of command. This is
+# a defensive backstop — mirroring the inline ``pass=``/``password=`` form
+# below — for any command whose grammar accepts the secret via a flag
+# (``-p <value>`` / ``--password <value>``) instead of a bare positional.
+# None of today's REPL commands mix flags with a credential positional (they
+# are all covered by ``_FLAG_FREE_SECRET_COMMANDS`` above), but the launcher
+# CLI already uses this exact spelling for ``adscan doctor``/``adscan
+# execute`` (``-p``/``--password``) and a future REPL command could adopt the
+# same grammar. When the CURRENT token exactly matches one of these names, the
+# token immediately following it is treated as the secret VALUE and marked —
+# independent of, and in addition to, the positional-index maps above.
+_SECRET_FLAG_NAMES: frozenset[str] = frozenset(
+    {
+        "-p",
+        "--password",
+        "--pass",
+        "-h",
+        "--hash",
+        "--hashes",
+        "--ntlm-hash",
+        "--ntlm",
+        "--nthash",
+        "--aes-key",
+        "--aeskey",
+    }
+)
 
 
 def redact_command_for_log(command_name: str, args_list: list[str]) -> str:
@@ -489,14 +693,27 @@ def redact_command_for_log(command_name: str, args_list: list[str]) -> str:
     operator must see the FULL cleartext command they ran — domain, IP, user,
     scan_mode, flags, everything — both on screen and in their own session
     recording. So this returns the command verbatim; the only transformation is
-    wrapping the secret positional(s) (per :data:`_SECRET_POSITIONAL_INDICES` /
-    :data:`_SECRET_POSITIONAL_BY_SUBCOMMAND`) with ``mark_sensitive(_,
+    wrapping the secret positional(s)/flag-value(s) with ``mark_sensitive(_,
     "password")``. Those markers are invisible zero-width characters, so the
     secret stays cleartext on the terminal while the telemetry export sanitizer
     scrubs exactly that value before upload.
 
-    A command with no entry in the maps has no secret positional, so every
-    argument is echoed in cleartext unchanged.
+    Three independent marking mechanisms run, any of which can mark a token:
+
+    1. **Positional index** (:data:`_SECRET_POSITIONAL_INDICES` /
+       :data:`_SECRET_POSITIONAL_BY_SUBCOMMAND`) — the primary mechanism for
+       today's flag-free REPL grammar (``dcsync <domain> <user> <password>``,
+       ...). For commands in :data:`_FLAG_FREE_SECRET_COMMANDS`, EVERY token
+       counts as a positional (a value that happens to start with ``-`` is
+       never misread as a flag).
+    2. **Flag name** (:data:`_SECRET_FLAG_NAMES`) — a global backstop: when a
+       token exactly matches a known secret flag spelling, the following
+       token is marked, regardless of the command.
+    3. **Inline ``pass=``/``password=``** — an existing defensive backstop for
+       the inline credential form.
+
+    A command with no entry in the maps and no recognized flag has no secret
+    positional, so every argument is echoed in cleartext unchanged.
 
     Args:
         command_name: The resolved command verb (already alias-normalized).
@@ -515,10 +732,27 @@ def redact_command_for_log(command_name: str, args_list: list[str]) -> str:
         first = (args_list[0] or "").strip().lower()
         secret_positional_indices = sub_map.get(first, secret_positional_indices)
 
+    # Flag-free commands: every token is positional. A secret value starting
+    # with "-" must never be misclassified as a CLI flag (see
+    # ``_FLAG_FREE_SECRET_COMMANDS`` docstring above).
+    treat_all_as_positional = cmd in _FLAG_FREE_SECRET_COMMANDS
+
     echoed: list[str] = []
     positional_idx = -1
+    mark_next_as_flag_value = False
     for token in args_list:
-        is_flag = token.startswith("-")
+        if mark_next_as_flag_value:
+            echoed.append(mark_sensitive(token, "password"))
+            mark_next_as_flag_value = False
+            continue
+
+        is_flag = (not treat_all_as_positional) and token.startswith("-")
+
+        if is_flag and token.lower() in _SECRET_FLAG_NAMES:
+            echoed.append(token)
+            mark_next_as_flag_value = True
+            continue
+
         if not is_flag:
             positional_idx += 1
         mark_this = (not is_flag) and positional_idx in secret_positional_indices
@@ -595,6 +829,12 @@ def normalize_command_alias(
     Client Deliverable Kit (the user deselects in the deliver checkbox to get
     a report-only PDF). ``deliver`` is the canonical verb; these are the
     discoverable on-ramps an operator naturally types.
+
+    ``?`` (bare or with a category argument) is aliased onto ``help`` — the
+    universal help convention that ``cmd.Cmd`` maps by default but which this
+    shell's custom dispatch would otherwise reject as an unknown command. So a
+    new user's reflexive first keystroke ``?`` opens the help tree, and
+    ``? <category>`` opens that category's help exactly like ``help <category>``.
     """
     cmd = (command_name or "").strip().lower()
     if not cmd:
@@ -608,6 +848,7 @@ def normalize_command_alias(
         "startauth": "start_auth",
         "start-unauth": "start_unauth",
         "startunauth": "start_unauth",
+        "?": "help",
     }
 
     mapped_direct = direct_aliases.get(cmd)
@@ -823,6 +1064,7 @@ def ensure_initialized_domain_context_for_command(
         telemetry.capture("domain_command_requires_initialization", properties)
     except Exception as exc:  # pragma: no cover - telemetry best effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     if is_non_interactive(shell=shell):
         return False
@@ -848,6 +1090,7 @@ def ensure_initialized_domain_context_for_command(
             start_method("")
     except Exception as exc:  # pragma: no cover - best effort handoff
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         raise
 
     return False

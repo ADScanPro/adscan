@@ -40,6 +40,7 @@ from adscan_internal.services.post_exploitation.path_promotion import (
     PATH_STATE_FAILED,
     PATH_STATE_FOOTHOLD_OBTAINED,
 )
+from adscan_core.rich_output import print_exception
 
 
 def _default_executor_factory(technique_id: str):
@@ -176,6 +177,7 @@ async def render_paths_execute(
         )
     except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"paths_execute aborted: {exc}")
         return 1
 

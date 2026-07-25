@@ -51,6 +51,7 @@ from adscan_core.rich_output import (
     print_success,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +269,7 @@ def _brand_logo_data_uri(variant: str = "dark") -> str:
             data_uri = f"data:image/png;base64,{encoded}"
     except Exception as exc:  # noqa: BLE001 — logo is cosmetic; never break render
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         data_uri = ""
 
     _BRAND_LOGO_CACHE[variant] = data_uri
@@ -385,6 +387,7 @@ def _resolve_observed_techniques(workspace_dir: Path | None) -> set[str]:
         return get_observed_techniques(workspace_dir)
     except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return set()
 
 
@@ -508,6 +511,7 @@ def _ctx_playbook(
         client = build_playbook_databinding(workspace_dir, frameworks)
     except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         client = None
 
     return {
@@ -657,6 +661,7 @@ def _ctx_checklist(
         client = build_checklist_databinding(workspace_dir, frameworks)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         client = None
 
     return {
@@ -687,11 +692,11 @@ def _ctx_coverage_matrix(
     by ``update_report_field`` → ``record_control_evidence``. This folds the
     legacy Coverage Matrix into a positive-assurance view driven by what was
     actually tested, rather than a static ATT&CK reference catalog. The
-    ``observed`` / ``has_workspace_signal`` / ``frameworks`` args are accepted
-    for the uniform dynamic-builder signature but unused — coverage state comes
-    from the report's control evidence (control name + what it defends against),
-    NOT from any per-framework compliance map, so the selected ``--frameworks``
-    do not change this report's content.
+    ``observed`` / ``has_workspace_signal`` args are accepted for the uniform
+    dynamic-builder signature but unused. ``frameworks`` IS consumed: each
+    control area is mapped to the ENS / ISO 27001 controls it satisfies, and the
+    selected frameworks decide which framework columns render — so the report
+    reads as an audit-grade coverage matrix for the chosen standards.
 
     Delegates to
     ``coverage_report_databinding.build_coverage_report_databinding``, which
@@ -703,7 +708,7 @@ def _ctx_coverage_matrix(
         build_coverage_report_databinding,
     )
 
-    return build_coverage_report_databinding(workspace_dir)
+    return build_coverage_report_databinding(workspace_dir, frameworks=frameworks)
 
 
 # Builders that consume workspace signal share a uniform signature
@@ -951,6 +956,7 @@ def _run_one(args: argparse.Namespace, bonus_key: str) -> int:
             _render_html(tpl, ctx, _load_theme(meta["theme"]))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Bonus dry-run failed: {exc}")
             return 1
         print_success(f"{BONUSES[bonus_key]['title']} dry-run OK (no PDF written).")
@@ -965,6 +971,7 @@ def _run_one(args: argparse.Namespace, bonus_key: str) -> int:
             size = render_bonus(bonus_key, output_path)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_error(f"Could not render {BONUSES[bonus_key]['title']}: {exc}")
             return 1
 

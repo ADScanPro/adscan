@@ -13,6 +13,7 @@ from typing import Any
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 # trustAttributes bits (Microsoft [MS-ADTS] 6.1.6.7.9).
@@ -183,6 +184,7 @@ def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"trust_query: search failed under {base}: {exc}")
         return []
 
@@ -210,6 +212,7 @@ def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"trust_query: entry decode failed: {exc}")
 
     return decoded

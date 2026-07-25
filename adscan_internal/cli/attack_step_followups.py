@@ -90,6 +90,7 @@ from adscan_internal.services.attack_graph_service import (
 )
 from adscan_internal.services.credential_store_service import CredentialStoreService
 from adscan_internal.models.domain import resolve_dc_ip
+from adscan_core.rich_output import print_exception
 
 
 _RODC_KRBTGT_RE = re.compile(r"^krbtgt[_-](\d+)$", re.IGNORECASE)
@@ -1742,6 +1743,7 @@ def _forge_rodc_golden_ticket(
         from adscan_internal import telemetry as _telemetry  # noqa: PLC0415
 
         _telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[rodc-golden] failed to register golden ticket for "
             f"{mark_sensitive(target_user, 'user')}: {type(exc).__name__}: {exc}"

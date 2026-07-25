@@ -6,6 +6,7 @@ from uuid import UUID
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_info_debug, print_warning_debug
 from adscan_internal.services.collector.models import CollectorEdge, NodeKind
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:
     from adscan_internal.services.ldap_transport_service import ADscanLDAPConnection
@@ -97,6 +98,32 @@ SELF_WRITE_GUID_TO_RELATION: dict[str, str] = {
     "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddSelf",  # member — Self-Membership
 }
 
+# Static, PRIMARY source for attribute schemaIDGUIDs.
+#
+# Base-schema attributes are defined by MS-ADSC and their schemaIDGUID is FIXED
+# across every AD forest — Microsoft never regenerates them — so resolving them
+# needs no per-attribute CN=Schema query. Querying the DC once per attribute is
+# both fragile (a transient LDAP failure could drop the scoped ACL edge) and
+# unnecessary for these constants, so they are served from this table and the
+# live schema lookup is kept only as a fallback for the rest.
+#
+# Sourcing note: reference/ (SharpHound/BloodHound common-lib well-known-GUID
+# lists, bloodyAD, ldeep) was NOT populated when this table was authored, so
+# every GUID below is a base-schema MS-ADSC constant taken from the published
+# schema — not invented from memory. ``member`` is additionally cross-checked
+# against SELF_WRITE_GUID_TO_RELATION in this same file (same GUID,
+# bf9679c0-…). Attributes whose schemaIDGUID is per-forest / schema-extension
+# generated and therefore NOT fixed — legacy LAPS ``ms-Mcs-AdmPwd``, the
+# Windows LAPS ``msLAPS-*`` attributes, and the RODC reveal groups
+# ``msDS-RevealOnDemandGroup`` / ``msDS-NeverRevealGroup`` — are deliberately
+# ABSENT here and resolve through the live CN=Schema fallback instead.
+_WELL_KNOWN_SCHEMA_ID_GUIDS: dict[str, str] = {
+    "scriptPath": "bf9679a8-0de6-11d0-a285-00aa003049e2",
+    "member": "bf9679c0-0de6-11d0-a285-00aa003049e2",
+    "servicePrincipalName": "f3a64788-5306-11d1-a9c5-0000f80367c1",
+    "msDS-KeyCredentialLink": "5b47d60f-6090-40b2-9f37-2a4de88f3063",
+}
+
 PROPERTY_GUID_TO_RELATION: dict[str, str] = {
     **WRITE_PROPERTY_GUID_TO_RELATION,
     **READ_PROPERTY_GUID_TO_RELATION,
@@ -164,14 +191,16 @@ class ACLParser:
             from winacl.dtyp.security_descriptor import SECURITY_DESCRIPTOR  # type: ignore
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_warning_debug(f"[acl_parser] winacl unavailable: {exc}")
+            print_exception(exception=exc)
+            print_warning_debug(f"acl_parser: winacl unavailable: {exc}")
             return []
 
         try:
             sd = SECURITY_DESCRIPTOR.from_bytes(sd_bytes)
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_info_debug(f"[acl_parser] Failed to parse SD: {exc}")
+            print_exception(exception=exc)
+            print_info_debug(f"acl_parser: Failed to parse SD: {exc}")
             return []
 
         dacl = getattr(sd, "Dacl", None)
@@ -357,13 +386,48 @@ class ACLParser:
         return result
 
     def _resolve_property_guid(self, attr_name: str) -> str | None:
+        """Resolve an attribute's ``schemaIDGUID`` (lowercased string form).
+
+        Resolution order:
+          1. Positive cache — a GUID already resolved this run.
+          2. Static well-known table (:data:`_WELL_KNOWN_SCHEMA_ID_GUIDS`) —
+             the PRIMARY source for base-schema attributes whose GUID is fixed
+             across every forest. No LDAP round-trip, so a transient DC failure
+             can never drop these scoped ACL edges.
+          3. Live ``CN=Schema`` lookup — the FALLBACK for per-forest /
+             schema-extension attributes (LAPS, RODC reveal groups) absent from
+             the static table.
+
+        Negative caching is DEFINITIVE-ONLY (mirrors the posture doctrine
+        "cache observations, never cache absences"): ``None`` is written to the
+        cache ONLY when the schema search succeeded and returned zero matching
+        entries. A missing/empty ``config_dn`` (UNKNOWN) or ANY exception
+        (transient: connection reset, LDAP signing/CBT renegotiation, timeout)
+        returns ``None`` WITHOUT caching, so a later call retries instead of the
+        whole run silently dropping this attribute's scoped ACL edges.
+        """
         if attr_name in self._guid_cache:
             return self._guid_cache[attr_name]
+
+        static_guid = _WELL_KNOWN_SCHEMA_ID_GUIDS.get(attr_name)
+        if static_guid is not None:
+            self._guid_cache[attr_name] = static_guid
+            return static_guid
+
         if not self._connection:
-            self._guid_cache[attr_name] = None
+            # No schema connection — UNKNOWN for this attribute, not a
+            # definitive not-found. Do not poison the cache.
             return None
+
+        config_dn = getattr(self._connection, "config_dn", None)
+        if not config_dn:
+            # An empty/None config_dn would build a malformed "CN=Schema," base.
+            # UNKNOWN, not not-found — return None WITHOUT caching so a later
+            # call (once config_dn is populated) can retry.
+            return None
+
         try:
-            schema_base = f"CN=Schema,{self._connection.config_dn}"
+            schema_base = f"CN=Schema,{config_dn}"
             self._connection.search(
                 search_base=schema_base,
                 search_filter=f"(lDAPDisplayName={attr_name})",
@@ -377,19 +441,37 @@ class ACLParser:
                 else []
             )
             raw_guid = raw_guid_list[0] if raw_guid_list else None
-            if not raw_guid:
-                self._guid_cache[attr_name] = None
-                return None
-            guid_str = str(UUID(bytes_le=raw_guid)).lower()
-            self._guid_cache[attr_name] = guid_str
-            return guid_str
         except Exception as exc:
+            # Transient failure (connection reset, signing/CBT renegotiation,
+            # timeout, ...). Retry-able — return None WITHOUT caching so the
+            # whole run is not poisoned for this attribute.
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
-                f"[acl_parser] Failed to resolve GUID for {attr_name}: {exc}"
+                f"acl_parser: transient GUID resolution failure for {attr_name}: {exc}"
             )
+            return None
+
+        if not raw_guid:
+            # The search DEFINITIVELY succeeded and returned no schemaIDGUID for
+            # this attribute — a real not-found. Safe to cache the negative.
             self._guid_cache[attr_name] = None
             return None
+
+        try:
+            guid_str = str(UUID(bytes_le=raw_guid)).lower()
+        except Exception as exc:
+            # Malformed GUID bytes — do not cache; a re-query is cheap and a
+            # cached None here would drop the edge for the whole run.
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"acl_parser: could not parse schemaIDGUID for {attr_name}: {exc}"
+            )
+            return None
+
+        self._guid_cache[attr_name] = guid_str
+        return guid_str
 
     def _ace_type(self, ace: Any) -> int | None:
         ace_type = getattr(ace, "AceType", None)

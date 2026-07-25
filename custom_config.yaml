@@ -436,3 +436,37 @@
   target:
     - code
     - doc
+
+# ---------------------------------------------------------------------------
+# PowerShell key-encrypted SecureString blob (ConvertFrom-SecureString -Key)
+# ---------------------------------------------------------------------------
+# Detects the ENCRYPTED, offline-recoverable SecureString blob by its fixed
+# magic header. This complements CredSweeper's built-in "CMD ConvertTo-
+# SecureString" rule (which captures a CLEARTEXT password passed INTO a
+# SecureString) — the opposite direction. Here the ciphertext often sits in a
+# variable far from any ConvertFrom-SecureString call (e.g.
+# `$secret = "76492d11…"`), so we anchor on the BLOB MAGIC, not the command.
+# use_ml: false — the 32-hex magic prefix is near-certain, no ML needed. The AES
+# decryption itself is done by ADscan's recovery SSOT
+# (adscan_internal.services.secret_recovery_service); this rule only guarantees
+# the encrypted blob is detected as a credential candidate so the file reaches
+# the credential funnel (handle_found_credentials) and recovery runs.
+- name: PS ConvertFrom-SecureString KeyEncrypted
+  severity: high
+  confidence: strong
+  type: pattern
+  values:
+    - (?P<value>76492d1116743f0423413b16050a5345[A-Za-z0-9+/=]{16,})
+  filter_type:
+    - ValueAllowlistCheck
+    - ValuePatternCheck(4)
+    - LineGitBinaryCheck
+    - LineUUEPartCheck
+    - ValueFilePathCheck
+  use_ml: false
+  required_substrings:
+    - "76492d11"
+  min_line_len: 48
+  target:
+    - code
+    - doc

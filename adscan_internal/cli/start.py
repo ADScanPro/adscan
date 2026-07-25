@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
+import argparse
 import ipaddress
 import time
 import os
@@ -73,6 +74,8 @@ from adscan_internal.cli.host_file_picker import (
 )
 from adscan_core.path_utils import get_effective_user_home
 from adscan_internal.services.network_preflight_service import (
+    DC_REACHABILITY_TCP_PORTS,
+    DC_REACHABILITY_TIMEOUT_SECONDS,
     RouteAssessment,
     assess_target_reachability,
     get_interface_ipv4_addresses,
@@ -1653,6 +1656,7 @@ def _list_local_interfaces_with_ipv4() -> list[tuple[str, list[str]]]:
             interfaces.append((str(iface), get_interface_ipv4_addresses(str(iface))))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return interfaces
 
 
@@ -1682,6 +1686,7 @@ def _apply_interface_switch(shell: Any, *, interface: str) -> str | None:
             saver()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[network-preflight] failed to persist interface switch: {exc}"
             )
@@ -1738,6 +1743,7 @@ def _maybe_offer_interface_switch_on_route_mismatch(
             return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     marked_route_src = (
         mark_sensitive(mismatch_route.source_ip, "ip")
@@ -1938,16 +1944,18 @@ def _run_start_network_preflight(
             shell,
             target_ip=target_ip,
             expected_interface=iface or None,
-            tcp_ports=(53, 389, 445),
+            tcp_ports=DC_REACHABILITY_TCP_PORTS,
+            timeout_seconds=DC_REACHABILITY_TIMEOUT_SECONDS,
         )
         open_ports = list(reachability.open_ports)
         marked_target = mark_sensitive(target_ip, "ip")
+        probed_ports_label = "/".join(str(p) for p in DC_REACHABILITY_TCP_PORTS)
         if not open_ports:
             checks.append(
                 _NetworkPreflightCheck(
                     name="DC service reachability",
                     status="fail",
-                    detail=f"Could not connect to TCP 53/389/445 on {marked_target}.",
+                    detail=f"Could not connect to TCP {probed_ports_label} on {marked_target}.",
                     suggestion="Verify routing/firewall rules and confirm the target is a DC/PDC.",
                 )
             )
@@ -2946,6 +2954,16 @@ def run_start_unauth(shell, args: str | None) -> None:
             # cancelled discovery, preflight abort) and delegation to
             # run_start_auth return False so we don't render a false completion.
             if scan_ran:
+                # Re-materialize the web-consumed attack-path snapshot as a pure
+                # projection of the reconciled graph BEFORE the loot card / web
+                # handoff, so a compromised domain is never ingested as
+                # all-theoretical. Single scan-finalization seam for both
+                # `adscan start` and `adscan ci` (ci routes through this).
+                from adscan_internal.cli.attack_path_execution import (
+                    rematerialize_attack_path_snapshots_at_scan_end,
+                )
+
+                rematerialize_attack_path_snapshots_at_scan_end(shell)
                 _emit_post_scan_panels(shell, "start_unauth")
                 reconcile_jobs_at_scan_end(shell)
             return
@@ -3084,23 +3102,53 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
     # the time the scan reaches the crack step. No-op when already cached-fresh.
     warm_benchmark_async(shell)
 
+    from adscan_internal.cli.repl_args import ReplArgumentParser, parse_command_args
+
     args_list = (args or "").strip().split() if args else []
+    namespace = None
     if args_list:
-        if len(args_list) != 4:
+        usage = (
+            "start_auth <domain> <pdc_ip> <username> <password_or_hash>  |  "
+            "start_auth -d <domain> --dc-ip <pdc_ip> -u <username> -p <password_or_hash>"
+        )
+        if len(args_list) == 4:
+            namespace = argparse.Namespace(
+                domain=args_list[0],
+                dc_ip=args_list[1],
+                username=args_list[2],
+                password=args_list[3],
+            )
+        else:
+            flag_parser = ReplArgumentParser(prog="start_auth", add_help=False)
+            flag_parser.add_argument("-d", "--domain", required=True)
+            flag_parser.add_argument("--dc-ip", dest="dc_ip", required=True)
+            flag_parser.add_argument("-u", "--username", required=True)
+            flag_parser.add_argument("-p", "--password", required=True)
+            namespace = parse_command_args(
+                tokens_source=args,
+                legacy_field_order=("domain", "dc_ip", "username", "password"),
+                parser=flag_parser,
+                usage=usage,
+            )
+
+        if namespace is None:
             if not sys.stdin.isatty():
                 print_error(
                     "You must provide: <domain> <pdc_ip> <username> <password_or_hash>."
                 )
-                print_info(
-                    "Usage: start_auth <domain> <pdc_ip> <username> <password_or_hash>"
-                )
+                print_info(f"Usage: {usage}")
                 return False
             # Interactive recovery for partial/mistyped args.
             print_warning(
                 "Arguments were incomplete/invalid. Switching to guided setup..."
             )
         else:
-            domain, pdc_ip, username, password = args_list
+            domain, pdc_ip, username, password = (
+                namespace.domain,
+                namespace.dc_ip,
+                namespace.username,
+                namespace.password,
+            )
             decision = preflight_domain_pdc(
                 shell,
                 domain=domain,
@@ -3624,6 +3672,16 @@ def run_start_auth(shell, args: str | None) -> None:
             # target, preflight/DNS abort) and delegation to run_start_unauth
             # return False so we don't render a false completion.
             if scan_ran:
+                # Re-materialize the web-consumed attack-path snapshot as a pure
+                # projection of the reconciled graph BEFORE the loot card / web
+                # handoff, so a compromised domain is never ingested as
+                # all-theoretical. Single scan-finalization seam for both
+                # `adscan start` and `adscan ci` (ci routes through this).
+                from adscan_internal.cli.attack_path_execution import (
+                    rematerialize_attack_path_snapshots_at_scan_end,
+                )
+
+                rematerialize_attack_path_snapshots_at_scan_end(shell)
                 _emit_post_scan_panels(shell, "start_auth")
                 reconcile_jobs_at_scan_end(shell)
             return

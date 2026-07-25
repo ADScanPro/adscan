@@ -34,6 +34,7 @@ from adscan_internal.services.collector.persistence import CollectorPersistence
 from adscan_internal.services.collector.smb_collector import SMBCollectorConfig
 from adscan_internal.services.collector.share_collector import ShareCollectorConfig
 from adscan_internal.workspaces import domain_subpath
+from adscan_core.rich_output import print_exception
 
 
 @dataclass
@@ -126,6 +127,7 @@ class CollectionOrchestrator:
             progress_callback(len(result.nodes))
         except Exception as exc:  # noqa: BLE001 — progress must never abort collection
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def collect_domain(
         self,
@@ -339,6 +341,7 @@ class CollectionOrchestrator:
                         }
                 except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
             timing.host_negotiate = host_timing.negotiate
             timing.host_samr = host_timing.samr
             timing.host_shares = host_timing.shares
@@ -439,6 +442,7 @@ class CollectionOrchestrator:
             )
         except Exception as exc:  # noqa: BLE001 — best-effort, never break collection
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(f"machine-pwd-policy: inspection failed: {exc}")
 
     def _wire_collection_resume(
@@ -493,6 +497,7 @@ class CollectionOrchestrator:
                 self._persistence.persist(shell, domain=domain, result=result)
             except Exception as exc:  # noqa: BLE001 — a failed persist must not flush the done-set
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 return
             checkpoint_collection_progress(shell, domain)
 
@@ -534,6 +539,7 @@ class CollectionOrchestrator:
                 mark_collection_complete(shell, domain)
         except Exception as exc:  # noqa: BLE001 — finalize is best-effort
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def collect_scope(
         self,

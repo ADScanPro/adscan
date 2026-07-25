@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 from typing import Any, Dict
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,75 @@ def ensure_isolated_tool_extra_specs_installed(
         return False
 
 
+def _module_name_from_traceback_path(file_path: str) -> str | None:
+    """Derive a sanitized dotted module name from a traceback ``File`` path.
+
+    Strips the absolute filesystem location: when the path is rooted at a
+    recognizable package directory (``site-packages`` / ``dist-packages``) the
+    dotted module below that root is returned (e.g. ``pypykatz/foo.py`` ->
+    ``pypykatz.foo``); otherwise the bare module stem is returned, which carries
+    no path information. Best-effort — returns ``None`` on any parsing issue.
+    """
+    try:
+        normalized = (file_path or "").replace("\\", "/")
+        parts = [segment for segment in normalized.split("/") if segment]
+        if not parts:
+            return None
+        stem = parts[-1]
+        if stem.endswith(".py"):
+            stem = stem[:-3]
+        parts[-1] = stem
+        for marker in ("site-packages", "dist-packages"):
+            if marker in parts:
+                marker_idx = len(parts) - 1 - parts[::-1].index(marker)
+                dotted = ".".join(parts[marker_idx + 1 :])
+                return dotted or (stem or None)
+        return stem or None
+    except Exception:
+        return None
+
+
+def _extract_help_crash_signature(output_text: str) -> tuple[str | None, str | None]:
+    """Derive a sanitized ``(exc_type, last_frame_module)`` from a crash traceback.
+
+    The help probe runs the tool in a subprocess, so a crash surfaces as a
+    textual Python traceback rather than a live exception object. This parses
+    that text into a privacy-safe signature — the exception class name plus the
+    dotted module of the crashing frame — with file paths, argv, and raw
+    traceback lines stripped. Best-effort: returns ``(None, None)`` rather than
+    raising when the text is not a recognizable traceback.
+    """
+    try:
+        text = output_text or ""
+        if "traceback (most recent call last)" not in text.lower():
+            return None, None
+
+        non_blank_lines = [line for line in text.splitlines() if line.strip()]
+
+        # Exception type: the final non-indented line of a traceback is
+        # ``ExceptionType: message`` (or a bare ``ExceptionType``). Scan upward
+        # so trailing tool output after the traceback does not fool us, and keep
+        # only the class-name token before the first colon.
+        exc_type: str | None = None
+        for line in reversed(non_blank_lines):
+            if line[:1].isspace():
+                continue
+            candidate = line.split(":", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][\w.]*", candidate):
+                exc_type = candidate
+                break
+
+        # Last frame module: the deepest ``File "<path>", line N`` entry.
+        last_frame_module: str | None = None
+        file_paths = re.findall(r'File "([^"]+)", line \d+', text)
+        if file_paths:
+            last_frame_module = _module_name_from_traceback_path(file_paths[-1])
+
+        return exc_type, last_frame_module
+    except Exception:
+        return None, None
+
+
 def check_executable_help_works(
     tool_name: str,
     executable_path: str,
@@ -251,6 +321,24 @@ def check_executable_help_works(
         if "traceback (most recent call last)" not in lowered:
             return
 
+        # A missing/misconfigured libmagic runtime (the shared library `python-magic`
+        # wraps) is a common, precisely-diagnosable failure mode -- most notably for
+        # MANSPIDER, which imports `magic` at startup. Check for it before falling
+        # through to the generic import-error message below so the operator sees the
+        # actionable fix on the first line, not a vague "Python import error".
+        if "libmagic" in lowered or "magic.mgc" in lowered:
+            deps.print_warning(
+                f"{tool_name} failed to start because the system libmagic runtime is missing or misconfigured."
+            )
+            deps.print_instruction(
+                "Fix (Debian/Kali): `sudo apt-get update && sudo apt-get install -y libmagic1`"
+            )
+            deps.telemetry_capture(
+                "tool_help_probe_missing_libmagic",
+                properties={"tool": tool_name},
+            )
+            return
+
         module_match = re.search(
             r"no module named ['\"]([^'\"]+)['\"]",
             output_text or "",
@@ -322,9 +410,15 @@ def check_executable_help_works(
         deps.print_instruction(
             f"If it still fails, remove {marked_tool_venv} and rerun `adscan install`."
         )
+        exc_type, last_frame_module = _extract_help_crash_signature(output_text)
+        crash_properties: dict[str, Any] = {"tool": tool_name}
+        if exc_type:
+            crash_properties["exc_type"] = exc_type
+        if last_frame_module:
+            crash_properties["last_frame_module"] = last_frame_module
         deps.telemetry_capture(
             "tool_help_probe_crash",
-            properties={"tool": tool_name},
+            properties=crash_properties,
         )
 
     help_variants: list[list[str]] = [
@@ -333,6 +427,7 @@ def check_executable_help_works(
     ]
     attempted_nxc_fix = False
     attempted_manspider_fix = False
+    diagnosed_help_failure = False
     for cmd in help_variants:
         timed_out, stdout_text, stderr_text, returncode, duration = _run_probe_command(
             cmd,
@@ -381,8 +476,13 @@ def check_executable_help_works(
             )
             return True
 
-        # Add a safe diagnosis (no raw traceback output).
-        _diagnose_help_failure(combined)
+        # Add a safe diagnosis (no raw traceback output). Both help variants
+        # (`--help` then `-h`) of a crashing tool surface the same failure, so
+        # diagnose + warn + emit telemetry ONCE per tool probe, not once per
+        # variant (which double-printed the warning and double-fired the event).
+        if not diagnosed_help_failure:
+            _diagnose_help_failure(combined)
+            diagnosed_help_failure = True
 
         # MANSPIDER writes logs to ~/.manspider/logs by default and can crash if
         # that directory is owned by another user (legacy root installs).
@@ -468,6 +568,7 @@ def check_executable_help_works(
                 )
             except Exception as fix_e:  # pragma: no cover - environment dependent
                 deps.telemetry_capture_exception(fix_e)
+                print_exception(exception=fix_e)
                 deps.print_info_debug(
                     f"[check] Failed to auto-repair manspider permissions: {fix_e}"
                 )
@@ -551,6 +652,7 @@ def check_executable_help_works(
                 )
             except Exception as fix_e:  # pragma: no cover - environment dependent
                 deps.telemetry_capture_exception(fix_e)
+                print_exception(exception=fix_e)
                 deps.print_info_debug(
                     f"[check] Failed to auto-repair NetExec permissions: {fix_e}"
                 )
@@ -790,6 +892,6 @@ def diagnose_manspider_help_failure(
         )
         return
 
-    deps.print_info_verbose(
+    deps.print_info_debug(
         "[check] manspider diagnosis: unknown failure while importing `magic` (output sanitized)."
     )

@@ -18,8 +18,6 @@ import json
 import os
 from typing import Any
 
-from rich.prompt import Confirm
-
 from adscan_internal import (
     print_info,
     print_info_debug,
@@ -48,6 +46,7 @@ from adscan_internal.services.inventory_timeline_service import (
 )
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.layout import DEFAULT_DOMAIN_LAYOUT
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(slots=True, frozen=True)
@@ -442,6 +441,7 @@ def _run_ntlm_sweep_for_newly_reachable_after_pivot(
         )
     except Exception as exc:  # noqa: BLE001 - sweep failure must not abort recalc
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[post-pivot] NTLMv1 sweep over newly-reachable hosts raised: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -576,7 +576,7 @@ def maybe_offer_post_pivot_owned_followup(
     refresh_result: PostPivotRefreshResult,
 ) -> None:
     """Offer a high-value owned-user follow-up when the pivot unlocked new hosts."""
-    from rich.prompt import Confirm
+    from adscan_core.output import confirm_ask  # noqa: PLC0415
 
     new_hosts = refresh_result.newly_reachable_hosts or []
     if not new_hosts:
@@ -596,7 +596,7 @@ def maybe_offer_post_pivot_owned_followup(
     if callable(confirmer):
         should_run = bool(confirmer(prompt, default=True))
     else:
-        should_run = bool(Confirm.ask(prompt, default=True))
+        should_run = bool(confirm_ask(prompt, default=True))
 
     if not should_run:
         print_info("Skipping post-pivot owned-user follow-up by user choice.")
@@ -666,7 +666,15 @@ def maybe_offer_trust_followup_for_newly_reachable_domains(
     if not callable(trust_runner):
         print_info_debug("[trust-followup] shell does not expose do_enum_trusts().")
         return
-    if Confirm.ask(prompt, default=prompt_default):
+
+    from adscan_core.output import confirm_ask  # noqa: PLC0415
+
+    confirmer = getattr(shell, "_questionary_confirm", None)
+    if callable(confirmer):
+        proceed = bool(confirmer(prompt, default=prompt_default))
+    else:
+        proceed = bool(confirm_ask(prompt, default=prompt_default))
+    if proceed:
         trust_runner(source_domain)
 
 
@@ -775,6 +783,7 @@ def refresh_network_inventory_after_pivot(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[post-pivot] failed to snapshot direct/current-vantage artifacts before pivot refresh: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -783,6 +792,7 @@ def refresh_network_inventory_after_pivot(
         refresh_callable(context.domain, computers_file, nmap_dir)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info(
             "The pivot was established, but the automatic current-vantage inventory refresh failed."
         )
@@ -811,6 +821,7 @@ def refresh_network_inventory_after_pivot(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[post-pivot] failed to record inventory timeline snapshot: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -874,6 +885,7 @@ def refresh_network_inventory_after_pivot(
                     )
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             "[post-pivot] failed to annotate network reachability report with pivot vantage metadata: "
             f"{mark_sensitive(str(exc), 'detail')}"
@@ -885,6 +897,7 @@ def refresh_network_inventory_after_pivot(
             save_workspace_data()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 "[post-pivot] failed to persist workspace data after pivot refresh: "
                 f"{mark_sensitive(str(exc), 'detail')}"

@@ -34,6 +34,7 @@ from adscan_internal import (
     print_success_verbose,
     print_table,
     print_warning,
+    print_warning_debug,
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive, print_panel
@@ -52,7 +53,25 @@ from adscan_internal.services.session_compromise_state_service import (
 from adscan_internal.services.credentials.credential_origin import (
     origin_display_label,
 )
-from adscan_internal.models.domain import resolve_dc_ip
+from adscan_internal.services.secret_recovery_service import (
+    _AES_KEY_LENGTHS,  # noqa: F401 — re-exported for tests/back-compat
+    _POWERSHELL_SECURESTRING_MAGIC,  # noqa: F401 — re-exported for back-compat
+    _SECURESTRING_BLOB_RE,
+    _extract_securestring_principal,  # noqa: F401 — re-exported for tests
+    _is_gpp_preferences_xml_path,
+    _read_full_file_text,
+    decrypt_cpassword,
+    decrypt_powershell_securestring,  # noqa: F401 — re-exported for tests
+    extract_cpassword_entries,
+    extract_securestring_key_material,  # noqa: F401 — re-exported for tests
+    find_powershell_securestring_blobs,  # noqa: F401 — re-exported for tests
+    looks_like_cpassword_value,
+    looks_like_dpapi_protected_securestring,
+    looks_like_securestring_blob,
+    recover_cpassword_secrets,  # noqa: F401 — source-agnostic SSOT orchestrator
+    recover_securestring_secrets,
+)
+from adscan_internal.models.domain import resolve_dc_ip, resolve_dc_reachability
 from adscan_core.theme import (
     ADSCAN_PRIMARY,
     COLOR_AMBER,
@@ -61,6 +80,7 @@ from adscan_core.theme import (
     COLOR_SAGE,
     COLOR_STEEL,
 )
+from adscan_core.rich_output import print_exception
 
 # UX glyphs paired with semantic colors so the credential surfaces remain
 # readable in NO_COLOR / monochrome terminals. Every state badge in this
@@ -236,6 +256,7 @@ def ensure_domain_ready_for_manual_credential_save(
         telemetry.capture("creds_save_requires_start_auth", properties)
     except Exception as exc:  # pragma: no cover - telemetry best effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     return False
 
@@ -589,10 +610,12 @@ def _prompt_for_domain_user_selection(
             )
         except KeyboardInterrupt as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_warning("Credential selection cancelled.")
             return None
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_warning(f"Questionary credential selection failed: {e}")
         else:
             if selected_user_idx is None:
@@ -621,6 +644,7 @@ def _prompt_for_domain_user_selection(
 
     except KeyboardInterrupt as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning("Credential selection cancelled.")
         return None
 
@@ -711,10 +735,12 @@ def delete_cred(shell: Any, domain: str) -> None:
             )
         except KeyboardInterrupt as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_warning("Credential deletion cancelled.")
             return
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_warning(f"Questionary credential deletion selection failed: {e}")
             selected_users = None
     else:
@@ -889,6 +915,7 @@ def _ensure_verified_domain_credential_ticket(
                     )
     except Exception as e:  # noqa: BLE001
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         marked_user = mark_sensitive(user, "user")
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
@@ -948,6 +975,51 @@ def user_privs_assessed_this_session(shell: Any, domain: str, user: str) -> bool
         return False
 
 
+def _render_unreachable_domain_authenticated_pipeline_skip(
+    shell: Any, *, domain: str
+) -> None:
+    """Render the fast, explicit skip panel for a confirmed-unreachable domain.
+
+    Mirrors the style of ``dns.py``'s ``🧭 DC/PDC Reachability`` panel so the
+    operator sees a single consistent "this domain's DC is unreachable"
+    surface, whether the signal came from the initial DNS/TCP-53 preflight or
+    (as here) from a later cross-domain connectivity precheck.
+    """
+    marked_domain = mark_sensitive(domain, "domain")
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    pdc_ip = domain_data.get("pdc")
+    lines = [
+        "[bold]Authenticated enumeration skipped.[/bold]",
+        "",
+        f"Domain: {marked_domain}",
+        "This domain's DC/PDC was already confirmed unreachable from the "
+        "current vantage (see the earlier 🧭 DC/PDC Reachability panel).",
+        "",
+        "The credential itself has been stored and will be used "
+        "automatically once a route to this domain's DC is available "
+        "(for example after establishing a pivot, or in a future session "
+        "run over VPN) — no re-harvesting required.",
+        "",
+        "[bold]Skipped:[/bold] posture probing, authenticated enumeration, "
+        "trust enumeration, and user-privilege / attack-path checks for "
+        f"{marked_domain} — every one of them requires a live "
+        "Kerberos/LDAP/SMB connection to this domain's DC and would only "
+        "time out.",
+    ]
+    if pdc_ip:
+        lines.insert(3, f"PDC: {mark_sensitive(pdc_ip, 'ip')}")
+    print_panel(
+        "\n".join(lines),
+        title="[bold]🧭 DC/PDC Reachability[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+    print_info_debug(
+        f"[creds] handle_auth_and_optional_privs: skipping authenticated "
+        f"pipeline for {marked_domain} -- resolve_dc_reachability() == False"
+    )
+
+
 def handle_auth_and_optional_privs(
     shell: Any,
     domain: str,
@@ -996,6 +1068,31 @@ def handle_auth_and_optional_privs(
         f"force_enum={force_authenticated_enumeration!r} "
         f"prompt_existing_auth={prompt_when_already_authenticated!r}"
     )
+
+    # Reachability gate — a domain whose DC/PDC is CONFIRMED unreachable from
+    # the current vantage (e.g. a cross-domain connectivity precheck run
+    # during trust enumeration, resolved via the SSOT
+    # ``resolve_dc_reachability``) must never enter the authenticated
+    # pipeline (posture probe, ``do_enum_authenticated`` -> trust
+    # enumeration, ``ask_for_user_privs`` -> attack-path checks) — every one
+    # of those phases sends bytes over Kerberos/LDAP/SMB to that domain's DC
+    # and is doomed to time out. This is THE single choke point: every
+    # "new/selected domain credential" flow (add_credential and start_auth)
+    # calls this function before doing any network-bound work for the
+    # domain. The credential itself was already stored by the caller before
+    # this function runs and stays available for a future session or once a
+    # route opens (e.g. via the pivoting feature) -- only the doomed network
+    # phases are skipped here.
+    #
+    # ``resolve_dc_reachability`` returns ``False`` ONLY from an explicit
+    # connectivity observation (never inferred from a timeout -- see the
+    # posture-caching "never cache absences" invariant in CLAUDE.md); ``None``
+    # (no observation -- the common case, including every primary scanned
+    # domain) and ``True`` both fall through to the normal flow unchanged.
+    if resolve_dc_reachability(shell.domains_data.get(domain, {}) or {}) is False:
+        _render_unreachable_domain_authenticated_pipeline_skip(shell, domain=domain)
+        return
+
     has_non_empty_credential = any(
         user and (cred is not None) and cred != "" for user, cred in users_with_creds
     )
@@ -1101,6 +1198,7 @@ def handle_auth_and_optional_privs(
             full_scan_started = True
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_warning(f"Failed to start authenticated enumeration: {e}")
             print_info(
                 "You can manually start enumeration with: enum_authenticated <domain>"
@@ -1379,6 +1477,7 @@ def handle_auth_and_optional_privs(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_verbose(
                 f"Failed to load pivot follow-up helpers for {mark_sensitive(user, 'user')}: {exc}"
             )
@@ -1873,6 +1972,7 @@ def handle_auth_and_optional_privs(
             shell.ask_for_user_privs(domain, user, cred)
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_info_verbose(f"Failed to prompt for user privileges: {e}")
 
 
@@ -2081,7 +2181,11 @@ def add_credential(
     Args:
         shell: The PentestShell instance with domains_data and related methods.
         domain: The domain name.
-        user: The username.
+        user: The username. Accepts either a bare sAMAccountName or a UPN
+            (``user@domain``) — a UPN whose domain matches ``domain`` is
+            normalized to its bare local part before anything else runs (SSOT
+            for every credential-add caller; see the normalization block at
+            the top of the function body).
         cred: The credential (password or hash).
         host: Optional host for local credentials.
         service: Optional service for local credentials.
@@ -2158,6 +2262,39 @@ def add_credential(
         print_error("Domain credential cannot be stored without a valid domain name.")
         return
     domain = normalized_domain
+
+    # SSOT UPN normalization — ``add_credential`` is the funnel every
+    # credential-add flow in the codebase goes through, and MULTIPLE upstream
+    # callers can surface a UPN (``user@domain``) instead of a bare
+    # sAMAccountName: cracked kerberoast/AS-REP-roast hashcat output is
+    # deliberately keyed by ``user@realm`` (hashcat's ``--username`` split
+    # requires a leading field on the raw ``$krb5tgs$``/``$krb5asrep$`` hash
+    # line, see ``cracking.py::_extract_asrep_username``), and that UPN string
+    # flows straight through to here. Passing it unmodified into the live
+    # LDAP/Kerberos verification below looks up the literal
+    # "user@domain" string as if it were a username, which never resolves —
+    # silently dropping a genuinely correct, cracked credential. Normalize
+    # HERE, before ``user`` is used for anything (storage keys, lookups, live
+    # verification), so every caller benefits without a per-call-site fix.
+    if "@" in user:
+        upn_local_part, _, upn_domain = user.partition("@")
+        upn_local_part = upn_local_part.strip()
+        upn_domain = upn_domain.strip()
+        if upn_local_part:
+            if upn_domain and upn_domain.lower() != domain.lower():
+                # A genuine mismatch is a signal something upstream resolved
+                # the wrong target domain for this credential — never silently
+                # drop it (that would be worse than a diagnosable log line),
+                # but do surface it so a recurrence is traceable.
+                print_warning_debug(
+                    "add_credential: UPN domain mismatch — credential "
+                    f"{mark_sensitive(user, 'user')} carries UPN domain "
+                    f"{mark_sensitive(upn_domain, 'domain')} but is being added "
+                    f"to target domain {mark_sensitive(domain, 'domain')}. "
+                    f"Normalizing to bare username "
+                    f"{mark_sensitive(upn_local_part, 'user')} anyway."
+                )
+            user = upn_local_part
 
     if not skip_hash_cracking and not ui_silent:
         # Professional credential addition header
@@ -2331,7 +2468,7 @@ def add_credential(
             )
             credential_persisted = True
             _apply_credential_metadata(
-                shell, domain=domain, user=user, metadata=metadata
+                shell, domain=domain, user=user, metadata=metadata, secret=cred
             )
 
             # Phase 3: AdminTo edge emission lives inside
@@ -2377,6 +2514,7 @@ def add_credential(
                 )
             except Exception as exc:  # pragma: no cover - best effort eventing
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
             if mark_user_compromised:
                 mark_session_user_compromised(shell, user)
@@ -2408,6 +2546,7 @@ def add_credential(
                         )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
                     print_info_debug(
                         "[add_credential] Failed to record credential provenance steps "
                         "in attack graph (continuing)."
@@ -2501,7 +2640,7 @@ def add_credential(
             )
             credential_persisted = True
             _apply_credential_metadata(
-                shell, domain=domain, user=user, metadata=metadata
+                shell, domain=domain, user=user, metadata=metadata, secret=cred
             )
             if credential_origin:
                 # Persist provenance into ``credentials_meta`` so the
@@ -2649,6 +2788,7 @@ def add_credential(
                             pass
             except Exception as e:
                 telemetry.capture_exception(e)
+                print_exception(exception=e)
                 # Telemetry failures shouldn't break the credential addition flow
 
             if not is_self_introduced_credential:
@@ -2673,6 +2813,7 @@ def add_credential(
                     )
                 except Exception as exc:  # pragma: no cover - best effort eventing
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
                 if mark_user_compromised:
                     mark_session_user_compromised(shell, user)
@@ -2704,6 +2845,7 @@ def add_credential(
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 print_info_debug(
                     "[add_credential] Failed to record credential provenance steps "
                     "in attack graph (continuing)."
@@ -2719,6 +2861,7 @@ def add_credential(
                 _mark_user_owned_in_bloodhound(shell, domain, user)
             except Exception as _bh_exc:
                 telemetry.capture_exception(_bh_exc)
+                print_exception(exception=_bh_exc)
                 print_info_debug(
                     f"[add_credential] BH mark-owned failed for "
                     f"{mark_sensitive(user, 'user')}@{mark_sensitive(domain, 'domain')}: {_bh_exc}"
@@ -2737,6 +2880,7 @@ def add_credential(
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
             _ensure_verified_domain_credential_ticket(
                 shell,
@@ -2957,6 +3101,7 @@ def resolve_credential_pairs_for_batch(
                 return bool(is_hash_fn(value))
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
         return bool(re.fullmatch(r"[0-9a-fA-F]{32}", str(value or "").strip()))
 
     prepared: list[tuple[str, str]] = []
@@ -3153,11 +3298,22 @@ def _purge_failed_domain_credential(
         # Valid but not usable as-is (e.g. password change required), expired, or
         # a transient/unclassified failure — keep a non-invalid credential.
         if not ui_silent:
-            print_warning(
-                f"Credential for '[bold]{marked_user}[/bold]' in domain "
-                f"[bold]{marked_domain}[/bold] is KEPT — valid but not usable as-is "
-                "(e.g. a password change is required before logon)."
-            )
+            if getattr(shell, "_last_domain_credential_verification_skipped", False):
+                # Verification never ran (the DC/KDC IP could not be resolved).
+                # The credential was NOT rejected — do not imply it is unusable
+                # or that a password change is required.
+                print_warning(
+                    f"Credential for '[bold]{marked_user}[/bold]' in domain "
+                    f"[bold]{marked_domain}[/bold] is KEPT — verification was SKIPPED "
+                    "(the PDC/DC IP is unknown), so it is retained UNVERIFIED. "
+                    "It remains usable."
+                )
+            else:
+                print_warning(
+                    f"Credential for '[bold]{marked_user}[/bold]' in domain "
+                    f"[bold]{marked_domain}[/bold] is KEPT — valid but not usable as-is "
+                    "(e.g. a password change is required before logon)."
+                )
         return False
 
     if not ui_silent:
@@ -3308,6 +3464,7 @@ def _check_local_creds_native_smb(
         )
     except Exception as exc:  # pylint: disable=broad-except
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"An unexpected error occurred during host credential verification: {exc}"
         )
@@ -3473,6 +3630,7 @@ def _check_local_creds_native_nonsmb(
             return False
     except Exception as exc:  # pylint: disable=broad-except
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"An unexpected error occurred during host credential verification: {exc}"
         )
@@ -3631,6 +3789,7 @@ def return_credentials(shell: Any, domain: str) -> tuple[str | None, str | None]
 
     except ValueError as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_error("Please enter a valid number")
         return None, None
 
@@ -3773,26 +3932,19 @@ def select_password_for_spraying(
         return None
     except Exception as e:
         telemetry.capture_exception(e)
+        print_exception(exception=e)
         print_warning(f"Error in password selection: {e}")
         # Fallback to highest confidence password
         return passwords_sorted[0][0]
 
 
-def looks_like_cpassword_value(value: str | None) -> bool:
-    """Heuristic check to determine if a string resembles a cpassword.
-
-    Args:
-        value: String to check
-
-    Returns:
-        True if the string looks like a cpassword value, False otherwise
-    """
-    if not value:
-        return False
-    candidate = value.strip()
-    if len(candidate) < 20 or len(candidate) % 4 != 0:
-        return False
-    return bool(re.fullmatch(r"[A-Za-z0-9+/=]+", candidate))
+# GPP cpassword + PowerShell SecureString recognition/decryption primitives are
+# the pure, transport-agnostic SSOT in
+# ``adscan_internal.services.secret_recovery_service`` (imported at module top):
+# ``_is_gpp_preferences_xml_path``, ``looks_like_cpassword_value``,
+# ``decrypt_cpassword``, ``extract_cpassword_entries``, the SecureString blob/key
+# helpers, and ``_read_full_file_text``. The functions below stay here because
+# they do shell-side wiring (printing, ``add_credential``, provenance, spraying).
 
 
 def read_line_from_file(file_path: str | None, line_num: int | None) -> str | None:
@@ -3817,49 +3969,6 @@ def read_line_from_file(file_path: str | None, line_num: int | None) -> str | No
     return None
 
 
-def decrypt_cpassword(cpassword: str) -> str | None:
-    """Decrypt a GPP cpassword value using gpp-decrypt library (bundled).
-
-    Args:
-        cpassword: The cpassword string extracted from GPP XML.
-
-    Returns:
-        The decrypted password, or None on failure.
-    """
-    from adscan_internal import print_info, print_error, print_exception
-
-    print_info("Decrypting the password with gpp-decrypt")
-    try:
-        from gpp_decrypt import decrypt_password
-
-        normalized_cpassword = "".join(str(cpassword).split())
-        decrypted = decrypt_password(  # type: ignore[no-untyped-call]
-            normalized_cpassword
-        )
-        decrypted_str = str(decrypted or "")
-
-        # gpp-decrypt currently returns UTF-16LE text with PKCS#7 padding
-        # artifacts (e.g. repeated U+0C0C) for some passwords.
-        decrypted_str = decrypted_str.rstrip("\x00")
-        while decrypted_str:
-            last_ord = ord(decrypted_str[-1])
-            low = last_ord & 0xFF
-            high = (last_ord >> 8) & 0xFF
-            if low == high and 1 <= low <= 16:
-                decrypted_str = decrypted_str[:-1]
-            else:
-                break
-
-        if decrypted_str:
-            return decrypted_str.strip() or None
-        return None
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_error("Error decrypting cpassword with gpp-decrypt.")
-        print_exception(show_locals=False, exception=exc)
-        return None
-
-
 def process_cpassword_text(
     shell: Any,
     text: str,
@@ -3868,38 +3977,37 @@ def process_cpassword_text(
     source_hosts: list[str] | None = None,
     source_shares: list[str] | None = None,
     auth_username: str | None = None,
+    provenance_origin: str = "share_spidering",
 ) -> bool:
     """Extract and decrypt cpassword entries from arbitrary text content.
+
+    Thin shell-side wrapper over the pure recovery SSOT
+    (:mod:`adscan_internal.services.secret_recovery_service`): it recognizes and
+    decrypts via the shared primitives, then does only shell-side wiring
+    (``mark_sensitive`` printing, report finding, ``add_credential`` with
+    provenance).
 
     Args:
         shell: The PentestShell instance with add_credential method
         text: Text content to search for cpassword entries
         domain: Domain name for credential storage
         source: Optional source description for logging
+        source_hosts: Optional origin hosts for provenance
+        source_shares: Optional origin shares for provenance
+        auth_username: Optional authenticating user for provenance
+        provenance_origin: Provenance origin tag for the credential source step
+            (``"share_spidering"`` for SMB, ``"artifact_filesystem"`` for
+            WinRM/MSSQL/RDP log loot).
     Returns:
         True if any cpassword entries were found and processed, False otherwise
     """
-    from adscan_internal import print_success, print_warning
+    from adscan_internal import print_info, print_success, print_warning
 
     if not text:
         return False
 
     source_label = f" ({source})" if source else ""
-    entries: list[tuple[str | None, str]] = []
-
-    entry_pattern = re.compile(
-        r'(?is)(?:userName="(?P<user>[^"]+)".*?cpassword="(?P<pass>[^"]+)"|cpassword="(?P<pass_alt>[^"]+)".*?userName="(?P<user_alt>[^"]+)")'
-    )
-
-    for match in entry_pattern.finditer(text):
-        username = match.group("user") or match.group("user_alt")
-        cpassword_value = match.group("pass") or match.group("pass_alt")
-        if cpassword_value:
-            entries.append((username, cpassword_value))
-
-    if not entries:
-        standalone_pattern = re.compile(r'cpassword="([^"]+)"', re.IGNORECASE)
-        entries = [(None, value) for value in standalone_pattern.findall(text)]
+    entries = extract_cpassword_entries(text)
 
     if not entries:
         return False
@@ -3912,6 +4020,21 @@ def process_cpassword_text(
         if not cpassword_value or cpassword_value in seen_values:
             continue
         seen_values.add(cpassword_value)
+
+        print_success(
+            f"cpassword found{source_label}: {mark_sensitive(cpassword_value, 'password')}"
+        )
+        print_info("Decrypting the password with gpp-decrypt")
+        plaintext_password = decrypt_cpassword(cpassword_value)
+        if not plaintext_password:
+            print_warning(f"Failed to decrypt cpassword{source_label}.")
+            continue
+
+        # Record the finding ONLY after a successful decrypt. The MS static AES
+        # key decrypts genuine GPP cpasswords and nothing else, so a successful
+        # decrypt is the authoritative confirmation this is a real GPP cpassword
+        # (not a coincidental base64-shaped blob). This prevents a false-positive
+        # gpp_passwords finding for a value that merely resembled a cpassword.
         if not report_updated:
             shell.update_report_field(domain, "gpp_passwords", True)
             report_updated = True
@@ -3949,14 +4072,7 @@ def process_cpassword_text(
                     prefix="[gpp]",
                 ):
                     telemetry.capture_exception(exc)
-
-        print_success(
-            f"cpassword found{source_label}: {mark_sensitive(cpassword_value, 'password')}"
-        )
-        plaintext_password = decrypt_cpassword(cpassword_value)
-        if not plaintext_password:
-            print_warning(f"Failed to decrypt cpassword{source_label}.")
-            continue
+                    print_exception(exception=exc)
 
         if username:
             normalized_user = username.split("\\")[-1]
@@ -3979,7 +4095,7 @@ def process_cpassword_text(
                     shares=source_shares,
                     artifact=source or None,
                     auth_username=auth_username,
-                    origin="share_spidering",
+                    origin=provenance_origin,
                 )
                 if source_hosts or source_shares:
                     marked_hosts = (
@@ -4006,6 +4122,7 @@ def process_cpassword_text(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 add_credential(
                     shell,
                     domain,
@@ -4021,6 +4138,283 @@ def process_cpassword_text(
     return True
 
 
+# ---------------------------------------------------------------------------
+# PowerShell ConvertFrom-SecureString (-Key) recovery — shell-side wiring
+# ---------------------------------------------------------------------------
+#
+# The pure recognition/decryption SSOT (blob detection, inline + sibling-file key
+# material, AES-CBC decrypt, DPAPI-variant detection, principal extraction) lives
+# in ``adscan_internal.services.secret_recovery_service`` and is imported at the
+# module top. The functions below stay here because they do shell-side wiring:
+# ``mark_sensitive`` printing, ``add_credential`` (with provenance), and the
+# spray re-injection the caller depends on.
+
+
+def _store_recovered_securestring_credential(
+    shell: Any,
+    domain: str,
+    username: str,
+    plaintext: str,
+    source: str | None,
+    source_hosts: list[str] | None,
+    source_shares: list[str] | None,
+    auth_username: str | None,
+    provenance_origin: str = "share_spidering",
+) -> None:
+    """Store a principal-anchored recovered SecureString secret.
+
+    Routes the ``(username, secret)`` pair through :func:`add_credential` with
+    ``credential_origin="passwordinshares"`` and PasswordInShare provenance so
+    the already-wired edge fires. ``add_credential`` verifies the pair against
+    the domain; the provenance edge is only recorded when verification succeeds,
+    which is exactly the principal-anchoring gate (no edge with an unproven
+    principal).
+    """
+    normalized_user = username.split("\\")[-1]
+    try:
+        from adscan_internal.services.share_credential_provenance_service import (
+            ShareCredentialProvenanceService,
+        )
+
+        provenance_service = ShareCredentialProvenanceService()
+        source_steps = provenance_service.build_credential_source_steps(
+            relation="PasswordInShare",
+            edge_type="share_password",
+            source="securestring_recovery",
+            secret=plaintext,
+            hosts=source_hosts,
+            shares=source_shares,
+            artifact=source or None,
+            auth_username=auth_username,
+            origin=provenance_origin,
+        )
+        add_credential(
+            shell,
+            domain,
+            normalized_user,
+            plaintext,
+            source_steps=source_steps,
+            credential_origin="passwordinshares",
+            prompt_for_user_privs_after=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        add_credential(
+            shell,
+            domain,
+            normalized_user,
+            plaintext,
+            credential_origin="passwordinshares",
+            prompt_for_user_privs_after=False,
+        )
+
+
+def process_securestring_text(
+    shell: Any,
+    text: str,
+    domain: str,
+    source: str | None = None,
+    source_hosts: list[str] | None = None,
+    source_shares: list[str] | None = None,
+    auth_username: str | None = None,
+    provenance_origin: str = "share_spidering",
+    file_path: str | None = None,
+    loot_dir: str | None = None,
+) -> list[str]:
+    """Recover PowerShell key-encrypted SecureString secrets from text.
+
+    Thin shell-side wrapper over the pure recovery SSOT
+    (:func:`recover_securestring_secrets`). Recovery is source-agnostic: it
+    decrypts a key-encrypted blob whenever the AES key is available either inline
+    OR in a referenced/sibling key file resolved relative to ``file_path`` /
+    ``loot_dir``. A recovered secret with an adjacent principal is stored and
+    chained (fires the PasswordInShare edge); a recovered secret WITHOUT an
+    adjacent principal is returned so the caller can route it to spray-validation
+    (which anchors the edge on a validated hit). A blob with no recoverable key —
+    or a DPAPI-protected (keyless) blob, which cannot be decrypted offline —
+    yields nothing: it stays a passive finding, never a fabricated credential.
+
+    Args:
+        shell: The PentestShell instance with ``add_credential``.
+        text: Text content to scan (ideally the full source file).
+        domain: Domain name for credential storage.
+        source: Optional source description (path) for logging/provenance.
+        source_hosts: Optional origin hosts for provenance.
+        source_shares: Optional origin shares for provenance.
+        auth_username: Optional authenticating user for provenance.
+        provenance_origin: Provenance origin tag for the credential source step
+            (``"share_spidering"`` for SMB, ``"artifact_filesystem"`` for
+            WinRM/MSSQL/RDP log loot).
+        file_path: Local path of the blob's source file, used to resolve a
+            referenced/sibling AES key file.
+        loot_dir: Directory of already-downloaded loot, searched (in addition to
+            the blob file's own directory) for a referenced/sibling key file.
+
+    Returns:
+        Recovered plaintexts that could NOT be anchored to a principal (spray
+        candidates). Anchored plaintexts are stored in-place and not returned.
+    """
+    from adscan_internal import print_success
+
+    if not text:
+        return []
+
+    source_label = f" ({source})" if source else ""
+    result = recover_securestring_secrets(text, file_path=file_path, loot_dir=loot_dir)
+    if not result.blobs_present:
+        # A DPAPI-protected (keyless) SecureString is detectable but NOT
+        # recoverable offline — it needs the encrypting user's DPAPI masterkey.
+        # Surface it as a passive finding with an explicit reason; never guess.
+        if looks_like_dpapi_protected_securestring(text):
+            print_info_debug(
+                "PowerShell DPAPI-protected SecureString detected"
+                f"{source_label}; it is not recoverable offline (no -Key; needs the "
+                "origin user's DPAPI masterkey). Keeping it as a passive finding."
+            )
+        return []
+    if not result.keys_present:
+        # Blob present but no recoverable key (inline or referenced/sibling file):
+        # leave it as the passive finding, do NOT fabricate a credential.
+        print_info_debug(
+            "PowerShell SecureString blob found without a recoverable key"
+            f"{source_label}; keeping it as a passive finding."
+        )
+        return []
+
+    unanchored: list[str] = []
+    for secret in result.secrets:
+        print_success(
+            "Recovered PowerShell SecureString secret"
+            f"{source_label}: {mark_sensitive(secret.plaintext, 'password')}"
+        )
+        if secret.principal:
+            print_success(
+                "Associated principal (from file context): "
+                f"{mark_sensitive(secret.principal, 'user')}"
+            )
+            _store_recovered_securestring_credential(
+                shell,
+                domain,
+                secret.principal,
+                secret.plaintext,
+                source,
+                source_hosts,
+                source_shares,
+                auth_username,
+                provenance_origin=provenance_origin,
+            )
+        else:
+            # Principal-anchoring gap: no adjacent principal in the file. Return
+            # the plaintext so the caller routes it to spray-validation, which
+            # anchors the PasswordInShare edge on a validated (user, secret) hit.
+            # Do NOT emit an edge with an unknown principal here.
+            unanchored.append(secret.plaintext)
+    return unanchored
+
+
+def filter_securestring_credential_entries(
+    shell: Any,
+    entries: list[tuple],
+    domain: str,
+    *,
+    source_hosts: list[str] | None = None,
+    source_shares: list[str] | None = None,
+    auth_username: str | None = None,
+    provenance_origin: str = "share_spidering",
+) -> list[tuple]:
+    """Recover key-encrypted SecureString secrets from credential entries.
+
+    Operates on ``(rule_name, cred_tuple)`` entries (``cred_tuple`` is
+    ``(value, ml_prob, context_line, line_num, file_path)``). For an entry whose
+    value is a key-encrypted SecureString blob, the FULL source file is read (to
+    find the inline key + adjacent principal) and recovery runs. Anchored secrets
+    are stored and their entry dropped; unanchored recovered plaintexts REPLACE
+    the useless encrypted blob so they flow to spray-validation. A blob with no
+    recoverable key is dropped from the sprayable set (it stays a passive
+    finding — the raw blob is never a usable spray secret). Non-SecureString
+    entries pass through unchanged.
+
+    Args:
+        shell: The PentestShell instance.
+        entries: List of ``(rule_name, cred_tuple)`` credential entries.
+        domain: Domain name.
+        source_hosts: Optional origin hosts for provenance.
+        source_shares: Optional origin shares for provenance.
+        auth_username: Optional authenticating user for provenance.
+
+    Returns:
+        The filtered entries list with SecureString blobs recovered/removed.
+    """
+    from adscan_internal import print_info
+
+    filtered: list[tuple] = []
+    processed_files: set[str] = set()
+
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            filtered.append(entry)
+            continue
+        rule_name, cred_tuple = entry
+        if not isinstance(cred_tuple, tuple) or len(cred_tuple) < 5:
+            filtered.append(entry)
+            continue
+        value, ml_prob, context_line, line_num, file_path = cred_tuple
+        if not looks_like_securestring_blob(value):
+            filtered.append(entry)
+            continue
+
+        # A single file may surface the blob through multiple credential entries;
+        # process each file's blobs only once and drop the redundant entries.
+        dedupe_key = str(file_path or "")
+        if dedupe_key and dedupe_key in processed_files:
+            continue
+        if dedupe_key:
+            processed_files.add(dedupe_key)
+
+        file_text = _read_full_file_text(file_path)
+        if file_text and _SECURESTRING_BLOB_RE.search(file_text):
+            combined_text = file_text
+        else:
+            # File unreadable / did not contain the blob (e.g. truncated
+            # index): fall back to the credential value + its context line so
+            # recovery can still find an inline key nearby.
+            combined_text = "\n".join(
+                part for part in (file_text, context_line, str(value or "")) if part
+            )
+
+        source_desc: str | None = file_path or None
+        if file_path and line_num:
+            source_desc = f"{file_path}:{line_num}"
+
+        print_info(
+            "Detected a PowerShell SecureString secret in share results. "
+            "Attempting offline recovery with the inline decryption key."
+        )
+        loot_dir = os.path.dirname(str(file_path)) if file_path else None
+        unanchored = process_securestring_text(
+            shell,
+            combined_text,
+            domain,
+            source_desc,
+            source_hosts=source_hosts,
+            source_shares=source_shares,
+            auth_username=auth_username,
+            provenance_origin=provenance_origin,
+            file_path=str(file_path) if file_path else None,
+            loot_dir=loot_dir,
+        )
+        # Re-inject unanchored recovered plaintexts as spray candidates, replacing
+        # the useless encrypted blob. Anchored secrets were already stored.
+        for plaintext in unanchored:
+            filtered.append(
+                (rule_name, (plaintext, ml_prob, context_line, line_num, file_path))
+            )
+        # The original encrypted blob is never a usable spray secret; drop it.
+
+    return filtered
+
+
 def filter_cpassword_credentials(
     shell: Any,
     credentials_list: list[tuple],
@@ -4029,6 +4423,7 @@ def filter_cpassword_credentials(
     source_hosts: list[str] | None = None,
     source_shares: list[str] | None = None,
     auth_username: str | None = None,
+    provenance_origin: str = "share_spidering",
 ) -> list[tuple]:
     """Remove cpassword entries from credential candidates and process them separately.
 
@@ -4053,11 +4448,18 @@ def filter_cpassword_credentials(
         context_text = context_line or read_line_from_file(file_path, line_num)
         snippet = context_text or ""
 
-        is_cpassword_candidate = False
-        if snippet and "cpassword" in snippet.lower():
-            is_cpassword_candidate = True
-        elif looks_like_cpassword_value(value):
-            is_cpassword_candidate = True
+        # A genuine GPP cpassword is authoritatively identified by a literal
+        # ``cpassword="..."`` attribute in the snippet. The bare base64-shape
+        # heuristic is far too loose (it also matches a PowerShell
+        # ``ConvertFrom-SecureString`` blob, config tokens, hashes), so it may
+        # only classify as GPP when the source file is one of the known GPP
+        # Preferences XML files under SYSVOL. Anything else stays a normal
+        # credential candidate and is captured by ``smb_share_secrets`` instead.
+        has_literal_cpassword = bool(snippet) and "cpassword" in snippet.lower()
+        is_cpassword_candidate = has_literal_cpassword or (
+            looks_like_cpassword_value(value)
+            and _is_gpp_preferences_xml_path(file_path)
+        )
 
         if is_cpassword_candidate:
             source_desc = None
@@ -4066,9 +4468,15 @@ def filter_cpassword_credentials(
                 if line_num:
                     source_desc = f"{file_path}:{line_num}"
 
-            snippet_for_processing = snippet if "cpassword" in snippet.lower() else None
-            if not snippet_for_processing:
+            # Only wrap the bare value into a synthetic ``cpassword="..."`` snippet
+            # when it came from a real GPP Preferences XML (the guard above). Never
+            # fabricate cpassword context for a value that lacks GPP provenance.
+            snippet_for_processing = snippet if has_literal_cpassword else None
+            if not snippet_for_processing and _is_gpp_preferences_xml_path(file_path):
                 snippet_for_processing = f'cpassword="{value}"'
+            if not snippet_for_processing:
+                filtered_credentials.append(cred_tuple)
+                continue
 
             print_info(
                 "Detected potential Group Policy cpassword in share results. "
@@ -4082,6 +4490,7 @@ def filter_cpassword_credentials(
                 source_hosts=source_hosts,
                 source_shares=source_shares,
                 auth_username=auth_username,
+                provenance_origin=provenance_origin,
             )
             if not processed:
                 print_warning(
@@ -4842,6 +5251,7 @@ def save_aggregated_credential_review_reports(
             saved_files[cred_type] = file_path
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Error saving local review report for {cred_type} credentials: {exc}"
             )
@@ -4910,6 +5320,7 @@ def save_aggregated_credential_review_indexes(
             saved_files[cred_type] = file_path
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning(
                 f"Error saving local review index for {cred_type} credentials: {exc}"
             )
@@ -5018,6 +5429,7 @@ def save_credentials_to_files(
             saved_files[cred_type] = file_path
         except Exception as e:
             telemetry.capture_exception(e)
+            print_exception(exception=e)
             print_warning(f"Error saving {cred_type} credentials to file: {e}")
 
     return saved_files
@@ -5298,6 +5710,7 @@ def handle_found_credentials(
             prefix="[smb-share-secrets]",
         ):
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     if saved_files:
         print_success("Credentials saved to smb/spidering/ directory:")
@@ -5326,6 +5739,21 @@ def handle_found_credentials(
             credential_entries.extend((cred_type, cred_tuple) for cred_tuple in creds_list)
 
     deduplicated_entries = deduplicate_credential_entries_for_spraying(credential_entries)
+
+    # Recover PowerShell key-encrypted SecureString secrets before spraying: an
+    # anchored secret is stored and chained (fires the PasswordInShare edge); an
+    # unanchored recovered plaintext replaces its useless encrypted blob so it
+    # flows to spray-validation. Runs before the cpassword filter and before the
+    # entries/values re-sync below so re-injected plaintexts stay sprayable.
+    deduplicated_entries = filter_securestring_credential_entries(
+        shell,
+        deduplicated_entries,
+        domain,
+        source_hosts=source_hosts,
+        source_shares=source_shares,
+        auth_username=auth_username,
+        provenance_origin=provenance_origin,
+    )
     deduplicated_credentials = [cred_tuple for _, cred_tuple in deduplicated_entries]
 
     # Inform user if duplicates were removed
@@ -5344,6 +5772,7 @@ def handle_found_credentials(
         source_hosts=source_hosts,
         source_shares=source_shares,
         auth_username=auth_username,
+        provenance_origin=provenance_origin,
     )
 
     retained_values = {str(item[0] or "").strip() for item in deduplicated_credentials}
@@ -5408,6 +5837,7 @@ def _apply_credential_metadata(
     domain: str,
     user: str,
     metadata: "CredentialMetadata | None",
+    secret: str | None = None,
 ) -> None:
     """Apply :class:`CredentialMetadata` via the privilege_role helpers.
 
@@ -5421,6 +5851,16 @@ def _apply_credential_metadata(
     * ``aes256_key`` / ``aes128_key`` / ``kerberos_keys`` — additional
       Kerberos key material captured during DCSync.
 
+    ``secret_kind`` inference — the SSOT for it. Most OFFENSIVE add paths
+    (DCSync / ESC9 / shadow-credentials) call ``add_credential`` with NO
+    ``metadata`` at all, so their credentials used to persist
+    ``secret_kind: null``. When the resulting metadata carries no explicit
+    ``secret_kind`` (either ``metadata is None`` or ``metadata.secret_kind is
+    None``) but the raw ``secret`` is available, infer it here via
+    :func:`_infer_secret_kind` — one place, so no offensive call-site has to
+    remember to stamp it and the ``/goal`` ``min_secret_kind`` gate reads a
+    correct ``nt_hash``/``password`` classification.
+
     Exception-safe by design — every helper call is wrapped in its own
     try/except so a failing tag does not lose the underlying credential
     persist.
@@ -5430,25 +5870,39 @@ def _apply_credential_metadata(
         set_credential_kerberos_material,
         set_credential_secret_kind,
     )
+    from adscan_internal.services.credentials.privilege_role import (
+        _infer_secret_kind,
+    )
 
-    if metadata is None:
-        return
-    if not isinstance(metadata, _CredentialMetadata):
-        # Defensive: reject malformed payloads silently (do not crash the
-        # add_credential flow on a bad caller).
-        return
+    # Defensive: reject malformed (non-None, wrong-type) payloads silently —
+    # but still fall through to secret_kind inference below so a bad metadata
+    # object never suppresses the inferred kind.
+    if metadata is not None and not isinstance(metadata, _CredentialMetadata):
+        metadata = None
 
     # --- secret_kind --------------------------------------------------------
+    # Resolve the kind to persist: an explicit metadata.secret_kind always wins;
+    # otherwise infer from the raw secret so offensive add paths (no metadata)
+    # still get a correct classification instead of a null.
+    resolved_secret_kind = (
+        metadata.secret_kind
+        if metadata is not None and metadata.secret_kind is not None
+        else (_infer_secret_kind(secret) if secret else None)
+    )
     try:
-        if metadata.secret_kind is not None:
+        if resolved_secret_kind is not None:
             set_credential_secret_kind(
                 shell,
                 domain=domain,
                 username=user,
-                secret_kind=metadata.secret_kind,
+                secret_kind=resolved_secret_kind,
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    if metadata is None:
+        return
 
     # --- kerberos material --------------------------------------------------
     try:
@@ -5467,3 +5921,4 @@ def _apply_credential_metadata(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)

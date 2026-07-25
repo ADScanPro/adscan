@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from adscan_internal import print_info_debug, telemetry
 from adscan_internal.workspaces import domain_subpath, read_json_file
+from adscan_core.rich_output import print_exception
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,70 @@ class AttackPathSnapshotMetrics:
         }
 
 
+@dataclass(frozen=True)
+class AttackPathVerdict:
+    """End-of-scan verdict selected purely from persisted snapshot metrics.
+
+    Pure decision object — no I/O, no session state. ``kind`` is one of:
+
+    - ``"no_paths"`` — no attack paths persisted (``total == 0``). The honest
+      "nothing found" message; the caller still splits auth vs unauth wording.
+    - ``"identified_unvalidated"`` — paths were persisted but none were proven
+      end-to-end (``total > 0`` and ``exploited == 0``). MUST NOT claim the
+      domain is "hardened": theoretical/blocked/unsupported paths are exposure,
+      not evidence of a defence.
+    - ``"exploited"`` — at least one exploited path (``exploited > 0``). The
+      victory / PRO-CTA branch.
+    """
+
+    kind: str
+    scan_mode: str | None
+    total: int
+    exploited: int
+    unvalidated: int
+
+
+def select_attack_path_verdict(
+    metrics: AttackPathSnapshotMetrics, *, scan_mode: str | None
+) -> AttackPathVerdict:
+    """Select the end-of-scan attack-path verdict from snapshot metrics.
+
+    This is the single source of truth for which closing message the scan emits.
+    It reads the persisted snapshot (via :class:`AttackPathSnapshotMetrics`),
+    never the legacy in-memory session counter — that counter is never
+    incremented, so keying the verdict on it falsely reports every authenticated
+    scan as "hardened" even when exploited paths exist.
+
+    Args:
+        metrics: Canonical snapshot metrics for the scanned domain(s).
+        scan_mode: The scan mode ("auth" / "unauth" / None). Only used to let the
+            caller pick auth-vs-unauth wording for the ``no_paths`` verdict.
+
+    Returns:
+        An :class:`AttackPathVerdict` describing which branch to render and the
+        real counts to render it with.
+    """
+    total = max(0, int(metrics.total))
+    exploited = max(0, int(metrics.exploited))
+    unvalidated = max(0, total - exploited)
+    normalized_mode = (str(scan_mode or "").strip().lower()) or None
+
+    if total <= 0:
+        kind = "no_paths"
+    elif exploited <= 0:
+        kind = "identified_unvalidated"
+    else:
+        kind = "exploited"
+
+    return AttackPathVerdict(
+        kind=kind,
+        scan_mode=normalized_mode,
+        total=total,
+        exploited=exploited,
+        unvalidated=unvalidated,
+    )
+
+
 def count_workspace_credentials(shell: object) -> int:
     """Return compromised credentials stored across all loaded domains.
 
@@ -60,6 +125,7 @@ def count_workspace_credentials(shell: object) -> int:
         return max(0, total)
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return 0
 
 
@@ -122,6 +188,7 @@ def get_attack_path_snapshot_metrics(
         )
     except Exception as exc:  # pragma: no cover - best effort
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[summary] attack-path snapshot breakdown unavailable: {exc}")
         return AttackPathSnapshotMetrics()
 

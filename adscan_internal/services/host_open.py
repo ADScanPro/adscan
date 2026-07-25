@@ -32,6 +32,7 @@ from typing import Final
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 __all__ = ("open_workspace_file", "display_host_path", "prompt_and_open")
 
@@ -74,6 +75,7 @@ def _request_open_via_host_helper(file_path: Path) -> bool:
         )
     except Exception as exc:  # noqa: BLE001 — import is optional from caller's POV
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[host_open] Cannot import host helper client: {exc}")
         return False
 
@@ -86,6 +88,7 @@ def _request_open_via_host_helper(file_path: Path) -> bool:
         )
     except Exception as exc:  # noqa: BLE001 — opener is non-critical
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[host_open] Host helper request raised: {exc}")
         return False
 
@@ -123,6 +126,7 @@ def _try_local_opener(file_path: Path) -> bool:
             return True
     except Exception as exc:  # noqa: BLE001 — opener is non-critical
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[host_open] Local opener failed: {exc}")
     return False
 

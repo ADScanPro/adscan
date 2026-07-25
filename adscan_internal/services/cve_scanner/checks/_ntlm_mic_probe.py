@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 
 
 # Module-level lock so concurrent probes against different hosts do not
@@ -156,6 +157,7 @@ def run_tampered_ntlm_smb_login(
                 notes.append(f"SessionError: {exc}")
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 exc_str = str(exc).lower()
                 # Detect NTLM disabled at negotiate/challenge level.
                 # impacket raises generic Exception (not SessionError) when

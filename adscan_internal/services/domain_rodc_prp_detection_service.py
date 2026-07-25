@@ -30,6 +30,7 @@ from adscan_internal.services.ldap_transport_service import (
     SD_FLAGS_DACL_CONTROL,
     execute_with_ldap_fallback,
 )
+from adscan_core.rich_output import print_exception
 
 
 _ADS_RIGHT_DS_WRITE_PROP = 0x20
@@ -114,6 +115,7 @@ class DomainRodcPrpDetectionService(BaseService):
             return report
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_warning_debug(
                 f"RODC PRP detection report generation failed: {type(exc).__name__}: {exc}"
             )
@@ -153,6 +155,7 @@ class DomainRodcPrpDetectionService(BaseService):
             return str(UUID(bytes_le=raw_guid)).lower()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             print_info_debug(
                 f"[rodc-prp] Failed to resolve schema GUID for {attribute_name}: "
                 f"{type(exc).__name__}: {exc}"

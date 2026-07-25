@@ -647,6 +647,7 @@ def extract_zip(shell: Any, *, zip_file: object, domain: str) -> None:
                     is_encrypted = True
             except subprocess.TimeoutExpired as exc:
                 telemetry.capture_exception(exc)
+                print_exception(exception=exc)
                 is_encrypted = True
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
@@ -681,6 +682,7 @@ def extract_zip(shell: Any, *, zip_file: object, domain: str) -> None:
                 shell.process_found_file(file_path, domain, "ext")
     except subprocess.TimeoutExpired as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error("Timeout reached while processing the ZIP.")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_exception
 
 
 def classify_secret_kind(secret: str) -> str:
@@ -139,6 +140,7 @@ def delete_domain_account_via_ldap(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[native-account-cleanup] LDAP delete of {username} failed: {exc}"
         )

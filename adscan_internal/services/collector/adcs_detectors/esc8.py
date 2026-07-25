@@ -3,6 +3,13 @@
 Probe-driven: needs ``web_enrollment_enabled`` from a CA HTTP probe. Without
 probe data no edges are emitted.
 
+EPA gating lives in the probe verdict, not here: when the CA offers web
+enrollment ONLY over HTTPS and that endpoint enforces EPA (channel binding),
+the probe resolves ``web_enrollment_enabled=False`` (the NTLM relay is
+defeated), so no ESC8 edge is emitted — the hardened, recommended CA state has
+no residual weakness to report. HTTP web enrollment is EPA-agnostic and keeps
+``web_enrollment_enabled=True``.
+
 The edge source is the Domain Users group SID (``{domain_sid}-513``) passed by
 the collector, so the edge resolves to a real graph node and surfaces correctly
 in tactical findings.  Callers must pass ``domain_users_sid`` whenever the

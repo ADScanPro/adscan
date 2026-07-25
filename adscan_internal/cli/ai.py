@@ -41,6 +41,7 @@ from adscan_internal.services.llm.external_cli_profiles import (
     normalize_external_cli_auth_check_command,
 )
 from adscan_core.paths import get_state_dir
+from adscan_core.rich_output import print_exception
 
 SETUP_PROVIDER_CHOICES: tuple[AIProvider, ...] = (
     AIProvider.OPENAI,
@@ -878,6 +879,7 @@ def _record_ai_usage_event(metadata: dict[str, Any]) -> None:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _load_ai_usage_events() -> list[dict[str, Any]]:
@@ -900,6 +902,7 @@ def _load_ai_usage_events() -> list[dict[str, Any]]:
                     events.append(payload)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return events
 
 
@@ -978,6 +981,7 @@ def _load_ai_usage_budget() -> dict[str, float]:
         }
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return default_budget
 
 
@@ -1043,6 +1047,7 @@ def _build_runtime_limit_rows(shell: Any) -> tuple[list[tuple[str, str, str, str
         runtime = service.get_runtime_snapshot()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return [], None
     if not isinstance(runtime, dict):
         return [], None
@@ -1270,6 +1275,7 @@ def _run_external_cli_command(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error_debug(f"External CLI command failed: {type(exc).__name__}: {exc}")
         return None
 

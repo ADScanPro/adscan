@@ -23,6 +23,7 @@ from adscan_core.rich_output import (
     print_info_verbose,
     print_warning,
 )
+from adscan_core.rich_output import print_exception
 
 # MS-ICPR disposition code for "certificate issued"
 _CR_DISP_ISSUED = 3
@@ -741,6 +742,11 @@ class CertRequestResult:
         request_id: Request ID assigned by the CA.
         disposition: Raw disposition code returned by MS-ICPR.
         error: Error message if ``success`` is False.
+        private_key_pem: PEM-encoded RSA private key generated locally for this
+            request. Surfaced on EVERY outcome (issued, denied, or pending) so a
+            caller that later retrieves the issued cert by ``request_id`` can
+            rebuild a usable PFX (cert + key). Without it the retrieved PFX would
+            carry the cert only, and PKINIT/pass-the-cert could never sign.
     """
 
     success: bool
@@ -752,6 +758,7 @@ class CertRequestResult:
     request_id: Optional[int] = None
     disposition: Optional[int] = None
     error: Optional[str] = None
+    private_key_pem: Optional[bytes] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1173,7 +1180,9 @@ async def _do_request_certificate(
     from cryptography import x509 as cx509
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives.serialization import (
+        Encoding,
         NoEncryption,
+        PrivateFormat,
         pkcs12,
     )
     from cryptography.x509.oid import ExtensionOID
@@ -1182,6 +1191,14 @@ async def _do_request_certificate(
 
     print_info_verbose(f"  ▸ Generating RSA-{config.key_size} private key...")
     key = rsa.generate_private_key(public_exponent=0x10001, key_size=config.key_size)
+    # Serialize the private key up front so it can be carried on the result
+    # regardless of disposition. When the CA denies/pends the request (ESC7
+    # SubCA: the policy module denies, then the officer force-issues it via a
+    # separate ManageCertificates op), the retrieve path rebuilds the PFX from
+    # this key — otherwise the issued cert would have no signing key.
+    key_pem = key.private_bytes(
+        Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+    )
 
     # CSR construction
     csr_der = _build_csr(config, key)
@@ -1238,6 +1255,7 @@ async def _do_request_certificate(
             request_id=request_id,
             disposition=disposition,
             error=msg,
+            private_key_pem=key_pem,
         )
 
     # Parse issued cert
@@ -1289,6 +1307,7 @@ async def _do_request_certificate(
         cert_serial=cert_serial,
         request_id=request_id,
         disposition=disposition,
+        private_key_pem=key_pem,
     )
 
 
@@ -1309,6 +1328,7 @@ async def request_certificate_native(
         return await _do_request_certificate(config, output_dir)
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # Premium failure rendering — classify the exception chain to
         # distinguish lab/network issues (the dominant failure mode for
         # ADCS enrollment) from real ADscan bugs, then render an
@@ -1332,7 +1352,10 @@ async def request_certificate_native(
 
 
 async def _do_retrieve_certificate(
-    config: CertRequestConfig, output_dir: Path, request_id: int
+    config: CertRequestConfig,
+    output_dir: Path,
+    request_id: int,
+    private_key_pem: Optional[bytes] = None,
 ) -> CertRequestResult:
     """Fetch an issued cert by request ID via ``ICPRRPC.retrieve_certificate``.
 
@@ -1340,10 +1363,17 @@ async def _do_retrieve_certificate(
     template) — the caller submits, captures the request_id, and re-runs this
     once the request is approved.  No CSR is sent; aiosmb passes an empty
     CSR and forwards the request_id via ``pdwRequestId``.
+
+    Args:
+        private_key_pem: PEM-encoded RSA private key from the ORIGINAL request
+            (``CertRequestResult.private_key_pem``). When supplied, the retrieved
+            cert is packaged with this key into a usable PFX; without it the PFX
+            carries the cert only (no key) and cannot sign a PKINIT AS-REQ.
     """
     from cryptography import x509 as cx509
     from cryptography.hazmat.primitives.serialization import (
         NoEncryption,
+        load_pem_private_key,
         pkcs12,
     )
 
@@ -1427,12 +1457,18 @@ async def _do_retrieve_certificate(
     output_dir.mkdir(parents=True, exist_ok=True)
     pfx_name = f"{config.username}_retrieved_{request_id}.pfx"
     pfx_path = output_dir / pfx_name
-    # The original private key is gone — we only have the issued cert.  Persist
-    # it in a PFX container without a key so callers can still load/verify it
-    # alongside any side-channel key they kept locally.
+    # Rebuild the PFX with the private key from the original request when the
+    # caller carried it forward. This is the whole point of ESC7/pending
+    # retrieval: the issued cert is useless for PKINIT without its key. When no
+    # key is supplied (e.g. a cert-only inspection), fall back to a keyless PFX.
+    retrieved_key = (
+        load_pem_private_key(private_key_pem, password=None)
+        if private_key_pem
+        else None
+    )
     pfx_bytes = pkcs12.serialize_key_and_certificates(
         name=config.username.encode(),
-        key=None,
+        key=retrieved_key,
         cert=cert,
         cas=None,
         encryption_algorithm=NoEncryption(),
@@ -1447,24 +1483,33 @@ async def _do_retrieve_certificate(
         cert_serial=cert_serial,
         request_id=request_id,
         disposition=disposition,
+        private_key_pem=private_key_pem,
     )
 
 
 async def retrieve_certificate_native(
-    config: CertRequestConfig, output_dir: Path, request_id: int
+    config: CertRequestConfig,
+    output_dir: Path,
+    request_id: int,
+    private_key_pem: Optional[bytes] = None,
 ) -> CertRequestResult:
     """Retrieve a previously-submitted ADCS certificate by request ID.
 
     Args:
         config: Same enrollment parameters as :func:`request_certificate_native`
             (auth + CA target).  Template/upn/sid are ignored on retrieval.
-        output_dir: Directory where the cert-only PFX is written on success.
+        output_dir: Directory where the PFX is written on success.
         request_id: The request ID returned by the original submission.
+        private_key_pem: PEM-encoded RSA private key from the original request,
+            so the retrieved cert is packaged into a signing-capable PFX.
     """
     try:
-        return await _do_retrieve_certificate(config, output_dir, request_id)
+        return await _do_retrieve_certificate(
+            config, output_dir, request_id, private_key_pem=private_key_pem
+        )
     except Exception as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         # Same premium classification as the submit path — see
         # ``request_certificate_native`` above for the rationale.  The
         # retrieve flow shares the same RPC transport and therefore the

@@ -94,11 +94,14 @@ def _default_workspace_name(workspaces_dir: str) -> str:
 
 
 def _prompt_for_new_workspace_name(shell: WorkspaceShell) -> str:
-    """Prompt for a new workspace name with a pre-filled, editable default.
+    """Prompt for a new workspace name with an empty, editable input.
 
     Shows the one-time "what is a workspace" explainer for a brand-new operator
-    (no workspaces yet), then renders a name prompt pre-filled with
-    :func:`_default_workspace_name`. Pressing Enter accepts the default; a
+    (no workspaces yet), then renders a name prompt suggesting
+    :func:`_default_workspace_name` as a hint. The operator can start typing
+    their own name immediately — the suggested default is never inserted as
+    pre-existing text they would have to delete first (``prefill_default=False``).
+    Pressing Enter on an empty input still accepts the suggested default; a
     non-interactive run auto-resolves to it without blocking. Returns the
     stripped name, or an empty string when the operator cancels.
     """
@@ -114,6 +117,7 @@ def _prompt_for_new_workspace_name(shell: WorkspaceShell) -> str:
         "Enter name for a new workspace",
         default=default_name,
         shell=shell,
+        prefill_default=False,
     )
     return (answer or "").strip()
 
@@ -201,10 +205,12 @@ def workspace_list(shell: WorkspaceShell) -> None:
         workspaces = list_workspaces(shell.workspaces_dir)
     except FileNotFoundError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Workspaces directory not found at: {shell.workspaces_dir}")
         return
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"Error accessing workspaces directory {shell.workspaces_dir}: {exc}"
         )
@@ -352,10 +358,12 @@ def workspace_select(shell: WorkspaceShell) -> None:
         workspaces = list_workspaces(shell.workspaces_dir)
     except FileNotFoundError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(f"Workspaces directory not found: {shell.workspaces_dir}")
         return
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"Error accessing workspaces directory {shell.workspaces_dir}: {exc}"
         )
@@ -509,6 +517,7 @@ def workspace_show(shell: WorkspaceShell) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         content.append(
             f"\nCould not list files in workspace: {exc}\n", style="italic red"
         )

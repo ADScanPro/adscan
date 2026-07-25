@@ -33,6 +33,7 @@ from adscan_internal.services.collector.models import is_collectable_computer_ho
 from adscan_internal.services.reachability.massdns_report import (
     _write_massdns_resolution_report,
 )
+from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:
     from adscan_internal.services.collector.models import CollectionResult
@@ -263,4 +264,5 @@ def _persist_resolution_report(
             )
     except OSError as exc:
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(f"[dns-resolver] report persistence error: {exc}")

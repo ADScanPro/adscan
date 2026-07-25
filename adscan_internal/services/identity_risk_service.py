@@ -30,6 +30,7 @@ from adscan_internal.services.privileged_group_classifier import (
     sid_rid,
 )
 from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
+from adscan_core.rich_output import print_exception
 
 IDENTITY_RISK_SNAPSHOT_FILENAME = "identity_risk_snapshot.json"
 CONTROL_EXPOSURE_IDENTITIES_FILENAME = "control_exposure_identities.txt"
@@ -67,6 +68,7 @@ def _workspace_cwd(shell: object) -> str:
             return str(getter())
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_exception(exception=exc)
     return str(getattr(shell, "current_workspace_dir", os.getcwd()) or os.getcwd())
 
 
@@ -349,6 +351,7 @@ def load_or_build_identity_risk_snapshot(shell: object, domain: str) -> dict[str
         return build_identity_risk_snapshot(shell, domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         return {
             "domain": domain,
             "version": 1,

@@ -433,12 +433,45 @@ class LiveSession:
         return None
 
     def _mirror_to_telemetry(self) -> None:
-        """Mirror the final renderable + optional summary to telemetry.
+        """Mirror the final Live state into telemetry, without double-mirroring.
 
-        Best-effort: any failure is swallowed (telemetry recording is
-        never allowed to break a user-visible flow). Skipped silently
-        when the telemetry console has not been initialised.
+        Live's internal per-frame rendering bypasses ``Console.print()``
+        entirely (see the module docstring), so nothing about the live
+        dashboard reaches the recording on its own — someone has to stamp
+        the final state into telemetry explicitly.
+
+        When a ``summary`` callback is configured, ``__exit__`` already ran
+        it against the shared console (``self._console``, a
+        ``_TeeConsole``) a few lines above this call. That console
+        auto-mirrors every ``.print()`` to telemetry (CLAUDE.md § "Telemetry
+        recording invariant — TeeConsole"), so the summary's
+        ``console.print(self._render())`` (the canonical pattern every
+        current widget follows) has ALREADY landed the final panel in the
+        recording. Re-printing it here — once as a raw
+        ``telemetry_console.print(self._renderable)`` and again by
+        re-invoking ``summary`` a second time directly against
+        ``telemetry_console`` — used to triple-mirror the identical panel
+        into every session recording for every widget using the canonical
+        alt-screen + summary pattern (posture probe, trust enum, CVE
+        scanner, credential dump streams, …). This is exactly the
+        "``console.print(x); telemetry_console.print(x)`` double-prints"
+        anti-pattern CLAUDE.md warns about, just hidden inside this
+        abstraction instead of at a raw call site.
+
+        So: when the summary already mirrored, this method is a no-op. It
+        only does the manual dump for widgets that pass no ``summary``
+        callback at all (e.g. the unauth-probe inline board) — those have
+        no other path to telemetry, so the raw dump is still required.
+
+        Best-effort throughout: any failure is swallowed (telemetry
+        recording is never allowed to break a user-visible flow). Skipped
+        silently when the telemetry console has not been initialised.
         """
+        if self._summary is not None and self._config.show_summary_on_exit:
+            # The summary callback already ran against the shared
+            # _TeeConsole in __exit__ and auto-mirrored to telemetry.
+            # Nothing left to do — see the docstring above.
+            return
         telemetry_console = _resolve_telemetry_console()
         if telemetry_console is None:
             return
@@ -451,18 +484,12 @@ class LiveSession:
             from adscan_core.output._log import print_info_debug as _dbg
             _dbg(
                 "[live_session] mirror_to_telemetry: dumping final "
-                "renderable + summary into telemetry buffer"
+                "renderable into telemetry buffer (no summary callback)"
             )
         except Exception:  # noqa: BLE001
             pass
         with suppress(Exception):
             telemetry_console.print(self._renderable)
-        if (
-            self._summary is not None
-            and self._config.show_summary_on_exit
-        ):
-            with suppress(Exception):
-                self._summary(telemetry_console)
 
     def _stop_deferred_capture(self, *, retain: bool) -> None:
         """Pop the deferred buffer off the module stack (stops capture).
