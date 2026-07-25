@@ -1,0 +1,64 @@
+name: Release notes from CHANGELOG
+
+# When a release is PUBLISHED from the GitHub UI (which shows GitHub's default
+# commit-diff notes), replace its body with that version's curated section from
+# this repo's own CHANGELOG.md. The founder's UI flow is unchanged; this just
+# guarantees the body is always the curated changelog, never the commit diff.
+#
+# Trigger is `published` ONLY. Our own `gh release edit` below emits a
+# `release: edited` event, which we deliberately do NOT listen to — so no loop.
+# Self-contained: the extractor is inline, so it needs nothing from the private
+# repo's scripts/ (which are not all mirrored here).
+on:
+  release:
+    types: [published]
+
+# A repo editing its OWN releases uses the built-in GITHUB_TOKEN — no PAT/secret.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-notes-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  set-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract this version's CHANGELOG section
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          python3 - "$VERSION" > release_notes.md <<'PY'
+          import re, sys, pathlib
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          ver = re.escape(version)
+          m = re.search(
+              r"^## \[" + ver + r"\][^\n]*\n(.*?)(?=^## \[|^\[Unreleased\]:|\Z)",
+              text, re.S | re.M,
+          )
+          body = m.group(1).strip("\n") if m else ""
+          out, blocks = [], re.split(r"(?m)^(### .+)$", body)
+          it = iter(blocks[1:])
+          for header, content in zip(it, it):
+              if content.strip():
+                  out.append(header.strip() + "\n" + content.strip("\n"))
+          result = "\n\n".join(out).strip()
+          if not result:
+              sys.stderr.write(f"No CHANGELOG section for {version}; leaving body unchanged.\n")
+              sys.exit(1)
+          sys.stdout.write(result)
+          PY
+          echo "Extracted $(wc -l < release_notes.md) lines for ${VERSION}."
+
+      - name: Overwrite the release body with the curated notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release edit "$TAG" --notes-file release_notes.md
