@@ -88,7 +88,7 @@ ADscan is not a replacement for every tool in every scenario. It is the fastest 
 
 ## Kerberoasting, ADCS and AD Attack Coverage
 
-ADscan covers 104 Active Directory attack techniques across the kill chain:
+ADscan covers 104 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
 
 <table>
 <tr>
