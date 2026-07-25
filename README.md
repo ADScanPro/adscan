@@ -6,6 +6,8 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/adscan.svg)](https://pypi.org/project/adscan/)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/adscan)
+[![GitHub stars](https://img.shields.io/github/stars/ADScanPro/adscan?logo=github)](https://github.com/ADscanPro/adscan/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/ADScanPro/adscan?logo=github)](https://github.com/ADscanPro/adscan/network/members)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
 [![Discord](https://img.shields.io/discord/1355089867096199300?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.com/invite/fXBR3P8H74)
@@ -41,7 +43,7 @@ ADscan is a free Linux CLI for pentesters, red teamers, and security consultants
 
 [![asciicast](https://asciinema.org/a/734180.svg)](https://asciinema.org/a/734180?autoplay=1)
 
-_Auto-pwns **HTB Forest** in ~3 minutes_
+_Real run, no cuts: ADscan takes **HTB Forest** from zero access to Domain Admin in ~3 minutes, unattended._
 
 ---
 
