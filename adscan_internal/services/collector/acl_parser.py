@@ -158,6 +158,67 @@ _RELATION_VALID_TARGET_KINDS: dict[str, frozenset[str]] = {
 }
 
 
+# LDAP result codes that are a DEFINITIVE answer from the directory: the object
+# or attribute genuinely is not there. They are the exact opposite of a transport
+# failure and must be cached as a negative, not retried once per ACL-bearing
+# object. badldap surfaces them as an ``LDAPSearchException`` (raised, not
+# returned), so a definitive result arrives through the same ``except`` as a
+# connection reset — hence this classifier.
+#
+# ``noSuchObject``            (32) — the search base does not exist.
+# ``undefinedAttributeType``  (17) — the attribute is not in the schema.
+# ``noSuchAttribute``         (16) — the requested attribute is absent.
+_DEFINITIVE_LDAP_ABSENCE_RESULTS: frozenset[str] = frozenset(
+    {"noSuchObject", "undefinedAttributeType", "noSuchAttribute"}
+)
+_DEFINITIVE_LDAP_ABSENCE_CODES: dict[int, str] = {
+    16: "noSuchAttribute",
+    17: "undefinedAttributeType",
+    32: "noSuchObject",
+}
+# Windows maps the same condition into the diagnostic message, which badldap
+# decodes into the WINERROR name. Present when the DC answers a search over a
+# base that does not exist.
+_DEFINITIVE_LDAP_ABSENCE_DIAGNOSTICS: tuple[str, ...] = (
+    "ERROR_DS_OBJ_NOT_FOUND",
+    "ERROR_DS_NO_SUCH_OBJECT",
+)
+
+
+def classify_ldap_absence(exc: BaseException) -> str | None:
+    """Return the LDAP result name when ``exc`` is a DEFINITIVE absence.
+
+    Returns ``None`` for anything else — a connection reset, a timeout, an
+    LDAP signing/CBT renegotiation, an unclassifiable error — so the caller
+    keeps treating those as transient and retry-able.
+
+    Duck-typed on purpose: badldap's ``LDAPServerException`` carries
+    ``resultname``/``resultcode``, but the classifier must not depend on that
+    import (or on the exception surviving a vendor rebase unchanged), so it
+    falls back to the numeric code and finally to the rendered message.
+    """
+    name = getattr(exc, "resultname", None)
+    if isinstance(name, str) and name in _DEFINITIVE_LDAP_ABSENCE_RESULTS:
+        return name
+
+    code = getattr(exc, "resultcode", None)
+    try:
+        mapped = _DEFINITIVE_LDAP_ABSENCE_CODES.get(int(code))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        mapped = None
+    if mapped:
+        return mapped
+
+    text = str(exc or "")
+    for marker in _DEFINITIVE_LDAP_ABSENCE_DIAGNOSTICS:
+        if marker in text:
+            return "noSuchObject"
+    for result_name in _DEFINITIVE_LDAP_ABSENCE_RESULTS:
+        if result_name in text:
+            return result_name
+    return None
+
+
 def _relation_valid_for_target(relation: str, target_kind: str) -> bool:
     """Return True when ``relation`` makes operational sense on ``target_kind``.
 
@@ -178,6 +239,11 @@ class ACLParser:
         self.domain = domain
         self._connection = connection
         self._guid_cache: dict[str, str | None] = {}
+        # Tri-state, memoized for the whole run: None = not probed yet,
+        # True = the schema base answered, False = the DC definitively says it
+        # is not there, so every live fallback lookup is disabled after ONE
+        # warning instead of failing once per ACL-bearing object.
+        self._schema_base_available: bool | None = None
 
     def parse_sd(
         self,
@@ -399,12 +465,29 @@ class ACLParser:
              the static table.
 
         Negative caching is DEFINITIVE-ONLY (mirrors the posture doctrine
-        "cache observations, never cache absences"): ``None`` is written to the
-        cache ONLY when the schema search succeeded and returned zero matching
-        entries. A missing/empty ``config_dn`` (UNKNOWN) or ANY exception
-        (transient: connection reset, LDAP signing/CBT renegotiation, timeout)
-        returns ``None`` WITHOUT caching, so a later call retries instead of the
-        whole run silently dropping this attribute's scoped ACL edges.
+        "cache observations, never cache absences"), and "definitive" covers
+        BOTH shapes the DC answers in:
+
+        * the search succeeded and returned zero matching entries, and
+        * the search raised with a definitive LDAP result code —
+          ``noSuchObject`` / ``undefinedAttributeType`` / ``noSuchAttribute``
+          (see :func:`classify_ldap_absence`). badldap raises these instead of
+          returning them, so without the classifier a definitive answer looked
+          exactly like a transport failure: no negative caching, plus a
+          telemetry event and a red traceback once per ACL-bearing object. On a
+          forest with no LAPS schema extension that is guaranteed and permanent
+          (152 identical failures in one collection, in the field).
+
+        A missing/empty ``config_dn`` (UNKNOWN) or a genuinely transient
+        exception (connection reset, LDAP signing/CBT renegotiation, timeout)
+        still returns ``None`` WITHOUT caching, so a later call retries instead
+        of the whole run silently dropping this attribute's scoped ACL edges.
+
+        ``noSuchObject`` is treated as a statement about the SEARCH BASE, not
+        about one attribute: it means ``CN=Schema,<config_dn>`` itself is not
+        there, so every remaining live lookup this run would fail identically.
+        The first one disables the fallback for the run (one warning, no extra
+        probe round-trip), which is what turns 152 failed searches into 1.
         """
         if attr_name in self._guid_cache:
             return self._guid_cache[attr_name]
@@ -426,8 +509,15 @@ class ACLParser:
             # call (once config_dn is populated) can retry.
             return None
 
+        if self._schema_base_available is False:
+            # The DC already told us this base does not exist. Every live
+            # lookup would fail identically, so cache the negative and skip the
+            # round-trip entirely.
+            self._guid_cache[attr_name] = None
+            return None
+
+        schema_base = f"CN=Schema,{config_dn}"
         try:
-            schema_base = f"CN=Schema,{config_dn}"
             self._connection.search(
                 search_base=schema_base,
                 search_filter=f"(lDAPDisplayName={attr_name})",
@@ -442,6 +532,27 @@ class ACLParser:
             )
             raw_guid = raw_guid_list[0] if raw_guid_list else None
         except Exception as exc:
+            absence = classify_ldap_absence(exc)
+            if absence:
+                # The DC answered definitively. Cache the negative, stay quiet
+                # (an unextended forest is normal), and never spend telemetry
+                # on it.
+                self._guid_cache[attr_name] = None
+                if absence == "noSuchObject" and self._schema_base_available is None:
+                    self._schema_base_available = False
+                    print_warning_debug(
+                        "acl_parser: the directory schema container is not "
+                        "present at the expected base; attributes that need a "
+                        "live schema lookup (LAPS, RODC reveal groups) are "
+                        "skipped for the rest of this run."
+                    )
+                else:
+                    print_info_debug(
+                        f"acl_parser: {attr_name} is not present in this "
+                        f"forest's schema ({absence}); scoped ACL edges for it "
+                        "are skipped."
+                    )
+                return None
             # Transient failure (connection reset, signing/CBT renegotiation,
             # timeout, ...). Retry-able — return None WITHOUT caching so the
             # whole run is not poisoned for this attribute.
@@ -451,6 +562,10 @@ class ACLParser:
                 f"acl_parser: transient GUID resolution failure for {attr_name}: {exc}"
             )
             return None
+
+        # The base answered, so it exists — record that, and a later stray
+        # ``noSuchObject`` can no longer disable the fallback for the run.
+        self._schema_base_available = True
 
         if not raw_guid:
             # The search DEFINITIVELY succeeded and returned no schemaIDGUID for

@@ -139,6 +139,48 @@ class ShadowCredentialFinding:
     key_count: int  # number of KeyCredentialLink entries present
 
 
+#: Canonical vuln-catalog key the HTTP-SPN relay/coercion surface maps to.
+#: Declared in ``adscan_internal/pro/reporting/vuln_catalog.py`` (full prose)
+#: and the LITE-safe ``adscan_core/reporting/vuln_catalog_meta.py`` slice
+#: (severity/title/mitre). The web CTEM gates finding ingestion on the meta
+#: slice, so this one key reaches both the PDF and the web product.
+HTTP_SPN_RELAY_FINDING_KEY = "http_spn_relay_surface"
+
+
+@dataclass(frozen=True)
+class HttpSpnFinding:
+    """A principal that publishes a Kerberos web service (``HTTP/*`` SPN).
+
+    Derived in the same SPN pass that flags kerberoastable accounts
+    (``persistence._persist_derived_attack_steps``) from the already-collected
+    ``serviceprincipalnames`` — no second SPN walk. An ``HTTP/`` SPN is a
+    relay / forced-authentication surface: it marks a Kerberos-authenticating
+    web endpoint published under the account. Plain JSON-serialisable scalars
+    only, so it flows straight into a technical-report finding's ``details``
+    payload and the web CTEM.
+    """
+
+    object_id: str
+    samaccountname: str
+    kind: str  # "User" | "Computer"
+    account_type: str  # "user" | "computer" | "gmsa"
+    distinguished_name: str
+    http_spns: tuple[str, ...]
+    enabled: bool | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_key": HTTP_SPN_RELAY_FINDING_KEY,
+            "object_id": self.object_id,
+            "samaccountname": self.samaccountname,
+            "kind": self.kind,
+            "account_type": self.account_type,
+            "distinguished_name": self.distinguished_name,
+            "http_spns": list(self.http_spns),
+            "enabled": self.enabled,
+        }
+
+
 @dataclass(frozen=True)
 class AuditFinding:
     """A hygiene or misconfiguration finding for audit-mode workspaces."""
@@ -227,6 +269,20 @@ class CollectionResult:
         default_factory=list
     )
     audit_findings: list[AuditFinding] = field(default_factory=list)
+    # Judged trust-posture weaknesses (TGT delegation enabled / SID filtering
+    # not enforced), derived at the trust collector seam from the already-
+    # decoded trustAttributes. Elements are
+    # ``adscan_internal.services.enumeration.trust_query.TrustPostureIssue``;
+    # typed ``Any`` here to avoid a runtime import of the enumeration layer
+    # into this low-level model module.
+    trust_posture_findings: list[Any] = field(default_factory=list)
+    # Principals publishing a Kerberos web service (``HTTP/*`` SPN) — a
+    # relay / forced-authentication surface derived in the SAME SPN pass that
+    # flags kerberoastable accounts (``persistence._persist_derived_attack_steps``)
+    # from the already-collected ``serviceprincipalnames``. Elements are
+    # :class:`HttpSpnFinding` (defined above); typed ``Any`` here for parity
+    # with the other finding lists.
+    http_spn_findings: list[Any] = field(default_factory=list)
     password_compliance: "PasswordComplianceReport | None" = None
     collection_scope: str = "ctf"
     adcs_elapsed: float = 0.0

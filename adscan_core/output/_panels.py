@@ -5,18 +5,38 @@ from __future__ import annotations
 from typing import Optional, List, Dict, Union
 
 from rich.console import Group, RenderableType
+from rich.errors import MissingStyle
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich.box import Box, ROUNDED
 
-from adscan_core.theme import ADSCAN_PRIMARY
+from adscan_core.theme import ADSCAN_PRIMARY, ADSCAN_THEME
 from adscan_core.output._state import (
     _get_console,
     _get_telemetry_console,
     _mark_operation_details,
 )
+from adscan_core.output._display_paths import translate_paths_for_display
 from adscan_core.output._log import BRAND_COLORS, _handle_spacing
+
+
+def _resolve_border_style(console, border_style):
+    """Return ``border_style`` if this console can render it, else the brand colour.
+
+    Rich resolves a style NAME against the console's theme and raises
+    ``MissingStyle`` when it is absent — at render time, so the exception
+    escapes ``console.print`` and kills the caller's message. Panels are how
+    ADscan delivers warnings the operator needs, so a style miss must degrade
+    to the brand colour, never to a traceback.
+    """
+    if not isinstance(border_style, str):
+        return border_style
+    try:
+        console.get_style(border_style)
+    except Exception:  # noqa: BLE001 — MissingStyle and any future style error
+        return BRAND_COLORS["info"]
+    return border_style
 
 
 def print_instruction(
@@ -34,6 +54,8 @@ def print_instruction(
     """
     console = _get_console()
     _get_telemetry_console()
+
+    message = translate_paths_for_display(message)
 
     # Handle spacing
     spacing_before = _handle_spacing("instruction", panel, spacing)
@@ -142,12 +164,28 @@ def print_panel(
     console = _get_console()
     _get_telemetry_console()
 
+    # Rewrite container paths in user-facing output so the path the user sees
+    # matches what they can ``cat`` or open from their host shell. Panels carry
+    # the money paths (report ready, workspace saved), and their content is
+    # usually a Group of styled Text — which is exactly what a str-only rewrite
+    # would miss.
+    content = translate_paths_for_display(content)
+    title = translate_paths_for_display(title)
+    subtitle = translate_paths_for_display(subtitle)
+
     if title is not None and title_align is None:
         title_align = "center"
 
-    # Use brand color as default border style
+    # Use brand color as default border style. A style NAME (rather than a
+    # colour) only resolves if the console's theme defines it, and Rich raises
+    # MissingStyle at RENDER time — inside console.print, far from this call —
+    # so an unthemed console anywhere upstream would turn the whole panel into
+    # a traceback. Resolve it here, where a miss costs the brand colour instead
+    # of the message.
     if border_style is None:
         border_style = BRAND_COLORS["info"]
+    else:
+        border_style = _resolve_border_style(console, border_style)
 
     # Handle spacing (panels always get spacing by default)
     spacing_before = _handle_spacing("info", True, spacing)
@@ -201,7 +239,15 @@ def print_panel(
             expand=expand,
         )
 
-    console.print(panel)
+    try:
+        console.print(panel)
+    except MissingStyle:
+        # A theme style name inside the CONTENT (e.g. "[warning]⚠[/warning]")
+        # resolves at render time against the console's theme. Retry under the
+        # product theme rather than losing the message: an unthemed console is
+        # the failure mode here, not a bad panel.
+        with console.use_theme(ADSCAN_THEME):
+            console.print(panel)
 
     # Handle spacing after
     if spacing != "none":
@@ -564,6 +610,9 @@ def print_step_status(
     """
     console = _get_console()
     _get_telemetry_console()
+
+    step_name = translate_paths_for_display(step_name)
+    details = translate_paths_for_display(details)
 
     # Status styling
     status_styles = {

@@ -1,0 +1,28 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Foundation — the reset and the base type every ADscan document sits on.
+   Moved verbatim out of the PRO premium template so both tiers share one copy.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+*,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--bg-0); color: var(--text); font-family: var(--font-sans); }
+body {
+  font-size: 9.5pt; line-height: 1.55;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  font-feature-settings: "kern" on, "liga" on, "calt" on, "ss01" on;
+  font-kerning: normal;
+  text-rendering: geometricPrecision;
+}
+
+/* Tabular figures for every numeric surface — keeps stat columns,
+   percentages, CVSS scores and metric cards optically aligned. */
+.ct-stat-v, .ct-meta-v, .mcard-v, .cf-stat-v, .cf-gauge-pct, .cs-score,
+.money-hero-num, .money-hero-denom, .money-kpi-v, .money-sev-total,
+.money-sev-legend-n, .rp-rank, .rp-blast, .ap-step-n, .toc-num,
+.finding-meta-primary, .finding-id, .ap-hop, .cf-card-id, .cf-nc-id,
+.cf-nc-cvss, .cf-cvss-badge, .mono, .mc-id, .mc-count, .kc-id, .kc-count,
+.meta-priority, .meta-base, .vector-string, .ct-foot-r, table.adscan-table td.mono,
+.rp-table td, .rp-mitre,
+.ds-figure-v, .ds-verdict-n, .ds-step-n, .ds-meta-v {
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum" on, "lnum" on;
+}

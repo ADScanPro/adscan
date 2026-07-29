@@ -63,6 +63,12 @@ def _request_cfg(
         # (GOAD: "vagrant up <ca_vm>") when applicable. None when the
         # operator is on a customer engagement / unknown lab.
         lab_provider=getattr(config.shell, "lab_provider", None) if config.shell is not None else None,
+        # Any certificate this request obtains is a durable credential left in
+        # the client's PKI, so the enrollment layer discloses it in the
+        # environment-change ledger as soon as the CA issues it.
+        ledger_shell=config.shell,
+        ledger_domain=config.domain,
+        ledger_technique=f"ADCSESC{config.esc} — certificate enrollment",
         **({} if _key_size is None else {"key_size": int(_key_size)}),
     )
 

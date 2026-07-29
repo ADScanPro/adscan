@@ -11,6 +11,7 @@ from aiosmb.commons.connection.factory import SMBConnectionFactory
 
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.rich_output import mark_sensitive, print_info
+from adscan_internal.services.adcs.esc_cleanup import register_issued_certificate
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
 from adscan_internal.services.adcs_web_enrollment_probe import (
     ADCSWebEnrollmentProbe,
@@ -224,7 +225,7 @@ async def run_esc8(config: EscConfig) -> EscResult:
     )
     result = await _run_adcs_relay_chain(config, listener_host, target)
     return _relay_chain_to_esc_result(
-        result, esc=8,
+        result, config=config, esc=8,
         technique="ESC8",
         fallback_error="ESC8 relay did not issue a certificate",
     )
@@ -262,7 +263,7 @@ async def run_esc11(config: EscConfig) -> EscResult:
     )
     result = await _run_adcs_relay_chain(config, listener_host, target)
     return _relay_chain_to_esc_result(
-        result, esc=11,
+        result, config=config, esc=11,
         technique="ESC11",
         fallback_error="ESC11 relay did not issue a certificate",
     )
@@ -397,6 +398,7 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
 
     return _relay_result_to_esc(
         result,
+        config=config,
         esc=8,
         technique="ESC8-KRB",
         fallback_error="ESC8 Kerberos relay did not issue a certificate",
@@ -517,9 +519,35 @@ class _KrbRelayChainResult:
         return self.relay_result.success
 
 
+def _disclose_issued_certificate(
+    config: EscConfig, relay_item, *, technique: str, pfx_path: str | None
+) -> None:
+    """Record a relay-issued certificate in the environment-change ledger.
+
+    Called the instant the relay returns a certificate, before any further work:
+    the certificate already exists in the client's CA at that point, so the
+    disclosure must survive a scan that is interrupted a second later.
+    """
+    metadata = relay_item.metadata or {}
+    register_issued_certificate(
+        config.shell,
+        domain=config.domain,
+        technique=f"ADCS{technique} — certificate issued through a relayed authentication",
+        principal=relay_item.principal or metadata.get("cert_subject"),
+        serial=metadata.get("cert_serial"),
+        request_id=metadata.get("request_id"),
+        template=metadata.get("template") or config.template,
+        ca_name=config.ca_name,
+        ca_host=config.ca_fqdn or config.ca_host,
+        not_after=metadata.get("cert_not_after"),
+        pfx_path=pfx_path,
+    )
+
+
 def _relay_result_to_esc(
     result: _KrbRelayChainResult,
     *,
+    config: EscConfig,
     esc: int,
     technique: str,
     fallback_error: str,
@@ -529,6 +557,9 @@ def _relay_result_to_esc(
 
     if first_success is not None:
         pfx_path = first_success.artifact_paths[0] if first_success.artifact_paths else None
+        _disclose_issued_certificate(
+            config, first_success, technique=technique, pfx_path=pfx_path
+        )
         if pfx_path:
             print_relay_cert_result(
                 technique=technique,
@@ -537,6 +568,7 @@ def _relay_result_to_esc(
                 cert_serial=first_success.metadata.get("cert_serial"),
                 cert_subject=first_success.metadata.get("cert_subject"),
                 request_id=first_success.metadata.get("request_id"),
+                not_after=first_success.metadata.get("cert_not_after"),
             )
         return EscResult(
             success=True,
@@ -574,7 +606,7 @@ def _infer_ca_samname(config: EscConfig) -> str:
 
 
 def _relay_chain_to_esc_result(
-    result, *, esc: int, technique: str, fallback_error: str
+    result, *, config: EscConfig, esc: int, technique: str, fallback_error: str
 ) -> EscResult:
     relay_results = result.relay_result.results
     first_success = next((item for item in relay_results if item.success), None)
@@ -582,6 +614,9 @@ def _relay_chain_to_esc_result(
     if first_success is not None:
         pfx_path = (
             first_success.artifact_paths[0] if first_success.artifact_paths else None
+        )
+        _disclose_issued_certificate(
+            config, first_success, technique=technique, pfx_path=pfx_path
         )
         if pfx_path:
             print_relay_cert_result(
@@ -591,6 +626,7 @@ def _relay_chain_to_esc_result(
                 cert_serial=first_success.metadata.get("cert_serial"),
                 cert_subject=first_success.metadata.get("cert_subject"),
                 request_id=first_success.metadata.get("request_id"),
+                not_after=first_success.metadata.get("cert_not_after"),
             )
         return EscResult(
             success=True,

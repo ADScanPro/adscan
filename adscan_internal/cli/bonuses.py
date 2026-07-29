@@ -197,8 +197,8 @@ def _load_theme(theme_name: str) -> str:
 
 
 # Cached base64 data-URIs for the ADscan wordmark. The asset lives in the
-# canonical logos home ``adscan_internal/assets/logos/`` (same place
-# ``report_service._find_adscan_logo`` reads, bundled in BOTH the PRO
+# canonical logos home ``adscan_internal/assets/logos/`` (read through the
+# shared ``services.brand_assets`` SSOT, bundled in BOTH the PRO
 # PyInstaller binary and the LITE image via the ``--add-data
 # adscan_internal/assets/logos`` line in build_adscan.sh / adscan.spec):
 #   * ``logo-wordmark-dark.png``  — charcoal ink, for the LIGHT paper
@@ -208,72 +208,44 @@ def _load_theme(theme_name: str) -> str:
 # render-time-robust option across the LITE cheatsheet bake, the PRO
 # binary's ``_MEIPASS`` tree, and source mode — the bytes travel inside
 # the HTML so there is no path to resolve when WeasyPrint/chromium runs.
-_BRAND_LOGO_CACHE: dict[str, str] = {}
-_BRAND_LOGO_FILENAMES: dict[str, str] = {
-    "dark": "logo-wordmark-dark.png",
-    "light": "logo-wordmark.png",
+#: Translation from this module's historical INK-named variants to the
+#: BACKGROUND-named variants of the shared resolver
+#: (:mod:`adscan_internal.services.brand_assets`), whose naming follows the
+#: asset filenames themselves (``logo-master-dark.svg`` is the white-ink mark
+#: FOR a dark background). The two conventions are opposites, so the mapping is
+#: explicit and locked by a test — resolving the wrong one would print white ink
+#: on white paper. Behaviour here is unchanged: ``"dark"`` still yields the
+#: charcoal ``logo-wordmark-dark.png`` for light themes.
+_INK_VARIANT_TO_BACKGROUND: dict[str, str] = {
+    "dark": "light",   # charcoal ink  -> for a LIGHT background
+    "light": "dark",   # white ink     -> for a DARK background
 }
 
 
 def _brand_logo_data_uri(variant: str = "dark") -> str:
     """Return a base64 PNG data-URI for the ADscan wordmark.
 
-    Reads from the canonical ``adscan_internal/assets/logos/`` home using
-    the same search roots as ``report_service._find_adscan_logo``: the
-    module-relative path (source mode + PyInstaller, since the binary
-    unpacks ``assets/logos`` into its tree) and the ``_MEIPASS`` bundle
-    root as a defensive fallback.
+    Thin delegate to :func:`adscan_internal.services.brand_assets.brand_logo_data_uri`,
+    the single source of truth for reading the canonical
+    ``adscan_internal/assets/logos/`` home (module-relative first, then the
+    PyInstaller ``_MEIPASS`` bundle root). The search discipline is NOT
+    duplicated here — a brand refresh is one asset swap.
 
     Args:
         variant: ``"dark"`` (charcoal ink — light themes, the default) or
-            ``"light"`` (white ink — dark band).
+            ``"light"`` (white ink — dark band). Ink-named for backward
+            compatibility; translated to the shared resolver's
+            background-named variants via :data:`_INK_VARIANT_TO_BACKGROUND`.
 
     Returns:
         ``data:image/png;base64,...`` string, or ``""`` if the asset
         cannot be read (never raises — the logo is cosmetic, and every
         template keeps a text-wordmark ``{% else %}`` fallback).
     """
-    if variant in _BRAND_LOGO_CACHE:
-        return _BRAND_LOGO_CACHE[variant]
+    from adscan_internal.services.brand_assets import brand_logo_data_uri
 
-    filename = _BRAND_LOGO_FILENAMES.get(variant, _BRAND_LOGO_FILENAMES["dark"])
-    data_uri = ""
-    try:
-        import base64
-        import sys
-
-        raw: bytes | None = None
-        # 1. Module-relative: bonuses.py → cli/ → adscan_internal/ → assets/logos/.
-        #    Works in source mode and in the PyInstaller-unpacked tree.
-        try:
-            candidate = (
-                Path(__file__).parent.parent / "assets" / "logos" / filename
-            )
-            if candidate.is_file():
-                raw = candidate.read_bytes()
-        except OSError:
-            raw = None
-        # 2. PyInstaller _MEIPASS bundle root (defensive — mirrors
-        #    _find_adscan_logo's second search root).
-        if raw is None:
-            meipass = getattr(sys, "_MEIPASS", None)
-            if meipass:
-                mp = Path(meipass) / "adscan_internal" / "assets" / "logos" / filename
-                try:
-                    if mp.is_file():
-                        raw = mp.read_bytes()
-                except OSError:
-                    raw = None
-        if raw is not None:
-            encoded = base64.b64encode(raw).decode("ascii")
-            data_uri = f"data:image/png;base64,{encoded}"
-    except Exception as exc:  # noqa: BLE001 — logo is cosmetic; never break render
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        data_uri = ""
-
-    _BRAND_LOGO_CACHE[variant] = data_uri
-    return data_uri
+    background = _INK_VARIANT_TO_BACKGROUND.get(variant, "light")
+    return brand_logo_data_uri(background)
 
 
 def _wordmark_variant_for_theme(theme: str | None) -> str:
@@ -311,10 +283,7 @@ def _render_html(template_source: str, context: dict[str, Any], theme_css: str) 
 
 def _render_pdf(html_str: str) -> bytes:
     """Render HTML to PDF bytes via the chromium engine."""
-    from adscan_internal.pro.reporting.engines import get_engine
-    from adscan_internal.pro.reporting.engines import (  # noqa: F401 - registration
-        chromium_engine as _chromium,
-    )
+    from adscan_internal.services.report_engines import get_engine
 
     engine = get_engine("chromium")
     ok, reason = engine.is_available()
@@ -895,8 +864,8 @@ def render_bonus(
 # LITE CLI surface — only the operator cheat sheet keeps a standalone command.
 # ---------------------------------------------------------------------------
 
-# Pre-baked LITE cheatsheet PDF. The LITE runtime ships without the PRO
-# reporting templates/engines, so it cannot render the cheatsheet on demand.
+# Pre-baked LITE cheatsheet PDF. LITE has the render engine (it is shared) but
+# not the PRO cheatsheet template, so it cannot render the cheatsheet on demand.
 # Instead the LITE Dockerfile copies a single pre-baked PDF here (the
 # private build pipeline produces it via ``scripts/bake_cheatsheet.sh``
 # using the PRO renderer and seeds it into the build context).

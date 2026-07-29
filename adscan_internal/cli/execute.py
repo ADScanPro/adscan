@@ -34,6 +34,7 @@ Design (all four properties hold by construction):
 
 from __future__ import annotations
 
+import difflib
 import os
 import shutil
 import uuid
@@ -140,6 +141,12 @@ EXECUTE_SAFE_VERBS: dict[str, ExecuteVerbSpec] = {
         "(execution offered only from OWNED start principals: the `owned` "
         "scope, or an explicit user that is owned). The L3.5 rung — run one "
         "attack (e.g. ESC7) from a kept workspace without a full `ci`.",
+    ),
+    "users": ExecuteVerbSpec(
+        needs_domain=True,
+        needs_collection=True,
+        summary="Write the user inventories (enabled users, control exposure, "
+        "domain-compromise enablers) for a collected domain.",
     ),
     "reset_attack_path_statuses": ExecuteVerbSpec(
         needs_domain=True,
@@ -323,12 +330,36 @@ def resolve_execute_verb(
             ),
         )
 
+    # Nothing matched. A near-miss on a real verb is the common case (the verb
+    # the operator wanted exists under a different name), so name the closest
+    # candidates instead of leaving them to guess from `--list`.
+    suggestions = _suggest_verbs(verb, known_verbs=known_verbs)
+    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
     return VerbResolution(
         False,
         verb,
         None,
-        f"Unknown verb '{verb}'. Run `adscan execute --list` to see available verbs.",
+        f"Unknown verb '{verb}'.{hint} Run `adscan execute --list` to see available verbs.",
     )
+
+
+def _suggest_verbs(verb: str, *, known_verbs: set[str], limit: int = 3) -> list[str]:
+    """Closest allowlisted verbs to a mistyped one (``enum_users`` → ``users``).
+
+    Allowlisted verbs are proposed first because they are the ones ``execute``
+    can actually run; only when none is close enough do we fall back to the
+    wider REPL registry, so the operator at least learns the real name.
+    """
+    normalized = (verb or "").strip().lower()
+    allowlisted = sorted(EXECUTE_SAFE_VERBS)
+    # Containment ("enum_users" → "users") beats difflib's ratio, which ranks a
+    # shared prefix ("enum_trusts") above the verb the operator actually meant.
+    contained = [v for v in allowlisted if v in normalized or normalized in v]
+    close = difflib.get_close_matches(normalized, allowlisted, n=limit, cutoff=0.6)
+    ranked = contained + [v for v in close if v not in contained]
+    if ranked:
+        return ranked[:limit]
+    return difflib.get_close_matches(normalized, sorted(known_verbs), n=limit, cutoff=0.7)
 
 
 def _verb_summary(verb: str, spec: ExecuteVerbSpec) -> str:
@@ -350,6 +381,7 @@ def _verb_summary(verb: str, spec: ExecuteVerbSpec) -> str:
 def list_execute_verbs() -> int:
     """Render the available verbs + auto-generated help. Returns an exit code."""
     from rich.table import Table  # noqa: PLC0415
+    from rich.text import Text  # noqa: PLC0415
     from rich import box as _box  # noqa: PLC0415
     from adscan_core.rich_output import get_console, print_panel  # noqa: PLC0415
 
@@ -369,10 +401,22 @@ def list_execute_verbs() -> int:
             needs.append("prior scan")
         table.add_row(verb, ", ".join(needs) or "-", _verb_summary(verb, spec))
 
+    # The usage line lives in the panel BODY, not the subtitle: Rich truncates a
+    # subtitle to the border width, which cut this one off mid-syntax — exactly
+    # where the operator needed to read it. In the body it wraps instead.
+    # Built with plain ``Text`` (never markup) so the bracketed optional
+    # arguments are not parsed as Rich style tags.
+    usage = Text("Usage: ", style="bold")
+    usage.append(
+        "adscan execute <verb> -d <domain> [--dc-ip IP] [-u USER -p PASS] "
+        "[-w WORKSPACE] [-- VERB ARGS]"
+    )
+    example = Text("Example: ", style="bold")
+    example.append("adscan execute kerberoast -d corp.local --dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'")
+
     print_panel(
-        table,
+        [table, Text(""), usage, example],
         title="adscan execute · available verbs",
-        subtitle="Usage: adscan execute <verb> -d <domain> [--dc-ip IP] [-u USER -p PASS] [-- ARGS]",
         border_style="cyan",
     )
     get_console()  # ensure the shared TeeConsole is initialised for recording
@@ -442,6 +486,24 @@ def _cleanup_workspace(shell: Any, *, created: bool, keep: bool) -> None:
         print_warning(f"Could not remove ephemeral workspace '{marked}'.")
 
 
+def _resolve_execute_dc_ip(shell: Any, config: ExecuteConfig) -> str:
+    """The DC/KDC IP for this run: the explicit flag, else the domain record.
+
+    Single source of truth for both the posture preflight and the credential
+    bootstrap, so the address the operator passed on the command line cannot be
+    known to one and missing from the other. Never reads ``dc_ip``/``pdc``
+    directly — ``resolve_dc_ip`` owns that fallback chain.
+    """
+    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+    explicit = (config.dc_ip or "").strip()
+    if explicit:
+        return explicit
+    domain = (config.domain or "").strip()
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+    return (resolve_dc_ip(domain_data) or "").strip()
+
+
 def _establish_domain_context(shell: Any, config: ExecuteConfig) -> bool:
     """Resolve the domain → DC context the verb needs (DNS + posture).
 
@@ -463,11 +525,8 @@ def _establish_domain_context(shell: Any, config: ExecuteConfig) -> bool:
         return False
 
     # Resolve the DC IP for posture; prefer the explicit flag, fall back to
-    # whatever do_check_dns discovered (never read raw dc_ip — use the SSOT).
-    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
-
-    domain_data = (shell.domains_data or {}).get(domain, {}) or {}
-    dc_ip = (config.dc_ip or "").strip() or resolve_dc_ip(domain_data) or ""
+    # whatever do_check_dns seeded (never read raw dc_ip — use the SSOT).
+    dc_ip = _resolve_execute_dc_ip(shell, config)
 
     # Posture preflight — idempotent, best-effort, adapts auth automatically.
     try:
@@ -511,8 +570,10 @@ def _establish_credentials(shell: Any, config: ExecuteConfig) -> bool:
     Routes through ``adscan_internal.cli.creds.add_credential`` — the canonical
     credential bootstrap that verifies the credential, mints a posture-aware TGT,
     and flips the domain auth state — exactly what the auth verbs expect to find.
-    Returns ``False`` (gracefully) when no usable credential was provided or it
-    failed verification.
+    The DC IP resolved for this run is handed over so verification has a KDC to
+    talk to; without it ``add_credential`` can only skip verification.
+    Returns ``False`` (gracefully) when no usable credential was provided or the
+    DC rejected it.
     """
     domain = (config.domain or "").strip()
     user = (config.username or "").strip()
@@ -526,33 +587,58 @@ def _establish_credentials(shell: Any, config: ExecuteConfig) -> bool:
 
     from adscan_internal.cli.creds import add_credential  # noqa: PLC0415
 
+    dc_ip = _resolve_execute_dc_ip(shell, config)
     try:
         add_credential(
             shell,
             domain,
             user,
             password,
+            pdc_ip=dc_ip or None,
             prompt_for_user_privs_after=False,
             prompt_local_reuse_after=False,
             ui_silent=True,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_error(
             f"Credential bootstrap failed for {mark_sensitive(user, 'user')}: {exc}"
         )
         return False
 
     domain_data = (shell.domains_data or {}).get(domain, {}) or {}
-    if user.lower() not in {
+    stored = user.lower() in {
         str(k).lower() for k in (domain_data.get("credentials", {}) or {})
-    }:
+    }
+    verification_skipped = bool(
+        getattr(shell, "_last_domain_credential_verification_skipped", False)
+    )
+    if stored:
+        if verification_skipped:
+            # The credential is usable; we simply had no KDC to check it against.
+            # Say that, rather than letting the verb fail later with no context.
+            print_warning(
+                "Credential stored without verification: no domain controller IP "
+                f"could be resolved for {mark_sensitive(domain, 'domain')}. Pass "
+                "--dc-ip <DC_IP> to have it verified before the verb runs."
+            )
+        return True
+
+    if verification_skipped:
+        # Never claim the credential is wrong when nothing ever checked it.
         print_error(
-            "The provided credential did not authenticate. Check the username, "
-            "password/hash, and domain, then retry."
+            "Credential verification was skipped — no domain controller IP could "
+            f"be resolved for {mark_sensitive(domain, 'domain')}. Pass --dc-ip "
+            "<DC_IP> (or check DNS for the domain) and retry."
         )
         return False
-    return True
+
+    print_error(
+        "The domain controller rejected the credential. Check the username, "
+        "password/hash, and domain, then retry."
+    )
+    return False
 
 
 # Value-taking flags in ``do_attack_paths`` (mirror of adscan.py); every other
@@ -841,7 +927,7 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
     run_session_preflight(
         config=SessionPreflightConfig(
             command_name="execute",
-            docs_utm_medium="execute_preflight_failed",
+            docs_placement="execute_preflight_failed",
             allow_unsafe_override=False,
         ),
         deps=SessionPreflightDeps(

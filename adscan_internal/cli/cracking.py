@@ -114,10 +114,23 @@ _MINIMUM_TIMEROAST_HASHCAT_VERSION = (7, 1, 2)
 _GRAPH_TRACKED_ROAST_HASH_TYPES = {"asreproast", "kerberoast"}
 _HASHCAT_NO_DEVICE_TEXT = "No devices found/left"
 _HASHCAT_EXHAUSTED_EXIT_CODE = 1
-# hashcat exits with code 2 when a run is aborted cleanly (e.g. the --runtime
-# cap is reached). When ADscan sets --runtime itself this is expected, not a
-# failure — the potfile still holds any creds recovered before the cap.
-_HASHCAT_RUNTIME_ABORT_EXIT_CODE = 2
+# hashcat's final exit codes are distinct per abort reason (see hashcat's
+# ``main.c``: STATUS_ABORTED -> 2, STATUS_ABORTED_CHECKPOINT -> 3,
+# STATUS_ABORTED_RUNTIME -> 4). Measured on hashcat v7.1.2:
+#   hashcat -a3 -m0 --runtime 3 --quiet --potfile-disable <md5> '?a?a?a?a?a?a?a'
+#     -> rc 4   (the --runtime cap was reached, keyspace NOT exhausted)
+#   hashcat -a3 -m0 --quiet --potfile-disable <md5> '?d?d'      -> rc 1 (exhausted)
+#   hashcat -a0 -m0 --quiet --potfile-disable <md5> <wordlist>  -> rc 0 (cracked)
+# Reaching the cap ADscan itself set is expected, not a failure: the potfile
+# still holds any creds recovered before the cap, and the run was TRUNCATED —
+# nothing at all was proven about the rest of the keyspace.
+_HASHCAT_RUNTIME_ABORT_EXIT_CODE = 4
+# A clean abort requested from outside the run (interactive ``[q]uit``, or a
+# checkpoint quit -> 3). ADscan launches hashcat with ``stdin=DEVNULL`` so this
+# is not expected, but it is an orderly shutdown with a valid potfile, not an
+# operational failure.
+_HASHCAT_USER_ABORT_EXIT_CODE = 2
+_HASHCAT_CHECKPOINT_ABORT_EXIT_CODE = 3
 _HASHCAT_FATAL_ERROR_PATTERNS = (
     "Kernel /",
     "build failed",
@@ -186,7 +199,12 @@ def _classify_hashcat_failure(combined_output: str, returncode: int | None) -> s
     """Return a short label for the most likely failure cause.
 
     Returns one of: ``no_device``, ``out_of_memory``, ``exhausted``,
-    ``hash_format``, ``runtime``, ``unknown``.
+    ``runtime_capped``, ``hash_format``, ``runtime``, ``unknown``.
+
+    ``runtime_capped`` and ``exhausted`` are opposites and must never be
+    conflated: exhausted means every candidate was tried and none matched;
+    runtime_capped means the run was cut short and most of the keyspace was
+    never touched.
     """
     lowered = (combined_output or "").lower()
     if _HASHCAT_NO_DEVICE_TEXT.lower() in lowered:
@@ -201,6 +219,8 @@ def _classify_hashcat_failure(combined_output: str, returncode: int | None) -> s
         return "runtime"
     if int(returncode or 0) == _HASHCAT_EXHAUSTED_EXIT_CODE:
         return "exhausted"
+    if int(returncode or 0) == _HASHCAT_RUNTIME_ABORT_EXIT_CODE:
+        return "runtime_capped"
     return "unknown"
 
 
@@ -337,8 +357,27 @@ def _harvest_source_for_hash_type(hash_type: str) -> str:
     return _HASH_TYPE_TO_HARVEST_SOURCE.get(hash_type, hash_type)
 
 
-def _next_action_for_failure(cause: str, hash_type: str) -> str:
-    """Human-readable next action paired with a failure cause."""
+def _next_action_for_failure(
+    cause: str, hash_type: str, *, runtime_seconds: int | None = None
+) -> str:
+    """Human-readable next action paired with a failure cause.
+
+    ``runtime_seconds`` is the ``--runtime`` cap that truncated the run; it is
+    only consulted for the ``runtime_capped`` cause.
+    """
+    if cause == "runtime_capped":
+        cap = (
+            f"the {int(runtime_seconds)}s time cap"
+            if runtime_seconds is not None and int(runtime_seconds) > 0
+            else "its time cap"
+        )
+        return (
+            f"The run stopped at {cap} with most of the candidate space still "
+            "untried, so nothing has been proven about this password. Repeating "
+            "the same wordlist under the same cap stops at the same point. "
+            "Raise the effort level for a longer budget, or run the crack on a "
+            "machine with a GPU — this mode is far too slow on CPU."
+        )
     if cause == "exhausted":
         return (
             "Wordlist exhausted without a match. "
@@ -1353,9 +1392,21 @@ def _is_benign_hashcat_stderr(stderr: str) -> bool:
 
 
 def _is_nonfatal_hashcat_exit_code(returncode: int | None) -> bool:
-    """Return True for hashcat exit codes that are not operational failures."""
+    """Return True for hashcat exit codes that are not operational failures.
 
-    return int(returncode or 0) in {0, _HASHCAT_EXHAUSTED_EXIT_CODE}
+    Every orderly termination qualifies: cracked (0), exhausted (1), and the
+    three abort reasons (user 2, checkpoint 3, runtime cap 4). All of them leave
+    a valid potfile behind, so none of them warrants a "command may have failed"
+    warning — only a genuine error (negative codes, 252 out-of-memory, ...) does.
+    """
+
+    return int(returncode or 0) in {
+        0,
+        _HASHCAT_EXHAUSTED_EXIT_CODE,
+        _HASHCAT_USER_ABORT_EXIT_CODE,
+        _HASHCAT_CHECKPOINT_ABORT_EXIT_CODE,
+        _HASHCAT_RUNTIME_ABORT_EXIT_CODE,
+    }
 
 
 def _parse_hashcat_version(output: str) -> tuple[int, int, int] | None:
@@ -3404,15 +3455,31 @@ def _render_cracking_failure_panel(
     wordlist_name: str | None,
     cause: str,
     total_hashes: int,
+    runtime_seconds: int | None = None,
 ) -> None:
     """Render a clear verdict panel when nothing cracked.
 
     The body separates the diagnosis from the next action so the operator can
     decide whether to relaunch with a different wordlist or escalate the
     problem to the underlying tooling.
+
+    ``runtime_seconds`` is the ``--runtime`` cap the run carried, so a truncated
+    run can say how long it actually got instead of implying the search
+    completed.
     """
+    capped_label = "Run aborted at its time cap — candidate space not exhausted"
+    if (
+        cause == "runtime_capped"
+        and runtime_seconds is not None
+        and int(runtime_seconds) > 0
+    ):
+        capped_label = (
+            f"Run aborted at the {int(runtime_seconds)}s time cap — "
+            "candidate space not exhausted"
+        )
     cause_label = {
         "exhausted": "Wordlist exhausted without a match",
+        "runtime_capped": capped_label,
         "no_device": "No usable hashcat compute device",
         "hash_format": "Hash format did not match the selected mode",
         "runtime": "Hashcat hit a fatal runtime error",
@@ -3434,7 +3501,9 @@ def _render_cracking_failure_panel(
             f"against {coverage}.[/]"
         )
 
-    next_text = _next_action_for_failure(cause, hash_type)
+    next_text = _next_action_for_failure(
+        cause, hash_type, runtime_seconds=runtime_seconds
+    )
     diag_lines.append("")
     diag_lines.append(f"[bold]Next:[/bold] {next_text}")
 
@@ -3636,21 +3705,25 @@ def execute_cracking(
                 + (completed_process_initial.stderr or "")
             )
             initial_stderr = completed_process_initial.stderr or ""
-            # A clean --runtime abort exits with code 2; when we set the cap
-            # ourselves that is expected (not a failure) and the potfile still
-            # holds any creds recovered before the cap, so treat it as non-fatal.
+            # A clean --runtime abort exits with code 4 (see the exit-code block
+            # at the top of this module); when we set the cap ourselves that is
+            # expected (not a failure) and the potfile still holds any creds
+            # recovered before the cap, so treat it as non-fatal.
             runtime_capped_abort = (
-                runtime_seconds is not None
-                and int(runtime_seconds) > 0
-                and int(completed_process_initial.returncode or 0)
+                int(completed_process_initial.returncode or 0)
                 == _HASHCAT_RUNTIME_ABORT_EXIT_CODE
             )
             if runtime_capped_abort:
                 initial_failure_cause = "runtime_capped"
+                cap_note = (
+                    f" ({int(runtime_seconds)}s)"
+                    if runtime_seconds is not None and int(runtime_seconds) > 0
+                    else ""
+                )
                 print_info_debug(
-                    "hashcat reached the --runtime cap "
-                    f"({int(runtime_seconds)}s); checking the potfile for "
-                    "recovered credentials."
+                    f"hashcat reached the --runtime cap{cap_note}; the candidate "
+                    "space was NOT exhausted. Checking the potfile for "
+                    "credentials recovered before the cap."
                 )
             if not runtime_capped_abort and not _is_nonfatal_hashcat_exit_code(
                 completed_process_initial.returncode
@@ -4016,6 +4089,7 @@ def execute_cracking(
                     wordlist_name=wordlist_name,
                     cause=initial_failure_cause,
                     total_hashes=total_hashes,
+                    runtime_seconds=runtime_seconds,
                 )
                 return {"status": "no_match", "cracked_count": 0}
         else:
@@ -4042,6 +4116,7 @@ def execute_cracking(
                 wordlist_name=wordlist_name,
                 cause=initial_failure_cause,
                 total_hashes=total_hashes,
+                runtime_seconds=runtime_seconds,
             )
             if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
                 try:

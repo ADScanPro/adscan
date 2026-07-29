@@ -30,6 +30,7 @@ import sentry_sdk
 
 from .ssl_certificates import configure_ssl_certificates_for_requests
 from adscan_core.offline import offline_mode_enabled
+from adscan_core.outbound_links import ADSCAN_SITE_HOST
 from adscan_core.lab_context import (
     build_lab_slug,
     build_lab_telemetry_fields,
@@ -55,6 +56,7 @@ from adscan_core.path_utils import (
     get_adscan_home,
     get_adscan_state_dir,
 )
+from adscan_core.telemetry_preference import global_telemetry_disabled
 from adscan_core.version_context import (
     detect_installer,
     get_installed_version,
@@ -149,6 +151,15 @@ _DEFAULT_IP_PASSTHROUGH: tuple[str, ...] = (
 _PUBLIC_URL_PASSTHROUGH_ALLOWLIST: tuple[str, ...] = (
     "https://nmap.org",
 )
+
+# First-party public domains. These are OUR OWN registered domains, so they
+# carry no customer identity -- and mangling them costs real triage value: a
+# recording that renders the docs link as
+# ``https://jult.ezxzetvti.lis/pubz/degqodr-jzoklep/ifcfomvukueg`` hides which
+# instruction the user was given. Unlike the URL allowlist above, a match here
+# also covers any SUBDOMAIN and any path/query, so ``docs.adscanpro.com/docs/...``
+# and ``sessions.adscanpro.com/sessions/<id>`` survive intact.
+_FIRST_PARTY_PUBLIC_DOMAINS: tuple[str, ...] = (ADSCAN_SITE_HOST,)
 
 _PASSTHROUGH_MARKERS = PASSTHROUGH_MARKERS["passthrough"]
 
@@ -365,6 +376,18 @@ def _get_ip_passthrough_networks() -> tuple[ipaddress._BaseNetwork, ...]:
     return tuple(networks)
 
 
+def _looks_like_ip_literal(value: str) -> bool:
+    """Return whether a value is a bare IPv4/IPv6 literal (no CIDR, no port)."""
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    try:
+        ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    return True
+
+
 def _is_ip_passthrough(value: str) -> bool:
     """Return True when an IP value should remain unchanged.
 
@@ -441,6 +464,32 @@ def _extract_passthrough_segments(content: str) -> tuple[str, dict[str, str]]:
             return placeholder
 
         content = url_pattern.sub(_replace_url, content)
+
+    # Preserve first-party ADscan domains (any subdomain, any path/query). Our
+    # own docs/session links are public, non-customer data, and a reviewer needs
+    # to read them verbatim.
+    for domain in _FIRST_PARTY_PUBLIC_DOMAINS:
+        escaped = re.escape(domain)
+        first_party_pattern = re.compile(
+            # Optional scheme, optional subdomain labels, the first-party
+            # domain, then an optional path/query. The leading guard stops
+            # ``notadscanpro.com`` / ``evil-adscanpro.com`` from matching.
+            r"(?<![A-Za-z0-9._@-])"
+            r"(?P<value>(?:https?://)?(?:[A-Za-z0-9-]+\.)*"
+            rf"{escaped}"
+            r"(?:/[^\s<>\"'`]*)?)",
+            re.IGNORECASE,
+        )
+
+        def _replace_first_party(match: re.Match[str]) -> str:
+            nonlocal counter
+            value = match.group("value")
+            placeholder = f"__ADSCAN_PASSTHROUGH_{counter}__"
+            counter += 1
+            mapping[placeholder] = value
+            return placeholder
+
+        content = first_party_pattern.sub(_replace_first_party, content)
 
     return content, mapping
 
@@ -681,7 +730,7 @@ def _get_current_telemetry_level() -> tuple[bool, str, str]:
         Tuple of (enabled, level, source)
         - enabled: effective telemetry enabled state
         - level: one of {"enabled", "session_disabled", "cli_disabled"}
-        - source: one of {"offline", "env", "cli", "default"}
+        - source: one of {"offline", "env", "global", "cli", "default"}
     """
     # Offline / no-external kill switch: absolute, highest priority. Reported as
     # source "offline" so the opt-out state-change POST is suppressed (a strict
@@ -693,6 +742,11 @@ def _get_current_telemetry_level() -> tuple[bool, str, str]:
         return False, "session_disabled", "env"
     if env_val == "1":
         return True, "enabled", "env"
+
+    # Persisted GLOBAL opt-out outranks any per-workspace/session override: a
+    # workspace may be stricter than the operator's preference, never looser.
+    if global_telemetry_disabled():
+        return False, "cli_disabled", "global"
 
     override = _CLI_STATE.telemetry_enabled_override
     if override is False:
@@ -898,8 +952,9 @@ def _is_telemetry_enabled() -> bool:
     Priority (highest to lowest):
     1. ADSCAN_TELEMETRY=0 → disabled (explicit opt-out)
     2. ADSCAN_TELEMETRY=1 → enabled (explicit opt-in)
-    3. CLI setting → use CLI override
-    4. Default → enabled (all environments: dev, ci, prod)
+    3. Persisted global opt-out → disabled (survives workspaces and sessions)
+    4. CLI setting → use CLI override
+    5. Default → enabled (all environments: dev, ci, prod)
 
     Note: Telemetry is enabled in all environments by default, but events
     are automatically routed to different PostHog projects based on environment
@@ -918,6 +973,12 @@ def _is_telemetry_enabled() -> bool:
         return False
     if env_val == "1":
         return True
+
+    # Persisted GLOBAL opt-out: the operator turned telemetry off once, so it
+    # stays off in every workspace and every later session. Deliberately ahead
+    # of the CLI override — a workspace can be stricter, never looser.
+    if global_telemetry_disabled():
+        return False
 
     # CLI setting override (for runtime toggling)
     override = _CLI_STATE.telemetry_enabled_override
@@ -945,6 +1006,9 @@ def _is_session_capture_enabled() -> bool:
         return False
     capture_opt = os.getenv("ADSCAN_SESSION_CAPTURE")
     if capture_opt == "0":
+        return False
+    # Persisted global opt-out covers session recordings too.
+    if global_telemetry_disabled():
         return False
     # If the user explicitly disables telemetry at runtime from the CLI,
     # also disable session capture to avoid unexpected uploads.
@@ -1333,12 +1397,13 @@ else:
         id_file.write_text(TELEMETRY_ID, encoding="utf-8")
 
 # Partner tag — identifies which partner/beta tester this install belongs to
-# (e.g. "glenn-mssp"). Used as a telemetry dimension and as the PRO entitlement
+# (e.g. "acme-mssp"). Used as a telemetry dimension and as the PRO entitlement
 # marker for the shared registry image.
 #
 # Resolution order (single source of truth — `resolve_partner_tag`):
-#   1. env var ADSCAN_PARTNER_TAG (override for CI / power-users / legacy baked
-#      images that still carry `ENV ADSCAN_PARTNER_TAG`)
+#   1. env var ADSCAN_PARTNER_TAG (forwarded into the container by the host
+#      launcher; also the override for CI / power-users / legacy baked images
+#      that still carry `ENV ADSCAN_PARTNER_TAG`)
 #   2. persisted file in the STATE dir (`get_adscan_state_dir()/partner.json`,
 #      field "partner_tag") — written once at runtime by the PRO start gate and
 #      surviving across `docker run --rm` because the state dir is bind-mounted
@@ -1354,6 +1419,38 @@ else:
 # sits in the home root on a persistent (non-`--rm`) home.
 _PARTNER_TAG_FILENAME = "partner.json"
 _PARTNER_TAG_FIELD = "partner_tag"
+
+# Format contract for a partner tag: starts with a lowercase letter or digit,
+# then 1-40 more of lowercase letters, digits, or hyphens (2-41 chars total).
+# Deliberately strict: no uppercase, no spaces, no underscores, no leading
+# hyphen — this is a URL/telemetry-safe slug like "acme-mssp".
+#
+# It lives HERE (adscan_core) rather than in the container-side start gate
+# because both sides validate against it: the host launcher's `--partner-tag`
+# flag and the in-container PRO gate. One pattern means a tag the launcher
+# accepts is never rejected by the gate that consumes it.
+_PARTNER_TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+
+#: Human-readable description of the format, for prompts and error messages.
+PARTNER_TAG_FORMAT_HINT = "lowercase letters, digits and hyphens, 2-41 characters"
+
+
+def validate_partner_tag(tag: object) -> bool:
+    """Return True when ``tag`` matches the partner-tag format contract.
+
+    Accepts e.g. ``acme-mssp``; rejects empty strings, uppercase, whitespace,
+    odd characters, and tags longer than 41 characters. Pure function — safe to
+    call from the host launcher and from the container runtime.
+
+    Args:
+        tag: Candidate partner tag (any type; non-strings are rejected).
+
+    Returns:
+        True if the tag is well-formed, False otherwise.
+    """
+    if not isinstance(tag, str):
+        return False
+    return bool(_PARTNER_TAG_PATTERN.match(tag.strip()))
 
 
 def _extract_partner_tag(partner_file: Path) -> str:
@@ -1595,6 +1692,39 @@ def set_workspace_hostnames(
         seen.add(key)
         deduped.append(hostname)
     _KNOWN_HOSTNAMES = deduped
+    _KNOWN_HOSTNAMES_LOADED = True
+
+
+def add_known_hostname(*hostnames: Optional[str]) -> None:
+    """Register additional hostnames for buffer-wide sanitization, incrementally.
+
+    :func:`set_workspace_hostnames` loads the known set once, from the
+    workspace's ``enabled_computers.txt``. That file does not exist yet during a
+    pre-authentication probe, and it never contains infrastructure names that
+    are not computer accounts -- an ADCS CA common name, for instance. Anything
+    learned mid-run therefore had no entry to match against, and a single-label
+    name has no structural signature for a regex net to anchor on, so it
+    travelled to the recording verbatim.
+
+    Because sanitization runs at EXPORT time over the whole buffer, registering
+    a name at the moment it is discovered also masks every occurrence recorded
+    BEFORE that point. Call this as soon as a DC identity, a CA name or any
+    other customer infrastructure name is resolved.
+
+    Args:
+        *hostnames: Names to add. Empty, non-string and duplicate (case-
+            insensitive) values are ignored.
+    """
+    global _KNOWN_HOSTNAMES, _KNOWN_HOSTNAMES_LOADED
+    existing = {name.casefold() for name in _KNOWN_HOSTNAMES}
+    for hostname in hostnames:
+        if not isinstance(hostname, str):
+            continue
+        cleaned = hostname.strip().rstrip(".")
+        if not cleaned or cleaned.casefold() in existing:
+            continue
+        existing.add(cleaned.casefold())
+        _KNOWN_HOSTNAMES.append(cleaned)
     _KNOWN_HOSTNAMES_LOADED = True
 
 
@@ -2221,6 +2351,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "docker_runtime_preflight",
         "docker_workspace_lock_blocked",
         "doctor_start",
+        "docs_link_shown",
         "domain_command_requires_initialization",
         "domain_compromise",
         "domain_discovered",
@@ -2228,6 +2359,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "domain_not_discovered",
         "environment_enumerated",
         "execute_start",
+        "exposure_report_generated",
         "first_cred_found",
         "first_install",
         "forcechangepassword_computer_hard_blocked",
@@ -2244,6 +2376,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "kerberoast_started",
         "kerberoast_users_found",
         "kerberos_ccache_principal_mismatch",
+        "launcher_low_memory_gate",
         "ldap_computers_enumerated",
         "ldap_scan_started",
         "metric_ttfh",
@@ -2252,6 +2385,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "myip_auto_configured",
         "myip_auto_updated",
         "native_collection_performance",
+        "operator_role",
         "pdc_preflight_auto_switched",
         "pdc_preflight_confirmed",
         "pdc_preflight_dns_validation",
@@ -2263,6 +2397,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "post_ex_execute_invoked",
         "post_ex_menu_viewed",
         "post_ex_technique_selected",
+        "post_scan_report_moment",
         "rdp_scan_started",
         "reinstall",
         "repl_command",
@@ -2307,6 +2442,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "timeroast_started",
         "uninstalled",
         "user_discovery_followups",
+        "victory_hint_shown",
         "users_enumerated",
         "winrm_scan_started",
         "workspace_dns_repair_attempted",
@@ -2315,6 +2451,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "workspace_dns_repair_succeeded",
         "workspace_dns_restore_best_effort",
         "workspace_dns_restore_failed",
+        "writeup_spine_generated",
     }
 )
 
@@ -2459,29 +2596,51 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
     #     print_info("Telemetry disabled")
 
 
+# Markup emitted by ``rich.console.Console.export_html`` (plus the document
+# scaffolding around it). Deliberately anchored on real HTML element names: the
+# old catch-all ``<[^>]+>`` also deleted ordinary angle-bracket TEXT such as
+# ``<variable>``, ``<none>``, ``<SID>`` or ``<user@domain>``, which the CLI uses
+# as placeholders in usage and diagnostic messages.
+_RICH_HTML_TAG_PATTERN = re.compile(
+    r"<!--.*?-->"
+    r"|<!DOCTYPE[^>]*>"
+    r"|</?(?:a|body|br|code|div|head|html|link|meta|p|pre|script|span|style|title)"
+    r"(?:\s[^>]*)?/?>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def _strip_html_tags(html: str) -> str:
-    """Remove HTML tags from string, keeping only text content.
+    """Remove Rich HTML-export markup from a string, keeping the text content.
 
     Args:
-        html: String potentially containing HTML tags
+        html: String potentially containing Rich ``export_html`` markup.
 
     Returns:
-        String with HTML tags removed
+        String with the HTML elements removed and their text content kept.
     """
-    # Remove HTML tags but keep text content
-    # This handles Rich HTML exports like <span class="r1">text</span>
-    return re.sub(r"<[^>]+>", "", html)
+    return _RICH_HTML_TAG_PATTERN.sub("", html)
 
 
 def _prepare_rich_content_for_processing(content: str) -> str:
     """Normalize Rich exports into plain text suitable for downstream processing.
 
-    This function:
-    - Unescapes HTML entities
-    - Strips ANSI codes
-    - Removes Rich HTML tags (export_html span markup)
+    Order matters, and getting it wrong silently destroyed content. Rich escapes
+    literal angle brackets on export, so ``set <variable> <value>`` leaves the
+    console as ``set &lt;variable&gt; &lt;value&gt;``. Unescaping FIRST turned
+    those entities back into ``<variable>``, which the tag strip then deleted --
+    every placeholder token vanished from every uploaded recording, leaving
+    "Incorrect usage: set" with a trailing blank. Stripping the real markup
+    first and unescaping afterwards keeps both halves correct: ``<span>`` is
+    markup and goes, ``&lt;variable&gt;`` is text and stays.
+
+    Args:
+        content: A Rich ``export_html`` or ``export_text`` payload.
+
+    Returns:
+        Plain text with markup and ANSI codes removed and entities resolved.
     """
-    return _strip_html_tags(strip_ansi_codes(unescape(content)))
+    return unescape(strip_ansi_codes(_strip_html_tags(content)))
 
 
 def _strip_sensitive_markers(content: str) -> str:
@@ -3237,6 +3396,145 @@ def _is_already_sanitized(value: str) -> bool:
     return value in _SANITIZED_VALUES
 
 
+_HOSTNAME_SHAPED_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
+_NETBIOS_SHAPED_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,14}$")
+
+
+def _looks_like_ad_domain_token(token: str, *, has_password: bool) -> bool:
+    """Return whether ``token`` is plausibly the DOMAIN half of ``DOMAIN/USER``.
+
+    The ``DOMAIN/USER[:PASSWORD]`` sanitizer used to treat ANY ``word/word`` as
+    a credential pair, so ordinary product prose was pseudonymized into
+    gibberish -- ``install/update`` became ``errfovs/ekjivu``, ``DC/PDC``
+    became ``ZV/WXH``, ``NTLM/Kerberos`` and ``and/or`` were destroyed the same
+    way. A reviewer then cannot read the recording, which is the whole point of
+    keeping one.
+
+    Recall is preserved because this gate only decides whether the SLASH form
+    is treated as a credential pair. A domain that really belongs to the
+    engagement is registered in the workspace (``_KNOWN_DOMAINS`` /
+    ``_KNOWN_NETBIOS``) and is pseudonymized by the targeted known-value passes
+    regardless of the shape it appears in, and a fully-qualified domain is
+    caught by the FQDN nets. What this rejects is only the SPECULATIVE
+    pseudonymization of two unrelated English words.
+
+    Args:
+        token: The left-hand token, already stripped of quotes.
+        has_password: True when the match also carried a ``:PASSWORD`` tail,
+            which is a strong credential signal in its own right.
+
+    Returns:
+        True when the token should be treated as an AD domain.
+    """
+    if not token:
+        return False
+    candidate = token.strip().strip("'\"")
+    if not candidate:
+        return False
+    # Placeholders left by an earlier pass are already domain-typed.
+    if candidate in ("[DOMAIN]", "{DOMAIN}") or _is_already_sanitized(candidate):
+        return True
+    # Fully-qualified shape (corp.local, sub.corp.local) with a real letter in
+    # it -- never a bare version number or a phase counter.
+    if _HOSTNAME_SHAPED_RE.match(candidate) and any(ch.isalpha() for ch in candidate):
+        return True
+    folded = candidate.casefold()
+    for known in _get_known_domains():
+        known_folded = known.strip().casefold()
+        if not known_folded:
+            continue
+        if folded == known_folded or folded == known_folded.split(".", 1)[0]:
+            return True
+    for netbios in _get_known_netbios():
+        if folded == netbios.strip().casefold():
+            return True
+    # An unregistered NetBIOS-shaped name only counts when the match carries a
+    # password tail (``CORP/user:Passw0rd``): that triple is a credential, not
+    # prose. Without the tail, ``SMB/LDAP`` and ``TCP/IP`` would be destroyed.
+    if has_password and _NETBIOS_SHAPED_RE.match(candidate):
+        return True
+    return False
+
+
+# Left-hand tokens of a ``PREFIX\NAME`` pair that are NOT a customer domain.
+# Windows itself prints these: registry hives, the local security authorities
+# whose names are public constants, and the default administrative shares. They
+# are dotless and upper-case, so they have exactly the shape of a NetBIOS domain
+# and would otherwise be pseudonymized into gibberish a reviewer cannot read.
+_NON_DOMAIN_BACKSLASH_PREFIXES: frozenset[str] = frozenset(
+    {
+        "hklm",
+        "hkcu",
+        "hkcr",
+        "hku",
+        "hkcc",
+        "hkey_local_machine",
+        "hkey_current_user",
+        "hkey_classes_root",
+        "hkey_users",
+        "hkey_current_config",
+        "builtin",
+        "authority",
+        "nt authority",
+        "service",
+        "nt service",
+        "apppool",
+        "iis apppool",
+        "host",
+        "manager",
+        "logon",
+        "sysvol",
+        "netlogon",
+        "admin$",
+        "ipc$",
+        "print$",
+        "windows",
+        "winnt",
+        "users",
+        "programdata",
+        "temp",
+        "system32",
+    }
+)
+
+
+def _looks_like_netbios_domain_prefix(token: str) -> bool:
+    """Return whether a dotless token is plausibly the DOMAIN of ``DOMAIN\\user``.
+
+    ``CORP\\jsnow`` is the single most common way a Windows principal appears in
+    tool output, and the backslash net used to require a DOT in the left-hand
+    token — so only the fully-qualified ``corp.local\\jsnow`` was ever
+    pseudonymized and the NetBIOS form travelled to the recording verbatim.
+
+    Accepting any dotless ``word\\word`` would go too far the other way: registry
+    paths, share paths and the local Windows authorities have the same shape.
+    So an UNREGISTERED token must look like a real NetBIOS name (upper-case,
+    2–15 characters, the shape Windows prints) and must not be one of the public
+    prefixes in :data:`_NON_DOMAIN_BACKSLASH_PREFIXES`. A token registered as
+    this engagement's domain or NetBIOS name is accepted in any case.
+
+    Args:
+        token: The left-hand token, already stripped of quotes/whitespace.
+
+    Returns:
+        True when the token should be treated as a NetBIOS domain.
+    """
+    candidate = (token or "").strip().strip("'\"")
+    if not candidate:
+        return False
+    folded = candidate.casefold()
+    if folded in _NON_DOMAIN_BACKSLASH_PREFIXES:
+        return False
+    for netbios in _get_known_netbios():
+        if folded == netbios.strip().casefold():
+            return True
+    for known in _get_known_domains():
+        known_folded = known.strip().casefold()
+        if known_folded and folded == known_folded.split(".", 1)[0]:
+            return True
+    return bool(_NETBIOS_SHAPED_RE.match(candidate))
+
+
 def _is_non_identifying_mac(value: str) -> bool:
     """Return whether a MAC-shaped token is a non-customer-identifying MAC.
 
@@ -3260,6 +3558,57 @@ def _is_non_identifying_mac(value: str) -> bool:
     if all(octet == "00" for octet in lowered):
         return True
     return False
+
+
+# A domain SID (S-1-5-21-<a>-<b>-<c>) and the per-account SIDs derived from it
+# (one extra RID) are the unique fingerprint of a customer's directory. Anchored
+# on the S-1-5-21- prefix so well-known SIDs are NEVER matched: S-1-5-18/19/20/
+# 11/9/7 (local/system principals) and S-1-5-32-<rid> (BUILTIN groups, e.g.
+# S-1-5-32-544 Administrators) are not customer-identifying and must survive
+# verbatim for triage readability.
+_DOMAIN_ACCOUNT_SID_PATTERN = re.compile(
+    r"\bS-1-5-21-[0-9]+-[0-9]+-[0-9]+(?:-[0-9]+)?\b"
+)
+
+# Candidate span for the IPv6 structural net. The regex only BOUNDS the token;
+# ipaddress.IPv6Address in _replace_ipv6_candidate is the real gate, so a
+# colon-separated shape that is not an address (a MAC, a duration, a version)
+# falls through untouched. A trailing "." is deliberately NOT excluded so an
+# address that ends a sentence still matches; a leading one is, so the net never
+# starts inside an already-pseudonymized dotted-quad.
+_IPV6_CANDIDATE_PATTERN = re.compile(
+    r"(?<![0-9A-Za-z:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Za-z:])"
+)
+
+
+def _is_customer_identifying_sid(value: str) -> bool:
+    """Return whether a SID belongs to a customer's directory rather than Windows."""
+    return bool(_DOMAIN_ACCOUNT_SID_PATTERN.fullmatch((value or "").strip()))
+
+
+def _is_non_identifying_ipv6(address: "ipaddress.IPv6Address") -> bool:
+    """Return whether an IPv6 address carries no customer information.
+
+    The loopback (``::1``) and the unspecified address (``::``) are protocol
+    constants that stay verbatim for triage readability. Link-local addresses do
+    NOT qualify: an EUI-64 ``fe80::`` address embeds the interface MAC, so it is
+    hardware-identifying and must be scrambled like any other address.
+    """
+    return address.is_loopback or address.is_unspecified
+
+
+def _replace_ipv6_candidate(match: "re.Match[str]") -> str:
+    """Pseudonymize an IPv6 candidate, leaving non-addresses untouched."""
+    token = match.group(0)
+    if _is_already_sanitized(token):
+        return token
+    try:
+        address = ipaddress.IPv6Address(token)
+    except ValueError:
+        return token
+    if _is_non_identifying_ipv6(address) or _is_ip_passthrough(token):
+        return token
+    return _record_pseudonym(token, "ip")
 
 
 def _replace_table_cell(segment: str, data_type: str) -> str:
@@ -3287,6 +3636,15 @@ def _looks_like_plain_text_table_row(line: str, *, min_columns: int) -> bool:
     return len(cells) >= min_columns
 
 
+# Characters that end an ORPHAN marked span (a marked value whose closing
+# marker was truncated away). Everything here is a boundary Rich itself draws:
+# the ellipsis it inserts when a cell overflows, the vertical rules of a table
+# or panel, a line break, and the tag delimiter of the exported HTML recording.
+# Deliberately NOT included: "&", because an HTML-escaped character inside the
+# value ("&amp;") would otherwise end the span early and leak the remainder.
+_ORPHAN_SPAN_TERMINATORS = "…\n\r│┃║┆┊<"
+
+
 def _sanitize_by_markers(
     content: str,
     data_types: Optional[set[str]] = None,
@@ -3310,6 +3668,44 @@ def _sanitize_by_markers(
     marker_patterns = SENSITIVE_MARKERS
     marker_chars = MARKER_CHARS
 
+    def _pseudonymize_marked(value: str, data_type: str) -> str:
+        """Return the replacement for one marked value of ``data_type``."""
+        if _is_already_sanitized(value):
+            return value
+        effective_type = data_type
+        # A value marked as a host/domain that is structurally an IP literal
+        # is pseudonymized AS an IP, so it still gets the provably-fake
+        # scrambler (an octet > 255 for v4, the 2001:db8::/32 documentation
+        # prefix for v6) instead of the domain character scramble, which can
+        # land on something that reads as a real routable address. Call
+        # sites legitimately pass an IP under a host-shaped category (a
+        # "connect to <host>" line does not know which it holds).
+        if effective_type in ("domain", "hostname") and _looks_like_ip_literal(value):
+            effective_type = "ip"
+        if effective_type == "ip" and _is_ip_passthrough(value):
+            return value
+        # Same carve-out the SID structural net applies: a well-known SID
+        # (S-1-5-32-544 BUILTIN\\Administrators, S-1-5-18 SYSTEM, ...) is a
+        # Windows constant, not customer data, and mangling it costs triage
+        # readability while protecting nothing.
+        if effective_type == "sid" and not _is_customer_identifying_sid(value):
+            return value
+        # A marker is an explicit declaration that this value is sensitive,
+        # so it overrides the bare well-known-principal passthrough: a MARKED
+        # "administrator" / "Domain Admins" is a registered secret here and
+        # must be redacted. force=True keeps only the log-level backstop.
+        #
+        # EXCEPTION — qualified well-known principals (administrators@domain,
+        # CORP\\administrators, NT AUTHORITY\\SYSTEM): preserve the PUBLIC
+        # name and sanitize only the customer domain. The bare name still
+        # redacts under a marker, but the qualified form would otherwise
+        # mangle a public, non-identifying built-in name.
+        if effective_type == "user":
+            preserved = _preserve_well_known_qualified(value)
+            if preserved is not None:
+                return preserved
+        return _record_pseudonym(value, effective_type, force=True)
+
     for data_type, (start_marker, end_marker) in marker_patterns.items():
         if data_types is not None and data_type not in data_types:
             continue
@@ -3325,29 +3721,52 @@ def _sanitize_by_markers(
         inner_pattern = f"(?P<value>[^{marker_chars}]*?)"
         pattern = re.escape(start_marker) + inner_pattern + re.escape(end_marker)
 
-        def _replace(match: re.Match[str]) -> str:
-            value = match.group("value")
-            if _is_already_sanitized(value):
-                return value
-            if data_type == "ip" and _is_ip_passthrough(value):
-                return value
-            # A marker is an explicit declaration that this value is sensitive,
-            # so it overrides the bare well-known-principal passthrough: a MARKED
-            # "administrator" / "Domain Admins" is a registered secret here and
-            # must be redacted. force=True keeps only the log-level backstop.
-            #
-            # EXCEPTION — qualified well-known principals (administrators@domain,
-            # CORP\\administrators, NT AUTHORITY\\SYSTEM): preserve the PUBLIC
-            # name and sanitize only the customer domain. The bare name still
-            # redacts under a marker, but the qualified form would otherwise
-            # mangle a public, non-identifying built-in name.
-            if data_type == "user":
-                preserved = _preserve_well_known_qualified(value)
-                if preserved is not None:
-                    return preserved
-            return _record_pseudonym(value, data_type, force=True)
+        content = re.sub(
+            pattern,
+            lambda match, dt=data_type: _pseudonymize_marked(
+                match.group("value"), dt
+            ),
+            content,
+            flags=re.DOTALL,
+        )
 
-        content = re.sub(pattern, _replace, content, flags=re.DOTALL)
+    # ── Fail-closed sweep for ORPHAN start markers ──────────────────────────
+    #
+    # A marked value whose CLOSING marker was cut off is invisible to the paired
+    # pass above, and the value then falls through to the structural nets only —
+    # which anchor nothing on a truncated fragment (an 11-hex prefix of an AES256
+    # key is neither 32 nor 40+ hex). Raw prefixes of real Kerberos key material
+    # reached production recordings this way.
+    #
+    # The terminator is lost for one reason in practice: Rich truncated the cell.
+    # A column with ``overflow="ellipsis"`` (or a crop at console width) cuts the
+    # tail off the laid-out text — markers included, because they are stripped
+    # from the visible stream only AFTER layout. The narrower the terminal, the
+    # more of the secret survives, which is why this went unnoticed.
+    #
+    # An orphan start marker is, by definition, a call site DECLARING "the text
+    # that follows is sensitive". The only safe reading is to sanitize it, so we
+    # pseudonymize from the marker up to the end of the visual token: the
+    # ellipsis Rich inserted, a cell/table border, a newline, or an HTML tag
+    # boundary in the exported recording. Trailing padding is preserved verbatim
+    # so column alignment survives.
+    orphan_inner = (
+        f"(?P<value>[^{marker_chars}{re.escape(_ORPHAN_SPAN_TERMINATORS)}]*)"
+    )
+    for data_type, (start_marker, _end_marker) in marker_patterns.items():
+        if data_types is not None and data_type not in data_types:
+            continue
+
+        def _replace_orphan(match: re.Match[str], dt: str = data_type) -> str:
+            raw = match.group("value")
+            body = raw.rstrip()
+            trailing = raw[len(body) :]
+            if not body:
+                # Nothing but the stray marker — drop it, keep the padding.
+                return trailing
+            return _pseudonymize_marked(body, dt) + trailing
+
+        content = re.sub(re.escape(start_marker) + orphan_inner, _replace_orphan, content)
 
     return content
 
@@ -3418,23 +3837,33 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
+    # Structural backstop for IPv6 addresses.
+    #
+    # A v6 address identifies customer infrastructure exactly as a v4 one does,
+    # and dual-stack DCs, link-local coercion targets and listener bind
+    # addresses all surface them. The provably-fake v6 scrambler
+    # (_scramble_ipv6_provably_fake, mapping into the RFC 3849 documentation
+    # prefix) already existed but was only reachable when a call site had
+    # explicitly marked the value "ip" -- so an unmarked v6 address travelled to
+    # the recording verbatim, while the v4 next to it was pseudonymized.
+    #
+    # The regex only bounds the CANDIDATE; ipaddress.IPv6Address is the actual
+    # gate, which is what keeps this net off adjacent shapes. A MAC address is
+    # six colon-separated hex groups and is never a valid IPv6 literal (v6 needs
+    # eight groups or a "::"), so MACs fall through to their own net below, and
+    # a clock like 09:30:00 is rejected outright.
+    content = _IPV6_CANDIDATE_PATTERN.sub(_replace_ipv6_candidate, content)
+
     # Structural backstop for Active Directory domain/account SIDs.
     #
-    # A domain SID (S-1-5-21-<a>-<b>-<c>) and the per-account SIDs derived from
-    # it (one extra RID: ...-<c>-<rid>) are the unique fingerprint of a
-    # customer's directory -- customer-identifying data that must never reach
-    # the uploaded recording. mark_sensitive(..., "sid") at the source sites is
-    # the primary defense; this regex is the fail-closed net for any raw SID
-    # that slipped through unmarked (mirroring the IPv4/FQDN structural nets).
-    #
-    # Anchored on the S-1-5-21- prefix so well-known SIDs are NEVER matched:
-    # S-1-5-18/19/20/11/9/7 (local/system principals) and S-1-5-32-<rid>
-    # (BUILTIN groups, e.g. S-1-5-32-544 Administrators) are not customer-
-    # identifying and must survive verbatim for triage readability.
-    domain_account_sid_pattern = re.compile(
-        r"\bS-1-5-21-[0-9]+-[0-9]+-[0-9]+(?:-[0-9]+)?\b"
-    )
-    content = domain_account_sid_pattern.sub(
+    # A domain SID and the per-account SIDs derived from it are the unique
+    # fingerprint of a customer's directory -- customer-identifying data that
+    # must never reach the uploaded recording. mark_sensitive(..., "sid") at the
+    # source sites is the primary defense; this regex is the fail-closed net for
+    # any raw SID that slipped through unmarked (mirroring the IPv4/FQDN
+    # structural nets). See _DOMAIN_ACCOUNT_SID_PATTERN for the well-known-SID
+    # carve-out, which the marker path applies too.
+    content = _DOMAIN_ACCOUNT_SID_PATTERN.sub(
         lambda m: m.group(0)
         if _is_already_sanitized(m.group(0))
         else _record_pseudonym(m.group(0), "sid"),
@@ -3520,6 +3949,10 @@ def _sanitize_rich_output(content: str) -> str:
         domain = domain_raw.strip("'\"")
         user = user_raw.strip("'\"")
         pwd = pwd.strip("'\"") if pwd else None
+        if not _looks_like_ad_domain_token(domain, has_password=bool(pwd)):
+            # Ordinary prose ("install/update", "DC/PDC", "and/or"), not a
+            # DOMAIN/USER credential pair. See _looks_like_ad_domain_token.
+            return token
         domain_repl = _apply_quote_wrapped(
             domain_raw, _record_pseudonym(domain, "domain")
         )
@@ -3549,15 +3982,19 @@ def _sanitize_rich_output(content: str) -> str:
     # - Support both legacy `{USER}` placeholders and current `[USER]`
     user_token = r"(?:\[USER\]|\{USER\}|[a-z0-9._$-]+)"
 
-    # Replace domain/user combos before general domain redaction
+    # Replace domain/user combos before general domain redaction.
+    # The separators are TIGHT (no surrounding whitespace): a real
+    # ``DOMAIN/USER:PASSWORD`` token never has spaces around its slash or
+    # colon, while ``\s*/\s*`` let the pattern swallow across a spaced slash
+    # and eat two unrelated words of prose.
     combo_pattern = re.compile(
         rf"""
         (?<![A-Za-z0-9_./~-])
         (?P<domain>["']?{domain_token}["']?)
-        \s*/\s*
+        /
         (?P<user>["']?{user_token}["']?)
         (?:
-            \s*:\s*
+            :
             (?P<pwd>
                 (?:"[^"]*"|'[^']*')
                 |
@@ -3571,18 +4008,60 @@ def _sanitize_rich_output(content: str) -> str:
     content = combo_pattern.sub(_replace_domain_user, content)
 
     # Replace DOMAIN\\USER (e.g., NETBIOS\\username), avoiding Windows drive paths.
+    #
+    # Two patterns, deliberately kept apart because they need opposite
+    # boundaries. The qualified one (``corp.local\\jsnow``) is anchored by the
+    # DOT and stays permissive, so an FQDN keeps being pseudonymized wherever it
+    # appears — including in the middle of a path (``SYSVOL\\corp.local\\…``).
+    # The bare NetBIOS one (``CORP\\jsnow``) has no dot to anchor it, so it needs
+    # strict boundaries or it eats registry and share paths.
+    def _replace_domain_backslash_user(match: re.Match[str]) -> str:
+        domain = match.group("domain")
+        user = match.group("user")
+        domain_repl = (
+            domain
+            if _is_already_sanitized(domain)
+            else _record_pseudonym(domain, "domain")
+        )
+        # A public built-in name (``CORP\\Administrators``) keeps its name; only
+        # the customer-identifying domain half is pseudonymized. Same rule the
+        # ``DOMAIN/USER`` combo and the marker path already apply.
+        user_repl = (
+            user if _is_well_known_principal(user) else _record_pseudonym(user, "user")
+        )
+        return domain_repl + match.group("slashes") + user_repl
+
     domain_backslash_pattern = re.compile(
         # IMPORTANT: `\.` matches a literal dot. Do NOT use `\\.` here, which would
         # match a backslash followed by any character and could accidentally match
         # Windows paths (e.g. `C:\\Users\\...`), causing double-sanitization.
-        r"(?i)(?<![A-Za-z]:)(?<![\\\\/])(?P<domain>[A-Za-z0-9._-]*\.[A-Za-z0-9._-]+)(?P<slashes>\\+)(?P<user>[A-Za-z0-9._$-]+)"
+        r"(?i)(?<![A-Za-z]:)(?<![\\/])(?P<domain>[A-Za-z0-9._-]*\.[A-Za-z0-9._-]+)(?P<slashes>\\+)(?P<user>[A-Za-z0-9._$-]+)"
     )
-    content = domain_backslash_pattern.sub(
-        lambda m: _record_pseudonym(m.group("domain"), "domain")
-        + m.group("slashes")
-        + _record_pseudonym(m.group("user"), "user"),
-        content,
+    content = domain_backslash_pattern.sub(_replace_domain_backslash_user, content)
+
+    # Bare NetBIOS form — ``CORP\\jsnow``, the shape Windows and every AD tool
+    # actually print. It was invisible to the pattern above (which requires a
+    # dot), so the single most common way a principal appears in tool output
+    # travelled to the recording verbatim.
+    #
+    # Accepting a dotless ``word\\word`` needs FULL boundaries on both sides, not
+    # merely "not a separator": a lookbehind that only rejected the separator
+    # would let the engine restart one character later and match
+    # ``OFTWARE\\Microsof`` inside ``HKLM:\\SOFTWARE\\Microsoft``, and a lookahead
+    # that only rejected the separator would backtrack the right-hand token by
+    # one character to dodge it. On top of the boundaries, the left-hand token
+    # has to pass :func:`_looks_like_netbios_domain_prefix`.
+    netbios_backslash_pattern = re.compile(
+        r"(?<![A-Za-z0-9._$:\\/-])(?P<domain>[A-Za-z0-9-]+)"
+        r"(?P<slashes>\\+)(?P<user>[A-Za-z0-9._$-]+)(?![A-Za-z0-9._$\\/-])"
     )
+
+    def _replace_netbios_backslash_user(match: re.Match[str]) -> str:
+        if not _looks_like_netbios_domain_prefix(match.group("domain")):
+            return match.group(0)
+        return _replace_domain_backslash_user(match)
+
+    content = netbios_backslash_pattern.sub(_replace_netbios_backslash_user, content)
 
     # Sanitize USER@DOMAIN:PASSWORD pattern (handles placeholders, real values, and quotes)
     def _is_password_context(match: re.Match[str], text: str) -> bool:
@@ -4000,6 +4479,47 @@ def _sanitize_rich_output(content: str) -> str:
         _replace_hash_argument,
         content,
     )
+
+    # LINE-WRAPPED key material. Rich wraps at terminal width, so on a narrow
+    # terminal a 32-hex NT hash arrives as two hex fragments split by a newline
+    # (plus whatever indentation the renderable carries). Neither hex net below
+    # can anchor a fragment, so BOTH halves used to reach the recording verbatim
+    # and reassembling the two lines recovered the complete hash -- contradicting
+    # the invariant that a raw hash cannot survive export. The primary defence
+    # (``mark_sensitive``) is span-based and already survives a wrap; this is the
+    # BACKSTOP, and it is what an unmarked hash in vendor output, tool stdout, a
+    # command echo or a table cell relies on.
+    #
+    # The joined run is pseudonymized as ONE value and redistributed across the
+    # original fragment lengths, so the wrapped layout is preserved AND the
+    # pseudonym matches the one the same hash gets when it is not wrapped
+    # (keeping hash-reuse correlation intact for a reviewer).
+    def _replace_wrapped_hex(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        fragments = re.split(r"(\s+)", raw)
+        joined = "".join(part for part in fragments if not part.isspace())
+        if not (len(joined) == 32 or 33 <= len(joined) <= 128):
+            return raw
+        if _is_already_sanitized(joined):
+            return raw
+        replacement = _record_pseudonym(joined, "hash")
+        if len(replacement) != len(joined):
+            return raw
+        rebuilt: list[str] = []
+        cursor = 0
+        for part in fragments:
+            if part.isspace():
+                rebuilt.append(part)
+                continue
+            rebuilt.append(replacement[cursor : cursor + len(part)])
+            cursor += len(part)
+        return "".join(rebuilt)
+
+    content = re.sub(
+        r"(?<![0-9A-Za-z])[0-9a-fA-F]+(?:\n[ \t]*[0-9a-fA-F]+)+(?![0-9A-Za-z])",
+        _replace_wrapped_hex,
+        content,
+    )
     content = re.sub(
         r"\b[0-9a-f]{32}:[0-9a-f]{32}\b",
         lambda m: _record_pseudonym(m.group(0), "hash"),
@@ -4008,13 +4528,19 @@ def _sanitize_rich_output(content: str) -> str:
     # Generic long-hex net (defence-in-depth for Kerberos key material). A
     # 64-hex AES256 key has no internal word boundary, so the {32} net below
     # cannot anchor it; this net catches it before upload. The window is bounded
-    # 40..128 hex: the floor (40) keeps the 32-hex NT-hash net's dedicated
+    # 33..128 hex: the floor sits one above the 32-hex NT-hash net's dedicated
     # handling below and never matches short hex (flags, etypes, seq numbers);
     # the ceiling (128) covers AES256 (64) and a concatenated key pair while
     # leaving absurdly long runs to the runaway-value guards (a 1024-char blob is
     # not a key and the keyword sanitizer deliberately preserves it).
+    #
+    # The floor was 40 until a certificate serial of 38 hex characters travelled
+    # verbatim: every length in 33..39 fell between the two nets and matched
+    # neither. Nothing legitimate lives in that window — a 33+ character hex run
+    # is key material, a serial, or a thumbprint, all of which identify the
+    # customer's environment.
     content = re.sub(
-        r"(?i)\b[0-9a-f]{40,128}\b",
+        r"(?i)\b[0-9a-f]{33,128}\b",
         lambda m: _record_pseudonym(m.group(0), "hash"),
         content,
     )
@@ -4054,6 +4580,13 @@ def _sanitize_rich_output(content: str) -> str:
         content,
         keywords=["password", "pass", "pwd"],
         data_type="password",
+        # An ASSIGNMENT ("password: x", "password=x", "│ Password │ x │") is
+        # taken at face value. Bare ADJACENCY ("password x") additionally has
+        # to look like a disclosed secret, because the positional rule used to
+        # pseudonymize whatever word merely FOLLOWED the noun: "password or
+        # NTLM hash" arrived as "password bo NTLM hash" and "the password is
+        # secret" as "the password qt secret".
+        bare_adjacency_guard=_looks_like_disclosed_secret,
     )
     content = _sanitize_keyword_value(
         content,
@@ -4555,12 +5088,129 @@ def _looks_like_keyword_value(value: str) -> bool:
     return True
 
 
+# Words that plausibly FOLLOW "password" / "pass" / "pwd" in ADscan's own
+# prose. The credential-keyword rule also fires on bare adjacency (no ``:`` or
+# ``=``), so without this set an ordinary sentence loses the word after the
+# noun. A miss here only means a prose word is still pseudonymized -- the same
+# behaviour as before -- so extending the set is always safe; it can never
+# cause a secret to survive.
+_CREDENTIAL_ADJACENT_PROSE_WORDS: frozenset[str] = frozenset(
+    {
+        # Security-domain nouns that follow the keyword in product copy.
+        "policy",
+        "policies",
+        "spraying",
+        "spray",
+        "sprays",
+        "cracking",
+        "cracked",
+        "crack",
+        "hash",
+        "hashes",
+        "hashing",
+        "reuse",
+        "reused",
+        "complexity",
+        "expiry",
+        "expired",
+        "expiration",
+        "history",
+        "length",
+        "attempts",
+        "authentication",
+        "auth",
+        "wordlist",
+        "wordlists",
+        "guessing",
+        "attack",
+        "attacks",
+        "strength",
+        "rotation",
+        "candidates",
+        "candidate",
+        "prompt",
+        "prompts",
+        "manager",
+        "vault",
+        "field",
+        "fields",
+        "value",
+        "values",
+        "entry",
+        "entries",
+        "column",
+        "columns",
+        "verification",
+        "validation",
+        "recovery",
+        "protected",
+        "protection",
+        # English function / state words.
+        "already",
+        "because",
+        "before",
+        "cannot",
+        "changed",
+        "during",
+        "either",
+        "enabled",
+        "disabled",
+        "however",
+        "instead",
+        "invalid",
+        "missing",
+        "neither",
+        "optional",
+        "present",
+        "provided",
+        "required",
+        "should",
+        "supplied",
+        "through",
+        "unknown",
+        "unless",
+        "without",
+    }
+)
+
+
+def _looks_like_disclosed_secret(value: str) -> bool:
+    """Return whether a bare-adjacency keyword value looks like a real secret.
+
+    Applied ONLY when the credential keyword was not followed by an assignment
+    (``:`` / ``=`` / a table cell). A digit, a symbol or an internal capital is
+    a credential shape no English word has; anything else has to clear a length
+    floor and not be a known prose word.
+
+    Args:
+        value: The token captured immediately after the keyword.
+
+    Returns:
+        True when the token should be pseudonymized.
+    """
+    if not value:
+        return False
+    candidate = value.strip().strip("'\"")
+    if len(candidate) < 4:
+        return False
+    if any(char.isdigit() for char in candidate):
+        return True
+    if any(not char.isalnum() for char in candidate):
+        return True
+    if any(char.isupper() for char in candidate[1:]):
+        return True
+    if candidate.casefold() in _CREDENTIAL_ADJACENT_PROSE_WORDS:
+        return False
+    return len(candidate) >= 6
+
+
 def _sanitize_keyword_value(
     content: str,
     keywords: list[str],
     data_type: str,
     separator_pattern: str = r"(?:\s*[:=]\s*|\s*[│|]\s*|[ \t]+)",
     value_pattern: str = r"[A-Za-z0-9._@!%^&*+=\\/-]+",
+    bare_adjacency_guard: Optional[Callable[[str], bool]] = None,
 ) -> str:
     """Sanitize values that follow specific keywords (user/password/source/etc.).
 
@@ -4568,6 +5218,11 @@ def _sanitize_keyword_value(
     unquoted (``keyword: value``). Both are defended by the
     ``_looks_like_keyword_value`` guard in the callback so any over-capture
     is silently rejected without polluting the surrounding text.
+
+    ``bare_adjacency_guard`` adds a second, caller-supplied predicate that runs
+    only when the keyword was NOT followed by an assignment separator, so a
+    positional match on ordinary prose can be rejected without weakening the
+    ``keyword: value`` form.
     """
     if not keywords:
         return content
@@ -4621,6 +5276,19 @@ def _sanitize_keyword_value(
         span = match.string[match.start() : match.end()]
         return "\n" in span or "\r" in span
 
+    def _rejected_by_bare_adjacency_guard(match: re.Match[str], value: str) -> bool:
+        """True when the caller's guard rejects a NON-assignment match.
+
+        Group 1 is ``keyword + separator``. When that separator carries no
+        ``:``/``=``/table glyph the keyword and the value are merely adjacent,
+        which is the shape that mistakes prose for a disclosure.
+        """
+        if bare_adjacency_guard is None:
+            return False
+        if any(char in match.group(1) for char in ":=│|"):
+            return False
+        return not bare_adjacency_guard(value)
+
     def _replace_if_not_placeholder(match: re.Match[str]) -> str:
         """Replace value only if it's not already a placeholder."""
         value = match.group("value")
@@ -4641,6 +5309,8 @@ def _sanitize_keyword_value(
             # Regex over-captured into surrounding UI/log text — bail out
             # without pseudonymizing. See `_looks_like_keyword_value`.
             return match.group(0)
+        if _rejected_by_bare_adjacency_guard(match, value_stripped):
+            return match.group(0)
         replacement = _record_pseudonym(value_stripped, data_type)
         return match.group(1) + _fit_to_length(replacement, len(value))
 
@@ -4657,6 +5327,8 @@ def _sanitize_keyword_value(
             return match.group(0)
         if not _looks_like_keyword_value(value_stripped):
             return match.group(0)
+        if _rejected_by_bare_adjacency_guard(match, value_stripped):
+            return match.group(0)
         replacement = _record_pseudonym(value_stripped, data_type)
         raw = f"{match.group('quote')}{value}{match.group('quote')}"
         return match.group(1) + _apply_quote_wrapped(raw, replacement)
@@ -4667,6 +5339,39 @@ def _sanitize_keyword_value(
     unquoted_regex = _build_unquoted_regex()
     content = unquoted_regex.sub(_replace_if_not_placeholder, content)
     return content
+
+
+_BOX_DRAWING_CHARS = "│┌┬└┴├┤┼─╭╮╰╯━┃┏┓┗┛┣┫┳┻╋"
+_HEADING_LEAD_TRIM = "»›*•·-–—[]()#>= \t"
+
+
+def _is_section_heading(line: str, phrases: tuple[str, ...]) -> bool:
+    """Return whether ``line`` opens a credential/user SECTION, not prose.
+
+    ``_mask_credential_sections`` masks every following line wholesale, so the
+    line that switches it on must genuinely be a table header or a panel/table
+    title. Substring matching alone turned ordinary sentences into triggers:
+    the interactive "Choose Scan Type" panel says "(recommended if you have
+    valid domain credentials)" and the two lines under it were replaced with
+    gibberish, level prefix included. "No users found in the OU ..." did the
+    same.
+
+    A heading is either a rendered table/panel line (it carries box-drawing
+    characters) or a line that OPENS with one of the phrases once decoration is
+    stripped -- which is exactly how Rich renders a table title, a panel title
+    and a header row.
+
+    Args:
+        line: The raw line (Rich markup already resolved to text).
+        phrases: Lower-case phrases that legitimately open such a section.
+
+    Returns:
+        True when the line should switch masking on.
+    """
+    if any(char in line for char in _BOX_DRAWING_CHARS):
+        return True
+    head = line.strip().lower().lstrip(_HEADING_LEAD_TRIM)
+    return any(head.startswith(phrase) for phrase in phrases)
 
 
 def _mask_credential_sections(content: str) -> str:
@@ -4681,29 +5386,42 @@ def _mask_credential_sections(content: str) -> str:
             mask_mode = None
             continue
 
-        if "cracked credentials" in stripped:
+        if "cracked credentials" in stripped and _is_section_heading(
+            line, ("cracked credentials",)
+        ):
             mask_mode = "credentials_table"
             continue
 
-        if "domain credentials" in stripped or "credentials for domain" in stripped:
+        if (
+            "domain credentials" in stripped or "credentials for domain" in stripped
+        ) and _is_section_heading(line, ("domain credentials", "credentials for domain")):
             mask_mode = "credentials_table"
             continue
 
-        if "asreproastable users" in stripped or (
-            "users" in stripped and ("[domain]" in stripped or "rid" in stripped)
+        if (
+            "asreproastable users" in stripped
+            or ("users" in stripped and ("[domain]" in stripped or "rid" in stripped))
+        ) and _is_section_heading(line, ("asreproastable users", "users", "rid")):
+            mask_mode = "user_list"
+            continue
+
+        if "users found" in stripped and _is_section_heading(line, ("users found",)):
+            mask_mode = "user_list"
+            continue
+
+        if (
+            "index" in stripped
+            and "users" in stripped
+            and _is_section_heading(line, ("index", "users"))
         ):
             mask_mode = "user_list"
             continue
 
-        if "users found" in stripped:
-            mask_mode = "user_list"
-            continue
-
-        if "index" in stripped and "users" in stripped:
-            mask_mode = "user_list"
-            continue
-
-        if "username" in stripped and "password" in stripped:
+        if (
+            "username" in stripped
+            and "password" in stripped
+            and _is_section_heading(line, ("username", "user", "password"))
+        ):
             if mask_mode != "credentials_table":
                 mask_mode = "credentials_table"
             continue

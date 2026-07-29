@@ -36,6 +36,7 @@ from adscan_core.cli_passthrough_spec import (
     render_passthrough_epilog,
 )
 from adscan_core.interrupts import emit_interrupt_debug
+from adscan_core.outbound_links import cta_display_url, cta_url
 from adscan_core.theme import ADSCAN_THEME
 from adscan_launcher import __version__
 from adscan_launcher.docker_commands import (
@@ -248,6 +249,19 @@ class _DeliverablesAwareParser(argparse.ArgumentParser):
         return base + "\n".join(lines) + "\n"
 
 
+# Help text for the launcher-own ``--partner-tag`` flag, shared by `start` and
+# `ci` so both read identically. This is a LAUNCHER flag (consumed at the seam,
+# never forwarded as a container argument), so it is deliberately NOT part of
+# `adscan_core.cli_passthrough_spec` — that SSOT only mirrors arguments the
+# container parser owns.
+_PARTNER_TAG_FLAG_HELP = (
+    "ADscan PRO: activate this install with the partner tag from your "
+    "onboarding email (for example: --partner-tag acme-mssp). The tag is saved "
+    "under ~/.adscan/state and reused on every later run, so you pass it once "
+    "per machine. Ignored by the free tier."
+)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _DeliverablesAwareParser(prog="adscan", add_help=True)
     parser.add_argument(
@@ -371,8 +385,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-low-memory",
         action="store_true",
         help=(
-            "Allow checks to continue when available RAM is critically low "
+            "Report, instead of failing, when available RAM is critically low "
             "(below 1.0 GB)."
+        ),
+    )
+    # The runtime's own `check` prints "Run: adscan check --fix" whenever a
+    # tool venv or system package is broken (doctor.py, isolated_tools.py,
+    # check.py). Users type that on the HOST, so the launcher has to accept
+    # the flag and route the repair into the container — otherwise the
+    # remediation ADscan prints is unrunnable. Locked by
+    # tests/unit/launcher/test_printed_commands_are_runnable.py.
+    check.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Attempt automatic repairs for detected issues (best effort). "
+            "Runs the in-container repair pass after the host prerequisites pass."
         ),
     )
 
@@ -394,6 +422,36 @@ def _build_parser() -> argparse.ArgumentParser:
             "Allow start to continue when available RAM is critically low "
             "(below 1.0 GB)."
         ),
+    )
+    # Engagement-posture toggles, same semantics as on `ci`: translated into
+    # container environment variables at the launcher seam (they are launcher-own
+    # flags, never forwarded as `adscan start` arguments) and applied to the
+    # launcher's own process environment by `_apply_host_posture_env`.
+    start.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Offline mode: disable every external lookup (weakpass / no-external "
+            "guard) for air-gapped or sovereign engagements. Sets ADSCAN_OFFLINE=1 "
+            "inside the session container."
+        ),
+    )
+    start.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        dest="no_telemetry",
+        help=(
+            "Disable anonymous usage telemetry for this session (sensitive "
+            "engagements). Sets ADSCAN_TELEMETRY=0 inside the session container. "
+            "To opt out permanently, run 'set telemetry off' in the shell."
+        ),
+    )
+    start.add_argument(
+        "--partner-tag",
+        dest="partner_tag",
+        default=None,
+        metavar="TAG",
+        help=_PARTNER_TAG_FLAG_HELP,
     )
     # `--tui` and the top-level `tui` subcommand are intentionally hidden
     # from --help while the Textual workbench is under active development.
@@ -452,7 +510,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "and is graduating from experimental as confidence in the autonomous "
             "decisions accumulates.\n\n"
             "If autonomous decisions look wrong on your engagement, re-run with "
-            "`--debug` and report the trace at https://adscanpro.com/docs."
+            "`--debug` and report the trace at " + cta_url("ci_help_debug")
         ),
         # The scan arguments below are forwarded to the container runtime through
         # argparse.REMAINDER (`args`), so argparse cannot list them natively. The
@@ -505,6 +563,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "Disable anonymous usage telemetry for this run (sensitive "
             "engagements). Sets ADSCAN_TELEMETRY=0 inside the scan container."
         ),
+    )
+    ci.add_argument(
+        "--partner-tag",
+        dest="partner_tag",
+        default=None,
+        metavar="TAG",
+        help=_PARTNER_TAG_FLAG_HELP,
     )
     ci.add_argument(
         "--scan-config",
@@ -871,10 +936,12 @@ def _consume_ci_remainder_global_flags(ns: argparse.Namespace) -> None:
     setattr(ns, "args", _consume_trailing_global_flags(ns, remainder))
 
 
-def _ci_posture_env_from_flags(
+def _posture_env_from_flags(
     ns: argparse.Namespace, passthrough: list[str]
 ) -> tuple[list[tuple[str, str]], list[str]]:
-    """Translate the `ci` engagement-posture flags into container env vars.
+    """Translate the engagement-posture flags into container env vars.
+
+    Shared by `ci` and `start` (both declare `--offline` / `--no-telemetry`).
 
     The two Settings-tab toggles (``--offline`` / ``--no-telemetry``) are
     interpreted at the launcher seam rather than forwarded as `adscan ci`
@@ -916,6 +983,109 @@ def _ci_posture_env_from_flags(
         extra_env.append(("ADSCAN_TELEMETRY", "0"))
 
     return extra_env, cleaned
+
+
+def _extract_partner_tag_flag(
+    ns: argparse.Namespace, passthrough: list[str]
+) -> tuple[str | None, list[str]]:
+    """Pull ``--partner-tag <value>`` out of the namespace and the passthrough.
+
+    Mirrors ``--scan-config``: the parsed attribute is used when the flag
+    preceded the auth/unauth positional, and the raw passthrough is scanned for
+    tokens that landed after it (past ``argparse.REMAINDER``'s flag cut-off).
+    Recognised tokens are removed so they never reach the container's parser.
+
+    Returns:
+        ``(tag_or_None, cleaned_passthrough)``.
+
+    Raises:
+        SystemExit: with code 2 when ``--partner-tag`` is given without a value.
+    """
+    tag = getattr(ns, "partner_tag", None)
+
+    cleaned: list[str] = []
+    tokens = list(passthrough)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--partner-tag":
+            if index + 1 < len(tokens):
+                tag = tokens[index + 1]
+                index += 2
+                continue
+            print_error("--partner-tag requires a tag argument.")
+            raise SystemExit(2)
+        if token.startswith("--partner-tag="):
+            tag = token.split("=", 1)[1]
+            index += 1
+            continue
+        cleaned.append(token)
+        index += 1
+
+    normalized = str(tag).strip() if tag is not None else None
+    return (normalized or None), cleaned
+
+
+def _apply_partner_tag_flag(
+    ns: argparse.Namespace, passthrough: list[str]
+) -> list[str]:
+    """Activate this install with ``--partner-tag`` and strip it from the args.
+
+    ADscan PRO refuses to start without a partner tag, and until this flag
+    existed the only documented recovery was an environment variable — which is
+    a route the operator cannot take on their own if the launcher does not
+    forward it. This is the route that always works: the tag is validated
+    against the shared format contract, persisted to the bind-mounted state dir
+    (``~/.adscan/state/partner.json`` -> ``/opt/adscan/state``, so it survives
+    ``docker run --rm`` and every later run), and exported on the launcher
+    process so the standard env forwarding carries it into THIS run.
+
+    Setting the launcher's own environment (rather than returning an extra
+    ``-e``) keeps one forwarding mechanism: an explicit flag simply overrides an
+    ambient ``ADSCAN_PARTNER_TAG`` for this run instead of racing it.
+
+    Args:
+        ns: Parsed launcher namespace.
+        passthrough: Raw container passthrough tokens (empty for ``start``).
+
+    Returns:
+        The passthrough with any ``--partner-tag`` tokens removed.
+
+    Raises:
+        SystemExit: with code 2 when the tag is missing its value or malformed.
+    """
+    tag, cleaned = _extract_partner_tag_flag(ns, passthrough)
+    if not tag:
+        return cleaned
+
+    from adscan_core import telemetry as _telemetry
+
+    if not _telemetry.validate_partner_tag(tag):
+        print_error(
+            "Invalid partner tag. Use the tag from your onboarding email: "
+            f"{_telemetry.PARTNER_TAG_FORMAT_HINT}."
+        )
+        raise SystemExit(2)
+
+    tag = tag.lower()
+    try:
+        _telemetry.persist_partner_tag(tag)
+    except OSError as exc:
+        capture_exception(exc)
+        print_exception(exception=exc)
+        # Non-fatal: the tag still reaches this run through the environment
+        # below; only the "ask once per machine" convenience is lost.
+        print_warning(
+            "Could not save the partner tag for future runs. Check that "
+            "~/.adscan is writable; this run continues with the tag you passed."
+        )
+
+    os.environ["ADSCAN_PARTNER_TAG"] = tag
+    try:
+        _telemetry.refresh_partner_tag()
+    except Exception:  # noqa: BLE001 — attribution is never worth failing a run
+        pass
+    return cleaned
 
 
 # Container path the scan-config file is bind-mounted at. Fixed (not under the
@@ -983,9 +1153,9 @@ def _ci_scan_config_from_flags(
 
 
 def _apply_host_posture_env(ns: argparse.Namespace, raw_argv: list[str]) -> None:
-    """Gate the LAUNCHER's OWN telemetry when a ``ci`` run opts out.
+    """Gate the LAUNCHER's OWN telemetry when a run opts out (``ci`` or ``start``).
 
-    ``_ci_posture_env_from_flags`` configures the scan CONTAINER, but the host
+    ``_posture_env_from_flags`` configures the scan CONTAINER, but the host
     launcher independently drains the telemetry queue and uploads its own
     preflight recording (both gated by the launcher process's environment, not
     the container's). Without this, ``adscan ci --no-telemetry`` / ``--offline``
@@ -1207,7 +1377,7 @@ def _guard_supported_host_platform(
             "Parrot) or macOS with Docker Desktop, then retry."
         )
         print_instruction(
-            "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
+            "System requirements: " + cta_display_url("unsupported_platform")
         )
         print_info_debug(
             "[platform] blocked unsupported host platform: "
@@ -1275,7 +1445,7 @@ def _guard_supported_host_platform(
             "Use a native Linux host or Linux VM instead of Docker-from-WSL."
         )
         print_instruction(
-            "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
+            "System requirements: " + cta_display_url("unsupported_wsl")
         )
         print_info_debug(
             "[platform] blocked unsupported WSL environment: "
@@ -1330,7 +1500,7 @@ def _guard_supported_host_platform(
         "Use an x86_64 or arm64 Linux host, or rebuild/run the container stack with compatible images."
     )
     print_instruction(
-        "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
+        "System requirements: " + cta_display_url("unsupported_arch")
     )
     print_info_debug(
         "[platform] blocked unsupported host architecture: "
@@ -1834,6 +2004,15 @@ def main(argv: list[str] | None = None) -> None:
     # drain so the gate sees it. (See _apply_host_posture_env.)
     _apply_host_posture_env(ns, raw_argv)
 
+    # One-time promotion of a per-workspace telemetry opt-out to the global
+    # preference, before anything can upload. Idempotent and best-effort.
+    try:
+        from adscan_core.telemetry_preference import migrate_and_notify
+
+        migrate_and_notify()
+    except Exception:
+        pass
+
     # Best-effort drain of any telemetry sessions that failed to upload
     # in previous CLI invocations (network blip, crash mid-flight,
     # oversize payload, etc.). Runs on a background thread; the launcher
@@ -1883,6 +2062,12 @@ def main(argv: list[str] | None = None) -> None:
 
     if cmd == "start":
         pull_timeout = getattr(ns, "pull_timeout", 3600)
+        # Same seam as `ci`: the posture toggles are consumed here and handed to
+        # the container as environment, never as `adscan start` arguments.
+        start_posture_env, _ = _posture_env_from_flags(ns, [])
+        # PRO activation: persist + export the partner tag before the container
+        # starts, so the in-container start gate finds it.
+        _apply_partner_tag_flag(ns, [])
         raise SystemExit(
             _run_host_command_with_session_capture(
                 command_type="start",
@@ -1893,6 +2078,7 @@ def main(argv: list[str] | None = None) -> None:
                     pull_timeout_seconds=int(pull_timeout),
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                     tui=bool(getattr(ns, "tui", False)),
+                    extra_env=start_posture_env,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
@@ -1947,6 +2133,9 @@ def main(argv: list[str] | None = None) -> None:
                 telemetry_console=telemetry_console,
                 runner=lambda: handle_check_docker(
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                    fix=bool(getattr(ns, "fix", False)),
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
                 ),
                 extra={"mode": "docker"},
             )
@@ -1976,11 +2165,17 @@ def main(argv: list[str] | None = None) -> None:
         # Translate the engagement-posture toggles (--offline / --no-telemetry)
         # into container environment variables. The flags are consumed here, NOT
         # forwarded into the container as `ci` args, because the internal runtime
-        # honours them via env. ``_ci_posture_env_from_flags`` also strips the
+        # honours them via env. ``_posture_env_from_flags`` also strips the
         # tokens out of the passthrough so a token that landed after the
         # auth/unauth positional (past argparse.REMAINDER's flag cut-off) still
         # takes effect and never reaches the container parser.
-        posture_env, passthrough = _ci_posture_env_from_flags(ns, passthrough)
+        posture_env, passthrough = _posture_env_from_flags(ns, passthrough)
+        # PRO activation: validate + persist the partner tag and export it on
+        # this process so the standard env forwarding carries it into the scan
+        # container (the in-container gate otherwise refuses to start PRO).
+        # Consumed at the seam and stripped from the passthrough, like the
+        # toggles above.
+        passthrough = _apply_partner_tag_flag(ns, passthrough)
         # Translate --scan-config <host-path> into a read-only container mount +
         # ADSCAN_SCAN_CONFIG env var. Consumed at the seam and stripped from the
         # passthrough (mirrors the posture-toggle pattern). Absent = no-op.

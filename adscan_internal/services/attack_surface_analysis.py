@@ -1,12 +1,19 @@
 """Attack Surface Analysis — shared, Word/PDF-free service.
 
-Computes node centrality, relation centrality, and remediation priority
-from a set of attack paths for a single domain.
+Computes node centrality, technique (relation) centrality, and remediation
+priority from a set of attack paths for a single domain.
+
+The technique axis — *which fix closes the most paths* — is derived by the shared
+single source of truth :mod:`adscan_internal.services.technique_priority`, the
+same derivation the paid deliverable's remediation ranking reads. Only the NODE
+axis (which single object the most paths run through) lives here, because it
+answers a different question. Nothing about a technique is recomputed in this
+module.
 
 Designed to be importable by:
 - CLI report renderer  (adscan_internal.pro.reporting.*)
-- adscan_web CTEM backend (future — exposes this data via REST API)
-- CLI shell commands (attack_surface, remediation_priority, etc.)
+- adscan_web CTEM backend (per-finding remediation intelligence)
+- the LITE exposure report's choke-point table
 
 No Word, PDF, or graphviz dependencies.  Pure Python + stdlib.
 """
@@ -16,56 +23,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
-# ── Status priority (lower = more severe) ─────────────────────────────────────
-_STATUS_SEVERITY: dict[str, int] = {
-    "exploited": 0,
-    "success": 0,
-    "succeeded": 0,
-    "blocked": 1,
-    "unsupported": 2,
-    "attempted": 3,
-    "failed": 3,
-    "error": 3,
-    "partial": 3,
-    "theoretical": 4,
-}
-
-_COMPLEXITY_ORDER: dict[str, int] = {
-    "low": 0,
-    "medium": 1,
-    "high": 2,
-    "very_high": 3,
-}
-
-
-def _normalize_status(raw: str) -> str:
-    s = str(raw or "theoretical").strip().lower()
-    if s in {"exploited", "success", "succeeded"}:
-        return "exploited"
-    if s == "blocked":
-        return "blocked"
-    if s == "unsupported":
-        return "unsupported"
-    if s in {"attempted", "failed", "error", "partial"}:
-        return "attempted"
-    return "theoretical"
-
-
-def _status_severity(status: str) -> int:
-    return _STATUS_SEVERITY.get(status, 4)
-
-
-def _path_relations(path: dict[str, Any]) -> list[str]:
-    """Return the non-MemberOf relation names for a path."""
-    relations = path.get("relations")
-    if not isinstance(relations, list):
-        return []
-    return [
-        str(r).strip().lower()
-        for r in relations
-        if str(r).strip().lower() != "memberof"
-    ]
+from adscan_internal.services.technique_priority import (
+    carries_client_exposure,
+    compute_technique_priorities,
+    normalize_path_status,
+    status_for_severity,
+    status_severity,
+)
 
 
 def _path_nodes(path: dict[str, Any]) -> list[str]:
@@ -90,6 +54,14 @@ class NodeCentralityEntry:
     is_entry_point: bool = False  # True if node appears as path source
     is_tier0_target: bool = False  # True if node appears as path target (last node)
     is_intermediate: bool = False  # True if node is neither source nor target
+    #: Of :attr:`path_count`, how many describe client exposure — a path whose
+    #: avenue the client's configuration already closed, or that ADscan had no
+    #: surface to walk, still runs through this node topologically but is not
+    #: something to fix. Remediation reads this count; graph rendering reads
+    #: :attr:`path_count`.
+    exposed_path_count: int = 0
+    #: :attr:`worst_status` restricted to those exposure-bearing paths.
+    exposed_worst_status: str = "theoretical"
 
 
 @dataclass
@@ -104,6 +76,9 @@ class RelationCentralityEntry:
     remediation_complexity: str = "medium"
     remediation_effort: str = ""
     can_fully_mitigate: bool = True
+    #: Distinct principals whose paths use this relation. "12 paths" is abstract;
+    #: "12 paths, 9 accounts" is the number a client acts on.
+    affected_principals: int = 0
 
 
 @dataclass
@@ -127,6 +102,8 @@ class RemediationTarget:
     remediation_complexity_rank: int  # 0–3 for sorting
     remediation_effort: str
     can_fully_mitigate: bool = True
+    #: Distinct principals whose paths this target eliminates.
+    affected_principals: int = 0
 
 
 @dataclass
@@ -162,17 +139,6 @@ def compute_attack_surface_analysis(
     Returns:
         AttackSurfaceAnalysis with centrality, remediation priority, etc.
     """
-    # Lazy import to avoid circular deps at module level.
-    # attack_step_catalog is in services/ — no pro/reporting dep needed.
-    try:
-        from adscan_internal.services.attack_step_catalog import (
-            get_step_metadata,
-        )
-
-        _has_step_meta = True
-    except ImportError:
-        _has_step_meta = False
-
     if not isinstance(paths, list) or not paths:
         return AttackSurfaceAnalysis(
             domain=domain,
@@ -183,15 +149,17 @@ def compute_attack_surface_analysis(
             remediation_priority=[],
         )
 
-    # ── Pass 1: per-path data ────────────────────────────────────────────────
+    # ── Pass 1: the TECHNIQUE axis, from the shared SSOT ─────────────────────
+    # "Which technique carries the most paths" is one question with one
+    # derivation, shared with the paid deliverable's remediation ranking.
+    techniques = compute_technique_priorities(paths, domain=domain)
+
+    # ── Pass 2: the NODE axis, local ─────────────────────────────────────────
+    # A different question: which single OBJECT do the most paths run through.
     status_counts: dict[str, int] = {}
     # node_id -> {path_count, worst_severity, is_entry, is_target, is_intermediate}
     node_data: dict[str, dict] = {}
-    # relation_key -> {path_count, worst_severity, meta}
-    rel_data: dict[str, dict] = {}
-    # All unique node ids and relation keys across all paths
     all_nodes: set[str] = set()
-    all_relations: set[str] = set()
     entry_nodes: set[str] = set()
     tier0_nodes: set[str] = set()
 
@@ -199,13 +167,12 @@ def compute_attack_surface_analysis(
         if not isinstance(path, dict):
             continue
 
-        raw_status = path.get("status") or "theoretical"
-        status = _normalize_status(str(raw_status))
-        severity = _status_severity(status)
+        status = normalize_path_status(path.get("status"))
+        severity = status_severity(status)
         status_counts[status] = status_counts.get(status, 0) + 1
+        exposed = carries_client_exposure(path.get("status"))
 
         nodes = _path_nodes(path)
-        rels = _path_relations(path)
 
         for i, node_id in enumerate(nodes):
             all_nodes.add(node_id)
@@ -222,6 +189,8 @@ def compute_attack_surface_analysis(
                 node_data[node_id] = {
                     "path_count": 0,
                     "worst_severity": severity,
+                    "exposed_path_count": 0,
+                    "exposed_worst_severity": None,
                     "is_entry": is_entry,
                     "is_target": is_target,
                     "is_intermediate": is_intermediate,
@@ -230,6 +199,11 @@ def compute_attack_surface_analysis(
             d["path_count"] += 1
             if severity < d["worst_severity"]:
                 d["worst_severity"] = severity
+            if exposed:
+                d["exposed_path_count"] += 1
+                current = d["exposed_worst_severity"]
+                if current is None or severity < current:
+                    d["exposed_worst_severity"] = severity
             if is_entry:
                 d["is_entry"] = True
             if is_target:
@@ -237,48 +211,13 @@ def compute_attack_surface_analysis(
             if is_intermediate:
                 d["is_intermediate"] = True
 
-        for rel_key in rels:
-            all_relations.add(rel_key)
-
-            if _has_step_meta:
-                meta = get_step_metadata(rel_key)
-                complexity = meta.get("remediation_complexity", "medium")
-                effort = meta.get("remediation_effort", "")
-                can_mitigate = bool(meta.get("can_fully_mitigate", True))
-                complexity_rank = _COMPLEXITY_ORDER.get(complexity, 1)
-            else:
-                complexity = "medium"
-                effort = ""
-                can_mitigate = True
-                complexity_rank = 1
-
-            if rel_key not in rel_data:
-                rel_data[rel_key] = {
-                    "path_count": 0,
-                    "worst_severity": severity,
-                    "remediation_complexity": complexity,
-                    "remediation_effort": effort,
-                    "can_fully_mitigate": can_mitigate,
-                    "complexity_rank": complexity_rank,
-                }
-            d = rel_data[rel_key]
-            d["path_count"] += 1
-            if severity < d["worst_severity"]:
-                d["worst_severity"] = severity
-
     total = len([p for p in paths if isinstance(p, dict)])
-
-    # ── Pass 2: build NodeCentralityEntry list ───────────────────────────────
-    _sev_to_status = {
-        v: k
-        for k, v in _STATUS_SEVERITY.items()
-        if k in {"exploited", "blocked", "unsupported", "attempted", "theoretical"}
-    }
 
     node_centrality: list[NodeCentralityEntry] = []
     for node_id, d in node_data.items():
         worst_sev = d["worst_severity"]
-        worst_status = _sev_to_status.get(worst_sev, "theoretical")
+        worst_status = status_for_severity(worst_sev)
+        exposed_sev = d["exposed_worst_severity"]
         node_centrality.append(
             NodeCentralityEntry(
                 node_id=node_id,
@@ -288,85 +227,85 @@ def compute_attack_surface_analysis(
                 is_entry_point=d["is_entry"],
                 is_tier0_target=d["is_target"],
                 is_intermediate=d["is_intermediate"],
+                exposed_path_count=d["exposed_path_count"],
+                exposed_worst_status=(
+                    status_for_severity(exposed_sev)
+                    if exposed_sev is not None
+                    else "theoretical"
+                ),
             )
         )
     node_centrality.sort(key=lambda e: (-e.path_count, e.worst_status_severity))
 
-    # ── Pass 3: build RelationCentralityEntry list ───────────────────────────
-    relation_centrality: list[RelationCentralityEntry] = []
-    for rel_key, d in rel_data.items():
-        worst_sev = d["worst_severity"]
-        worst_status = _sev_to_status.get(worst_sev, "theoretical")
-        relation_centrality.append(
-            RelationCentralityEntry(
-                relation=rel_key,
-                path_count=d["path_count"],
-                worst_status=worst_status,
-                worst_status_severity=worst_sev,
-                remediation_complexity=d["remediation_complexity"],
-                remediation_effort=d["remediation_effort"],
-                can_fully_mitigate=d["can_fully_mitigate"],
-            )
+    # ── Pass 3: project the shared technique ranking ─────────────────────────
+    # Structural edges never reach this list — the SSOT already excludes them,
+    # so a built-in group nesting can never be offered to a client as a fix.
+    relation_centrality: list[RelationCentralityEntry] = [
+        RelationCentralityEntry(
+            relation=entry.technique,
+            path_count=entry.paths_affected,
+            worst_status=entry.worst_status,
+            worst_status_severity=entry.worst_status_severity,
+            remediation_complexity=entry.remediation_complexity,
+            remediation_effort=entry.remediation_effort,
+            can_fully_mitigate=entry.can_fully_mitigate,
+            affected_principals=entry.affected_principals,
         )
+        for entry in techniques
+    ]
     relation_centrality.sort(key=lambda e: (-e.path_count, e.worst_status_severity))
+    all_relations: set[str] = {entry.relation for entry in relation_centrality}
 
     # ── Pass 4: Remediation priority list ───────────────────────────────────
-    # Intermediate nodes: fixing the node (e.g., removing a GenericAll ACL on it)
-    # eliminates all paths passing through it.
-    # Relations: fixing the relation type (e.g., patching Zerologon) eliminates
-    # all paths using that edge.
-    # We include both, deduplicated, sorted by:
-    #   1. paths_eliminated desc
-    #   2. remediation_complexity_rank asc (easier first)
-    #   3. worst_status_severity asc (confirmed first)
+    # Two kinds of target, deduplicated into one ranking:
+    #   * a TECHNIQUE — fix the class (patch Zerologon, revoke the ACL pattern)
+    #     and every path that uses it closes;
+    #   * an intermediate NODE — one over-connected object many paths run
+    #     through, which is usually a symptom of one of the techniques above.
+    # Sorted by paths eliminated, then cheapest remediation, then worst status.
 
-    remediation_targets: list[RemediationTarget] = []
-
-    # Relation-based targets (more actionable — you fix a vuln, not a specific node)
-    for entry in relation_centrality:
-        if entry.relation in {"memberof"}:
-            continue
-        complexity_rank = _COMPLEXITY_ORDER.get(entry.remediation_complexity, 1)
-        elimination_rate = entry.path_count / total if total else 0.0
-        remediation_targets.append(
-            RemediationTarget(
-                target_id=entry.relation,
-                target_label=entry.relation.upper()
-                if not entry.remediation_effort
-                else _friendly_rel_label(entry.relation),
-                target_type="relation",
-                paths_eliminated=entry.path_count,
-                total_paths=total,
-                elimination_rate=elimination_rate,
-                worst_status=entry.worst_status,
-                remediation_complexity=entry.remediation_complexity,
-                remediation_complexity_rank=complexity_rank,
-                remediation_effort=entry.remediation_effort,
-                can_fully_mitigate=entry.can_fully_mitigate,
-            )
+    remediation_targets: list[RemediationTarget] = [
+        RemediationTarget(
+            target_id=entry.technique,
+            target_label=entry.label,
+            target_type="relation",
+            paths_eliminated=entry.paths_affected,
+            total_paths=total,
+            elimination_rate=entry.paths_affected / total if total else 0.0,
+            worst_status=entry.worst_status,
+            remediation_complexity=entry.remediation_complexity,
+            remediation_complexity_rank=entry.remediation_complexity_rank,
+            remediation_effort=entry.remediation_effort,
+            can_fully_mitigate=entry.can_fully_mitigate,
+            affected_principals=entry.affected_principals,
         )
+        for entry in techniques
+    ]
 
-    # Node-based targets (intermediate nodes with high centrality)
+    # Node-based targets (intermediate nodes with high centrality). Counted on
+    # exposure-bearing paths only, for the same reason the technique axis is: a
+    # node whose routes the client's configuration already closed is not work to
+    # do, and a node ADscan could not reach is our data gap, not their exposure.
     for entry in node_centrality:
         if entry.is_entry_point or entry.is_tier0_target:
             continue  # entry points and targets are structural, not remediable
-        if entry.path_count < 2:
+        if entry.exposed_path_count < 2:
             continue  # single-path nodes: not worth listing separately
-        elimination_rate = entry.path_count / total if total else 0.0
+        elimination_rate = entry.exposed_path_count / total if total else 0.0
         remediation_targets.append(
             RemediationTarget(
                 target_id=entry.node_id,
                 target_label=entry.node_id,
                 target_type="node",
-                paths_eliminated=entry.path_count,
+                paths_eliminated=entry.exposed_path_count,
                 total_paths=total,
                 elimination_rate=elimination_rate,
-                worst_status=entry.worst_status,
+                worst_status=entry.exposed_worst_status,
                 remediation_complexity="medium",  # node-level: ACL/config fix
                 remediation_complexity_rank=1,
                 remediation_effort=(
                     f"Remediate the vulnerabilities or ACL misconfigurations that "
-                    f"allow {entry.path_count} attack path(s) to pass through this object."
+                    f"allow {entry.exposed_path_count} attack path(s) to pass through this object."
                 ),
                 can_fully_mitigate=True,
             )
@@ -376,7 +315,7 @@ def compute_attack_surface_analysis(
         key=lambda t: (
             -t.paths_eliminated,
             t.remediation_complexity_rank,
-            t.worst_status,
+            status_severity(t.worst_status),
         )
     )
 
@@ -392,52 +331,6 @@ def compute_attack_surface_analysis(
         entry_nodes=entry_nodes,
         tier0_nodes=tier0_nodes,
     )
-
-
-def _friendly_rel_label(rel: str) -> str:
-    """Return a human-readable label for a relation key."""
-    label_map = {
-        "adcsesc1": "ADCS ESC1",
-        "adcsesc2": "ADCS ESC2",
-        "adcsesc3": "ADCS ESC3",
-        "adcsesc4": "ADCS ESC4",
-        "adcsesc6": "ADCS ESC6",
-        "adcsesc8": "ADCS ESC8",
-        "adcsesc9": "ADCS ESC9",
-        "adcsesc10": "ADCS ESC10",
-        "adcsesc13": "ADCS ESC13",
-        "adcsesc15": "ADCS ESC15",
-        "genericall": "GenericAll",
-        "genericwrite": "GenericWrite",
-        "writedacl": "WriteDACL",
-        "writeowner": "WriteOwner",
-        "forcechangepassword": "ForceChangePassword",
-        "addmember": "AddMember",
-        "writelogonscript": "WriteLogonScript",
-        "managerodcprp": "ManageRODCPrp",
-        "writesmbpath": "WriteSmbPath",
-        "readlapspassword": "ReadLAPSPassword",
-        "readgmsapassword": "ReadGMSAPassword",
-        "dcsync": "DCSync",
-        "goldencert": "GoldenCert",
-        "adminto": "AdminTo",
-        "kerberoasting": "Kerberoasting",
-        "asreproasting": "ASREPRoasting",
-        "zerologon": "Zerologon",
-        "nopac": "NoPac",
-        "printnightmare": "PrintNightmare",
-        "dfscoerce": "DFSCoerce",
-        "petitpotam": "PetitPotam",
-        "printerbug": "PrinterBug",
-        "mseven": "MS17-010",
-        "ms17-010": "MS17-010",
-        "sqlaccess": "SQLAccess",
-        "sqladmin": "SQLAdmin",
-        "allowedtodelegate": "ConstrainedDelegation",
-        "coercetotgt": "UnconstrainedDelegation",
-        "allowedtoactonbehalfofotheridentity": "RBCD",
-    }
-    return label_map.get(str(rel).lower(), str(rel))
 
 
 def top_remediation_targets(

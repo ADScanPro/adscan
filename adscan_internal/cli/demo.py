@@ -21,6 +21,8 @@ Module is loaded from both:
 
 from __future__ import annotations
 
+from adscan_core.version import get_version
+
 import argparse
 import os
 import random
@@ -31,6 +33,11 @@ from pathlib import Path
 from typing import Sequence
 
 from adscan_core import telemetry
+from adscan_core.outbound_links import (
+    cta_display_url,
+    cta_link_style,
+    cta_markup,
+)
 from adscan_core.paths import get_workspaces_dir
 from adscan_core.posture_score import PostureInputs, PostureScore, compute_posture_score
 from adscan_core.rich_output import (
@@ -68,7 +75,7 @@ DEMO_DOMAIN = "essos.local"
 DEMO_WORKSPACE_NAME = "demo-goad"
 DEMO_REPORT_FILENAME = "Sample_Report.pdf"
 DEMO_KIT_FILENAME = "Sample_Kit.zip"
-DEMO_DOCS_URL = "https://adscanpro.com/docs"
+DEMO_DOCS_URL = cta_display_url("demo_next_steps")
 
 # Color tokens (mirrors adscan_core.theme — kept inline so we don't widen the
 # public theme surface for one command).
@@ -251,7 +258,7 @@ def _print_next_steps() -> None:
         f"[bold {_CYAN}]•[/] Run against your own domain:\n"
         f"    [bold]adscan start[/]\n"
         f"[bold {_CYAN}]•[/] Read the playbook:\n"
-        f"    [bold]{DEMO_DOCS_URL}[/]"
+        f"    [bold]{cta_markup('demo_next_steps', DEMO_DOCS_URL)}[/]"
     )
     print_panel(body, title=f"[bold {_CYAN}]NEXT STEPS[/]", border_style=_CYAN)
 
@@ -407,7 +414,7 @@ def _generate_demo_pdf(
         "workspace_name": workspace_name,
         "report_date": time.strftime("%B %d, %Y"),
         "report_type": "Active Directory Security Assessment (Demo)",
-        "report_version": "ADscan",
+        "report_version": get_version(),
     }
 
     pdf_bytes = generate_report_pdf(
@@ -494,7 +501,10 @@ def _render_lite_closing_panel(*, lite_dir: Path, pro_preview_dir: Path) -> None
 
     cta = Text()
     cta.append("Upgrade: ", style="bold")
-    cta.append("https://adscanpro.com/pro", style="bold bright_cyan")
+    cta.append(
+        cta_display_url("demo_closing"),
+        style=cta_link_style("demo_closing", "bold bright_cyan"),
+    )
 
     body = Group(
         eyebrow,
@@ -653,7 +663,10 @@ def _render_lite_cast_closing_panel(*, workspace_dir: Path) -> None:
 
     cta = Text()
     cta.append("Upgrade: ", style="bold")
-    cta.append("https://adscanpro.com/pro", style="bold bright_cyan")
+    cta.append(
+        cta_display_url("demo_closing"),
+        style=cta_link_style("demo_closing", "bold bright_cyan"),
+    )
 
     body = Group(
         eyebrow,

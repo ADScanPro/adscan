@@ -212,9 +212,25 @@ def _run_deliver(shell: Any, args: str) -> None:
     from adscan_core import tier
 
     if not tier.is_pro():
-        from adscan_core.pro_upsell import print_pro_upsell
+        # LITE: produce the artifact, never point at another verb. The REPL
+        # aliases ``report`` / ``reporting`` / ``generate_report`` onto
+        # ``deliver``, so an upsell telling the operator to run
+        # ``generate_report`` routes straight back here and loops forever with
+        # no report at the end. The tier decides the output, not the verb (same
+        # rule as ``ci``): LITE renders the self-contained HTML exposure report
+        # and the success panel carries the pointer to the PRO kit.
+        #
+        # Kept byte-identical to the ``do_deliver`` branch in ``adscan.py``:
+        # both handlers are reachable through the registry binder, and letting
+        # them disagree is how this bug reached a real session.
+        from adscan_internal.services.post_scan_report import (
+            TRIGGER_REPL_DELIVER,
+            generate_report_with_telemetry,
+        )
 
-        print_pro_upsell("deliver", "direct_invocation")
+        generate_report_with_telemetry(
+            shell, trigger=TRIGGER_REPL_DELIVER, asked_for_the_kit=True
+        )
         return
 
     from adscan_internal.cli.deliver import run_deliver_sync
@@ -231,6 +247,18 @@ def _run_deliver(shell: Any, args: str) -> None:
             os.environ.pop("ADSCAN_CURRENT_WORKSPACE", None)
         else:
             os.environ["ADSCAN_CURRENT_WORKSPACE"] = prev
+
+
+def _run_writeup(shell: Any, args: str) -> None:
+    """Write the writeup evidence spine for the active workspace.
+
+    The single positional argument is an output directory, so the operator can
+    drop the spine straight into a blog repository instead of the workspace.
+    """
+    from adscan_internal.services.writeup_spine import generate_writeup_spine
+
+    tokens = shlex.split(args) if args.strip() else []
+    generate_writeup_spine(shell, output_dir=tokens[0] if tokens else None)
 
 
 def _run_mitre_navigator(shell: Any, args: str) -> None:
@@ -369,6 +397,35 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
         handler=_run_mitre_navigator,
         suggested_after=("start_auth", "start_unauth"),
         is_deliverable=True,
+    ),
+    # Not flagged as a deliverable and not suggested after a scan: this is a
+    # lab artifact, and the post-scan seam already offers it to the population
+    # that wants it (``post_scan_report``, lab workspaces only). Putting it in
+    # the client deliverables list would push a personal blog draft into an
+    # engagement's end-of-scan panel.
+    ShellCommandSpec(
+        verb="writeup",
+        category=_DELIVERABLES_CATEGORY,
+        short_help="Write a Markdown evidence spine for a lab writeup (you write the prose).",
+        long_help=(
+            "Usage:\n"
+            "  writeup [OUTPUT_DIR]\n\n"
+            "Record the mechanical part of a writeup while it is still on disk:\n"
+            "the ports that answered, what the directory held, the chain as a\n"
+            "mermaid diagram, every step that ran with its outcome and a public\n"
+            "reference for the technique, which credential came from which\n"
+            "technique, and the routes that went nowhere.\n\n"
+            "It writes no analysis. The paragraphs that carry a writeup are left\n"
+            "as marked, empty placeholders for you to fill in.\n\n"
+            "The output is a local Markdown draft under the workspace, marked\n"
+            "draft in its frontmatter. Nothing is published or uploaded.\n\n"
+            "Examples:\n"
+            "  writeup\n"
+            "  writeup ~/blog/content/posts/certified\n"
+        ),
+        handler=_run_writeup,
+        suggested_after=(),
+        is_deliverable=False,
     ),
 )
 

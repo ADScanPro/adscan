@@ -2492,6 +2492,90 @@ def offer_a_record_fallback(
 
 
 
+def seed_dc_context_after_dns_success(
+    shell: DNSShell, *, domain: str, ip: str | None = None
+) -> str | None:
+    """Persist the domain's DC context after DNS validation SUCCEEDS.
+
+    ``check_dns`` only ever seeded ``domains_data[domain]`` on its *failure*
+    paths (auto-configure / interactive DC IP entry), so a domain whose DNS
+    already worked came out of a successful check with **no DC recorded**. Every
+    consumer that resolves the DC through the SSOT ``resolve_dc_ip`` then found
+    nothing — most visibly ``verify_domain_credentials``, which can only SKIP
+    verification without a DC/KDC IP, a skip that downstream code reported to
+    the operator as "your credential is wrong".
+
+    Non-destructive and best-effort. The DC IP is taken from, in order: the
+    explicitly supplied ``ip``, whatever the domain record already resolves to,
+    then DNS-only SRV discovery through the local resolver. When none of those
+    yields an address the domain record is left untouched.
+
+    Args:
+        shell: Shell providing ``domains_data`` and the DNS discovery services.
+        domain: Domain whose DNS was just validated.
+        ip: DC IP the caller already knows (``--dc-ip`` and friends), if any.
+
+    Returns:
+        The DC IP persisted for the domain, or ``None`` when none was resolved.
+    """
+    normalized_domain = (domain or "").strip().rstrip(".")
+    if not normalized_domain:
+        return None
+
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        domain_info = shell.domains_data.setdefault(normalized_domain, {})
+        if not isinstance(domain_info, dict):
+            return None
+
+        marked_domain = mark_sensitive(normalized_domain, "domain")
+        pdc_ip = (ip or "").strip() or (resolve_dc_ip(domain_info) or "").strip()
+        hostname = _normalize_hostname_label(domain_info.get("pdc_hostname"))
+        discovered_dcs: list[str] = []
+
+        if not pdc_ip:
+            resolver_ip = (shell.get_local_resolver_ip() or "").strip()
+            if resolver_ip:
+                (
+                    discovered_ip,
+                    discovered_hostname,
+                    discovered_dcs,
+                ) = _discover_pdc_and_dcs_via_resolver(
+                    shell, domain=normalized_domain, resolver_ip=resolver_ip
+                )
+                pdc_ip = (discovered_ip or "").strip()
+                hostname = hostname or _normalize_hostname_label(discovered_hostname)
+
+        if not pdc_ip:
+            print_info_debug(
+                f"check_dns seed: DNS resolves for {marked_domain} but no DC IP could "
+                "be determined; leaving the domain record untouched."
+            )
+            return None
+
+        domain_info["pdc"] = pdc_ip
+        if not hostname:
+            hostname = _normalize_hostname_label(
+                resolve_pdc_hostname(shell, domain=normalized_domain, pdc_ip=pdc_ip)
+            )
+        if hostname:
+            domain_info["pdc_hostname"] = hostname
+        if discovered_dcs and not domain_info.get("dcs"):
+            domain_info["dcs"] = list(dict.fromkeys(discovered_dcs))
+
+        print_info_debug(
+            f"check_dns seed: recorded DC {mark_sensitive(pdc_ip, 'ip')} for "
+            f"{marked_domain}"
+            + (f" (hostname {mark_sensitive(hostname, 'hostname')})" if hostname else "")
+        )
+        return pdc_ip
+    except Exception as exc:  # noqa: BLE001 — seeding must never fail a working DNS check
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
 def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
     """Check DNS resolution for a domain and optionally auto-configure if needed.
 
@@ -2652,6 +2736,9 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
     )
 
     if is_working:
+        # DNS works — record the DC context so the SSOT (``resolve_dc_ip``) is
+        # populated however discovery succeeded, not only on the failure paths.
+        seed_dc_context_after_dns_success(shell, domain=domain, ip=ip)
         return True
 
     # DNS resolution failed - attempt auto-configuration or prompt user
@@ -2665,6 +2752,7 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
                 auto_configure=False,
             )
             if is_working_retry:
+                seed_dc_context_after_dns_success(shell, domain=domain, ip=ip)
                 return True
             print_error(f"DNS resolution failed for {marked_domain}")
             return False
@@ -2718,6 +2806,9 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
                 marked_domain = mark_sensitive(domain, "domain")
                 print_success(
                     f"DNS resolution configured for {marked_domain} using DC {dc_ip.strip()}"
+                )
+                seed_dc_context_after_dns_success(
+                    shell, domain=domain, ip=dc_ip.strip()
                 )
                 return True
             print_error("Failed to configure DNS resolution. Please try again.")

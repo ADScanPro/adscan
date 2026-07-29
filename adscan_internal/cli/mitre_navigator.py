@@ -44,6 +44,7 @@ from adscan_core.reporting.finding_vuln_map import build_vuln_map_from_findings
 from adscan_core.rich_output import (
     print_error,
     print_info,
+    print_info_debug,
     print_info_verbose,
     print_success,
     print_warning,
@@ -374,11 +375,26 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
 
     if not args.no_html:
         # Lazy import — keeps LITE imports clean and PRO failure isolated.
+        #
+        # The absent ``pro/`` package is the NORMAL state of the free tier, not
+        # an error: this is an optional-feature probe, so it is logged at debug
+        # level and the operator gets the one line that is actually useful to
+        # them. A blanket ``capture_exception`` + ``print_exception`` here sent
+        # a PostHog error event and printed an internal traceback every time a
+        # free-tier user ran ``adscan mitre``. Anything OTHER than the module
+        # being absent is unexpected and keeps the full three-sink treatment.
         try:
             from adscan_internal.pro.reporting.mitre_navigator_html import (
                 build_interactive_html,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (ImportError, ModuleNotFoundError) as exc:
+            print_info_debug(f"Interactive HTML bundle unavailable: {exc}")
+            print_error(
+                "Interactive HTML bundle unavailable in this build. "
+                "The Navigator layer JSON above is complete; re-run with "
+                "--no-html to skip this step."
+            )
+        except Exception as exc:  # noqa: BLE001 — genuinely unexpected failure
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_error(f"Interactive HTML bundle unavailable: {exc}")

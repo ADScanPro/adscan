@@ -1713,6 +1713,29 @@ def offer_attack_path_execution(
     """
     if not allowed:
         return False
+    # A path whose critical step is CLOSED with certainty by the environment's
+    # configuration/topology (single-DC self-relay reflection, LDAP signing+CBT,
+    # no ADCS) is a POSITIVE hardening fact ("Attack Surface Reduced — Hardening
+    # Observed"), not an executable avenue. Selecting it should surface its
+    # details (already rendered by the detail view) — never prompt "Execute this
+    # attack path now?". There is nothing to run: the closed step is exactly what
+    # would have granted the reach the downstream steps need. This is the manual
+    # "Select an action" backstop for the same status that
+    # ``_path_is_actionable_for_execution_prompt`` already excludes from the
+    # auto-offered set.
+    from adscan_internal.services.relay_status_constants import (  # noqa: PLC0415
+        CONFIGURATION_CLOSE_STATUS,
+    )
+
+    if (
+        str(summary.get("status") or "").strip().lower()
+        == CONFIGURATION_CLOSE_STATUS
+    ):
+        print_info(
+            "This avenue is closed by the environment's configuration "
+            "(hardening observed) — nothing to execute. Shown for visibility only."
+        )
+        return False
     annotated = annotate_summary_execution_readiness(
         shell,
         domain=domain,
@@ -2138,6 +2161,22 @@ def _attack_path_step_readiness_reason(
     if not step_action:
         return "no action"
 
+    # A step ADscan observed to be CLOSED with certainty by the environment's
+    # configuration/topology (single-DC self-relay reflection, LDAP signing+CBT,
+    # no ADCS) is a POSITIVE hardening fact — it belongs in the "Attack Surface
+    # Reduced" bucket, NOT the executable set. It must never render ``[ready]``
+    # (the credential/reachability gate below would otherwise mark a closed
+    # self-relay runnable and auto-execute it). Guarded here so even a custom
+    # start-step selection surfaces it as locked. B1 already keeps the PATH out
+    # of the offer list; this is the step-level backstop.
+    from adscan_internal.services.relay_status_constants import (  # noqa: PLC0415
+        CONFIGURATION_CLOSE_STATUS,
+    )
+
+    step_status = str(step_item.get("status") or "").strip().lower()
+    if step_status == CONFIGURATION_CLOSE_STATUS:
+        return "closed by configuration (hardening observed)"
+
     if step_key in ACL_ACE_RELATIONS:
         try:
             exec_context = build_ace_step_context(
@@ -2214,6 +2253,56 @@ def _attack_path_step_readiness_reason(
         ):
             return "no host or DC available"
     return ""
+
+
+def _auto_resolve_target_blocked_by_config_close(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    first_ready_idx: int,
+) -> bool:
+    """Return True when auto-resolving to ``first_ready_idx`` is a dead end.
+
+    The precondition-recovery flow recommends "Start from Step #N" when the
+    operator picks a locked step but a later step reads ``[ready]``. That
+    recommendation is bogus when reaching the later step requires traversing a
+    step ADscan observed to be CLOSED with certainty by the environment's
+    configuration/topology (single-DC self-relay reflection, LDAP signing+CBT,
+    no ADCS): the closed step is exactly what would have granted control of the
+    later step's start principal, so starting there guarantees a failure (no
+    credential for the intermediate principal). The one legitimate exception is
+    when that principal is *independently* owned via another route — then the
+    auto-resolve is real and must be preserved.
+    """
+    from adscan_internal.services.relay_status_constants import (  # noqa: PLC0415
+        CONFIGURATION_CLOSE_STATUS,
+    )
+
+    if first_ready_idx < 1 or first_ready_idx > len(steps):
+        return False
+    # Does the jump to first_ready_idx skip over a config-closed step?
+    closed_before = any(
+        isinstance(step, dict)
+        and str(step.get("status") or "").strip().lower() == CONFIGURATION_CLOSE_STATUS
+        for step in steps[: first_ready_idx - 1]
+    )
+    if not closed_before:
+        return False
+    # Only a dead end when the target step's own start principal is not already
+    # owned — i.e. reachable ONLY through the closed step. If it holds a stored
+    # credential (owned via another route), the auto-resolve is legitimate.
+    target_step = steps[first_ready_idx - 1]
+    from_label = (
+        str((target_step.get("details") or {}).get("from") or "").strip()
+        if isinstance(target_step, dict)
+        else ""
+    )
+    if not from_label:
+        return False
+    return not _get_stored_domain_credential_for_user(
+        shell, domain=domain, username=from_label
+    )
 
 
 def _choose_custom_attack_path_start_step(
@@ -2308,16 +2397,38 @@ def _choose_custom_attack_path_start_step(
 
     chosen_step_idx = executable_indices[selection]
     chosen_ready, chosen_reason = readiness[selection]
-    if (
-        not chosen_ready
-        and first_ready_idx is not None
-        and first_ready_idx != chosen_step_idx
-    ):
+    if chosen_ready:
+        return chosen_step_idx
+
+    # The chosen step is locked. Decide whether a "Start from Step #N"
+    # auto-resolve is a real option or a dead end.
+    auto_resolve_target: int | None = (
+        first_ready_idx
+        if (first_ready_idx is not None and first_ready_idx != chosen_step_idx)
+        else None
+    )
+    config_closed_dead_end = (
+        auto_resolve_target is not None
+        and _auto_resolve_target_blocked_by_config_close(
+            shell,
+            domain=domain,
+            steps=steps,
+            first_ready_idx=auto_resolve_target,
+        )
+    )
+    if config_closed_dead_end:
+        # The only "ready" downstream step is reachable ONLY through a step the
+        # environment's configuration has closed — recommending it would
+        # guarantee a failure. Drop the auto-resolve; offer only override/cancel
+        # with an honest note.
+        auto_resolve_target = None
+
+    if auto_resolve_target is not None:
         print_warning(f"Step #{chosen_step_idx} is locked: {chosen_reason}.")
         choice = shell._questionary_select(
             "Preconditions are not met. What do you want to do?",
             [
-                f"Start from Step #{first_ready_idx} instead (auto-resolve, recommended)",
+                f"Start from Step #{auto_resolve_target} instead (auto-resolve, recommended)",
                 f"Run Step #{chosen_step_idx} anyway (override)",
                 "Cancel execution",
             ],
@@ -2326,13 +2437,33 @@ def _choose_custom_attack_path_start_step(
         if choice is None or choice == 2:
             return None
         if choice == 0:
-            return first_ready_idx
-    elif not chosen_ready:
-        # No ready step exists at all — let the user override but warn once.
-        print_warning(
-            f"Step #{chosen_step_idx} is locked: {chosen_reason}. "
-            "Running anyway; expect failures if preconditions don't resolve at runtime."
+            return auto_resolve_target
+        return chosen_step_idx
+
+    if config_closed_dead_end:
+        print_warning(f"Step #{chosen_step_idx} is locked: {chosen_reason}.")
+        print_info(
+            "This avenue is closed by the environment's configuration "
+            "(hardening observed). The next step's prerequisites can only be "
+            "granted by the closed step, so there is nothing to start from."
         )
+        choice = shell._questionary_select(
+            "This avenue is closed by configuration. What do you want to do?",
+            [
+                f"Run Step #{chosen_step_idx} anyway (override)",
+                "Cancel execution",
+            ],
+            default_idx=1,
+        )
+        if choice is None or choice == 1:
+            return None
+        return chosen_step_idx
+
+    # No ready step exists at all — let the user override but warn once.
+    print_warning(
+        f"Step #{chosen_step_idx} is locked: {chosen_reason}. "
+        "Running anyway; expect failures if preconditions don't resolve at runtime."
+    )
     return chosen_step_idx
 
 

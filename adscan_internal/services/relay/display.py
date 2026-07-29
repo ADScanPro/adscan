@@ -85,6 +85,7 @@ def print_relay_cert_result(
     cert_serial: str | None = None,
     cert_subject: str | None = None,
     request_id: int | None = None,
+    not_after: str | None = None,
 ) -> None:
     """Render a premium result panel for a successfully relayed certificate."""
     from rich.panel import Panel
@@ -106,12 +107,21 @@ def print_relay_cert_result(
         grid.add_row("Serial", f"[cyan]{cert_serial}[/]")
     if request_id is not None:
         grid.add_row("Request ID", str(request_id))
+    if not_after:
+        grid.add_row("Valid until", f"[yellow]{not_after}[/]")
     grid.add_row("", "")
     grid.add_row("PFX path", mark_sensitive(pfx_path, "path"))
     grid.add_row("", "")
     grid.add_row(
         "Next step",
         "[dim]Use the PFX with PKINIT (adscan pass-the-cert) to obtain NT hash[/]",
+    )
+    # The certificate lives in the client's CA until it is revoked, so the
+    # operator is told here that it has been recorded for the cleanup report.
+    grid.add_row(
+        "Cleanup",
+        "[dim]Recorded as an environment change — revocation is a manual step "
+        "for the client[/]",
     )
 
     title = Text("  Certificate Issued (Relay)  ", style="bold white on green")

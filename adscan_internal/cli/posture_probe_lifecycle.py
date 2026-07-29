@@ -18,7 +18,7 @@ import time
 from typing import Any, Optional
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_warning
+from adscan_core.rich_output import print_info_debug, print_warning
 from adscan_internal import get_console
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.posture_probe import ProbeResult
@@ -101,15 +101,28 @@ def _emit_posture_findings_best_effort(shell: Any, domain: str) -> None:
 
     Best-effort: any failure (LITE build with no ``pro/`` directory,
     bridge import error, missing report context on ``shell``) is
-    swallowed silently after capturing to telemetry. Finding emission
-    never blocks the probe lifecycle.
+    swallowed after capturing to telemetry. Finding emission never
+    blocks the probe lifecycle.
+
+    The absent ``pro/`` package is the NORMAL state of the free tier, not
+    an error: it is an optional-feature probe, so it is logged at debug
+    level only. A blanket ``capture_exception`` + ``print_exception``
+    here put a red ``Error: No module named 'adscan_internal.pro'`` under
+    every LITE scan's posture summary and one PostHog error event per
+    LITE run. Anything OTHER than the module being absent is unexpected
+    and keeps the full three-sink treatment.
     """
     try:
         from adscan_internal.pro.services.posture_findings_emitter import (
             emit_findings_from_posture,
         )
-    except Exception as exc:  # noqa: BLE001
-        # LITE build (no pro/) — silently skip.
+    except (ImportError, ModuleNotFoundError) as exc:
+        # LITE build (no pro/) — expected, not a failure.
+        print_info_debug(
+            f"Posture finding emission unavailable in this build: {exc}"
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — genuinely unexpected import failure
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         return

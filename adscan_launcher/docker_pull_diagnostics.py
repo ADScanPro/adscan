@@ -37,6 +37,8 @@ import signal
 from dataclasses import dataclass
 from typing import Literal
 
+from adscan_core.outbound_links import cta_markup
+
 
 # ─────────────────────────────────────────────────────────────────────
 # ANSI / progress noise stripping
@@ -527,7 +529,7 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
         followup=(
             "If the failure persists, capture the output of "
             "`docker pull {image_name}` and open an issue at "
-            "https://adscanpro.com/docs."
+            + cta_markup("image_pull_failed")
         ),
     ),
 }

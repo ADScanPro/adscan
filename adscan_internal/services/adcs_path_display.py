@@ -162,6 +162,10 @@ def extract_adcs_template_names(details: Mapping[str, Any] | None) -> list[str]:
                 templates.append(name)
 
     _append(details.get("template"))
+    # The executed-ESC path stamps the template it actually enrolled from under
+    # its own key. Without it, a step whose only template evidence is that field
+    # renders with no object named at all.
+    _append(details.get("template_used_for_run"))
 
     for key in ("templates", "agent_templates", "target_templates"):
         raw_value = details.get(key)
@@ -199,6 +203,44 @@ def extract_adcs_template_names(details: Mapping[str, Any] | None) -> list[str]:
             _append(candidate)
 
     return sorted({name for name in templates if name}, key=str.lower)
+
+
+#: ``vulnerable_resources`` kinds that identify a certificate AUTHORITY rather
+#: than a template. The CA-level escalations (ESC5, ESC7, ESC8, ESC11) have no
+#: abused template at all, so a renderer that only asks for template names is
+#: left with nothing to name.
+_ADCS_AUTHORITY_KINDS: frozenset[str] = frozenset(
+    {"enterpriseca", "aiaca", "rootca", "ntauthstore"}
+)
+
+
+def extract_adcs_authority_names(details: Mapping[str, Any] | None) -> list[str]:
+    """Extract the distinct certificate-authority names from ADCS edge notes.
+
+    The template-level sibling of :func:`extract_adcs_template_names`. A
+    CA-level escalation abuses the authority itself, so this is the object a
+    report must name for it — without this, an ESC7 step in a client-facing
+    document identifies nothing.
+    """
+    if not isinstance(details, Mapping):
+        return []
+    names: list[str] = []
+    raw_resources = details.get("vulnerable_resources")
+    if isinstance(raw_resources, list):
+        for entry in raw_resources:
+            if not isinstance(entry, dict):
+                continue
+            kind = str(entry.get("kind") or "").strip().lower()
+            if kind not in _ADCS_AUTHORITY_KINDS:
+                continue
+            name = str(entry.get("name") or "").strip()
+            if name:
+                names.append(name)
+    for key in ("ca_name", "certificate_authority"):
+        candidate = details.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            names.append(candidate.strip())
+    return sorted({name for name in names if name}, key=str.lower)
 
 
 def has_compromise_centric_target(details: Mapping[str, Any] | None) -> bool:

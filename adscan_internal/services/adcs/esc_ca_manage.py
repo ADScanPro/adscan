@@ -192,6 +192,9 @@ async def run_esc7(config: EscConfig) -> EscResult:
             template=_SUBCA_TEMPLATE, username=config.username,
             password=config.effective_secret, upn=config.target_upn,
             ca_fqdn=config.ca_fqdn,
+            ledger_shell=config.shell,
+            ledger_domain=config.domain,
+            ledger_technique="ADCSESC7 — certificate issued through CA officer rights",
             **({} if _esc7_key_size is None else {"key_size": int(_esc7_key_size)}),
         )
         req = await request_certificate_native(req_cfg, out)

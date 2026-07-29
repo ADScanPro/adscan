@@ -5,8 +5,9 @@ structure used throughout ADScan. It provides a strongly-typed interface for
 domain information, authentication state, and discovered credentials.
 """
 
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from datetime import datetime
 from enum import Enum
 
@@ -281,6 +282,266 @@ def resolve_dc_ip(domain_data: dict) -> str | None:
             if connectivity_pdc_ip:
                 return connectivity_pdc_ip
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Domain-controller topology SSOT — "how many DCs / is host X the sole DC / is
+# there an alternate DC to relay to".
+#
+# ``domains_data[domain]`` records DCs under a MIX of identifiers — ``dc_ip``,
+# ``pdc``, ``pdc_hostname``, ``pdc_hostname_fqdn``, ``pdc_fqdn``, ``dc_fqdn`` and
+# a ``dcs`` list. These are ALIASES of possibly ONE DC (e.g. MEEREEN present as
+# both ``192.168.180.12`` and ``meereen.essos.local``). Naive comparison with
+# ``hosts_match`` cannot reconcile IP<->FQDN, so a single DC seen under its IP
+# AND its FQDN gets miscounted as two DCs — the essos single-DC false positive
+# that let a doomed self-relay proceed.
+#
+# The fix that makes dedup robust: the PDC field-group all describe the SAME
+# primary DC, so they give the IP<->FQDN link FOR FREE. Build ONE primary DC
+# record carrying ALL of those as aliases; then a host that is that DC's IP still
+# matches the record via its FQDN alias, and vice-versa. Every consumer resolves
+# DC topology through :func:`resolve_domain_controllers` — no code re-derives it
+# ad-hoc.
+# --------------------------------------------------------------------------- #
+
+# The PDC field-group: all keys under ``domains_data[domain]`` that describe the
+# SAME primary DC. Collected into one record so its IP/short/FQDN aliases are
+# linked (defeats the IP<->FQDN dedup trap).
+_PRIMARY_DC_FIELDS: Tuple[str, ...] = (
+    "dc_ip",
+    "pdc",
+    "pdc_hostname",
+    "pdc_hostname_fqdn",
+    "pdc_fqdn",
+    "dc_fqdn",
+)
+
+
+def _looks_like_ipv4(value: str) -> bool:
+    """Return True when *value* is a dotted-quad IPv4 literal."""
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", str(value or "").strip()))
+
+
+def _best_fqdn(aliases: Iterable[str]) -> Optional[str]:
+    """Return the first alias that looks like an FQDN (dotted, not an IP)."""
+    for alias in aliases:
+        a = str(alias or "").strip()
+        if a and "." in a and not _looks_like_ipv4(a):
+            return a
+    return None
+
+
+def _dc_identifiers_provably_distinct(a: str, b: str) -> bool:
+    """Return True only when ``a`` and ``b`` are provably DIFFERENT machines.
+
+    Conservative by construction — a false "different machine" is the dangerous
+    direction (it fabricates an alternate DC that lets a doomed self-relay
+    proceed):
+
+    * ``hosts_match`` True (alias-aware IP/short/FQDN/``HOST$``) -> same machine.
+    * One side an IP literal and the other a name -> INDETERMINATE. ``hosts_match``
+      cannot bridge IP<->FQDN, so a DC's own FQDN vs its IP is NOT "different" —
+      this is exactly the essos single-DC false positive. Treated as
+      not-provably-distinct.
+    * Same identifier family (both IPs, or both names) and ``hosts_match`` False ->
+      provably a different machine.
+    """
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        hosts_match,
+    )
+
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return False
+    if hosts_match(a, b):
+        return False
+    if _looks_like_ipv4(a) != _looks_like_ipv4(b):
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class _DCRecord:
+    """One distinct domain controller and every identifier that denotes it."""
+
+    aliases: Tuple[str, ...]
+    fqdn: Optional[str] = None
+
+    def matches(self, host: str) -> bool:
+        """Return whether ``host`` denotes this DC (alias-aware IP/short/FQDN)."""
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            hosts_match,
+        )
+
+        return any(hosts_match(host, alias) for alias in self.aliases)
+
+
+@dataclass(frozen=True)
+class DomainControllers:
+    """Deduped domain-controller topology for one domain (SSOT value object).
+
+    Built by :func:`resolve_domain_controllers` (from ``domains_data``) or by
+    :meth:`from_dc_records` (from an already-canonical record set, e.g. the
+    attack-graph DC nodes). Every "how many DCs / is host X the sole DC / is
+    there an alternate DC to relay to" question resolves through this one type so
+    the answer is identical wherever it is asked.
+    """
+
+    dcs: Tuple[_DCRecord, ...] = ()
+
+    @property
+    def count(self) -> int:
+        """Number of DISTINCT domain controllers (deduped by alias)."""
+        return len(self.dcs)
+
+    def _record_for_host(self, host: str) -> Optional[_DCRecord]:
+        h = str(host or "").strip()
+        if not h:
+            return None
+        for rec in self.dcs:
+            if rec.matches(h):
+                return rec
+        return None
+
+    def is_sole_dc(self, host: str) -> Optional[bool]:
+        """Return True iff there is exactly one DC and ``host`` aliases it.
+
+        ``None`` when there are no DC identifiers, ``host`` is empty, or ``host``
+        is not a recognized DC (insufficient to decide).
+        """
+        if not self.dcs or not str(host or "").strip():
+            return None
+        if self._record_for_host(host) is None:
+            return None
+        return self.count == 1
+
+    def has_alternate_dc(self, host: str) -> Optional[bool]:
+        """Return whether a DC provably distinct from ``host`` exists.
+
+        * ``True`` — a DC that is a provably-different machine than ``host``
+          exists (relay has a non-reflecting target).
+        * ``False`` — ``host`` IS a recognized DC and it is the only one (the
+          single-DC reflection case).
+        * ``None`` — indeterminate: no DC identifiers, empty host, or ``host`` is
+          not a recognized DC and no DC is provably distinct from it (IP<->name
+          indeterminacy). A false "alternate available" is the dangerous
+          direction, so indeterminate never returns True.
+        """
+        if not self.dcs or not str(host or "").strip():
+            return None
+        matched = self._record_for_host(host)
+        if matched is not None:
+            return any(rec is not matched for rec in self.dcs)
+        if any(
+            _dc_identifiers_provably_distinct(alias, host)
+            for rec in self.dcs
+            for alias in rec.aliases
+        ):
+            return True
+        return None
+
+    def alternate_dc_fqdn(self, host: str) -> Optional[str]:
+        """Return the FQDN of a DC distinct from ``host`` (relay target), or None.
+
+        Picks the first provably-distinct / other DC record; returns ``None``
+        when there is no alternate or the alternate has no usable FQDN.
+        """
+        if not self.dcs or not str(host or "").strip():
+            return None
+        matched = self._record_for_host(host)
+        if matched is not None:
+            for rec in self.dcs:
+                if rec is not matched:
+                    return rec.fqdn
+            return None
+        for rec in self.dcs:
+            if any(
+                _dc_identifiers_provably_distinct(alias, host)
+                for alias in rec.aliases
+            ):
+                return rec.fqdn
+        return None
+
+    @classmethod
+    def from_dc_records(
+        cls, records: Iterable[Tuple[Iterable[str], Optional[str]]]
+    ) -> "DomainControllers":
+        """Build from an already-canonical ``(aliases, fqdn)`` record set.
+
+        Used where the DC set is already deduped (e.g. attack-graph DC nodes keyed
+        by node id), so the caller gets the SAME count/sole/alternate logic as the
+        ``domains_data`` path without re-deriving it. ``fqdn`` is kept EXACTLY as
+        supplied (an empty/None fqdn stays "no usable relay endpoint") — it is not
+        re-derived from the aliases.
+        """
+        built: List[_DCRecord] = []
+        for aliases, fqdn in records:
+            alias_tuple = tuple(
+                a for a in (str(x or "").strip() for x in aliases) if a
+            )
+            fq = str(fqdn or "").strip() or None
+            if not alias_tuple and not fq:
+                continue
+            built.append(_DCRecord(aliases=alias_tuple, fqdn=fq))
+        return cls(dcs=tuple(built))
+
+
+def resolve_domain_controllers(domain_data: Mapping) -> DomainControllers:
+    """Return the deduped DC topology for one ``domains_data[domain]`` entry.
+
+    Dedup algorithm:
+
+    1. Build the PRIMARY DC record from the PDC field-group (``dc_ip``, ``pdc``,
+       ``pdc_hostname``, ``pdc_hostname_fqdn``, ``pdc_fqdn``, ``dc_fqdn``) — all of
+       which describe the SAME primary DC, giving the IP<->FQDN link for free.
+    2. For each ``dcs[]`` entry: attach it to a record it aliases (``hosts_match``
+       against ANY of that record's aliases — short-name/case/IP/FQDN aware), else
+       start a NEW record.
+
+    ``count`` is the number of records. A host that is the primary DC's IP still
+    matches the primary record via its FQDN alias, so the single-DC case counts as
+    one, not two.
+    """
+    dd = domain_data or {}
+
+    primary_aliases: List[str] = []
+    seen: set[str] = set()
+    for key in _PRIMARY_DC_FIELDS:
+        val = str(dd.get(key) or "").strip()
+        if val and val.lower() not in seen:
+            primary_aliases.append(val)
+            seen.add(val.lower())
+
+    records: List[_DCRecord] = []
+    if primary_aliases:
+        records.append(
+            _DCRecord(aliases=tuple(primary_aliases), fqdn=_best_fqdn(primary_aliases))
+        )
+
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        hosts_match,
+    )
+
+    for entry in dd.get("dcs") or []:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        attached = False
+        for idx, rec in enumerate(records):
+            if any(hosts_match(text, alias) for alias in rec.aliases):
+                if text.lower() not in {a.lower() for a in rec.aliases}:
+                    new_aliases = rec.aliases + (text,)
+                    records[idx] = _DCRecord(
+                        aliases=new_aliases,
+                        fqdn=rec.fqdn or _best_fqdn(new_aliases),
+                    )
+                attached = True
+                break
+        if not attached:
+            records.append(_DCRecord(aliases=(text,), fqdn=_best_fqdn([text])))
+
+    return DomainControllers(dcs=tuple(records))
 
 
 def resolve_dc_reachability(domain_data: dict) -> bool | None:

@@ -55,11 +55,14 @@ import os
 import shlex
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.interaction import is_ci_marker_present, is_non_interactive
-from adscan_internal.models.domain import resolve_dc_ip
+from adscan_internal.models.domain import (
+    resolve_dc_ip,
+    resolve_domain_controllers,
+)
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error,
@@ -599,6 +602,31 @@ def run_relay_ldap(
     return RELAY_OUTCOME_SUCCESS if success["ok"] else RELAY_OUTCOME_FAILED
 
 
+def _alternate_dc_available(
+    domains_data: Mapping[str, Any], domain: str, *, coerce_host: Optional[str]
+) -> Optional[bool]:
+    """Return whether a DC PROVABLY distinct from ``coerce_host`` exists.
+
+    Used by the self-relay reflection backstop: when the coerced host is the sole
+    DC there is no non-reflecting relay target. Delegates to the DC-topology SSOT
+    (:func:`resolve_domain_controllers`), which builds ONE record per distinct DC
+    carrying all of its aliases (IP + short + FQDN), so a coerced host that is the
+    sole DC's IP still matches that DC via its FQDN alias and is NOT counted as an
+    alternate of itself (the essos single-DC false positive).
+
+    Returns ``True`` only when a provably-different DC machine exists; ``False``
+    when the coerced host IS the sole DC; ``None`` when the coerce host is unknown
+    or no DC identifiers are recorded. A false "no alternate" harmlessly blocks a
+    real multi-DC relay; a false "alternate available" lets a doomed self-relay
+    proceed — so the conservative direction is the correct one for a backstop.
+    """
+    coerce = str(coerce_host or "").strip()
+    if not coerce:
+        return None
+    dd = (domains_data or {}).get(domain) or {}
+    return resolve_domain_controllers(dd).has_alternate_dc(coerce)
+
+
 def _evaluate_feasibility(
     shell: Any,
     *,
@@ -648,6 +676,15 @@ def _evaluate_feasibility(
         # asserting an unverified reachability.
         listener_reachable_from_victim=None,
         relayed_principal_self_write=None,
+        # Self-relay reflection backstop: the coerced host is ``victim_ip``; the
+        # LDAP relay target for RBCD/Shadow-Creds is the DC (``dc_ip``). If they
+        # are the same machine and no OTHER DC exists, the relay reflects to
+        # itself and can never land — refuse it BEFORE minting a delegate.
+        coerce_host=victim_ip,
+        relay_target_host=dc_ip,
+        alternate_dc_available=_alternate_dc_available(
+            getattr(shell, "domains_data", {}) or {}, domain, coerce_host=victim_ip
+        ),
     )
     feasibility = evaluate_relay_feasibility(inputs)
     print_relay_feasibility_panel(

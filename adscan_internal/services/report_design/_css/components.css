@@ -1,0 +1,277 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Component grammar — the pieces every ADscan document is built from.
+
+   Two families live here, and the difference matters:
+
+   1. Classes PRO's markup already uses (.chip, .sev-bar, table.adscan-table).
+      Carried here VERBATIM from the premium template, so moving them cannot
+      change the paid deliverable. Both tiers now render a severity chip from
+      one definition; a colour that drifts drifts in both or neither.
+
+   2. Canonical ds-* components. New work reaches for these instead of
+      inventing a variant. They are written so nothing PRO renders today can
+      be affected — PRO's markup carries none of these class names.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Severity / status chips ────────────────────────────────────────────── */
+.chip {
+  display: inline-flex; align-items: center; padding: 2px 9px;
+  border-radius: 999px; font-size: 6.5pt; font-weight: 700;
+  letter-spacing: 1.5px; text-transform: uppercase;
+  border: 1px solid var(--line-2);
+}
+.chip.critical { background: var(--critical-bg); color: var(--critical); border-color: var(--critical-bd); }
+.chip.high     { background: var(--red-bg); color: var(--red); border-color: var(--red-bd); }
+.chip.medium   { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-bd); }
+.chip.low      { background: var(--blue-bg); color: var(--blue); border-color: var(--blue-bd); }
+.chip.info     { background: rgba(148,163,184,0.12); color: var(--text-3); }
+.chip.exploited { background: var(--red-bg); color: var(--red); border-color: var(--red-bd); }
+/* Partially validated — a proven segment, not end-to-end. Stronger than
+   "attempted": rendered in a distinct gold, sitting between exploited (red)
+   and attempted (amber). */
+.chip.partial { background: rgba(212,160,23,0.14); color: #B8860B; border-color: rgba(212,160,23,0.35); }
+.chip.attempted { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-bd); }
+.chip.theoretical { background: rgba(148,163,184,0.12); color: var(--text-3); }
+/* Structural / membership hop — requires no exploitation (e.g. MemberOf).
+   Neutral slate, deliberately NOT "theoretical" so it never reads as a
+   contradiction inside an exploited chain. */
+.chip.structural { background: rgba(100,116,139,0.12); color: var(--text-2); }
+
+/* The remaining exposure-validation outcomes, so a status never has to be
+   coloured at the call site. Same doctrine as the labels themselves: a step
+   that did not run is never attributed to a defensive control. */
+.chip.proven { background: var(--red-bg); color: var(--red); border-color: var(--red-bd); }
+.chip.safety { background: rgba(154,107,0,0.12); color: var(--amber); border-color: var(--amber-bd); }
+.chip.hardening { background: rgba(47,111,79,0.10); color: var(--green); border-color: rgba(47,111,79,0.30); }
+.chip.gap { background: rgba(148,163,184,0.12); color: var(--text-3); }
+
+/* A chip is a pill: it takes the width of its label and never breaks across
+   two lines. Two-line chips doubled in height and pushed themselves above the
+   row they were meant to sit on, so the same status read as two different
+   shapes on different pages ("PARTIALLY VALIDATED" wrapped, "VALIDATED" did
+   not). Scoped under .ds-doc because it is a NEW rule and the paid template
+   does not opt in yet — PRO's own layouts are unaffected until they do. */
+.ds-doc .chip { white-space: nowrap; }
+
+/* ── Proportional severity distribution ─────────────────────────────────── */
+.sev-bar-wrap { margin-bottom: 6mm; page-break-inside: avoid; }
+.sev-bar-label { font-size: 6.5pt; color: var(--text-4); letter-spacing: 2px; text-transform: uppercase; font-weight: 700; margin-bottom: 2mm; }
+.sev-bar { height: 6mm; display: flex; background: var(--bg-2); border-radius: 3mm; overflow: hidden; border: 1px solid var(--line); }
+.sev-bar-seg { height: 100%; }
+.sev-bar-seg.critical { background: linear-gradient(180deg, var(--critical) 0%, #7f1d1d 100%); }
+.sev-bar-seg.high   { background: linear-gradient(180deg, var(--red) 0%, #b91c1c 100%); }
+.sev-bar-seg.medium { background: linear-gradient(180deg, var(--amber) 0%, #b45309 100%); }
+.sev-bar-seg.low    { background: linear-gradient(180deg, var(--blue) 0%, #2563eb 100%); }
+.sev-bar-seg.info   { background: linear-gradient(180deg, #64748b 0%, #334155 100%); }
+.sev-legend { display: flex; gap: 5mm; margin-top: 3mm; flex-wrap: wrap; }
+.sev-legend-item { display: flex; align-items: center; gap: 2mm; font-size: 7.5pt; color: var(--text-3); }
+.sev-legend-dot { width: 2.5mm; height: 2.5mm; border-radius: 50%; }
+.sev-legend-dot.critical { background: var(--critical); }
+.sev-legend-dot.high { background: var(--red); }
+.sev-legend-dot.medium { background: var(--amber); }
+.sev-legend-dot.low { background: var(--blue); }
+.sev-legend-dot.info { background: var(--text-4); }
+.sev-legend-n { font-family: var(--font-mono); color: var(--text-2); font-weight: 600; }
+
+/* ── Hairline data table ────────────────────────────────────────────────── */
+table.adscan-table { width: 100%; border-collapse: collapse; font-size: 8.5pt; color: var(--text-2); margin: 3mm 0; }
+table.adscan-table th { background: var(--bg-2); color: var(--text-3); padding: 2mm 3mm; text-align: left; font-size: 6.5pt; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; border-bottom: 1px solid var(--line-2); }
+table.adscan-table td { padding: 2.5mm 3mm; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.adscan-table tr:last-child td { border-bottom: none; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Canonical ds-* components
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Eyebrow — the letterspaced kicker that opens a section ─────────────── */
+.ds-eyebrow {
+  display: flex; align-items: center; gap: 3mm;
+  font-size: 6.5pt; font-weight: 700; letter-spacing: 0.26em;
+  text-transform: uppercase; color: var(--accent);
+}
+.ds-eyebrow::before {
+  content: ''; width: 9mm; height: 1.5px; background: var(--accent);
+  flex-shrink: 0; border-radius: 1px;
+}
+.ds-eyebrow.ds-eyebrow-plain::before { content: none; }
+
+/* ── Section head — eyebrow, serif title, optional standfirst, hairline ─── */
+.ds-section { margin-top: 9mm; }
+.ds-section-head { padding-bottom: 3mm; border-bottom: 1px solid var(--line-2); margin-bottom: 5mm; }
+.ds-section-title {
+  font-family: var(--font-serif); font-size: 16pt; font-weight: 700;
+  color: var(--text); letter-spacing: -0.3px; line-height: 1.15; margin-top: 3mm;
+}
+.ds-section-lead {
+  font-size: 8.5pt; color: var(--text-3); line-height: 1.55;
+  margin-top: 2mm; max-width: 68ch;
+}
+
+/* ── Display verdict — the one sentence the document is about ───────────── */
+.ds-verdict {
+  font-family: var(--font-serif); font-weight: 600;
+  font-size: 19pt; line-height: 1.24; letter-spacing: -0.4px;
+  color: var(--text); max-width: 30ch; margin: 7mm 0 0;
+}
+.ds-verdict-n { color: var(--critical); font-weight: 800; font-style: normal; }
+.ds-verdict-n.ds-tone-ok { color: var(--green); }
+.ds-verdict-sub {
+  font-size: 8.5pt; color: var(--text-3); line-height: 1.55;
+  margin-top: 3mm; max-width: 68ch;
+}
+
+/* ── Column row — figures in a ledger, not cards in a dashboard ──────────
+   A gapless track grid: the gutter is cell padding, the separation a hairline
+   between cells. Two reasons, one editorial and one mechanical.
+
+   Editorial: a row of bordered boxes reads as a dashboard export. Hairline-
+   separated figures read as an annual report, which is the register this
+   document is in.
+
+   Mechanical: Chromium clips page content at the printable box, so a bordered
+   box whose outer edge lands exactly ON that boundary loses its border to the
+   clip. That is what used to happen to the fourth severity card — the strip
+   filled the text column edge to edge, and the last card printed with three
+   sides. A ledger has no box edge at the boundary, so the failure cannot
+   occur. If you do put bordered boxes in a full-width row, leave them a
+   millimetre of clearance. */
+.ds-cols {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  border-top: 1px solid var(--line-2);
+  page-break-inside: avoid;
+}
+.ds-col { padding: 4mm 5mm 0 0; min-width: 0; }
+.ds-col + .ds-col { border-left: 1px solid var(--line); padding-left: 5mm; }
+
+/* ── Figure — a numeral in the ledger ───────────────────────────────────── */
+.ds-figure-v {
+  font-family: var(--font-serif); font-size: 26pt; font-weight: 700;
+  line-height: 1; letter-spacing: -1px; color: var(--text);
+}
+.ds-figure-v.critical { color: var(--critical); }
+.ds-figure-v.high     { color: var(--red); }
+.ds-figure-v.medium   { color: var(--amber); }
+.ds-figure-v.low      { color: var(--blue); }
+.ds-figure-v.accent   { color: var(--accent); }
+.ds-figure-v small { font-size: 0.45em; font-weight: 600; color: var(--text-3); letter-spacing: 0; }
+/* Two lines' worth of box, so a label that wraps does not knock the sub-line
+   out of alignment with its neighbours in the ledger. */
+.ds-figure-k {
+  font-size: 6.5pt; font-weight: 700; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--text-4);
+  margin-top: 2.5mm; min-height: 6.4mm;
+}
+.ds-figure-sub { font-size: 7.5pt; color: var(--text-3); margin-top: 1.5mm; line-height: 1.4; }
+
+/* ── Note — a bordered aside with a top accent rule, never a side stripe ── */
+.ds-note {
+  border-top: 2px solid var(--accent);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 4.5mm 5mm 5mm;
+  page-break-inside: avoid;
+}
+.ds-note-k {
+  font-size: 6.5pt; font-weight: 700; letter-spacing: 0.26em;
+  text-transform: uppercase; color: var(--text-4); margin-bottom: 2.5mm;
+}
+.ds-note-t {
+  font-family: var(--font-serif); font-size: 10.5pt; font-style: italic;
+  line-height: 1.6; color: var(--text-2); max-width: 68ch;
+}
+
+/* ── Meta row — key/value pairs under a masthead ────────────────────────── */
+.ds-meta { display: flex; flex-wrap: wrap; gap: 6mm; margin-top: 4mm; }
+.ds-meta-k {
+  font-size: 6pt; font-weight: 700; letter-spacing: 0.2em;
+  text-transform: uppercase; color: var(--text-4);
+}
+.ds-meta-v { font-size: 8.5pt; color: var(--text-2); margin-top: 1mm; }
+
+/* ── Numbered step list ─────────────────────────────────────────────────── */
+.ds-steps { list-style: none; margin: 3mm 0 0; padding: 0; counter-reset: ds-step; }
+.ds-steps > li {
+  position: relative; padding: 2.5mm 0 2.5mm 9mm;
+  border-top: 1px dashed var(--line);
+  page-break-inside: avoid;
+}
+.ds-steps > li::before {
+  counter-increment: ds-step; content: counter(ds-step);
+  position: absolute; left: 0; top: 2.5mm;
+  width: 6mm; text-align: right;
+  font-family: var(--font-mono); font-size: 7.5pt; font-weight: 700;
+  color: var(--accent);
+}
+.ds-step-txt { font-size: 8.5pt; color: var(--text-2); line-height: 1.5; }
+.ds-step-status { margin-left: 2mm; vertical-align: 0.4mm; }
+
+/* ── Route line — source → target ─────────────────────────────────────────
+   Set in the sans, not the display serif: principal names arrive from the
+   directory in upper case, and a column of upper-case serif route lines reads
+   as shouting rather than as a list. */
+.ds-route {
+  font-family: var(--font-sans); font-size: 9pt; font-weight: 700;
+  color: var(--text); line-height: 1.35; letter-spacing: 0.01em;
+  word-break: break-word;
+}
+.ds-route .ds-arrow { color: var(--accent); margin: 0 1.5mm; font-weight: 400; }
+.ds-reach { font-size: 7.5pt; color: var(--text-3); margin-top: 1.5mm; }
+
+/* ── Card — a hairline-framed block, top rule carries the tone ──────────── */
+.ds-card {
+  border: 1px solid var(--line);
+  border-top: 2px solid var(--line-2);
+  background: var(--surface);
+  padding: 4.5mm 5mm 5mm;
+  margin-top: 4mm;
+  page-break-inside: avoid;
+}
+.ds-card.critical { border-top-color: var(--critical); }
+.ds-card.high     { border-top-color: var(--red); }
+.ds-card.medium   { border-top-color: var(--amber); }
+.ds-card.low      { border-top-color: var(--blue); }
+.ds-card.accent   { border-top-color: var(--accent); }
+.ds-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 4mm; }
+
+/* ── Ranked list numeral ─────────────────────────────────────────────────
+   The leading cell of a priority table. Set in the mono face at the accent
+   colour so the ranking reads as an ordering, not as data.
+
+   Scoped under .ds-doc: new grammar, so it cannot reach the paid template
+   until that document opts in. */
+.ds-doc .ds-rank {
+  font-family: var(--font-mono); font-size: 9pt; font-weight: 700;
+  color: var(--accent); text-align: right; white-space: nowrap;
+}
+
+/* ── Inline share meter ──────────────────────────────────────────────────
+   A proportion inside a table cell: the figure, then a hairline track filled
+   to that share. Reading a column of percentages is arithmetic; reading a
+   column of bars is a glance.
+
+   The track carries no side borders and the fill is inset, so nothing here
+   can land a box edge on Chromium's printable boundary. */
+.ds-doc .ds-meter { display: flex; align-items: center; gap: 2.5mm; min-width: 0; }
+.ds-doc .ds-meter-n {
+  font-family: var(--font-mono); font-size: 8pt; font-weight: 700;
+  color: var(--text); white-space: nowrap; min-width: 8mm; text-align: right;
+}
+/* The track is a flex box, not a bare inline span: an inline element ignores
+   width and height, which is how a meter ends up rendering as an empty
+   groove. */
+.ds-doc .ds-meter-track {
+  display: flex; flex: 1; height: 1.6mm; min-width: 10mm;
+  background: var(--bg-2); border-radius: 1mm; overflow: hidden;
+}
+.ds-doc .ds-meter-fill {
+  display: block; height: 100%; background: var(--accent); border-radius: 1mm;
+}
+
+/* ── Fine print ─────────────────────────────────────────────────────────── */
+.ds-fineprint {
+  font-size: 7.5pt; color: var(--text-3); line-height: 1.55;
+  margin-top: 5mm; padding-top: 3mm; border-top: 1px solid var(--line);
+  page-break-inside: avoid;
+}
+.ds-fineprint b { color: var(--text-2); font-weight: 700; }
+.ds-muted { color: var(--text-4); }

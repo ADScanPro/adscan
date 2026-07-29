@@ -43,6 +43,18 @@ _PROBE_MARKER = "ADSCANPROBE"
 # Kept POSIX-sh portable and dependency-free (no python/awk assumptions beyond
 # coreutils that the runtime image ships). uid_map spaces are squeezed to '_'
 # so the marker is trivially splittable.
+#
+# ``capeff`` is the SHELL's effective set and is kept for diagnostics only. It
+# is NOT the capability set ADscan runs with: the kernel clears permitted and
+# effective caps when a process runs as a non-root uid, so a plain ``/bin/sh``
+# under ``--user 1000:1000`` reports ``CapEff: 0`` on EVERY runtime, rootful or
+# rootless, no matter what ``--cap-add`` was passed. Reading network caps off
+# that shell declared every host "reduced network mode".
+#
+# ``pycapeff`` is the load-bearing one: the effective set of the venv python
+# AFTER exec, which is where the file capabilities land
+# (``cap_net_raw,cap_net_admin,cap_net_bind_service=ep``) and is exactly the
+# process that opens ADscan's raw sockets and tun devices.
 _PROBE_SCRIPT = (
     'um=$(head -n1 /proc/self/uid_map 2>/dev/null | tr -s " " | '
     'sed -e "s/^_//" -e "s/ /_/g" | tr " " "_"); '
@@ -50,8 +62,10 @@ _PROBE_SCRIPT = (
     "cut -f2 | tr -d ' \t'); "
     'py=$(readlink -f /opt/adscan/venv/bin/python 2>/dev/null); '
     'if [ -n "$py" ] && "$py" -c "" 2>/dev/null; then fx=ok; else fx=fail; fi; '
-    'printf "%s|uidmap=%s|capeff=%s|filecap_exec=%s\\n" '
-    f'"{_PROBE_MARKER}" "$um" "$ce" "$fx"'
+    'pce=$("$py" -c "print(open(\'/proc/self/status\').read())" 2>/dev/null | '
+    "grep -m1 '^CapEff:' | cut -f2 | tr -d ' \t'); "
+    'printf "%s|uidmap=%s|capeff=%s|pycapeff=%s|filecap_exec=%s\\n" '
+    f'"{_PROBE_MARKER}" "$um" "$ce" "$pce" "$fx"'
 )
 
 
@@ -144,7 +158,13 @@ def build_verdict_from_probe(
 
     filecap_exec_ok = parsed.get("filecap_exec", "").lower() == "ok"
     remapped = _userns_remapped_from_uidmap(parsed.get("uidmap", ""))
-    caps = _decode_capeff(parsed.get("capeff", ""))
+    # Read the caps off the file-capability-bearing python, which is the process
+    # that actually does ADscan's network work. The shell's set is empty for any
+    # non-root uid and would report every runtime as degraded. An older probe
+    # output without the field falls back to the shell set.
+    caps = _decode_capeff(parsed.get("pycapeff", "")) or _decode_capeff(
+        parsed.get("capeff", "")
+    )
     net_raw = _CAP_NET_RAW in caps
     net_admin = _CAP_NET_ADMIN in caps
 

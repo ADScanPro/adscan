@@ -38,6 +38,7 @@ _STATUS_GLYPH = {
 _CHECK_LABELS = {
     "ntlm_enabled": "NTLM enabled",
     "ntlmv1_or_cve1040": "NTLMv1 / CVE-2019-1040",
+    "self_relay_reflection": "Self-relay reflection",
     "ldap_signing": "LDAP signing",
     "ldap_channel_binding": "LDAP channel binding",
     "ldaps_available": "LDAPS available",

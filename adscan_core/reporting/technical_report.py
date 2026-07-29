@@ -383,6 +383,27 @@ def record_technical_finding(
         #   - bool(evidence)     -> confirming evidence attached
         confirmed = (value is None) or _is_positive_value(value) or bool(evidence)
         if not confirmed:
+            # The probe RAN and proved the condition absent. That is real
+            # positive-assurance evidence and the AD Control Coverage Report
+            # exists to render it, so route it there instead of discarding it.
+            # Dropping it silently was why an authenticated engagement shipped
+            # a two-page empty coverage document: every clear result on a
+            # CATALOG key (LDAP anonymous bind refused, SMBv1 off, no secrets
+            # in reachable shares…) landed here and vanished, leaving only the
+            # handful of NON-catalog metrics that the unauthenticated phase
+            # writes — and an authenticated-only scan never runs that phase.
+            # No ``title=``: the catalog title names the WEAKNESS ("LDAP
+            # Anonymous Bind Enabled"), which reads backwards on a record whose
+            # whole meaning is that the weakness is absent. The coverage report
+            # renders its own control-area names anyway.
+            record_control_evidence(
+                shell,
+                domain,
+                key=key,
+                category="Coverage",
+                status="verified_clear",
+                details={"value": value, "checked_clear": True},
+            )
             return
         resolved_from_attack_graph = (
             bool(from_attack_graph) if from_attack_graph is not None else False

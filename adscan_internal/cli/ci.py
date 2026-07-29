@@ -269,7 +269,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     preflight_result = run_session_preflight(
         config=SessionPreflightConfig(
             command_name="ci",
-            docs_utm_medium="ci_preflight_failed",
+            docs_placement="ci_preflight_failed",
             allow_unsafe_override=False,
         ),
         deps=SessionPreflightDeps(
@@ -708,21 +708,29 @@ def run_generate_report(
         Path to generated report file, or None on failure
     """
     if ReportService is None or ReportGenerationConfig is None:
-        # LITE — the PRO report service is stripped from the image. Render
-        # the canonical PRO upsell panel instead of a flat error so the
-        # operator sees the same CTA they would get from ``adscan deliver``
-        # (host) or ``deliver`` (REPL). The panel surfaces ``adscan demo``
-        # as the zero-risk preview path and ``adscanpro.com/pro`` as the
-        # upgrade URL — single source of truth for the PRO ask.
-        #
-        # Note: ``do_generate_report`` in adscan.py gates earlier so the
-        # operator never reaches this branch with prompts already
-        # answered. This stays as the final safety net for non-REPL
-        # callers (e.g. ``adscan ci`` invoking the report path directly).
-        from adscan_core.pro_upsell import print_pro_upsell
+        # LITE — the PRO report service is stripped from the image. Render the
+        # self-contained HTML exposure report from the scan's own data instead.
+        # This is the single LITE render path shared by the REPL
+        # ``generate_report`` verb and ``adscan ci`` (the tier decides the
+        # output; there is no flag). Returns the written ``.html`` path so CI's
+        # artifact handling picks it up like any other report.
+        from adscan_internal.services.post_scan_report import (
+            TRIGGER_CI,
+            generate_report_with_telemetry,
+            get_post_scan_report_path,
+        )
 
-        print_pro_upsell("generate_report", "direct_invocation")
-        return None
+        # An engagement workspace already had its exposure report rendered at
+        # scan completion. Re-rendering here would write a second timestamped
+        # pair of files and print the same panel twice, so reuse the artifact
+        # this run already produced.
+        already_rendered = get_post_scan_report_path(shell)
+        if already_rendered and os.path.exists(already_rendered):
+            return already_rendered
+
+        return generate_report_with_telemetry(
+            shell, trigger=TRIGGER_CI, report_file=report_file
+        )
 
     if not os.path.exists(report_file):
         print_error(f"Report file not found: {report_file}")

@@ -13,7 +13,12 @@ from adscan_internal.services import attack_graph_service
 from adscan_internal.services.collector.inventory_persistence import (
     CollectorInventoryPersistence,
 )
-from adscan_internal.services.collector.models import CollectionResult, CollectorEdge
+from adscan_internal.services.collector.models import (
+    CollectionResult,
+    CollectorEdge,
+    HttpSpnFinding,
+)
+from adscan_internal.services.credential_store_service import hosts_match
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
     resolve_privileged_followup_decision,
@@ -565,6 +570,12 @@ def _persist_derived_attack_steps(
 ) -> int:
     """Persist attack steps derived from collected account properties."""
     domain_users_id = _find_domain_users_graph_id(result, sid_to_graph_id)
+    # ADCS Enterprise CA web-enrollment hosts carry an ``HTTP/<ca>`` SPN, but the
+    # ADCS collector already owns that host's Kerberos-relay story (ESC8 detection
+    # plus the active EPA probe in ``adcs_web_enrollment_probe``). Collect those
+    # host identifiers up front so the generic HTTP-SPN surface finding below is
+    # suppressed there — otherwise the same asset is reported twice.
+    adcs_ca_hosts = _adcs_ca_web_enrollment_hosts(result)
     created = 0
     created += _persist_dcsync_steps(
         graph, result=result, sid_to_graph_id=sid_to_graph_id
@@ -576,7 +587,57 @@ def _persist_derived_attack_steps(
         graph_id = sid_to_graph_id.get(node.object_id.upper())
         if not graph_id:
             continue
-        if node.kind == "User" and domain_users_id and _node_is_enabled(node):
+        # Single account-type classification (user / computer / gMSA) shared by
+        # every derivation below, so the HTTP-SPN scoping and the kerberoast /
+        # AS-REP roast filters agree on what a gMSA is.
+        account_type = _node_account_type(node)
+        # HTTP/* SPN classification — the SAME collected SPN list the
+        # kerberoastable derivation reads, classified for the Kerberos
+        # web-app / relay-coercion surface (user, service account, gMSA, or
+        # computer). Not a graph edge: it is an observed configuration
+        # exposure surfaced as a report finding via ``result.http_spn_findings``
+        # (emitted in cli/intelligence.py alongside the trust-posture findings,
+        # reaching both the PDF and the web CTEM).
+        if node.kind in {"User", "Computer"}:
+            # Fire only for structurally UNCRACKABLE accounts — machine accounts
+            # and gMSAs (random 120/240-char passwords kerberoast cannot crack),
+            # where the relay-surface / EPA-hardening signal is the UNIQUE finding.
+            # A normal USER account carrying an HTTP/* SPN is already owned by the
+            # Kerberoasting finding (offline password cracking is the direct,
+            # higher-value attack); emitting a relay-surface finding on the same
+            # account is the same one-asset/two-findings duplication we remove for
+            # the ADCS CA vs ESC8 case below.
+            if account_type in {"computer", "gmsa"}:
+                http_spns = _exclude_adcs_ca_http_spns(
+                    _http_service_spns(
+                        _node_list_property(node, "serviceprincipalnames")
+                    ),
+                    adcs_ca_hosts,
+                )
+                if http_spns:
+                    result.http_spn_findings.append(
+                        HttpSpnFinding(
+                            object_id=node.object_id,
+                            samaccountname=node.samaccountname,
+                            kind=node.kind,
+                            account_type=account_type,
+                            distinguished_name=node.distinguished_name,
+                            http_spns=tuple(http_spns),
+                            enabled=node.enabled,
+                        )
+                    )
+        # A gMSA (``account_type == "gmsa"``) has a KDC-managed 240-char random
+        # password, so it is NEVER a valid kerberoast / AS-REP target even though
+        # it is a ``User`` node that commonly carries SPNs. Exclude it explicitly
+        # by account type (not the fragile trailing-``$`` heuristic) so no
+        # false-positive Kerberoasting / ASREPRoasting edge is derived on an
+        # account nobody can crack offline.
+        if (
+            node.kind == "User"
+            and account_type != "gmsa"
+            and domain_users_id
+            and _node_is_enabled(node)
+        ):
             if _node_bool_property(node, "hasspn"):
                 created += _upsert_derived_edge(
                     graph,
@@ -1699,6 +1760,93 @@ def _node_list_property(node: Any, key: str) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _http_service_spns(spns: list[str]) -> list[str]:
+    """Return the subset of ``spns`` whose service class is HTTP.
+
+    An SPN is ``serviceclass/instance[:port][/name]``; the service class is the
+    token before the first ``/`` (MS-ADTS 2.2.21), matched case-insensitively.
+    Unlike the auto-registered ``HOST/`` / ``RestrictedKrbHost/`` SPNs, an
+    ``HTTP/`` SPN is registered deliberately when a Kerberos web service is
+    published under the account, so every occurrence is the signal. Reuses the
+    already-collected SPN list — the same one the kerberoastable derivation
+    walks — so there is no second SPN pass.
+    """
+    out: list[str] = []
+    for spn in spns or []:
+        text = str(spn).strip()
+        if text and text.split("/", 1)[0].strip().lower() == "http":
+            out.append(text)
+    return out
+
+
+def _adcs_ca_web_enrollment_hosts(result: CollectionResult) -> set[str]:
+    """Return the FQDN host identifiers of every ADCS Enterprise CA collected.
+
+    An Enterprise CA's web-enrollment endpoint publishes an ``HTTP/<ca>`` SPN, so
+    the generic HTTP-SPN relay-surface finding would fire on the very host that
+    ADCS/ESC8 detection (and the active EPA probe in ``adcs_web_enrollment_probe``)
+    already covers with a specific, higher-value finding. The authoritative marker
+    is the ``EnterpriseCA`` node's ``dns_hostname`` (the CA's FQDN, populated by
+    the ADCS collector). These hosts are used to suppress the duplicate.
+    """
+    hosts: set[str] = set()
+    for node in result.nodes.values():
+        if str(node.kind) != "EnterpriseCA":
+            continue
+        dns_hostname = str(node.properties.get("dns_hostname") or "").strip()
+        if dns_hostname:
+            hosts.add(dns_hostname)
+    return hosts
+
+
+def _spn_instance_host(spn: str) -> str:
+    """Return the instance host of an SPN (``serviceclass/instance[:port][/name]``).
+
+    The instance is the token after the first ``/``; an optional ``:port`` and an
+    optional ``/servicename`` suffix are dropped. Returns ``""`` for a malformed
+    SPN with no instance.
+    """
+    text = str(spn or "").strip()
+    if "/" not in text:
+        return ""
+    instance = text.split("/", 1)[1].strip()
+    instance = instance.split("/", 1)[0]
+    instance = instance.split(":", 1)[0]
+    return instance.strip()
+
+
+def _exclude_adcs_ca_http_spns(
+    http_spns: list[str], adcs_ca_hosts: set[str]
+) -> list[str]:
+    """Drop HTTP SPNs whose instance host is an ADCS CA web-enrollment endpoint.
+
+    ADCS/ESC8 detection owns those hosts' Kerberos-relay story, so the generic
+    HTTP-SPN surface finding would be a duplicate on the same asset. Host matching
+    is alias-aware (IP <-> short <-> FQDN <-> ``HOST$``) via the canonical
+    resolver. Non-ADCS HTTP SPNs are kept unchanged, so a principal carrying both
+    a CA and a non-CA HTTP SPN still surfaces only for the non-CA endpoint.
+    """
+    if not adcs_ca_hosts:
+        return http_spns
+    kept: list[str] = []
+    for spn in http_spns:
+        instance = _spn_instance_host(spn)
+        if instance and any(
+            hosts_match(instance, ca_host) for ca_host in adcs_ca_hosts
+        ):
+            continue
+        kept.append(spn)
+    return kept
+
+
+def _node_account_type(node: Any) -> str:
+    """Human account-type label for the HTTP-SPN finding evidence."""
+    explicit = str(node.properties.get("account_type") or "").strip().lower()
+    if explicit:
+        return explicit
+    return "computer" if node.kind == "Computer" else "user"
 
 
 def _prune_existing_adcs_raw_acl_edges(graph: dict[str, Any]) -> int:

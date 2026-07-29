@@ -248,6 +248,14 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
  'credential_in_ldap_attribute': {'severity': 'high',
                                   'title': 'Credentials Found in LDAP Attributes',
                                   'mitre': []},
+ 'ldap_user_description_password_leak': {'severity': 'medium',
+                                         'title': 'Password Material in User Description Attributes (LDAP)',
+                                         'mitre': [{'id': 'T1552',
+                                                    'name': 'Unsecured Credentials'}]},
+ 'user_description_credential_leak': {'severity': 'medium',
+                                      'title': 'Password Material in Account Description Attributes',
+                                      'mitre': [{'id': 'T1552',
+                                                 'name': 'Unsecured Credentials'}]},
  'ntlm_authentication_accepted': {'severity': 'medium',
                                   'title': 'Domain Controller Accepts NTLM Authentication',
                                   'mitre': [{'id': 'T1557', 'name': 'Adversary-in-the-Middle'},
@@ -288,6 +296,74 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
                               'title': 'NTLMv1 Coerce-and-Relay to Shadow Credentials',
                               'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'},
                                         {'id': 'T1557', 'name': 'Adversary-in-the-Middle'},
-                                        {'id': 'T1556', 'name': 'Modify Authentication Process'}]}}
+                                        {'id': 'T1556', 'name': 'Modify Authentication Process'}]},
+ 'trust_tgt_delegation_enabled': {'severity': 'high',
+                                  'title': 'Kerberos TGT Delegation Enabled Across a Forest Trust',
+                                  'mitre': [{'id': 'T1558',
+                                             'name': 'Steal or Forge Kerberos Tickets'}]},
+ 'trust_sid_filtering_disabled': {'severity': 'high',
+                                  'title': 'SID Filtering Not Enforced on a Cross-Forest / External Trust',
+                                  'mitre': [{'id': 'T1134.005',
+                                             'name': 'Access Token Manipulation: SID-History Injection'}]},
+ 'http_spn_relay_surface': {'severity': 'medium',
+                            'title': 'Kerberos Web Service (HTTP SPN) Relay and Coercion Surface',
+                            'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'},
+                                      {'id': 'T1557', 'name': 'Adversary-in-the-Middle'}]}}
 
-__all__ = ("VULN_CATALOG_META",)
+#: The attack-graph relation each finding ships under, for the keys the PRO
+#: catalog declares one for. A relation name is a structural join key -- it is
+#: what lets affected-asset resolution correlate a finding to the graph edges
+#: that carry its concrete hosts and accounts -- so it belongs in the LITE-safe
+#: slice alongside severity and ATT&CK. Without it the free report resolves
+#: fewer assets than the paid kit for the same scan, which is precisely the
+#: drift the shared derivation layer exists to prevent.
+#:
+#: Most relations are also recoverable by inverting ``ATTACK_STEP_CATALOG`` on
+#: ``vuln_key``; three are not (``ldapanonymousbind``, ``passwordinshare``,
+#: ``gpppassword`` carry no ``vuln_key`` there), which is why this mapping is
+#: carried explicitly rather than derived. Drift-guarded against the PRO catalog
+#: by ``tests/unit/test_vuln_catalog_meta_drift.py``.
+VULN_CATALOG_STEP_RELATIONS: dict[str, str] = {
+    "kerberoast": "kerberoasting",
+    "asreproast": "asreproasting",
+    "smb_guest_shares": "guestsession",
+    "ldap_anonymous": "ldapanonymousbind",
+    "smb_share_secrets": "passwordinshare",
+    "gpp_passwords": "gpppassword",
+    "laps_readable": "readlapspassword",
+    "gmsa_readable": "readgmsapassword",
+    "dcsync": "dcsync",
+    "rbcd_exploitable": "allowedtoact",
+    "force_change_password": "forcechangepassword",
+    "all_extended_rights": "allextendedrights",
+    "adcs_esc1": "adcsesc1",
+    "adcs_esc2": "adcsesc2",
+    "adcs_esc3": "adcsesc3",
+    "adcs_esc4": "adcsesc4",
+    "adcs_esc5": "adcsesc5",
+    "adcs_esc6": "adcsesc6",
+    "adcs_esc7": "adcsesc7",
+    "adcs_esc8": "adcsesc8",
+    "adcs_esc9": "adcsesc9",
+    "adcs_esc10": "adcsesc10",
+    "adcs_esc11": "adcsesc11",
+    "adcs_esc13": "adcsesc13",
+    "adcs_esc14": "adcsesc14",
+    "nopac": "nopac",
+    "zerologon": "zerologon",
+    "printnightmare": "printnightmare",
+    "ms17-010": "ms17-010",
+    "dfscoerce": "dfscoerce",
+    "mseven": "mseven",
+    "petitpotam": "petitpotam",
+    "printerbug": "printerbug",
+    "unconstrained_delegation": "coercetotgt",
+    "constrained_delegation": "allowedtodelegate",
+    "da_sessions": "hassession",
+    "adcs_esc15": "adcsesc15",
+    "adcs_esc16": "adcsesc16",
+    "adcs_esc17": "adcsesc17",
+    "shadow_credentials_present": "hasshadowcredentials",
+}
+
+__all__ = ("VULN_CATALOG_META", "VULN_CATALOG_STEP_RELATIONS")

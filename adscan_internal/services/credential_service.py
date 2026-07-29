@@ -110,6 +110,84 @@ async def _diagnose_kdc_unreachable(*, kdc_ip: str, original_error: str) -> str:
     return f"Kerberos transport error (TCP/88 reachable on {kdc_ip}): {original_error}"
 
 
+#: Wordings that positively identify a rejected secret when the KDC failure
+#: carries no error code. Deliberately narrow — a bare "password" also appears
+#: in "password expired" / "password must be changed", which are account states,
+#: not wrong secrets.
+_WRONG_SECRET_MARKERS: tuple[str, ...] = (
+    "preauth",
+    "pre-authentication",
+    "pre authentication",
+    "bad cred",
+    "wrong password",
+    "invalid password",
+    "incorrect password",
+)
+
+
+def _mentions_wrong_secret(exc: BaseException) -> bool:
+    """Return whether a codeless auth failure names the secret as the problem."""
+    text = " ".join(f"{type(c).__name__}: {c}".lower() for c in _walk_exc_chain(exc))
+    return any(marker in text for marker in _WRONG_SECRET_MARKERS)
+
+
+def _kerberos_error_code_name(exc: BaseException) -> str:
+    """Return the KDC error-code name carried anywhere in the exception chain.
+
+    kerbad attaches ``errorcode`` to its ``KerberosError``; ADscan's transport
+    wraps that in a domain exception, so the code is one or two ``__cause__``
+    links down. Returns ``""`` when the failure carries no KDC code at all —
+    which is itself the important signal: without a code the KDC never told us
+    anything classifiable about the credential.
+    """
+    for candidate in _walk_exc_chain(exc):
+        code = getattr(candidate, "errorcode", None)
+        if code is not None:
+            return str(getattr(code, "name", code))
+    return ""
+
+
+def _log_kerberos_auth_diagnostic(
+    *,
+    domain: str,
+    username: str,
+    requested_etypes: Any,
+    exc: BaseException,
+    code_name: str,
+) -> None:
+    """Record why a Kerberos authentication failed, before it becomes a status.
+
+    A bare "Incorrect credentials" line is undiagnosable from a session
+    recording: it hides whether the KDC rejected the secret, refused the
+    encryption type, or was answering a request built with a stale clock. The
+    KDC error-code name, the etypes we asked for and the realm skew currently
+    applied are not secrets. Best-effort; never raises. Bracket-free marker —
+    Rich silently drops a ``[bracketed]`` prefix.
+    """
+    try:
+        from adscan_internal.rich_output import mark_sensitive  # noqa: PLC0415
+        from adscan_internal.services._kerberos_recovery import (  # noqa: PLC0415
+            get_realm_skew,
+        )
+
+        skew = get_realm_skew(domain)
+        print_info_debug(
+            "kdc-auth-failure: user=%s domain=%s error_code=%s requested_etypes=%s "
+            "realm_skew=%s exc=%s: %s"
+            % (
+                mark_sensitive(username or "", "user"),
+                mark_sensitive(domain or "", "domain"),
+                code_name or "none",
+                requested_etypes if requested_etypes else "default",
+                f"{skew.total_seconds():+.0f}s" if skew is not None else "none",
+                type(exc).__name__,
+                mark_sensitive(str(exc), "detail"),
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _walk_exc_chain(exc: BaseException, *, max_depth: int = 10) -> list[BaseException]:
     """Return the exception and its ``__cause__`` / ``__context__`` chain.
 
@@ -157,6 +235,15 @@ class CredentialVerificationResult:
         protocol_used: Which transport actually produced the verdict
             ("kerberos", "ntlm-ldap", "ntlm-smb"). Lets the caller render an
             accurate Protocol label instead of a hardcoded one.
+        verdict_is_definitive: Whether the server gave a POSITIVE, classified
+            answer about this credential — a Kerberos ``KDC_ERR_PREAUTH_FAILED``
+            /``KDC_ERR_C_PRINCIPAL_UNKNOWN``, an NTLM ``STATUS_LOGON_FAILURE`` /
+            ``invalidCredentials``, or an explicit account-state code. It is
+            ``False`` for anything ADscan merely failed to complete. Only a
+            definitive verdict may drive a destructive decision such as deleting
+            the stored credential: "we could not tell why the KDC refused" is
+            NOT "the secret is wrong", and conflating the two has already
+            deleted freshly-minted, perfectly valid credentials.
     """
 
     status: CredentialStatus
@@ -166,6 +253,7 @@ class CredentialVerificationResult:
     error_message: Optional[str] = None
     is_admin: bool = False
     protocol_used: str = "kerberos"
+    verdict_is_definitive: bool = False
     # Raw command output is kept for in-process consumers (e.g. CLI) but is
     # intentionally excluded from serialized representations to avoid leaking
     # potentially sensitive information.
@@ -312,6 +400,7 @@ class CredentialService(BaseService):
                 username=username,
                 domain=domain,
                 credential_type=credential_type,
+                verdict_is_definitive=True,
             )
             # Attach ccache bytes so the caller can persist the ticket without
             # an extra AS-REQ.  raw_output normally holds str but bytes here is
@@ -319,13 +408,84 @@ class CredentialService(BaseService):
             r.raw_output = ccache  # type: ignore[assignment]
             return r
 
-        def _fail(status: CredentialStatus, msg: str) -> "CredentialVerificationResult":
+        def _fail(
+            status: CredentialStatus, msg: str, *, definitive: bool = False
+        ) -> "CredentialVerificationResult":
             return CredentialVerificationResult(
                 status=status,
                 username=username,
                 domain=domain,
                 credential_type=credential_type,
                 error_message=msg,
+                verdict_is_definitive=definitive,
+            )
+
+        async def _classify_auth_error(
+            exc: BaseException, *, requested_etypes: Any, context: str = ""
+        ) -> "CredentialVerificationResult":
+            """Map a Kerberos auth rejection to a status, never guessing.
+
+            Only a KDC error code ADscan recognises produces a definitive
+            verdict. A rejection with no classifiable code is reported as
+            ``ERROR`` — "the KDC refused and did not say why" is not evidence
+            that the secret is wrong, and reporting it as INVALID is what let a
+            freshly-minted, valid credential be auto-deleted.
+            """
+            code_name = _kerberos_error_code_name(exc)
+            _log_kerberos_auth_diagnostic(
+                domain=domain,
+                username=username,
+                requested_etypes=requested_etypes,
+                exc=exc,
+                code_name=code_name,
+            )
+            suffix = f" ({context})" if context else ""
+            if code_name == "KDC_ERR_KEY_EXPIRED":
+                return _fail(
+                    CredentialStatus.PASSWORD_MUST_CHANGE,
+                    "Password must be changed before logon",
+                    definitive=True,
+                )
+            if code_name == "KDC_ERR_CLIENT_REVOKED":
+                # Distinguish locked vs disabled via LDAP userAccountControl.
+                uac_status = await self._ldap_get_account_status(
+                    domain=domain,
+                    kdc_ip=kdc_ip,
+                    username=username,
+                    password=password,
+                    nt_hash=nt_hash,
+                )
+                return _fail(
+                    uac_status,
+                    uac_status.value.replace("_", " ").capitalize(),
+                    definitive=True,
+                )
+            if code_name == "KDC_ERR_PREAUTH_FAILED":
+                return _fail(
+                    CredentialStatus.INVALID,
+                    f"Invalid credentials — the KDC rejected the secret{suffix}",
+                    definitive=True,
+                )
+            if not code_name and _mentions_wrong_secret(exc):
+                # kerbad raised something the transport classified as an auth
+                # failure from its wording alone. Report it as invalid so the
+                # operator gets the right message, but NOT as definitive: a
+                # wording match is not the KDC naming the reason, so it must not
+                # authorise deleting the stored credential.
+                return _fail(
+                    CredentialStatus.INVALID,
+                    f"Invalid credentials — pre-authentication failed{suffix}",
+                )
+            # Nothing classifiable: keep the credential and say what we do and
+            # do not know. The message reaches the operator verbatim.
+            reason = code_name or "no KDC error code"
+            return _fail(
+                CredentialStatus.ERROR,
+                (
+                    "Kerberos authentication was refused but the credential was "
+                    f"NOT proven invalid ({reason}{suffix}). The credential is "
+                    "kept; re-run verification once the cause is resolved."
+                ),
             )
 
         try:
@@ -339,10 +499,14 @@ class CredentialService(BaseService):
             try:
                 ccache = await get_tgt(cfg_aes)
                 return _ok(ccache)
-            except KerberosAuthError:
-                return _fail(CredentialStatus.INVALID, "Invalid credentials (AES-only KDC)")
+            except KerberosAuthError as exc:
+                return await _classify_auth_error(
+                    exc, requested_etypes=[18, 17], context="AES-only KDC"
+                )
             except KerberosPrincipalError:
-                return _fail(CredentialStatus.USER_NOT_FOUND, "User not found")
+                return _fail(
+                    CredentialStatus.USER_NOT_FOUND, "User not found", definitive=True
+                )
             except KerberosTransportError as exc:
                 # No-verdict transport failure on the AES retry — same recovery
                 # as the outer branch: try NTLM (LDAP then SMB) before giving up.
@@ -362,38 +526,36 @@ class CredentialService(BaseService):
                 return _fail(CredentialStatus.ERROR, diagnosis)
 
         except KerberosPrincipalError:
-            return _fail(CredentialStatus.USER_NOT_FOUND, "User not found")
+            # The KDC positively reported the principal does not exist.
+            return _fail(
+                CredentialStatus.USER_NOT_FOUND, "User not found", definitive=True
+            )
 
         except KerberosAuthError as exc:
-            # Inspect the original kerbad error code to distinguish sub-states.
-            # KDC_ERR_CLIENT_REVOKED (0x12=18) covers locked + disabled accounts;
-            # we disambiguate with a quick LDAP read of userAccountControl.
-            # KDC_ERR_KEY_EXPIRED (0x17=23) = password must change.
-            original = getattr(exc, "__cause__", exc)
-            try:
-                from kerbad.protocol.errors import KerberosErrorCode  # noqa: PLC0415
-                code = getattr(original, "errorcode", None)
-                if code == KerberosErrorCode.KDC_ERR_KEY_EXPIRED:
-                    return _fail(
-                        CredentialStatus.PASSWORD_MUST_CHANGE,
-                        "Password must be changed before logon",
-                    )
-                if code == KerberosErrorCode.KDC_ERR_CLIENT_REVOKED:
-                    # Distinguish locked vs disabled via LDAP userAccountControl.
-                    uac_status = await self._ldap_get_account_status(
-                        domain=domain, kdc_ip=kdc_ip,
-                        username=username, password=password, nt_hash=nt_hash,
-                    )
-                    return _fail(uac_status, uac_status.value.replace("_", " ").capitalize())
-            except Exception:  # noqa: BLE001
-                pass
-            return _fail(CredentialStatus.INVALID, "Invalid credentials")
+            # Sub-states come from the kerbad error code:
+            # KDC_ERR_CLIENT_REVOKED (0x12=18) covers locked + disabled accounts,
+            # disambiguated with a quick LDAP read of userAccountControl;
+            # KDC_ERR_KEY_EXPIRED (0x17=23) = password must change;
+            # KDC_ERR_PREAUTH_FAILED (0x18=24) = the secret really is wrong.
+            # Anything else stays ERROR — see _classify_auth_error.
+            return await _classify_auth_error(exc, requested_etypes=cfg.etypes)
 
-        except KerberosClockSkewError:
+        except KerberosClockSkewError as exc:
             # Clock skew is a transport problem, not a credential problem.
             # Signal ERROR so the caller can fall back to netexec (which has its
             # own clock-sync logic) or prompt for manual sync.
-            return _fail(CredentialStatus.ERROR, "Clock skew too large — sync clocks and retry")
+            _log_kerberos_auth_diagnostic(
+                domain=domain,
+                username=username,
+                requested_etypes=cfg.etypes,
+                exc=exc,
+                code_name=_kerberos_error_code_name(exc) or "KRB_AP_ERR_SKEW",
+            )
+            return _fail(
+                CredentialStatus.ERROR,
+                "Clock skew too large — sync clocks and retry. The credential was "
+                "NOT proven invalid and is kept.",
+            )
 
         except KerberosTransportError as exc:
             # Port 88 unreachable, DNS failure, etc. This is the NO-VERDICT
@@ -582,6 +744,7 @@ class CredentialService(BaseService):
                     "Validated via NTLM (LDAP); Kerberos KDC unreachable, no TGT minted."
                 ),
                 protocol_used="ntlm-ldap",
+                verdict_is_definitive=True,
             )
         except Exception as exc:  # noqa: BLE001
             # Transport failure (LDAP also unreachable) → no verdict here; let
@@ -604,6 +767,7 @@ class CredentialService(BaseService):
                     credential_type=credential_type,
                     error_message="Invalid credentials (validated via NTLM/LDAP)",
                     protocol_used="ntlm-ldap",
+                    verdict_is_definitive=True,
                 )
             # Anything we cannot classify (e.g. strongerAuthRequired / channel
             # binding) is not a credential verdict — fall through to SMB.
@@ -661,19 +825,33 @@ class CredentialService(BaseService):
                     "Validated via NTLM (SMB); Kerberos KDC unreachable, no TGT minted."
                 ),
                 protocol_used="ntlm-smb",
+                verdict_is_definitive=True,
             )
-        except SMBAuthError:
+        except SMBAuthError as exc:
+            # SMBAuthError is deliberately BROAD at the transport layer (it also
+            # covers Kerberos/ticket/AP-exchange failures so the SMB fallback
+            # chain can react). Only a status code that names the credential is
+            # a verdict about the credential; everything else is inconclusive
+            # and must not be reported as INVALID.
+            classified = self._classify_smb_auth_failure(exc)
+            if classified is None:
+                print_info_debug(
+                    "[verify] NTLM SMB bind failed without a credential-specific "
+                    f"status ({type(exc).__name__}) — inconclusive, not INVALID."
+                )
+                return None
+            status, message = classified
             print_info_debug(
-                "[verify] NTLM SMB bind rejected the credential — "
-                "definitive INVALID verdict."
+                f"[verify] NTLM SMB bind returned a definitive verdict: {status.value}."
             )
             return CredentialVerificationResult(
-                status=CredentialStatus.INVALID,
+                status=status,
                 username=username,
                 domain=domain,
                 credential_type=credential_type,
-                error_message="Invalid credentials (validated via NTLM/SMB)",
+                error_message=f"{message} (validated via NTLM/SMB)",
                 protocol_used="ntlm-smb",
+                verdict_is_definitive=True,
             )
         except Exception as exc:  # noqa: BLE001
             # SMB also unreachable / inconclusive → no verdict; the caller keeps
@@ -685,6 +863,44 @@ class CredentialService(BaseService):
                 f"{type(exc).__name__}: {exc}."
             )
             return None
+
+    @staticmethod
+    def _classify_smb_auth_failure(
+        exc: BaseException,
+    ) -> "Optional[tuple[CredentialStatus, str]]":
+        """Return the account verdict an SMB auth failure positively proves.
+
+        ``SMBAuthError`` is raised for a wide family of failures (bad password,
+        but also Kerberos ticket / AP-exchange / generic "authentication"
+        problems) because the SMB fallback chain needs to catch all of them.
+        Only an NT status code that names the credential or the account state is
+        a verdict about the credential — ``None`` means the attempt tells us
+        nothing about the secret, so the caller must not call it INVALID.
+        """
+        text = " ".join(
+            f"{type(c).__name__}: {c}".lower() for c in _walk_exc_chain(exc)
+        )
+        if "status_account_locked_out" in text:
+            return CredentialStatus.ACCOUNT_LOCKED, "Account locked out"
+        if "status_account_disabled" in text:
+            return CredentialStatus.ACCOUNT_DISABLED, "Account disabled"
+        if "status_password_must_change" in text:
+            return (
+                CredentialStatus.PASSWORD_MUST_CHANGE,
+                "Password must be changed before logon",
+            )
+        if "status_password_expired" in text:
+            return CredentialStatus.PASSWORD_EXPIRED, "Password expired"
+        if "status_account_restriction" in text:
+            return CredentialStatus.ACCOUNT_RESTRICTION, "Account restricted"
+        if (
+            "status_logon_failure" in text
+            or "status_wrong_password" in text
+            or "sec_e_logon_denied" in text
+            or "invalidcredentials" in text
+        ):
+            return CredentialStatus.INVALID, "Invalid credentials"
+        return None
 
     @staticmethod
     def _is_ntlm_bind_rejection(exc: BaseException) -> bool:
@@ -1104,6 +1320,7 @@ class CredentialService(BaseService):
                 domain=domain,
                 credential_type=credential_type,
                 error_message="Incorrect credentials",
+                verdict_is_definitive=True,
             )
 
         if "STATUS_ACCOUNT_LOCKED_OUT" in output:
@@ -1158,6 +1375,7 @@ class CredentialService(BaseService):
                 domain=domain,
                 credential_type=credential_type,
                 error_message="User not found",
+                verdict_is_definitive=True,
             )
 
         if "KDC_ERR_PREAUTH_FAILED" in output:
@@ -1167,9 +1385,14 @@ class CredentialService(BaseService):
                 domain=domain,
                 credential_type=credential_type,
                 error_message="Pre-authentication failed",
+                verdict_is_definitive=True,
             )
 
         if self._contains_negative_auth_result(output, username, domain):
+            # A bare ``[-] domain\user:secret`` line with no status code. It is
+            # NetExec saying "auth failed", not the DC naming the reason, so the
+            # verdict is reported but deliberately left non-definitive: it must
+            # not authorise deleting the stored credential.
             return CredentialVerificationResult(
                 status=CredentialStatus.INVALID,
                 username=username,

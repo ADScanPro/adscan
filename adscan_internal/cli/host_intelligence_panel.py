@@ -19,6 +19,7 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.text import Text
 
+from adscan_core.outbound_links import ADSCAN_SITE_HOST
 from adscan_internal.services.exploitation.dump_display import (
     ACID_GREEN,
     AMBER,
@@ -122,7 +123,7 @@ def render_host_intelligence_panel(
         body.append(workspace_type, style=ICE_BLUE)
 
     footer = Text()
-    footer.append("\n  adscanpro.com  ·  ", style=MUTED)
+    footer.append(f"\n  {ADSCAN_SITE_HOST}  ·  ", style=MUTED)
     footer.append(_format_cache_footer(cache_ttl_remaining_s), style=MUTED)
 
     console.print(

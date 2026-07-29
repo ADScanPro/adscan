@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from rich.text import Text
 
+from adscan_core.outbound_links import cta_url
 from adscan_core.theme import ADSCAN_PRIMARY
 
 # ── Brand constants ───────────────────────────────────────────────────────────
@@ -26,7 +27,7 @@ ADSCAN_TAGLINE = "Automate the AD kill chain."
 ADSCAN_COPYRIGHT = "© 2026 Yeray Martín · Macroblond44"
 
 ADSCAN_LINKS = {
-    "docs": "https://www.adscanpro.com/docs",
+    "docs": cta_url("intro_banner"),
     "github": "https://github.com/ADscanPro/adscan",
     "discord": "https://discord.gg/fXBR3P8H74",
     "linkedin": "https://linkedin.com/in/yeray-martín-domínguez-324a64223",

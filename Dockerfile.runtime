@@ -1313,8 +1313,8 @@ COPY custom_config.yaml /opt/adscan-src/custom_config.yaml
 COPY pyproject.toml /opt/adscan-src/pyproject.toml
 
 # Pre-baked LITE cheatsheet PDF. The LITE runtime cannot render the
-# cheatsheet on demand (the PRO reporting templates/engines under
-# ``adscan_internal/pro/`` are stripped from this image), so the build
+# cheatsheet on demand (the render engine is shared, but the PRO cheatsheet
+# template under ``adscan_internal/pro/`` is stripped from this image), so the build
 # pipeline pre-renders the PDF in the PRO image and seeds it into the
 # build context at ``adscan_internal/assets/cheatsheet/``. The runtime
 # ``adscan cheatsheet`` falls back to this static path when the PRO

@@ -7,9 +7,9 @@ point is :func:`request_certificate_native`.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.services.kerberos_tcp_target import (
@@ -556,6 +556,52 @@ def _render_request_result(
     get_console().print(panel)
 
 
+def _disclose_issued_certificate(
+    config: "CertRequestConfig",
+    *,
+    principal: Optional[str],
+    serial: Optional[str],
+    request_id: Optional[int],
+    not_after: Optional[str],
+    pfx_path: Optional[Path],
+) -> None:
+    """Register a CA-issued certificate as a manual-cleanup environment change.
+
+    Called from the two issuance points in this module, which is where every
+    native ADCS enrollment in the product converges — so a future ESC flow
+    inherits the disclosure by construction rather than by remembering to add
+    it. The registration is written the moment the CA returns the certificate,
+    because from that instant the credential exists in the client's PKI whether
+    or not the scan survives to write a report.
+
+    Silent no-op when the caller supplied no ledger context (standalone lab
+    harnesses, unit tests).
+    """
+    if config.ledger_shell is None:
+        return
+    try:
+        from adscan_internal.services.adcs.esc_cleanup import (
+            register_issued_certificate,
+        )
+
+        register_issued_certificate(
+            config.ledger_shell,
+            domain=config.ledger_domain or config.effective_target_domain,
+            technique=config.ledger_technique or "ADCS certificate enrollment",
+            principal=principal,
+            serial=serial,
+            request_id=request_id,
+            template=config.template or None,
+            ca_name=config.ca_name,
+            ca_host=config.ca_fqdn or config.ca_host,
+            not_after=not_after,
+            pfx_path=str(pfx_path) if pfx_path else None,
+        )
+    except Exception as exc:  # noqa: BLE001 — disclosure must never break issuance
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def _hint_for_failure(
     disposition: Optional[int], message: Optional[str]
 ) -> Optional[str]:
@@ -613,6 +659,15 @@ class CertRequestConfig:
             referral resolution when fetching the inter-realm TGS).
         application_policies: Optional list of application policy OIDs to embed
             in the CSR (ESC15 — enrollment-agent policy injection).
+        ledger_shell: Session shell carrying the environment-change ledger. When
+            set, every certificate this config obtains is disclosed to the client
+            as a manual-cleanup item (see ``ledger_technique``). Every ESC flow
+            passes it; leave it unset only for a request that provably touches no
+            live CA.
+        ledger_domain: Domain the disclosure is recorded under. Falls back to
+            the effective target domain.
+        ledger_technique: Technique label recorded against the disclosure (e.g.
+            ``"ADCSESC1 — certificate enrollment"``).
     """
 
     domain: str
@@ -652,6 +707,13 @@ class CertRequestConfig:
     # ``None`` means no fingerprint — the panel falls back to lab-agnostic
     # advice so we never invent a context the operator didn't confirm.
     lab_provider: Optional[str] = None
+    # Environment-change disclosure context. A certificate obtained from a live
+    # CA is a durable credential in the client's PKI, so it is registered in the
+    # ledger the moment it is issued. Kept out of ``repr``/``compare`` because
+    # the shell is a live session object, not request data.
+    ledger_shell: Optional[Any] = dc_field(default=None, repr=False, compare=False)
+    ledger_domain: Optional[str] = None
+    ledger_technique: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Enforce data invariants for credential and CA hostname routing.
@@ -739,6 +801,9 @@ class CertRequestResult:
         cert_subject: Subject DN extracted from the issued cert.
         cert_san: SAN UPN extracted from the issued cert (if present).
         cert_serial: Hex serial number.
+        cert_not_after: Expiry of the issued certificate, formatted for a human
+            reader. This is how long the credential stays usable in the client's
+            environment, so it is carried through to the cleanup disclosure.
         request_id: Request ID assigned by the CA.
         disposition: Raw disposition code returned by MS-ICPR.
         error: Error message if ``success`` is False.
@@ -755,6 +820,7 @@ class CertRequestResult:
     cert_subject: Optional[str] = None
     cert_san: Optional[str] = None
     cert_serial: Optional[str] = None
+    cert_not_after: Optional[str] = None
     request_id: Optional[int] = None
     disposition: Optional[int] = None
     error: Optional[str] = None
@@ -1296,6 +1362,18 @@ async def _do_request_certificate(
     )
     pfx_path.write_bytes(pfx_bytes)
 
+    from adscan_internal.services.adcs.esc_cleanup import format_certificate_not_after
+
+    cert_not_after = format_certificate_not_after(cert)
+    _disclose_issued_certificate(
+        config,
+        principal=cert_san or cert_subject,
+        serial=cert_serial,
+        request_id=request_id,
+        not_after=cert_not_after,
+        pfx_path=pfx_path,
+    )
+
     _render_request_result(config, cert, cert_serial, cert_subject, cert_san, pfx_path)
 
     return CertRequestResult(
@@ -1305,6 +1383,7 @@ async def _do_request_certificate(
         cert_subject=cert_subject,
         cert_san=cert_san,
         cert_serial=cert_serial,
+        cert_not_after=cert_not_after,
         request_id=request_id,
         disposition=disposition,
         private_key_pem=key_pem,
@@ -1475,12 +1554,28 @@ async def _do_retrieve_certificate(
     )
     pfx_path.write_bytes(pfx_bytes)
 
+    from adscan_internal.services.adcs.esc_cleanup import format_certificate_not_after
+
+    cert_subject = cert.subject.rfc4514_string()
+    cert_not_after = format_certificate_not_after(cert)
+    # A pending request that is now issued is the same environment change as a
+    # directly-issued one: the certificate exists in the CA from here on.
+    _disclose_issued_certificate(
+        config,
+        principal=cert_subject,
+        serial=cert_serial,
+        request_id=request_id,
+        not_after=cert_not_after,
+        pfx_path=pfx_path,
+    )
+
     return CertRequestResult(
         success=True,
         pfx_path=pfx_path,
         pfx_password="",
-        cert_subject=cert.subject.rfc4514_string(),
+        cert_subject=cert_subject,
         cert_serial=cert_serial,
+        cert_not_after=cert_not_after,
         request_id=request_id,
         disposition=disposition,
         private_key_pem=private_key_pem,

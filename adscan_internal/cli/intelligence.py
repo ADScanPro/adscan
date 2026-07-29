@@ -857,6 +857,74 @@ def _persist_collector_findings(
             },
         )
 
+    # ── Trust posture ─────────────────────────────────────────────────────
+    # Judged trust-posture weaknesses (TGT delegation enabled across a forest
+    # trust / SID filtering not enforced), derived at the trust collector seam
+    # from the already-decoded trustAttributes. One finding per canonical key,
+    # each carrying the affected trusts as structured evidence. Both keys are
+    # gated into the web CTEM by ``VULN_CATALOG_META`` (drift-locked), so this
+    # single emit reaches the PDF and the web product.
+    trust_issues = getattr(result, "trust_posture_findings", None) or []
+    if trust_issues:
+        by_key: dict[str, list[Any]] = {}
+        for issue in trust_issues:
+            key = getattr(issue, "finding_key", "") or ""
+            if key:
+                by_key.setdefault(key, []).append(issue)
+        for finding_key, issues in by_key.items():
+            _safe_record(
+                key=finding_key,
+                details={
+                    "count": len(issues),
+                    "trusts": [
+                        issue.to_dict()
+                        if hasattr(issue, "to_dict")
+                        else {
+                            "partner": getattr(issue, "partner", ""),
+                            "trust_type": getattr(issue, "trust_type", ""),
+                            "direction": getattr(issue, "direction", ""),
+                            "reason": getattr(issue, "reason", ""),
+                            "attribute_flags": list(
+                                getattr(issue, "attribute_flags", ()) or ()
+                            ),
+                        }
+                        for issue in issues
+                    ],
+                    "partners": [getattr(issue, "partner", "") for issue in issues],
+                },
+            )
+
+    # ── Kerberos web-service (HTTP SPN) relay/coercion surface ────────────
+    # Every principal (user / service account / gMSA / computer) that publishes
+    # a Kerberos web service via an HTTP/* SPN, derived at post-collection from
+    # the already-collected serviceprincipalnames. One finding carrying the
+    # affected principals as structured evidence. The canonical key is gated
+    # into the web CTEM by ``VULN_CATALOG_META`` (drift-locked), so this single
+    # emit reaches the PDF and the web product.
+    http_spn = getattr(result, "http_spn_findings", None) or []
+    if http_spn:
+        from adscan_internal.services.collector.models import (
+            HTTP_SPN_RELAY_FINDING_KEY,
+        )
+
+        _safe_record(
+            key=HTTP_SPN_RELAY_FINDING_KEY,
+            details={
+                "count": len(http_spn),
+                "accounts": [
+                    f.to_dict()
+                    if hasattr(f, "to_dict")
+                    else {
+                        "samaccountname": getattr(f, "samaccountname", ""),
+                        "kind": getattr(f, "kind", ""),
+                        "http_spns": list(getattr(f, "http_spns", ()) or ()),
+                    }
+                    for f in http_spn
+                ],
+                "principals": [getattr(f, "samaccountname", "") for f in http_spn],
+            },
+        )
+
     # ── Audit findings (audit scope only) ─────────────────────────────────
     audit = getattr(result, "audit_findings", None) or []
     if not audit:

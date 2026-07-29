@@ -239,9 +239,9 @@ def run_rating_funnel(shell, *, value_tier: str | None) -> bool:
 
     Returns:
         True if the rating prompt took this exit's primary-ask slot (so the
-        caller must NOT also ask attribution this exit). False when the funnel
-        was not eligible (non-interactive, no value moment, or already rated) —
-        the caller proceeds with its normal exit flow.
+        caller must NOT also run the operator survey this exit). False when the
+        funnel was not eligible (non-interactive, no value moment, or already
+        rated) — the caller proceeds with its normal exit flow.
     """
     if not rating_funnel_will_run(shell, value_tier=value_tier):
         return False
@@ -276,11 +276,11 @@ def run_rating_funnel(shell, *, value_tier: str | None) -> bool:
     if idx is None:
         # Cancelled / interrupted (Ctrl+C): do NOT persist the once-ever flag so
         # the next value-moment exit asks again — but the prompt already took
-        # this exit's ask slot, so attribution still waits.
+        # this exit's ask slot, so the operator survey still waits.
         return True
 
     # A deliberate answer (a score OR an explicit skip) closes the funnel for
-    # good; mirror the attribution once-ever contract.
+    # good; mirror the operator-survey once-ever contract.
     _mark_rated()
 
     if idx == _SKIP_INDEX:

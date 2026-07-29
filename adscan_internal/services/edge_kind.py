@@ -439,6 +439,47 @@ def is_terminal_kind(kind: EdgeKind) -> bool:
     return kind in {EdgeKind.CONTROL, EdgeKind.DERIVED, EdgeKind.ESCALATION}
 
 
+def is_structural_relation(relation: str | None) -> bool:
+    """Return True when ``relation`` is a structural edge, not a remediable one.
+
+    A structural edge is a *fact of the directory's own hierarchy* rather than
+    a misconfiguration someone can revoke: today that is group membership
+    (``MemberOf``). ``DOMAIN ADMINS ∈ ADMINISTRATORS`` is the canonical case —
+    a built-in nesting Windows creates and refuses to let you remove.
+
+    This is the single source of truth for "may this edge be offered to the
+    client as something to fix". Three consumers depend on it and they must
+    never disagree, because the same document renders both sides:
+
+    * :mod:`adscan_internal.services.attack_surface_analysis` — the choke-point
+      table (shared, LITE).
+    * :mod:`adscan_internal.pro.reporting.remediation_engine` — the PRO
+      "Attack Technique Priorities" ranking.
+    * :mod:`adscan_internal.pro.reporting.html_pdf_generator` — the per-step
+      ``Structural`` label in the attack-path sections.
+
+    Before this predicate existed the rule was hardcoded in the first, absent
+    from the second and re-derived in the third, so the PRO report labelled the
+    ``MemberOf`` hop ``STRUCTURAL`` twenty times and still ranked it the
+    client's second most valuable remediation, advising them to remove a
+    membership that cannot be removed.
+
+    Args:
+        relation: The edge label, e.g. ``"MemberOf"``, ``"GenericAll"``.
+
+    Returns:
+        ``True`` for a structural edge; ``False`` for anything remediable,
+        unknown, or empty.
+    """
+    rel = (relation or "").strip()
+    if not rel:
+        return False
+    try:
+        return classify_edge_kind(rel) is EdgeKind.MEMBERSHIP
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Control strength — per-edge refinement WITHIN EdgeKind.AUTH.
 #

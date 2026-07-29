@@ -30,6 +30,7 @@ from rich.text import Text
 
 from adscan_launcher.docker_commands import pull_runtime_image_with_diagnostics
 from adscan_core.rich_output import print_exception
+from adscan_core.version_context import is_uv_tool_install
 
 
 _UPDATE_HEALTH_FILENAME = "update_health.json"
@@ -417,7 +418,7 @@ def _record_update_health(
     payload["last_attempt_ok"] = ok
     payload["last_attempt_launcher_updated"] = updated_launcher
     payload["last_attempt_runtime_updated"] = updated_runtime
-    payload["installer"] = ctx.detect_installer()
+    payload["installer"] = _resolve_launcher_installer(ctx)
     payload["docker_image"] = ctx.get_docker_image_name()
     try:
         payload["launcher_version"] = str(ctx.get_installed_version() or "").strip()
@@ -727,9 +728,63 @@ def get_docker_update_info(ctx: UpdateContext) -> dict:
         return info
 
 
-def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> bool:
-    """Update the launcher (pipx/pip). Returns True if an update was attempted."""
+# A uv-managed tool venv ships no ``pip``. Whatever wording the interpreter
+# uses, the upgrade must be retried through uv rather than reported as a pip
+# failure with pip advice the user cannot act on.
+_MISSING_PIP_MARKERS = ("no module named pip", "no module named 'pip'")
+_UV_TOOL_UPGRADE_HINT = "Try: uv tool upgrade adscan"
+
+
+def _resolve_launcher_installer(ctx: UpdateContext) -> str:
+    """Return the installer to upgrade through, ``uv_tool`` included.
+
+    ``ctx.detect_installer`` is injected and older injections only ever answer
+    ``pipx``/``pip``, so a ``uv tool install`` reads as ``pip`` and the upgrade
+    runs ``<uv venv python> -m pip``, which does not exist. The shared
+    :func:`is_uv_tool_install` predicate settles it for every caller without
+    each injection site having to learn the layout.
+    """
     installer = ctx.detect_installer()
+    if installer in {"pipx", "uv_tool"}:
+        return installer
+    if is_uv_tool_install():
+        return "uv_tool"
+    return installer
+
+
+def _upgrade_via_uv_tool(ctx: UpdateContext) -> bool:
+    """Run ``uv tool upgrade adscan``. Returns True when it succeeded."""
+    uv_executable = shutil.which("uv")
+    if not uv_executable:
+        ctx.print_error(
+            "This launcher is installed in a uv-managed environment, but uv is "
+            "not on PATH, so it cannot be upgraded automatically."
+        )
+        ctx.print_instruction(_UV_TOOL_UPGRADE_HINT)
+        return False
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [uv_executable, "tool", "upgrade", "adscan"], check=False
+        )
+    except Exception as exc:
+        ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc)
+        ctx.print_error("Failed to update the launcher via uv.")
+        ctx.print_instruction(_UV_TOOL_UPGRADE_HINT)
+        return False
+    if proc.returncode != 0:
+        ctx.print_error("Failed to update the launcher via uv.")
+        ctx.print_instruction(_UV_TOOL_UPGRADE_HINT)
+        return False
+    return True
+
+
+def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> bool:
+    """Update the launcher (pipx / uv tool / pip). Returns True if an update was
+    attempted."""
+    installer = _resolve_launcher_installer(ctx)
+    if installer == "uv_tool":
+        return _upgrade_via_uv_tool(ctx)
     if installer == "pipx":
         try:
             proc = subprocess.run(["pipx", "upgrade", "adscan"], check=False)
@@ -761,11 +816,21 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
             prefer_break_system_packages=True,
         )
     except Exception as exc:
+        ctx.print_info_debug(f"[update] pip upgrade error: {exc}")
+        # Backstop, independent of installer detection: an environment with no
+        # ``pip`` module is by definition not a pip install, so reporting a pip
+        # failure and printing pip advice sends the user in circles. Retry
+        # through uv, which is the only manager that produces such a venv.
+        if any(marker in str(exc).lower() for marker in _MISSING_PIP_MARKERS):
+            ctx.print_info_debug(
+                "[update] Target environment has no pip module; retrying the "
+                "launcher upgrade through uv."
+            )
+            return _upgrade_via_uv_tool(ctx)
         ctx.telemetry_capture_exception(exc)
         print_exception(exception=exc)
         ctx.print_error("Failed to update the launcher via pip.")
         ctx.print_instruction("Try: python3 -m pip install --upgrade adscan")
-        ctx.print_info_debug(f"[update] pip upgrade error: {exc}")
         return False
     return True
 
@@ -900,19 +965,36 @@ def _update_docker_image(
     *,
     command_name: str,
 ) -> bool:
-    """Pull the Docker image to latest. Returns True if pull succeeded."""
+    """Pull the Docker image to latest. Returns True if pull succeeded.
+
+    Every exit from this function is announced. The launcher half of an update
+    (``_update_launcher``) already prints an error plus a concrete retry on
+    each failure; the image half used to return False silently, so an operator
+    who ran ``adscan update`` because the panel said the image was missing got
+    ``Pulling image: <image>`` and then nothing at all — no verdict, no next
+    step. A pull the operator interrupts is announced too, then re-raised so
+    the launcher still unwinds with the interrupt exit code.
+    """
     ctx.print_info(f"Pulling image: {image}")
     pull_start = time.monotonic()
-    resolved_image = pull_runtime_image_with_diagnostics(
-        image=image,
-        pull_timeout_seconds=ctx.docker_pull_timeout_seconds,
-        command_name=command_name,
-        stream_output=True,
-    )
+    try:
+        resolved_image = pull_runtime_image_with_diagnostics(
+            image=image,
+            pull_timeout_seconds=ctx.docker_pull_timeout_seconds,
+            command_name=command_name,
+            stream_output=True,
+        )
+    except KeyboardInterrupt:
+        ctx.print_warning(f"Image download cancelled: {image}")
+        ctx.print_instruction(f"Resume it with: adscan {command_name}")
+        raise
     ctx.print_info_debug(
         f"[update] Docker pull duration: {time.monotonic() - pull_start:.2f}s"
     )
     if not resolved_image:
+        # Verdict only — the caller owns the next step, because what to do
+        # differs by caller (abort the command vs. finish the update run).
+        ctx.print_error(f"The ADscan runtime image was not updated: {image}")
         return False
     ctx.print_success("ADscan Docker image pulled successfully.")
     return True
@@ -1296,7 +1378,8 @@ def run_update_command(ctx: UpdateContext) -> bool:
         ctx.print_info("Launcher already up-to-date.")
 
     image_name = str(docker_info.get("image") or ctx.get_docker_image_name())
-    if docker_info.get("needs_update") or not docker_info.get("image_present"):
+    image_missing_locally = not bool(docker_info.get("image_present"))
+    if docker_info.get("needs_update") or image_missing_locally:
         docker_updated = _update_docker_image(ctx, image_name, command_name="update")
         ok = docker_updated and ok
     else:
@@ -1309,7 +1392,24 @@ def run_update_command(ctx: UpdateContext) -> bool:
         updated_runtime=docker_updated,
     )
 
-    if updated_launcher and launcher_restart_ready:
+    restarting = bool(updated_launcher and launcher_restart_ready)
+    # Close the command with a verdict. Without this the failure path ended on
+    # whatever the last sub-step happened to print, which for an image pull was
+    # nothing — the operator was left at a bare prompt with no idea whether the
+    # update worked. Skipped when we are about to re-exec into the upgraded
+    # launcher, since that run prints its own verdict.
+    if not restarting:
+        if ok:
+            ctx.print_success("ADscan is up to date.")
+        else:
+            ctx.print_error("Update did not complete.")
+            if image_missing_locally and not docker_updated:
+                ctx.print_instruction(
+                    "The runtime image is still missing, so scan commands cannot run yet."
+                )
+            ctx.print_instruction("Retry with: adscan update")
+
+    if restarting:
         _restart_into_upgraded_launcher(ctx)
     elif updated_launcher and not launcher_restart_ready:
         # Upgrade ran but we could not confirm a clean in-process restart.

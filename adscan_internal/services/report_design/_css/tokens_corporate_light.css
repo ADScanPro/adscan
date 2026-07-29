@@ -1,0 +1,114 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   corporate_light — Precision Authority
+   Premium consulting-grade light theme for ADscan reports.
+   Designed for board presentation and regulatory auditor review.
+   Optimised for Chromium/Playwright print rendering.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Design tokens ──────────────────────────────────────────────────────── */
+:root {
+  /* Backgrounds — layered white/slate */
+  --bg-0:      #ffffff;
+  --bg-1:      #f8fafc;
+  --bg-2:      #f1f5f9;
+  --bg-3:      #e2e8f0;
+  --surface:   #ffffff;
+  --surface-2: #f8fafc;
+
+  /* Borders */
+  --line:   rgba(15,23,42,0.09);
+  --line-2: rgba(15,23,42,0.16);
+
+  /* Typography — deep navy, not harsh black */
+  --text:   #0f172a;
+  --text-2: #1e293b;
+  --text-3: #475569;
+  --text-4: #94a3b8;
+
+  /* Accent — ADscan brand deep teal (cool-institutional, on white paper) */
+  --accent:   #0e6e78;
+  --accent-2: #0a545c;
+  --accent-3: #1aa0ae;
+
+  /* Semantic colours */
+  --critical:    #b91c1c;
+  --critical-bg: rgba(185,28,28,0.08);
+  --critical-bd: rgba(185,28,28,0.30);
+  --red:         #dc2626;
+  --red-bg:      #fef2f2;
+  --red-bd:      #fca5a5;
+  --amber:       #b45309;
+  --amber-bg:    #fffbeb;
+  --amber-bd:    #fcd34d;
+  --blue:        #1d4ed8;
+  --blue-bg:     #eff6ff;
+  --blue-bd:     #93c5fd;
+  --gray:        #64748b;
+  --green:       #15803d;
+  --purple:      #6d28d9;
+
+  /* Fonts — refined editorial pairing */
+  --font-sans:  'Inter','Carlito','Liberation Sans',system-ui,sans-serif;
+  --font-serif: 'Source Serif 4','Georgia','Times New Roman',serif;
+  --font-mono:  'JetBrains Mono','DejaVu Sans Mono',monospace;
+
+  --radius-sm: 3px;
+  --radius:    5px;
+  --radius-lg: 8px;
+
+  /* MITRE ATT&CK heatmap density (Hormozi #9) */
+  --mitre-0: rgba(15,23,42,0.04);
+  --mitre-1: rgba(14,110,120,0.16);
+  --mitre-2: rgba(180,83,9,0.28);
+  --mitre-3: rgba(185,28,28,0.40);
+}
+
+/* ── Bonus token bridge ─────────────────────────────────────────────────────
+   The bonus templates (playbook, checklist) are built on a SEPARATE token
+   vocabulary (--paper/--ink/--sev-*) than the report (--bg-0/--text). To keep
+   the whole Client Deliverable Kit on ONE institutional skin, map every bonus
+   COLOUR/FONT token onto this theme's palette. Layout tokens the bonuses own
+   (--fs-* type scale, --sp-* spacing) are deliberately left untouched — only
+   colour and typography are unified, never geometry. */
+:root {
+  --paper:        #ffffff;
+  --paper-2:      #f8fafc;
+  /* --surface / --surface-2 already defined above (white / slate). */
+  --ink-wash:     #f1f5f9;
+  --ink:          #0f172a;
+  --ink-2:        #1e293b;
+  --ink-3:        #475569;
+  --ink-4:        #94a3b8;
+  --ink-5:        #cbd5e1;
+
+  /* --accent already brand teal above. */
+  --accent-deep:  #0a545c;
+  --accent-soft:  #d6e6e6;
+  --accent-wash:  rgba(14,110,120,0.08);
+
+  --line-strong:  rgba(15,23,42,0.28);
+
+  /* Severity scale — same hues the report uses, so a finding reads identically
+     across the report and the playbook/checklist. */
+  --sev-critical:    #b91c1c;
+  --sev-critical-bg: rgba(185,28,28,0.08);
+  --sev-critical-bd: rgba(185,28,28,0.30);
+  --sev-high:        #dc2626;
+  --sev-high-bg:     #fef2f2;
+  --sev-high-bd:     #fca5a5;
+  --sev-medium:      #b45309;
+  --sev-medium-bg:   #fffbeb;
+  --sev-medium-bd:   #fcd34d;
+  --sev-low:         #1d4ed8;
+  --sev-low-bg:      #eff6ff;
+  --sev-low-bd:      #93c5fd;
+  --sev-info:        #64748b;
+  --sev-info-bg:     #f1f5f9;
+
+  --ok:    #15803d;
+  --ok-bg: rgba(21,128,61,0.08);
+  --ok-bd: rgba(21,128,61,0.25);
+
+  /* Display serif → the report's editorial serif, so headlines match. */
+  --font-display: 'Source Serif 4','Georgia','Times New Roman',serif;
+}

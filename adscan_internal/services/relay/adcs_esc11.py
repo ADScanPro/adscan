@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from adscan_core.rich_output import print_info_debug, print_warning
+from adscan_internal.services.adcs.esc_cleanup import format_certificate_not_after
 from adscan_internal.services.relay.core import RelayAuthentication, RelayTargetResult
 from adscan_internal.services.relay.display import print_relay_captured
 from adscan_internal.services.relay.identity import (
@@ -161,6 +162,8 @@ class AdcsEsc11RelayTarget:
                 "disposition": disposition,
                 "cert_serial": f"{cert.serial_number:X}",
                 "cert_subject": cert.subject.rfc4514_string(),
+                "cert_not_after": format_certificate_not_after(cert),
+                "template": self.config.template,
             },
         )
 

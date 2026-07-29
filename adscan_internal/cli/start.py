@@ -72,6 +72,7 @@ from adscan_internal.cli.host_file_picker import (
     maybe_import_host_file_to_workspace,
     select_host_file_via_gui,
 )
+from adscan_core.outbound_links import cta_markup, cta_url
 from adscan_core.path_utils import get_effective_user_home
 from adscan_internal.services.network_preflight_service import (
     DC_REACHABILITY_TCP_PORTS,
@@ -106,6 +107,53 @@ class _DcDiscoveryRecoveryDecision:
 
     action: Literal["retry_scope", "switch_context", "cancel"]
     hosts: str | None = None
+
+
+# Shell attribute recording that the current start attempt got past setup and
+# into the scan itself. See :func:`mark_scan_launched`.
+_SCAN_LAUNCHED_ATTR = "_start_scan_launched"
+
+
+@dataclass(frozen=True)
+class DomainContextResult:
+    """Outcome of the target-context wizard.
+
+    ``cancelled`` and ``blind`` are deliberately distinct. Collapsing both into
+    a bare ``None`` made backing out of a sub-prompt indistinguishable from
+    explicitly choosing host-range discovery, so an operator who answered "yes,
+    I know the target" and then changed their mind was marched into the
+    discovery mode they had just declined.
+    """
+
+    outcome: Literal["resolved", "blind", "cancelled"]
+    domain: str | None = None
+    dc_ip: str | None = None
+
+    @property
+    def resolved(self) -> bool:
+        """Whether a usable ``(domain, dc_ip)`` pair was confirmed."""
+        return self.outcome == "resolved"
+
+    @property
+    def blind(self) -> bool:
+        """Whether the operator explicitly asked for host-range discovery."""
+        return self.outcome == "blind"
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether the operator backed out without answering."""
+        return self.outcome == "cancelled"
+
+    @property
+    def context(self) -> tuple[str, str] | None:
+        """The ``(domain, dc_ip)`` pair, or ``None`` when not resolved."""
+        if self.resolved and self.domain and self.dc_ip:
+            return self.domain, self.dc_ip
+        return None
+
+
+_DOMAIN_CONTEXT_CANCELLED = DomainContextResult(outcome="cancelled")
+_DOMAIN_CONTEXT_BLIND = DomainContextResult(outcome="blind")
 
 
 # IPv4-shaped token (four dot-separated 1-3 digit groups). Used to catch a
@@ -643,8 +691,14 @@ def _select_option_interactive(
 ) -> int | None:
     """Select an option interactively with a best-effort UX.
 
-    Prefers the shell's `*_questionary_select` UI when available, otherwise falls
-    back to a numbered Prompt.
+    Prefers the shell's ``_questionary_select`` UI when available and falls back
+    to the centralized ``questionary_select_index`` helper, which auto-resolves
+    to ``default_index`` in unattended runs. The fallback must never be a raw
+    ``Prompt.ask``: Docker allocates a TTY for ``adscan ci``, so a raw prompt
+    looks answerable and simply blocks on stdin forever.
+
+    Returns:
+        The selected index, or ``None`` when the operator cancelled.
     """
     try:
         selector = getattr(shell, "_questionary_select", None)
@@ -660,29 +714,122 @@ def _select_option_interactive(
     except Exception:
         pass
 
-    from rich.prompt import Prompt
-    from rich.text import Text
+    return questionary_select_index(
+        title=message,
+        options=options,
+        default_idx=default_index,
+        shell=shell,
+    )
 
-    numbered = [f"{i + 1}. {opt}" for i, opt in enumerate(options)]
+
+def _reset_scan_launch_marker(shell: Any) -> None:
+    """Clear the scan-launched marker before a start attempt."""
+    try:
+        setattr(shell, _SCAN_LAUNCHED_ATTR, False)
+    except Exception:  # noqa: BLE001 - advisory marker, never blocks a scan
+        pass
+
+
+def mark_scan_launched(shell: Any) -> None:
+    """Record that setup is over and the scan itself is running.
+
+    Read by :func:`_handle_start_wizard_interrupt`. An interrupt after this
+    point must never be reported as "nothing was executed": by then the run may
+    already hold verified credentials and workspace artifacts, and telling the
+    operator otherwise has cost a captured domain credential — they believed
+    the panel, chose to retry, and confirmed the workspace cleanup it offers.
+    """
+    try:
+        setattr(shell, _SCAN_LAUNCHED_ATTR, True)
+    except Exception:  # noqa: BLE001 - advisory marker, never blocks a scan
+        pass
+
+
+def _scan_has_launched(shell: Any) -> bool:
+    """Return whether the current start attempt got past setup into the scan."""
+    return bool(getattr(shell, _SCAN_LAUNCHED_ATTR, False))
+
+
+def _summarize_preserved_scan_state(shell: Any) -> list[str]:
+    """Describe what an interrupted scan already stored, in operator terms."""
+    lines: list[str] = []
+
+    workspace = str(getattr(shell, "current_workspace", "") or "").strip()
+    if workspace:
+        lines.append(
+            f"workspace [bold]{workspace}[/bold] holds everything collected so far"
+        )
+
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return lines
+
+    domains: list[str] = []
+    domain_credentials = 0
+    local_credentials = 0
+    kerberos_tickets = 0
+    for domain, state in domains_data.items():
+        if not isinstance(state, dict):
+            continue
+        domains.append(str(domain))
+        stored = state.get("credentials")
+        if isinstance(stored, dict):
+            domain_credentials += len(stored)
+        tickets = state.get("kerberos_tickets")
+        if isinstance(tickets, dict):
+            kerberos_tickets += len(tickets)
+        per_host = state.get("local_credentials")
+        if isinstance(per_host, dict):
+            for services in per_host.values():
+                if not isinstance(services, dict):
+                    continue
+                for users in services.values():
+                    local_credentials += len(users) if isinstance(users, dict) else 1
+
+    if domains:
+        marked = ", ".join(mark_sensitive(name, "domain") for name in domains[:3])
+        suffix = f" (+{len(domains) - 3} more)" if len(domains) > 3 else ""
+        lines.append(f"domain context initialized for {marked}{suffix}")
+    if domain_credentials:
+        lines.append(
+            f"{domain_credentials} domain credential(s) captured and stored"
+        )
+    if local_credentials:
+        lines.append(f"{local_credentials} local (host) credential(s) stored")
+    if kerberos_tickets:
+        lines.append(f"{kerberos_tickets} Kerberos ticket(s) minted")
+
+    return lines
+
+
+def _print_interrupted_scan_panel(shell: Any, *, command_name: str) -> None:
+    """Report an interrupt that landed after the scan had already started."""
+    body_lines = [
+        f"[bold yellow]✕[/bold yellow]  [bold]{command_name} interrupted while the scan was running.[/bold]",
+        "",
+        "This is a partial scan, not a cancelled setup. Results collected before",
+        "the interrupt are already written to the workspace.",
+    ]
+    preserved = _summarize_preserved_scan_state(shell)
+    if preserved:
+        body_lines.append("")
+        body_lines.append("[bold]Kept:[/bold]")
+        body_lines.extend(f"    [cyan]›[/cyan]  {line}" for line in preserved)
+    body_lines.extend(
+        [
+            "",
+            "[bold]What to do next:[/bold]",
+            "    [cyan]›[/cyan]  run [bold]info[/bold] to review what was captured",
+            f"    [cyan]›[/cyan]  re-run [bold]{command_name}[/bold] to continue on this workspace",
+            "    [cyan]›[/cyan]  only clean the workspace if you mean to discard these results",
+        ]
+    )
     print_panel(
-        "[bold]Choose one option:[/bold]\n\n" + "\n".join(numbered),
-        title="[bold]» Selection[/bold]",
+        "\n".join(body_lines),
+        title="[bold]» Scan Interrupted[/bold]",
         border_style="yellow",
         padding=(1, 2),
     )
-    choices = [str(i + 1) for i in range(len(options))]
-    selected = Prompt.ask(
-        Text(message, style="cyan"),
-        choices=choices,
-        default=str(default_index + 1),
-    )
-    try:
-        idx = int(selected) - 1
-    except ValueError:
-        return None
-    if 0 <= idx < len(options):
-        return idx
-    return None
 
 
 def _handle_start_wizard_interrupt(
@@ -691,25 +838,41 @@ def _handle_start_wizard_interrupt(
     command_name: str,
     switch_command: str | None = None,
 ) -> str:
-    """Guide recovery when a start wizard prompt is cancelled.
+    """Guide recovery when a start flow is interrupted.
 
-    Returns one of ``retry``, ``switch``, or ``return``. Non-interactive
-    sessions always return ``return`` because there is no safe recovery path.
+    Two very different situations reach this seam and conflating them is
+    destructive: an interrupt DURING setup (nothing ran, retrying is free) and
+    an interrupt AFTER the scan launched (results already exist). Only the
+    first gets the recovery menu, whose "retry" path re-enters the
+    workspace-cleanup prompt.
+
+    Returns one of ``retry``, ``switch``, or ``return``. Unattended sessions and
+    interrupted scans always return ``return`` because there is no safe
+    automatic recovery.
     """
+    from adscan_internal.interaction import is_non_interactive
+
+    scan_launched = _scan_has_launched(shell)
+    interactive = not is_non_interactive(shell)
     telemetry.capture(
         "start_wizard_interrupted",
         properties={
             "command": command_name,
-            "interactive": bool(sys.stdin.isatty()),
+            "interactive": interactive,
             "switch_command": switch_command,
+            "scan_launched": scan_launched,
         },
     )
     print_info_debug(
-        f"[start] interactive setup interrupted for {command_name}; "
-        f"switch_target={switch_command or 'none'}"
+        f"[start] flow interrupted for {command_name}; "
+        f"scan_launched={scan_launched} switch_target={switch_command or 'none'}"
     )
 
-    if not sys.stdin.isatty():
+    if scan_launched:
+        _print_interrupted_scan_panel(shell, command_name=command_name)
+        return "return"
+
+    if not interactive:
         print_warning(
             f"{command_name} setup was cancelled. Returning without starting the scan."
         )
@@ -768,6 +931,126 @@ def _show_host_range_discovery_intro() -> None:
     )
 
 
+def _containing_slash24(ip: str | None) -> str | None:
+    """Return the /24 that contains ``ip``, or ``None`` when it is not an IPv4."""
+    candidate = str(ip or "").strip()
+    if not candidate:
+        return None
+    try:
+        return str(ipaddress.ip_network(f"{candidate}/24", strict=False))
+    except ValueError:
+        return None
+
+
+def _suggest_discovery_scope(shell: Any) -> tuple[str, str] | None:
+    """Derive a plausible discovery scope from what the session already knows.
+
+    ADscan holds two signals by the time it asks for a range: a DC/PDC IP the
+    operator supplied or that discovery confirmed, and the IPv4 of the
+    configured interface. Either beats the hardcoded lab range that used to be
+    offered here — an operator who accepted it scanned 256 unrelated hosts.
+
+    Returns:
+        ``(cidr, source_label)`` for the best suggestion, or ``None`` when the
+        session knows nothing to base one on (in which case the operator is
+        asked for a range with no default rather than a misleading one).
+    """
+    dc_ip = str(getattr(shell, "pdc", "") or "").strip()
+    if not dc_ip:
+        domains_data = getattr(shell, "domains_data", None)
+        if isinstance(domains_data, dict):
+            for state in domains_data.values():
+                if isinstance(state, dict) and state.get("pdc"):
+                    dc_ip = str(state["pdc"]).strip()
+                    break
+    scope = _containing_slash24(dc_ip)
+    if scope:
+        return scope, "the DC you provided"
+
+    interface = str(getattr(shell, "interface", "") or "").strip()
+    local_ip = str(getattr(shell, "myip", "") or "").strip()
+    if not local_ip and interface:
+        addresses = get_interface_ipv4_addresses(interface)
+        local_ip = addresses[0] if addresses else ""
+    scope = _containing_slash24(local_ip)
+    if scope:
+        return scope, f"interface {interface}" if interface else "your local address"
+
+    return None
+
+
+# One octet of an Nmap target expression: a number, an ``a-b`` range, or a
+# comma-separated list of either (``10.10.10.1-50``, ``10.10.10.1,5,20-30``).
+_NMAP_OCTET_RE = re.compile(r"^\d{1,3}(?:-\d{1,3})?(?:,\d{1,3}(?:-\d{1,3})?)*$")
+# RFC 1123 hostname: labels of letters/digits/hyphens, not starting or ending
+# with a hyphen, optionally fully qualified.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$"
+)
+
+
+def _octets_are_valid_nmap_ranges(host_part: str) -> bool:
+    """Return whether ``host_part`` is a dotted expression of valid octet terms."""
+    octets = host_part.split(".")
+    if len(octets) != 4:
+        return False
+    for octet in octets:
+        if not _NMAP_OCTET_RE.match(octet):
+            return False
+        if any(int(bound) > 255 for bound in re.findall(r"\d{1,3}", octet)):
+            return False
+    return True
+
+
+def validate_discovery_scope(value: str) -> tuple[bool, str | None]:
+    """Validate a discovery target expression before it reaches the scanner.
+
+    The scanner rejects a malformed expression with "Unable to split netmask"
+    and scans nothing, which downstream is indistinguishable from a range that
+    genuinely holds no domain controllers — so the operator is told to widen a
+    range that was never scanned, and a typo costs an entire recovery cycle.
+    Catching it here keeps the diagnosis where the operator can act on it.
+
+    Accepts anything the scanner accepts as ONE target: an IP or CIDR, an
+    octet-range expression (``10.10.10.1-50``), or a hostname.
+
+    Args:
+        value: Raw operator input.
+
+    Returns:
+        ``(True, None)`` when usable, otherwise ``(False, reason)`` where the
+        reason is a short operator-facing explanation.
+    """
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False, "no target was entered"
+    if any(char.isspace() for char in candidate):
+        # The expression is passed to the scanner as a single argument, so a
+        # space-separated list never reaches it as several targets.
+        return False, "enter one target expression, not a space-separated list"
+
+    try:
+        ipaddress.ip_network(candidate, strict=False)
+        return True, None
+    except ValueError:
+        pass
+
+    host_part, separator, prefix = candidate.partition("/")
+    if separator:
+        if not prefix.isdigit() or not 0 <= int(prefix) <= 32:
+            return False, "the netmask after '/' must be a number from 0 to 32"
+    if _octets_are_valid_nmap_ranges(host_part):
+        return True, None
+
+    if host_part == candidate and _HOSTNAME_RE.match(candidate) and any(
+        char.isalpha() for char in candidate
+    ):
+        return True, None
+
+    return False, "not a valid IP, CIDR range, host range, or hostname"
+
+
 def _prompt_domain_discovery_hosts(
     shell: Any,
     *,
@@ -775,6 +1058,17 @@ def _prompt_domain_discovery_hosts(
 ) -> str | None:
     """Prompt for discovery scope with UX tailored to domain discovery."""
     default_value = str(default_hosts or getattr(shell, "hosts", "") or "").strip()
+    if not default_value:
+        suggestion = _suggest_discovery_scope(shell)
+        if suggestion:
+            default_value, source = suggestion
+            print_info(
+                f"Suggested scope [bold]{mark_sensitive(default_value, 'host')}[/bold], "
+                f"derived from {source}. [dim]Replace it if the DCs live elsewhere.[/dim]"
+            )
+    # No default at all when nothing could be derived: a wrong default costs the
+    # operator a full scan of an unrelated range, an empty one costs a keystroke.
+    prompt_kwargs = {"default": default_value} if default_value else {}
     while True:
         hosts_input = Prompt.ask(
             Text(
@@ -782,11 +1076,30 @@ def _prompt_domain_discovery_hosts(
                 "(single IP or CIDR, e.g., 10.10.10.100 or 10.10.10.0/24)",
                 style="cyan",
             ),
-            default=default_value or "10.10.10.0/24",
+            **prompt_kwargs,
         ).strip()
         if not hosts_input:
             print_warning("Domain discovery cancelled before any targets were scanned.")
             return None
+        is_valid, reason = validate_discovery_scope(hosts_input)
+        if not is_valid:
+            print_warning(
+                f"[bold]That target expression can't be scanned:[/bold] {reason}.",
+                panel=True,
+                items=[
+                    f"Entered: {mark_sensitive(hosts_input, 'host')}",
+                    "Single IP        10.10.10.100",
+                    "CIDR range       10.10.10.0/24",
+                    "Host range       10.10.10.1-50",
+                    "Hostname         dc01.contoso.local",
+                ],
+            )
+            from adscan_internal.interaction import is_non_interactive
+
+            if is_non_interactive(shell):
+                # Nothing will type a different value; re-prompting would spin.
+                return None
+            continue
         shell.hosts = hosts_input
         _warn_if_single_discovery_target(hosts_input)
         return hosts_input
@@ -796,10 +1109,59 @@ def _prompt_dc_discovery_recovery(
     shell: Any,
     *,
     current_target: str,
-    reason: Literal["scope_rejected", "no_candidates"],
+    reason: Literal["scope_rejected", "invalid_scope", "no_candidates"],
 ) -> _DcDiscoveryRecoveryDecision:
-    """Guide the operator to the best next step after discovery cannot continue."""
-    if reason == "scope_rejected":
+    """Guide the operator to the best next step after discovery cannot continue.
+
+    Unattended runs get no menu. Every option here needs a human to supply a
+    DIFFERENT scope, and in a non-interactive run both prompts auto-resolve to
+    their defaults — "try a different host range" followed by the same host
+    range, forever. That is not a hypothetical: session
+    9a75ef12-962f-4954-aa66-0b80923c0f9f burned 188 identical scans of one IP
+    over ten minutes until the operator hit Ctrl+C. So `adscan ci` is told what
+    to change and stops.
+    """
+    from adscan_internal.interaction import is_non_interactive
+
+    if is_non_interactive(shell):
+        if reason == "invalid_scope":
+            print_warning(
+                "The target expression could not be parsed, so nothing was scanned.",
+                panel=True,
+                items=[
+                    f"Expression given: {mark_sensitive(current_target, 'host')}",
+                    "Re-run with a valid target, e.g. --hosts 10.10.10.0/24",
+                    "Or skip discovery entirely by passing the domain and DC IP",
+                ],
+            )
+        else:
+            print_warning(
+                "No domain controllers were found in this scope, and an unattended "
+                "run cannot pick a new one.",
+                panel=True,
+                items=[
+                    f"Scope scanned: {mark_sensitive(current_target, 'host')}",
+                    "Re-run with a wider range, e.g. --hosts 10.10.10.0/24",
+                    "Or skip discovery entirely by passing the domain and DC IP",
+                ],
+            )
+        return _DcDiscoveryRecoveryDecision(action="cancel")
+
+    if reason == "invalid_scope":
+        # Never advise widening a range that was never scanned — the expression
+        # itself was rejected, so the only useful next step is a correct one.
+        body = (
+            "[bold]No scan was run: the target expression could not be parsed.[/bold]\n\n"
+            "This is a syntax problem, not a coverage problem — widening the range\n"
+            "would not help. Enter a valid IP, CIDR, host range, or hostname."
+        )
+        title = "[bold]» Fix the Target Expression[/bold]"
+        options = [
+            "Enter a valid host range/IP (recommended)",
+            "Switch to known domain/DC input instead",
+            "Cancel start_unauth for now",
+        ]
+    elif reason == "scope_rejected":
         body = (
             "[bold]No scan was run.[/bold]\n\n"
             "You stopped the discovery pass before scanning the large range.\n"
@@ -950,7 +1312,19 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
             ),
             default=True,
         ):
-            context = _domain_context_wizard_for_unauth(shell)
+            result = _domain_context_wizard_for_unauth(shell)
+            if result.cancelled:
+                # Backing out of the follow-up select is NOT "I know nothing":
+                # the operator just told us they DO know the target. Offer the
+                # wizard once more instead of silently starting the host-range
+                # discovery they declined a moment ago.
+                print_info(
+                    "No target context captured yet. Let's try that once more —\n"
+                    "[dim]pick 'I know nothing' if you'd rather run host-range discovery.[/dim]"
+                )
+                result = _domain_context_wizard_for_unauth(shell)
+
+            context = result.context
             if context is not None:
                 known_domain, known_pdc_ip = context
                 skip_domain_discovery = True
@@ -968,6 +1342,14 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                     f"DC/PDC set to: {mark_sensitive(known_pdc_ip, 'ip')}\n"
                     "[dim]Skipping host-range discovery, proceeding with direct enumeration...[/dim]"
                 )
+            elif result.cancelled and not confirm_ask(
+                "Still no target context. Scan a host range to discover the domain instead?",
+                default=False,
+            ):
+                print_warning(
+                    "start_unauth cancelled: no target context and no host range to scan."
+                )
+                return False
 
         if not skip_domain_discovery:
             _show_host_range_discovery_intro()
@@ -1267,6 +1649,10 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         "Starting Unauthenticated Scan", details=scan_details, icon="🚀"
     )
 
+    # Setup is over; from here on an interrupt is a partial scan, not a
+    # cancelled wizard.
+    mark_scan_launched(shell)
+
     # Mark scan mode for telemetry
     shell.scan_mode = "unauth"
     shell.domain_validated_cred_counts = {}
@@ -1285,9 +1671,15 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         # Add domain to shell.domains if not already there
         if not hasattr(shell, "domains"):
             shell.domains = []
-        if known_domain not in shell.domains:
+        first_time_for_domain = known_domain not in shell.domains
+        if first_time_for_domain:
             shell.domains.append(known_domain)
-            shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
+        # Unconditional: the call is idempotent and it is what reconciles the
+        # `dir`/`pdc` keys that make this domain context usable. Skipping it on
+        # a reused workspace is how every domain-scoped command ended up
+        # refused with "Domain context not initialized".
+        shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
+        if first_time_for_domain:
             # Offer broadcast poisoning as a background job (consent-gated,
             # idempotent by interface). Best-effort; results are deferred (the
             # launch itself is bounded, it does not wait on captures).
@@ -1373,6 +1765,13 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                 )
 
                 selected_summary = None
+                # Scopes already scanned to zero candidates. Re-scanning one of
+                # them cannot produce a different answer, so a "retry" that
+                # lands back on a scanned scope ends the flow instead of
+                # spinning. This backstops the recovery prompt itself: whatever
+                # supplies the new scope, the loop only continues on a scope it
+                # has not tried.
+                exhausted_scopes: set[str] = set()
                 while True:
                     candidate_port_map = discover_dc_candidates_with_nmap_details(
                         shell, hosts=target, ports=[88, 389, 53]
@@ -1384,24 +1783,64 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                                 shell, "_last_dc_discovery_cancelled_by_user", False
                             )
                         )
+                        invalid_target = bool(
+                            getattr(shell, "_last_dc_discovery_invalid_target", False)
+                        )
+                        if not cancelled_by_user and not invalid_target:
+                            # Only a scope that was actually SCANNED is
+                            # exhausted. A scope the operator declined to scan,
+                            # or one the scanner refused to parse, is still
+                            # worth a second look after they correct it.
+                            exhausted_scopes.add(str(target).strip())
+                        if invalid_target:
+                            recovery_reason = "invalid_scope"
+                        elif cancelled_by_user:
+                            recovery_reason = "scope_rejected"
+                        else:
+                            recovery_reason = "no_candidates"
                         recovery = _prompt_dc_discovery_recovery(
                             shell,
                             current_target=str(target),
-                            reason=(
-                                "scope_rejected"
-                                if cancelled_by_user
-                                else "no_candidates"
-                            ),
+                            reason=recovery_reason,
                         )
                         if recovery.action == "cancel":
                             return False
                         if recovery.action == "switch_context":
-                            context = _domain_context_wizard_for_unauth(shell)
+                            # No blind option here: host-range discovery is
+                            # exactly what just came up empty, so offering it
+                            # again would send the operator back into the
+                            # failure they are recovering from.
+                            context = _domain_context_wizard_for_unauth(
+                                shell, allow_blind=False
+                            ).context
                             if context is None:
+                                print_warning(
+                                    "No target context was entered, so there is nothing "
+                                    "left to scan in this run.",
+                                    panel=True,
+                                    items=[
+                                        "Re-run `start_unauth <domain> <dc_ip>` once you "
+                                        "have the domain and a DC IP",
+                                        "Or re-run `start_unauth` and give a host range "
+                                        "that contains a DC",
+                                    ],
+                                )
                                 return False
                             known_domain, known_pdc_ip = context
                             break
-                        target = recovery.hosts or target
+                        next_target = str(recovery.hosts or target).strip()
+                        if next_target in exhausted_scopes:
+                            print_warning(
+                                "That scope was already scanned and found no "
+                                "domain controllers. Widen the range or provide "
+                                "the domain and DC IP directly.",
+                                panel=True,
+                                items=[
+                                    f"Scope: {mark_sensitive(next_target, 'host')}"
+                                ],
+                            )
+                            return False
+                        target = next_target
                         shell.hosts = str(target)
                         continue
 
@@ -1464,7 +1903,9 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                     shell.domains = []
                 if known_domain not in shell.domains:
                     shell.domains.append(known_domain)
-                    shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
+                # Unconditional and idempotent — see the note at the
+                # known-domain branch above.
+                shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
 
                 finalize_domain_context(
                     shell,
@@ -1838,6 +2279,97 @@ def _maybe_offer_interface_switch_on_route_mismatch(
     )
 
 
+def _log_local_network_inventory(iface: str, route: RouteAssessment | None) -> None:
+    """Record the raw interface + route evidence behind an interface verdict.
+
+    This is the diagnostic a failed preflight recording never had: which
+    interfaces the container actually sees, what addresses each carries, and
+    the verbatim route line the kernel returned.
+    """
+    try:
+        inventory = ", ".join(
+            f"{name}={'/'.join(addrs) if addrs else 'no-ipv4'}"
+            for name, addrs in _list_local_interfaces_with_ipv4()
+        )
+        print_info_debug(f"network-preflight interface inventory: {inventory or 'none'}")
+        if route is not None:
+            print_info_debug(
+                "network-preflight route: "
+                f"ok={route.ok} reason={route.reason} "
+                f"dev={route.route_interface or 'unknown'} "
+                f"src={mark_sensitive(route.source_ip or 'unknown', 'ip')} "
+                f"raw={route.raw_line or 'none'}"
+            )
+        else:
+            print_info_debug(
+                f"network-preflight route: not probed for interface '{iface or 'unset'}'"
+            )
+    except Exception as exc:  # noqa: BLE001 - diagnostics never block a scan
+        print_exception(exception=exc)
+
+
+def _build_interface_preflight_check(
+    shell: Any,
+    *,
+    iface: str,
+    route: RouteAssessment | None,
+) -> _NetworkPreflightCheck:
+    """Judge the local interface, reconciled against the kernel's own route.
+
+    ``netifaces`` reporting no IPv4 for an interface is not proof the interface
+    is unusable — point-to-point tunnels and partial container views of the host
+    network both produce it. When the kernel resolves the route to the target
+    through THIS interface and hands back a source address, that source address
+    is the authoritative answer: it becomes the session's source IP and the
+    check degrades to a warning. Hard-failing on the netifaces answer alone
+    aborted scans whose DC was demonstrably reachable on 53/88/389/445/636, and
+    the operator's only recourse was "continue anyway".
+    """
+    if not iface:
+        _log_local_network_inventory(iface, route)
+        return _NetworkPreflightCheck(
+            name="Interface",
+            status="fail",
+            detail="No network interface configured.",
+            suggestion="Set an interface before scanning (e.g., `set interface tun0`).",
+        )
+
+    ipv4_addrs = get_interface_ipv4_addresses(iface)
+    if ipv4_addrs:
+        return _NetworkPreflightCheck(
+            name="Interface",
+            status="ok",
+            detail=f"Interface '{iface}' is up with IPv4 {mark_sensitive(ipv4_addrs[0], 'ip')}.",
+        )
+
+    _log_local_network_inventory(iface, route)
+
+    route_source_ip = str(getattr(route, "source_ip", "") or "").strip()
+    route_interface = str(getattr(route, "route_interface", "") or "").strip()
+    if route is not None and route.ok and route_source_ip and route_interface == iface:
+        try:
+            shell.myip = route_source_ip
+        except Exception as exc:  # noqa: BLE001 - adoption is best effort
+            print_exception(exception=exc)
+        return _NetworkPreflightCheck(
+            name="Interface",
+            status="warn",
+            detail=(
+                f"No IPv4 is reported for interface '{iface}', but the route to the target "
+                f"originates from it with source {mark_sensitive(route_source_ip, 'ip')}. "
+                "Using that address."
+            ),
+            suggestion="If callbacks fail, confirm the tunnel address with `ip -4 addr`.",
+        )
+
+    return _NetworkPreflightCheck(
+        name="Interface",
+        status="fail",
+        detail=f"Interface '{iface}' has no IPv4 address assigned.",
+        suggestion="Reconnect VPN/tunnel and confirm interface has an IPv4 address.",
+    )
+
+
 def _run_start_network_preflight(
     shell: Any,
     *,
@@ -1851,40 +2383,14 @@ def _run_start_network_preflight(
     """Validate local interface/routing reachability before starting scans."""
     checks: list[_NetworkPreflightCheck] = []
     iface = (interface or "").strip()
-    if not iface:
-        checks.append(
-            _NetworkPreflightCheck(
-                name="Interface",
-                status="fail",
-                detail="No network interface configured.",
-                suggestion="Set an interface before scanning (e.g., `set interface tun0`).",
-            )
-        )
-    else:
-        ipv4_addrs = get_interface_ipv4_addresses(iface)
-        if not ipv4_addrs:
-            checks.append(
-                _NetworkPreflightCheck(
-                    name="Interface",
-                    status="fail",
-                    detail=f"Interface '{iface}' has no IPv4 address assigned.",
-                    suggestion="Reconnect VPN/tunnel and confirm interface has an IPv4 address.",
-                )
-            )
-        else:
-            marked_ip = mark_sensitive(ipv4_addrs[0], "ip")
-            checks.append(
-                _NetworkPreflightCheck(
-                    name="Interface",
-                    status="ok",
-                    detail=f"Interface '{iface}' is up with IPv4 {marked_ip}.",
-                )
-            )
 
-    mismatch_route: RouteAssessment | None = None
+    # The route probe runs FIRST: its source IP is direct evidence that the
+    # kernel can originate traffic from this interface, which the interface
+    # verdict below reconciles against.
     probe_target = target_ip or _extract_probe_ip_from_hosts_expression(
         hosts_expression
     )
+    route_assessment: RouteAssessment | None = None
     if probe_target:
         route_assessment = assess_target_reachability(
             shell,
@@ -1892,6 +2398,13 @@ def _run_start_network_preflight(
             expected_interface=iface or None,
             tcp_ports=(),
         ).route
+
+    checks.append(
+        _build_interface_preflight_check(shell, iface=iface, route=route_assessment)
+    )
+
+    mismatch_route: RouteAssessment | None = None
+    if probe_target and route_assessment is not None:
         marked_probe = mark_sensitive(probe_target, "ip")
         if not route_assessment.ok:
             checks.append(
@@ -2264,16 +2777,34 @@ def _ensure_unauth_target_list(
     return False
 
 
-def _domain_context_wizard_for_unauth(shell: Any) -> tuple[str, str] | None:
-    """Collect domain context for unauthenticated scans (includes blind discovery option)."""
-    return _domain_context_wizard(shell, allow_blind=True, mode_label="unauth")
+def _resolved_domain_context(pair: tuple[str, str] | None) -> DomainContextResult:
+    """Wrap a ``(domain, dc_ip)`` helper return as a wizard outcome."""
+    if pair and pair[0] and pair[1]:
+        return DomainContextResult(outcome="resolved", domain=pair[0], dc_ip=pair[1])
+    return _DOMAIN_CONTEXT_CANCELLED
+
+
+def _domain_context_wizard_for_unauth(
+    shell: Any, *, allow_blind: bool = True
+) -> DomainContextResult:
+    """Collect domain context for unauthenticated scans.
+
+    Args:
+        allow_blind: Whether to offer "I know nothing (use host-range
+            discovery)". Recovery paths reached *because* host-range discovery
+            already failed pass ``False`` — re-offering the option that just
+            came up empty is a dead end.
+    """
+    return _domain_context_wizard(
+        shell, allow_blind=allow_blind, mode_label="unauth"
+    )
 
 
 def _domain_context_wizard_for_auth(
     shell: Any,
     *,
     credential: tuple[str, str] | None = None,
-) -> tuple[str, str] | None:
+) -> DomainContextResult:
     """Collect domain context for authenticated scans (no blind discovery option).
 
     Args:
@@ -2294,12 +2825,13 @@ def _domain_context_wizard(
     allow_blind: bool,
     mode_label: Literal["unauth", "auth"],
     credential: tuple[str, str] | None = None,
-) -> tuple[str, str] | None:
+) -> DomainContextResult:
     """Collect the best available (domain, dc_ip) context from partial user inputs.
 
     Args:
         shell: Interactive shell.
-        allow_blind: When True, include a "I know nothing" option and return None.
+        allow_blind: When True, include a "I know nothing" option whose
+            selection yields a ``blind`` outcome.
         mode_label: Telemetry label describing which start flow is using the wizard.
         credential: Optional ``(username, password)`` already captured for this
             scan. Only consumed by the "I know only a DC/DNS IP" branch as a
@@ -2309,8 +2841,10 @@ def _domain_context_wizard(
             flows (no credentials to retry with).
 
     Returns:
-        (domain, dc_ip) if enough information is confirmed to run direct enumeration,
-        or None when the user opts out (or selects blind discovery).
+        A :class:`DomainContextResult`: ``resolved`` with the confirmed
+        ``(domain, dc_ip)``, ``blind`` when the operator explicitly chose
+        host-range discovery, or ``cancelled`` when they backed out. The last
+        two are distinct on purpose — see :class:`DomainContextResult`.
     """
     import ipaddress
 
@@ -2326,16 +2860,18 @@ def _domain_context_wizard(
     if allow_blind:
         options.append("🕳️ I know nothing (use host-range discovery)")
 
+    from adscan_internal.interaction import is_non_interactive
+
     selection = _select_option_interactive(
         shell,
         message="What do you know about the target?",
         options=options,
-        default_index=2 if (os.getenv("CI") or not sys.stdin.isatty()) else 0,
+        default_index=2 if is_non_interactive(shell) else 0,
     )
     if selection is None:
-        return None
+        return _DOMAIN_CONTEXT_CANCELLED
     if allow_blind and selection == 4:
-        return None
+        return _DOMAIN_CONTEXT_BLIND
 
     service = shell._get_dns_discovery_service()
 
@@ -2396,27 +2932,31 @@ def _domain_context_wizard(
                 continue
             return ip_input
 
-    def _confirm_and_preflight(domain: str, ip: str) -> tuple[str, str] | None:
-        return confirm_domain_pdc_mapping(
-            shell,
-            domain=domain,
-            candidate_ip=ip,
-            interactive=True,
-            mode_label=mode_label,
-            on_reenter=lambda: prompt_known_domain_and_pdc_interactive(
-                shell, mode_label=mode_label
-            ),
+    def _confirm_and_preflight(domain: str, ip: str) -> DomainContextResult:
+        return _resolved_domain_context(
+            confirm_domain_pdc_mapping(
+                shell,
+                domain=domain,
+                candidate_ip=ip,
+                interactive=True,
+                mode_label=mode_label,
+                on_reenter=lambda: prompt_known_domain_and_pdc_interactive(
+                    shell, mode_label=mode_label
+                ),
+            )
         )
 
     # 0) domain + IP
     if selection == 0:
-        return prompt_known_domain_and_pdc_interactive(shell, mode_label=mode_label)
+        return _resolved_domain_context(
+            prompt_known_domain_and_pdc_interactive(shell, mode_label=mode_label)
+        )
 
     # 1) domain only
     if selection == 1:
         domain = _prompt_domain()
         if not domain:
-            return None
+            return _DOMAIN_CONTEXT_CANCELLED
         pdc_ip, pdc_hostname = service.discover_pdc(domain=domain)
         if pdc_ip:
             marked_domain = mark_sensitive(domain, "domain")
@@ -2469,15 +3009,15 @@ def _domain_context_wizard(
         ):
             ip = _prompt_ip()
             if not ip:
-                return None
+                return _DOMAIN_CONTEXT_CANCELLED
             return _confirm_and_preflight(domain, ip)
-        return None
+        return _DOMAIN_CONTEXT_CANCELLED
 
     # 2) IP only
     if selection == 2:
         ip = _prompt_ip()
         if not ip:
-            return None
+            return _DOMAIN_CONTEXT_CANCELLED
         inferred_domain = _infer_domain_from_candidate_ip_with_ux(
             shell,
             candidate_ip=ip,
@@ -2499,7 +3039,7 @@ def _domain_context_wizard(
         )
         domain = _prompt_domain()
         if not domain:
-            return None
+            return _DOMAIN_CONTEXT_CANCELLED
         return _confirm_and_preflight(domain, ip)
 
     # 3) hostname only
@@ -2514,11 +3054,11 @@ def _domain_context_wizard(
     )
     if not hostname or "." not in hostname:
         print_warning("A DC hostname must be a FQDN (e.g., dc01.contoso.local).")
-        return None
+        return _DOMAIN_CONTEXT_CANCELLED
     inferred_domain = infer_domain_from_fqdn(hostname)
     if not inferred_domain:
         print_warning("Could not infer a domain from the provided hostname.")
-        return None
+        return _DOMAIN_CONTEXT_CANCELLED
 
     ip_candidates = service.resolve_ipv4_addresses_robust(hostname)
     if not ip_candidates:
@@ -2532,12 +3072,12 @@ def _domain_context_wizard(
         )
         resolver_ip = _prompt_ip()
         if not resolver_ip:
-            return None
+            return _DOMAIN_CONTEXT_CANCELLED
         ip_candidates = service.resolve_ipv4_addresses_robust(
             hostname, resolver=resolver_ip
         )
         if not ip_candidates:
-            return None
+            return _DOMAIN_CONTEXT_CANCELLED
 
     chosen_ip = ip_candidates[0]
     if len(ip_candidates) > 1:
@@ -2549,7 +3089,7 @@ def _domain_context_wizard(
             default_index=0,
         )
         if idx is None:
-            return None
+            return _DOMAIN_CONTEXT_CANCELLED
         chosen_ip = ip_candidates[idx]
 
     reconciled_domain, crosscheck_line = (
@@ -2564,7 +3104,7 @@ def _domain_context_wizard(
         )
     )
     if not reconciled_domain:
-        return None
+        return _DOMAIN_CONTEXT_CANCELLED
     inferred_domain = reconciled_domain
 
     marked_domain = mark_sensitive(inferred_domain, "domain")
@@ -2589,7 +3129,7 @@ def _domain_context_wizard(
         Text("Validate and proceed with these values?", style="cyan"),
         default=True,
     ):
-        return None
+        return _DOMAIN_CONTEXT_CANCELLED
     return _confirm_and_preflight(inferred_domain, chosen_ip)
 
 
@@ -2618,12 +3158,11 @@ def maybe_relaunch_into_venv(
     if not os.path.exists(venv_python):
         print_error(f"Virtual environment Python not found at {venv_python}.")
         print_instruction("Please run: adscan install")
-        docs_url = (
-            "https://www.adscanpro.com/docs/guides/troubleshooting"
-            "?utm_source=cli&utm_medium=install_error#virtualenv-setup"
+        print_info(
+            "💡 "
+            + cta_markup("install_error", "Troubleshooting installation errors")
         )
-        print_info(f"💡 [link={docs_url}]Troubleshooting installation errors[/link]")
-        track_docs_link_shown("install_error", docs_url)
+        track_docs_link_shown("install_error", cta_url("install_error"))
         sys.exit(1)
 
     try:
@@ -2733,7 +3272,7 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
     preflight_result = run_session_preflight(
         config=SessionPreflightConfig(
             command_name="start",
-            docs_utm_medium="start_preflight_failed",
+            docs_placement="start_preflight_failed",
             allow_unsafe_override=True,
         ),
         deps=SessionPreflightDeps(
@@ -2916,14 +3455,27 @@ def _ensure_workspace_selected_for_start(shell: Any) -> bool:
 
 
 def _emit_post_scan_panels(shell, verb: str) -> None:
-    """Render post-scan UX panels (premium recap, first-scan flag).
+    """Render the post-scan moment (exposure report, premium recap, first-scan flag).
+
+    Ordering is deliberate and is the whole point of routing this through one
+    seam. The exposure report is resolved FIRST (rendered automatically on an
+    engagement, offered on a lab, skipped in PRO where the deliverable kit owns
+    the CTA) so the recap that follows can point at the artifact instead of the
+    raw technical JSON. The one-line lab offer is printed LAST, as a footnote to
+    the result rather than a second surface competing with it.
 
     Threads ``shell`` into :func:`print_post_scan_suggestions` so it can build
     the premium end-of-scan recap (findings + headline attack path + outcome)
-    from the live scan artifacts. Best-effort: panel rendering or flag
-    persistence failures must never propagate into the success path of a scan
-    flow.
+    from the live scan artifacts. Best-effort throughout: report rendering,
+    panel rendering, or flag persistence failures must never propagate into the
+    success path of a scan flow.
     """
+    try:
+        from adscan_internal.services.post_scan_report import run_post_scan_report
+
+        run_post_scan_report(shell, verb)
+    except Exception:  # noqa: BLE001 - the report must not break the success path
+        pass
     try:
         from adscan_internal.cli.post_scan_suggestions import (
             print_post_scan_suggestions,
@@ -2931,6 +3483,14 @@ def _emit_post_scan_panels(shell, verb: str) -> None:
 
         print_post_scan_suggestions(verb, shell=shell)
     except Exception:  # noqa: BLE001 - UX panel must not break the success path
+        pass
+    try:
+        from adscan_internal.services.post_scan_report import (
+            print_post_scan_report_offer,
+        )
+
+        print_post_scan_report_offer(shell)
+    except Exception:  # noqa: BLE001 - a hint must not break the success path
         pass
     try:
         from adscan_internal.cli.first_run_panel import mark_first_scan_done
@@ -2947,6 +3507,7 @@ def run_start_unauth(shell, args: str | None) -> None:
     orchestration logic in this module so that `adscan.py` can be slimmer.
     """
     while True:
+        _reset_scan_launch_marker(shell)
         try:
             scan_ran = _run_start_unauth_impl(shell, args)
             # Only render the post-scan "Scan complete" panel when a scan
@@ -3170,7 +3731,7 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
                 )
                 context = _domain_context_wizard_for_auth(
                     shell, credential=(username, password)
-                )
+                ).context
                 if context is None:
                     print_error(
                         "A valid DC/PDC target is required for authenticated scanning."
@@ -3229,7 +3790,7 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
     while True:
         context = _domain_context_wizard_for_auth(
             shell, credential=(username, password)
-        )
+        ).context
         if context is not None:
             domain, pdc_ip = context
             finalize_domain_context(
@@ -3575,6 +4136,10 @@ def _start_auth_with_params(
     # the scan runs — broadening the compromise at zero extra operator effort.
     maybe_launch_poisoning_job(shell, domain, getattr(shell, "interface", None))
 
+    # Setup is over; from here on an interrupt is a partial scan, not a
+    # cancelled wizard.
+    mark_scan_launched(shell)
+
     shell.scan_mode = "auth"
     shell.domain_validated_cred_counts = {}
     shell.scan_start_time = time.monotonic()
@@ -3665,6 +4230,7 @@ def run_start_auth(shell, args: str | None) -> None:
     a guided interactive mode when the user runs `start_auth` without arguments.
     """
     while True:
+        _reset_scan_launch_marker(shell)
         try:
             scan_ran = _run_start_auth_impl(shell, args)
             # Only render the post-scan "Scan complete" panel when a scan

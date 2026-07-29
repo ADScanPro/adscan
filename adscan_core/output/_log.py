@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import re
 import sys
 from typing import Any, Dict, List, Optional, Union
 
@@ -15,6 +13,10 @@ from rich.panel import Panel
 from rich.text import Text
 
 from adscan_core.output import _state
+from adscan_core.output._display_paths import (
+    translate_items_for_display,
+    translate_paths_for_display,
+)
 from adscan_core.theme import ADSCAN_PRIMARY
 
 
@@ -69,48 +71,18 @@ BRAND_COLORS = {
 
 # Container ↔ host path translation for user-facing output.
 #
-# ADscan ships every command inside a Docker container that bind-mounts the
-# user's ``~/.adscan/`` directory to ``/opt/adscan/`` inside the container.
-# The container code legitimately refers to paths under ``/opt/adscan/``
-# (that's where the files physically live in the container), but every
-# string the user reads in the TUI must show the host path — otherwise they
-# try ``cat /opt/adscan/...`` from their shell and get "No such file or
-# directory", which is a UX failure that compounds across the product.
-#
-# The substitution runs only when ``ADSCAN_CONTAINER_RUNTIME=1`` is set.
-# Outside the container (dev mode, host process) the input passes through.
-#
-# The regex anchors on a boundary character after ``/opt/adscan`` so that
-# sibling paths like ``/opt/adscan-src`` (the source mount) are NOT
-# rewritten — they are container-internal and never user-facing.
-_CONTAINER_DISPLAY_PATH_RE = re.compile(r"/opt/adscan(?=[/\s\"'`,;:)\]}]|$)")
-_HOST_DISPLAY_PATH_REPLACEMENT = "~/.adscan"
-
-
-def _translate_paths_for_display(value: Any) -> Any:
-    """Rewrite container paths to host paths for display.
-
-    Strings get a regex substitution. Other types pass through unchanged
-    (Rich ``Text`` objects assembled by callers must be pre-translated by
-    the caller using ``adscan_internal.services.host_open.display_host_path``;
-    walking arbitrary Rich renderables would be fragile and is not worth
-    the complexity for the small fraction of call sites that build Text
-    objects manually).
-    """
-    if not isinstance(value, str):
-        return value
-    if os.environ.get("ADSCAN_CONTAINER_RUNTIME") != "1":
-        return value
-    return _CONTAINER_DISPLAY_PATH_RE.sub(_HOST_DISPLAY_PATH_REPLACEMENT, value)
+# The rewrite itself (and the reason it exists) lives in ``_display_paths``,
+# which is the single source of truth shared by the log helpers and the panel
+# helpers. These two names are kept as the log-layer aliases because they are
+# referenced across this module and by existing tests.
+_translate_paths_for_display = translate_paths_for_display
 
 
 def _translate_items_for_display(
     items: Optional[List[Union[str, Text]]],
 ) -> Optional[List[Union[str, Text]]]:
-    """Translate every string entry in an ``items`` list for display."""
-    if items is None:
-        return items
-    return [_translate_paths_for_display(item) for item in items]
+    """Translate every entry in an ``items`` list for display."""
+    return translate_items_for_display(items)
 
 # Spacing state — owned here because _handle_spacing / reset_spacing live here
 _last_message_type: Optional[str] = None
@@ -327,6 +299,7 @@ def _print_logger_format_fallback(
     _get_telemetry_console()
 
     # Extract plain text if needed
+    message = _translate_paths_for_display(message)
     if isinstance(message, Text):
         plain_text = message.plain
     else:
@@ -464,6 +437,7 @@ def print_info_verbose(message: Union[str, Text], panel: bool = False, icon: str
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -626,6 +600,7 @@ def print_info_debug(message: Union[str, Text], panel: bool = False, icon: str =
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -753,6 +728,7 @@ def print_event_debug(message: Union[str, Text], panel: bool = False, icon: str 
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
     event_message = f"[events] {plain_text}"
@@ -942,6 +918,7 @@ def print_success_verbose(
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -1021,6 +998,7 @@ def print_success_debug(
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -1153,6 +1131,7 @@ def print_warning_verbose(
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -1224,6 +1203,7 @@ def print_warning_debug(
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -1346,6 +1326,7 @@ def print_error_verbose(
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 
@@ -1415,6 +1396,7 @@ def print_error_debug(message: Union[str, Text], panel: bool = False, icon: str 
     """
     import logging
 
+    message = _translate_paths_for_display(message)
     plain_text = _extract_plain_text(message)
     logger = _get_logger()
 

@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from adscan_core.outbound_links import ADSCAN_SITE_HOST
 from adscan_internal.services.ctf_flag_collector import (
     FlagCollectionResult,
     FlagDiscoveryStrategy,
@@ -143,7 +144,7 @@ def render_unconventional_panel(
     inner.add_row(Text(""))
     inner.add_row(
         Text(
-            "adscanpro.com  ·  ctf  ·  native aiosmb deep scan",
+            f"{ADSCAN_SITE_HOST}  ·  ctf  ·  native aiosmb deep scan",
             style=MUTED,
         )
     )

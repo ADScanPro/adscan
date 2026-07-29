@@ -359,11 +359,23 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
     except Exception:  # noqa: BLE001
         headline_path = None
 
+    # Prefer the shareable exposure report when this run produced one: that is
+    # the file the operator can actually send. The technical JSON is the
+    # fallback, so a run without a report keeps the previous behaviour.
     report_path = None
     try:
-        report_path = str(_get_technical_report_path(shell))
+        from adscan_internal.services.post_scan_report import (
+            get_post_scan_report_display_path,
+        )
+
+        report_path = get_post_scan_report_display_path(shell)
     except Exception:  # noqa: BLE001
         report_path = None
+    if not report_path:
+        try:
+            report_path = str(_get_technical_report_path(shell))
+        except Exception:  # noqa: BLE001
+            report_path = None
 
     fanout = ()
     try:

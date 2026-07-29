@@ -36,6 +36,7 @@ never an exception that breaks the scan.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 # Persisted key under ``domains_data[domain]`` — deliberately NOT ``_``-prefixed
@@ -62,6 +63,57 @@ RUN_ENUMERATION_PHASE_IDS: tuple[str, ...] = (
     "unauthenticated_attack_surface",
     "audit_extras",
 )
+
+
+class StepOutcome(str, Enum):
+    """Why a scan step's runner is telling the pipeline to continue or stop.
+
+    ``run_enumeration``'s step runner used to answer this with a bare ``bool``
+    that meant two OPPOSITE things at once — "stop, the objective is met" and
+    "stop, we are done here" — so every call site could only do a bare ``return``
+    and the checkpoint was left at ``status="running"`` forever. A CTF scan that
+    reached full domain compromise was then indistinguishable, on the next
+    workspace load, from a scan that died half-way: the resume front door offered
+    to continue a scan that had already WON.
+
+    The three outcomes are exhaustive and each carries its checkpoint obligation:
+
+    * :attr:`CONTINUE` — the step ran (successfully or not); keep going. A step
+      that FAILED is still ``CONTINUE``: the failure is logged and the pipeline
+      moves on, exactly as before.
+    * :attr:`STOP_OBJECTIVE_MET` — the engagement's own success criterion is
+      satisfied (CTF: the domain is owned), so the remaining offensive phases are
+      deliberately skipped. The scan is COMPLETE by its own definition and the
+      checkpoint must be finalized — leaving it ``running`` is what produced the
+      "a scan that wins is recorded as interrupted, forever" bug.
+    * :attr:`STOP_INCOMPLETE` — the pipeline stopped without meeting the
+      objective (an abort, a chunk boundary, an unrecoverable precondition). The
+      checkpoint stays ``running`` so the scan remains resumable.
+
+    ``bool(outcome)`` answers "should the pipeline stop?", so a foreign caller
+    that still writes ``if run_step(...):`` keeps behaving correctly. In-repo
+    call sites use the explicit :attr:`should_stop` / :attr:`finalizes_scan`
+    properties — the whole point of this type is that "stop" and "why" are no
+    longer the same bit.
+    """
+
+    CONTINUE = "continue"
+    STOP_OBJECTIVE_MET = "stop_objective_met"
+    STOP_INCOMPLETE = "stop_incomplete"
+
+    @property
+    def should_stop(self) -> bool:
+        """Return True when the surrounding pipeline must stop here."""
+        return self is not StepOutcome.CONTINUE
+
+    @property
+    def finalizes_scan(self) -> bool:
+        """Return True when this stop means the scan is COMPLETE, not interrupted."""
+        return self is StepOutcome.STOP_OBJECTIVE_MET
+
+    def __bool__(self) -> bool:
+        """Truthiness is "should the pipeline stop?" (compatibility guard)."""
+        return self.should_stop
 
 
 def should_manage_progress(

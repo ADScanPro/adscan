@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from adscan_core.lab_context import normalize_lab_name, normalize_lab_provider
+from adscan_core.telemetry_preference import default_workspace_telemetry
 from adscan_internal.workspaces.io import write_json_file
 from adscan_internal.workspaces.paths import workspace_variables_path
 
@@ -92,7 +93,9 @@ def write_initial_workspace_variables(
         "current_domain_dir": None,
         "domain_path": None,
         "auto": False,
-        "telemetry": True,
+        # A workspace created while the operator is globally opted out is born
+        # opted out — never silently re-enabled by being new.
+        "telemetry": default_workspace_telemetry(),
         "type": workspace_type,
         "lab_provider": normalize_lab_provider(lab_provider),
         "lab_name": normalize_lab_name(lab_name),

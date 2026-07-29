@@ -22,6 +22,8 @@ from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
 
+from adscan_core.outbound_links import cta_display, cta_link_style
+
 UpsellContext = Literal["direct_invocation", "post_scan", "help_listing"]
 
 _BRAND_CYAN = "bright_cyan"
@@ -47,95 +49,97 @@ _PDFS = (
     "AD Control Coverage Report",
 )
 
+# What the paid kit adds on top of the free LITE exposure report. Ordered by
+# what a consultant weighs: the regulatory mapping and the remediation depth
+# first (the hours saved per engagement), then the two hardening documents, then
+# the branding boundary stated plainly.
+_KIT_ITEMS = (
+    "Security Assessment Report mapped to DORA, NIS2, ENS and ISO 27001",
+    "Per-finding remediation your client's sysadmin can execute",
+    "AD Hardening Playbook",
+    "AD Control Coverage Report",
+    "Your branding, not ours",
+)
+
 
 def _feature_display_name(feature: str) -> str:
     """Return a human-readable name for ``feature`` (fallback: title-case)."""
     return _FEATURE_DISPLAY_NAMES.get(feature, feature.replace("_", " ").title())
 
 
-def _secondary_cta(context: UpsellContext) -> str | None:
-    if context == "direct_invocation":
-        return "Preview:  adscan demo  (generates a sample report — no AD required)"
-    if context == "post_scan":
-        return "Preview:  adscan demo  (see the full report from your scan data)"
-    # help_listing: omit secondary
-    return None
+def render_pro_upsell_panel(
+    feature: str,
+    context: UpsellContext,
+    *,
+    report_path: str | None = None,
+) -> Panel:
+    """Render the canonical PRO upsell panel for the Client Deliverable Kit.
 
-
-def render_pro_upsell_panel(feature: str, context: UpsellContext) -> Panel:
-    """Render the canonical PRO upsell panel for ``feature`` in ``context``.
+    The panel leads with what the LITE operator can do RIGHT NOW — generate the
+    free HTML exposure report — and only then states what the paid kit adds. It
+    reads as a next step after a successful scan, never as a refusal.
 
     Args:
-        feature: PRO verb being promoted (e.g. ``"playbook"``,
-            ``"coverage_matrix"``, ``"deliver"``, ``"generate_report"``).
-        context: Where the panel is being rendered. Drives the secondary
-            CTA: ``direct_invocation`` shows ``adscan demo`` as zero-risk
-            preview, ``post_scan`` invites rendering against the user's
-            own scan data, and ``help_listing`` omits the secondary CTA.
+        feature: PRO verb being promoted (kept for call-site compatibility;
+            the body is kit-focused and no longer branches on it).
+        context: Where the panel is rendered (unused for copy today; kept for
+            signature stability across the three call sites).
+        report_path: Absolute path to an exposure report already generated in
+            this workspace. When provided, the panel points at that file instead
+            of telling the operator to generate one again.
 
     Returns:
-        A configured :class:`rich.panel.Panel` ready to print. Callers
-        should print it with ``console.print(panel)`` directly — wrapping
-        it through ``print_panel`` produces a double-bordered render.
-        Most callers prefer :func:`print_pro_upsell` which handles this.
+        A configured :class:`rich.panel.Panel` ready to print. Callers should
+        print it with ``console.print(panel)`` directly — wrapping it through
+        ``print_panel`` produces a double-bordered render. Most callers prefer
+        :func:`print_pro_upsell` which handles this.
     """
-    display = _feature_display_name(feature)
+    del feature, context  # body is kit-focused; params kept for compatibility
 
     eyebrow = Text(
         "CLIENT DELIVERABLE KIT · PRO FEATURE",
         style=f"bold {_BRAND_CYAN}",
     )
+    header = Text("Client Deliverable Kit", style="bold")
 
-    # The default headline construction ("<X> is part of the Client
-    # Deliverable Kit — …") works for components (Security Assessment
-    # Report, Playbook, AD Control Coverage Report). When the feature IS
-    # the Kit itself (``deliver``), it collapses into a tautology
-    # ("Client Deliverable Kit is part of the Client Deliverable Kit").
-    # Branch on the feature name to keep the copy clean.
-    headline = Text()
-    if feature == "deliver":
-        headline.append("The Client Deliverable Kit", style="bold")
-        headline.append(
-            " is the 3 PDFs you hand to the customer after every engagement.",
+    capability = Text()
+    if report_path:
+        capability.append("Your exposure report is ready:\n")
+        capability.append(report_path, style=_BRAND_CYAN)
+        capability.append(
+            "\nScore, findings and the proven attack paths, and it is yours to send."
         )
     else:
-        headline.append(display, style="bold")
-        headline.append(
-            " is part of the Client Deliverable Kit — the 3 PDFs you "
-            "hand to the customer after every engagement.",
+        capability.append(
+            "You can generate your exposure report right now with 'generate_report'.\n"
+            "Score, findings and the proven attack paths, and it is yours to send."
         )
 
-    pdfs_line = Text()
-    for idx, name in enumerate(_PDFS):
-        if idx > 0:
-            pdfs_line.append("  ·  ", style=_BRAND_CYAN)
-        pdfs_line.append(name)
+    adds_intro = Text("The kit adds what you bill for:", style="bold")
+    bullets: list[Text] = [Text("  " + item) for item in _KIT_ITEMS]
 
-    punchline = Text(
-        "Stop writing reports. Ship the kit in 90 seconds.",
-        style="bold",
+    cost = Text("An evening of writing, or a ZIP at the end of the engagement.")
+
+    # Short, clean text; the tracking parameters ride in the hyperlink target.
+    primary_cta = Text(
+        cta_display("pro_upsell_panel"),
+        style=cta_link_style("pro_upsell_panel", f"{_BRAND_CYAN} on grey11"),
     )
-
-    primary_cta = Text()
-    primary_cta.append("Upgrade:  ", style="bold")
-    primary_cta.append("https://adscanpro.com/pro", style=f"{_BRAND_CYAN} on grey11")
 
     parts: list[Text] = [
         eyebrow,
         Text(""),
-        headline,
+        header,
         Text(""),
-        pdfs_line,
+        capability,
         Text(""),
-        punchline,
+        adds_intro,
+        *bullets,
+        Text(""),
+        cost,
         Text(""),
         primary_cta,
     ]
-
-    secondary = _secondary_cta(context)
-    if secondary is not None:
-        sec = Text(secondary, style=_BRAND_CYAN)
-        parts.append(sec)
 
     return Panel(
         Group(*parts),
@@ -144,24 +148,26 @@ def render_pro_upsell_panel(feature: str, context: UpsellContext) -> Panel:
     )
 
 
-def print_pro_upsell(feature: str, context: UpsellContext) -> None:
+def print_pro_upsell(
+    feature: str,
+    context: UpsellContext,
+    *,
+    report_path: str | None = None,
+) -> None:
     """Render the PRO upsell panel and print it without double-wrapping.
 
-    Convenience wrapper for the three container call sites (REPL
-    ``deliver``, REPL ``generate_report``, top-level ``adscan deliver``)
-    that previously did ``print_panel(render_pro_upsell_panel(...))`` and
-    got a panel-inside-a-panel render — two stacked cyan borders.
+    Convenience wrapper for the container call sites (REPL ``deliver``,
+    top-level ``adscan deliver``) that previously did
+    ``print_panel(render_pro_upsell_panel(...))`` and got a panel-inside-a-panel
+    render — two stacked cyan borders.
 
-    This helper prints the panel directly through the shared Rich console
-    so the operator sees the canonical single-frame premium panel. Prefer
-    it over the raw renderer in any call site that just wants to surface
-    the upsell — only reach for :func:`render_pro_upsell_panel` when the
-    panel is being composed into a larger layout (e.g. embedded inside a
-    Group, a Layout, or another Panel intentionally).
+    This helper prints the panel directly through the shared Rich console so the
+    operator sees the canonical single-frame premium panel. ``report_path`` is
+    forwarded so the panel can point at an already-generated exposure report.
     """
     from adscan_core.output._panels import _get_console
 
-    panel = render_pro_upsell_panel(feature, context)
+    panel = render_pro_upsell_panel(feature, context, report_path=report_path)
     _get_console().print(panel)
 
 

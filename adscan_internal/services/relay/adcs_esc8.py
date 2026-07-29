@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, pkcs12
 from cryptography.x509.oid import NameOID
 
+from adscan_internal.services.adcs.esc_cleanup import format_certificate_not_after
 from adscan_internal.services.relay.core import RelayAuthentication, RelayTargetResult
 from adscan_internal.services.relay.display import print_relay_captured
 from adscan_internal.services.relay.identity import (
@@ -119,6 +120,8 @@ class AdcsEsc8RelayTarget:
                 "request_id": request_id,
                 "cert_serial": f"{cert.serial_number:X}",
                 "cert_subject": cert.subject.rfc4514_string(),
+                "cert_not_after": format_certificate_not_after(cert),
+                "template": self.config.template,
                 "endpoint": client.endpoint,
             },
         )

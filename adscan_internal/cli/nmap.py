@@ -214,6 +214,7 @@ def discover_dc_candidates_with_nmap_details(
     """
     try:
         setattr(shell, "_last_dc_discovery_cancelled_by_user", False)
+        setattr(shell, "_last_dc_discovery_invalid_target", False)
         if not _confirm_large_dc_discovery_scan(
             shell,
             hosts=hosts,
@@ -249,6 +250,16 @@ def discover_dc_candidates_with_nmap_details(
             return {}
 
         output_text = (result.stdout or "") + "\n" + (result.stderr or "")
+        if _nmap_output_indicates_invalid_target(output_text):
+            # Nothing was scanned, so the zero-candidate result below would be
+            # a lie. Flag it for the recovery prompt, which then asks for a
+            # corrected expression instead of advising a wider range.
+            setattr(shell, "_last_dc_discovery_invalid_target", True)
+            print_error(
+                f"The target expression {marked_hosts} could not be parsed, so no host "
+                "was scanned. Provide a valid IP, CIDR, host range, or hostname."
+            )
+            return {}
         if _nmap_output_indicates_missing_privileges(output_text):
             sudo_scan_cmd = (
                 f"sudo -n nmap --open -n -Pn -sS -p{port_list} "
@@ -285,10 +296,17 @@ def discover_dc_candidates_with_nmap_details(
         open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
         candidates = sorted(open_ports_by_host.keys())
 
-        print_success(
-            f"Discovered {len(candidates)} DC candidate host(s) "
-            f"with ports {marked_ports} open."
-        )
+        if candidates:
+            print_success(
+                f"Discovered {len(candidates)} DC candidate host(s) "
+                f"with ports {marked_ports} open."
+            )
+        else:
+            # Zero candidates is a dead end, not an accomplishment — a ✓ here
+            # reads as "discovery worked" right before the flow stalls.
+            print_warning(
+                f"No DC candidate hosts found with ports {marked_ports} open."
+            )
         return open_ports_by_host
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -1125,6 +1143,31 @@ def _nmap_output_indicates_missing_privileges(output: str) -> bool:
         "operation not permitted",
         "permission denied",
         "not permitted",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _nmap_output_indicates_invalid_target(output: str) -> bool:
+    """Check whether nmap rejected the TARGET EXPRESSION rather than scanning it.
+
+    A malformed expression (``10.10.10.0/24n``) makes nmap parse nothing and
+    exit having scanned zero hosts. Without this classifier that is
+    indistinguishable from a well-formed range holding no domain controllers,
+    so the operator is advised to widen a range that was never scanned.
+
+    Args:
+        output: Combined stdout/stderr from the nmap invocation.
+
+    Returns:
+        True when the output shows a target-parsing rejection.
+    """
+    lowered = (output or "").lower()
+    markers = (
+        "unable to split netmask",
+        "no targets were specified",
+        "failed to resolve",
+        "failed to determine route to",
+        "invalid target host specification",
     )
     return any(marker in lowered for marker in markers)
 

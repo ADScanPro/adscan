@@ -3,6 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from adscan_core.rich_output import print_info_verbose
+from adscan_core.telemetry_preference import (
+    WORKSPACE_PREFERENCE_ATTR,
+    default_workspace_telemetry,
+    load_global_preference,
+    resolve_effective_telemetry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +133,37 @@ def _coerce_json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _workspace_telemetry_preference_for_save(shell: Any) -> bool:
+    """Return the workspace's own telemetry preference for persistence.
+
+    Prefers the explicitly tracked workspace preference; falls back to the
+    shell's effective flag for shells that never loaded a workspace.
+    """
+    preference = getattr(shell, WORKSPACE_PREFERENCE_ATTR, None)
+    if isinstance(preference, bool):
+        return preference
+    effective = getattr(shell, "telemetry", None)
+    if isinstance(effective, bool):
+        return effective
+    return default_workspace_telemetry()
+
+
+def _apply_telemetry_preference_to_shell(shell: Any, raw_value: Any) -> None:
+    """Split the loaded ``telemetry`` value into workspace vs effective state.
+
+    ``shell.telemetry`` is the EFFECTIVE state (global opt-out wins), while
+    ``shell.telemetry_workspace_preference`` keeps what this workspace itself
+    recorded so it survives a round-trip through save/load.
+    """
+    workspace_preference = raw_value if isinstance(raw_value, bool) else None
+    if workspace_preference is None:
+        workspace_preference = default_workspace_telemetry()
+    setattr(shell, WORKSPACE_PREFERENCE_ATTR, workspace_preference)
+    shell.telemetry = resolve_effective_telemetry(
+        load_global_preference(), workspace_preference
+    )
+
+
 def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
     """Collect workspace-level variables from the CLI shell instance."""
     workspace_vars = {
@@ -149,7 +186,10 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         "domains_data": getattr(shell, "domains_data", {}),
         "domain_connectivity": getattr(shell, "domain_connectivity", {}),
         "auto": getattr(shell, "auto", False),
-        "telemetry": getattr(shell, "telemetry", True),
+        # Persist the WORKSPACE's own preference, not the resolved effective
+        # state: a global opt-out must not be written back here as though the
+        # user had disabled telemetry for this engagement specifically.
+        "telemetry": _workspace_telemetry_preference_for_save(shell),
         "type": getattr(shell, "type", None),
         "lab_provider": getattr(shell, "lab_provider", None),
         "lab_name": getattr(shell, "lab_name", None),
@@ -249,6 +289,8 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
         "domains_data": {},
         "domain_connectivity": {},
         "auto": False,
+        # Handled out of band by ``_apply_telemetry_preference_to_shell`` below;
+        # listed here so the schema stays complete.
         "telemetry": True,
         "type": None,
         "lab_provider": None,
@@ -262,10 +304,16 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
     }
 
     for key, default in defaults.items():
+        if key == "telemetry":
+            continue
         if key in variables:
             setattr(shell, key, variables.get(key))
         else:
             setattr(shell, key, default)
+
+    # Telemetry is resolved, not copied: the persisted workspace value is only
+    # one of the two inputs (the global opt-out is the other, and it wins).
+    _apply_telemetry_preference_to_shell(shell, variables.get("telemetry"))
 
     domains_data = getattr(shell, "domains_data", None)
     if isinstance(domains_data, dict):

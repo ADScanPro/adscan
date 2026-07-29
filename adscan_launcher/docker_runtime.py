@@ -286,6 +286,13 @@ def docker_needs_sudo(timeout: int = 5) -> bool:
 #   * Only fires for ``docker run`` (the actual container exec).
 #     ``docker info``, ``docker pull``, ``docker image inspect`` etc.
 #     are launcher-only operations and don't trigger the hook.
+#   * Only fires when the launcher is SURRENDERING the terminal to that
+#     container — i.e. the output is inherited, not captured. A captured
+#     ``docker run`` is a short probe the launcher outlives (``adscan check``
+#     runs ``--version`` that way); flushing there ended the recording before
+#     the command had said anything, so 11 of 11 `check` sessions had no
+#     verdict in them. ``run_docker`` knows which case it is and tells the
+#     hook; do not infer it from the argv.
 _pre_container_exec_hook: Callable[[], None] | None = None
 
 
@@ -309,8 +316,22 @@ def _is_container_exec_argv(argv: Sequence[str]) -> bool:
     return False
 
 
-def _fire_pre_container_exec_hook(argv: Sequence[str]) -> None:
-    """Invoke and clear the pre-``docker run`` hook, once, best-effort."""
+def _fire_pre_container_exec_hook(
+    argv: Sequence[str],
+    *,
+    surrenders_terminal: bool,
+) -> None:
+    """Invoke and clear the pre-``docker run`` hook, once, best-effort.
+
+    Args:
+        argv: The docker command about to run.
+        surrenders_terminal: True when the launcher hands stdio to the
+            container and outlives nothing (``adscan start`` / ``ci`` /
+            passthrough). False for a captured probe the launcher continues
+            past — flushing the session there truncates the recording.
+    """
+    if not surrenders_terminal:
+        return
     if not _is_container_exec_argv(argv):
         return
     global _pre_container_exec_hook  # pylint: disable=global-statement
@@ -362,7 +383,7 @@ def run_docker(
     # capturing output. Let Docker inherit the real TTY so interactive UIs
     # (questionary/prompt_toolkit) behave correctly.
     if capture_output:
-        _fire_pre_container_exec_hook(cmd)
+        _fire_pre_container_exec_hook(cmd, surrenders_terminal=False)
         proc = subprocess.run(
             cmd,
             capture_output=True,
@@ -381,7 +402,7 @@ def run_docker(
             _DOCKER_PERMISSION_WARNING_SHOWN = True
         return proc
 
-    _fire_pre_container_exec_hook(cmd)
+    _fire_pre_container_exec_hook(cmd, surrenders_terminal=True)
     return subprocess.run(  # noqa: S603
         cmd,
         timeout=timeout,
@@ -526,7 +547,10 @@ def run_docker_stream(
         cmd = ["sudo", f"--preserve-env={preserve_env}"] + cmd
 
     use_pty = bool(sys.stdout.isatty() and sys.stdin.isatty() and not os.getenv("CI"))
-    _fire_pre_container_exec_hook(cmd)
+    # Streams to the terminal but returns its output tail to the caller, so the
+    # launcher outlives it — not a handoff. (Today this only carries
+    # ``docker pull``, which the argv gate ignores anyway.)
+    _fire_pre_container_exec_hook(cmd, surrenders_terminal=False)
     if use_pty:
         # If we pipe stdout/stderr, Docker disables its rich progress UI because it
         # thinks it's not attached to a TTY. Use a PTY in interactive sessions so
@@ -866,12 +890,37 @@ def _make_docker_accessible_url(url: str) -> str:
     )
 
 
+def runtime_cap_add_list() -> tuple[str, ...]:
+    """Return the ``--cap-add`` names the real ADscan container is launched with.
+
+    Single source of truth for ``build_adscan_run_command`` and the capability
+    probe. They MUST agree: a probe that adds fewer capabilities than the real
+    run measures a container ADscan never runs in, and reports capabilities as
+    missing when the actual container has them.
+
+    NET_ADMIN is conditional on the host exposing ``/dev/net/tun``, since that
+    is what ligolo's TUN pivoting needs.
+    """
+    caps = ["SYS_TIME", "NET_BIND_SERVICE"]
+    if Path("/dev/net/tun").exists():
+        caps.append("NET_ADMIN")
+    return tuple(caps)
+
+
 def _render_reduced_runtime_panel(verdict) -> None:
-    """Render the premium 'reduced network mode' notice for a rootless runtime."""
+    """Render the 'reduced network mode' notice for a capability-limited runtime.
+
+    The headline states only what the probe OBSERVED. A remapped user namespace
+    is named as such; anything else says the capabilities are missing without
+    guessing why, because a rootful daemon can also be missing them (stripped
+    caps, no ``/dev/net/tun``) and telling that operator they are "rootless"
+    sends them to fix something that is not broken.
+    """
     ipv6_ok = bool(getattr(verdict, "net_raw", False))
     tun_ok = bool(getattr(verdict, "net_admin", False))
-    ok = "[status.success]✓[/status.success]"
-    warn = "[status.warning]⚠[/status.warning]"
+    remapped = bool(getattr(verdict, "userns_remapped", False))
+    ok = "[success]✓[/success]"
+    warn = "[warning]⚠[/warning]"
     rows = [
         f"  {ok}  Core assessment    LDAP · SMB · Kerberos · RPC · attack paths",
         f"  {ok}  Recon              port / service discovery (TCP connect)",
@@ -880,19 +929,35 @@ def _render_reduced_runtime_panel(verdict) -> None:
         f"  {ok if tun_ok else warn}  Tunnel pivoting    "
         + ("available" if tun_ok else "ligolo-ng TUN — requires NET_ADMIN"),
     ]
-    body = (
-        "Rootless / user-namespaced runtime detected (rootless Docker or Podman). "
-        "The full AD assessment runs normally — the optional offensive extras "
-        "below are unavailable in this runtime.\n\n"
-        + "\n".join(rows)
-        + "\n\n[bold]Full features[/bold] → run on a standard (rootful) Docker daemon.\n"
-        "                no sudo: add your user to the [bold]docker[/bold] group."
-    )
+    if remapped:
+        headline = (
+            "Rootless / user-namespaced runtime detected (rootless Docker or "
+            "Podman). The full AD assessment runs normally — the optional "
+            "offensive extras below are unavailable in this runtime."
+        )
+        title = "⚠  Reduced Network Mode · rootless container runtime"
+        footer = (
+            "\n\n[bold]Full features[/bold] → run on a standard (rootful) Docker daemon.\n"
+            "                no sudo: add your user to the [bold]docker[/bold] group."
+        )
+    else:
+        headline = (
+            "This container runtime does not grant every network capability "
+            "ADscan can use. The full AD assessment runs normally — the "
+            "optional offensive extras below are unavailable."
+        )
+        title = "⚠  Reduced Network Mode · limited container capabilities"
+        footer = (
+            "\n\n[bold]Full features[/bold] → a runtime that allows NET_RAW and "
+            "NET_ADMIN.\n"
+            "                TUN pivoting also needs [bold]/dev/net/tun[/bold] on the host."
+        )
+    body = headline + "\n\n" + "\n".join(rows) + footer
     print_panel(
         body,
-        title="⚠  Reduced Network Mode · rootless container runtime",
+        title=title,
         title_align="left",
-        border_style="status.warning",
+        border_style="panel.border.warning",
     )
 
 
@@ -913,14 +978,11 @@ def probe_and_warn_reduced_runtime(cfg: DockerRunConfig) -> None:
             probe_runtime_capability,
         )
 
-        cap_add = ["SYS_TIME"]
-        if Path("/dev/net/tun").exists():
-            cap_add.append("NET_ADMIN")
         verdict = probe_runtime_capability(
             image=cfg.image,
             uid=os.getuid(),
             gid=os.getgid(),
-            cap_add=tuple(cap_add),
+            cap_add=runtime_cap_add_list(),
         )
         if not verdict.probe_ok:
             return  # inconclusive — say nothing (fail-open)
@@ -941,6 +1003,68 @@ def probe_and_warn_reduced_runtime(cfg: DockerRunConfig) -> None:
             print_exception(exception=exc)
         except Exception:  # noqa: BLE001
             pass
+
+
+#: Host environment variables forwarded verbatim into the scan container.
+#:
+#: Opt-in by design: a key is only forwarded when it is set (and non-empty) on
+#: the host, so the default runtime behaviour is unchanged. This tuple is the
+#: contract between the host and the container — anything the runtime asks an
+#: operator to "set in the environment" must be listed here, or the instruction
+#: is impossible to follow. It is module-level (not a local inside
+#: ``build_adscan_run_command``) precisely so tests can assert against it.
+PASSTHROUGH_ENV_KEYS: tuple[str, ...] = (
+    "ADSCAN_SESSION_ENV",
+    "ADSCAN_ENV",
+    "ADSCAN_TELEMETRY",
+    "ADSCAN_ALLOW_PUBLIC_DNS",
+    # Offline / no-external kill switch (PoV appliance). Without forwarding
+    # these, an ``ADSCAN_OFFLINE=1`` set on the host (e.g. by the appliance
+    # cloud-init / Celery unit) never reaches the scan container, so the
+    # weakpass egress guard and telemetry opt-out inside the runtime stay
+    # off — the "zero bytes leave the appliance" promise would rest solely
+    # on nftables. ``ADSCAN_NO_EXTERNAL`` is the documented alias
+    # (see weakpass_service._OFFLINE_ENV_VARS).
+    "ADSCAN_OFFLINE",
+    "ADSCAN_NO_EXTERNAL",
+    # PRO entitlement/attribution tag. The in-container PRO start gate refuses
+    # to run without it and tells the operator to supply one; without this
+    # entry the host value never arrived and the instruction could not be
+    # followed. The launcher's ``--partner-tag`` flag also lands here (it sets
+    # the variable on the launcher process before this forwarding runs).
+    "ADSCAN_PARTNER_TAG",
+    # CI event pipeline: forward the structured-event sink config so the container
+    # emits JSON events to stderr (read by the Celery worker via PIPE).
+    "ADSCAN_EVENT_SINK",
+    "ADSCAN_SCAN_ID",
+    "ADSCAN_NONINTERACTIVE",
+    # Remote interaction bridge: forward the sink type so the container can delegate
+    # interactive prompts (e.g. attack path selection) back to the web UI via Redis.
+    # The Redis URL is NOT forwarded as-is because localhost/127.0.0.1 is unreachable
+    # from inside Docker; instead we compute a host-gateway-based URL below.
+    "ADSCAN_INTERACTIVE_SINK",
+    "ADSCAN_INTERACTIVE_TIMEOUT_SECONDS",
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "CIRCLECI",
+    "TRAVIS",
+    "JENKINS_HOME",
+    "TEAMCITY_VERSION",
+    "BUILDKITE",
+    "DRONE",
+    "CONTINUOUS_INTEGRATION",
+    "FORCE_COLOR",
+    "TERM",
+    # Used by telemetry proxy / sentry proxy when present.
+    "CLI_SHARED_TOKEN",
+    # Used by the host privileged helper (Docker clock sync).
+    "CONTAINER_SHARED_TOKEN",
+    # Distinguish host launcher version from in-container runtime version.
+    "ADSCAN_LAUNCHER_VERSION",
+    # Correlate launcher preflight + runtime sessions as one logical run.
+    "ADSCAN_SESSION_TRACE_ID",
+)
 
 
 def build_adscan_run_command(
@@ -967,23 +1091,21 @@ def build_adscan_run_command(
         # 127.0.0.1 rewrites resolve to the host bridge IP.
         cmd.extend(["--add-host", "host-gateway:host-gateway"])
         host_gateway_added = True
-    # Allow the container to adjust the host clock when needed for Kerberos.
-    # This is intentionally narrower than `--privileged` but still grants the
-    # ability to change the system time (CAP_SYS_TIME).
-    cmd.extend(["--cap-add", "SYS_TIME"])
-    # Coercion-based NTLM capture / relay listeners (NTLM auth-type sweep, ESC8
-    # relay) bind PRIVILEGED ports inbound (SMB 445, HTTP 80, LDAP 389). The
-    # runtime runs as a non-root --user, so without this it gets EACCES binding
-    # <1024 and those features skip with "listener failed to start". CAP_NET_BIND_
-    # SERVICE is the minimal capability for this (far narrower than --privileged);
-    # Docker 20.10+ also propagates --cap-add to the ambient set so the non-root
-    # user can actually use it. --sysctl net.ipv4.ip_unprivileged_port_start is
-    # NOT an option here because the runtime uses --network host, which forbids
-    # namespaced net sysctls.
-    cmd.extend(["--cap-add", "NET_BIND_SERVICE"])
+    # Capabilities, from the shared list the capability probe also uses:
+    # - SYS_TIME lets the container adjust the host clock for Kerberos. Narrower
+    #   than `--privileged`, which is why it is granted individually.
+    # - NET_BIND_SERVICE: coercion-based NTLM capture / relay listeners (NTLM
+    #   auth-type sweep, ESC8 relay) bind PRIVILEGED ports inbound (SMB 445,
+    #   HTTP 80, LDAP 389). The runtime runs as a non-root --user, so without
+    #   this it gets EACCES binding <1024 and those features skip with
+    #   "listener failed to start". --sysctl net.ipv4.ip_unprivileged_port_start
+    #   is NOT an option here because the runtime uses --network host, which
+    #   forbids namespaced net sysctls.
+    # - NET_ADMIN (when the host has /dev/net/tun) for ligolo TUN pivoting.
+    for cap in runtime_cap_add_list():
+        cmd.extend(["--cap-add", cap])
     host_tun_device = Path("/dev/net/tun")
     if host_tun_device.exists():
-        cmd.extend(["--cap-add", "NET_ADMIN"])
         cmd.extend(["--device", f"{host_tun_device}:{host_tun_device}"])
         print_info_debug(
             "[docker] enabling ligolo TUN support: "
@@ -1188,54 +1310,9 @@ def build_adscan_run_command(
         value = str(os.environ.get(key, default_value)).strip()
         cmd.extend(["-e", f"{key}={value}"])
 
-    passthrough_keys = (
-        "ADSCAN_SESSION_ENV",
-        "ADSCAN_ENV",
-        "ADSCAN_TELEMETRY",
-        "ADSCAN_ALLOW_PUBLIC_DNS",
-        # Offline / no-external kill switch (PoV appliance). Without forwarding
-        # these, an ``ADSCAN_OFFLINE=1`` set on the host (e.g. by the appliance
-        # cloud-init / Celery unit) never reaches the scan container, so the
-        # weakpass egress guard and telemetry opt-out inside the runtime stay
-        # off — the "zero bytes leave the appliance" promise would rest solely
-        # on nftables. Opt-in: only forwarded when set, so the default runtime
-        # behaviour is unchanged. ``ADSCAN_NO_EXTERNAL`` is the documented alias
-        # (see weakpass_service._OFFLINE_ENV_VARS).
-        "ADSCAN_OFFLINE",
-        "ADSCAN_NO_EXTERNAL",
-        # CI event pipeline: forward the structured-event sink config so the container
-        # emits JSON events to stderr (read by the Celery worker via PIPE).
-        "ADSCAN_EVENT_SINK",
-        "ADSCAN_SCAN_ID",
-        "ADSCAN_NONINTERACTIVE",
-        # Remote interaction bridge: forward the sink type so the container can delegate
-        # interactive prompts (e.g. attack path selection) back to the web UI via Redis.
-        # The Redis URL is NOT forwarded as-is because localhost/127.0.0.1 is unreachable
-        # from inside Docker; instead we compute a host-gateway-based URL below.
-        "ADSCAN_INTERACTIVE_SINK",
-        "ADSCAN_INTERACTIVE_TIMEOUT_SECONDS",
-        "CI",
-        "GITHUB_ACTIONS",
-        "GITLAB_CI",
-        "CIRCLECI",
-        "TRAVIS",
-        "JENKINS_HOME",
-        "TEAMCITY_VERSION",
-        "BUILDKITE",
-        "DRONE",
-        "CONTINUOUS_INTEGRATION",
-        "FORCE_COLOR",
-        "TERM",
-        # Used by telemetry proxy / sentry proxy when present.
-        "CLI_SHARED_TOKEN",
-        # Used by the host privileged helper (Docker clock sync).
-        "CONTAINER_SHARED_TOKEN",
-        # Distinguish host launcher version from in-container runtime version.
-        "ADSCAN_LAUNCHER_VERSION",
-        # Correlate launcher preflight + runtime sessions as one logical run.
-        "ADSCAN_SESSION_TRACE_ID",
-    )
-    for key in passthrough_keys:
+    # Allow-list lives at module scope (PASSTHROUGH_ENV_KEYS) so it can be
+    # asserted against — see tests/unit/launcher/.
+    for key in PASSTHROUGH_ENV_KEYS:
         if key in os.environ and str(os.environ.get(key, "")).strip():
             cmd.extend(["-e", f"{key}={os.environ[key]}"])
 

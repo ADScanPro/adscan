@@ -49,13 +49,16 @@ _Real run, no cuts: ADscan takes **HTB Forest** from zero access to Domain Admin
 
 ## Quick Start
 
+**Before you start:** ADscan runs inside Docker, so you need **Docker Engine installed and running**, and about **12 GB of free disk** for the runtime image (the installer requires 15 GB free before it will pull). Host must be **Linux or macOS**. Native Windows and WSL are not supported.
+
 ```bash
+docker version   # if this fails, install Docker first
 pipx install adscan
 adscan install
 adscan start
 ```
 
-> Full installation guide at [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)
+> Docker install steps per distribution, and everything else: [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)
 
 Once inside the shell, start an unauthenticated recon:
 
@@ -64,6 +67,23 @@ Once inside the shell, start an unauthenticated recon:
 ```
 
 This discovers domain controllers, SMB exposure, null sessions, and roastable accounts without credentials. From there, run `start_auth` with a domain user to enumerate LDAP, collect BloodHound data, and build the attack graph.
+
+### One command instead of the shell
+
+`adscan ci` runs the whole pipeline non-interactively: preflight, recon, enumeration, exploitation, reporting, no prompts. Same engine, no shell.
+
+```bash
+# Authenticated scan of a domain
+adscan ci auth --type audit --interface eth0 \
+  --domain corp.local --dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'
+
+# Unauthenticated sweep
+adscan ci unauth --type audit --interface eth0 --dc-ip 10.0.0.1
+```
+
+`--type`, `--interface` and the `auth`/`unauth` positional are required. `adscan ci --help` lists the rest.
+
+`adscan ci` is still marked beta: it makes every decision the interactive shell would ask you about, and those defaults and its output format can change between releases. The interactive `adscan start` shell is the supported path for client work; `ci` is for pipelines, lab automation, and unattended runs.
 
 ---
 
@@ -191,8 +211,9 @@ Beta access is free for security consultants. [adscanpro.com/pro](https://adscan
 
 | | |
 |---|---|
-| **OS** | Linux (Debian/Ubuntu/Kali) |
-| **Docker** | Docker Engine + Compose |
+| **OS** | Linux (Debian/Ubuntu/Kali/Parrot) or macOS with Docker Desktop. Native Windows and WSL are not supported |
+| **Docker** | Docker Engine. Compose is no longer needed |
+| **Disk** | 15 GB free before install; the runtime image is roughly 12 GB unpacked |
 | **Privileges** | `docker` group or `sudo` |
 | **Network** | Internet (pull images) + target network |
 

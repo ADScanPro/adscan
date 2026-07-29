@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -78,6 +79,13 @@ class EnvironmentChangeLedger:
     def __init__(self, workspace_dir: str) -> None:
         self._path = os.path.join(workspace_dir, _LEDGER_FILENAME)
         self._state: dict[str, Any] = self._load()
+        if not os.path.exists(self._path):
+            # Materialize the empty ledger the moment the workspace is
+            # activated, so an ABSENT file means "no ledger ever ran here" and
+            # never "the scan wrote nothing". The client disclosure separates
+            # those two states (see resolve_environment_changes) and a clean run
+            # must be provable, not inferred from a missing file.
+            self.flush()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -861,3 +869,153 @@ def build_cleanup_report_from_dict(env_changes: dict[str, Any] | None) -> dict[s
         merged.update({k: v for k, v in summary.items() if isinstance(v, int)})
         summary = merged
     return _build_cleanup_report(changes, summary)
+
+
+# ── Disclosure resolution (what the client report is allowed to state) ────────
+#
+# A report renders BEFORE the session ends, so the ``environment_changes`` block
+# that ``do_exit`` attaches to ``technical_report.json`` is not there yet on a
+# workspace's first run. Reading that block alone therefore cannot tell "the
+# scan wrote nothing" apart from "the record has not been written yet", and
+# collapsing the two into the reassuring answer is how a report told a client
+# nothing had been touched while the ledger held machine accounts and mutated
+# templates. These three states keep them apart.
+
+#: The ledger holds at least one change.
+CHANGE_RECORD_RECORDED = "recorded"
+#: A ledger was consulted and holds no changes — the scan provably wrote nothing.
+CHANGE_RECORD_NONE = "none"
+#: No ledger could be read. The report says so; it never claims a clean run.
+CHANGE_RECORD_UNDETERMINED = "undetermined"
+
+#: Key stamped on a resolved ``environment_changes`` block so a renderer that
+#: only receives the block (the PRO context builder) can still tell an
+#: undetermined record from an empty one. Absent on the legacy persisted block,
+#: which is itself evidence a ledger was read, hence the ``True`` default in
+#: :func:`environment_changes_determined`.
+DETERMINED_KEY = "determined"
+
+
+@dataclass(frozen=True)
+class EnvironmentChangeResolution:
+    """What is known about this scan's writes to the directory.
+
+    Attributes:
+        state: One of :data:`CHANGE_RECORD_RECORDED`, :data:`CHANGE_RECORD_NONE`,
+            :data:`CHANGE_RECORD_UNDETERMINED`.
+        block: The ``{summary, changes, determined}`` block, or ``None`` when
+            undetermined. Shaped exactly like the persisted block so every
+            existing consumer (``build_cleanup_report_from_dict``, the web
+            ingester) reads it unchanged.
+        source: Where the answer came from — ``live_ledger``, ``workspace_file``,
+            ``report_block`` or ``""`` when nothing could be read.
+    """
+
+    state: str
+    block: dict[str, Any] | None = None
+    source: str = ""
+
+    @property
+    def determined(self) -> bool:
+        """True when a ledger was actually read, whatever it contained."""
+        return self.state != CHANGE_RECORD_UNDETERMINED
+
+    @property
+    def recorded(self) -> bool:
+        """True when the ledger holds at least one change."""
+        return self.state == CHANGE_RECORD_RECORDED
+
+    def cleanup_report(self) -> dict[str, Any] | None:
+        """The normalized render shape, or ``None`` when there is nothing to show."""
+        return build_cleanup_report_from_dict(self.block)
+
+
+def _resolution_from_parts(
+    summary: Any, changes: Any, *, source: str
+) -> EnvironmentChangeResolution:
+    """Build a resolution from a ledger's summary + change list."""
+    entries = [entry for entry in changes if isinstance(entry, dict)] if isinstance(changes, list) else []
+    block: dict[str, Any] = {
+        "summary": dict(summary) if isinstance(summary, dict) else _compute_summary(entries),
+        "changes": entries,
+        DETERMINED_KEY: True,
+    }
+    state = CHANGE_RECORD_RECORDED if entries else CHANGE_RECORD_NONE
+    return EnvironmentChangeResolution(state=state, block=block, source=source)
+
+
+def resolve_environment_changes(
+    *,
+    ledger: Any = None,
+    workspace_dir: str | None = None,
+    report_block: Any = None,
+) -> EnvironmentChangeResolution:
+    """Resolve what this scan wrote to the directory, from the freshest source.
+
+    Preference order, freshest first:
+
+    1. the LIVE ledger held by the session — authoritative, and the only source
+       that exists before anything has been flushed;
+    2. ``environment_changes.json`` in the workspace — written on every mutation
+       and materialized empty at workspace activation, so its presence with an
+       empty change list is itself proof of a clean run;
+    3. the ``environment_changes`` block inside ``technical_report.json`` — only
+       attached at session exit, so on a first run it is absent and on a later
+       run it may describe the PREVIOUS session. Last resort.
+
+    When none of the three can be read the result is
+    :data:`CHANGE_RECORD_UNDETERMINED`, and the caller must say so rather than
+    state a clean run.
+
+    Args:
+        ledger: The live :class:`EnvironmentChangeLedger`, when the caller has one.
+        workspace_dir: Workspace root holding ``environment_changes.json``.
+        report_block: The ``environment_changes`` block from ``technical_report.json``.
+
+    Returns:
+        The resolution. Never raises — an unreadable source falls through to the
+        next one.
+    """
+    if ledger is not None:
+        try:
+            return _resolution_from_parts(
+                ledger.get_summary(), ledger.get_changes(), source="live_ledger"
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    ledger_path = os.path.join(workspace_dir, _LEDGER_FILENAME) if workspace_dir else ""
+    # An absent file is the ordinary "this workspace predates the ledger" case,
+    # not an error — it simply falls through to the next source. Only a file
+    # that exists and cannot be read is worth a traceback.
+    if ledger_path and os.path.exists(ledger_path):
+        try:
+            data = read_json_file(ledger_path)
+            if isinstance(data, dict) and isinstance(data.get("changes"), list):
+                return _resolution_from_parts(
+                    data.get("summary"), data.get("changes"), source="workspace_file"
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    if isinstance(report_block, dict) and isinstance(report_block.get("changes"), list):
+        return _resolution_from_parts(
+            report_block.get("summary"), report_block.get("changes"), source="report_block"
+        )
+
+    return EnvironmentChangeResolution(state=CHANGE_RECORD_UNDETERMINED)
+
+
+def environment_changes_determined(env_changes: Any) -> bool:
+    """Whether an ``environment_changes`` block came from a ledger that was read.
+
+    A block carrying :data:`DETERMINED_KEY` says so explicitly. A legacy
+    persisted block has no such key, but its existence means ``do_exit`` wrote it
+    from a real ledger — so a plain dict counts as determined, and only a missing
+    block (or one explicitly marked undetermined) does not.
+    """
+    if not isinstance(env_changes, dict):
+        return False
+    return bool(env_changes.get(DETERMINED_KEY, True))

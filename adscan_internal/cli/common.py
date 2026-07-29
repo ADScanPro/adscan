@@ -10,6 +10,7 @@ import hashlib
 import inspect
 from typing import Any, Callable, Literal
 
+from adscan_core.outbound_links import cta_markup, cta_url
 from adscan_core.lab_context import (
     build_lab_telemetry_fields,
     build_workspace_telemetry_fields,
@@ -125,6 +126,9 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "user_postauth_access": "requires_initialized_domain",
     "validate_attack_graph": "requires_initialized_domain",
     "workspace": "exempt",
+    # Reads a finished workspace off disk; it never touches the domain, so it
+    # stays usable months later when the lab is long gone.
+    "writeup": "exempt",
 }
 _AUTH_INIT_RECOMMENDED_COMMANDS = {
     "bloodhound_collector",
@@ -345,8 +349,7 @@ def show_first_run_helper(
         "  • Start unauth scan: [cyan]start_unauth[/cyan]\n"
         "  • Start auth scan:   [cyan]start_auth[/cyan]\n"
         "  • Save more creds:   [cyan]creds save <domain> <username> <password_or_hash>[/cyan]\n"
-        "📚 Full documentation: [link=https://www.adscanpro.com/docs?utm_source=cli&utm_medium=first_run]"
-        "www.adscanpro.com/docs[/link]\n"
+        f"📚 Full documentation: {cta_markup('first_run')}\n"
         "   (Installation, guides, troubleshooting, and more)\n\n"
         "[dim]Tip: This panel disappears automatically after the first successful "
         "`start_unauth` or `start_auth` in this workspace.[/dim]"
@@ -362,10 +365,7 @@ def show_first_run_helper(
     # Track docs link shown if tracking function provided
     if track_docs_link_shown is not None:
         try:
-            track_docs_link_shown(
-                "first_run",
-                "https://www.adscanpro.com/docs?utm_source=cli&utm_medium=first_run",
-            )
+            track_docs_link_shown("first_run", cta_url("first_run"))
         except Exception:
             # Silently fail if tracking fails (non-critical)
             pass
@@ -941,8 +941,50 @@ def command_requires_initialized_domain_context(
     return policy in {"auto_by_signature", "requires_initialized_domain"}
 
 
+def resolve_domain_dir_on_disk(shell: Any, domain: str | None) -> str | None:
+    """Return the domain sub-workspace directory when it exists on disk.
+
+    The ``dir`` key in ``domains_data`` is a cache of a derivable fact: the
+    per-domain directory under the active workspace. This derives it instead,
+    so a workspace written before the entry was reconciled correctly is not
+    permanently unusable. Pure read — it never writes back.
+
+    Args:
+        shell: Active shell instance.
+        domain: Domain name to resolve.
+
+    Returns:
+        The absolute directory path when it exists, otherwise ``None``.
+    """
+    if not domain:
+        return None
+
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if not workspace_dir:
+        return None
+
+    try:
+        from adscan_internal.workspaces.domains import resolve_domain_paths
+
+        domain_dir = resolve_domain_paths(
+            workspace_dir,
+            str(getattr(shell, "domains_dir", "domains") or "domains"),
+            str(domain),
+        ).domain_dir
+    except Exception as exc:  # noqa: BLE001 - a guard must never raise
+        print_exception(exception=exc)
+        return None
+
+    return domain_dir if os.path.isdir(domain_dir) else None
+
+
 def is_domain_context_initialized(shell: Any, domain: str | None) -> bool:
     """Return whether the given domain already has the minimum initialized state.
+
+    A domain counts as initialized when a DC is known for it (``pdc``) and its
+    sub-workspace exists. The sub-workspace is normally recorded as the ``dir``
+    key, but the on-disk directory is accepted as equivalent evidence so an
+    older workspace whose ``dir`` key was never written still works.
 
     Args:
         shell: Active shell instance with ``domains_data``.
@@ -950,7 +992,7 @@ def is_domain_context_initialized(shell: Any, domain: str | None) -> bool:
 
     Returns:
         ``True`` when the domain exists in ``domains_data`` and includes the
-        critical fields created by ``start_unauth``/``start_auth``.
+        critical state created by ``start_unauth``/``start_auth``.
     """
     if not domain:
         return False
@@ -963,7 +1005,13 @@ def is_domain_context_initialized(shell: Any, domain: str | None) -> bool:
     if not isinstance(domain_state, dict):
         return False
 
-    return bool(domain_state.get("pdc")) and bool(domain_state.get("dir"))
+    if not domain_state.get("pdc"):
+        return False
+
+    if domain_state.get("dir"):
+        return True
+
+    return bool(resolve_domain_dir_on_disk(shell, domain))
 
 
 def _recommended_domain_initializer(command_name: str) -> str | None:

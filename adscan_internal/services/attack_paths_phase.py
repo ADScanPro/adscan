@@ -46,7 +46,7 @@ def run_attack_paths_discovery_phase(
     span_domain: str,
     scan_type: str | None = None,
     announce: bool = True,
-    run_step: Callable[[str, Callable[[], None]], bool] | None = None,
+    run_step: Callable[[str, Callable[[], None]], Any] | None = None,
     max_depth: int = 6,
 ) -> bool:
     """Run the ``attack_paths_discovery`` phase lifecycle for one or more domains.
@@ -87,9 +87,11 @@ def run_attack_paths_discovery_phase(
             the caller already announced the phase through its own machinery.
         run_step: Optional step-runner (the Phase-2 ``_run_step`` closure) that
             wraps the compute with the operator-facing step UX and the CTF-pwned
-            early-stop check. When provided and it returns True, the pipeline
-            should stop and the phase is NOT marked complete. When omitted the
-            compute runs directly.
+            early-stop check. It returns a TRUTHY value (``StepOutcome.STOP_*``)
+            to signal an early stop, in which case the pipeline should stop and
+            the phase is NOT marked complete. Finalizing the scan checkpoint on
+            an objective-met stop is the runner's own responsibility — this seam
+            only honours the stop. When omitted the compute runs directly.
         max_depth: Actionable-edge depth budget for the single-domain build.
 
     Returns:
@@ -144,9 +146,10 @@ def run_attack_paths_discovery_phase(
 
     try:
         if run_step is not None:
-            # ``run_step`` returns True to signal a CTF-pwned early stop; in that
-            # case the phase must NOT be marked complete (parity with the inline
-            # ``if _run_step(...): return`` before ``_mark_done``).
+            # ``run_step`` returns a truthy outcome to signal a CTF-pwned early
+            # stop; in that case the phase must NOT be marked complete (parity
+            # with the inline ``if _run_step(...).should_stop: return`` before
+            # ``_mark_done``).
             if run_step(_ATTACK_PATHS_DISCOVERY_TITLE, _compute):
                 return True
         else:

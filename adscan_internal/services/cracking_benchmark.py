@@ -27,7 +27,25 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_warning_debug
+
+# The hardware benchmark is an OPTIONAL warm-up: every failure in it degrades
+# the effort engine to the safe "fast" tier and nothing else. So none of its
+# failures may reach the operator as an error.
+#
+# ``print_exception`` is the wrong sink for them on two counts. It renders
+# ``✗ Error: <str(exc)>`` with SECRET_MODE off, and the exception text here is
+# a raw ``subprocess`` message carrying the FULL internal command line
+# (``Command 'taskset -c 0-6 nice -n 19 hashcat -b ...' timed out``) — an
+# internal tool name and command string, both forbidden in default output. And
+# it is operator-facing at all, for a probe the operator never asked for: in
+# the field two of these landed between a live prompt and the answer being
+# typed. ``print_warning_debug`` keeps the full detail in
+# ``adscan.debug.log`` (always) and on the console only under ``--debug``,
+# where SECRET_MODE is on and the command is fair game.
+#
+# ``adscan benchmark`` — the one place a human DID ask — still renders its own
+# clear, tool-name-free verdict when no rates come back.
 
 # The four hashcat modes ADscan cracks: NetNTLMv2, NetNTLMv1, Kerberoast
 # (TGS-REP, RC4), AS-REP Roasting (RC4). Etype-derived AES modes
@@ -169,7 +187,7 @@ def _load_cache() -> BenchmarkRecord | None:
         )
     except Exception as exc:  # noqa: BLE001 -- a corrupt cache is cold, never crashes
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        print_warning_debug(f"benchmark: cache unreadable, treating as cold: {exc}")
         return None
 
 
@@ -350,9 +368,9 @@ def _run_single_benchmark(shell: Any, mode: str, device_flag: str) -> float | No
         # between unrelated interactive steps. The parsed speed result below
         # is unaffected; only the recorded preview is suppressed.
         result = shell.run_command(wrapped, timeout=120, untrusted_output=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- optional probe, degrades to "fast"
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        print_warning_debug(f"benchmark: mode {mode} measurement failed: {exc}")
         return None
     if result is None:
         return None
@@ -374,9 +392,9 @@ def _probe_devices(shell: Any) -> str | None:
         # preview between unrelated interactive prompts — suppress it there;
         # the full text is still returned to the caller below.
         result = shell.run_command(wrapped, timeout=30, untrusted_output=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- optional probe, degrades to "fast"
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        print_warning_debug(f"benchmark: device probe failed: {exc}")
         return None
     if result is None:
         return None
@@ -521,9 +539,9 @@ def get_or_run_benchmark(
             "incomplete) -- prior cache kept as-is"
         )
         return rates
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- optional probe, degrades to "fast"
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        print_warning_debug(f"benchmark: sweep failed: {exc}")
         return cached.rates if cached is not None else None
 
 
@@ -633,7 +651,7 @@ def write_benchmark_estimates(
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 -- artifact write is best-effort
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        print_warning_debug(f"benchmark: estimates artifact not written: {exc}")
 
 
 def _warm_benchmark_worker(shell: Any) -> None:
@@ -644,16 +662,21 @@ def _warm_benchmark_worker(shell: Any) -> None:
     -b`` / ``hashcat -I`` subprocess chatter (``run_command`` DEBUG lines) can
     never paint the live console mid-scan or collide with an interactive prompt
     -- it is telemetered + deferred for the foreground to flush instead.
+
+    The failure handler is INSIDE that context, not around it. An ``except``
+    wrapped around the ``with`` runs after ``__exit__`` has already dropped the
+    background marker, so its own output would paint LIVE from this worker
+    thread -- exactly the collision the context exists to prevent.
     """
     from adscan_core.rich_output import background_console_context  # noqa: PLC0415
 
-    try:
-        with background_console_context("benchmark-warmup"):
+    with background_console_context("benchmark-warmup"):
+        try:
             rates = get_or_run_benchmark(shell)
             write_benchmark_estimates(shell, rates)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        except Exception as exc:  # noqa: BLE001 -- warm-up failure is never fatal
+            telemetry.capture_exception(exc)
+            print_warning_debug(f"benchmark: warm-up failed: {exc}")
 
 
 def warm_benchmark_async(shell: Any) -> None:

@@ -21,6 +21,7 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_info_verbose,
     print_warning,
+    print_warning_debug,
     print_error,
     print_exception,
     print_attack_paths_summary_debug,
@@ -63,6 +64,11 @@ from adscan_internal.services.attack_step_catalog import (
     get_exploitation_relation_vuln_keys,
     normalize_execution_relation,
 )
+from adscan_internal.services.attack_graph_node_identity import (
+    describe_resolution_failure as describe_node_resolution_failure,
+    resolve_node_candidates as resolve_graph_node_candidates,
+)
+from adscan_internal.services.path_state import _PROVEN_STATUSES as _PROVEN_EDGE_STATUSES
 from adscan_internal.services.domain_controller_classifier import node_is_rodc_computer
 from adscan_internal.services.edge_kind import classify_edge_kind
 from adscan_internal.services.compromise_class import (
@@ -6927,6 +6933,10 @@ def refresh_attack_graph_execution_support(
     if not edges:
         return {"changed": 0}
 
+    from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+        DANGEROUS_DESTRUCTIVE_MARKER,
+    )
+
     changed = 0
     to_blocked = 0
     to_unsupported = 0
@@ -6952,8 +6962,37 @@ def refresh_attack_graph_execution_support(
             changed += 1
             metadata_updated += 1
         current_status = str(edge.get("status") or "discovered").strip().lower()
-        if current_status in {"success", "attempted", "failed", "error", "unavailable"}:
+        if current_status in {
+            "success",
+            "attempted",
+            "failed",
+            "error",
+            "unavailable",
+            # An environment/topology closure (e.g. single-DC NTLMv1 self-relay
+            # reflection). This is decided by the environment, NOT by the ADscan
+            # version — the exec-support reconcile (a VERSION concern) must never
+            # re-open it as an executable "discovered" step. Without this, a
+            # config-closed edge on a SUPPORTED relation was silently re-stamped
+            # "discovered" and offered for execution.
+            "closed_by_configuration",
+        }:
             continue
+        # A SAFETY abstention — a destructive step hard-refused by the
+        # destructive-action policy (stamped ``blocked_kind="dangerous_destructive"``)
+        # — is likewise an environment/safety closure, not a version concern.
+        # Re-opening it to "discovered" would offer a destructive action ADscan
+        # deliberately refuses to run. Gated on the safety marker so the
+        # policy_blocked reconcile below (which SETS ``blocked`` on other edges,
+        # and re-derives an opt-in ``blocked_kind="dangerous"`` FCP edge) is
+        # unaffected.
+        if current_status == "blocked":
+            existing = edge.get("notes")
+            if (
+                isinstance(existing, dict)
+                and str(existing.get("blocked_kind") or "").strip()
+                == DANGEROUS_DESTRUCTIVE_MARKER
+            ):
+                continue
 
         support = _classify_edge_execution_support(
             graph,
@@ -7439,7 +7478,7 @@ def _personalize_edge_knowledge(
     if not isinstance(edge_notes, dict) or not edge_notes:
         return base
     try:
-        from adscan_internal.pro.reporting.affected_assets import (
+        from adscan_internal.pro.reporting.finding_specifics import (
             weave_specifics_into_knowledge,
         )
     except Exception:  # noqa: BLE001 — LITE/runtime without the PRO catalog
@@ -8449,6 +8488,50 @@ def compute_display_steps_for_domain(
     return display
 
 
+def _select_edge_endpoints(
+    graph: dict[str, Any],
+    *,
+    relation: str,
+    from_candidates: list[str],
+    to_candidates: list[str],
+) -> tuple[str, str]:
+    """Pick the endpoint pair a status update should be written onto.
+
+    A display label is not unique in an AD graph (an AD CS deployment renders
+    its EnterpriseCA, AIACA and RootCA with the same ``<CA>@<REALM>`` label),
+    so identity resolution alone can hand back several candidates. The edge
+    being updated is the tie-breaker: prefer the ``(from, to)`` pair that
+    already carries an edge with this relation, because that is the edge the
+    attack path was built from. Falls back to the best identity candidate when
+    no existing edge matches (a genuinely new runtime edge).
+
+    Returns:
+        ``(from_id, to_id)``; either may be ``""`` when nothing resolved.
+    """
+    best_from = from_candidates[0] if from_candidates else ""
+    best_to = to_candidates[0] if to_candidates else ""
+    if len(from_candidates) <= 1 and len(to_candidates) <= 1:
+        return best_from, best_to
+
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return best_from, best_to
+
+    wanted_relation = _normalize_relation_key(relation)
+    from_set = set(from_candidates)
+    to_set = set(to_candidates)
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if _normalize_relation_key(edge.get("relation")) != wanted_relation:
+            continue
+        edge_from = str(edge.get("from") or "")
+        edge_to = str(edge.get("to") or "")
+        if edge_from in from_set and edge_to in to_set:
+            return edge_from, edge_to
+    return best_from, best_to
+
+
 def update_edge_status_by_labels(
     shell: object,
     domain: str,
@@ -8486,48 +8569,65 @@ def update_edge_status_by_labels(
         )
         return False
 
-    # Security principals (Group, User, Computer) must win over structural AD
-    # objects (OU, Container, CertTemplate, EnterpriseCA) when multiple nodes
-    # share the same normalised display label.  Without this preference, an OU
-    # named "Domain Controllers" is returned before the Domain Controllers
-    # security group (SID-516) because the OU may appear earlier in the dict,
-    # producing a runtime edge that targets the OU GUID instead of the group —
-    # the attack-path DFS then finds the native_derived edge (still at
-    # "discovered") rather than the updated one and the path stays "theoretical".
-    _PRINCIPAL_KINDS = frozenset({"Group", "User", "Computer", "Domain"})
-
-    def match(label: str, node_id: str) -> bool:
-        node = nodes_map.get(node_id)
-        if not isinstance(node, dict):
-            return False
-        node_label = str(node.get("label") or "")
-        return _normalize_account(node_label) == _normalize_account(label)
-
-    def _resolve_node_id(label: str) -> str:
-        """Return the best-matching node ID, preferring security principals."""
-        principal_match = next(
-            (
-                nid
-                for nid in nodes_map.keys()
-                if match(label, nid)
-                and nodes_map[nid].get("kind") in _PRINCIPAL_KINDS
-            ),
-            "",
-        )
-        if principal_match:
-            return principal_match
-        return next((nid for nid in nodes_map.keys() if match(label, nid)), "")
-
-    from_id = _resolve_node_id(from_label)
-    to_id = _resolve_node_id(to_label)
+    # Endpoint resolution is alias-aware and lives in one place
+    # (``attack_graph_node_identity``).  Three properties matter here:
+    #
+    # * Security principals (Group, User, Computer, Domain) win over structural
+    #   AD objects (OU, Container, CertTemplate, EnterpriseCA) when several
+    #   nodes share the same normalised display label.  Without that preference
+    #   an OU named "Domain Controllers" is returned before the Domain
+    #   Controllers security group (SID-516), producing a runtime edge that
+    #   targets the OU GUID instead of the group — the attack-path DFS then
+    #   finds the native_derived edge (still at "discovered") and the path stays
+    #   "theoretical".
+    # * A host-shaped endpoint may be named by IP, short name, FQDN or ``HOST$``
+    #   while the node is labelled with one of the other three.  An ADCS ESC8
+    #   step naming its Enterprise CA by IP used to resolve to nothing, so a
+    #   PROVEN domain-compromising step was dropped from the graph and the whole
+    #   path rendered as theoretical in the client deliverable.
+    # * A display label is NOT unique.  One AD CS deployment renders three nodes
+    #   as ``<CA>@<REALM>`` — the EnterpriseCA, its AIACA and its RootCA — and
+    #   the ADCS ESC edges hang off the EnterpriseCA.  Picking a candidate by
+    #   dict order writes the proven status onto a sibling node, creating an
+    #   orphan runtime edge while the real edge keeps its stale status.  So when
+    #   an endpoint is ambiguous, prefer the candidate pair that ALREADY carries
+    #   an edge with this relation.
+    from_candidates = resolve_graph_node_candidates(nodes_map, from_label)
+    to_candidates = resolve_graph_node_candidates(nodes_map, to_label)
+    from_id, to_id = _select_edge_endpoints(
+        graph, relation=relation, from_candidates=from_candidates, to_candidates=to_candidates
+    )
     if not from_id or not to_id:
+        # Only the sampled node LABELS are marked: the counts and the kind
+        # census carry no identity and must stay readable in a recording — they
+        # are what tells "no node of this kind exists" apart from "it exists
+        # under another label".
+        diagnosis = describe_node_resolution_failure(
+            nodes_map,
+            from_label=from_label,
+            to_label=to_label,
+            from_id=from_id,
+            to_id=to_id,
+            mask_label=lambda value: mark_sensitive(value, "node"),
+        )
         print_info_debug(
-            "[attack-graph] Edge status update skipped: "
+            "attack-graph: Edge status update skipped: "
             f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
             f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
             f"reason=edge_nodes_not_found from_id={mark_sensitive(from_id or 'N/A', 'detail')} "
-            f"to_id={mark_sensitive(to_id or 'N/A', 'detail')}"
+            f"to_id={mark_sensitive(to_id or 'N/A', 'detail')} "
+            f"{diagnosis}"
         )
+        if str(status or "").strip().lower() in _PROVEN_EDGE_STATUSES:
+            # Losing a PROVEN step is the expensive failure: the compromise
+            # happened but the graph — and therefore the report and the web
+            # CTEM — never record it. Surface it above debug-only noise.
+            print_warning_debug(
+                "attack-graph: a PROVEN attack step could not be recorded: "
+                f"relation={relation} status={status} "
+                f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+                f"{diagnosis}"
+            )
         return False
 
     upsert_edge(

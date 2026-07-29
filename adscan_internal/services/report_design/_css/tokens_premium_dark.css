@@ -1,0 +1,122 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   ADscan Client Deliverable Kit — shared premium design system
+   ─────────────────────────────────────────────────────────────────────────
+   Register: editorial, document-grade, ink-on-warm-paper. Built for a CISO
+   reading a printed €10K-consultancy deliverable, not an operator squinting
+   at a dark terminal. Light surface, one decisive ember accent, a disciplined
+   semantic severity scale confined to data.
+
+   This file is the SINGLE SOURCE OF TRUTH for the three deliverables that
+   inherit it (AD Hardening Playbook, MITRE Remediation Checklist, Coverage
+   Matrix). It exposes design TOKENS (color, type, space, elevation) plus a
+   reusable COMPONENT layer (chips, badges, finding rows, stat ledgers, CSS
+   data-viz bars/gauges). Sibling templates should consume these tokens and
+   classes rather than redeclaring local values.
+
+   Engine: Chromium (Playwright, full modern CSS). Colors use OKLCH where the
+   engine supports it, with hex fallbacks declared first so any non-OKLCH
+   path degrades gracefully. No JavaScript — this renders to static PDF.
+
+   The theme key is still "premium_dark" for catalog compatibility, but the
+   visual language is intentionally light/editorial. Renaming the key is a
+   separate, riskier change (touches BONUSES + bake pipeline) and is out of
+   scope here.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/* Distinctive, PDF-safe web fonts. Loaded over the network by the Chromium
+   engine (wait_until="networkidle"); robust local fallbacks (DejaVu / Lato /
+   Liberation are present in the runtime image) guarantee a clean render even
+   when the build container is offline. */
+
+:root {
+  /* ── Color tokens ────────────────────────────────────────────────────────
+     Warm paper neutrals tinted toward the ember brand hue (never pure #fff /
+     #000). The ink scale runs from near-black to hairline. One accent only. */
+
+  /* Paper / surfaces (light, warm) */
+  --paper:        #faf7f2;   /* page field — warm bone, tinted to brand hue */
+  --paper-2:      #f4efe7;   /* recessed band / table zebra */
+  --surface:      #fffdf9;   /* raised card */
+  --surface-2:    #f7f2ea;   /* secondary card / chip well */
+  --ink-wash:     #efe8dd;   /* faint fill for ghost numerals, gauges */
+
+  /* Ink (text) scale — warm charcoal, not black */
+  --ink:          #1c1815;   /* primary text / display */
+  --ink-2:        #423b34;   /* body */
+  --ink-3:        #6b6258;   /* secondary / meta */
+  --ink-4:        #968b7d;   /* faint labels, kickers */
+  --ink-5:        #c4b9a9;   /* hairline ghost */
+
+  /* Hairlines (warm, low-contrast) */
+  --line:         rgba(28,24,21,0.10);
+  --line-2:       rgba(28,24,21,0.18);
+  --line-strong:  rgba(28,24,21,0.30);
+
+  /* Brand accent — deep ember/terracotta. One decisive color, ≤10% of ink.
+     Escapes the "security → cyan-on-black" category reflex on purpose. */
+  --accent:       #b8431f;   /* ember */
+  --accent-deep:  #8f2f12;   /* pressed / on-paper headings */
+  --accent-soft:  #e9d9cf;   /* tint fill */
+  --accent-wash:  rgba(184,67,31,0.08);
+
+  /* Semantic severity scale — used ONLY on data (chips, bars, gauges).
+     Kept distinct from the brand accent so risk reads as risk. */
+  --sev-critical: #9b1c1c;   --sev-critical-bg: rgba(155,28,28,0.10);  --sev-critical-bd: rgba(155,28,28,0.30);
+  --sev-high:     #b8431f;   --sev-high-bg:     rgba(184,67,31,0.10);  --sev-high-bd:     rgba(184,67,31,0.30);
+  --sev-medium:   #9a6b00;   --sev-medium-bg:   rgba(154,107,0,0.10);  --sev-medium-bd:   rgba(154,107,0,0.30);
+  --sev-low:      #3f6f8f;   --sev-low-bg:      rgba(63,111,143,0.10);  --sev-low-bd:      rgba(63,111,143,0.30);
+  --sev-info:     #6b6258;   --sev-info-bg:     rgba(107,98,88,0.08);   --sev-info-bd:     var(--line-2);
+  --ok:           #2f6f4f;   --ok-bg:           rgba(47,111,79,0.10);   --ok-bd:           rgba(47,111,79,0.30);
+
+  /* ── Typography tokens ─────────────────────────────────────────────────── */
+  --font-display: 'Spectral','Bitstream Charter','DejaVu Serif','Georgia',serif;
+  --font-sans:    'Archivo','Lato','Liberation Sans','DejaVu Sans',system-ui,sans-serif;
+  --font-mono:    'Spline Sans Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+
+  /* Modular scale (≈1.28 ratio). pt for print fidelity. */
+  --fs-micro:  6pt;
+  --fs-xs:     7pt;
+  --fs-sm:     8.5pt;
+  --fs-base:   9.5pt;
+  --fs-md:     11pt;
+  --fs-lg:     14pt;
+  --fs-xl:     18pt;
+  --fs-2xl:    24pt;
+  --fs-3xl:    32pt;
+  --fs-4xl:    44pt;
+  --fs-hero:   62pt;
+
+  --tracking-kicker: 2.6px;   /* uppercase eyebrows / labels */
+  --tracking-mono:   0.4px;
+
+  /* ── Space scale (mm, print-native) ────────────────────────────────────── */
+  --sp-1: 1.5mm;  --sp-2: 2.5mm;  --sp-3: 4mm;  --sp-4: 6mm;
+  --sp-5: 8mm;    --sp-6: 11mm;   --sp-7: 14mm; --sp-8: 18mm;
+
+  /* ── Radius + elevation ────────────────────────────────────────────────── */
+  --radius-sm: 2px;
+  --radius:    4px;
+  --radius-lg: 7px;
+  --shadow-sm: 0 1px 2px rgba(28,24,21,0.05);
+  --shadow:    0 2px 10px rgba(28,24,21,0.06);
+
+  /* Coverage heatmap density (Coverage Matrix sibling) */
+  --heat-0: rgba(28,24,21,0.05);
+  --heat-1: rgba(184,67,31,0.18);
+  --heat-2: rgba(184,67,31,0.32);
+  --heat-3: rgba(184,67,31,0.50);
+}
+
+/* OKLCH refinement layer — applied only where the engine supports it. The hex
+   values above remain the floor; these sharpen the accent on capable engines. */
+@supports (color: oklch(0.5 0.1 30)) {
+  :root {
+    --paper:       oklch(0.972 0.008 76);
+    --paper-2:     oklch(0.945 0.011 76);
+    --surface:     oklch(0.988 0.006 80);
+    --ink:         oklch(0.235 0.012 56);
+    --ink-2:       oklch(0.345 0.014 56);
+    --accent:      oklch(0.545 0.165 38);
+    --accent-deep: oklch(0.455 0.150 35);
+  }
+}

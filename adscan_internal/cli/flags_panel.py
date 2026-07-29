@@ -26,6 +26,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from adscan_core.outbound_links import ADSCAN_SITE_HOST
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.ctf_flag_collector import (
     FlagCollectionResult,
@@ -305,15 +306,17 @@ def render_flags_captured_panel(
 
     if result.fallback_used and result.fallback_method is not None:
         footer_text = (
-            f"adscanpro.com  ·  ctf  ·  native aiosmb byte-read  ·  "
+            f"{ADSCAN_SITE_HOST}  ·  ctf  ·  native aiosmb byte-read  ·  "
             f"fallback: {result.fallback_method.value}"
         )
         footer_style = AMBER
     elif has_any:
-        footer_text = "adscanpro.com  ·  ctf  ·  native aiosmb byte-read"
+        footer_text = f"{ADSCAN_SITE_HOST}  ·  ctf  ·  native aiosmb byte-read"
         footer_style = MUTED
     else:
-        footer_text = "adscanpro.com  ·  ctf  ·  no flags accessible at this access level"
+        footer_text = (
+            f"{ADSCAN_SITE_HOST}  ·  ctf  ·  no flags accessible at this access level"
+        )
         footer_style = LAVA
     inner.add_row(Text(footer_text, style=footer_style))
 

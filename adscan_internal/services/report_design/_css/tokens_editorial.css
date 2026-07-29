@@ -1,0 +1,147 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   editorial — Warm Ink Authority
+   Premium, editorial-grade light theme for ADscan reports and the full Client
+   Deliverable Kit (report + AD Hardening Playbook + MITRE Checklist + Coverage
+   Matrix). Ink on warm bone paper, one decisive ADscan brand-teal accent, a
+   disciplined semantic severity scale (warm reds/ambers) confined to data.
+
+   Built on corporate_light's proven class-coverage structure (it correctly
+   skins every report section), re-tinted from institutional blue to the warm
+   editorial palette established by premium_dark / the bonus templates. Every
+   token vocabulary the kit uses is defined here so the report (--bg-0/--text),
+   the bonuses (--paper/--ink/--sev-*) and the coverage matrix (--cm-*) all read
+   as one premium document family.
+
+   Optimised for Chromium/Playwright print rendering.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Distinctive, PDF-safe web fonts — matched to the bonus deliverables so the
+   report and the kit share one typographic voice. Fraunces is the report's
+   native editorial display serif; Spectral is the bonus serif and a robust
+   companion fallback. Local fallbacks (DejaVu / Liberation) guarantee a clean
+   render when the build container is offline. */
+
+/* ── Design tokens — REPORT vocabulary (--bg-0/--text/--accent/...) ───────── */
+:root {
+  /* Backgrounds — layered warm bone, never pure #fff */
+  --bg-0:      #faf7f2;
+  --bg-1:      #f4efe7;
+  --bg-2:      #efe8dd;
+  --bg-3:      #e6dccf;
+  --surface:   #fffdf9;
+  --surface-2: #f7f2ea;
+
+  /* Borders — warm, low-contrast hairlines */
+  --line:   rgba(28,24,21,0.10);
+  --line-2: rgba(28,24,21,0.18);
+
+  /* Typography — warm charcoal ink, not harsh black */
+  --text:   #1c1815;
+  --text-2: #423b34;
+  --text-3: #6b6258;
+  --text-4: #968b7d;
+
+  /* Accent — ADscan brand deep teal, against the warm bone/severity palette */
+  --accent:   #0e6e78;
+  --accent-2: #0a545c;
+  --accent-3: #1b97a1;
+
+  /* Semantic colours — readable on warm light, warm-tinted backgrounds */
+  --critical:    #9b1c1c;
+  --critical-bg: rgba(155,28,28,0.09);
+  --critical-bd: rgba(155,28,28,0.30);
+  --red:         #b8431f;
+  --red-bg:      rgba(184,67,31,0.09);
+  --red-bd:      rgba(184,67,31,0.34);
+  --amber:       #9a6b00;
+  --amber-bg:    rgba(154,107,0,0.10);
+  --amber-bd:    rgba(154,107,0,0.36);
+  --blue:        #3f6f8f;
+  --blue-bg:     rgba(63,111,143,0.10);
+  --blue-bd:     rgba(63,111,143,0.34);
+  --gray:        #6b6258;
+  --green:       #2f6f4f;
+  --purple:      #6d4f8f;
+
+  /* Fonts — editorial serif display + refined sans body + mono */
+  --font-sans:  'Archivo','Lato','Liberation Sans','DejaVu Sans',system-ui,sans-serif;
+  --font-serif: 'Fraunces','Spectral','Georgia','Times New Roman',serif;
+  --font-mono:  'Spline Sans Mono','JetBrains Mono','DejaVu Sans Mono',monospace;
+
+  --radius-sm: 3px;
+  --radius:    5px;
+  --radius-lg: 8px;
+
+  /* MITRE ATT&CK heatmap density — ember-tinted ramp */
+  --mitre-0: rgba(28,24,21,0.04);
+  --mitre-1: rgba(184,67,31,0.16);
+  --mitre-2: rgba(154,107,0,0.28);
+  --mitre-3: rgba(155,28,28,0.40);
+}
+
+/* ── Bonus token bridge — bonus vocabulary (--paper/--ink/--sev-*) ───────────
+   The bonus templates (playbook, checklist) are built on a SEPARATE token
+   vocabulary (--paper/--ink/--sev-*) than the report (--bg-0/--text). To keep
+   the whole Client Deliverable Kit on ONE warm-editorial skin, map every bonus
+   COLOUR/FONT token onto this theme's palette. Layout tokens the bonuses own
+   (--fs-* type scale, --sp-* spacing) are deliberately left untouched — only
+   colour and typography are unified, never geometry. */
+:root {
+  --paper:        #faf7f2;
+  --paper-2:      #f4efe7;
+  /* --surface / --surface-2 already defined above (warm card / chip well). */
+  --ink-wash:     #efe8dd;
+  --ink:          #1c1815;
+  --ink-2:        #423b34;
+  --ink-3:        #6b6258;
+  --ink-4:        #968b7d;
+  --ink-5:        #c4b9a9;
+
+  /* --accent already brand teal above. */
+  --accent-deep:  #0a545c;
+  --accent-soft:  #d6e6e6;
+  --accent-wash:  rgba(14,110,120,0.08);
+
+  --line-strong:  rgba(28,24,21,0.30);
+
+  /* Severity scale — same hues the report uses, so a finding reads identically
+     across the report and the playbook/checklist. */
+  --sev-critical:    #9b1c1c;
+  --sev-critical-bg: rgba(155,28,28,0.10);
+  --sev-critical-bd: rgba(155,28,28,0.30);
+  --sev-high:        #b8431f;
+  --sev-high-bg:     rgba(184,67,31,0.10);
+  --sev-high-bd:     rgba(184,67,31,0.30);
+  --sev-medium:      #9a6b00;
+  --sev-medium-bg:   rgba(154,107,0,0.10);
+  --sev-medium-bd:   rgba(154,107,0,0.30);
+  --sev-low:         #3f6f8f;
+  --sev-low-bg:      rgba(63,111,143,0.10);
+  --sev-low-bd:      rgba(63,111,143,0.30);
+  --sev-info:        #6b6258;
+  --sev-info-bg:     rgba(107,98,88,0.08);
+
+  --ok:    #2f6f4f;
+  --ok-bg: rgba(47,111,79,0.10);
+  --ok-bd: rgba(47,111,79,0.30);
+
+  /* Display serif → the report's editorial serif, so headlines match. */
+  --font-display: 'Fraunces','Spectral','Georgia','Times New Roman',serif;
+}
+
+/* OKLCH refinement layer — sharpens the warm neutrals + brand teal on capable
+   engines (Chromium). The hex values above remain the floor. */
+@supports (color: oklch(0.5 0.1 30)) {
+  :root {
+    --bg-0:        oklch(0.972 0.008 76);
+    --surface:     oklch(0.988 0.006 80);
+    --text:        oklch(0.235 0.012 56);
+    --text-2:      oklch(0.345 0.014 56);
+    --accent:      oklch(0.505 0.080 202);
+    --accent-2:    oklch(0.420 0.072 202);
+    --paper:       oklch(0.972 0.008 76);
+    --ink:         oklch(0.235 0.012 56);
+    --ink-2:       oklch(0.345 0.014 56);
+    --accent-deep: oklch(0.420 0.072 202);
+  }
+}

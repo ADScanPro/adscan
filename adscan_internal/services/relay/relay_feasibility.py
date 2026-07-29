@@ -40,6 +40,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Optional, Protocol, Sequence
 
+from adscan_internal.services.credential_store_service import hosts_match
 from adscan_internal.services.domain_posture import (
     ConstraintCategory,
     ConstraintState,
@@ -48,6 +49,7 @@ from adscan_internal.services.domain_posture import (
     TriState,
     get_posture,
 )
+from adscan_internal.services.relay_status_constants import REFLECTION_BLOCKED_REASON
 
 # --------------------------------------------------------------------------- #
 # Type aliases
@@ -150,6 +152,16 @@ class RelayFeasibilityInputs:
         relayed_principal_self_write: Whether the relayed principal can write
             its own RBCD / KeyCredentialLink attribute. ``None`` => unknown
             (confirmed at execution); surfaced as a warning.
+        coerce_host: The host whose NTLM auth is coerced (the relay SOURCE).
+            ``None`` => not supplied (the reflection check cannot assess and
+            stays informational-ok).
+        relay_target_host: The host the coerced auth is relayed TO (the DC's
+            LDAP endpoint). ``None`` => not supplied.
+        alternate_dc_available: Whether a DC distinct from ``coerce_host`` exists
+            to relay to (so a coerced-DC's auth can land on a DIFFERENT DC rather
+            than reflect to itself). ``True`` => a real alternate exists (no
+            reflection block); ``False``/``None`` => none known, so a
+            coerce==target is treated as self-relay reflection (blocking).
     """
 
     domains_data: Optional[Mapping[str, Any]]
@@ -161,6 +173,9 @@ class RelayFeasibilityInputs:
     machine_account_quota: Optional[int] = None
     listener_reachable_from_victim: Optional[bool] = None
     relayed_principal_self_write: Optional[bool] = None
+    coerce_host: Optional[str] = None
+    relay_target_host: Optional[str] = None
+    alternate_dc_available: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +273,70 @@ def check_ntlm_enabled(
         why="NTLM authentication is not known-disabled; coerced auth can be relayed.",
         remediation=None,
         confidence=state.confidence,
+    )
+
+
+def check_self_relay_reflection(
+    posture: DomainPosture, inputs: RelayFeasibilityInputs
+) -> FeasibilityVerdict:
+    """Blocking when the coerced host IS the relay target and no alternate DC exists.
+
+    Windows NTLM reflection mitigation (post CVE-2019-1384) refuses an NTLM auth
+    relayed back to the SAME host it was coerced from. When the sole DC is both
+    the coerce source and the LDAP relay target, the relay can never succeed —
+    executing it only mints a throwaway delegate account and coerces the DC to no
+    effect. This mirrors the graph-builder's ``_select_relay_target`` reflection
+    gate at the EXECUTION boundary, so an edge that slipped through as executable
+    is still refused BEFORE any network action.
+
+    Alias-aware host comparison (IP <-> short <-> FQDN <-> ``HOST$``) via
+    :func:`hosts_match`. When either host is unsupplied the check stays
+    informational-ok (it cannot assert reflection without both endpoints).
+    """
+    coerce_host = str(inputs.coerce_host or "").strip()
+    relay_target = str(inputs.relay_target_host or "").strip()
+    if not coerce_host or not relay_target:
+        return FeasibilityVerdict(
+            check_id="self_relay_reflection",
+            status="ok",
+            observed="hosts not supplied",
+            why="Coerce source and relay target were not both supplied; the "
+            "self-relay reflection gate cannot be evaluated here.",
+            remediation=None,
+            confidence=SignalConfidence.LOW,
+        )
+    if not hosts_match(coerce_host, relay_target):
+        return FeasibilityVerdict(
+            check_id="self_relay_reflection",
+            status="ok",
+            observed="source != target",
+            why="The coerced host and the relay target are distinct machines; the "
+            "NTLM reflection mitigation does not apply.",
+            remediation=None,
+            confidence=SignalConfidence.HIGH,
+        )
+    # Coerce source == relay target (self-relay). Only an alternate DC to relay to
+    # can rescue it.
+    if inputs.alternate_dc_available is True:
+        return FeasibilityVerdict(
+            check_id="self_relay_reflection",
+            status="warning",
+            observed="self-relay; alternate DC available",
+            why="The coerce source is the relay target, but another DC exists to "
+            "relay to instead of reflecting to the coerced host.",
+            remediation="Relay to the alternate DC's LDAP, not the coerced DC itself.",
+            confidence=SignalConfidence.MEDIUM,
+        )
+    return FeasibilityVerdict(
+        check_id="self_relay_reflection",
+        status="blocking",
+        observed=REFLECTION_BLOCKED_REASON,
+        why="The coerced host is the only DC and is also the relay target; Windows "
+        "reflection mitigation refuses an NTLM auth relayed back to the same host, "
+        "so this relay cannot succeed.",
+        remediation="No relay path here — pursue a different escalation "
+        "(e.g. offline NTLMv1 crack) or a second DC as the relay target.",
+        confidence=SignalConfidence.HIGH,
     )
 
 
@@ -796,6 +875,7 @@ def _weakest_confidence(*states: ConstraintState) -> SignalConfidence:
 _CORE_CHECKS: tuple[RelayPrecondition, ...] = (
     check_ntlm_enabled,
     check_ntlmv1_or_cve1040,
+    check_self_relay_reflection,
     check_ldap_signing,
     check_ldap_channel_binding,
     check_ldaps_available,

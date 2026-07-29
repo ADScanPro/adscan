@@ -34,6 +34,27 @@ _PROVEN_STATUSES: frozenset[str] = frozenset(
     {"success", "exploited", "domain_compromised"}
 )
 
+#: Statuses that describe NO client exposure, and therefore may never be counted
+#: into a risk figure or offered to a client as something to remediate.
+#:
+#: * ``closed_by_configuration`` — the POSITIVE bucket. The client's own
+#:   configuration already closed this avenue and ADscan observed it with
+#:   certainty ("Attack Surface Reduced — Hardening Observed"). Billing them to
+#:   fix hardening they already did inverts what the report is for.
+#: * ``unsupported`` / ``unavailable`` — an ADscan data gap: no reachable surface
+#:   to walk, so the absence of a result says nothing about the client.
+#:
+#: This is the same set as the ``None`` entries of
+#: ``exposure_score_service._PROOF_WEIGHT`` — that table builds them from here,
+#: so the exposure score and every remediation ranking exclude exactly the same
+#: paths and cannot drift apart. The token spelling is locked against
+#: ``relay_status_constants.CONFIGURATION_CLOSE_STATUS`` by
+#: ``tests/unit/services/test_remediation_status_filter.py`` (a test-only import,
+#: which keeps this module the stdlib-only leaf its closure depends on).
+NO_EXPOSURE_STATUSES: frozenset[str] = frozenset(
+    {"closed_by_configuration", "unsupported", "unavailable"}
+)
+
 
 class PathState(str, Enum):
     """Canonical lifecycle state of an attack path."""

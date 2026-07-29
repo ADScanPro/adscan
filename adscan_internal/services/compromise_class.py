@@ -884,6 +884,51 @@ def compromise_reach_label_short(cls: CompromiseClass) -> str:
     return _COMPROMISE_REACH_LABELS_SHORT.get(cls, "Standard reach")
 
 
+# Axis 2, TERMINUS form — the same Compromise Reach axis worded as the thing a
+# route ENDS AT: the last node of a chain diagram, the right-hand side of a path
+# header, and the verdict banner under the steps. Those three used to be worded
+# independently, which is how one page could head a route "MISSANDEI → DOMAIN
+# ADMINS", draw its chain ending on a DOMAIN ADMINS node, and then close with
+# "DOMAIN COMPROMISED" — three answers to one question. A route also has to
+# terminate at an OUTCOME and never at a group or a technique name: naming the
+# group as the destination breaks the nomenclature rule, and naming the
+# technique ("… → ESC13") leaves the reader with something they cannot act on.
+_COMPROMISE_TERMINUS_LABELS: dict[CompromiseClass, str] = {
+    CompromiseClass.DOMAIN_BREAKER: "Domain Compromised",
+    CompromiseClass.TIER0_FOOTHOLD: "Tier 0 Foothold",
+    CompromiseClass.PRIVILEGED_ESCALATOR: "Tier 0 Group Takeover",
+    CompromiseClass.COMPROMISE_ENABLER: "Stepping Stone to Tier 0",
+    CompromiseClass.UNAUTHENTICATED_PRINCIPAL: "Unauthenticated Reach",
+    CompromiseClass.NONE: "Standard Reach",
+}
+
+
+def compromise_terminus_label(cls: CompromiseClass) -> str:
+    """Return the label for what a route of this class ENDS AT.
+
+    The single source of truth for the chain's terminal node, the path header's
+    destination, and the verdict banner — so a client reads one answer, not
+    three. The :class:`CompromiseClass` argument is the PATH's class; this only
+    translates it to wording, it never recomputes reach.
+    """
+    return _COMPROMISE_TERMINUS_LABELS.get(cls, "Standard Reach")
+
+
+def compromise_terminus_label_for_key(value: str) -> str:
+    """Return the terminus label for a raw ``compromise_class`` string.
+
+    Convenience for renderers that carry the class as the plain string stamped
+    on a path record rather than the enum. An unknown value falls back to the
+    domain-breaker terminus, matching the report's own default for a path whose
+    class did not resolve.
+    """
+    key = (value or "").strip().lower()
+    for member in CompromiseClass:
+        if member.value == key:
+            return compromise_terminus_label(member)
+    return compromise_terminus_label(CompromiseClass.DOMAIN_BREAKER)
+
+
 # ---------------------------------------------------------------------------
 # Tier glossary — the legend the report and platform render. SSOT for the
 # glossary CONTENT only; Phase 2 owns the rendering (PDF legend, web panel).

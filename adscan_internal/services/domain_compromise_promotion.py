@@ -18,6 +18,7 @@ from typing import Any
 
 import rich.box
 
+from adscan_core.outbound_links import cta_markup
 from adscan_internal import (
     print_info_debug,
     telemetry,
@@ -262,9 +263,7 @@ def promote_to_pwned(
                         "[bold]Next step:[/bold] Document it before the engagement "
                         "window closes.\n"
                         "Generate a board-ready report → "
-                        "[link=https://adscanpro.com/pro?utm_source=cli&"
-                        "utm_medium=victory_da_compromise]"
-                        "adscanpro.com/pro[/link]"
+                        f"{cta_markup('victory_da_compromise')}"
                     ),
                 )
             # The session-exit rating -> star funnel owns the single star ask at

@@ -18,11 +18,13 @@ import socket
 import re
 import secrets
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from rich.prompt import Confirm
 
+from adscan_core.outbound_links import cta_markup, cta_url
 from adscan_launcher import telemetry
 from adscan_launcher import runtime_session as _runtime_session
 from adscan_launcher.docker_pull_diagnostics import (
@@ -79,12 +81,10 @@ LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
 ADSCAN_RUNTIME_LICENSE_MODE_ENV = "ADSCAN_RUNTIME_LICENSE_MODE"
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
 _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\s--gpus\b", re.IGNORECASE)
-_DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/installation"
+_DOCKER_INSTALL_DOCS_URL = cta_url("docker_missing")
 _ALLOW_PODMAN_DOCKER_API_ENV = "ADSCAN_ALLOW_PODMAN_DOCKER_API"
 _ALLOW_LEGACY_IMAGE_FALLBACK_ENV = "ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK"
-_HOST_HELPER_TROUBLESHOOTING_DOCS_URL = (
-    "https://www.adscanpro.com/docs/guides/troubleshooting#host-helper-docker-mode"
-)
+_HOST_HELPER_TROUBLESHOOTING_DOCS_URL = cta_url("host_helper_failed")
 _DOCKER_SERVICE_UNIT_MISSING_RE = re.compile(
     r"(unit\s+docker\.service\s+could\s+not\s+be\s+found|could\s+not\s+find\s+the\s+requested\s+service\s+docker)",
     re.IGNORECASE,
@@ -101,6 +101,8 @@ from adscan_core.interaction import is_non_interactive  # noqa: E402
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
 _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = 1.0
 _LOW_MEMORY_WARNING_THRESHOLD_GB = 1.5
+_ALLOW_LOW_MEMORY_ENV = "ADSCAN_ALLOW_LOW_MEMORY"
+_ALLOW_LOW_MEMORY_FLAG = "--allow-low-memory"
 _EPHEMERAL_CONTAINER_SHARED_TOKEN: str | None = None
 _LEGACY_IMAGE_WARNING_SHOWN = False
 _DOCKER_RUNTIME_CONTEXT_EMITTED = False
@@ -516,6 +518,184 @@ def _log_install_resource_status(path: Path) -> tuple[float, float]:
     free_disk_gb = free_disk_bytes / (1024**3)
     free_mem_gb = free_mem_bytes / (1024**3)
     return free_disk_gb, free_mem_gb
+
+
+# ---------------------------------------------------------------------------
+# Host memory gate
+# ---------------------------------------------------------------------------
+#
+# ``--allow-low-memory`` documented a gate that did not exist: every handler
+# discarded the flag and the two thresholds below had a single reader (a
+# telemetry field). A host with 0.99 GB free passed ``adscan check`` clean and
+# then OOM-killed the container mid-scan. The gate below is the one
+# implementation of the promise the flag already makes:
+#
+#   ≥ 1.5 GB free   → proceed silently (debug line only)
+#   1.0–1.5 GB free → proceed with a visible warning
+#   < 1.0 GB free   → refuse, unless the operator opted in
+#   unmeasurable    → proceed (never refuse on a reading we could not take)
+#
+# The opt-in is the ``--allow-low-memory`` flag on install/check/start/ci/tui,
+# or ``ADSCAN_ALLOW_LOW_MEMORY=1`` for the container passthroughs (execute,
+# doctor, deliver) whose args go through argparse.REMAINDER and therefore
+# cannot carry a launcher flag.
+
+
+def _low_memory_override_active(allow_low_memory: bool) -> bool:
+    """Return whether the operator accepted the risk of a low-memory run."""
+    if allow_low_memory:
+        return True
+    return str(os.getenv(_ALLOW_LOW_MEMORY_ENV, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _measure_free_memory_gb() -> float | None:
+    """Return available host RAM in GB, or None when it cannot be measured."""
+    free_bytes = _get_free_memory_bytes()
+    if free_bytes <= 0:
+        return None
+    return free_bytes / (1024**3)
+
+
+def _classify_free_memory(free_gb: float | None) -> str:
+    """Map free RAM to one of ``unknown`` / ``critical`` / ``low`` / ``ok``."""
+    if free_gb is None:
+        return "unknown"
+    if free_gb < _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB:
+        return "critical"
+    if free_gb < _LOW_MEMORY_WARNING_THRESHOLD_GB:
+        return "low"
+    return "ok"
+
+
+def _format_free_memory(free_gb: float | None) -> str:
+    return "unknown" if free_gb is None else f"{free_gb:.2f} GB"
+
+
+def _print_low_memory_block_panel(*, command_name: str, free_gb: float | None) -> None:
+    """Render the refusal panel, including how to override it."""
+    print_panel(
+        "\n".join(
+            [
+                f"Required: ≥ {_LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB:.1f} GB available RAM",
+                f"Available: {_format_free_memory(free_gb)}",
+                "",
+                "The ADscan runtime container will be OOM-killed mid-run at this "
+                "memory level. Close other workloads or add RAM, then retry.",
+                "",
+                "To run anyway and accept the risk:",
+                f"  adscan {command_name} {_ALLOW_LOW_MEMORY_FLAG}",
+                f"  {_ALLOW_LOW_MEMORY_ENV}=1 adscan {command_name}",
+            ]
+        ),
+        title="Insufficient Memory",
+        border_style="yellow",
+    )
+
+
+def _enforce_host_memory_gate(*, command_name: str, allow_low_memory: bool) -> bool:
+    """Return False when the host has too little RAM to run ``command_name``.
+
+    Args:
+        command_name: Launcher command shown in the override hint.
+        allow_low_memory: Whether ``--allow-low-memory`` was passed.
+    """
+    free_gb = _measure_free_memory_gb()
+    level = _classify_free_memory(free_gb)
+    override = _low_memory_override_active(allow_low_memory)
+    print_info_debug(
+        f"[memory] gate: command={command_name} "
+        f"free={_format_free_memory(free_gb)} level={level} override={override}"
+    )
+    if level in ("ok", "unknown"):
+        return True
+
+    if level == "low":
+        print_warning(
+            f"Low available memory: {_format_free_memory(free_gb)} free "
+            f"(recommended: at least {_LOW_MEMORY_WARNING_THRESHOLD_GB:.1f} GB)."
+        )
+        return True
+
+    telemetry.capture(
+        "launcher_low_memory_gate",
+        {
+            "command_name": command_name,
+            "free_memory_gb": round(free_gb, 2) if free_gb is not None else None,
+            "blocked": not override,
+            "override": override,
+        },
+    )
+    if override:
+        print_warning(
+            f"Continuing with critically low memory "
+            f"({_format_free_memory(free_gb)} free) because the low-memory "
+            "override was set. The container may be OOM-killed."
+        )
+        return True
+
+    print_error(
+        f"Not enough available memory to run ADscan ({_format_free_memory(free_gb)} free)."
+    )
+    _print_low_memory_block_panel(command_name=command_name, free_gb=free_gb)
+    return False
+
+
+def _report_host_memory_for_check(*, allow_low_memory: bool) -> bool:
+    """Print the memory line for ``adscan check`` and return whether it is OK.
+
+    ``check`` diagnoses a machine, so it reports the condition instead of
+    refusing to run — but a host below the hard-block threshold must not get a
+    clean bill of health, so the verdict goes to False unless the operator
+    passed the override.
+    """
+    free_gb = _measure_free_memory_gb()
+    level = _classify_free_memory(free_gb)
+    override = _low_memory_override_active(allow_low_memory)
+    label = _format_free_memory(free_gb)
+
+    if level == "unknown":
+        print_info("Available memory: unknown (could not read host memory).")
+        return True
+    if level == "ok":
+        print_success(f"Available memory: {label}")
+        return True
+    if level == "low":
+        print_warning(
+            f"Available memory: {label} "
+            f"(recommended: at least {_LOW_MEMORY_WARNING_THRESHOLD_GB:.1f} GB)."
+        )
+        return True
+
+    print_error(
+        f"Available memory: {label} "
+        f"(minimum: {_LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB:.1f} GB). "
+        "ADscan will be OOM-killed at this level."
+    )
+    telemetry.capture(
+        "launcher_low_memory_gate",
+        {
+            "command_name": "check",
+            "free_memory_gb": round(free_gb, 2) if free_gb is not None else None,
+            "blocked": not override,
+            "override": override,
+        },
+    )
+    if override:
+        print_warning(
+            "Reporting the memory shortfall as accepted because the low-memory "
+            "override was set."
+        )
+        return True
+    print_instruction(
+        "Free memory and re-run `adscan check`, or accept the risk with "
+        f"`adscan check {_ALLOW_LOW_MEMORY_FLAG}`."
+    )
+    return False
 
 
 def _get_docker_storage_path() -> Path:
@@ -3080,7 +3260,7 @@ def _print_docker_install_summary() -> None:
         tele_detail.add_row("Not sent", "IPs, domains, credentials, paths")
         tele_detail.add_row("Session off", "export ADSCAN_TELEMETRY=0")
         tele_detail.add_row("Permanent", "telemetry off  (inside ADscan)")
-        tele_detail.add_row("Details", "adscanpro.com/docs/telemetry")
+        tele_detail.add_row("Details", cta_markup("telemetry_notice"))
         renderables.append(tele_detail)
     else:
         tele_status = Text("  OFF", style="bold yellow")
@@ -3129,9 +3309,12 @@ def handle_install_docker(
     allow_low_memory: bool = False,
 ) -> bool:
     """Install ADscan via Docker (pull image)."""
-    del allow_low_memory
     _emit_docker_runtime_context(command_name="install")
     _emit_docker_host_resources_context(command_name="install")
+    if not _enforce_host_memory_gate(
+        command_name="install", allow_low_memory=allow_low_memory
+    ):
+        return False
 
     install_lock = _acquire_install_lock_or_warn(command_name="install")
     if install_lock is None:
@@ -3271,9 +3454,59 @@ def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
 def handle_check_docker(
     *,
     allow_low_memory: bool = False,
+    fix: bool = False,
+    verbose: bool = False,
+    debug: bool = False,
+) -> bool:
+    """Check ADscan Docker-mode prerequisites, optionally repairing the runtime.
+
+    Args:
+        allow_low_memory: Report a critically low memory reading without
+            failing the verdict.
+        fix: Also run the in-container repair pass (``adscan check --fix``)
+            once the host prerequisites pass. This is the command the runtime
+            itself tells operators to run when a tool venv or system package
+            is broken, so the launcher has to be able to deliver it.
+        verbose: Forwarded to the in-container repair pass.
+        debug: Forwarded to the in-container repair pass.
+    """
+    prerequisites_ok = _check_docker_prerequisites(allow_low_memory=allow_low_memory)
+    if not fix:
+        return prerequisites_ok
+
+    if not prerequisites_ok:
+        print_warning(
+            "Skipping --fix: the Docker-mode prerequisites above must pass first."
+        )
+        return False
+
+    print_info("Running in-container repairs (check --fix)...")
+    fix_args = ["check", "--fix"]
+    if debug:
+        fix_args.append("--debug")
+    elif verbose:
+        fix_args.append("--verbose")
+    exit_code = run_adscan_passthrough_docker(
+        adscan_args=fix_args,
+        verbose=verbose,
+        debug=debug,
+        allow_low_memory=allow_low_memory,
+    )
+    if exit_code != 0:
+        print_warning(
+            "In-container repairs finished with issues. Re-run `adscan check` "
+            "to see what is still missing."
+        )
+        return False
+    print_success("In-container repairs completed.")
+    return True
+
+
+def _check_docker_prerequisites(
+    *,
+    allow_low_memory: bool = False,
 ) -> bool:
     """Check ADscan Docker-mode prerequisites."""
-    del allow_low_memory
     _emit_docker_runtime_context(command_name="check")
     _emit_docker_host_resources_context(command_name="check")
     image = _select_existing_or_preferred_image()
@@ -3281,6 +3514,12 @@ def handle_check_docker(
     all_ok = True
     try:
         print_info("Checking ADscan Docker mode...")
+        # Memory is reported, not enforced, here: refusing to diagnose a
+        # constrained machine is unhelpful, but a machine below the hard-block
+        # threshold must not be told it is fine either. Kept out of ``all_ok``
+        # so a memory shortfall still lets every remaining probe run — it only
+        # joins the verdict at the end.
+        memory_ok = _report_host_memory_for_check(allow_low_memory=allow_low_memory)
         if not docker_available():
             print_error("Docker is not installed or not in PATH.")
             print_instruction(
@@ -3358,7 +3597,7 @@ def handle_check_docker(
                     print_info_debug(f"[docker] probe exception: {exc}")
                     all_ok = False
 
-        return all_ok
+        return all_ok and memory_ok
     finally:
         _release_runtime_acquisition(acq)
 
@@ -3370,11 +3609,21 @@ def handle_start_docker(
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
     tui: bool = False,
+    extra_env: Sequence[tuple[str, str]] = (),
 ) -> int:
-    """Start ADscan inside Docker and return the docker exit code."""
-    del allow_low_memory
+    """Start ADscan inside Docker and return the docker exit code.
+
+    Args:
+        extra_env: Additional container environment pairs (the engagement
+            posture toggles ``--offline`` / ``--no-telemetry``, translated at
+            the launcher seam).
+    """
     _emit_docker_runtime_context(command_name="start")
     _emit_docker_host_resources_context(command_name="start")
+    if not _enforce_host_memory_gate(
+        command_name="start", allow_low_memory=allow_low_memory
+    ):
+        return 1
     image = _select_existing_or_preferred_image()
     acq = _RuntimeAcquisition()
     try:
@@ -3439,6 +3688,7 @@ def handle_start_docker(
                     ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
                     ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
                 ]
+                + list(extra_env)
             ),
             run_host_dir=acq.session_dir,
         )
@@ -3495,9 +3745,12 @@ def handle_ci_docker(
     allow_low_memory: bool = False,
 ) -> int:
     """Run `adscan ci` inside Docker and return the docker exit code."""
-    del allow_low_memory
     _emit_docker_runtime_context(command_name="ci")
     _emit_docker_host_resources_context(command_name="ci")
+    if not _enforce_host_memory_gate(
+        command_name="ci", allow_low_memory=allow_low_memory
+    ):
+        return 1
     image = _select_existing_or_preferred_image()
     acq = _RuntimeAcquisition()
     try:
@@ -3686,9 +3939,17 @@ def run_adscan_passthrough_docker(
             bind-mounts (e.g. a ``--scan-config`` file passed by absolute path
             outside the standard mounted tree).
     """
-    del allow_low_memory
     _emit_docker_runtime_context(command_name="passthrough")
     _emit_docker_host_resources_context(command_name="passthrough")
+    # The passthrough carries `ci`, `tui`, `execute`, `doctor` and the
+    # deliverables. Those whose args go through argparse.REMAINDER cannot take
+    # a launcher flag, which is why the gate also honours
+    # ``ADSCAN_ALLOW_LOW_MEMORY=1``.
+    passthrough_command = str(adscan_args[0]) if adscan_args else "start"
+    if not _enforce_host_memory_gate(
+        command_name=passthrough_command, allow_low_memory=allow_low_memory
+    ):
+        return 1
     image = _select_existing_or_preferred_image()
     acq = _RuntimeAcquisition()
     try:

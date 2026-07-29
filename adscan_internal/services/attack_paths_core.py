@@ -1308,6 +1308,17 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         for action in non_context_actions
     ):
         return "unsupported"
+    # An avenue ADscan observed to be CLOSED with certainty by the environment's
+    # configuration/topology (LDAP signing+CBT, no ADCS, single-DC self-relay
+    # reflection). A POSITIVE Exposure-Validation fact ("attack surface reduced"),
+    # never a risk/held status — and critically NOT executable, so it must not
+    # fall through to ``theoretical`` (which the offer/readiness gate treats as
+    # runnable, mis-offering a closed self-relay as a "Ready" step). Placed last,
+    # after the attempted/blocked/unsupported/policy checks, so a genuine
+    # not-run/blocked/unsupported signal keeps precedence. Mirrors the sibling
+    # rollup in ``attack_graph_core._path_from_steps``.
+    if any(status == "closed_by_configuration" for status in statuses):
+        return "closed_by_configuration"
     return "theoretical"
 
 

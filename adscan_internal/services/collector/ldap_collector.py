@@ -1725,6 +1725,7 @@ class ADscanLDAPCollector:
         result: CollectionResult,
     ) -> None:
         from adscan_internal.services.enumeration.trust_query import (
+            evaluate_trust_posture,
             query_trusted_domains,
         )
 
@@ -1744,6 +1745,13 @@ class ADscanLDAPCollector:
 
         for entry in entries:
             try:
+                # Judge the ALREADY-decoded trustAttributes for report findings
+                # (TGT delegation enabled / SID filtering not enforced). Done
+                # over every decoded trust regardless of direction — a weakness
+                # on an inbound trust is still a weakness — and independent of
+                # the edge-emission direction filter below.
+                result.trust_posture_findings.extend(evaluate_trust_posture(entry))
+
                 if entry.direction not in ("Outbound", "Bidirectional"):
                     continue
                 result.add_edge(

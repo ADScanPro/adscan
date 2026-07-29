@@ -21,6 +21,7 @@ import sys
 import signal
 from typing import Any, Dict, List
 
+from adscan_core.outbound_links import cta_markup, cta_url
 from adscan_core.path_utils import get_adscan_state_dir
 from adscan_core.theme import (
     COLOR_WARNING,
@@ -3631,10 +3632,8 @@ def run_check(
         deps.print_instruction(recovery_guidance.instruction)
         if recovery_guidance.follow_up_message:
             deps.print_info(recovery_guidance.follow_up_message)
-        docs_url = "https://www.adscanpro.com/docs/guides/troubleshooting?utm_source=cli&utm_medium=check_failed"
-        deps.print_info(
-            f"Troubleshooting guide: [link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
-        )
+        docs_url = cta_url("check_failed")
+        deps.print_info(f"Troubleshooting guide: {cta_markup('check_failed')}")
         deps.track_docs_link_shown("check_failed", docs_url)
         deps.print_check_summary(False)
         deps.set_last_check_session_extra(

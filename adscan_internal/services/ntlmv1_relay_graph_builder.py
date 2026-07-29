@@ -46,7 +46,7 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.attack_paths_materialized_cache import (
     invalidate_attack_path_artifacts,
 )
-from adscan_internal.models.domain import resolve_dc_ip
+from adscan_internal.models.domain import DomainControllers, resolve_dc_ip
 from adscan_internal.workspaces import domain_subpath
 
 _RBCD_BADGE = "Local Admin via NTLMv1→RBCD relay"
@@ -122,10 +122,22 @@ def _select_relay_target(
             # silently emit a target-less "theoretical" edge.
             return None, NO_RELAY_TARGET_REASON
         return None, NO_RELAY_TARGET_REASON
-    # Coerced node IS a DC → need a DIFFERENT DC as the relay target.
-    other_dcs = [d for d in dc_nodes if str(d.get("id") or "") != str(coerced_node_id or "")]
-    if other_dcs:
-        fqdn = str(other_dcs[0].get("fqdn") or "").strip()
+    # Coerced node IS a DC → need a DIFFERENT DC as the relay target. Delegate the
+    # "is there an alternate DC" determination to the DC-topology SSOT so the
+    # single-DC reflection decision is the SAME logic as the self-relay backstop
+    # (``relay_rbcd._alternate_dc_available``). The graph DC set is already
+    # canonical (one node per DC), so it is fed to the SSOT as explicit records —
+    # the node ``fqdn`` is preserved verbatim (an empty fqdn stays "no usable relay
+    # endpoint" → ``NO_RELAY_TARGET_REASON``).
+    controllers = DomainControllers.from_dc_records(
+        (
+            [str(d.get("id") or ""), str(d.get("fqdn") or "")],
+            str(d.get("fqdn") or ""),
+        )
+        for d in dc_nodes
+    )
+    if controllers.has_alternate_dc(str(coerced_node_id or "")):
+        fqdn = str(controllers.alternate_dc_fqdn(str(coerced_node_id or "")) or "").strip()
         if fqdn:
             return fqdn, None
         # A different DC exists but its FQDN is empty → no usable relay endpoint.

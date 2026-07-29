@@ -1834,6 +1834,18 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
     # ── Inject operator-accepted credentials into the credential store ──
     # Only desc_creds_verified (operator-reviewed) are saved. The full
     # desc_creds list is preserved in the JSON artefact for the audit trail.
+    # Accumulated across the loop and recorded ONCE below. Recording per
+    # iteration loses data: ``record_technical_finding`` merges with
+    # ``finding["details"].update(details)``, so a flat ``username``/``field``
+    # written per credential is overwritten by the next one and only the LAST
+    # leak survives in ``details`` — while ``evidence`` correctly accumulates
+    # all of them, so the finding looked complete and was not. The batched
+    # ``details["findings"]`` list is also the shape the affected-asset rules
+    # read (``record_containers=("findings",)``), and the shape this finding's
+    # sibling ``credential_in_ldap_attribute`` already uses in ``cli/ldap.py``.
+    described_leaks: list[dict[str, Any]] = []
+    described_evidence: list[dict[str, Any]] = []
+
     for cred in desc_creds_verified:
         if not cred.raw_value:
             continue
@@ -1854,6 +1866,23 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 f"[unauth-enrich] add_credential skipped for description leak: {exc}"
             )
 
+        described_leaks.append(
+            {
+                "username": cred.samaccountname,
+                "field": cred.field,
+                "rule": cred.rule_name,
+                "ml_probability": cred.ml_probability,
+            }
+        )
+        described_evidence.append(
+            {
+                "type": "string",
+                "summary": f"Credential pattern in {cred.field} (rule: {cred.rule_name})",
+                "artifact_path": "users.json",
+            }
+        )
+
+    if described_leaks:
         try:
             from adscan_core.reporting.technical_report import (
                 record_technical_finding,
@@ -1866,18 +1895,9 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 value=True,
                 details={
                     "source": "unauth_enrichment_service.credsweeper",
-                    "username": cred.samaccountname,
-                    "field": cred.field,
-                    "rule": cred.rule_name,
-                    "ml_probability": cred.ml_probability,
+                    "findings": described_leaks,
                 },
-                evidence=[
-                    {
-                        "type": "string",
-                        "summary": f"Credential pattern in {cred.field} (rule: {cred.rule_name})",
-                        "artifact_path": "users.json",
-                    }
-                ],
+                evidence=described_evidence,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)

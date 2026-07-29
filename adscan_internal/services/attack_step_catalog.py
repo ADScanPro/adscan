@@ -3645,9 +3645,10 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         target = "the target object"
 
     relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
-    # Human-formatted label (lazy import to avoid circular deps with reporting layer).
+    # Human-formatted label from the shared vocabulary (lazy import to avoid a
+    # circular dep at module load; the module itself is LITE-safe).
     try:
-        from adscan_internal.pro.reporting.attack_path_narratives import (
+        from adscan_internal.services.attack_relation_labels import (
             format_relation_label,
         )
 
@@ -3991,7 +3992,7 @@ def render_path_summary(path: dict[str, Any]) -> str:
 
     # Collect unique technique labels in path order
     try:
-        from adscan_internal.pro.reporting.attack_path_narratives import (
+        from adscan_internal.services.attack_relation_labels import (
             format_relation_label,
         )
 

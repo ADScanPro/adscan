@@ -3777,6 +3777,10 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     from adscan_internal.services.attack_step_support_registry import (
         classify_relation_support,
     )
+    from adscan_internal.services.remediability import (
+        classify_edge_remediability,
+        principal_facts_from_node,
+    )
 
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     context_relations = {
@@ -3788,6 +3792,29 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         if isinstance(node, dict):
             return str(node.get("label") or node_id)
         return node_id
+
+    # Whether a step is something the client can CHANGE is decided here, once,
+    # because this is the only layer that holds both the edge and the graph nodes
+    # its endpoints resolve to. Deciding it downstream would mean deciding it from
+    # the relation name alone, which is wrong per instance: most group
+    # memberships are removable and most replication rights are not (see
+    # adscan_internal.services.remediability). Every consumer — the paid
+    # deliverable's technique ranking, the free report's choke-point table and the
+    # web CTEM's remediation page — reads the stamp instead of re-resolving.
+    _facts_cache: dict[str, Any] = {}
+
+    def _facts(node_id: str) -> Any:
+        if node_id not in _facts_cache:
+            _facts_cache[node_id] = principal_facts_from_node(nodes_map.get(node_id))
+        return _facts_cache[node_id]
+
+    def remediability_of(relation: str, from_id: str, to_id: str) -> dict[str, str]:
+        try:
+            return classify_edge_remediability(
+                relation, source=_facts(from_id), target=_facts(to_id)
+            ).as_dict()
+        except Exception:  # pragma: no cover - a verdict is never fatal
+            return {}
 
     def _resolve_membership_followup_step(
         target_node: dict[str, Any] | None,
@@ -3907,6 +3934,9 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 # per-render relabel. Proven / blocked / config-close statuses are
                 # preserved unchanged (see ``derive_step_display_status``).
                 "status": derive_step_display_status(step.relation, step.status),
+                "remediability": remediability_of(
+                    step.relation, step.from_id, step.to_id
+                ),
                 "details": {
                     "from": label(step.from_id),
                     "to": label(step.to_id),
@@ -3921,6 +3951,12 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 "step": len(steps_for_ui) + 1,
                 "action": str(synthetic_followup["relation"]),
                 "status": synthetic_status,
+                # A synthetic follow-up has no target NODE (its target is a
+                # rendered label), so only the source resolves — enough for every
+                # family whose fix does not depend on the target's identity.
+                "remediability": remediability_of(
+                    str(synthetic_followup["relation"]), path.target_id, ""
+                ),
                 "details": {
                     "from": label(path.target_id),
                     "to": str(synthetic_followup["to"]),

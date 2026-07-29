@@ -145,29 +145,67 @@ def status_label(revert_status: str | None) -> str:
     return STATUS_LABEL.get(s, s.replace("_", " ").title() or "Pending")
 
 
+# ── Change kinds that need a named constant ───────────────────────────────────
+# A certificate the CA issued during the assessment. It is an environment change
+# like any other — the certificate lives in the CA database and stays usable for
+# authentication until it expires or is revoked — and revocation needs CA rights
+# the assessment does not hold, so it is always a MANUAL cleanup item.
+KIND_ISSUED_CERTIFICATE = "issued_certificate"
+
 # ── Change-kind display strings (SSOT) ────────────────────────────────────────
+# Every kind any writer registers needs an entry here, or the client-facing
+# disclosure prints the raw snake_case token. Keep this in step with the
+# ``kind=`` arguments passed to ``EnvironmentChangeLedger.register``; a missing
+# key is not a crash, it is a `template_mutated` in a customer's PDF.
 KIND_DISPLAY: dict[str, str] = {
     "group_membership_added": "Group membership",
     "group_membership_changed": "Group membership",
     "file_uploaded": "File upload",
     "user_created": "User created",
     "password_changed": "Password reset",
-    "template_modified": "Template modified",
+    "template_modified": "Certificate template modified",
+    "template_mutated": "Certificate template modified",
+    "ca_template_enabled": "Certificate template published",
+    KIND_ISSUED_CERTIFICATE: "Certificate issued by your CA",
     "acl_modified": "ACL modified",
     "shadow_credentials_added": "Shadow credentials",
     "dacl_ace_added": "DACL ACE (GenericAll)",
     "owner_changed": "Object owner",
     "spn_added": "SPN (Kerberoast)",
+    "spn_relocated": "SPN moved between accounts",
     "machine_account_created": "Machine account",
+    "computer_account_created": "Computer account",
     "rbcd_delegation_added": "RBCD delegation",
     "keycredentiallink_added": "KeyCredentialLink",
+    "upn_changed": "User principal name",
+    "altsecurityidentities_written": "Certificate mapping attribute",
+    "gpo_ldap_attribute_modified": "Group Policy object attribute",
+    "gpo_gpt_ini_modified": "Group Policy version file",
+    "gpo_sysvol_dir_created": "Group Policy folder in SYSVOL",
+    "gpo_sysvol_file_created": "Group Policy file in SYSVOL",
+    "mssql_admin_account_created": "Database administrator account",
+    "mssql_postex_account": "Database account",
+    "mssql_clr_assembly_loaded": "Database CLR assembly",
+    "mssql_clr_config_changed": "Database CLR configuration",
+    "mssql_xp_cmdshell_enabled": "Database command execution setting",
 }
 
 
 def kind_display(kind: str | None) -> str:
-    """Return the display string for a change kind (falls back to the raw kind)."""
+    """Return the display string for a change kind.
+
+    Falls back to a humanized form of the raw kind rather than the raw token
+    itself: an unmapped kind then reads as "Template mutated" in a client
+    document instead of ``template_mutated``.
+    """
     raw = str(kind or "").strip()
-    return KIND_DISPLAY.get(raw, raw)
+    mapped = KIND_DISPLAY.get(raw)
+    if mapped:
+        return mapped
+    if not raw:
+        return ""
+    humanized = raw.replace("_", " ").strip()
+    return humanized[:1].upper() + humanized[1:]
 
 
 # ── Client-safe native remediation templates (SSOT) ───────────────────────────
@@ -228,6 +266,44 @@ MANUAL_MACHINE_ACCOUNT = (
     "  Remove-ADComputer -Identity 'TARGET' -Confirm:$false"
 )
 
+# A certificate the CA issued during the assessment. Revoking it needs
+# certificate-manager rights on the issuing CA, which the assessment does not
+# hold — so this is always a manual item, and the client's administrator needs
+# enough detail to find the record, revoke it, publish the result and check it.
+# Placeholders (SERIAL_NUMBER / REQUEST_ID / CA_CONFIG) are filled in by
+# :func:`issued_certificate_remediation`; the raw template is the fallback used
+# when a record reaches the report without them.
+MANUAL_ISSUED_CERTIFICATE = (
+    "Your certification authority issued this certificate during the assessment. It stays "
+    "valid for authentication until it expires or is revoked, and revoking it requires "
+    "certificate-manager rights on the CA, so your team has to complete this step.\n"
+    "Run the commands below on the CA server, or on any host with the Certification "
+    "Authority tools installed, as a member of the CA's Certificate Managers group (or the "
+    "CA host's local Administrators):\n"
+    "  1. Locate the record and confirm it is still live\n"
+    '     certutil -config "CA_CONFIG" -view -restrict "RequestId=REQUEST_ID" '
+    '-out "RequestId,Request.RequesterName,Certificate.SerialNumber,'
+    'Certificate.NotAfter,Request.Disposition"\n'
+    "     A Disposition of 20 means the certificate is issued and usable.\n"
+    "  2. Revoke it. Reason code 1 is key compromise, which is the accurate reason here: "
+    "the private key was generated outside your control.\n"
+    '     certutil -config "CA_CONFIG" -revoke SERIAL_NUMBER 1\n'
+    "  3. Publish a fresh CRL so domain members learn of the revocation\n"
+    '     certutil -config "CA_CONFIG" -CRL\n'
+    "  4. Verify the change took effect\n"
+    '     certutil -config "CA_CONFIG" -view -restrict "SerialNumber=SERIAL_NUMBER" '
+    '-out "Request.Disposition,Request.RevokedReason"\n'
+    "     Disposition must now read 21 (revoked).\n"
+    "Two caveats worth planning for. The certificate keeps working until the new CRL has "
+    "replicated to every CRL distribution point published in it, so confirm distribution "
+    "with certutil -verify -urlfetch against a copy of the certificate. And revocation "
+    "only stops future authentication: any Kerberos ticket already obtained with the "
+    "certificate remains valid until it expires under Default Domain Policy > Computer "
+    "Configuration > Policies > Windows Settings > Security Settings > Account Policies > "
+    "Kerberos Policy. If the certificate carried the identity of a privileged or machine "
+    "account, reset that account's password once the revocation is confirmed."
+)
+
 # Per-kind remediation template (raw, with TARGET/SPN/GROUP/MEMBER placeholders).
 KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     "shadow_credentials_added": MANUAL_SHADOW_CREDS,
@@ -240,7 +316,62 @@ KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     "rbcd_delegation_added": MANUAL_RBCD,
     "keycredentiallink_added": MANUAL_KEYCREDENTIALLINK,
     "machine_account_created": MANUAL_MACHINE_ACCOUNT,
+    KIND_ISSUED_CERTIFICATE: MANUAL_ISSUED_CERTIFICATE,
 }
+
+
+def issued_certificate_remediation(
+    *,
+    serial: str | None = None,
+    request_id: int | str | None = None,
+    ca_name: str | None = None,
+    ca_host: str | None = None,
+    template: str | None = None,
+    principal: str | None = None,
+    not_after: str | None = None,
+) -> str:
+    """Render the client-facing revocation instructions for one issued certificate.
+
+    Prepends a one-line identification of the certificate (who it authenticates
+    as, which template and CA produced it, how long it stays valid) to the
+    native ``certutil`` revocation procedure, then substitutes the concrete
+    serial / request id / CA configuration string into it.
+
+    Args:
+        serial: Hex serial number as recorded by the CA.
+        request_id: Request ID assigned by the CA.
+        ca_name: CA common name (e.g. ``ESSOS-CA``).
+        ca_host: Host running the CA (used to build ``host\\CA name``).
+        template: Certificate template the request used.
+        principal: Account the certificate authenticates as.
+        not_after: Expiry, already formatted for a human reader.
+
+    Returns:
+        A single client-safe string using only native Microsoft tooling.
+    """
+    ca_config = "CA_HOST\\CA_NAME"
+    if ca_host and ca_name:
+        ca_config = f"{ca_host}\\{ca_name}"
+    elif ca_name:
+        ca_config = ca_name
+
+    identity_bits: list[str] = []
+    if principal:
+        identity_bits.append(f"authenticates as {principal}")
+    if template:
+        identity_bits.append(f"issued from template {template}")
+    if ca_name:
+        identity_bits.append(f"by {ca_name}")
+    if not_after:
+        identity_bits.append(f"valid until {not_after}")
+    header = ("Certificate " + ", ".join(identity_bits) + ".\n") if identity_bits else ""
+
+    body = MANUAL_ISSUED_CERTIFICATE.replace("CA_CONFIG", ca_config)
+    body = body.replace("SERIAL_NUMBER", str(serial) if serial else "SERIAL_NUMBER")
+    body = body.replace(
+        "REQUEST_ID", str(request_id) if request_id is not None else "REQUEST_ID"
+    )
+    return header + body
 
 
 def remediation_template_for_kind(kind: str | None) -> str:
@@ -290,6 +421,9 @@ __all__ = [
     "MANUAL_RBCD",
     "MANUAL_KEYCREDENTIALLINK",
     "MANUAL_MACHINE_ACCOUNT",
+    "MANUAL_ISSUED_CERTIFICATE",
+    "KIND_ISSUED_CERTIFICATE",
+    "issued_certificate_remediation",
     "KIND_REMEDIATION_TEMPLATE",
     "remediation_template_for_kind",
 ]

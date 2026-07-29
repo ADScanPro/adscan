@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import os
 import sys
 
+from adscan_core.outbound_links import cta_markup, cta_url
 from adscan_internal import print_error, print_info, print_warning, telemetry
 
 
@@ -16,13 +17,14 @@ class SessionPreflightConfig:
 
     Args:
         command_name: Command identifier used in telemetry event names.
-        docs_utm_medium: ``utm_medium`` value used for troubleshooting links.
+        docs_placement: Outbound-link placement (``adscan_core.outbound_links``)
+            used for the troubleshooting link this command shows.
         allow_unsafe_override: Whether the command may offer an interactive
             override after ``adscan check --fix`` already attempted repairs.
     """
 
     command_name: str
-    docs_utm_medium: str
+    docs_placement: str
     allow_unsafe_override: bool
 
 
@@ -65,17 +67,13 @@ def _build_issue_counts(last_check: dict[str, object]) -> dict[str, int]:
 
 def _print_support_links(
     *,
-    docs_url: str,
-    docs_tracking_key: str,
+    docs_placement: str,
     track_docs_link_shown: Callable[[str, str], None],
 ) -> None:
     """Render the standard troubleshooting and support guidance."""
 
-    print_info(
-        "💡 Troubleshooting guide: "
-        f"[link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
-    )
-    track_docs_link_shown(docs_tracking_key, docs_url)
+    print_info(f"💡 Troubleshooting guide: {cta_markup(docs_placement)}")
+    track_docs_link_shown(docs_placement, cta_url(docs_placement))
     print_info("Need help? Open an issue: https://github.com/ADscanPro/adscan/issues")
     print_info("Or ask in Discord: https://discord.com/invite/fXBR3P8H74")
 
@@ -98,10 +96,6 @@ def run_session_preflight(
     preflight_fix_attempted = bool(last_check.get("fix_mode"))
     preflight_overridden = False
     event_prefix = f"session_{config.command_name}"
-    docs_url = (
-        "https://www.adscanpro.com/docs/guides/troubleshooting"
-        f"?utm_source=cli&utm_medium={config.docs_utm_medium}"
-    )
 
     if not preflight_ok:
         issue_counts = _build_issue_counts(last_check)
@@ -133,8 +127,7 @@ def run_session_preflight(
                 "Starting anyway is not recommended and may be unsafe (results may be unreliable)."
             )
             _print_support_links(
-                docs_url=docs_url,
-                docs_tracking_key=config.docs_utm_medium,
+                docs_placement=config.docs_placement,
                 track_docs_link_shown=deps.track_docs_link_shown,
             )
             proceed_anyway = deps.confirm_ask(
@@ -163,8 +156,7 @@ def run_session_preflight(
         else:
             print_error("ADscan preflight checks failed.")
             _print_support_links(
-                docs_url=docs_url,
-                docs_tracking_key=config.docs_utm_medium,
+                docs_placement=config.docs_placement,
                 track_docs_link_shown=deps.track_docs_link_shown,
             )
             deps.exit(1)

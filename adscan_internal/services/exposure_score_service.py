@@ -61,7 +61,11 @@ from typing import Any, Mapping, Sequence
 from adscan_internal.services.attack_step_support_registry import (
     classify_relation_support,
 )
-from adscan_internal.services.path_state import _PROVEN_STATUSES, PathState
+from adscan_internal.services.path_state import (
+    _PROVEN_STATUSES,
+    NO_EXPOSURE_STATUSES,
+    PathState,
+)
 
 # --------------------------------------------------------------------------- #
 # Tunables — the weights/shape are the only thing to tune; the union form and
@@ -109,13 +113,13 @@ _PROOF_WEIGHT: dict[str, float | None] = {
     "failed": 0.4,
     "error": 0.4,
     "post_ex_failed": 0.4,
-    # Avenue ADscan observed CLOSED with certainty by the environment's own
-    # configuration (LDAP signing/CBT, no ADCS, MAQ==0, single-DC reflection).
-    # Not presently exploitable → excluded from the exposure score (positive fact).
-    "closed_by_configuration": None,
-    # Not runnable / no reachable surface — excluded from the score.
-    "unsupported": None,
-    "unavailable": None,
+    # No client exposure at all → excluded from the score entirely:
+    # ``closed_by_configuration`` (an avenue the environment's own configuration
+    # closed, observed with certainty — a POSITIVE fact) and ``unsupported`` /
+    # ``unavailable`` (an ADscan data gap, no reachable surface). Unpacked from
+    # the shared vocabulary so the exposure score and the remediation rankings
+    # exclude exactly the same paths — one definition, not two tables.
+    **{status: None for status in NO_EXPOSURE_STATUSES},
 }
 
 #: Evidence base for a safety-abstention destructive avenue (``blocked`` +
@@ -343,6 +347,178 @@ def count_report_tiers(
         if tier is not None:
             counts[tier] += 1
     return counts
+
+
+def derive_posture_path_inputs(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    paths_to_da: int | None = None,
+) -> tuple[int, int]:
+    """Return ``(paths_to_da, tier0_exposed)`` for :func:`compute_posture_score`.
+
+    The **single source of truth** for the two path-derived posture-score inputs,
+    shared by the PRO report and the LITE HTML exposure report so the SAME
+    workspace always yields the SAME score on both tiers. A client who sees one
+    number in the free tier and a different one after buying has a number they
+    cannot trust, so this derivation must never be re-implemented per surface.
+
+    Both inputs are class-driven via the canonical report-tier split
+    (:func:`report_tier_for_record`), never via a per-record ``is_tier_zero``
+    flag:
+
+    * ``paths_to_da`` — the **T1** count (``domain_breaker``): paths that reach
+      full domain compromise. Counted per PATH, not deduplicated by
+      source/target/relations: two distinct chains to the same target are two
+      distinct ways in, and the score's path penalty is meant to reflect that.
+    * ``tier0_exposed`` — the count of **distinct targets** reached by **T1 or
+      T2** paths (the canonical :data:`_TIER0_COMPROMISE_CLASSES`: full domain
+      compromise plus Tier-0 host footholds). Targets are compared
+      case-insensitively so ``ESSOS.LOCAL`` and ``essos.local`` are one asset.
+      **T3 (``privileged_escalator``) is deliberately EXCLUDED**: control of a
+      Tier-0 escalation group (Cert Publishers, DnsAdmins, the Operators) is a
+      privilege-escalation enabler, not Tier-0 asset exposure on its own, and
+      counting it inflates the penalty. Including T3 was exactly the defect that
+      made LITE render 0/100 where PRO rendered 2/100 on the same workspace.
+
+    Args:
+        records: Attack-path records carrying ``compromise_class`` and
+            ``target`` (as produced by ``get_attack_path_summaries`` and
+            persisted into ``attack_paths_snapshot.json``).
+        paths_to_da: Optional pre-resolved T1 count. Callers that already
+            resolved it from the engine-stamped ``exposure_kpis`` ``path_axis``
+            block (the PRO report's preferred source) pass it here so this
+            helper does not recount; every other caller leaves it ``None`` and
+            gets the records-derived T1 count. The two agree by construction.
+
+    Returns:
+        A ``(paths_to_da, tier0_exposed)`` tuple of non-negative ints.
+    """
+    tier0_targets: set[str] = set()
+    t1_count = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        tier = report_tier_for_record(record)
+        if tier == "T1":
+            t1_count += 1
+        if tier in {"T1", "T2"}:
+            target = str(record.get("target") or "").strip().lower()
+            if target:
+                tier0_targets.add(target)
+    resolved_da = t1_count if paths_to_da is None else max(0, int(paths_to_da))
+    return resolved_da, len(tier0_targets)
+
+
+@dataclass(frozen=True)
+class DomainUserReach:
+    """How much of the domain's user population a compromise class reaches.
+
+    The blast-radius figure in human terms. "25 of 31 paths" is an inventory
+    count; "10 of 10 domain users hold a path to full domain compromise" is the
+    same evidence in the unit a CISO budgets in, and it is the sentence the
+    paid report leads with.
+
+    Attributes:
+        affected: Distinct domain users holding at least one path of the
+            requested class.
+        total: The domain's enabled user population (the denominator).
+        all_users: A contributing path expanded through a broad group (Domain
+            Users / Authenticated Users / Everyone), so the reach is the whole
+            population by construction rather than by enumeration.
+        available: There was a KPI block to read. ``False`` means the artifact
+            predates the KPI engine and the caller should say nothing at all
+            rather than render a zero it cannot stand behind.
+    """
+
+    affected: int = 0
+    total: int = 0
+    all_users: bool = False
+    available: bool = False
+
+    @property
+    def pct(self) -> float:
+        """Share of the domain population, saturating at 100."""
+        if self.total > 0:
+            return min(100.0, round(self.affected / self.total * 100.0, 1))
+        return 100.0 if self.all_users else 0.0
+
+    @property
+    def is_every_account(self) -> bool:
+        """True when every account in the domain is affected."""
+        return bool(self.all_users or (self.total > 0 and self.affected >= self.total))
+
+
+def derive_domain_user_reach(
+    domains: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    *,
+    compromise_classes: Sequence[str] = ("domain_breaker",),
+) -> DomainUserReach:
+    """Return the user-population reach of ``compromise_classes`` across domains.
+
+    Reads the engine-stamped ``exposure_kpis`` ``user_axis`` block VERBATIM —
+    the single source of truth written by :func:`compute_exposure_kpis`. Never
+    recomputed from paths here: a second derivation is how the free and paid
+    tiers end up quoting different numbers off one scan.
+
+    Per-domain the requested classes are unioned (capped at that domain's own
+    population), then summed across domains, which is sound because the counts
+    are domain-disjoint. A broad-group expansion saturates the domain to its
+    full population.
+
+    Args:
+        domains: Either the ``technical_report["domains"]`` mapping or an
+            iterable of per-domain dicts, each optionally carrying an
+            ``exposure_kpis`` block.
+        compromise_classes: Which classes to union. Defaults to the headline
+            one, ``domain_breaker`` (full domain compromise).
+
+    Returns:
+        A :class:`DomainUserReach`. ``available`` is False when no domain
+        carried a KPI block.
+    """
+    entries = list(domains.values()) if isinstance(domains, Mapping) else list(domains)
+
+    affected = 0
+    total = 0
+    any_all_users = False
+    available = False
+
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        kpis = entry.get("exposure_kpis")
+        if not isinstance(kpis, Mapping):
+            continue
+        available = True
+        domain_users = max(0, int(kpis.get("domain_user_count", 0) or 0))
+        total += domain_users
+        user_axis = kpis.get("user_axis")
+        if not isinstance(user_axis, Mapping):
+            continue
+        domain_affected = 0
+        domain_all_users = False
+        for class_name in compromise_classes:
+            bucket = user_axis.get(class_name)
+            if not isinstance(bucket, Mapping):
+                continue
+            any_bucket = bucket.get("any")
+            if not isinstance(any_bucket, Mapping):
+                continue
+            domain_affected = max(
+                domain_affected, max(0, int(any_bucket.get("count", 0) or 0))
+            )
+            domain_all_users = domain_all_users or bool(any_bucket.get("all_users"))
+        if domain_all_users and domain_users > 0:
+            domain_affected = domain_users
+        affected += domain_affected
+        any_all_users = any_all_users or domain_all_users
+
+    return DomainUserReach(
+        affected=affected,
+        total=total,
+        all_users=any_all_users,
+        available=available,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1055,8 +1231,10 @@ def _build_explanation(
 
 
 __all__ = [
+    "DomainUserReach",
     "ExposureScore",
     "ExposureContributor",
     "compute_exposure_score",
     "compute_exposure_kpis",
+    "derive_domain_user_reach",
 ]

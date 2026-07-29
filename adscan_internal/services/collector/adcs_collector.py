@@ -62,6 +62,41 @@ from adscan_internal.services.smb_transport import SMBConfig
 from adscan_core.rich_output import print_exception
 
 # ---------------------------------------------------------------------------
+# CA identity handling
+# ---------------------------------------------------------------------------
+
+# Win32 ACCESS_DENIED, as surfaced by the CSRA/ICertAdminD2 fault. Reading a CA
+# security descriptor requires CA-admin rights, so this is the expected answer
+# for any ordinary domain account — not a failure.
+_CA_ACCESS_DENIED_MARKERS = ("0x80070005", "access_denied", "access denied")
+
+
+def _is_expected_ca_security_denial(exc: BaseException) -> bool:
+    """Return whether a GetCASecurity error is the normal not-CA-admin denial."""
+    return any(marker in str(exc).lower() for marker in _CA_ACCESS_DENIED_MARKERS)
+
+
+def _register_ca_identity(ca_name: str, ca_host: str) -> None:
+    """Register a CA's names with the telemetry sanitizer as soon as they resolve.
+
+    A CA common name follows ``<ORG>-<DCHOST>-CA``, so it publishes the
+    customer's organisation name and a DC hostname. It is not a computer account
+    and never appears in the workspace's ``enabled_computers.txt``, so the
+    hostname net had nothing to match — and the name reached the recording
+    verbatim inside vendor exception text such as
+    ``GetCASecurity failed for <CA>: ...``.
+
+    Registering here scrubs every occurrence in the exported buffer, including
+    ones recorded before this point and ones inside strings this module never
+    formats itself.
+    """
+    try:
+        telemetry.add_known_hostname(ca_name, ca_host)
+    except Exception:  # pragma: no cover - best effort, never break collection
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Attribute lists per kind
 # ---------------------------------------------------------------------------
 
@@ -975,10 +1010,12 @@ class ADCSCollector:
         ca_host = str(ca.properties.get("dns_hostname") or "").strip()
         if not ca_host or not ca_name:
             return []
+        _register_ca_identity(ca_name, ca_host)
         if is_ip_address(ca_host):
             print_info_debug(
-                f"adcs GetCASecurity skipped for {ca_name}: only an IP is "
-                "available for the CA host (need an FQDN for Kerberos DCOM)"
+                f"adcs GetCASecurity skipped for {mark_sensitive(ca_name, 'hostname')}: "
+                "only an IP is available for the CA host "
+                "(need an FQDN for Kerberos DCOM)"
             )
             return []
 
@@ -1004,8 +1041,9 @@ class ADCSCollector:
 
         if not username or (not ccache_path and not password and not nt_hash):
             print_info_debug(
-                f"adcs GetCASecurity skipped for {ca_name}: no Kerberos ccache "
-                "and no NTLM/PtH secret recoverable (unauthenticated scan)"
+                f"adcs GetCASecurity skipped for {mark_sensitive(ca_name, 'hostname')}: "
+                "no Kerberos ccache and no NTLM/PtH secret recoverable "
+                "(unauthenticated scan)"
             )
             return []
 
@@ -1033,7 +1071,8 @@ class ADCSCollector:
         )
         print_info_debug(
             f"adcs GetCASecurity read attempted ca_host="
-            f"{mark_sensitive(ca_host, 'hostname')} ca_name={ca_name} source={source}"
+            f"{mark_sensitive(ca_host, 'hostname')} "
+            f"ca_name={mark_sensitive(ca_name, 'hostname')} source={source}"
         )
 
         sd_bytes = None
@@ -1043,24 +1082,39 @@ class ADCSCollector:
                 if err is not None:
                     raise err
         except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {rich.markup.escape(str(exc))}"
+            if _is_expected_ca_security_denial(exc):
+                # Reading the CA security descriptor requires CA-admin rights,
+                # so ACCESS_DENIED is the NORMAL outcome for the vast majority
+                # of authenticated scans. Reporting the expected answer as an
+                # error told the operator something had gone wrong on nearly
+                # every run against a domain with ADCS, and sent an exception to
+                # error tracking for a case that is not one.
+                print_info_debug(
+                    "adcs GetCASecurity not permitted for "
+                    f"{mark_sensitive(ca_name, 'hostname')} (CA-admin rights "
+                    f"required): {detail}"
+                )
+                return []
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(
-                f"adcs GetCASecurity read failed for {ca_name}: "
-                f"{type(exc).__name__}: {rich.markup.escape(str(exc))}"
+                f"adcs GetCASecurity read failed for "
+                f"{mark_sensitive(ca_name, 'hostname')}: {detail}"
             )
             return []
 
         edges = parse_ca_security_edges(sd_bytes, ca.object_id)
         if sd_bytes is None:
             print_info_debug(
-                f"adcs GetCASecurity read failed for {ca_name}: no security "
+                f"adcs GetCASecurity read failed for "
+                f"{mark_sensitive(ca_name, 'hostname')}: no security "
                 "descriptor returned (DCOM read error)"
             )
         else:
             print_info_debug(
                 f"adcs GetCASecurity parsed {len(edges)} ManageCA/ManageCertificates "
-                f"edge(s) for {ca_name}"
+                f"edge(s) for {mark_sensitive(ca_name, 'hostname')}"
             )
         return edges
 
@@ -1082,6 +1136,7 @@ class ADCSCollector:
         for ca in cas:
             ca_host = str(ca.properties.get("dns_hostname") or "").strip()
             ca_name = ca.name.split("@", 1)[0] if ca.name else ""
+            _register_ca_identity(ca_name, ca_host)
             registry_result: CARegistryProbeResult | None = None
             web_result: WebEnrollmentProbeResult | None = None
 

@@ -444,6 +444,19 @@ def _sync_skew_to_cache(client: Any) -> None:
         pass
 
 
+def get_realm_skew(realm: str) -> datetime.timedelta | None:
+    """Return the clock skew currently applied to ``realm``, if any.
+
+    Read-only accessor for diagnostics: a Kerberos auth failure is only
+    interpretable alongside the skew correction that was in force when the
+    request was built. Never raises.
+    """
+    try:
+        return _REALM_SKEW_CACHE.get((realm or "").upper())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def seed_realm_skew(realm: str, offset_seconds: float) -> None:
     """Proactively seed the realm clock-skew cache from a MEASURED DC offset.
 

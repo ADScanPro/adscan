@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "10.1.0"
+version = "11.0.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -175,4 +175,4 @@ include = ["adscan_core*", "adscan_launcher*"]
 
 [tool.setuptools.package-data]
 adscan_launcher = ["assets/**/*.yml", "assets/**/*.yaml"]
-adscan_internal = ["pro/reporting/templates/*.html", "assets/demo_workspace/*.json", "assets/report_samples/*.pdf", "assets/rules/*.rule"]
+adscan_internal = ["pro/reporting/templates/*.html", "pro/reporting/themes/*/theme.css", "services/report_design/_css/*.css", "assets/demo_workspace/*.json", "assets/report_samples/*.pdf", "assets/rules/*.rule"]

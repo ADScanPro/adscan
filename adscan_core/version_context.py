@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import re
@@ -87,8 +88,77 @@ def _print_info_debug(message: str) -> None:
         return
 
 
+def uv_tool_root() -> Path:
+    """Return the directory ``uv tool install`` places tool venvs in.
+
+    ``UV_TOOL_DIR`` wins when set, otherwise uv follows the XDG data dir
+    (``$XDG_DATA_HOME/uv/tools``, defaulting to ``~/.local/share/uv/tools``).
+    """
+    explicit = os.environ.get("UV_TOOL_DIR")
+    if explicit:
+        return Path(explicit)
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    base = (
+        Path(xdg_data) if xdg_data else get_effective_user_home() / ".local" / "share"
+    )
+    return base / "uv" / "tools"
+
+
+def is_uv_tool_install() -> bool:
+    """Return whether this process runs from a ``uv tool install`` venv.
+
+    Such a venv is uv-managed and ships NO ``pip``, so the pip upgrade path
+    fails with ``No module named pip`` and the launcher stays pinned against a
+    newer runtime image. ``uv tool upgrade adscan`` is the only correct command.
+
+    Detected from the UNRESOLVED ``sys.prefix``, never from
+    ``os.path.realpath(sys.executable)``: uv symlinks the venv's interpreter to
+    the real one, so resolving it collapses to something like
+    ``/usr/bin/python3.12`` and erases every trace of the tool directory. That
+    is the same symlink trap that once made pipx installs look like pip.
+
+    Two independent signals, either is sufficient:
+
+    1. ``uv-receipt.toml`` at the venv root — uv writes it into every TOOL venv
+       and into no other kind, so it also keeps a plain ``uv venv`` / project
+       ``.venv`` (a source checkout) out of this branch.
+    2. The venv sits under :func:`uv_tool_root` — covers a receipt-less or
+       future layout.
+    """
+    try:
+        prefix = Path(os.path.abspath(str(sys.prefix)))
+    except Exception:
+        return False
+
+    try:
+        if (prefix / "uv-receipt.toml").is_file():
+            return True
+    except OSError:
+        pass
+
+    try:
+        tool_root = Path(os.path.abspath(str(uv_tool_root())))
+    except Exception:
+        return False
+    candidates = [prefix]
+    try:
+        candidates.append(Path(os.path.abspath(str(sys.executable))).parent.parent)
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate == tool_root or tool_root in candidate.parents:
+            return True
+    return False
+
+
 def detect_installer() -> str:
-    """Detect installation method: ``pip`` or ``pipx``."""
+    """Detect installation method: ``pip``, ``pipx``, ``uv_tool``, ``uv`` or
+    ``source_tree``.
+
+    ``uv_tool`` is checked BEFORE the source-tree branch: a ``uv tool``-installed
+    launcher run from inside a checkout would otherwise be classified by the
+    directory it happens to be invoked from.
+    """
     pipx_home = Path(
         os.environ.get("PIPX_HOME", str(get_effective_user_home() / ".local" / "pipx"))
     )
@@ -98,6 +168,8 @@ def detect_installer() -> str:
         return "pipx"
     if "pipx" in str(exe_path).lower():
         return "pipx"
+    if is_uv_tool_install():
+        return "uv_tool"
     if _resolve_source_tree_version() is not None:
         if (
             os.environ.get("UV_ACTIVE")
@@ -373,6 +445,8 @@ __all__ = [
     "VERSION",
     "RUNTIME_CONTRACT_VERSION",
     "detect_installer",
+    "is_uv_tool_install",
+    "uv_tool_root",
     "resolve_installed_version_info",
     "get_installed_version",
     "get_source_tree_version",

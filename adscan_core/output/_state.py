@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional
 from rich.console import Console
 
 from adscan_core.theme import ADSCAN_PRIMARY  # noqa: F401 (re-exported convenience)
+from adscan_core.theme import ADSCAN_THEME
 
 # ---------------------------------------------------------------------------
 # Module-level globals
@@ -34,6 +35,10 @@ from adscan_core.theme import ADSCAN_PRIMARY  # noqa: F401 (re-exported convenie
 
 # Global console instance (will be initialized from adscan.py)
 _console: Optional[Console] = None
+
+# Themed console used until ``init_rich_output`` installs the real one (the
+# whole launcher path lives here). Built lazily by ``_get_console``.
+_fallback_console: Optional[Console] = None
 
 # Secondary console dedicated to telemetry recording.
 # This console is never shown directly to the user; it is used only to
@@ -913,10 +918,27 @@ def update_modes(
 
 
 def _get_console() -> Console:
-    """Get the global console instance."""
-    if _console is None:
-        return Console()
-    return _console
+    """Get the global console instance.
+
+    Before ``init_rich_output`` runs — the whole host-side launcher, and any
+    early startup path — this falls back to a console built HERE. That console
+    carries ``ADSCAN_THEME``, because the ``print_*`` helpers render with theme
+    style names (``panel.border.warning``, ``success``, …) and Rich raises
+    ``MissingStyle`` for a name the console's theme does not define. An
+    untheméd fallback turned every such panel into a traceback: the launcher's
+    "Reduced Network Mode" notice crashed the run on exactly this.
+
+    The fallback is cached so repeated calls share one console (spacing state,
+    recording flag). It resolves ``file`` lazily like any Rich console, so
+    stdout redirection and pytest's capture still work.
+    """
+    global _fallback_console
+
+    if _console is not None:
+        return _console
+    if _fallback_console is None:
+        _fallback_console = _TeeConsole(theme=ADSCAN_THEME)
+    return _fallback_console
 
 
 def _get_telemetry_console() -> Optional[Console]:

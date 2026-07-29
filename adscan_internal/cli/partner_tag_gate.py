@@ -18,14 +18,24 @@ This module is the single entry point for that gate. It runs at PRO startup:
   otherwise print a clear English error and refuse to start PRO. It never
   blocks waiting on stdin (that would hang ``adscan ci``).
 
+Two host-side routes satisfy this gate without any prompt, and the refusal
+message must only ever name a route that actually works:
+
+* ``adscan ci --partner-tag <tag>`` / ``adscan start --partner-tag <tag>`` —
+  the launcher validates the tag, writes ``<state>/partner.json`` (bind-mounted,
+  so it survives ``docker run --rm``) and forwards it for the current run.
+* ``ADSCAN_PARTNER_TAG`` in the host environment — forwarded into the container
+  by the launcher's env allow-list.
+
 The validation is format-only (lowercase / digits / hyphens) — there is no
-membership check against any list; the registry token is the real gate.
+membership check against any list; the registry token is the real gate. The
+format contract itself lives in ``adscan_core.telemetry`` so the host launcher
+and this gate validate identically.
 """
 
 from __future__ import annotations
 
 import os
-import re
 
 from adscan_core import telemetry
 from adscan_core.rich_output import (
@@ -38,21 +48,15 @@ from adscan_core.rich_output import (
 from adscan_internal.interaction import is_non_interactive
 from adscan_core.rich_output import print_exception
 
-# Format contract for a partner tag: starts with a lowercase letter or digit,
-# then 1-40 more of lowercase letters, digits, or hyphens (2-41 chars total).
-# Deliberately strict: no uppercase, no spaces, no underscores, no leading
-# hyphen — this is a URL/telemetry-safe slug like "glenn-mssp".
-_PARTNER_TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
-
 _MAX_PROMPT_ATTEMPTS = 3
 
 
 def validate_partner_tag(tag: str) -> bool:
     """Return True when ``tag`` matches the partner-tag format contract.
 
-    Accepts e.g. ``glenn-mssp``; rejects empty strings, uppercase, whitespace,
-    odd characters, and tags longer than 41 characters. Pure function — safe to
-    unit test with no I/O.
+    Thin delegation to :func:`adscan_core.telemetry.validate_partner_tag`, which
+    owns the format so the host launcher (``--partner-tag``) and this gate can
+    never disagree about which tags are acceptable.
 
     Args:
         tag: Candidate partner tag.
@@ -60,9 +64,7 @@ def validate_partner_tag(tag: str) -> bool:
     Returns:
         True if the tag is well-formed, False otherwise.
     """
-    if not isinstance(tag, str):
-        return False
-    return bool(_PARTNER_TAG_PATTERN.match(tag.strip()))
+    return telemetry.validate_partner_tag(tag)
 
 
 def is_pro_mode(license_mode: object) -> bool:
@@ -137,7 +139,7 @@ def _render_intro_panel(console: object) -> None:
         "continue. It links this install to your account and is stored on this "
         "machine, so you are asked only once.\n\n"
         "[dim]Format: lowercase letters, digits and hyphens "
-        "(for example, glenn-mssp).[/dim]\n"
+        "(for example, acme-mssp).[/dim]\n"
     )
     panel = Panel(
         body,
@@ -197,14 +199,22 @@ def ensure_partner_tag_for_pro(license_mode: object) -> bool:
         return True
 
     if is_non_interactive():
-        # Non-interactive: only the env var can satisfy the gate. We must never
-        # block on stdin here (it would hang `adscan ci`). `partner_tag_required`
-        # already consulted the env var via `resolve_partner_tag`, so reaching
-        # this point means it is absent.
+        # Non-interactive: the tag must already be resolvable (persisted file or
+        # forwarded env var). We must never block on stdin here (it would hang
+        # `adscan ci`). `partner_tag_required` already consulted both via
+        # `resolve_partner_tag`, so reaching this point means neither is present.
+        #
+        # The recovery named here MUST be a route that works from the host:
+        # `--partner-tag` is a launcher flag that persists the tag to the
+        # bind-mounted state dir, and ADSCAN_PARTNER_TAG is in the launcher's
+        # env allow-list. Never instruct the operator to set a variable the
+        # launcher does not forward (locked by a contract test).
         print_error(
-            "ADscan PRO requires a partner tag, but none was provided. "
-            "Set ADSCAN_PARTNER_TAG to the tag from your onboarding email "
-            "(for example, ADSCAN_PARTNER_TAG=glenn-mssp) and re-run."
+            "ADscan PRO requires a partner tag. Re-run with --partner-tag and "
+            "the tag from your onboarding email, for example: "
+            "adscan ci --partner-tag acme-mssp. ADscan saves it on this "
+            "machine, so you only pass it once. Exporting ADSCAN_PARTNER_TAG "
+            "before the run works too."
         )
         print_info_debug(
             "Partner-tag gate refused PRO start in non-interactive mode: "
@@ -215,8 +225,9 @@ def ensure_partner_tag_for_pro(license_mode: object) -> bool:
     tag = _prompt_for_partner_tag()
     if not tag:
         print_error(
-            "A valid partner tag is required to use ADscan PRO. "
-            "Check your onboarding email and try again."
+            "A valid partner tag is required to use ADscan PRO. Check your "
+            "onboarding email and try again, or start with the tag already "
+            "supplied: adscan start --partner-tag acme-mssp."
         )
         return False
 

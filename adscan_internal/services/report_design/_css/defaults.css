@@ -1,0 +1,26 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Token floor — what a document renders on before a theme is applied.
+   Kept so a template is never token-less (e.g. a PRO render with theme="").
+   Every value here is overridden by tokens_<theme>.css, which is injected
+   later in the cascade.
+   ═══════════════════════════════════════════════════════════════════════════ */
+:root {
+  --bg-0: #070b14; --bg-1: #0b1220; --bg-2: #101a2e; --bg-3: #16243d;
+  --surface: #0e1728; --surface-2: #1a2540;
+  --line: rgba(148,163,184,0.12); --line-2: rgba(148,163,184,0.22);
+  --text: #f1f5f9; --text-2: #cbd5e1; --text-3: #94a3b8; --text-4: #64748b;
+  --accent: #1AA0AE; --accent-2: #0E6E78; --accent-3: #3CC5D3;
+  --critical: #dc2626; --critical-bg: rgba(220,38,38,0.16); --critical-bd: rgba(220,38,38,0.45);
+  --red: #ef4444; --red-bg: rgba(239,68,68,0.12); --red-bd: rgba(239,68,68,0.35);
+  --amber: #f59e0b; --amber-bg: rgba(245,158,11,0.12); --amber-bd: rgba(245,158,11,0.35);
+  --blue: #60a5fa; --blue-bg: rgba(96,165,250,0.12); --blue-bd: rgba(96,165,250,0.35);
+  --gray: #6b7280; --green: #10b981; --purple: #a855f7;
+  --font-sans: 'Inter Tight','Inter','Carlito','Liberation Sans',system-ui,sans-serif;
+  --font-serif:'Fraunces','Georgia','Times New Roman',serif;
+  --font-mono: 'JetBrains Mono','Fira Code','DejaVu Sans Mono',monospace;
+  --radius-sm: 4px; --radius: 6px; --radius-lg: 10px;
+  --mitre-0: rgba(148,163,184,0.06);
+  --mitre-1: rgba(34,211,238,0.22);
+  --mitre-2: rgba(245,158,11,0.32);
+  --mitre-3: rgba(239,68,68,0.50);
+}

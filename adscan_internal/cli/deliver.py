@@ -24,6 +24,8 @@ quality gain.
 
 from __future__ import annotations
 
+from adscan_core.version import get_version
+
 import argparse
 import asyncio
 import json
@@ -427,6 +429,53 @@ def _resolve_deliverables(args: argparse.Namespace, *, shell: object | None = No
     return ",".join(chosen)
 
 
+def _drop_unsupportable_items(
+    items: tuple[_KitItem, ...],
+    workspace_dir: Path,
+) -> tuple[_KitItem, ...]:
+    """Remove kit artefacts this workspace has no data to fill.
+
+    A paid deliverable that arrives empty is worse than one that is absent: it
+    costs the reader the time to open it, and the only thing it can say is that
+    there is nothing to say. The AD Control Coverage Report is the one artefact
+    that can legitimately have no input — it renders positive assurance from
+    ``control_evidence``, and a scan that probed nothing clear has none — so it
+    is dropped rather than shipped as a two-page explainer.
+
+    The check is deliberately narrow. Every other artefact derives from findings
+    and attack paths, which any real scan produces; a missing one there is a bug
+    to fix, not a document to suppress.
+
+    Args:
+        items: The selected kit artefacts, in canonical order.
+        workspace_dir: Source workspace carrying ``technical_report.json``.
+
+    Returns:
+        ``items`` minus anything unsupportable. Best-effort: on any failure the
+        selection is returned untouched.
+    """
+    try:
+        from adscan_internal.pro.reporting.coverage_report_databinding import (
+            build_coverage_report_databinding,
+        )
+
+        if not any(item.slug == "coverage-matrix" for item in items):
+            return items
+        context = build_coverage_report_databinding(workspace_dir)
+        if context.get("has_coverage_data"):
+            return items
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return items
+
+    print_info(
+        "Skipping the AD Control Coverage Report: this scan recorded no "
+        "verified-clear control evidence to attest."
+    )
+    return tuple(item for item in items if item.slug != "coverage-matrix")
+
+
 # ---------------------------------------------------------------------------
 # Generators — async wrappers around the existing PRO renderers
 # ---------------------------------------------------------------------------
@@ -581,7 +630,6 @@ async def _render_assessment_async(
             build_report_data_from_raw,
         )
         from adscan_internal.pro.services.report_service import (
-            _find_adscan_logo,
             ensure_report_attack_paths,
         )
 
@@ -598,7 +646,11 @@ async def _render_assessment_async(
         # map is derived on demand from ``findings``); feeding it raw made
         # the compliance engine see zero findings per requirement and
         # falsely report ~100% conformant for every framework.
-        report_data = build_report_data_from_raw(raw) if isinstance(raw, dict) else {}
+        report_data = (
+            build_report_data_from_raw(raw, workspace_dir=workspace_dir)
+            if isinstance(raw, dict)
+            else {}
+        )
         # Compute + inject attack paths the same way ``generate_report`` does.
         # The renderer expects them already present; the workspace JSON stores
         # them empty (computed on demand), so without this the kit report
@@ -613,7 +665,10 @@ async def _render_assessment_async(
             metadata=metadata,
             report_profile="full",
             frameworks=fw,
-            logo_path=_find_adscan_logo(report_theme),
+            # White-label slot only (the customer's own firm mark). ADscan's
+            # own cover mark comes from the shared brand SSOT inside the
+            # renderer, keyed on the theme — see report_service._generate_html_pdf.
+            logo_path=None,
             engine="chromium",
             renderer="cytoscape",
             template="premium",
@@ -716,7 +771,11 @@ def _generate_affected_assets_appendix(
             )
             return ()
         raw = json.loads(report_json.read_text(encoding="utf-8"))
-        report_data = build_report_data_from_raw(raw) if isinstance(raw, dict) else {}
+        report_data = (
+            build_report_data_from_raw(raw, workspace_dir=workspace_dir)
+            if isinstance(raw, dict)
+            else {}
+        )
         # Compute + inject attack paths the same way the assessment report does,
         # so the appendix's correlated assets match the PDF exactly.
         ensure_report_attack_paths(report_data, workspace_dir)
@@ -931,7 +990,11 @@ def _generate_navigator_extras(
     # ``vulnerabilities`` maps (the raw JSON stores them empty -- the same
     # root cause that made the compliance section render ~100% conformant).
     # Without this the navigator layer was always empty of techniques.
-    report_data = build_report_data_from_raw(report) if isinstance(report, dict) else {}
+    report_data = (
+        build_report_data_from_raw(report, workspace_dir=workspace_dir)
+        if isinstance(report, dict)
+        else {}
+    )
 
     # Pick the domain with the MOST findings rather than the first non-empty
     # one, so a multi-domain kit targets the domain that actually carries the
@@ -1161,6 +1224,14 @@ async def run_deliver(args: argparse.Namespace) -> int:
 
     client, engagement = _resolve_client_meta(args)
 
+    items = _drop_unsupportable_items(items, workspace_dir)
+    if not items:
+        print_error(
+            "This workspace carries no data for the selected deliverables. "
+            "Widen the selection with --only, or run a scan against the domain first."
+        )
+        return 2
+
     try:
         frameworks = _resolve_frameworks(args)
     except ValueError as exc:
@@ -1174,7 +1245,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
         "workspace_name": display_name,
         "report_date": time.strftime("%B %d, %Y"),
         "report_type": "Active Directory Security Assessment",
-        "report_version": "ADscan",
+        "report_version": get_version(),
         "client_name": client or "",
         "engagement_id": engagement or "",
     }

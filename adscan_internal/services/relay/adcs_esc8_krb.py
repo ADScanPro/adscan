@@ -24,6 +24,7 @@ import os
 
 from adscan_core import telemetry
 from adscan_internal.rich_output import print_info_debug, print_success
+from adscan_internal.services.adcs.esc_cleanup import format_certificate_not_after
 from adscan_internal.services.relay.adcs_esc8 import (
     AdcsEsc8RelayConfig,
     _AdcsWebEnrollmentClient,
@@ -121,6 +122,8 @@ class AdcsEsc8KrbRelayTarget:
                 "request_id": request_id,
                 "cert_serial": f"{cert.serial_number:X}",
                 "cert_subject": subject,
+                "cert_not_after": format_certificate_not_after(cert),
+                "template": self.config.template,
                 "endpoint": client.endpoint,
             },
         )

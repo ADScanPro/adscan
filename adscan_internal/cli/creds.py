@@ -38,6 +38,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive, print_panel
+from adscan_core.outbound_links import cta_url
 from adscan_core.rich_output import confirm_ask
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.cli.ci_events import emit_event, emit_phase
@@ -2319,6 +2320,10 @@ def add_credential(
     # Initial validations
     user = user.lower()
     credential_verified = False
+    # Verification was attempted but could not run (no DC/KDC IP). Distinct from
+    # ``credential_verified``: the credential is still stored, just unverified —
+    # and the second verification site must not re-run the same doomed check.
+    credential_verification_skipped = False
     credential_source_verified = False
     credential_persisted = False
     store_update_skipped = False
@@ -2412,10 +2417,11 @@ def add_credential(
                         "secret must not purge it."
                     )
                     return
-                _purge_failed_domain_credential(
+                if _dispose_or_retain_unverified_domain_credential(
                     shell, domain=domain, user=user, ui_silent=ui_silent
-                )
-                return
+                ):
+                    return
+                credential_verification_skipped = True
         if trusted_manual_validation:
             credential_verified = True
             print_info_verbose(
@@ -2596,7 +2602,11 @@ def add_credential(
                 "[creds] Treating domain credential as manually validated; "
                 "live verification skipped."
             )
-        elif verify_credential and not credential_verified:
+        elif (
+            verify_credential
+            and not credential_verified
+            and not credential_verification_skipped
+        ):
             if _verify_domain_credentials(
                 shell,
                 domain,
@@ -2624,10 +2634,11 @@ def add_credential(
                         "secret must not purge it."
                     )
                     return
-                _purge_failed_domain_credential(
+                if _dispose_or_retain_unverified_domain_credential(
                     shell, domain=domain, user=user, ui_silent=ui_silent
-                )
-                return
+                ):
+                    return
+                credential_verification_skipped = True
 
         if (cred is not None) and (allow_empty_credential or cred != "") and not skip_store_update:
             # Update domain credential using the service
@@ -2762,7 +2773,7 @@ def add_credential(
                                     show_hint(
                                         victory_type="domain_compromised",
                                         message="Valid credentials found!",
-                                        docs_link="https://www.adscanpro.com/share?utm_source=cli&utm_medium=victory_domain_compromised",
+                                        docs_link=cta_url("victory_domain_compromised"),
                                     )
                             else:
                                 # Try importing from adscan module if available
@@ -2781,7 +2792,7 @@ def add_credential(
                                             adscan_module.show_victory_hint_subtle(
                                                 victory_type="domain_compromised",
                                                 message="Valid credentials found!",
-                                                docs_link="https://www.adscanpro.com/share?utm_source=cli&utm_medium=victory_domain_compromised",
+                                                docs_link=cta_url("victory_domain_compromised"),
                                             )
                         except Exception:
                             # Victory hints are optional, don't break flow if they fail
@@ -2805,6 +2816,11 @@ def add_credential(
                         verification_status=(
                             "manually_validated"
                             if trusted_manual_validation
+                            # Verification was requested but could not run (no
+                            # DC/KDC IP): the credential is stored, but claiming
+                            # it was "verified" would be a lie in the timeline.
+                            else "unverified"
+                            if credential_verification_skipped
                             else "verified"
                             if verify_credential or credential_verified
                             else "trusted_import"
@@ -3256,16 +3272,102 @@ def _verify_domain_credentials(
             return bool(shell.verify_domain_credentials(domain, user, cred))
 
 
+def _domain_credential_verification_was_skipped(shell: Any) -> bool:
+    """Whether the last domain-credential verification never actually ran.
+
+    ``verify_domain_credentials`` returns ``False`` for two outcomes that are
+    not the same thing: the DC answered and rejected the credential, and the
+    verification could not be attempted at all (no DC/KDC IP resolvable). Only
+    the first is a failure; the second is flagged on the shell.
+    """
+    return bool(getattr(shell, "_last_domain_credential_verification_skipped", False))
+
+
+def _dispose_or_retain_unverified_domain_credential(
+    shell: Any, *, domain: str, user: str, ui_silent: bool
+) -> bool:
+    """Resolve a non-successful domain verification into abort-or-continue.
+
+    * The DC rejected the credential (or it is valid but unusable as-is): the
+      disposal policy in :func:`_purge_failed_domain_credential` applies and the
+      caller must abort without storing anything.
+    * Verification was SKIPPED because no DC/KDC IP could be resolved: nothing
+      rejected the credential, so it is retained and STORED unverified and the
+      caller carries on. Treating this as a failure silently dropped a perfectly
+      good credential and then told the operator their password was wrong.
+
+    Args:
+        shell: Shell carrying the last verification outcome + credential store.
+        domain: Domain the credential belongs to.
+        user: Username the credential belongs to.
+        ui_silent: Suppress operator-facing panels (internal/sub-call flows).
+
+    Returns:
+        ``True`` when the caller must abort, ``False`` when it must continue and
+        store the credential unverified.
+    """
+    if not _domain_credential_verification_was_skipped(shell):
+        _purge_failed_domain_credential(
+            shell, domain=domain, user=user, ui_silent=ui_silent
+        )
+        return True
+
+    marked_user = mark_sensitive(user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    message = (
+        f"Credential for '{marked_user}' in domain {marked_domain} is stored "
+        "UNVERIFIED: no domain controller IP could be resolved, so verification "
+        "was skipped. Supply the DC IP (--dc-ip, or `set pdc <IP>`) to verify it."
+    )
+    if ui_silent:
+        print_info_verbose(message)
+    else:
+        print_warning(message)
+    return False
+
+
 def _should_delete_failed_domain_credential(shell: Any) -> bool:
-    """Return True only for genuinely invalid credentials that should be purged."""
+    """Return True only for credentials the DC POSITIVELY rejected.
+
+    Two conditions, both required — the second is what makes the gate fail-safe:
+
+    * the status is one that means "this secret does not work"
+      (``INVALID`` / ``USER_NOT_FOUND``), and
+    * the verdict is DEFINITIVE — the server named the reason
+      (``KDC_ERR_PREAUTH_FAILED``, ``STATUS_LOGON_FAILURE``,
+      ``invalidCredentials``, an explicit account-state code).
+
+    "We could not tell why authentication failed" is not evidence that a secret
+    is wrong. Treating the two as the same is how a DC machine-account hash that
+    ADscan had just recovered end to end — and authenticated with — was declared
+    invalid and deleted. A verification result that predates the definitive flag
+    (or any object that does not carry it) is treated as NOT definitive, so the
+    conservative branch is the default.
+    """
     from adscan_internal.services.credential_service import CredentialStatus
 
     last_result = getattr(shell, "_last_domain_credential_verification_result", None)
     status = getattr(last_result, "status", None)
-    return status in {
-        CredentialStatus.INVALID,
-        CredentialStatus.USER_NOT_FOUND,
-    }
+    if status not in {CredentialStatus.INVALID, CredentialStatus.USER_NOT_FOUND}:
+        return False
+    return bool(getattr(last_result, "verdict_is_definitive", False))
+
+
+def _domain_credential_failure_was_unclassified(shell: Any) -> bool:
+    """Whether the last failure looks like a rejection nobody could explain.
+
+    Distinguishes "the account is fine but needs a password change" from
+    "authentication failed and the domain controller did not say why", so the
+    operator is not told a password rotation is required when nothing of the
+    sort was observed.
+    """
+    from adscan_internal.services.credential_service import CredentialStatus
+
+    last_result = getattr(shell, "_last_domain_credential_verification_result", None)
+    status = getattr(last_result, "status", None)
+    if status in {CredentialStatus.INVALID, CredentialStatus.USER_NOT_FOUND}:
+        return not bool(getattr(last_result, "verdict_is_definitive", False))
+    return status in {CredentialStatus.ERROR, CredentialStatus.TIMEOUT}
 
 
 def _purge_failed_domain_credential(
@@ -3278,12 +3380,15 @@ def _purge_failed_domain_credential(
 
     * A credential that is valid-but-unusable (PASSWORD_MUST_CHANGE /
       PASSWORD_EXPIRED) or whose failure was transient/unclassified is NEVER
-      purged — only genuinely INVALID / USER_NOT_FOUND credentials are deletion
+      purged — only credentials the DC POSITIVELY rejected are deletion
       candidates (gated by :func:`_should_delete_failed_domain_credential`).
-    * Even then the operator confirms before the irreversible delete
-      (default yes). ``ui_silent`` (internal recovery sub-calls) and
-      non-interactive runs auto-resolve to the default, preserving the prior
-      auto-purge behaviour for batch/CI.
+    * Even then the delete is opt-IN for the operator: the prompt's default is
+      NO, so an unattended run — where the answer is auto-resolved — never
+      destroys stored state on its own. ``ui_silent`` (internal sub-calls such
+      as ``add_credential`` re-verifying a secret the operator just supplied)
+      does not prompt and purges only that same named rejection, because
+      keeping a secret the DC proved wrong just feeds the next bad-password
+      attempt into the domain's lockout counter.
 
     Returns ``True`` iff the credential was deleted.
     """
@@ -3295,8 +3400,11 @@ def _purge_failed_domain_credential(
     marked_domain = mark_sensitive(domain, "domain")
 
     if not _should_delete_failed_domain_credential(shell):
-        # Valid but not usable as-is (e.g. password change required), expired, or
-        # a transient/unclassified failure — keep a non-invalid credential.
+        # Three different reasons to keep, and the operator must be able to tell
+        # them apart: verification never ran, the credential is correct but not
+        # usable as-is, or authentication failed for a reason the DC did not
+        # name. Describing the third as the second told operators a password
+        # change was required when nothing of the sort had been observed.
         if not ui_silent:
             if getattr(shell, "_last_domain_credential_verification_skipped", False):
                 # Verification never ran (the DC/KDC IP could not be resolved).
@@ -3308,6 +3416,13 @@ def _purge_failed_domain_credential(
                     "(the PDC/DC IP is unknown), so it is retained UNVERIFIED. "
                     "It remains usable."
                 )
+            elif _domain_credential_failure_was_unclassified(shell):
+                print_warning(
+                    f"Credential for '[bold]{marked_user}[/bold]' in domain "
+                    f"[bold]{marked_domain}[/bold] is KEPT — authentication did not "
+                    "succeed, but the domain controller did not report the credential "
+                    "as wrong, so it has NOT been proven invalid."
+                )
             else:
                 print_warning(
                     f"Credential for '[bold]{marked_user}[/bold]' in domain "
@@ -3316,13 +3431,18 @@ def _purge_failed_domain_credential(
                 )
         return False
 
+    # Reaching here means the server NAMED the rejection, so the secret provably
+    # does not work: keeping it only feeds another bad-password attempt into the
+    # domain's lockout counter. Silent internal sub-calls purge it; the operator
+    # is asked, and the question defaults to NO so an unattended run — where the
+    # answer is auto-resolved — never destroys stored state on its own.
     if not ui_silent:
         print_error(
-            f"Incorrect credentials for user '[bold]{marked_user}[/bold]' in "
-            f"domain [bold]{marked_domain}[/bold]."
+            f"The domain controller rejected the credential for user "
+            f"'[bold]{marked_user}[/bold]' in domain [bold]{marked_domain}[/bold]."
         )
         if not confirm_ask(
-            f"Delete the invalid stored credential for '{user}'?", default=True
+            f"Delete the rejected stored credential for '{user}'?", default=False
         ):
             print_info(
                 f"Kept the credential for '{user}' in domain {domain} (not deleted)."
@@ -3333,15 +3453,15 @@ def _purge_failed_domain_credential(
         domains_data=shell.domains_data, domain=domain, username=user
     )
     if deleted:
-        if not ui_silent:
-            print_warning(
-                f"Existing invalid credential for '[bold]{marked_user}[/bold]' in "
-                f"domain [bold]{marked_domain}[/bold] has been deleted."
+        if ui_silent:
+            print_info_verbose(
+                f"[ui_silent] The rejected credential for '{marked_user}' in domain "
+                f"{marked_domain} has been deleted."
             )
         else:
-            print_info_verbose(
-                f"[ui_silent] Existing credential for '{marked_user}' in domain "
-                f"{marked_domain} has been deleted."
+            print_warning(
+                f"The rejected credential for '[bold]{marked_user}[/bold]' in "
+                f"domain [bold]{marked_domain}[/bold] has been deleted."
             )
         if getattr(shell, "current_workspace_dir", None) and hasattr(
             shell, "save_workspace_data"
@@ -5061,6 +5181,54 @@ def _relativize_credential_loot_path(shell: Any, file_path: str) -> str:
     return normalized_path
 
 
+def _split_smb_loot_path(file_path: str) -> tuple[str, str, str] | None:
+    """Return ``(host, share, remote_tail)`` for a local SMB loot path.
+
+    Share spidering mirrors the remote tree locally, so the remote location of a
+    recovered secret is recoverable from where its file landed on disk:
+    ``…/smb/rclone/<run>/loot/<host>/<share>/<path>`` for the deterministic scan
+    and ``…/smb/cifs/mounts/<host>/<share>/<path>`` for the mounted one. Returns
+    ``None`` for any other layout (WinRM sensitive files, ad-hoc artifacts).
+    """
+    normalized = str(file_path or "").strip().replace("\\", "/")
+    if not normalized:
+        return None
+    if "/smb/rclone/" in normalized and "/loot/" in normalized:
+        relative = normalized.split("/loot/", 1)[1]
+    elif "/smb/cifs/mounts/" in normalized:
+        relative = normalized.split("/smb/cifs/mounts/", 1)[1]
+    else:
+        return None
+    parts = [part for part in relative.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1], "/".join(parts[2:])
+
+
+def derive_credential_unc_path(file_path: str) -> str:
+    r"""Return the UNC path a secret was recovered from, or ``""``.
+
+    ``\\10.0.0.5\HR\Notice from HR.txt`` — the locator a sysadmin opens to clear
+    the file, as opposed to the bare share name. A secret found inside an archive
+    keeps the ``!/`` suffix so the containing member is still identified.
+    """
+    normalized = str(file_path or "").strip().replace("\\", "/")
+    if not normalized:
+        return ""
+    if "!/" in normalized:
+        outer_path, internal_path = normalized.split("!/", 1)
+        outer_unc = derive_credential_unc_path(outer_path)
+        return f"{outer_unc}!/{internal_path}" if outer_unc else ""
+    parts = _split_smb_loot_path(normalized)
+    if parts is None:
+        return ""
+    host, share, remote_tail = parts
+    unc = f"\\\\{host}\\{share}"
+    if remote_tail:
+        unc = f"{unc}\\" + remote_tail.replace("/", "\\")
+    return unc
+
+
 def _derive_credential_origin_path(file_path: str) -> str:
     """Derive a logical remote/source path from a local loot path when possible."""
     raw_path = str(file_path or "").strip()
@@ -5090,27 +5258,71 @@ def _derive_credential_origin_path(file_path: str) -> str:
             if drive:
                 return f"WinRM {drive}\\"
 
-    if "/smb/rclone/" in normalized and "/loot/" in normalized:
-        relative = normalized.split("/loot/", 1)[1].strip("/")
-        parts = [part for part in relative.split("/") if part]
-        if len(parts) >= 2:
-            host, share = parts[0], parts[1]
-            remote_tail = "/".join(parts[2:])
-            if remote_tail:
-                return f"SMB {host}/{share}/{remote_tail}"
-            return f"SMB {host}/{share}"
-
-    if "/smb/cifs/mounts/" in normalized:
-        relative = normalized.split("/smb/cifs/mounts/", 1)[1].strip("/")
-        parts = [part for part in relative.split("/") if part]
-        if len(parts) >= 2:
-            host, share = parts[0], parts[1]
-            remote_tail = "/".join(parts[2:])
-            if remote_tail:
-                return f"SMB {host}/{share}/{remote_tail}"
-            return f"SMB {host}/{share}"
+    smb_parts = _split_smb_loot_path(normalized)
+    if smb_parts is not None:
+        host, share, remote_tail = smb_parts
+        if remote_tail:
+            return f"SMB {host}/{share}/{remote_tail}"
+        return f"SMB {host}/{share}"
 
     return ""
+
+
+#: Ceiling on the per-hit locations persisted into the ``smb_share_secrets``
+#: finding. A wide share scan can match hundreds of files; the report only ever
+#: renders the first ``INLINE_AFFECTED_ASSETS_CAP`` of them, and the full set
+#: stays in the per-detector JSON artifacts the finding's evidence points at.
+MAX_PERSISTED_SECRET_LOCATIONS = 50
+
+
+def build_secret_location_records(
+    credentials: dict[str, list[tuple[Any, Any, Any, Any, Any]]],
+    *,
+    limit: int = MAX_PERSISTED_SECRET_LOCATIONS,
+) -> list[dict[str, Any]]:
+    """Return where each recovered secret actually lives, for the finding details.
+
+    A finding that reports the detector categories it matched
+    ("DOC_CREDENTIALS", "CMD ConvertTo-SecureString") tells the reader nothing
+    they can act on. These records carry the concrete file — its UNC path, host,
+    share and line — so the deliverable's affected assets name what to go clear.
+
+    Ordered by host/share/path for a stable report, deduplicated per
+    ``(location, line, detector)``, and capped at *limit*.
+    """
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, Any, str]] = set()
+    for cred_type, creds_list in sorted((credentials or {}).items()):
+        for entry in creds_list or []:
+            try:
+                _value, _ml, _context, line_num, file_path = entry
+            except (TypeError, ValueError):
+                continue
+            path_text = str(file_path or "").strip()
+            if not path_text:
+                continue
+            unc = derive_credential_unc_path(path_text)
+            location = unc or _derive_credential_origin_path(path_text)
+            if not location:
+                continue
+            try:
+                line = int(line_num) if line_num is not None else None
+            except (TypeError, ValueError):
+                line = None
+            key = (location, line, str(cred_type))
+            if key in seen:
+                continue
+            seen.add(key)
+            record: dict[str, Any] = {"unc": unc} if unc else {"path": location}
+            smb_parts = _split_smb_loot_path(path_text)
+            if smb_parts is not None:
+                record["host"], record["share"], _tail = smb_parts
+            if line is not None:
+                record["line"] = line
+            record["detector"] = str(cred_type)
+            records.append(record)
+    records.sort(key=lambda item: str(item.get("unc") or item.get("path") or ""))
+    return records[:limit]
 
 
 def _format_local_credential_source(
@@ -5691,15 +5903,22 @@ def handle_found_credentials(
             }
             for cred_type, file_path in saved_files.items()
         ]
+        secret_locations = build_secret_location_records(credentials)
+        finding_details: dict[str, Any] = {
+            "total_credentials": total_found,
+            "credential_types": sorted(credentials.keys()),
+        }
+        # Where the secrets are, not just what kind they were: the report's
+        # affected assets name each file by UNC path so the reader can go clear
+        # it. Without this the finding carries only detector categories.
+        if secret_locations:
+            finding_details["secret_locations"] = secret_locations
         record_technical_finding(
             shell,
             domain,
             key="smb_share_secrets",
             value=True,
-            details={
-                "total_credentials": total_found,
-                "credential_types": sorted(credentials.keys()),
-            },
+            details=finding_details,
             evidence=evidence_entries or None,
         )
     except Exception as exc:  # pragma: no cover

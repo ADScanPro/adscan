@@ -1,0 +1,45 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Print rules — how an ADscan document paginates.
+
+   `@page` GEOMETRY (size, margins, running header/footer) is deliberately NOT
+   here: it is per-document furniture, and PRO's own @page rules interpolate
+   template variables. What is shared is the pagination behaviour every
+   paginated document wants.
+
+   Anything that would change PRO's current pagination is scoped under the
+   opt-in document class `.ds-doc`, which LITE sets on <body> and PRO does
+   not. That lets the rules be authored once, now, without touching the
+   revenue artifact; PRO opts in when its composition is next reworked.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Break utilities — already relied on by PRO's markup, carried verbatim. */
+.page-break { page-break-after: always; }
+.no-break   { page-break-inside: avoid; }
+.break-before { page-break-before: always; }
+
+/* ── Opt-in document pagination hygiene ─────────────────────────────────── */
+.ds-doc { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+@media print {
+  /* No line left alone at the top or bottom of a page. */
+  .ds-doc p, .ds-doc li, .ds-doc td { orphans: 3; widows: 3; }
+
+  /* A heading is never the last thing on a page. */
+  .ds-doc .ds-section-head { break-inside: avoid; break-after: avoid; }
+  .ds-doc .ds-section-title { break-after: avoid; }
+  .ds-doc .ds-section-lead { break-after: avoid; }
+
+  /* A long table repeats its header and keeps each row whole. */
+  .ds-doc thead { display: table-header-group; }
+  .ds-doc tbody tr { break-inside: avoid; }
+
+  /* Structural blocks stay in one piece. */
+  .ds-doc .ds-note,
+  .ds-doc .ds-card,
+  .ds-doc .ds-cols,
+  .ds-doc .ds-fineprint,
+  .ds-doc .ds-steps > li { break-inside: avoid; }
+
+  /* A link in print is text, not a call to action. */
+  .ds-doc a { text-decoration: none; }
+}

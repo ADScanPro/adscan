@@ -149,6 +149,9 @@ from adscan_internal.services.session_compromise_state_service import (
 from adscan_internal.services.session_ad_scale_metadata import (
     build_session_ad_scale_metadata,
 )
+from adscan_internal.services.scan_progress import (
+    StepOutcome as _StepOutcome,
+)
 from adscan_internal.version import get_version, get_version_tag
 from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
@@ -210,6 +213,7 @@ from adscan_core.lab_catalog import (
 )
 from adscan_core.console_runtime import build_rich_console as _build_rich_console
 from adscan_core.native_secret_scrub import scrub_native_secrets
+from adscan_core.outbound_links import cta_display_url, cta_markup, cta_url
 from adscan_core.lab_context import build_lab_telemetry_fields
 from adscan_internal.services.dns_discovery_service import (
     is_dns_resolution_error,
@@ -249,9 +253,7 @@ def _should_disable_interactive_prompts(shell: object | None = None) -> bool:
 _PIP_BREAK_SYSTEM_PACKAGES_FLAG = "--break-system-packages"
 _PIP_BREAK_SYSTEM_PACKAGES_SUPPORT_CACHE: dict[str, bool] = {}
 
-raw_SYSTEM_REQUIREMENTS_URL = (
-    "https://www.adscanpro.com/docs/getting-started/system-requirements"
-)
+raw_SYSTEM_REQUIREMENTS_URL = cta_url("unsupported_os")
 _SYSTEM_REQUIREMENTS_URL = mark_passthrough(raw_SYSTEM_REQUIREMENTS_URL)
 _DOCKER_USE_SUDO: bool | None = None
 
@@ -4227,84 +4229,22 @@ def show_victory_hint_explicit(victory_type: str, title: str, message: str):
         pass
 
 
-def _is_attribution_asked() -> bool:
-    """Return True if attribution question has already been asked (once-ever flag)."""
-    flag_file = Path(ADSCAN_STATE_DIR) / ".attribution_asked"
-    return flag_file.exists()
+def _maybe_run_exit_survey(shell) -> bool:
+    """Run at most one of the two once-ever operator questions at a clean exit.
 
-
-def _mark_attribution_asked() -> None:
-    """Persist the once-ever attribution flag."""
-    flag_file = Path(ADSCAN_STATE_DIR) / ".attribution_asked"
-    try:
-        flag_file.parent.mkdir(parents=True, exist_ok=True)
-        flag_file.touch()
-    except Exception:
-        pass
-
-
-def _maybe_ask_attribution(shell) -> None:
-    """Ask once-ever how the user found ADscan. Captured to PostHog as attribution_source.
-
-    Shown on the first exit only, before the session summary, so the user
-    still has the session context in mind.  Non-blocking: Ctrl-C or any
-    cancel returns None and is silently ignored.
+    Delegates to the SSOT in ``services.operator_survey``: the discovery
+    question ("how did you first hear about ADscan?") and, on a later session,
+    the role question. Both are optional, skippable, and silent on a
+    non-interactive, offline, or telemetry-off run.
     """
-    if _is_attribution_asked():
-        return
-    if _should_disable_interactive_prompts():
-        return
-
-    options = [
-        "LinkedIn",
-        "GitHub",
-        "A colleague or friend recommended it",
-        "Discord community",
-        "Web (adscanpro.com)",
-        "Conference or talk (RootedCON, Hackén...)",
-        "Other / Prefer not to say",
-    ]
-
-    _ATTR_KEYS = [
-        "linkedin",
-        "github_organic",
-        "word_of_mouth",
-        "discord_community",
-        "landing_web",
-        "conference",
-        "other",
-    ]
-
     try:
-        shell.console.print()
-        print_info(
-            "[dim]Quick question (optional) — helps us show up where pentesters actually look:[/dim]"
-        )
-        idx = questionary_select_index(
-            title="How did you first hear about ADscan?",
-            options=options,
-            default_idx=6,  # default → "Other / Prefer not to say"
-            shell=shell,
-        )
-    except Exception:
-        idx = None
+        from adscan_internal.services.operator_survey import run_exit_survey
 
-    if idx is None:
-        # Cancelled / interrupted (e.g. Ctrl+C at the prompt) — do NOT persist
-        # the once-ever flag, so the next CLEAN exit asks again. Marking here
-        # would permanently lose attribution for exactly the users who bounce.
-        return
-
-    # Only mark asked once the user actually answered.
-    _mark_attribution_asked()
-
-    source = _ATTR_KEYS[idx] if 0 <= idx < len(_ATTR_KEYS) else "other"
-    try:
-        telemetry.capture(
-            "attribution_source", {"source": source, "source_label": options[idx]}
-        )
-    except Exception:
-        pass
+        return bool(run_exit_survey(shell))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
 
 
 def _maybe_run_rating_funnel(shell, value_tier: str | None) -> bool:
@@ -4427,7 +4367,7 @@ def _maybe_show_report_cta(shell) -> None:
     if workspace_type != "audit":
         return
     shell.console.print()
-    _pro_url = mark_passthrough("https://adscanpro.com/pro")
+    _pro_url = mark_passthrough(cta_display_url("session_summary"))
     if "domain_compromise" in victories:
         print_info(
             f"Domain Admin achieved — document it before the engagement closes. "
@@ -8801,7 +8741,7 @@ def _print_install_summary():
         tele_detail.add_row("Not sent", "IPs, domains, credentials, paths")
         tele_detail.add_row("Session off", "export ADSCAN_TELEMETRY=0")
         tele_detail.add_row("Permanent", "telemetry off  (inside ADscan)")
-        tele_detail.add_row("Details", "adscanpro.com/docs/telemetry")
+        tele_detail.add_row("Details", cta_markup("telemetry_notice"))
         renderables.append(tele_detail)
     else:
         tele_status = Text("  OFF", style="bold yellow")
@@ -9140,6 +9080,61 @@ def _resolve_streamer_workspace_type(workspace_type_raw: Any) -> Optional[str]:
     if normalized and normalized in _STREAMER_WORKSPACE_TYPES:
         return normalized
     return None
+
+
+def _resolve_streamer_workspace_id_hash(shell: Any) -> Optional[str]:
+    """Resolve the workspace identity hash for a live streamer chunk.
+
+    Privacy: the raw workspace name is customer-sensitive ("acme-corp-prod")
+    and never leaves the host. Only the stable 12-char derivative travels, so
+    the dashboard can group a workspace's sessions without knowing its name.
+
+    The field stopped being populated on 10.x — it sits at roughly 1 in 65
+    runtime sessions with a recording, across 26 distinct users, while
+    ``workspace_type`` (emitted from the SAME per-chunk payload, two lines
+    below the call site) keeps landing. There are exactly three ways for this
+    to return nothing and the recording cannot tell them apart, so each one
+    names itself at debug level: the next occurrence is diagnosable from
+    ``adscan.debug.log`` instead of guessable. Extracted from the closure so
+    the branch is reachable from a test — the closure's logic was previously
+    re-implemented inside the test rather than exercised.
+
+    Args:
+        shell: The ``PentestShell`` instance for the live session.
+
+    Returns:
+        The 12-char workspace id hash, or ``None`` when it cannot be derived.
+    """
+    try:
+        workspace_now = getattr(shell, "current_workspace", None)
+        # A blank name is "no workspace selected yet", not a workspace: hashing
+        # it would mint an identity every blank-named session shares. The value
+        # itself is passed through UNSTRIPPED so this hash stays byte-identical
+        # to the one the finalize payload derives (``_build_session_metadata``).
+        if not workspace_now or not str(workspace_now).strip():
+            print_info_debug(
+                "(telemetry-streamer) workspace_id_hash omitted: "
+                "shell.current_workspace is unset "
+                f"(type={type(workspace_now).__name__})"
+            )
+            return None
+        from adscan_core.telemetry import compute_workspace_id_hash as _wsh
+
+        ws_hash = _wsh(workspace_now)
+        if not ws_hash:
+            print_info_debug(
+                "(telemetry-streamer) workspace_id_hash omitted: "
+                "compute_workspace_id_hash returned empty for a "
+                "non-empty workspace"
+            )
+            return None
+        return str(ws_hash)
+    except Exception as exc:  # noqa: BLE001 — a chunk must never fail on this
+        print_info_debug(
+            "(telemetry-streamer) workspace_id_hash omitted: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
 
 
 def _resolve_streamer_metadata_snapshot(shell: Any) -> dict[str, Any]:
@@ -14711,7 +14706,7 @@ class PentestShell:
                             )
                             print_info(
                                 "Need examples? Type `help` or open "
-                                "https://www.adscanpro.com/docs"
+                                + cta_display_url("unknown_command_hint")
                             )
                         print_info(
                             "If you want to execute a command, use the 'system' command. "
@@ -14806,6 +14801,8 @@ class PentestShell:
         - iface: network interface to use. Automatically adds the interface's IP to the myip variable
         - auto: enable or disable automatic mode. It will run the scan without prompting (automatic) or by prompting the user (semi-automatic)
         - type: set the pentest type. Must be 'ctf' for CTF scenarios or 'audit' for real audits. This setting is mandatory before starting scans.
+        - telemetry: turn anonymous usage telemetry on or off. The change applies to every
+          workspace and future session; add 'workspace' to scope it to the current one.
 
         Examples:
 
@@ -14813,7 +14810,8 @@ class PentestShell:
         set iface eth0
         set auto True
         set type ctf
-        set telemetry on
+        set telemetry off
+        set telemetry off workspace
         """
         try:
             # Split only on the first space to separate variable from values
@@ -14873,21 +14871,17 @@ class PentestShell:
                 else:
                     print_error("Invalid type. Please use 'ctf' or 'audit'.")
             elif variable == "telemetry":
-                if value.lower() in ["true", "on", "1"]:
-                    self.telemetry = True
-                elif value.lower() in ["false", "off", "0"]:
-                    self.telemetry = False
-                else:
-                    print_error("Please set telemetry to on/true/1 or off/false/0")
-                    return
-                print_success(f"Telemetry configured: {self.telemetry}")
-                from adscan_internal.cli.common import build_telemetry_context
-
-                telemetry_context = build_telemetry_context(
-                    shell=self,
-                    trigger="set_telemetry",
+                from adscan_internal.services.telemetry_preference_service import (
+                    USAGE as TELEMETRY_SET_USAGE,
+                    apply_telemetry_setting,
+                    parse_telemetry_setting,
                 )
-                telemetry.set_cli_telemetry(self.telemetry, context=telemetry_context)
+
+                request = parse_telemetry_setting(value)
+                if request is None:
+                    print_error(TELEMETRY_SET_USAGE)
+                    return
+                apply_telemetry_setting(self, request)
 
             elif variable == "username":
                 self.domains_data[self.domain]["username"] = value
@@ -16877,9 +16871,15 @@ class PentestShell:
                 return False
 
         # If already compromised in CTF, execute queued post-compromise actions (once)
-        # and skip the rest of the enumeration pipeline.
+        # and skip the rest of the enumeration pipeline. The objective is already
+        # met, so a checkpoint still left in flight is finalized here rather than
+        # being carried forward as a resumable "interrupted scan" (see
+        # ``_finalize_scan_on_objective_met``). No ``scan_complete`` telemetry:
+        # this invocation ran no phases, so the event belongs to the invocation
+        # that actually reached the objective.
         if self._is_ctf_domain_pwned(domain):
             self._ctf_execute_post_compromise_actions(domain)
+            self._finalize_scan_on_objective_met(domain, ran_scan_work=False)
             return
 
         # Audit: drain any queued post-compromise actions (graph re-collection
@@ -17056,17 +17056,28 @@ class PentestShell:
             step_number: int | None = None,
             total_steps: int | None = None,
             details: str | None = None,
-        ) -> bool:
+        ) -> _StepOutcome:
             """Run a step with consistent UX and allow early stop on CTF compromise.
 
+            The return value says BOTH whether to stop and WHY: a CTF compromise is
+            ``STOP_OBJECTIVE_MET`` (the engagement's success criterion is satisfied,
+            so the scan is complete and the checkpoint is finalized right here),
+            never a bare "stop" that a call site could mistake for an interruption.
+            A step that FAILED is still ``CONTINUE`` — the failure is logged and the
+            pipeline moves on, unchanged.
+
             Returns:
-                True if the enumeration pipeline should stop early (CTF + pwned).
+                ``_StepOutcome.CONTINUE`` to keep going, or
+                ``_StepOutcome.STOP_OBJECTIVE_MET`` when the domain is owned in CTF
+                mode and the remaining phases are deliberately skipped.
             """
             # If we were compromised asynchronously (e.g. by another pipeline), stop
             # without printing additional "Running/Completed" noise in CTF mode.
             if self._is_ctf_domain_pwned(domain):
                 self._ctf_execute_post_compromise_actions(domain)
-                return True
+                if _manage_progress:
+                    self._finalize_scan_on_objective_met(domain, ran_scan_work=True)
+                return _StepOutcome.STOP_OBJECTIVE_MET
 
             print_step_status(
                 step_name,
@@ -17101,10 +17112,14 @@ class PentestShell:
                 self._exit_enumeration_context()
 
             # If the domain was compromised during this step, execute the minimal
-            # post-compromise actions and stop the remaining pipeline.
+            # post-compromise actions and stop the remaining pipeline. This is the
+            # engagement's success criterion, so the scan is recorded COMPLETE —
+            # the remaining phases are skipped by design, not by interruption.
             if self._is_ctf_domain_pwned(domain):
                 self._ctf_execute_post_compromise_actions(domain)
-                return True
+                if _manage_progress:
+                    self._finalize_scan_on_objective_met(domain, ran_scan_work=True)
+                return _StepOutcome.STOP_OBJECTIVE_MET
 
             # Audit: if a step compromised the domain (e.g. DCSync as the
             # terminal step of an attack path executed during Phase 2), drain
@@ -17113,7 +17128,7 @@ class PentestShell:
             # (which re-runs the attack-path engine) is no longer re-entrant.
             # No-op when nothing is queued. Audit keeps mapping (no early stop).
             self._execute_audit_post_compromise_actions(domain)
-            return False
+            return _StepOutcome.CONTINUE
 
         def _phase1_outputs_ready() -> bool:
             from adscan_internal.workspaces import domain_subpath
@@ -17217,7 +17232,7 @@ class PentestShell:
                 lambda: self.do_host_inventory(domain),
                 step_number=1,
                 total_steps=3,
-            ):
+            ).should_stop:
                 return
 
             time.sleep(2)
@@ -17227,7 +17242,7 @@ class PentestShell:
                 lambda: self.do_identity_inventory(domain),
                 step_number=2,
                 total_steps=3,
-            ):
+            ).should_stop:
                 return
 
             # Per-host NTLMv1 sweep (sub-project #2). Runs HERE -- after the
@@ -17261,7 +17276,7 @@ class PentestShell:
                     _run_ntlm_auth_type_sweep_step,
                     step_number=3,
                     total_steps=3,
-                ):
+                ).should_stop:
                     return
             else:
                 print_step_status(
@@ -17409,7 +17424,7 @@ class PentestShell:
                 lambda: self.ask_for_timeroast(domain),
                 step_number=step_num,
                 total_steps=total_quickwin_steps,
-            ):
+            ).should_stop:
                 return
             step_num += 1
 
@@ -17418,7 +17433,7 @@ class PentestShell:
                 lambda: self.ask_for_ldap_descriptions(domain),
                 step_number=step_num,
                 total_steps=total_quickwin_steps,
-            ):
+            ).should_stop:
                 return
             step_num += 1
 
@@ -17429,7 +17444,7 @@ class PentestShell:
                     lambda: self.ask_for_smb_gpp_autologin(domain),
                     step_number=step_num,
                     total_steps=total_quickwin_steps,
-                ):
+                ).should_stop:
                     return
                 step_num += 1
 
@@ -17438,7 +17453,7 @@ class PentestShell:
                     lambda: self.ask_for_smb_gpp_passwords(domain),
                     step_number=step_num,
                     total_steps=total_quickwin_steps,
-                ):
+                ).should_stop:
                     return
                 step_num += 1
 
@@ -17478,7 +17493,7 @@ class PentestShell:
                 lambda: self.ask_for_spraying(domain),
                 step_number=1,
                 total_steps=1,
-            ):
+            ).should_stop:
                 return
             _mark_done("password_spraying")
         # NOTE: no post-phase pre2k follow-up here. Pre2k is now Step 1 of the
@@ -17506,7 +17521,7 @@ class PentestShell:
                 lambda: self.ask_for_share_credential_hunt(domain),
                 step_number=1,
                 total_steps=1,
-            ):
+            ).should_stop:
                 return
             _mark_done("share_credential_hunt")
 
@@ -17522,7 +17537,7 @@ class PentestShell:
                     lambda: self.ask_for_unauth_scan(domain),
                     step_number=1,
                     total_steps=1,
-                ):
+                ).should_stop:
                     return
                 _mark_done("unauthenticated_attack_surface")
 
@@ -17552,7 +17567,7 @@ class PentestShell:
                     lambda: self.ask_for_enum_cve(domain),
                     step_number=1,
                     total_steps=1,
-                ):
+                ).should_stop:
                     return
                 try:
                     self._render_audit_summary_panel(domain)
@@ -17624,7 +17639,10 @@ class PentestShell:
 
         # Durable completion state: flips the checkpoint to "complete" so the
         # resume front door stops offering to continue this scan. Anything left
-        # at "running" on next load == an interrupted scan.
+        # at "running" on next load == an interrupted scan. (The CTF
+        # objective-met early stop reaches the same state through
+        # ``_finalize_scan_on_objective_met`` — a scan that WINS is complete,
+        # not interrupted.)
         if _manage_progress:
             _scan_progress.mark_scan_complete(self, domain)
 
@@ -17643,7 +17661,7 @@ class PentestShell:
         )
         if _ap_verdict.kind == "exploited":
             if should_show_victory_hint("scan_complete_report", "subtle"):
-                _pro_url = mark_passthrough("https://adscanpro.com/pro")
+                _pro_url = mark_passthrough(cta_display_url("scan_complete_paths"))
                 self.console.print()
                 print_info(
                     f"💡 Found [bold]{_ap_verdict.total} attack path(s)[/bold] — PRO turns them into a "
@@ -17945,6 +17963,47 @@ class PentestShell:
             title_align="left",
             border_style="cyan",
         )
+
+    def _finalize_scan_on_objective_met(
+        self, domain: str, *, ran_scan_work: bool
+    ) -> None:
+        """Record the scan as COMPLETE because its objective was met.
+
+        A CTF scan stops the remaining offensive phases the moment the domain is
+        owned — that early stop is intentional, and the scan is complete by its
+        own success criterion. Before this seam existed the early stop was a bare
+        ``return`` that skipped ``mark_scan_complete``, so the checkpoint stayed
+        ``status="running"`` and every later workspace load offered to resume a
+        scan that had already won (and the ``scan_complete`` telemetry event —
+        the one carrying ``domain_compromised`` and the time-to-compromise
+        metrics — was never emitted, precisely on the wins).
+
+        Both obligations live here so a future early-stop site inherits them by
+        construction instead of having to remember two calls.
+
+        Args:
+            domain: Domain whose checkpoint is being finalized.
+            ran_scan_work: True when THIS invocation actually ran scan phases and
+                reached the objective (emit the ``scan_complete`` case-study
+                event, then finalize). False when the invocation found the
+                objective already met before doing any work — it then only
+                repairs a checkpoint that is still in flight, so it neither
+                double-counts telemetry nor fabricates a ``complete`` record for
+                a domain that was never checkpointed.
+        """
+        from adscan_internal.services import scan_progress as _scan_progress
+
+        try:
+            if ran_scan_work:
+                self._capture_scan_complete(domain)
+            else:
+                status = _scan_progress.read_scan_progress(self, domain).get("status")
+                if status != _scan_progress.STATUS_RUNNING:
+                    return
+            _scan_progress.mark_scan_complete(self, domain)
+        except Exception as exc:  # noqa: BLE001 — finalization must never break the flow
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _capture_scan_complete(self, domain: str) -> None:
         """Capture scan_complete telemetry event with case study metrics."""
@@ -27265,7 +27324,10 @@ class PentestShell:
             print_info(
                 "Attack graph report validation is available with ADscan PRO."
             )
-            print_info("Get beta access: https://www.adscanpro.com/pro")
+            print_info(
+                "Get beta access: "
+                + cta_display_url("beta_access_graph_validation")
+            )
             return
 
         errors = validate_attack_graph_findings(self, target_domain)
@@ -27513,39 +27575,67 @@ class PentestShell:
         return decrypt_cpassword(cpassword)
 
     def create_sub_workspace_for_domain(self, domain, pdc_ip=None):
-        """Creates a sub-workspace within the current workspace for a specific domain."""
+        """Create — or reconcile — the per-domain sub-workspace for ``domain``.
+
+        Idempotent by design. Provisioning the directory tree and running the
+        DNS/PDC discovery behind it only makes sense once, but the
+        ``domains_data[domain]`` entry it produces must be reconciled on EVERY
+        call. The domain-context guard treats a domain as initialized only when
+        both ``pdc`` and ``dir`` are present, and ``dir`` is written here; an
+        early return on "the directory already exists" left it unset forever on
+        any reused workspace, so every domain-scoped command was refused with
+        "Domain context not initialized" and the remedy it suggested (re-run
+        ``start_unauth``) could not repair the state.
+
+        Args:
+            domain: Domain the sub-workspace belongs to.
+            pdc_ip: PDC/DC IP confirmed for this run, when known. It wins over
+                a previously stored value; ``None`` keeps whatever is stored.
+        """
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.workspaces.domains import resolve_domain_paths
 
         if not self.current_workspace:
             print_error("No workspace selected to create sub-workspaces.")
             return
 
-        # Create the path for the 'domains' directory within the current workspace
-        domains_dir = os.path.join(self.current_workspace_dir, "domains")
+        paths = resolve_domain_paths(
+            self.current_workspace_dir,
+            getattr(self, "domains_dir", "domains") or "domains",
+            domain,
+        )
+        os.makedirs(paths.domains_root, exist_ok=True)
+        sub_workspace_path = paths.domain_dir
+        already_provisioned = os.path.isdir(sub_workspace_path)
+        os.makedirs(sub_workspace_path, exist_ok=True)
 
-        # Check if the 'domains' directory exists; if not, create it
-        if not os.path.exists(domains_dir):
-            os.makedirs(domains_dir)
+        marked_domain = mark_sensitive(domain, "domain")
 
-        # Define the path for the new sub-workspace
-        sub_workspace_path = os.path.join(domains_dir, domain)
-
-        # Check if the sub-workspace already exists
-        if os.path.exists(sub_workspace_path):
-            marked_domain = mark_sensitive(domain, "domain")
-            # print_error(f"The sub-workspace {marked_domain} already exists within {self.current_workspace}.")
+        if already_provisioned:
+            # Reconcile-only pass: no rediscovery, but restore the keys that
+            # make this domain context usable for the rest of the session.
+            stored = {}
+            if isinstance(self.domains_data, dict):
+                candidate = self.domains_data.get(domain)
+                if isinstance(candidate, dict):
+                    stored = candidate
+            self.update_domain_data(
+                domain,
+                pdc=pdc_ip or stored.get("pdc"),
+                domain_dir=sub_workspace_path,
+            )
+            print_info_debug(
+                "[create_sub_workspace_for_domain] Reconciled existing sub-workspace "
+                f"for {marked_domain} at: {sub_workspace_path}"
+            )
             return
 
-        # Create the sub-workspace
-        os.makedirs(sub_workspace_path)
         print_info_debug(
             f"[create_sub_workspace_for_domain] Created sub-workspace at: {sub_workspace_path}"
         )
 
         self.do_extract_base_dn(domain)
-        from adscan_internal.rich_output import mark_sensitive
 
-        marked_domain = mark_sensitive(domain, "domain")
         marked_pdc_ip = mark_sensitive(pdc_ip, "ip")
         print_info_debug(
             f"[create_sub_workspace_for_domain] Calling dns_find_dcs for domain: {marked_domain}, pdc_ip: {marked_pdc_ip}"
@@ -27855,7 +27945,9 @@ class PentestShell:
             initialize_report(self)
         except ImportError:
             print_info("Report initialization is available with ADscan Report License.")
-            print_info("Get beta access: https://www.adscanpro.com/pro")
+            print_info(
+                "Get beta access: " + cta_display_url("beta_access_report_init")
+            )
 
     @staticmethod
     def _is_optional_report_service_import_error(exc: Exception) -> bool:
@@ -28024,10 +28116,26 @@ class PentestShell:
         # this single gate covers every on-ramp into the deliverable kit.
         from adscan_core import tier as _tier
         if not _tier.is_pro():
-            from adscan_core.pro_upsell import print_pro_upsell
+            # LITE: the reporting aliases (``report`` / ``reporting`` /
+            # ``generate_report``) ALL dispatch here, so this branch has to
+            # produce the artifact rather than point at another verb. It used
+            # to print the upsell telling the operator to run
+            # ``generate_report``, which the alias map routes straight back to
+            # this method — an infinite loop with no report at the end of it.
+            #
+            # The tier decides the output, not the verb (same rule as ``ci``):
+            # in LITE every reporting on-ramp renders the self-contained HTML
+            # exposure report; in PRO every one of them builds the full kit
+            # below. ``do_generate_report`` keeps its own LITE branch for the
+            # non-REPL entry points.
+            from adscan_internal.services.post_scan_report import (
+                TRIGGER_REPL_DELIVER,
+                generate_report_with_telemetry,
+            )
 
-            print_pro_upsell("deliver", "direct_invocation")
-            return None
+            return generate_report_with_telemetry(
+                self, trigger=TRIGGER_REPL_DELIVER, asked_for_the_kit=True
+            )
 
         import argparse as _argparse
         import shlex as _shlex
@@ -28121,10 +28229,16 @@ class PentestShell:
         # (they just tried to render the deliverable).
         from adscan_core import tier as _tier
         if not _tier.is_pro():
-            from adscan_core.pro_upsell import print_pro_upsell
+            # LITE tier: render the self-contained HTML exposure report from the
+            # scan's own data. This is the free-tier shareable artifact — the
+            # PRO deliverable kit (compliance mapping, remediation roadmap,
+            # bonuses, branding) stays gated below. The PRO path is untouched.
+            from adscan_internal.services.post_scan_report import (
+                TRIGGER_REPL_REPORT,
+                generate_report_with_telemetry,
+            )
 
-            print_pro_upsell("generate_report", "direct_invocation")
-            return None
+            return generate_report_with_telemetry(self, trigger=TRIGGER_REPL_REPORT)
 
         from adscan_internal.cli.ci import run_generate_report
 
@@ -29861,18 +29975,11 @@ class PentestShell:
             # leaves the host. The raw workspace name is
             # customer-sensitive (think "acme-corp-prod") and stays
             # local — single source of truth for that rule is
-            # ``_build_session_metadata`` in telemetry.py.
-            try:
-                workspace_now = getattr(self, "current_workspace", None)
-                if workspace_now:
-                    from adscan_core.telemetry import (
-                        compute_workspace_id_hash as _wsh,
-                    )
-                    ws_hash = _wsh(workspace_now)
-                    if ws_hash:
-                        fields["workspace_id_hash"] = ws_hash
-            except Exception:  # noqa: BLE001
-                pass
+            # ``_build_session_metadata`` in telemetry.py. The resolver
+            # names which of its three exits fired under ``--debug``.
+            ws_hash = _resolve_streamer_workspace_id_hash(self)
+            if ws_hash:
+                fields["workspace_id_hash"] = ws_hash
             # Carry the workspace TYPE (ctf/audit) on every chunk. The
             # streamer is built in __init__ before self.type is known
             # (set later by _prompt_type_if_missing / stored-value load),
@@ -30481,8 +30588,8 @@ class PentestShell:
             exit: Legacy positional flag / raw REPL arg string; coerced to bool.
             from_signal: True when the shutdown was initiated by a Ctrl+C /
                 signal handler or the abrupt-exit atexit hook. In that case the
-                optional attribution question is skipped — asking during an
-                interrupt is bad timing and would block the abort.
+                optional exit survey is skipped — asking during an interrupt is
+                bad timing and would block the abort.
         """
         global _SESSION_CAPTURE_FINALIZED
         exit_requested = exit if isinstance(exit, bool) else True
@@ -30583,14 +30690,15 @@ class PentestShell:
         print_info("Workspace saved.")
         # Context-aware exit: summary → single primary ask → report CTA.
         # The primary ask at peak goodwill is EITHER the 1-5 session rating
-        # funnel (when the session hit a real value moment) OR the once-ever
-        # attribution question — never both the same exit. Rating takes
-        # priority; attribution waits for another exit. Neither runs on a
-        # signal / abrupt shutdown (bad timing, would block the abort).
+        # funnel (when the session hit a real value moment) OR one question
+        # from the once-ever operator survey (discovery, then role on a later
+        # session) — never two the same exit. Rating takes priority; the survey
+        # waits for another exit. Neither runs on a signal / abrupt shutdown
+        # (bad timing, would block the abort).
         value_tier = _show_exit_summary(self)
         if not from_signal:
             if not _maybe_run_rating_funnel(self, value_tier):
-                _maybe_ask_attribution(self)
+                _maybe_run_exit_survey(self)
         _maybe_show_report_cta(self)
         # Build metadata from workspace context
         command_type = _resolve_command_type(shell=self)
@@ -30928,16 +31036,12 @@ class PentestShell:
                 "\nType 'help <category>' to see the commands in that category.\n",
                 style="bold green",
             )
-            raw_docs_url = (
-                "https://www.adscanpro.com/docs?utm_source=cli&utm_medium=help_command"
-            )
-            docs_url = mark_passthrough(raw_docs_url)
             self.console.print(
-                f"💡 [dim]For detailed guides and examples:[/dim] "
-                f"[link={docs_url}]"
-                "www.adscanpro.com/docs[/link]\n"
+                "💡 [dim]For detailed guides and examples:[/dim] "
+                + cta_markup("help_command")
+                + "\n"
             )
-            track_docs_link_shown("help_command", docs_url)
+            track_docs_link_shown("help_command", cta_url("help_command"))
         else:
             arg_lower = arg.strip().lower()
             # Create an auxiliary dictionary for case-insensitive comparison.
@@ -30974,14 +31078,13 @@ class PentestShell:
                         self.console.print(
                             f"[-] No help found for '{arg.strip()}'.", style="bold red"
                         )
-                        raw_docs_url = "https://www.adscanpro.com/docs/commands?utm_source=cli&utm_medium=help_not_found"
-                        docs_url = mark_passthrough(raw_docs_url)
                         self.console.print(
-                            f"💡 [dim]Type[/dim] [cyan]help[/cyan] [dim]for available commands or visit[/dim] "
-                            f"[link={docs_url}]"
-                            "docs for full reference[/link]"
+                            "💡 [dim]Type[/dim] [cyan]help[/cyan] [dim]for available commands or visit[/dim] "
+                            + cta_markup("help_not_found", "docs for full reference")
                         )
-                        track_docs_link_shown("help_not_found", docs_url)
+                        track_docs_link_shown(
+                            "help_not_found", cta_url("help_not_found")
+                        )
 
 
 # ── Registry-driven shell-command binding ────────────────────────────────
@@ -31911,6 +32014,17 @@ if __name__ == "__main__":
 
     init_sentry()
     _cleanup_legacy_adscan_sudo_alias()
+
+    # One-time promotion of a pre-existing per-workspace telemetry opt-out to
+    # the global preference, so a user who opted out under the old
+    # per-workspace semantics is not recorded again in a new workspace. Kept in
+    # the runtime entry point (not at import) to avoid a disk write on import.
+    try:
+        from adscan_core.telemetry_preference import migrate_and_notify
+
+        migrate_and_notify()
+    except Exception:  # noqa: BLE001 - never block CLI startup
+        pass
     # ADscan can be run as a normal user. Commands that require privileges will
     # either request sudo when needed or (for install) re-exec via sudo with a
     # minimal preserved environment.

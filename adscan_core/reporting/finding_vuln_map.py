@@ -60,6 +60,67 @@ def is_catalog_finding_key(
     return key.strip() in catalog_meta
 
 
+#: Severity labels a genuine recorded finding carries. A record whose severity
+#: is outside this set is not a finding the client inventory can rank.
+_FINDING_SEVERITIES: frozenset[str] = frozenset(
+    {"critical", "high", "medium", "low", "info"}
+)
+
+#: Legacy metric residue. ``update_report_field`` now routes every non-catalog
+#: key to ``control_evidence``, so the current recorder cannot produce these
+#: under ``findings[]`` any more -- but workspaces written before that gate
+#: landed still carry counters like ``unauth_users_count`` in the findings
+#: list, and a counter is coverage data, never a client finding.
+_LEGACY_METRIC_KEY_SUFFIXES: tuple[str, ...] = ("_count",)
+
+
+def is_reportable_finding(
+    finding: Any,
+    *,
+    catalog_meta: Mapping[str, dict[str, Any]] = VULN_CATALOG_META,
+) -> bool:
+    """Return whether a recorded finding belongs in the client inventory.
+
+    The RENDER-time gate, and the counterpart to :func:`is_catalog_finding_key`
+    (which is the RECORD-time gate: given only a key, does it name a catalog
+    finding?). The two answer different questions and both are needed.
+
+    A catalogued key is always reportable. An **uncatalogued** one still is,
+    provided the record is a well-formed finding -- a key, a title, and a
+    severity from :data:`_FINDING_SEVERITIES`. That fallback is the whole point:
+    an uncatalogued finding must degrade to the data the recorder already
+    stamped on it, never vanish. It vanishing is how the paid deliverable came
+    to report fewer findings than the free one from the same scan
+    (``ldap_user_description_password_leak`` had a detector, an affected-asset
+    rule and a coverage mapping, but no catalog entry, so PRO dropped it while
+    LITE showed it).
+
+    The one exclusion is legacy metric residue (``*_count``): counters written
+    into ``findings[]`` by workspaces that predate the ``update_report_field``
+    routing gate. Those are coverage data and must not resurface as findings.
+
+    Args:
+        finding: One entry from a domain's ``findings`` list.
+        catalog_meta: The finding-key catalog. Defaults to the LITE-safe
+            :data:`VULN_CATALOG_META`.
+
+    Returns:
+        ``True`` when the record should reach a finding-rendering surface.
+    """
+    if not isinstance(finding, Mapping):
+        return False
+    key = str(finding.get("key") or "").strip()
+    if not key:
+        return False
+    if is_catalog_finding_key(key, catalog_meta=catalog_meta):
+        return True
+    if key.endswith(_LEGACY_METRIC_KEY_SUFFIXES):
+        return False
+    if not str(finding.get("title") or "").strip():
+        return False
+    return str(finding.get("severity") or "").strip().lower() in _FINDING_SEVERITIES
+
+
 def build_vuln_map_from_findings(
     findings: list[dict[str, Any]] | None,
     *,
@@ -68,11 +129,12 @@ def build_vuln_map_from_findings(
 ) -> dict[str, Any]:
     """Project a domain's flat findings list onto the legacy vulnerability map.
 
-    Gated on the catalog keyset: only findings whose ``key`` exists in
-    ``catalog_meta`` become vuln entries (keeps the report focused, matching the
-    historical PRO behaviour). Each kept entry is the finding's ``details`` dict
-    (copied so callers cannot mutate the source report), or ``True`` when there
-    are no details and ``attach_mitre`` is off.
+    Gated by :func:`is_reportable_finding`: a catalogued key always survives, an
+    uncatalogued but well-formed finding survives on its own recorded title and
+    severity, and legacy metric residue (``*_count``) is dropped. Each kept
+    entry is the finding's ``details`` dict (copied so callers cannot mutate the
+    source report), or ``True`` when there are no details and ``attach_mitre``
+    is off.
 
     Args:
         findings: The domain's ``findings`` list from ``technical_report.json``.
@@ -97,16 +159,15 @@ def build_vuln_map_from_findings(
     for finding in findings:
         if not isinstance(finding, dict):
             continue
+        if not is_reportable_finding(finding, catalog_meta=catalog_meta):
+            continue
         key = str(finding.get("key") or "").strip()
-        if not key:
-            continue
-        if not is_catalog_finding_key(key, catalog_meta=catalog_meta):
-            # Skip non-vulnerability findings (keeps the report focused).
-            continue
         details = finding.get("details")
         entry: dict[str, Any] = dict(details) if isinstance(details, dict) else {}
         if attach_mitre:
-            mitre = catalog_meta[key].get("mitre") or []
+            # An uncatalogued finding has no ATT&CK mapping to attach; it still
+            # belongs in the map, it simply contributes no technique cell.
+            mitre = (catalog_meta.get(key) or {}).get("mitre") or []
             if mitre:
                 entry["mitre"] = list(mitre)
             vuln_map[key] = entry
@@ -116,4 +177,8 @@ def build_vuln_map_from_findings(
     return vuln_map
 
 
-__all__ = ("build_vuln_map_from_findings", "is_catalog_finding_key")
+__all__ = (
+    "build_vuln_map_from_findings",
+    "is_catalog_finding_key",
+    "is_reportable_finding",
+)
