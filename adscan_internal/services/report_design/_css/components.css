@@ -43,7 +43,15 @@
 .chip.proven { background: var(--red-bg); color: var(--red); border-color: var(--red-bd); }
 .chip.safety { background: rgba(154,107,0,0.12); color: var(--amber); border-color: var(--amber-bd); }
 .chip.hardening { background: rgba(47,111,79,0.10); color: var(--green); border-color: rgba(47,111,79,0.30); }
-.chip.gap { background: rgba(148,163,184,0.12); color: var(--text-3); }
+/* Not Assessed — no reachable surface, so ADscan makes no claim either way.
+   A dashed outline reads as "open question" and, crucially, is legible against
+   the solid slate of "theoretical": the two used to render identically, and an
+   auditor counting badges then folded a coverage gap into the mapped routes. */
+.chip.gap,
+.chip.not_assessed {
+  background: transparent; color: var(--text-3);
+  border-color: var(--line-2); border-style: dashed;
+}
 
 /* A chip is a pill: it takes the width of its label and never breaks across
    two lines. Two-line chips doubled in height and pushed themselves above the

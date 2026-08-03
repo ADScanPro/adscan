@@ -19,6 +19,7 @@ from adscan_internal.services.adcs.ca_backup import (
 from adscan_internal.services.adcs.cert_forge import (
     ForgeConfig,
     ForgeResult,
+    build_ca_crl_distribution_uri,
     forge_certificate_native,
 )
 from adscan_internal.services.adcs.pass_the_cert import (
@@ -48,6 +49,7 @@ __all__ = [
     "ca_backup_native",
     "ForgeConfig",
     "ForgeResult",
+    "build_ca_crl_distribution_uri",
     "forge_certificate_native",
     "PassTheCertificateResult",
     "native_ptc_enabled",

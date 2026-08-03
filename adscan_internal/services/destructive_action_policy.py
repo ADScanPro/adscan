@@ -16,6 +16,15 @@ The single classifier :func:`classify_destructive` is consumed by the execution
 gates (``run_exploit_force_change_password``, the ACE-step dispatcher, the
 attack-path executor) and by the graph stamping so the display and the executor
 never disagree about what is refused.
+
+This module is also the single source of truth for the CLIENT-FACING wording of
+why a step did not execute — :func:`non_execution_statement` and the constants
+behind it. A step that did not run has exactly two honest client statements: a
+deliberate safety abstention (only ever a hard-blocked step, keyed on
+:data:`DANGEROUS_DESTRUCTIVE_MARKER`) or "mapped but not exercised". Everything
+else — the catalog's engineering-register ``support_reason`` in particular — is
+screened out by :func:`is_internal_engineering_reason` before it can reach a
+deliverable.
 """
 
 from __future__ import annotations
@@ -25,9 +34,13 @@ from dataclasses import dataclass
 __all__ = [
     "DestructiveVerdict",
     "classify_destructive",
+    "client_safe_step_reason",
     "is_machine_account_name",
+    "is_internal_engineering_reason",
+    "non_execution_statement",
     "safety_abstention_statement",
     "DANGEROUS_DESTRUCTIVE_MARKER",
+    "NOT_EXERCISED_STATEMENT",
     "SAFETY_ABSTENTION_LABEL",
     "SAFETY_ABSTENTION_LEAD",
     "safety_abstention_notes",
@@ -56,6 +69,22 @@ SAFETY_ABSTENTION_LABEL = "Not executed for safety"
 SAFETY_ABSTENTION_LEAD = (
     "This attack path is real and exploitable. ADscan deliberately chose not to "
     "execute this step to avoid disrupting a production host."
+)
+
+# Client-facing statement for a step that simply was NOT run — the honest
+# alternative to the safety framing above, and the default for every
+# non-execution that is not a hard-blocked safety abstention.
+#
+# The distinction is not cosmetic: claiming a protective motive for a step
+# ADscan did not attempt misrepresents the engagement, and stating WHY ADscan
+# did not attempt it ("not implemented yet") is a capability-gap confession that
+# belongs in the engineering log, never in a priced deliverable. What is true
+# and useful to the reader is that the step was derived from the environment's
+# own configuration and left unexercised, so the finding still stands on the
+# evidence that produced it.
+NOT_EXERCISED_STATEMENT = (
+    "This step was identified from the environment's configuration and was not "
+    "exercised during this engagement."
 )
 
 # Statically disruptive techniques ADscan refuses to execute in every mode.
@@ -256,3 +285,97 @@ def safety_abstention_statement(client_safe_reason: str | None) -> str:
     if reason:
         return f"{SAFETY_ABSTENTION_LEAD} {reason}"
     return SAFETY_ABSTENTION_LEAD
+
+
+def is_internal_engineering_reason(text: str | None) -> bool:
+    """Return True when ``text`` is an internal, engineering-register reason.
+
+    Screens a candidate reason string against every ``support_reason`` authored
+    in the attack-step catalog and the support registry (see
+    ``attack_step_support_registry.internal_support_reasons``). Those strings
+    explain ADscan's automation coverage to a developer; a client reading one in
+    a deliverable gets a capability-gap confession instead of a finding.
+
+    Best-effort by design: if the registry cannot be imported (a trimmed
+    deployment), nothing is screened rather than raising inside a renderer.
+    """
+    candidate = str(text or "").strip().casefold()
+    if not candidate:
+        return False
+    try:
+        from adscan_internal.services.attack_step_support_registry import (  # noqa: PLC0415
+            internal_support_reasons,
+        )
+
+        return candidate in internal_support_reasons()
+    except Exception:  # noqa: BLE001 - never break a render over the screen.
+        return False
+
+
+def client_safe_step_reason(details: dict | None) -> str:
+    """Return the step's reason text that is safe to print to a client, or "".
+
+    ``client_safe_reason`` is the ONLY key a producer promises to author as
+    client-facing prose (:func:`safety_abstention_notes`,
+    :func:`classify_destructive`). The generic ``reason`` key carries whatever
+    the engine had — usually the engineering-register ``support_reason`` — so it
+    is read only for a safety abstention, where
+    :func:`safety_abstention_notes` writes the same authored sentence into both
+    keys and older persisted graphs may carry only ``reason``.
+
+    Whatever survives that is still screened by
+    :func:`is_internal_engineering_reason`, so an internal string cannot reach a
+    deliverable even if a future producer writes one into the wrong key.
+
+    Args:
+        details: A step/edge ``details`` (or graph ``notes``) mapping.
+
+    Returns:
+        A client-safe sentence, or ``""`` when the step has none.
+    """
+    if not isinstance(details, dict):
+        return ""
+    candidates = [details.get("client_safe_reason")]
+    blocked_kind = str(details.get("blocked_kind") or "").strip().lower()
+    if blocked_kind == DANGEROUS_DESTRUCTIVE_MARKER:
+        candidates.append(details.get("reason"))
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text and not is_internal_engineering_reason(text):
+            return text
+    return ""
+
+
+def non_execution_statement(details: dict | None) -> str:
+    """Return the client-facing sentence for a step that did not execute, or "".
+
+    The single mapping every client surface (PDF report, web platform) uses, so
+    the two can never disagree about what ADscan claims:
+
+    - hard-blocked safety abstention (``blocked_kind`` is
+      :data:`DANGEROUS_DESTRUCTIVE_MARKER`) → :data:`SAFETY_ABSTENTION_LEAD`
+      plus the authored reason. This is the ONLY route to the safety framing;
+      a bare reason string never reaches it.
+    - any other non-execution marker (``unsupported``, the opt-in-only
+      ``dangerous``) → :data:`NOT_EXERCISED_STATEMENT`, plus a client-safe
+      reason when the producer authored one.
+    - no marker at all → ``""`` (the step is theoretical; the narrative already
+      says so and needs no trailing sentence).
+
+    Args:
+        details: A step/edge ``details`` (or graph ``notes``) mapping.
+
+    Returns:
+        A complete, client-safe sentence, or ``""``.
+    """
+    if not isinstance(details, dict):
+        return ""
+    blocked_kind = str(details.get("blocked_kind") or "").strip().lower()
+    if not blocked_kind:
+        return ""
+    reason = client_safe_step_reason(details)
+    if blocked_kind == DANGEROUS_DESTRUCTIVE_MARKER:
+        return safety_abstention_statement(reason)
+    if reason:
+        return f"{NOT_EXERCISED_STATEMENT} {reason}"
+    return NOT_EXERCISED_STATEMENT

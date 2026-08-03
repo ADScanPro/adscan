@@ -10,8 +10,10 @@ import ipaddress
 import json
 import os
 import platform
+import queue
 import re
 import secrets
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from html import unescape
@@ -533,25 +535,26 @@ class _SentryN8nTransport:
                 )
                 return
 
-            # Serialize envelope
+            # Serialize + sanitize the envelope on THIS thread, then hand the
+            # already-safe payload to the fire-and-forget dispatcher. The
+            # network POST happens on the daemon so Sentry's synchronous
+            # transport call never blocks the scan thread.
             envelope_payload = _sanitize_serialized_payload_for_telemetry(
                 envelope.serialize().decode("utf-8")
             )
-
-            # Configure SSL certificates before making request
-            _configure_ssl_certificates_for_requests()
-
-            # Send to n8n proxy
-            response = requests.post(
-                self.proxy_url,
-                json={"envelope": envelope_payload},
-                headers={
-                    "X-CLI-Token": token,
-                    "Content-Type": "application/json",
-                },
-                timeout=5,
+            _submit_send_job(
+                _TelemetrySendJob(
+                    url=self.proxy_url,
+                    json_body={"envelope": envelope_payload},
+                    headers={
+                        "X-CLI-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=5,
+                    label="sentry_envelope",
+                    persist=False,
+                )
             )
-            response.raise_for_status()
         except (requests.RequestException, ValueError, AttributeError) as exc:
             print_warning_debug(f"Failed to send Sentry event via n8n proxy: {exc}")
 
@@ -743,16 +746,19 @@ def _get_current_telemetry_level() -> tuple[bool, str, str]:
     if env_val == "1":
         return True, "enabled", "env"
 
-    # Persisted GLOBAL opt-out outranks any per-workspace/session override: a
-    # workspace may be stricter than the operator's preference, never looser.
-    if global_telemetry_disabled():
-        return False, "cli_disabled", "global"
-
+    # Resolved effective state (the CLI override already merged the per-workspace
+    # and global scopes — see telemetry_preference.resolve_effective_telemetry).
+    # It wins over the persisted global so an explicit workspace opt-in can
+    # recover a stale global-off; there is no one-way ratchet.
     override = _CLI_STATE.telemetry_enabled_override
     if override is False:
         return False, "cli_disabled", "cli"
     if override is True:
         return True, "enabled", "cli"
+
+    # No override in scope yet: fall back to the deliberate global preference.
+    if global_telemetry_disabled():
+        return False, "cli_disabled", "global"
 
     return True, "enabled", "default"
 
@@ -974,16 +980,16 @@ def _is_telemetry_enabled() -> bool:
     if env_val == "1":
         return True
 
-    # Persisted GLOBAL opt-out: the operator turned telemetry off once, so it
-    # stays off in every workspace and every later session. Deliberately ahead
-    # of the CLI override — a workspace can be stricter, never looser.
-    if global_telemetry_disabled():
-        return False
-
-    # CLI setting override (for runtime toggling)
+    # Resolved effective state first (the CLI override already merged the
+    # per-workspace and global scopes). An explicit workspace preference must be
+    # able to recover a stale global-off, so the override wins over the global.
     override = _CLI_STATE.telemetry_enabled_override
     if override is not None:
         return override
+
+    # No override in scope yet: honour a deliberate global opt-out.
+    if global_telemetry_disabled():
+        return False
 
     # Default: enabled in all environments
     # Events are routed to appropriate PostHog project based on environment
@@ -1007,13 +1013,16 @@ def _is_session_capture_enabled() -> bool:
     capture_opt = os.getenv("ADSCAN_SESSION_CAPTURE")
     if capture_opt == "0":
         return False
-    # Persisted global opt-out covers session recordings too.
-    if global_telemetry_disabled():
-        return False
-    # If the user explicitly disables telemetry at runtime from the CLI,
-    # also disable session capture to avoid unexpected uploads.
+    # Resolved effective state (the override already merged workspace + global
+    # scopes) governs recordings too, and wins over the global so an explicit
+    # workspace opt-in can recover a stale global-off.
     override = _CLI_STATE.telemetry_enabled_override
     if override is False:
+        return False
+    if override is True:
+        return True
+    # No override in scope yet: honour a deliberate global opt-out.
+    if global_telemetry_disabled():
         return False
     return True
 
@@ -2277,6 +2286,206 @@ else:
     print_warning_debug("[telemetry] PostHog proxy not configured")
 
 
+# --- Fire-and-forget outbound dispatcher -----------------------------------
+#
+# Telemetry MUST NEVER sit on the scan's critical path. Every event and every
+# swallowed exception used to do a SYNCHRONOUS blocking ``requests.post``
+# (timeout=5s) inline on the scan thread, so a hardened, multi-host scan that
+# raises thousands of handled exceptions could add minutes of pure network
+# wait — which pushed operators to ``set telemetry off`` and cost us the
+# diagnostic sessions we depend on.
+#
+# The fix is ONE bounded-queue single-daemon dispatcher that owns ALL outbound
+# POSTs for events + exceptions + Sentry envelopes. Producers build the FULLY
+# SANITIZED payload on their own thread (this is load-bearing — see the
+# no-exfiltration note below), enqueue it, and RETURN IMMEDIATELY. On a full
+# queue the job is DROPPED (best-effort; telemetry never blocks and the queue
+# never grows unbounded).
+#
+# NO-EXFILTRATION INVARIANT: the daemon does ONLY the network POST of an
+# ALREADY-SANITIZED payload. All payload building and sanitization
+# (``_sanitize_telemetry_properties``, ``mark_sensitive`` resolution,
+# ``native_secret_scrub``, the structural identifier nets, the fail-closed
+# skip-on-sanitize-failure) runs on the CALLING thread BEFORE ``put_nowait``.
+# A payload that fails sanitization is dropped by its seam and never enqueued.
+# Nothing un-sanitized ever reaches the queue or the wire.
+_TELEMETRY_QUEUE_MAXSIZE = 2048
+_telemetry_dispatch_queue: "queue.Queue[Any]" = queue.Queue(
+    maxsize=_TELEMETRY_QUEUE_MAXSIZE
+)
+_telemetry_dispatch_thread: Optional[threading.Thread] = None
+_telemetry_dispatch_lock = threading.Lock()
+_TELEMETRY_DISPATCH_SENTINEL = object()
+
+
+class _TelemetrySendJob:
+    """A ready-to-POST, already-sanitized outbound telemetry payload."""
+
+    __slots__ = ("url", "json_body", "headers", "timeout", "label", "persist")
+
+    def __init__(
+        self,
+        url: str,
+        json_body: dict[str, Any],
+        headers: dict[str, str],
+        *,
+        timeout: float = 5.0,
+        label: str = "event",
+        persist: bool = False,
+    ) -> None:
+        """Store the immutable POST parameters for the dispatcher daemon.
+
+        Args:
+            url: Fully-resolved proxy endpoint to POST to.
+            json_body: The already-sanitized JSON body.
+            headers: Request headers (auth token + content type).
+            timeout: Per-request network timeout in seconds.
+            label: Human-readable tag for debug logging only (never the wire).
+            persist: When True, an undrained job at exit is written to the
+                on-disk telemetry queue for next-run retry.
+        """
+        self.url = url
+        self.json_body = json_body
+        self.headers = headers
+        self.timeout = timeout
+        self.label = label
+        self.persist = persist
+
+
+def _telemetry_dispatch_loop() -> None:
+    """Single daemon that drains the queue and POSTs each job best-effort."""
+    while True:
+        # Bind the queue once per iteration so get() and task_done() always
+        # target the SAME object even if the module global is later rebound.
+        work_queue = _telemetry_dispatch_queue
+        job = work_queue.get()
+        try:
+            if job is _TELEMETRY_DISPATCH_SENTINEL:
+                return
+            _dispatch_send_job(job)
+        except Exception:  # noqa: BLE001
+            # A send failure must never raise into the daemon loop; telemetry
+            # is best-effort by design.
+            pass
+        finally:
+            try:
+                work_queue.task_done()
+            except ValueError:
+                pass
+
+
+def _dispatch_send_job(job: "_TelemetrySendJob") -> bool:
+    """POST one already-sanitized job. Returns True on a 2xx response."""
+    try:
+        _configure_ssl_certificates_for_requests()
+        response = requests.post(
+            job.url,
+            json=job.json_body,
+            headers=job.headers,
+            timeout=job.timeout,
+        )
+        response.raise_for_status()
+        return True
+    except (requests.exceptions.RequestException, ValueError, TypeError, OSError) as exc:
+        print_warning_debug(f"Telemetry dispatch failed ({job.label}): {exc}")
+        return False
+
+
+def _ensure_dispatch_thread() -> None:
+    """Lazily start the single dispatcher daemon; guard against double-start."""
+    global _telemetry_dispatch_thread
+    thread = _telemetry_dispatch_thread
+    if thread is not None and thread.is_alive():
+        return
+    with _telemetry_dispatch_lock:
+        thread = _telemetry_dispatch_thread
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=_telemetry_dispatch_loop,
+            name="adscan-telemetry-dispatch",
+            daemon=True,
+        )
+        thread.start()
+        _telemetry_dispatch_thread = thread
+
+
+def _submit_send_job(job: "_TelemetrySendJob") -> bool:
+    """Enqueue an already-sanitized job and return immediately.
+
+    Never blocks: on a full queue the job is dropped (best-effort). Returns
+    True if the job was enqueued, False if it was dropped.
+    """
+    _ensure_dispatch_thread()
+    try:
+        _telemetry_dispatch_queue.put_nowait(job)
+        return True
+    except queue.Full:
+        print_warning_debug(
+            f"Telemetry queue full; dropping {job.label} (best-effort)."
+        )
+        return False
+
+
+def _persist_undrained_dispatch_jobs() -> None:
+    """Move any undrained-at-exit persistable jobs to the on-disk queue.
+
+    Reuses the existing session disk-queue (``telemetry_queue``) so a job the
+    exit drain could not flush in time is retried on the next CLI run. The
+    stored payload is already sanitized (it was sanitized before enqueue), so
+    persisting it is safe. Only jobs marked ``persist`` are kept; bulky /
+    ephemeral jobs (Sentry envelopes) are dropped.
+    """
+    try:
+        from adscan_core import telemetry_queue
+    except ImportError:
+        return
+    while True:
+        try:
+            job = _telemetry_dispatch_queue.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if job is _TELEMETRY_DISPATCH_SENTINEL:
+                continue
+            if not getattr(job, "persist", False):
+                continue
+            telemetry_queue.enqueue_session(
+                {
+                    "_generic_telemetry_post": True,
+                    "url": job.url,
+                    "headers": job.headers,
+                    "json_body": job.json_body,
+                    "timeout": job.timeout,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _telemetry_dispatch_queue.task_done()
+
+
+def drain_telemetry_dispatch(total_timeout: float = 2.5) -> None:
+    """Bounded exit drain of the outbound dispatcher queue.
+
+    Waits up to ``total_timeout`` seconds TOTAL (not per-event) for the daemon
+    to flush pending sends, then persists whatever is left to the on-disk queue
+    for next-run retry. A slow proxy at shutdown can never hang the CLI beyond
+    the bound.
+    """
+    deadline = time.monotonic() + max(0.0, total_timeout)
+    while time.monotonic() < deadline:
+        # ``unfinished_tasks`` counts items get() but not yet task_done()'d, so
+        # it also covers the one job that may be mid-flight in the daemon.
+        pending = getattr(_telemetry_dispatch_queue, "unfinished_tasks", None)
+        if pending is None:
+            pending = _telemetry_dispatch_queue.qsize()
+        if pending <= 0:
+            break
+        time.sleep(0.02)
+    _persist_undrained_dispatch_jobs()
+
+
 # --- Event-name closed vocabulary (data-protection guard) -------------------
 #
 # The event NAME is the ONE field capture() forwards without sanitization
@@ -2306,6 +2515,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "asreproast_no_users_found",
         "asreproast_started",
         "asreproast_users_found",
+        "attack_path_compute_performance",
         "attribution_source",
         "audit_wordlist_cracked",
         "binary_deploy",
@@ -2378,6 +2588,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "kerberos_ccache_principal_mismatch",
         "launcher_low_memory_gate",
         "ldap_computers_enumerated",
+        "local_credential_host_identifier_username",
         "ldap_scan_started",
         "metric_ttfh",
         "mssql_scan_started",
@@ -2565,26 +2776,29 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
             # field (not the event, not the props).
             safe_event = _coerce_event_name(event)
 
-            # Send event to n8n proxy (mimics PostHog API format)
+            # Send event to n8n proxy (mimics PostHog API format). The payload
+            # above is fully sanitized on THIS thread; hand it to the
+            # fire-and-forget dispatcher so the network POST never blocks the
+            # scan. SSL config runs inside the dispatcher before the POST.
             payload = {
                 "event": safe_event,
                 "distinct_id": TELEMETRY_ID,
                 "properties": props,
             }
 
-            # Configure SSL certificates before making request
-            _configure_ssl_certificates_for_requests()
-
-            response = requests.post(
-                proxy_url,
-                json=payload,
-                headers={
-                    "X-CLI-Token": token,
-                    "Content-Type": "application/json",
-                },
-                timeout=5,
+            _submit_send_job(
+                _TelemetrySendJob(
+                    url=proxy_url,
+                    json_body=payload,
+                    headers={
+                        "X-CLI-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=5,
+                    label=f"event:{safe_event}",
+                    persist=True,
+                )
             )
-            response.raise_for_status()
             # print_info(f'Captured event: {event}: {props}, {TELEMETRY_ID}')
         except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
             # Log the coerced (allow-listed / bucketed) name, never the raw one,
@@ -3936,6 +4150,60 @@ def _sanitize_rich_output(content: str) -> str:
     content = re.sub(
         r"(?i)(\bOU\s*=\s*)([^,)\n]+)",
         lambda m: m.group(1) + _record_pseudonym(m.group(2).strip(), "path"),
+        content,
+    )
+
+    # Redact the DOMAIN identity carried in the DC= components of a DN.
+    #
+    # A distinguished name splits the domain across DC= RDNs
+    # (DC=cmm,DC=mx == the domain cmm.mx). The bare-domain scrubber matches a
+    # dotted token, so it never sees the split form, and a real customer domain
+    # (and, via a CA name, a DC hostname) reached uploaded recordings verbatim
+    # inside DNs and the environment-changes panel while the co-located sysvol
+    # UNC path WAS sanitized. This net reassembles the DC= run into the dotted
+    # domain, pseudonymizes it through the SAME keyed transform the domain
+    # scrubber uses -- so DC=cmm,DC=mx and a bare cmm.mx elsewhere in the buffer
+    # map to the identical pseudonym -- then writes the pseudonymized labels
+    # back into the DC= components. Requires >=2 DC= components so a lone
+    # "DC=x" is not touched, and the "=" is mandatory, so "DC/PDC" (no equals)
+    # can never match.
+    _dc_run_pattern = re.compile(
+        r"(?i)\bDC\s*=\s*[^,\s)]+(?:\s*,\s*DC\s*=\s*[^,\s)]+)+"
+    )
+
+    def _replace_dc_domain(match: re.Match[str]) -> str:
+        run = match.group(0)
+        if _is_already_sanitized(run):
+            return run
+        labels = re.findall(r"(?i)DC\s*=\s*([^,\s)]+)", run)
+        if len(labels) < 2:
+            return run
+        dotted = ".".join(labels)
+        pseudo = _record_pseudonym(dotted, "domain")
+        pseudo_labels = pseudo.split(".")
+        if len(pseudo_labels) != len(labels):
+            # Length-preserving pseudonym must keep the dot count; if it did
+            # not, fail closed by masking each label rather than emitting raw.
+            pseudo_labels = [_record_pseudonym(lbl, "domain") for lbl in labels]
+        return ",".join(f"DC={lbl}" for lbl in pseudo_labels)
+
+    content = _dc_run_pattern.sub(_replace_dc_domain, content)
+
+    # Redact Active Directory Certificate Services CA common names.
+    #
+    # A CA CN follows the <ORG>-<DCHOST>-CA convention (e.g.
+    # CMM-SERVERMEXICODC2-CA), so it discloses both the customer org and a real
+    # DC hostname. The ADCS call sites mark the CA name at source, but a CA name
+    # that surfaces on an unmarked path (a GetCASecurity FAILURE line, an
+    # environment-change panel) reached the recording verbatim. Anchored to at
+    # least three dash-separated components ending in "-CA" so an ordinary
+    # two-part token like "FOO-CA" is NOT over-matched; the "CA" suffix is kept
+    # uppercase to avoid eating lowercase prose ending in "-ca".
+    _ca_name_pattern = re.compile(r"\b[A-Za-z0-9]+-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-CA\b")
+    content = _ca_name_pattern.sub(
+        lambda m: m.group(0)
+        if _is_already_sanitized(m.group(0))
+        else _record_pseudonym(m.group(0), "hostname"),
         content,
     )
 
@@ -6596,6 +6864,33 @@ def _enqueue_oversize_session(payload: dict[str, Any], *, html_size: int) -> Non
         )
 
 
+def _replay_generic_telemetry_post(payload: dict[str, Any]) -> bool:
+    """Re-POST a persisted generic telemetry job (event/exception/identify).
+
+    The body was fully sanitized before it was persisted, so this only performs
+    the network POST. Returns True on a 2xx so ``drain_queue`` deletes it.
+    """
+    url = payload.get("url")
+    json_body = payload.get("json_body")
+    headers = payload.get("headers") or {}
+    if not url or not isinstance(json_body, dict):
+        # Malformed entry — return True so drain_queue discards it rather than
+        # retrying a payload that can never succeed.
+        return True
+    try:
+        _configure_ssl_certificates_for_requests()
+        response = requests.post(
+            str(url),
+            json=json_body,
+            headers=headers,
+            timeout=float(payload.get("timeout") or 5),
+        )
+        response.raise_for_status()
+        return True
+    except (requests.exceptions.RequestException, ValueError, TypeError, OSError):
+        return False
+
+
 def _drain_queue_upload_fn(payload: dict[str, Any]) -> bool:
     """Bridge between the disk queue and the wire uploader.
 
@@ -6619,6 +6914,12 @@ def _drain_queue_upload_fn(payload: dict[str, Any]) -> bool:
       it rather than retrying forever.
     * Everything else → a normal legacy single-shot session payload.
     """
+    if payload.get("_generic_telemetry_post"):
+        # A small event/exception/identify POST that the exit drain could not
+        # flush in time. Replay it to its original endpoint with the stored
+        # (already-sanitized) body. Return True so a successful replay is
+        # deleted from the queue.
+        return _replay_generic_telemetry_post(payload)
     chunk_trace_id = payload.get("_chunk_trace_id")
     if chunk_trace_id:
         # Strip client-only routing markers so the chunk endpoint sees the
@@ -7227,25 +7528,27 @@ def identify_user(properties: dict):
                 )
                 return
 
-            # Send identify request to n8n proxy (mimics PostHog identify API)
+            # Send identify request to n8n proxy (mimics PostHog identify API).
+            # Properties are sanitized above on THIS thread; the POST is routed
+            # through the fire-and-forget dispatcher so it never blocks.
             payload = {
                 "distinct_id": TELEMETRY_ID,
                 "properties": properties,
             }
 
-            # Configure SSL certificates before making request
-            _configure_ssl_certificates_for_requests()
-
-            response = requests.post(
-                f"{proxy_url}/identify",
-                json=payload,
-                headers={
-                    "X-CLI-Token": token,
-                    "Content-Type": "application/json",
-                },
-                timeout=5,
+            _submit_send_job(
+                _TelemetrySendJob(
+                    url=f"{proxy_url}/identify",
+                    json_body=payload,
+                    headers={
+                        "X-CLI-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=5,
+                    label="identify",
+                    persist=True,
+                )
             )
-            response.raise_for_status()
         except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
             print_warning_debug(f"Failed to identify telemetry user: {exc}")
 
@@ -7356,26 +7659,29 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
                 capture_props.update(properties)
             capture_props = _sanitize_telemetry_properties(capture_props)
 
-            # Send exception as a special event to PostHog via n8n
+            # Send exception as a special event to PostHog via n8n. The
+            # payload above is fully sanitized on THIS thread; hand it to the
+            # fire-and-forget dispatcher so the network POST never blocks the
+            # scan (this seam fires from thousands of handled ``except`` blocks).
             payload = {
                 "event": "$exception",
                 "distinct_id": TELEMETRY_ID,
                 "properties": capture_props,
             }
 
-            # Configure SSL certificates before making request
-            _configure_ssl_certificates_for_requests()
-
-            response = requests.post(
-                proxy_url,
-                json=payload,
-                headers={
-                    "X-CLI-Token": token,
-                    "Content-Type": "application/json",
-                },
-                timeout=5,
+            _submit_send_job(
+                _TelemetrySendJob(
+                    url=proxy_url,
+                    json_body=payload,
+                    headers={
+                        "X-CLI-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=5,
+                    label="exception",
+                    persist=True,
+                )
             )
-            response.raise_for_status()
             # print_info(f"Exception captured: {e}, {TELEMETRY_ID}, {properties}")
         except (
             requests.exceptions.RequestException,

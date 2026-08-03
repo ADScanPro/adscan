@@ -52,7 +52,7 @@ from adscan_internal.services.auth_error_classification import (
     is_unreachable_foreign_realm_error,
 )
 from adscan_internal.services.async_bridge import run_async_sync, run_sync_off_loop
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_info_verbose
 
 
 SD_FLAGS_DACL_CONTROL: str = "sd_flags_dacl"
@@ -2660,12 +2660,14 @@ async def _premint_kerberos_ccache_for_ldap(
 def _ldap_credential_context_can_remint(cred_ctx: Any) -> bool:
     """True when *cred_ctx* carries secret material for a generic re-mint.
 
-    Capability-bearing ESC13 PAC-TGTs and scoped S4U/RBCD/silver ServiceTickets
-    flow through the explicit ``ccache_path`` branch WITHOUT a CredentialContext,
-    so they never reach this gate — re-minting them would destroy the synthetic
-    group SID / impersonated principal. We additionally require at least one
-    re-mintable secret (password / NT hash / AES key) so a context with nothing
-    to re-issue from does not register a no-op reminter.
+    This answers ONLY "does this context hold something to re-issue an AS-REQ
+    from". It is deliberately NOT the capability-bearing test: the absence of a
+    CredentialContext says nothing about whether a ticket is capability-bearing
+    (every ordinary caller that passes a bare ``ccache_path`` also has no
+    context), and using it as a proxy is what left an expired-but-renewable
+    ticket un-renewable. The capability-bearing question is decided from the
+    explicit markers by
+    :func:`kerberos_ccache_renewal.is_capability_bearing_ccache`.
     """
     if cred_ctx is None:
         return False
@@ -2673,6 +2675,84 @@ def _ldap_credential_context_can_remint(cred_ctx: Any) -> bool:
         if getattr(cred_ctx, attr, None):
             return True
     return False
+
+
+async def _prepare_explicit_ccache_for_ldap(
+    config: "ADscanLDAPConfig",
+) -> "ADscanLDAPConfig":
+    """Renew (or discard) an explicit, already-expired Kerberos ccache.
+
+    Runs at the LDAP connect seam for every bind that carries an explicit
+    ``ccache_path``, so no caller has to remember it — the same doctrine that
+    puts clock sync at the auth seam rather than in each caller.
+
+    Three outcomes, all decided by
+    :func:`kerberos_ccache_renewal.prepare_ccache_for_bind_async`:
+
+    * **capability-bearing** (marked ESC13 PAC-TGT, scoped S4U/RBCD/silver
+      ticket) — returned untouched and never re-minted.
+    * **expired and renewable** — the config now points at a freshly minted TGT
+      for the same principal.
+    * **expired and not renewable** — the ticket is dropped from the config when
+      the bind has another way in (password / NT hash / AES key). Dropping it is
+      what re-opens the rest of the ladder: the salt-correct fresh-TGT pre-mint
+      below, and then the posture-gated NTLM last resort. With nothing else to
+      bind with, the dead ticket is kept so the bind surfaces the authentic
+      Kerberos error rather than a confusing "no credential" one.
+    """
+    path = str(getattr(config, "ccache_path", "") or "").strip()
+    if not path or not getattr(config, "use_kerberos", False):
+        return config
+
+    from adscan_internal.services.kerberos_ccache_renewal import (  # noqa: PLC0415
+        prepare_ccache_for_bind_async,
+    )
+
+    try:
+        preparation = await prepare_ccache_for_bind_async(
+            ccache_path=path,
+            username=config.username,
+            domain=config.domain,
+            auth_domain=config.auth_domain,
+            dc_ip=str(config.auth_kdc or config.dc_ip or "").strip() or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — renewal must never break a bind
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            "[ldap_transport] ccache renewal raised "
+            f"{type(exc).__name__}: {exc}; binding with the ticket as-is"
+        )
+        return config
+
+    if preparation.capability_bearing or not preparation.expired:
+        return config
+
+    import dataclasses as _dc_ccache
+
+    if preparation.renewed and preparation.ccache_path:
+        print_info_verbose(
+            "Kerberos ticket had expired; a fresh one was issued for "
+            f"{mark_sensitive(str(config.username or ''), 'user')} before the "
+            "directory bind."
+        )
+        return _dc_ccache.replace(config, ccache_path=preparation.ccache_path)
+
+    has_alternative = bool(config.password or config.aes_key)
+    if not has_alternative:
+        print_info_debug(
+            "[ldap_transport] expired ccache could not be renewed and no other "
+            "credential is present; binding with it so the authentic Kerberos "
+            "error surfaces"
+        )
+        return config
+
+    print_info_verbose(
+        "Kerberos ticket has expired and could not be renewed; falling back to "
+        "the remaining authentication options for "
+        f"{mark_sensitive(str(config.username or ''), 'user')}."
+    )
+    return _dc_ccache.replace(config, ccache_path=None)
 
 
 def _make_ldap_expiry_reminter(cred_ctx: Any) -> "Callable[[], str | None]":
@@ -2854,6 +2934,16 @@ async def async_connect_with_ldap_fallback(
             )
         except Exception:  # noqa: BLE001 — never let the sync break the bind
             pass
+
+    # ---- Explicit-ccache renewal at the auth seam ---------------------------
+    # A caller-supplied ``ccache_path`` is a TICKET, and tickets expire. Renew
+    # (or discard) it here, before the pre-mint decision below reads it, so
+    # every caller that hands us a bare ccache — LAPS, the ACL/exploit helpers,
+    # the attack-path executors — inherits renewal without asking for it.
+    # Capability-bearing tickets (marked ESC13 PAC-TGTs, scoped S4U/RBCD/silver
+    # service tickets) are detected from their markers and passed through
+    # untouched.
+    config = await _prepare_explicit_ccache_for_ldap(config)
 
     # ---- FIX 1: salt-aware Kerberos TGT pre-mint ----------------------------
     # When the bind would mint a FRESH TGT (kerberos-password / -aes / -rc4),
@@ -3121,23 +3211,32 @@ async def async_connect_with_ldap_fallback(
         configs_to_try = sealed_configs
     # ---------------------------------------------------------------------------
 
-    # Register a realm-scoped expiry reminter so a mid-bind
+    # Register a principal-scoped expiry reminter so a mid-bind
     # KRB_AP_ERR_TKT_EXPIRED on a ccache-only Kerberos bind can be re-minted
-    # transparently (real 12h ticket expiry, not clock skew). Only the GENERIC
-    # shell-aware branch qualifies: a CredentialContext carrying re-mintable
-    # secret material. Capability-bearing ESC13 PAC-TGTs and scoped S4U/RBCD
-    # ServiceTickets flow without a CredentialContext, so they are never
-    # registered (re-minting would destroy their synthetic SID / impersonation).
-    # Always deregistered in the finally so it never leaks across operations or
-    # principals.
+    # transparently (real 12h ticket expiry, not clock skew). This branch covers
+    # binds driven by a CredentialContext, whose ``refresh_if_stale`` keeps the
+    # context's own PAC-freshness bookkeeping in step. Binds carrying a bare
+    # ``ccache_path`` are already armed at the auth seam above
+    # (``_prepare_explicit_ccache_for_ldap``), which also decides — from the
+    # explicit markers, not from the absence of a context — whether the ticket
+    # is capability-bearing and must never be re-minted. Deregistered in the
+    # finally, and only when this exact callback is still the registered one.
     _expiry_reminter_realm: str | None = None
+    _expiry_reminter_principal: str | None = None
+    _expiry_reminter_callback: "Callable[[], str | None] | None" = None
     if _ldap_credential_context_can_remint(cred_ctx):
         _expiry_reminter_realm = str(
             getattr(cred_ctx, "auth_domain", None) or config.domain or ""
         ).strip()
+        _expiry_reminter_principal = str(
+            getattr(cred_ctx, "username", None) or config.username or ""
+        ).strip() or None
         if _expiry_reminter_realm:
+            _expiry_reminter_callback = _make_ldap_expiry_reminter(cred_ctx)
             _kerberos_recovery.register_expiry_reminter(
-                _expiry_reminter_realm, _make_ldap_expiry_reminter(cred_ctx)
+                _expiry_reminter_realm,
+                _expiry_reminter_callback,
+                principal=_expiry_reminter_principal,
             )
 
     # NTLM last-resort rung for a caller-requested-Kerberos bind that dead-ends
@@ -3522,7 +3621,11 @@ async def async_connect_with_ldap_fallback(
         )
     finally:
         if _expiry_reminter_realm:
-            _kerberos_recovery.unregister_expiry_reminter(_expiry_reminter_realm)
+            _kerberos_recovery.unregister_expiry_reminter(
+                _expiry_reminter_realm,
+                principal=_expiry_reminter_principal,
+                callback=_expiry_reminter_callback,
+            )
 
 
 def execute_with_ldap_fallback(

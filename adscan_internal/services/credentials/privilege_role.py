@@ -29,6 +29,8 @@ secret string) and ``aes256_key`` / ``aes128_key`` / ``kerberos_keys``
 
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, MutableMapping
 
@@ -271,32 +273,104 @@ def set_credential_secret_kind(
         print_exception(exception=exc)
 
 
-def set_credential_origin(
+# A single credential can genuinely be reachable by several techniques, but the
+# list is bounded so a pathological retry loop can never grow ``variables.json``
+# without limit. Twelve distinct (origin, secret) pairs is far beyond anything a
+# real engagement produces.
+_MAX_ORIGIN_ENTRIES = 12
+
+
+def credential_secret_fingerprint(secret: Any) -> str:
+    """Return a short one-way fingerprint of a secret, for dedup only.
+
+    Two captures of the SAME secret by the same technique are one acquisition
+    and must collapse to one provenance entry; the same technique yielding a
+    DIFFERENT secret (a rotated password re-sprayed, a hash later resolved to
+    its plaintext) is a genuinely new acquisition and must not.
+
+    The value is a SHA-256 prefix — it is never rendered, never leaves the
+    workspace store, and cannot be reversed to the secret.
+
+    Args:
+        secret: The stored secret string (or ``None``).
+
+    Returns:
+        16 lowercase hex characters, or ``""`` for an empty/absent secret.
+    """
+    text = str(secret or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _stored_secret(domain_data: MutableMapping[str, Any], key: str) -> str:
+    """Return the currently stored secret for ``key``, or ``""``."""
+    credentials = domain_data.get("credentials")
+    if not isinstance(credentials, dict):
+        return ""
+    return str(credentials.get(key) or "")
+
+
+def append_credential_origin(
     shell: Any,
     *,
     domain: str,
     username: str,
     origin: str,
+    acquisition: str | None = None,
+    secret: str | None = None,
+    secret_kind: str | None = None,
+    evidence: str | None = None,
 ) -> None:
-    """Record the provenance ``origin`` for ``username``'s credential.
+    """Record one provenance acquisition for ``username``'s credential.
 
-    ``origin`` is the machine-readable source label for how this credential
-    entered the store (for example ``kerberoast``, ``dcsync``, ``spray``,
-    ``authenticated_scan`` for the scan's own STARTING credential, or
-    ``user_provided`` for a manual ``creds save``). It is persisted into
-    ``credentials_meta[username]["credential_origin"]`` so the ``creds show``
-    Provenance column and the compromise SSOT can read it back.
+    This is the single writer for credential provenance. It maintains two
+    fields inside ``credentials_meta[username]``:
 
-    Two of these origins identify a self-introduced credential — the scan
-    input or a manually entered one — and are excluded from the
-    compromised-credential counters via
-    :data:`adscan_internal.services.session_compromise_state_service.NON_COMPROMISE_ORIGINS`,
-    while the credential remains a fully owned principal for attack-path
-    discovery.
+    * ``credential_origin`` — the scalar PRIMARY origin. Set once, on the
+      first acquisition, and never overwritten. Every existing consumer
+      (``creds show``, the PRO report, the writeup spine, the web ingester)
+      keeps reading exactly this field.
+    * ``origins`` — an append-only list of every acquisition, so a credential
+      reachable by more than one technique records all of them instead of
+      silently keeping whichever ran first.
 
-    Writes a JSON-safe string. Idempotent (last-write-wins); never raises.
+    A credential being reachable by several independent techniques is a fact
+    the client needs: closing one of them does not remove the exposure. Before
+    this list existed, the second technique to reach an already-held secret was
+    dropped, and the report implied that fixing the first route was enough.
+
+    Each entry carries ``origin``, ``acquisition`` (see
+    :class:`~adscan_internal.services.credentials.credential_origin.CredentialAcquisition`),
+    an ISO-8601 UTC ``at`` timestamp, the ``secret_kind``, a one-way
+    ``secret_fingerprint`` and an optional ``evidence`` pointer to the attack
+    graph relation. Entries are deduplicated on ``(origin, secret_fingerprint)``
+    so a retried step records once, while the same technique yielding a new
+    secret records again.
+
+    Args:
+        shell: Active shell exposing ``domains_data``.
+        domain: Domain the credential belongs to.
+        username: Principal owning the credential (case-insensitive).
+        origin: Machine-readable origin slug (for example ``dcsync``,
+            ``adcsesc2``, ``authenticated_scan``).
+        acquisition: Explicit ``executed`` / ``derived`` override. Defaults to
+            the classification of ``origin`` in the credential-origin SSOT.
+        secret: The secret this acquisition produced. Defaults to whatever is
+            currently stored for the principal, so callers that have just
+            persisted it do not need to pass it again.
+        secret_kind: Recorded kind of the secret. Defaults to whatever
+            ``credentials_meta`` already holds.
+        evidence: Optional attack-graph relation that evidences this
+            acquisition.
+
+    JSON-safe and best-effort — never raises.
     """
     try:
+        from adscan_internal.services.credentials.credential_origin import (  # noqa: PLC0415
+            classify_origin_acquisition,
+        )
+
         normalized_origin = str(origin or "").strip()
         if not normalized_origin:
             return
@@ -310,11 +384,90 @@ def set_credential_origin(
         current = meta_map.get(key)
         if not isinstance(current, dict):
             current = _default_meta()
-        current["credential_origin"] = normalized_origin
+
+        # PRIMARY: first acquisition wins, so every existing scalar consumer
+        # keeps a stable answer to "how was this first obtained".
+        if not str(current.get("credential_origin") or "").strip():
+            current["credential_origin"] = normalized_origin
+
+        resolved_kind = secret_kind or current.get("secret_kind")
+        resolved_secret = secret if secret is not None else _stored_secret(
+            domain_data, key
+        )
+        entry: dict[str, Any] = {
+            "origin": normalized_origin,
+            "acquisition": str(
+                acquisition or classify_origin_acquisition(normalized_origin).value
+            ),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "secret_kind": str(resolved_kind) if resolved_kind else None,
+            "secret_fingerprint": credential_secret_fingerprint(resolved_secret),
+        }
+        if evidence:
+            entry["evidence"] = str(evidence)
+
+        origins = current.get("origins")
+        if not isinstance(origins, list):
+            origins = []
+        dedup_key = (
+            normalized_origin.strip().lower(),
+            entry["secret_fingerprint"],
+        )
+        for recorded in origins:
+            if not isinstance(recorded, dict):
+                continue
+            recorded_key = (
+                str(recorded.get("origin") or "").strip().lower(),
+                str(recorded.get("secret_fingerprint") or ""),
+            )
+            if recorded_key == dedup_key:
+                break
+        else:
+            if len(origins) < _MAX_ORIGIN_ENTRIES:
+                origins.append(entry)
+        current["origins"] = origins
         meta_map[key] = current
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
+
+
+def set_credential_origin(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    origin: str,
+) -> None:
+    """Record the provenance ``origin`` for ``username``'s credential.
+
+    Thin wrapper over :func:`append_credential_origin`, kept so existing
+    callers and tests keep working. Prefer ``append_credential_origin`` in new
+    code: it accepts the acquisition class, the secret and an evidence pointer.
+
+    ``origin`` is the machine-readable source label for how this credential
+    entered the store (for example ``kerberoast``, ``dcsync``, ``spray``,
+    ``authenticated_scan`` for the scan's own STARTING credential, or
+    ``user_provided`` for a manual ``creds save``). It is persisted into
+    ``credentials_meta[username]["credential_origin"]`` so the ``creds show``
+    Provenance column and the compromise SSOT can read it back, and appended to
+    ``credentials_meta[username]["origins"]`` so a later technique reaching the
+    same credential is not lost.
+
+    Two of these origins identify a self-introduced credential — the scan
+    input or a manually entered one — and are excluded from the
+    compromised-credential counters via
+    :data:`adscan_internal.services.session_compromise_state_service.NON_COMPROMISE_ORIGINS`,
+    while the credential remains a fully owned principal for attack-path
+    discovery.
+
+    Writes JSON-safe values. The scalar is FIRST-write-wins (a later technique
+    lands in the ``origins`` list rather than rewriting attribution); never
+    raises.
+    """
+    append_credential_origin(
+        shell, domain=domain, username=username, origin=origin
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +933,8 @@ __all__ = [
     "CredentialPrivilegeRole",
     "CredentialKind",
     "ROLE_PRIORITY",
+    "append_credential_origin",
+    "credential_secret_fingerprint",
     "get_credential_meta",
     "set_credential_kerberos_material",
     "set_credential_origin",

@@ -158,7 +158,6 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "ForgedTicketFor",
         "ReadGMSAPasswordOf",
         "OwnsCertificateFor",
-        "GoldenCert",
         "DumpLSA",
         "DumpLSASS",
         "DumpSAM",

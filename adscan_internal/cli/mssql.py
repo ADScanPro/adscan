@@ -3018,9 +3018,21 @@ def execute_xp_cmdshell_on_instance(
         wire_secret=password,
         password=password,
     )
+    # Multi-homed split: connect to the reachable IP (impacket TDS resolves the
+    # name itself and takes only getaddrinfo()[0], dead-ending on an unreachable
+    # NIC), keep the FQDN as the Kerberos SPN. See CLAUDE.md "Resolving a host to
+    # its reachable IP".
+    from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+        resolve_connect_and_spn,
+    )
+
+    connect_host, spn_host = resolve_connect_and_spn(
+        shell, host=host, domain=domain, resolver_ip=kdc_host, service="mssql", probe_port=1433
+    )
     backend = ImpacketMSSQLBackend(
-        host=host,
+        host=connect_host,
         domain=domain,
+        kerberos_target_hostname=spn_host,
         kdc_host=kdc_host,
         ntlm_fallback_secret=ntlm_fallback_secret,
     )
@@ -3398,7 +3410,20 @@ def revert_deferred_xp_cmdshell(
         kdc_host = resolve_dc_ip(
             (getattr(shell, "domains_data", None) or {}).get(domain) or {}
         )
-        backend = ImpacketMSSQLBackend(host=host, domain=domain, kdc_host=kdc_host)
+        # Multi-homed split: reachable IP for the connect, FQDN for the SPN.
+        from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+            resolve_connect_and_spn,
+        )
+
+        connect_host, spn_host = resolve_connect_and_spn(
+            shell, host=host, domain=domain, resolver_ip=kdc_host, service="mssql", probe_port=1433
+        )
+        backend = ImpacketMSSQLBackend(
+            host=connect_host,
+            domain=domain,
+            kerberos_target_hostname=spn_host,
+            kdc_host=kdc_host,
+        )
         _revert_xp_cmdshell_enable(
             shell,
             backend,
@@ -3477,9 +3502,18 @@ def run_openrowset_bulk_read_on_instance(
         wire_secret=password,
         password=password,
     )
+    # Multi-homed split: reachable IP for the connect, FQDN for the SPN.
+    from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+        resolve_connect_and_spn,
+    )
+
+    connect_host, spn_host = resolve_connect_and_spn(
+        shell, host=host, domain=domain, resolver_ip=kdc_host, service="mssql", probe_port=1433
+    )
     backend = ImpacketMSSQLBackend(
-        host=host,
+        host=connect_host,
         domain=domain,
+        kerberos_target_hostname=spn_host,
         kdc_host=kdc_host,
         ntlm_fallback_secret=ntlm_fallback_secret,
     )
@@ -3784,9 +3818,18 @@ def run_xpcmdshell_system_escalation_followup(
             wire_secret=password,
             password=password,
         )
+        # Multi-homed split: reachable IP for the connect, FQDN for the SPN.
+        from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+            resolve_connect_and_spn,
+        )
+
+        connect_host, spn_host = resolve_connect_and_spn(
+            shell, host=source_host, domain=domain, resolver_ip=kdc_host, service="mssql", probe_port=1433
+        )
         backend = ImpacketMSSQLBackend(
-            host=source_host,
+            host=connect_host,
             domain=domain,
+            kerberos_target_hostname=spn_host,
             kdc_host=kdc_host,
             ntlm_fallback_secret=ntlm_fallback_secret,
         )
@@ -3802,7 +3845,12 @@ def run_xpcmdshell_system_escalation_followup(
             domain=domain,
             username=username,
             password=password,
-            host=source_host,
+            # Hand the service the already-resolved reachable IP + FQDN SPN so every
+            # sub-backend it builds connects to a live interface (impacket TDS cannot
+            # iterate a multi-homed host's addrinfo). The service also self-resolves
+            # when a caller does not pre-resolve, so both paths are correct.
+            host=connect_host,
+            conn_spn=spn_host,
             linked_server=linked_server,
             target_host=target_host,
             is_dc=is_dc,
@@ -4075,9 +4123,21 @@ def run_mssql_postauth_workflow(
         wire_secret=password,
         password=password,
     )
+    # Multi-homed split: connect to the reachable IP (impacket TDS resolves the
+    # name itself and takes only getaddrinfo()[0], dead-ending on an unreachable
+    # NIC), keep the FQDN as the Kerberos SPN. See CLAUDE.md "Resolving a host to
+    # its reachable IP".
+    from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+        resolve_connect_and_spn,
+    )
+
+    connect_host, spn_host = resolve_connect_and_spn(
+        shell, host=host, domain=domain, resolver_ip=_kdc_host, service="mssql", probe_port=1433
+    )
     backend = ImpacketMSSQLBackend(
-        host=host,
+        host=connect_host,
         domain=domain,
+        kerberos_target_hostname=spn_host,
         kdc_host=_kdc_host,
         ntlm_fallback_secret=_ntlm_fallback_secret,
     )

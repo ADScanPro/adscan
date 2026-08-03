@@ -35,7 +35,6 @@ Design rules
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -61,6 +60,10 @@ from adscan_core.theme import (
     ADSCAN_PRIMARY_DIM,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.credential_disclosure_detection import (
+    detect_credential_disclosure,
+    is_builtin_principal,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +75,6 @@ TaskStatus = Literal["skipped", "running", "done", "error", "denied"]
 
 # UF_DONT_REQUIRE_PREAUTH — AS-REP roastable accounts.
 UF_DONT_REQUIRE_PREAUTH = 0x400000
-
-# Sensitive-keyword regex for SAMR/LDAP descriptions and comments.
-_SENSITIVE_KEYWORD_RE = re.compile(
-    r"password|pwd|pass|secret|key|p@ss|p4ss|cred",
-    re.IGNORECASE,
-)
 
 
 @dataclass
@@ -111,6 +108,9 @@ class LDAPActiveUser:
     user_account_control: int = 0
     last_logon_timestamp: str | None = None
     asreproast_eligible: bool = False
+    #: Carried so a Windows built-in is recognised by RID rather than by its
+    #: description text, which is localised per install.
+    object_sid: str = ""
 
 
 # SAMRUser is owned by native_samr_service so unauth + auth flows share one
@@ -166,16 +166,38 @@ class UnauthEnrichmentResults:
 
     @property
     def sensitive_descriptions(self) -> list[tuple[str, str]]:
+        """Accounts whose directory attributes disclose a credential.
+
+        The judgement is the shared one in
+        :mod:`adscan_internal.services.credential_disclosure_detection`, so the
+        unauthenticated sweep and the authenticated LDAP description sweep can
+        never disagree about what counts as a leak. A keyword on its own is
+        prose, and a Windows built-in's stock description — localised, and the
+        same on every domain on earth — is not a finding.
+        """
         out: list[tuple[str, str]] = []
         for u in self.ldap_active_users:
-            if u.description and _SENSITIVE_KEYWORD_RE.search(u.description):
+            if not u.description:
+                continue
+            builtin = is_builtin_principal(
+                samaccountname=u.samaccountname, object_sid=u.object_sid
+            )
+            if detect_credential_disclosure(
+                "description", u.description, builtin=builtin
+            ):
                 out.append((u.samaccountname, u.description))
         for s in self.samr_users:
-            blob = " ".join([s.description or "", s.comment or "", s.full_name or ""])
-            if blob.strip() and _SENSITIVE_KEYWORD_RE.search(blob):
-                out.append(
-                    (s.username, (s.description or s.comment or s.full_name).strip())
-                )
+            builtin = is_builtin_principal(samaccountname=s.username, rid=s.rid)
+            for field_name, text in (
+                ("description", s.description or ""),
+                ("comment", s.comment or ""),
+                ("displayName", s.full_name or ""),
+            ):
+                if text and detect_credential_disclosure(
+                    field_name, text, builtin=builtin
+                ):
+                    out.append((s.username, text.strip()))
+                    break
         # Dedup on (username, text)
         seen: set[tuple[str, str]] = set()
         unique: list[tuple[str, str]] = []
@@ -297,6 +319,7 @@ async def _enrich_ldap_via_collector(
                 user_account_control=uac,
                 last_logon_timestamp=str(last_logon) if last_logon else None,
                 asreproast_eligible=bool(props.get("dontreqpreauth")),
+                object_sid=str(node.object_id or ""),
             )
         )
 
@@ -826,13 +849,14 @@ def _render_intel_sheet(
 
     # 🎯 Attack surface flags
     asrep = results.asreproast_eligible_users
-    pwd_hits = [
-        (u, d) for u, d in sens if re.search(r"password|pwd|pass", d, re.IGNORECASE)
-    ]
+    # ``sens`` is already the credential-disclosure set, so a second, weaker
+    # keyword pass over it would only report a smaller number for the same
+    # thing (and miss a password stored in ``userPassword``, where the word
+    # "password" never appears in the value).
     flag_lines = [
         Text.from_markup(f"  AS-REP roastable accounts : [bold]{len(asrep)}[/bold]"),
         Text.from_markup(
-            f"  Descriptions matching 'password' : [bold]{len(pwd_hits)}[/bold]"
+            f"  Descriptions disclosing a credential : [bold]{len(sens)}[/bold]"
         ),
         Text.from_markup(
             f"  GPP cpassword leaks (decrypted) : [bold]{len(decrypted)}[/bold]"
@@ -947,7 +971,14 @@ async def run_unauth_enrichment_async(
                 sensitive = sum(
                     1
                     for u in users
-                    if u.description and _SENSITIVE_KEYWORD_RE.search(u.description)
+                    if u.description
+                    and detect_credential_disclosure(
+                        "description",
+                        u.description,
+                        builtin=is_builtin_principal(
+                            samaccountname=u.samaccountname, object_sid=u.object_sid
+                        ),
+                    )
                 )
                 tags: list[str] = []
                 if asrep:

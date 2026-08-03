@@ -21,7 +21,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_info_debug, print_info_verbose, print_warning
+from adscan_core.rich_output import (
+    print_info,
+    print_info_debug,
+    print_info_verbose,
+    print_warning,
+)
 from adscan_core.interaction import is_non_interactive
 from adscan_core.tui.patience_notice import (
     PatienceNoticeConfig,
@@ -365,6 +370,26 @@ def _apply_host_cap(dispatch_nodes: list, host_cap: int) -> tuple[list, int]:
         "Set host_cap=0 (or ADSCAN_COLLECTOR_HOST_CAP=0) for a full sweep."
     )
     return kept, skipped_capped
+
+
+def emit_samr_srvsvc_denial_notice(denied_hosts: int, attempted_hosts: int) -> None:
+    """Emit ONE operator line summarising expected SAMR/SRVSVC access denials.
+
+    Access denied on SAMR (local-group enumeration) or SRVSVC (session
+    enumeration) simply means the authenticating principal is not a local admin
+    on that host — the EXPECTED outcome across most member servers at enterprise
+    scale, not a per-host failure. The per-host denial is suppressed at the SAMR
+    service layer (see ``native_samr_service._report_samr_exception``); this
+    aggregates the count into a single informational line so the operator still
+    sees the coverage without the terminal — and the session recording — being
+    flooded with one red error per denied host. No-op when nothing was denied.
+    """
+    if denied_hosts <= 0 or attempted_hosts <= 0:
+        return
+    print_info(
+        f"{denied_hosts}/{attempted_hosts} host(s) denied SAMR/SRVSVC enumeration "
+        "(access denied — the scan principal is not a local admin there; expected)."
+    )
 
 
 @dataclass(frozen=True)
@@ -1939,6 +1964,16 @@ async def _collect_domain_hosts_async(
     # Measured per-host duration distribution + outcome histogram (the data that
     # tells us where the SMB-collection time actually went).
     _log_host_phase_stats(timing, len(dispatch_nodes))
+
+    # SAMR/SRVSVC access-denied hosts (no local admin) are the expected common
+    # case at scale; the per-host red error is suppressed at the SAMR service
+    # layer, so surface a single aggregate coverage line here instead.
+    if config.collect_samr:
+        _samr_attempted = sum((timing.stage_outcomes.get("localadmins") or {}).values())
+        emit_samr_srvsvc_denial_notice(
+            denied_hosts=int(timing.outcome_counts.get("access_denied", 0)),
+            attempted_hosts=_samr_attempted,
+        )
 
     # Operator notification — distinguish the three share-collection states so an
     # aborted enumeration (coverage unknown) is never rendered as "0 shares"

@@ -176,21 +176,42 @@ class WindowsLootAnalysisService:
         phase_root_abs: str,
     ) -> WindowsArtifactLootAnalysisSummary:
         """Run shared artifact analysis over one local loot directory."""
+        from adscan_core.tui.progress_dashboard import ProgressDashboardConfig
+        from adscan_internal.services.loot_progress import live_progress
+
         spidering_service = shell._get_spidering_service()
         artifact_records: list[ArtifactProcessingRecord] = []
-        for file_path in list_files_under_path(loot_dir):
-            artifact_records.append(
-                spidering_service.process_found_file(
-                    file_path,
-                    domain,
-                    "ext",
-                    source_hosts=[host],
-                    source_shares=[source_share],
-                    auth_username=username,
-                    enable_legacy_zip_callbacks=False,
-                    apply_actions=True,
-                )
+        candidate_files = list_files_under_path(loot_dir)
+        total_files = len(candidate_files)
+        # Live per-file analysis progress: an X / N files bar + ETA over the
+        # artifact loop. DISPLAY-ONLY and fail-open — every file is processed
+        # identically whether or not the live surface builds.
+        with live_progress(
+            ProgressDashboardConfig(
+                title=f"SMB Share Exposure · Artifact Analysis · {phase_label}",
+                total=total_files,
+                unit="files",
+                last_item_type="path",
             )
+        ) as analysis_dashboard:
+            for index, file_path in enumerate(candidate_files, start=1):
+                artifact_records.append(
+                    spidering_service.process_found_file(
+                        file_path,
+                        domain,
+                        "ext",
+                        source_hosts=[host],
+                        source_shares=[source_share],
+                        auth_username=username,
+                        enable_legacy_zip_callbacks=False,
+                        apply_actions=True,
+                    )
+                )
+                if analysis_dashboard is not None:
+                    try:
+                        analysis_dashboard.update(done=index, last=file_path)
+                    except Exception:  # noqa: BLE001 -- render must not abort analysis
+                        pass
         loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
         report_path: str | None = None
         if artifact_records:

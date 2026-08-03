@@ -1527,7 +1527,11 @@ def execute_dcsync_native(
             mark_full_ntds_replicated,
         )
 
-        mark_full_ntds_replicated(shell, domain)
+        # ``username`` is the principal this DRSUAPI walk authenticated as. It
+        # is what names the DCSync attack-graph edge to mark when no attack-path
+        # step is executing, so the proof lands on the grant ADscan actually
+        # replicated through instead of on every principal holding the right.
+        mark_full_ntds_replicated(shell, domain, executed_as=username)
 
     # Screenshot moment: krbtgt hash extracted = full domain compromise.
     # Augments (does not replace) the print_success above so logs stay

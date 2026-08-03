@@ -41,6 +41,31 @@ from typing import Any, Literal
 
 SupportKind = Literal["supported", "unsupported", "policy_blocked", "context"]
 ExecutionTargetAccessRequirement = Literal["none", "computer_reachable"]
+# Orthogonal to SupportKind / CompromiseSemantics: does the step SUCCEED outright
+# (deterministic — a write / ACL edit / delegation primitive) or only if a
+# recovered secret cracks or a guess lands (probabilistic — Kerberoasting,
+# AS-REP Roasting, password spraying)? Governs the collapsed-pivot execution UX:
+# probabilistic → multi-select (try several candidates, one crack is enough);
+# deterministic → single-select (one destructive change is enough).
+ExecutionDeterminism = Literal["deterministic", "probabilistic"]
+# Orthogonal to SupportKind: what makes this step a CLIENT FINDING when ADscan
+# did not execute it. ``support_kind`` answers "can ADscan run this"; this
+# answers "if it did not run, is there still an exposure in the client's
+# directory to report". The two are routinely confused, and conflating them is
+# what let a step ADscan simply cannot perform be billed as a critical finding.
+#
+# * ``observed_configuration`` (DEFAULT) — the edge exists because ADscan READ a
+#   misconfiguration out of the directory (a permissive ACL, a vulnerable
+#   certificate template, an unconstrained-delegation flag). The weakness is
+#   real whether or not ADscan can exploit it, so a not-assessed execution
+#   status never erases the finding. This is the safe default: a new relation
+#   that forgets to declare the axis keeps its finding.
+# * ``execution_outcome`` — the edge is an AVENUE ADscan hypothesised, not a
+#   misconfiguration it observed; the only proof it leads anywhere is execution.
+#   When every one of its edges is not-assessed there is nothing observed to
+#   report, and recording an open finding would bill the client for a gap in
+#   ADscan's coverage.
+FindingBasis = Literal["observed_configuration", "execution_outcome"]
 CompromiseSemantics = Literal[
     "direct_target_compromise",
     "access_capability_only",
@@ -102,6 +127,13 @@ class AttackStepCatalogEntry:
     requires_execution_context: bool = False
     counts_for_execution_readiness: bool = False
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none"
+    # Whether this step's success is crack/guess-gated (probabilistic) or
+    # succeeds outright (deterministic). Default deterministic — the conservative
+    # single-destructive-action choice; only crack/spray relations set this.
+    execution_determinism: ExecutionDeterminism = "deterministic"
+    # What makes this step a client finding when it was not executed. See
+    # :data:`FindingBasis`. Consumed by the attack-graph → finding derivation.
+    finding_basis: FindingBasis = "observed_configuration"
     # BloodHound-style narrative templates with placeholders.
     # Placeholders resolved at render time by render_step_narrative():
     #   {source}      — display name of source principal
@@ -153,6 +185,8 @@ def _entry(
     requires_execution_context: bool = False,
     counts_for_execution_readiness: bool = False,
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
+    execution_determinism: ExecutionDeterminism = "deterministic",
+    finding_basis: FindingBasis = "observed_configuration",
     narrative_template: str = "",
     short_narrative_template: str = "",
     remediation_steps: tuple[str, ...] = (),
@@ -184,6 +218,8 @@ def _entry(
         requires_execution_context=requires_execution_context,
         counts_for_execution_readiness=counts_for_execution_readiness,
         execution_target_access_requirement=execution_target_access_requirement,
+        execution_determinism=execution_determinism,
+        finding_basis=finding_basis,
         narrative_template=narrative_template.strip(),
         short_narrative_template=short_narrative_template.strip(),
         remediation_steps=tuple(remediation_steps),
@@ -634,6 +670,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "kerberoasting",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Extract and crack Kerberos TGS hashes for a target user",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
@@ -655,6 +692,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "asreproasting",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Extract and crack Kerberos AS-REP hashes for a target user",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
@@ -676,6 +714,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "timeroasting",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Extract and crack MS-SNTP machine-account material",
         source_context_requirement="none",
         category="credential_access",
@@ -1282,8 +1321,12 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc5",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason=(
+            "Native CA private-key backup and offline certificate forge, with full "
+            "environment-change disclosure of the exfiltrated CA key, the forged "
+            "certificate, and the transient host artifacts"
+        ),
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -1554,30 +1597,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4768",),
         bh_native=True,
         bh_cypher_names=("CoerceAndRelayNTLMToADCS",),
-    ),
-    _entry(
-        "goldencert",
-        support_kind="supported",
-        support_reason="Backup CA private key, forge certificate, and run Pass-the-Certificate",
-        category="adcs",
-        description="Certificate authority compromise persistence path",
-        remediation_complexity="very_high",
-        remediation_effort=(
-            "Prevention: Deploy an HSM (Hardware Security Module) to store the CA private key. "
-            "this makes the key non-exportable even with admin access to the CA server. "
-            "Treat the CA server as Tier-0 (same level as DCs). "
-            "If the CA private key is already compromised: revoke the CA certificate, "
-            "remove it from the NTAuth Store and all certificate trust lists, "
-            "deploy a new CA with a new key pair (preferably in an HSM), "
-            "and re-enroll all certificates issued by the compromised CA. "
-            "This constitutes a full PKI rebuild and causes significant operational disruption."
-        ),
-        can_fully_mitigate=True,
-        mitre_technique_id="T1649",
-        mitre_technique_name="Steal or Forge Authentication Certificates",
-        detection_event_ids=("5058", "5061"),
-        bh_native=True,
-        bh_cypher_names=("GoldenCert",),
     ),
     # ── ACL / Object control ─────────────────────────────────────────────────
     _entry(
@@ -2277,6 +2296,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "passwordspray",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Executable via built-in password spraying workflows",
         compromise_semantics="direct_target_compromise",
         compromise_effort="medium",
@@ -2296,6 +2316,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "useraspass",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Executable via built-in username-as-password spraying workflows",
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
@@ -2315,6 +2336,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "blankpassword",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Executable via built-in blank-password validation workflow",
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
@@ -2334,6 +2356,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "computerpre2k",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason="Executable via built-in pre2k computer-account validation workflow",
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
@@ -2614,9 +2637,20 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     # surfaced as a manual follow-up, not an automated capability. It models a
     # credential_access_only avenue so the graph reasons about it correctly, but
     # the operator must run the crack out-of-band.
+    #
+    # ``finding_basis="execution_outcome"``: unlike an ACL or a certificate
+    # template, this edge records no misconfiguration ADscan read out of the
+    # directory — the directory weakness behind it (NTLMv1 still negotiable) is
+    # already reported on its own key, ``ntlmv1_enabled``. What this edge adds is
+    # only the offline crack, and whether that crack lands is unknown until
+    # someone runs it. So when its edges are all not-assessed there is nothing
+    # observed left to report, and a separate open finding would bill the client
+    # for the absence of a crack backend rather than for anything in their AD.
     _entry(
         "CrackNTLMv1",
         support_kind="unsupported",
+        execution_determinism="probabilistic",
+        finding_basis="execution_outcome",
         support_reason=(
             "The coerced host's NetNTLMv1 challenge/response is captured, then "
             "cracked offline to recover the machine account NT hash."
@@ -2669,6 +2703,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "PoisonCaptureNtlmv2Crack",
         support_kind="supported",
+        execution_determinism="probabilistic",
         support_reason=(
             "A rogue name-resolution service on the victim's local broadcast segment "
             "answered a lookup, captured the victim user's NetNTLMv2 authentication, "
@@ -3083,6 +3118,41 @@ def relation_requires_reachable_computer_target(relation: str) -> bool:
     return entry.execution_target_access_requirement == "computer_reachable"
 
 
+def is_probabilistic_step(relation: str) -> bool:
+    """Return True when a step's success is crack/guess-gated (probabilistic).
+
+    Probabilistic steps — Kerberoasting, AS-REP Roasting, password spraying, and
+    any offline-crack / online-guess relation — succeed only if a recovered secret
+    cracks or a guess lands, so trying MORE candidates raises the odds. Deterministic
+    steps (writes, ACL edits, delegation primitives) succeed outright, so one is
+    enough. Unknown relations default to deterministic (the conservative
+    single-destructive-action choice).
+    """
+    entry = get_attack_step_entry(normalize_execution_relation(relation))
+    if entry is None:
+        return False
+    return entry.execution_determinism == "probabilistic"
+
+
+def finding_basis_for_relation(relation: str) -> FindingBasis:
+    """Return what makes *relation* a client finding when it was not executed.
+
+    See :data:`FindingBasis`. An unknown relation resolves to
+    ``"observed_configuration"`` — the safe direction, because the alternative is
+    silently dropping a real finding from the client's inventory.
+
+    Args:
+        relation: A graph edge's ``relation`` token, in any casing.
+
+    Returns:
+        ``"observed_configuration"`` or ``"execution_outcome"``.
+    """
+    entry = get_attack_step_entry(normalize_execution_relation(relation))
+    if entry is None:
+        return "observed_configuration"
+    return entry.finding_basis
+
+
 def get_exploitation_relation_vuln_keys() -> dict[str, str]:
     """Return relation->vuln_key mappings for exploitation-style classification."""
     return {
@@ -3090,6 +3160,41 @@ def get_exploitation_relation_vuln_keys() -> dict[str, str]:
         for relation, entry in ATTACK_STEP_CATALOG.items()
         if isinstance(entry.vuln_key, str) and entry.vuln_key.strip()
     }
+
+
+#: Built once at import — :func:`classify_edge_relation` runs per edge on every
+#: graph save, so it must not rebuild the mapping on each call.
+_EXPLOITATION_RELATION_VULN_KEYS: dict[str, str] = get_exploitation_relation_vuln_keys()
+
+
+def classify_edge_relation(relation: str) -> tuple[str, str | None]:
+    """Return the ``(category, vuln_key)`` an attack-graph edge carries.
+
+    The single definition of what makes a graph edge *reportable*: an edge whose
+    relation names a catalog technique is ``("exploitation", <vuln_key>)`` and is
+    what :func:`~adscan_internal.services.attack_graph_findings.sync_attack_graph_findings`
+    turns into a client finding; everything else is ``("relationship", None)``
+    and only shapes attack paths.
+
+    It lives here, on the catalog that already owns ``vuln_key``, so the two
+    consumers that must never disagree can share it: the persistence seam that
+    stamps the pair onto every edge before it reaches ``attack_graph.json``, and
+    the derivation that reads the pair back off an edge written by an older
+    build. Two graph writers once persisted edges without it, and noPac,
+    PrintNightmare and the whole NTLMv1 family were invisible to the report of
+    any scan whose workspace was never reopened.
+
+    Args:
+        relation: A graph edge's ``relation`` token, in any casing or punctuation.
+
+    Returns:
+        ``("exploitation", vuln_key)`` for a catalog technique that owns a
+        ``vuln_key``, else ``("relationship", None)``.
+    """
+    vuln_key = _EXPLOITATION_RELATION_VULN_KEYS.get(_relation_lookup_key(relation))
+    if vuln_key:
+        return "exploitation", vuln_key
+    return "relationship", None
 
 
 def ntlmv1_crack_support_for(account_type: str) -> str:
@@ -3191,7 +3296,7 @@ def get_bh_native_adcs_cypher_names() -> frozenset[str]:
     excluded because BH CE does not create those edges natively.
     """
     _adcs_prefixes = ("ADCS",)
-    _adcs_exact = {"CoerceAndRelayNTLMToADCS", "GoldenCert"}
+    _adcs_exact = {"CoerceAndRelayNTLMToADCS"}
     result: set[str] = set()
     for entry in ATTACK_STEP_CATALOG.values():
         if not entry.bh_native:
@@ -3947,7 +4052,20 @@ _STATUS_PHRASE: dict[str, str] = {
     "closed_by_configuration": (
         "targets an avenue your environment's configuration already closes"
     ),
-    "unsupported": "is mapped as a viable route but was not executed in this engagement",
+    # A validated SEGMENT. Never folded into "probed but not fully executed":
+    # a step of this chain ran successfully against the live environment, which
+    # is materially stronger evidence than an attempt that went nowhere.
+    "partial": (
+        "had part of its chain validated by live execution, but was not run "
+        "end-to-end"
+    ),
+    # No reachable surface to test the avenue, so its exposure is unknown
+    # rather than mapped. Deliberately NOT "a viable route": that claimed more
+    # than the engagement observed, and it contradicted the card's own badge.
+    "unsupported": (
+        "was not assessed in this engagement: no reachable surface was "
+        "available to test the avenue"
+    ),
     "theoretical": "is a theoretical route derived from configuration analysis",
 }
 
@@ -3967,8 +4085,10 @@ def render_path_summary(path: dict[str, Any]) -> str:
     status_raw = str(path.get("status") or "theoretical").strip().lower()
     if status_raw in {"success", "succeeded"}:
         status_raw = "exploited"
-    elif status_raw in {"failed", "error", "partial"}:
+    elif status_raw in {"failed", "error"}:
         status_raw = "attempted"
+    elif status_raw == "unavailable":
+        status_raw = "unsupported"
 
     # Resolve display names for the endpoints
     source = str(path.get("source") or "").strip()

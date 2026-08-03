@@ -363,7 +363,47 @@ def iter_account_records(
                 continue
             seen.add(key)
             records.append((name, sid, qualifier))
-    return records
+    return _drop_subsumed_records(records)
+
+
+def _drop_subsumed_records(
+    records: list[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    """Drop a bare record that a richer record for the same principal covers.
+
+    A finding can carry the same principal through two containers written by two
+    detectors, at different fidelity. Two shapes recur, and both read to a client
+    as two affected objects when they are one:
+
+    * ``jdoe`` alongside ``jdoe · description`` — one detector says WHICH
+      attribute holds the secret, the other does not. The qualified record is
+      strictly more informative, so the bare one goes.
+    * ``MEEREEN`` alongside ``MEEREEN$`` — one detector persists a plain host
+      list, the other the machine account with its SID. Only the record carrying
+      the SID names a directory object, so the bare hostname goes.
+
+    The second fold is deliberately narrow: it applies only when the bare record
+    has no SID of its own and a ``$``-suffixed record for the same base name
+    does, which is exactly the plain-host-list case and not a user who happens to
+    share a name with a computer account.
+    """
+    qualified = {
+        name.strip().lower() for name, _sid, qualifier in records if qualifier.strip()
+    }
+    identified = {
+        name.strip().lower().rstrip("$") for name, sid, _q in records if sid.strip()
+    }
+    if not qualified and not identified:
+        return records
+    kept: list[tuple[str, str, str]] = []
+    for name, sid, qualifier in records:
+        lowered = name.strip().lower()
+        if not qualifier.strip() and lowered in qualified:
+            continue
+        if not sid.strip() and lowered.rstrip("$") in identified:
+            continue
+        kept.append((name, sid, qualifier))
+    return kept
 
 
 def _extract_account_assets(details: Any, *, rule: AssetRule | None = None) -> list[str]:
@@ -667,28 +707,94 @@ def _extract_assets_from_attack_graph_edges(
     _extend_unique(target, matches)
 
 
-def _path_matches_vulnerability(path: dict[str, Any], vuln_name: str) -> bool:
-    """Return True when a path contains a step tied to the vulnerability."""
-    relation_aliases = _relation_aliases_for_vulnerability(vuln_name)
-    if not relation_aliases:
-        return False
+def _path_relation_tokens(path: dict[str, Any]) -> set[str]:
+    """Return every normalized relation token a path carries.
+
+    Reads both places the engine records a step's relation: the flat
+    ``relations`` list and the per-step ``action``/``relation`` field. Extracted
+    from :func:`_path_matches_vulnerability` so the *one* definition of "which
+    relations does this path use" is shared by the per-finding predicate and by
+    :func:`count_findings_on_paths`, which needs it once per path rather than
+    once per (finding, path) pair.
+    """
+    tokens: set[str] = set()
 
     relations = path.get("relations")
     if isinstance(relations, list):
         for relation in relations:
-            if _normalize_relation(relation) in relation_aliases:
-                return True
+            token = _normalize_relation(relation)
+            if token:
+                tokens.add(token)
 
     steps = path.get("steps")
     if isinstance(steps, list):
         for step in steps:
             if not isinstance(step, dict):
                 continue
-            relation = step.get("action") or step.get("relation")
-            if _normalize_relation(relation) in relation_aliases:
-                return True
+            token = _normalize_relation(step.get("action") or step.get("relation"))
+            if token:
+                tokens.add(token)
 
-    return False
+    return tokens
+
+
+def _path_matches_vulnerability(path: dict[str, Any], vuln_name: str) -> bool:
+    """Return True when a path contains a step tied to the vulnerability."""
+    relation_aliases = _relation_aliases_for_vulnerability(vuln_name)
+    if not relation_aliases:
+        return False
+    return bool(_path_relation_tokens(path) & relation_aliases)
+
+
+def count_findings_on_paths(
+    finding_keys: Iterable[Any],
+    paths: Iterable[Any],
+) -> tuple[int, int]:
+    """Count how many findings sit on at least one attack path.
+
+    The topological counterpart to the finding list: a finding that appears on
+    no complete path reaches nothing on its own, and the share of findings in
+    that state is the field figure this exists to measure. Both halves are
+    returned as raw counts and NEVER as a ratio — a percentage cannot be
+    re-aggregated across audits, whereas two counts can be summed.
+
+    "On a path" is decided by exactly the same relation-alias join
+    :func:`_path_matches_vulnerability` applies (a finding key resolves to the
+    graph relations it can appear as, via ``VULN_CATALOG.step_relation`` plus
+    the inverted attack-step catalog). Each path's relation tokens are read
+    once, so the cost is linear in paths plus one set intersection per finding
+    rather than a full re-scan of the path list for every finding.
+
+    Args:
+        finding_keys: The finding/vulnerability keys to test, one per finding
+            the report counts. Every entry counts toward the denominator —
+            including a key with no relation mapping (a posture finding such as
+            ``smb_signing_disabled`` has no graph edge and legitimately sits on
+            no path) and a blank key — so the denominator matches the finding
+            inventory the caller passed in rather than a filtered subset.
+        paths: Attack-path dicts (the engine's summary shape). Non-dict entries
+            are ignored.
+
+    Returns:
+        ``(findings_on_path, findings_total)``. A finding that matches several
+        paths counts once.
+    """
+    path_tokens = [
+        _path_relation_tokens(path) for path in paths if isinstance(path, dict)
+    ]
+    path_tokens = [tokens for tokens in path_tokens if tokens]
+
+    findings_total = 0
+    findings_on_path = 0
+    for key in finding_keys:
+        findings_total += 1
+        aliases = _relation_aliases_for_vulnerability(str(key or ""))
+        if not aliases:
+            continue
+        if any(tokens & aliases for tokens in path_tokens):
+            findings_on_path += 1
+
+    return findings_on_path, findings_total
 
 
 def _extract_assets_from_matching_step(step: dict[str, Any]) -> list[str]:
@@ -994,6 +1100,27 @@ def extract_affected_assets(
     )
 
 
+def _drop_machine_account_shadows(assets: list[str]) -> list[str]:
+    """Drop a bare hostname when the same host's machine account is listed.
+
+    One finding can reach this list through two containers written by two
+    detectors: a plain host list (``MEEREEN``) and a per-account record carrying
+    the machine account (``MEEREEN$``). They are the same computer, and listing
+    both names one host twice — visible to the client as two affected objects.
+    The machine account is the directory object, so it is the one kept.
+    """
+    machine_accounts = {
+        asset.strip().lower()[:-1] for asset in assets if asset.strip().endswith("$")
+    }
+    if not machine_accounts:
+        return assets
+    return [
+        asset
+        for asset in assets
+        if asset.strip().endswith("$") or asset.strip().lower() not in machine_accounts
+    ]
+
+
 def _extract_affected_assets_raw(
     vuln_name: str,
     vuln_data: Any,
@@ -1069,6 +1196,8 @@ def _extract_affected_assets_raw(
         assets, _extract_account_assets(vuln_data.get("details"), rule=rule)
     )
     _extend_unique(assets, _extract_account_assets(vuln_data, rule=rule))
+
+    assets = _drop_machine_account_shadows(assets)
 
     if assets:
         return assets

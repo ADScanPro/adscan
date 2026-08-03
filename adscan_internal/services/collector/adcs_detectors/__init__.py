@@ -90,6 +90,7 @@ def detect_all_for_template(
     cert_mapping_methods: int = 0,
     strong_cert_binding_enforced: bool = False,
     oid_to_group_dn: dict[str, str] | None = None,
+    oid_links_resolved: bool = False,
 ) -> list[CollectorEdge]:
     """Run every template-bound ADCS detector for one CertTemplate.
 
@@ -100,6 +101,12 @@ def detect_all_for_template(
     The optional probe kwargs (``ca_editf_san2_enabled``,
     ``cert_mapping_methods``, ``strong_cert_binding_enforced``) gate the
     ESC6 and ESC10 detectors. Defaults emit no edges.
+
+    ``oid_to_group_dn`` + ``oid_links_resolved`` gate ESC13: an edge is emitted
+    only when a template issuance-policy OID resolves to a group in the map.
+    ``oid_links_resolved`` distinguishes "query succeeded, no link exists"
+    (ESC13 absent) from "query failed" (data gap); both suppress the edge, so a
+    domain without ``msDS-OIDToGroupLink`` never yields a false ESC13 finding.
     """
     if template_node.kind != "CertTemplate":
         return []
@@ -119,7 +126,10 @@ def detect_all_for_template(
             "cert_mapping_methods": cert_mapping_methods,
             "strong_cert_binding_enforced": strong_cert_binding_enforced,
         },
-        "detect_esc13": {"oid_to_group_dn": dict(oid_to_group_dn or {})},
+        "detect_esc13": {
+            "oid_to_group_dn": dict(oid_to_group_dn or {}),
+            "oid_links_resolved": oid_links_resolved,
+        },
     }
     for name in _TEMPLATE_DETECTOR_NAMES:
         detector = getattr(module, name)

@@ -25,6 +25,8 @@ from adscan_internal.services.credentials.privilege_role import (
     ROLE_PRIORITY,
     CredentialKind,
     CredentialPrivilegeRole,
+    append_credential_origin,
+    credential_secret_fingerprint,
     get_credential_meta,
     pick_credential_for_local_admin,
     set_credential_kerberos_material,
@@ -32,16 +34,30 @@ from adscan_internal.services.credentials.privilege_role import (
     set_credential_secret_kind,
 )
 from adscan_internal.services.credentials.credential_origin import (
+    CredentialAcquisition,
+    build_method_set,
+    classify_origin_acquisition,
     origin_display_label,
+    origin_slug_for_relation,
+)
+from adscan_internal.services.credentials.provenance_context import (
+    resolve_active_step_credential_origin,
 )
 
 __all__ = [
     "ROLE_PRIORITY",
+    "CredentialAcquisition",
     "CredentialKind",
     "CredentialMetadata",
     "CredentialPrivilegeRole",
+    "append_credential_origin",
+    "build_method_set",
+    "classify_origin_acquisition",
+    "credential_secret_fingerprint",
     "get_credential_meta",
     "origin_display_label",
+    "origin_slug_for_relation",
+    "resolve_active_step_credential_origin",
     "pick_credential_for_local_admin",
     "set_credential_kerberos_material",
     "set_credential_origin",

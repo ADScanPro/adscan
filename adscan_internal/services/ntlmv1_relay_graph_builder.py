@@ -43,9 +43,6 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from adscan_core import telemetry
 from adscan_core.rich_output import print_error, print_exception, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
-from adscan_internal.services.attack_paths_materialized_cache import (
-    invalidate_attack_path_artifacts,
-)
 from adscan_internal.models.domain import DomainControllers, resolve_dc_ip
 from adscan_internal.workspaces import domain_subpath
 
@@ -360,16 +357,19 @@ def persist_ntlmv1_relay_edges(
     graph_path.parent.mkdir(parents=True, exist_ok=True)
 
     graph: dict[str, Any]
+    # ``nodes`` defaults to a MAPPING, the shape every persisted attack graph
+    # uses (``upsert_nodes`` keys it by node id) and the shape the canonical save
+    # path reads when it prunes Tier-0-source edges.
     if graph_path.exists():
         try:
             graph = json.loads(graph_path.read_text(encoding="utf-8"))
             if not isinstance(graph, dict):
-                graph = {"nodes": [], "edges": []}
+                graph = {"nodes": {}, "edges": []}
         except (OSError, ValueError, TypeError):
-            graph = {"nodes": [], "edges": []}
+            graph = {"nodes": {}, "edges": []}
     else:
-        graph = {"nodes": [], "edges": []}
-    graph.setdefault("nodes", [])
+        graph = {"nodes": {}, "edges": []}
+    graph.setdefault("nodes", {})
     edges_list = graph.setdefault("edges", [])
     if not isinstance(edges_list, list):
         edges_list = []
@@ -391,24 +391,24 @@ def persist_ntlmv1_relay_edges(
             edges_list.append(edge)
         written += 1
 
+    # Persist through the canonical seam, never a raw write: it is what stamps
+    # ``category`` / ``vuln_key`` onto these edges (without which the finding
+    # derivation cannot see them), invalidates the materialized attack-path
+    # artifacts, and syncs technical findings. A raw ``write_text`` here is
+    # exactly how the whole NTLMv1 family stayed out of the client's report.
     try:
-        graph_path.write_text(
-            json.dumps(graph, indent=2, sort_keys=True, ensure_ascii=False),
-            encoding="utf-8",
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            save_attack_graph,
         )
-    except OSError as exc:
+
+        save_attack_graph(shell, domain, graph)
+    except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_error(
             f"[ntlmv1_relay_graph_builder] failed to write attack_graph.json: {exc}"
         )
         return 0
-
-    try:
-        invalidate_attack_path_artifacts(shell, domain)
-    except Exception as exc:  # noqa: BLE001 — telemetry sink
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
 
     print_info_verbose(
         f"[ntlmv1_relay_graph_builder] materialized {written} NTLMv1 attack "

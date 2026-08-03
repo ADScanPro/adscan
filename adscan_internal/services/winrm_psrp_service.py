@@ -226,6 +226,44 @@ class WinRMPSRPService:
         """Return True when the configured secret is a bare 32-hex NT hash."""
         return bool(re.fullmatch(r"[0-9A-Fa-f]{32}", str(self.password or "").strip()))
 
+    def _renew_explicit_ccache_if_expired(self, ccache_path: str) -> str:
+        """Return a usable ccache path for *ccache_path*, renewing it if expired.
+
+        Delegates the whole decision to the ccache-renewal SSOT: a marked ESC13
+        PAC-TGT or a scoped service ticket is returned untouched, an expired but
+        re-mintable ticket is replaced with a fresh one for the same principal,
+        and anything else is passed through. Best-effort — the original path is
+        returned on any failure, so this can only improve on the previous
+        behaviour of handing pyspnego a dead ticket.
+        """
+        path = str(ccache_path or "").strip()
+        if not path:
+            return path
+        try:
+            from adscan_internal.services.kerberos_ccache_renewal import (
+                prepare_ccache_for_bind,
+            )
+
+            preparation = prepare_ccache_for_bind(
+                ccache_path=path,
+                username=self.username,
+                domain=self.domain,
+                dc_ip=str(getattr(self, "kdc_ip", "") or "") or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break the WinRM auth path
+            print_info_debug(
+                f"[winrm_psrp] ccache renewal raised {type(exc).__name__}: {exc}; "
+                "using the ticket as-is"
+            )
+            return path
+        if preparation.renewed and preparation.ccache_path:
+            print_info_debug(
+                "[winrm_psrp] explicit ccache had expired; using the freshly "
+                f"minted ticket for {mark_sensitive(str(self.username or ''), 'user')}"
+            )
+            return preparation.ccache_path
+        return preparation.ccache_path or path
+
     def _resolve_existing_workspace_ccache(self) -> str | None:
         """Return a valid workspace ccache path for this principal, if any.
 
@@ -455,7 +493,15 @@ class WinRMPSRPService:
 
         if effective_auth in {"kerberos", "negotiate"}:
             if self._looks_like_ccache_path():
-                kerberos_ticket_path = str(self.password).strip()
+                # Same auth-seam renewal the LDAP and SMB transports apply: an
+                # explicit ccache is a TICKET and tickets expire. Renew it (or
+                # let the NTLM fallback take over) before handing it to
+                # pyspnego, which would otherwise fail with an expired ticket
+                # it cannot recover from. Capability-bearing tickets (marked
+                # ESC13 PAC-TGTs, scoped service tickets) are passed verbatim.
+                kerberos_ticket_path = self._renew_explicit_ccache_if_expired(
+                    str(self.password).strip()
+                )
                 password = None
                 # When authenticating via ccache the Kerberos principal is
                 # already embedded in the ticket.  Passing a DOMAIN\user string

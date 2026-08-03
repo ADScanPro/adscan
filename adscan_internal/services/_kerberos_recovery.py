@@ -64,7 +64,18 @@ _REALM_SKEW_CACHE: dict[str, datetime.timedelta] = {}
 # Layering: this module MUST NOT import anything from adscan_internal. The
 # reminter is injected as an opaque callback so the dependency direction stays
 # clean (the transport depends on us, never the reverse).
-_REALM_EXPIRY_REMINTERS: dict[str, "Callable[[], str | None]"] = {}
+#
+# Keyed realm -> {principal_key: callback}. The principal key is the normalized
+# sAMAccountName the reminter re-mints, or "" for a legacy principal-agnostic
+# registration. Principal scoping matters because several principals of one
+# realm are authenticated within a single scan: a reminter registered for user A
+# must never "recover" a ticket expiry hit while binding as user B, which would
+# swap in A's ticket and silently authenticate as the wrong principal — the
+# exact failure class ``ensure_user_ccache`` exists to prevent. The result of
+# every re-mint is additionally verified against the expired ticket's own client
+# principal before it is used (see ``_try_reminter_refresh``), so a wrong
+# principal cannot slip through even on the legacy key.
+_REALM_EXPIRY_REMINTERS: dict[str, dict[str, "Callable[[], str | None]"]] = {}
 
 # Re-entrancy guard: set while a reminter callback runs so a reminter that
 # triggers its own Kerberos primitive (e.g. its re-mint issues a TGS) cannot
@@ -168,24 +179,76 @@ def _try_clock_resync(credential: Any) -> bool:
     return stepped
 
 
-def register_expiry_reminter(realm: str, callback: "Callable[[], str | None]") -> None:
+def _normalize_principal(principal: Any) -> str:
+    """Normalize a principal to a comparable key (bare name, lowercased)."""
+    name = str(principal or "").strip()
+    if not name:
+        return ""
+    if "\\" in name:
+        name = name.split("\\", 1)[1]
+    if "@" in name:
+        name = name.split("@", 1)[0]
+    if "/" in name:
+        name = name.split("/", 1)[0]
+    return name.strip().lower()
+
+
+def register_expiry_reminter(
+    realm: str,
+    callback: "Callable[[], str | None]",
+    *,
+    principal: str | None = None,
+) -> None:
     """Register a re-mint callback for *realm* (uppercased).
 
     The callback takes no arguments and returns the path to a freshly minted
-    ccache for the principal, or ``None`` when it could not re-mint. The
-    transport that registers it owns deregistration (always in a ``finally``)
-    so a reminter never leaks across operations or principals.
+    ccache for the principal, or ``None`` when it could not re-mint.
+
+    Args:
+        realm: Kerberos realm / AD domain the reminter can re-mint in.
+        callback: Zero-argument re-mint callable.
+        principal: The principal the callback re-mints. Strongly preferred:
+            it scopes the reminter so an expiry hit while binding as a
+            *different* principal of the same realm does not pick it up.
+            ``None`` registers a legacy realm-wide reminter.
+
+    A transport whose reminter is bound to one operation (e.g. a bind's
+    ``CredentialContext``) deregisters it in a ``finally``. A reminter armed at
+    an auth seam for a workspace principal may stay registered for the session:
+    it re-mints exactly that principal, and the result is principal-verified
+    before use.
     """
     if not realm:
         return
-    _REALM_EXPIRY_REMINTERS[realm.upper()] = callback
+    _REALM_EXPIRY_REMINTERS.setdefault(realm.upper(), {})[
+        _normalize_principal(principal)
+    ] = callback
 
 
-def unregister_expiry_reminter(realm: str) -> None:
-    """Remove any reminter registered for *realm* (no-op when absent)."""
+def unregister_expiry_reminter(
+    realm: str,
+    *,
+    principal: str | None = None,
+    callback: "Callable[[], str | None] | None" = None,
+) -> None:
+    """Remove a reminter registered for *realm* (no-op when absent).
+
+    Removes only the entry for *principal* (default: the legacy realm-wide
+    slot). When *callback* is given, the entry is removed only if it is still
+    that exact callable — so a transport tearing down its own scoped reminter
+    cannot delete one another seam registered in the meantime.
+    """
     if not realm:
         return
-    _REALM_EXPIRY_REMINTERS.pop(realm.upper(), None)
+    bucket = _REALM_EXPIRY_REMINTERS.get(realm.upper())
+    if not bucket:
+        return
+    key = _normalize_principal(principal)
+    if callback is not None and bucket.get(key) is not callback:
+        return
+    bucket.pop(key, None)
+    if not bucket:
+        _REALM_EXPIRY_REMINTERS.pop(realm.upper(), None)
 
 
 def _credential_can_refresh_tgt(credential: Any) -> bool:
@@ -233,14 +296,45 @@ def install() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _ccache_client_principal(ccache: Any) -> str:
+    """Return the normalized client principal recorded in a CCACHE object."""
+    try:
+        for cred in list(getattr(ccache, "credentials", []) or []):
+            principal = getattr(cred, "client", None)
+            if principal is None:
+                continue
+            name = principal.to_string(separator="/")
+            if name:
+                return _normalize_principal(name)
+    except Exception:  # noqa: BLE001 — identity check must never raise
+        return ""
+    return ""
+
+
+def _select_reminter(realm: str, principal: str) -> "Callable[[], str | None] | None":
+    """Pick the reminter for ``principal@realm``.
+
+    An exact principal match wins. The legacy realm-wide slot (registered
+    without a principal) is the fallback, and its result is still verified
+    against the expired ticket's own principal before being used.
+    """
+    bucket = _REALM_EXPIRY_REMINTERS.get(realm)
+    if not bucket:
+        return None
+    if principal and principal in bucket:
+        return bucket[principal]
+    return bucket.get("")
+
+
 def _try_reminter_refresh(client: Any) -> bool:
     """Run a registered reminter for the client's realm and reload its ccache.
 
-    Returns ``True`` when a reminter produced a fresh ccache that was reloaded
-    into ``client.credential.ccache`` (and ``client.kerberos_TGT`` was reset so
-    the retried primitive re-reads it); ``False`` when there is no reminter, it
-    returned ``None``, or reloading failed. Re-entrancy guarded so a reminter
-    that triggers its own Kerberos primitive cannot recurse.
+    Returns ``True`` when a reminter produced a fresh ccache *for the same
+    principal* that was reloaded into ``client.credential.ccache`` (and
+    ``client.kerberos_TGT`` was reset so the retried primitive re-reads it);
+    ``False`` when there is no reminter, it returned ``None``, reloading failed,
+    or the fresh ticket belongs to a different principal. Re-entrancy guarded so
+    a reminter that triggers its own Kerberos primitive cannot recurse.
     """
     global _REMINTER_RUNNING
     if _REMINTER_RUNNING:
@@ -249,7 +343,15 @@ def _try_reminter_refresh(client: Any) -> bool:
     realm = (getattr(credential, "domain", None) or "").upper()
     if not realm:
         return False
-    reminter = _REALM_EXPIRY_REMINTERS.get(realm)
+    requested_principal = _normalize_principal(getattr(credential, "username", None))
+    if not requested_principal:
+        # A ccache bind that named no principal: fall back to whoever the
+        # expired ticket itself belongs to, so the identity check below still
+        # has something to compare against.
+        requested_principal = _ccache_client_principal(
+            getattr(client, "ccache", None) or getattr(credential, "ccache", None)
+        )
+    reminter = _select_reminter(realm, requested_principal)
     if reminter is None:
         return False
     _REMINTER_RUNNING = True
@@ -272,6 +374,24 @@ def _try_reminter_refresh(client: Any) -> bool:
             "Kerberos expiry reminter produced ccache %s but reload failed: %r",
             fresh_path,
             exc,
+        )
+        return False
+    # Identity gate: a re-mint must reproduce the SAME principal. This is what
+    # makes a session-scoped reminter safe — a fresh ticket for a different
+    # principal would silently rebind the connection as somebody else (the
+    # ambient-ccache hijack class), so it is refused and the original expiry
+    # error propagates instead.
+    fresh_principal = _ccache_client_principal(fresh_ccache)
+    if (
+        requested_principal
+        and fresh_principal
+        and fresh_principal != requested_principal
+    ):
+        logger.warning(
+            "Kerberos expiry reminter for realm %s returned a ticket for a "
+            "different principal; refusing the swap and propagating the "
+            "original expiry error.",
+            realm,
         )
         return False
     # Reload the fresh ccache into BOTH the credential AND the client's OWN

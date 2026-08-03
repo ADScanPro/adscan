@@ -5,11 +5,12 @@ This module handles ACE enumeration and other BloodHound operations.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from collections import defaultdict
 import os
 import sys
 import re
+import time
 from datetime import datetime, timezone
 
 from rich.prompt import Confirm, Prompt
@@ -82,6 +83,11 @@ from adscan_internal.services.attack_step_support_registry import (
     describe_search_mode_label,
 )
 from adscan_internal.workspaces import domain_relpath, domain_subpath, write_json_file
+
+if TYPE_CHECKING:
+    from adscan_internal.services.attack_path_progress import (
+        AttackPathComputeProgress,
+    )
 
 
 # Compute-time path cap for `attack_paths` UX.
@@ -1801,6 +1807,179 @@ def _execution_allowed_for_start(
     return False
 
 
+def _format_compute_duration(seconds: float) -> str:
+    """Return a compact human duration (e.g. ``2h 14m 03s`` / ``19.2s``)."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
+
+
+def _render_compute_progress_bar(fraction: float, width: int = 26) -> str:
+    """Return a block-character progress bar (``█`` filled, ``░`` empty).
+
+    Always paired with a literal ``N / M`` count at the call site so the bar is
+    never the sole signal (color-blind / monochrome safe).
+    """
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(fraction * width))
+    return "█" * filled + "░" * max(0, width - filled)
+
+
+# Per-checklist-state glyph + style — symbol carries the meaning so the panel
+# reads without color (accessibility), color reinforces it.
+_CHECKLIST_STATE_GLYPHS: dict[str, tuple[str, str]] = {
+    "done": ("✓", "green"),
+    "running": ("▶", "bold cyan"),
+    "pending": ("·", "dim"),
+}
+
+
+def _render_attack_path_compute_progress(
+    progress: "AttackPathComputeProgress",
+) -> Panel:
+    """Build the live progress panel for the attack-path compute.
+
+    Reads the mutable ``progress`` snapshot on every render so the elapsed timer,
+    the per-principal DFS bar + ETA, and the post-DFS phase checklist all advance
+    under the ``LiveSession`` auto-refresh even while the compute blocks the main
+    thread between stage boundaries.
+    """
+    elapsed = progress.elapsed()
+    done = progress.stage == "Complete"
+    rows: list[Any] = []
+
+    if done:
+        rows.append(
+            Text.assemble(
+                ("Attack paths computed: ", "bold"),
+                (f"{progress.final_paths:,}", "green"),
+            )
+        )
+        if progress.raw_paths:
+            rows.append(
+                Text(f"Paths discovered: {progress.raw_paths:,}", style="dim")
+            )
+        if progress.nodes or progress.edges:
+            rows.append(
+                Text(
+                    f"Graph: {progress.nodes:,} nodes · {progress.edges:,} edges",
+                    style="dim",
+                )
+            )
+        rows.append(
+            Text(f"Elapsed: {_format_compute_duration(elapsed)}", style="dim")
+        )
+        return Panel(
+            Group(*rows),
+            title="Attack Paths · complete",
+            border_style="green",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+
+    # --- DFS phase — real progress bar + honest ETA --------------------------
+    fraction = progress.principal_fraction()
+    if fraction is not None:
+        eta = progress.principal_eta_seconds()
+        pct = int(round(fraction * 100))
+        bar = Text.assemble(
+            ("Enumerating paths  ", "bold"),
+            ("[", "dim"),
+            (_render_compute_progress_bar(fraction), "cyan"),
+            ("] ", "dim"),
+            (f"{progress.principals_done:,} / {progress.principals_total:,}", "bold"),
+            (f"  ({pct}%)", "dim"),
+        )
+        if eta is not None and fraction < 1.0:
+            bar.append(f"   ETA ~{_format_compute_duration(eta)}", style="cyan")
+        rows.append(bar)
+    else:
+        # Pre-DFS graph prep / an indeterminate phase before the first principal.
+        rows.append(Text.assemble(("Stage: ", "bold"), (progress.stage, "cyan")))
+
+    # --- Post-DFS phase checklist (pending / running / done) -----------------
+    checklist = progress.pipeline_checklist()
+    if checklist:
+        for label, state in checklist:
+            glyph, style = _CHECKLIST_STATE_GLYPHS.get(state, ("·", "dim"))
+            row_style = style if state != "pending" else "dim"
+            rows.append(
+                Text.assemble(
+                    ("  ", ""),
+                    (f"{glyph} ", style),
+                    (label, row_style),
+                )
+            )
+
+    if progress.raw_paths:
+        rows.append(Text(f"Paths discovered: {progress.raw_paths:,}", style="dim"))
+    if progress.nodes or progress.edges:
+        rows.append(
+            Text(
+                f"Graph: {progress.nodes:,} nodes · {progress.edges:,} edges",
+                style="dim",
+            )
+        )
+    rows.append(Text(f"Elapsed: {_format_compute_duration(elapsed)}", style="dim"))
+    return Panel(
+        Group(*rows),
+        title=f"Attack Paths · {progress.stage}",
+        border_style="cyan",
+        box=ROUNDED,
+        padding=(0, 1),
+    )
+
+
+class _AttackPathComputeProgressRenderable:
+    """Rich renderable that re-reads the live progress snapshot each frame."""
+
+    def __init__(self, progress: "AttackPathComputeProgress") -> None:
+        self._progress = progress
+
+    def __rich__(self) -> Panel:
+        return _render_attack_path_compute_progress(self._progress)
+
+
+def _emit_attack_path_compute_telemetry(
+    shell: Any,
+    domain: str,
+    progress: "AttackPathComputeProgress",
+) -> None:
+    """Emit the one-shot ``attack_path_compute_performance`` event.
+
+    Counts + per-stage seconds only (no path content / principal names). Skipped
+    on a cache hit (no stage ran), so a fast re-run does not emit noise. This is
+    what makes a future multi-hour compute diagnosable from a session recording.
+    """
+    if not progress.has_run():
+        return
+    from adscan_core import telemetry
+
+    try:
+        from adscan_internal.cli.common import build_lab_event_fields
+
+        properties: dict[str, Any] = {
+            "domain": mark_sensitive(domain, "domain"),
+            **progress.telemetry_properties(),
+        }
+        try:
+            properties.update(build_lab_event_fields(shell=shell, include_slug=False))
+        except Exception:  # noqa: BLE001 — lab fields are best-effort enrichment
+            pass
+        telemetry.capture("attack_path_compute_performance", properties)
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break the flow
+        telemetry.capture_exception(exc)
+        from adscan_core.rich_output import print_exception
+
+        print_exception(exception=exc)
+
+
 def run_show_attack_paths(
     shell: BloodHoundShell,
     target_domain: str,
@@ -2238,6 +2417,12 @@ def run_show_attack_paths(
     )
     max_paths_compute = _resolve_attack_paths_compute_cap(max_display)
 
+    from adscan_internal.services.attack_path_progress import (
+        AttackPathComputeProgress,
+    )
+
+    _compute_progress = AttackPathComputeProgress(started_at=time.monotonic())
+
     def _sort_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Canonical UX ordering — same single source of truth used by the
         # table renderer and any selector prompt downstream. The canonical
@@ -2246,7 +2431,10 @@ def run_show_attack_paths(
         # need a secondary regroup.
         from adscan_internal.rich_output import order_attack_paths_for_display
 
-        return order_attack_paths_for_display(paths)
+        _order_t0 = time.monotonic()
+        ordered = order_attack_paths_for_display(paths)
+        _compute_progress.record_ordering(time.monotonic() - _order_t0)
+        return ordered
 
     def _compute_paths() -> list[dict[str, Any]]:
         if start_user_norm == "owned":
@@ -2328,7 +2516,47 @@ def run_show_attack_paths(
         )
         return _sort_paths(domain_paths)
 
-    path_refs = _compute_paths()
+    # The compute is a single blocking synchronous call whose containment filter
+    # can run for a very long time on large graphs (2h+ on a 774-host scan). Wrap
+    # it in a LiveSession so the operator sees the current stage, running path
+    # count, elapsed and throughput instead of a frozen elapsed-only counter. The
+    # panel refreshes from the stage boundaries the compute already crosses (via
+    # the ``attack_path_progress`` observer) — the compute stays synchronous and
+    # its results are byte-identical. Non-interactive / CI runs auto-fall back to
+    # the inline digest (collapsed, one line per stage).
+    from adscan_core.tui import LiveSession, LiveSessionConfig
+    from adscan_internal.services import attack_path_progress as _app_progress
+    from adscan_internal.services.attack_graph_service import (
+        preselect_dev_engine_for_display,
+    )
+
+    _progress_renderable = _AttackPathComputeProgressRenderable(_compute_progress)
+
+    def _compute_progress_summary(console: Any) -> None:
+        try:
+            console.print(_render_attack_path_compute_progress(_compute_progress))
+        except Exception:  # noqa: BLE001 — the recap must never break the flow
+            pass
+
+    # Resolve the dev engine/parallelism selection BEFORE entering the LiveSession
+    # alt-screen — otherwise the in-compute questionary pickers fire underneath the
+    # alt-screen (hidden, unanswerable) and the run hangs until Ctrl-C. No-op in
+    # production (resolves to local/sequential without prompting).
+    with preselect_dev_engine_for_display(shell), LiveSession(
+        _progress_renderable,
+        config=LiveSessionConfig(refresh_per_second=8, alt_screen=True),
+        summary=_compute_progress_summary,
+    ) as _progress_session:
+        _compute_progress.on_update = lambda _p: _progress_session.update(
+            _progress_renderable
+        )
+        with _app_progress.track_compute_progress(_compute_progress):
+            path_refs = _compute_paths()
+        _compute_progress.mark_done(final_paths=len(path_refs))
+        _progress_session.update(_progress_renderable)
+
+    _emit_attack_path_compute_telemetry(shell, target_domain, _compute_progress)
+
     cache_after = get_attack_paths_cache_stats(domain=target_domain)
     membership_cache_after = get_membership_snapshot_cache_stats()
 

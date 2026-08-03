@@ -79,6 +79,7 @@ Honesty (CLAUDE.md § Nomenclature Standard):
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -104,6 +105,12 @@ from adscan_core.posture_score import (
     PostureScore,
     compute_posture_score,
 )
+from adscan_core.reporting.domain_scope import (
+    classify_report_domains,
+    format_discovered_domains_note,
+)
+from adscan_core.reporting.finding_aliases import collapse_finding_aliases
+from adscan_core.reporting.finding_vuln_map import is_reportable_finding
 from adscan_core.reporting.technical_report import _get_technical_report_path
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 from adscan_core.rich_output import (
@@ -118,6 +125,9 @@ from adscan_internal.services.adcs_path_display import (
 from adscan_internal.services.affected_assets_struct import (
     SERIALIZED_KEY,
     TYPE_DOMAIN,
+)
+from adscan_internal.services.attack_graph_findings import (
+    reconcile_workspace_attack_graph_findings,
 )
 from adscan_internal.services.attack_path_presentation import (
     order_paths_for_client_presentation,
@@ -151,7 +161,11 @@ from adscan_internal.services.exposure_score_service import (
     derive_domain_user_reach,
     derive_posture_path_inputs,
 )
-from adscan_internal.services.path_state import _PROVEN_STATUSES
+from adscan_internal.services.path_state import _PROVEN_STATUSES, client_status_label
+from adscan_internal.services.post_compromise_obligations import (
+    load_post_compromise_obligations,
+    obligations_to_dicts,
+)
 from adscan_internal.services.report_design import load_design_css
 
 # How many attack paths to render before collapsing the rest into an honest
@@ -189,20 +203,22 @@ LITE_THEME = "editorial"
 #   closed_by_configuration | theoretical
 # (step statuses also include success / failed / error).
 #
-# "Proven" is the SSOT set _PROVEN_STATUSES (success / exploited /
-# domain_compromised) — NEVER a bare literal. Everything else maps below. No
-# label claims a defensive control blocked the attack.
-_NONPROVEN_STATUS_PRESENTATION: dict[str, tuple[str, str]] = {
-    "partial": ("Partially Validated", "partial"),
-    "attempted": ("Attempted", "attempted"),
-    "failed": ("Attempted", "attempted"),
-    "error": ("Attempted", "attempted"),
-    "unavailable": ("Not Assessed", "gap"),
-    "unsupported": ("Not Assessed", "gap"),
-    "blocked": ("Not Executed for Safety", "safety"),
-    "safety_blocked": ("Not Executed for Safety", "safety"),
-    "closed_by_configuration": ("Attack Surface Reduced", "hardening"),
-    "theoretical": ("Theoretical", "theoretical"),
+# The LABEL is the shared SSOT ``path_state.client_status_label`` (the paid
+# deliverable renders the same vocabulary, so the two tiers can never name a
+# status differently). Only the TONE — a CSS-class token this document's
+# stylesheet maps to a colour — is local.
+_STATUS_TONES: dict[str, str] = {
+    "partial": "partial",
+    "attempted": "attempted",
+    "failed": "attempted",
+    "error": "attempted",
+    "post_ex_failed": "attempted",
+    "unavailable": "gap",
+    "unsupported": "gap",
+    "blocked": "safety",
+    "safety_blocked": "safety",
+    "closed_by_configuration": "hardening",
+    "theoretical": "theoretical",
 }
 
 
@@ -211,13 +227,13 @@ def status_presentation(status: object) -> tuple[str, str]:
 
     ``tone`` is a stable CSS-class token the template maps to a colour. Proven
     statuses (the SSOT :data:`_PROVEN_STATUSES` set) return ``("Validated",
-    "proven")``; every other status maps through
-    :data:`_NONPROVEN_STATUS_PRESENTATION`, defaulting to Theoretical.
+    "proven")``; every other label comes from the shared
+    :func:`client_status_label`, defaulting to Theoretical.
     """
     token = str(status or "").strip().lower()
     if token in _PROVEN_STATUSES:
         return ("Validated", "proven")
-    return _NONPROVEN_STATUS_PRESENTATION.get(token, ("Theoretical", "theoretical"))
+    return (client_status_label(token), _STATUS_TONES.get(token, "theoretical"))
 
 
 def _score_tone(score: int) -> str:
@@ -294,6 +310,11 @@ class AttackPathRow:
     #: tells them apart is how they get there.
     via: str = ""
     extra_steps: int = 0
+    #: When many near-identical paths differ only in which account is the pivot,
+    #: the engine collapses them into this one row and records the full set. This
+    #: note names the interchangeable accounts so the reader knows every
+    #: credential to rotate, e.g. "Opened by any of 50 accounts (1 validated)".
+    via_accounts_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -394,7 +415,16 @@ class LiteReportModel:
 
     workspace_name: str
     domain_label: str
+    #: ASSESSED domains only — the count the cover and the page footers print, so
+    #: it must mean what a reader takes it to mean: domains this scan enumerated.
+    #: A domain reached over a trust and never enumerated is carried in
+    #: ``discovered_domains`` instead. SSOT: adscan_core.reporting.domain_scope.
     domain_count: int
+    #: Domains named by the scan but never enumerated — unmeasured surface,
+    #: reported in its own right and excluded from every figure.
+    discovered_domains: tuple[str, ...]
+    #: One sentence naming those domains, or empty when there are none.
+    discovered_domains_note: str
     generated_at: str
     # The verdict — one sentence, the thing the document is about. Composed in
     # Python (see :func:`build_verdict`) so the template interpolates values
@@ -431,6 +461,15 @@ class LiteReportModel:
     proven_paths: int
     choke_points: tuple[ChokePointRow, ...]
     changes: ChangeDisclosure
+    #: What the PROVEN compromise obliges the reader to do — reset krbtgt twice,
+    #: rotate every recovered credential, revoke a certificate the CA issued.
+    #: Derived by the tier-shared SSOT
+    #: :mod:`~adscan_internal.services.post_compromise_obligations`, so this
+    #: document and the paid deliverable state the same obligations from the
+    #: same proof. Empty when the engagement proved none of them, and the
+    #: section is then omitted. Withholding a safety-critical instruction is
+    #: not a tier boundary, which is why the free report carries it too.
+    obligations: tuple[dict[str, Any], ...] = ()
     #: How many paths carry a validated segment without being proven end to end.
     #: Not rendered as its own figure today; carried so the document's own
     #: proof mix can be measured (see :func:`derive_report_content_metrics`).
@@ -439,6 +478,13 @@ class LiteReportModel:
     #: the assets; this is the roll-up of how many name something the reader can
     #: act on, which is what the content telemetry reports.
     finding_assets: FindingAssetCoverage = FindingAssetCoverage()
+    #: The assessed CLIENT's own logo as a ``data:`` URI, placed ALONGSIDE (never
+    #: instead of) the ADscan mark in the masthead. Empty string renders only the
+    #: ADscan mark. Resolved through the shared SSOT
+    #: :mod:`~adscan_internal.services.client_logo`, so both tiers co-brand from
+    #: the one persisted logo. Suppressing the ADscan mark (full white-label) is a
+    #: separate paid boundary and is deliberately NOT done here.
+    client_logo_uri: str = ""
     pro_url: str = _PRO_URL
     repo_url: str = _LITE_REPO_URL
 
@@ -542,6 +588,55 @@ def _finding_asset_labels(finding: Any) -> tuple[tuple[str, ...], int]:
     return shown, max(0, len(ordered) - len(shown))
 
 
+def iter_reportable_findings(
+    domains: Any,
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield ``(domain_name, finding)`` for every record the report counts.
+
+    The single source of truth for WHICH records are findings, applied in
+    order: alias-family collapse, the reportable gate, then the empty-title
+    drop. :func:`_collect_findings` builds the document's rows from this, and
+    the scan-complete telemetry derives its findings denominator from it — so a
+    published "share of findings that reach nothing" is measured against
+    exactly the finding count the customer reads in their own report, and the
+    two cannot drift.
+
+    Args:
+        domains: The ``domains`` mapping of a ``technical_report.json`` payload
+            (``{fqdn: {"findings": [...], ...}}``). Anything else yields
+            nothing.
+    """
+    if not isinstance(domains, dict):
+        return
+    for domain_name, entry in domains.items():
+        if not isinstance(entry, dict):
+            continue
+        findings = entry.get("findings")
+        if not isinstance(findings, list):
+            continue
+        for finding in collapse_finding_aliases(findings):
+            if not isinstance(finding, dict):
+                continue
+            if not is_reportable_finding(finding):
+                continue
+            if not str(finding.get("title") or "").strip():
+                continue
+            yield str(domain_name), finding
+
+
+def reportable_finding_keys(domains: Any) -> list[str]:
+    """Return one catalog key per finding the report counts, in report order.
+
+    The key is what joins a finding to the attack-graph relations it can appear
+    as. A finding with no key still contributes an entry (an empty string), so
+    the list length always equals the document's finding count.
+    """
+    return [
+        str(finding.get("key") or "")
+        for _domain, finding in iter_reportable_findings(domains)
+    ]
+
+
 def _collect_findings(
     domains: dict[str, Any], *, multi_domain: bool
 ) -> tuple[list[FindingRow], dict[str, int], FindingAssetCoverage]:
@@ -550,41 +645,41 @@ def _collect_findings(
     Reads ONLY the LITE-safe fields (key, title, severity, category). The rich
     ``knowledge`` object and ``cvss_base`` are deliberately never read, so a
     PRO-produced JSON renders exactly like a LITE one.
+
+    Which records qualify is decided by :func:`iter_reportable_findings`, which
+    applies two shared gates owned by ``adscan_core.reporting``: alias-family
+    duplicates collapse to one entry, so a weakness two producers observed is
+    listed once at one severity; and :func:`is_reportable_finding` drops legacy
+    metric residue — counters such as
+    ``smb_samr_descriptions_credentials_count`` that older builds wrote into
+    ``findings[]`` before the recorder routed metrics to control evidence. The
+    paid report has always applied that gate; applying it here is what stops the
+    free report from listing a coverage counter as a medium finding.
     """
     counts: dict[str, int] = {sev: 0 for sev in _SEVERITY_ORDER}
     rows: list[FindingRow] = []
     with_assets = 0
     with_locator = 0
-    for domain_name, entry in domains.items():
-        if not isinstance(entry, dict):
-            continue
-        findings = entry.get("findings")
-        if not isinstance(findings, list):
-            continue
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
-            severity = str(finding.get("severity") or "").strip().lower()
-            title = str(finding.get("title") or "").strip()
-            if not title:
-                continue
-            if severity in counts:
-                counts[severity] += 1
-            has_assets, has_locator = finding_asset_state(finding)
-            with_assets += int(has_assets)
-            with_locator += int(has_locator)
-            assets, assets_overflow = _finding_asset_labels(finding)
-            rows.append(
-                FindingRow(
-                    title=title,
-                    severity=severity if severity in counts else "low",
-                    category=str(finding.get("category") or "General").strip(),
-                    mitre=_finding_mitre(str(finding.get("key") or "")),
-                    domain=str(domain_name) if multi_domain else "",
-                    assets=assets,
-                    assets_overflow=assets_overflow,
-                )
+    for domain_name, finding in iter_reportable_findings(domains):
+        severity = str(finding.get("severity") or "").strip().lower()
+        title = str(finding.get("title") or "").strip()
+        if severity in counts:
+            counts[severity] += 1
+        has_assets, has_locator = finding_asset_state(finding)
+        with_assets += int(has_assets)
+        with_locator += int(has_locator)
+        assets, assets_overflow = _finding_asset_labels(finding)
+        rows.append(
+            FindingRow(
+                title=title,
+                severity=severity if severity in counts else "low",
+                category=str(finding.get("category") or "General").strip(),
+                mitre=_finding_mitre(str(finding.get("key") or "")),
+                domain=domain_name if multi_domain else "",
+                assets=assets,
+                assets_overflow=assets_overflow,
             )
+        )
     rows.sort(
         key=lambda r: (
             _SEVERITY_ORDER.index(r.severity) if r.severity in _SEVERITY_ORDER else 99,
@@ -853,9 +948,35 @@ def _build_path_rows(
                 steps=tuple(step_rows),
                 via=_format_via(techniques),
                 extra_steps=extra,
+                via_accounts_note=_format_via_accounts_note(path),
             )
         )
     return rows, len(ordered), proven, partial
+
+
+def _format_via_accounts_note(path: dict[str, Any]) -> str:
+    """Name the interchangeable accounts a collapsed sibling-pivot row stands for.
+
+    The engine folds many paths that differ only in their pivot account into one
+    row and records the full set (``via_accounts_count``) plus a sample
+    (``via_accounts``). Surfacing the count and the names tells the reader every
+    credential that opens this route, so none is missed when rotating.
+    """
+    count = path.get("via_accounts_count")
+    if not isinstance(count, int) or count <= 1:
+        return ""
+    proven = path.get("via_accounts_proven_count")
+    sample = path.get("via_accounts")
+    note = f"Opened by any of {count} interchangeable accounts"
+    if isinstance(proven, int) and proven > 0:
+        note += f" ({proven} validated)"
+    if isinstance(sample, list) and sample:
+        names = [str(a).strip() for a in sample[:5] if str(a).strip()]
+        if names:
+            extra = count - len(names)
+            suffix = f", +{extra} more" if extra > 0 else ""
+            note += f": {', '.join(names)}{suffix}"
+    return note
 
 
 #: How many techniques the path spine names before it elides. Three is what
@@ -1280,6 +1401,8 @@ def build_report_model(
     raw_paths: list[dict[str, Any]],
     generated_at: Optional[str] = None,
     environment_changes: Optional[EnvironmentChangeResolution] = None,
+    client_logo_uri: str = "",
+    obligations: Sequence[dict[str, Any]] = (),
 ) -> LiteReportModel:
     """Build the fully-resolved, client-safe report model from loaded data.
 
@@ -1296,11 +1419,21 @@ def build_report_model(
     block there is attached at exit and is absent on a first run. Omit it and the
     model falls back to that block alone, which yields "record unavailable"
     rather than a clean run when it is missing.
+
+    ``obligations`` carries what the proven compromise obliges the client to do
+    (see :func:`~adscan_internal.services.post_compromise_obligations.load_post_compromise_obligations`).
+    It is a parameter for the same reason: deriving it reads the workspace
+    credential store, and this builder stays pure.
     """
     domains = technical_report.get("domains")
     if not isinstance(domains, dict):
         domains = {}
-    domain_names = [str(d) for d in domains.keys() if isinstance(d, str) and d]
+    # A trust-discovered domain sits in this mapping exactly like an enumerated
+    # one. Counting the mapping put "3 DOMAINS (…)" in every page footer of a
+    # document whose body covered one — so the cover, the footer and the scope
+    # tile all read the ASSESSED set. SSOT: adscan_core.reporting.domain_scope.
+    domain_scope = classify_report_domains(domains)
+    domain_names = list(domain_scope.assessed)
     multi_domain = len(domain_names) > 1
 
     findings, counts, finding_assets = _collect_findings(
@@ -1334,6 +1467,8 @@ def build_report_model(
         workspace_name=workspace_name,
         domain_label=domain_label,
         domain_count=len(domain_names),
+        discovered_domains=domain_scope.discovered,
+        discovered_domains_note=format_discovered_domains_note(domain_scope),
         generated_at=generated_at or _now_display(),
         verdict_figure=verdict_figure,
         verdict_text=verdict_text,
@@ -1369,6 +1504,8 @@ def build_report_model(
         ),
         partial_paths=partial,
         finding_assets=finding_assets,
+        client_logo_uri=client_logo_uri,
+        obligations=tuple(obligations),
     )
 
 
@@ -1631,6 +1768,48 @@ def _stamp_affected_assets(
     return changed
 
 
+def _stamp_domain_assessments(
+    workspace_dir: str, domains: list[str], raw_domains: Any = None
+) -> bool:
+    """Record the assessed/discovered verdict for each domain in the workspace.
+
+    The tier-shared resolver decides (:func:`resolve_domain_assessment`) and the
+    LITE-safe recorder persists, so both artifacts and ``adscan_web`` read one
+    verdict rather than each re-inferring it from the absence of findings — which
+    a genuinely clean assessed domain would also produce.
+
+    Best-effort: an unreadable or unwritable workspace leaves no marker and the
+    model falls back to the inference in
+    :mod:`adscan_core.reporting.domain_scope`.
+
+    Returns:
+        ``True`` when the technical report was rewritten.
+    """
+    from types import SimpleNamespace
+
+    from adscan_core.reporting.technical_report import record_domain_assessment
+    from adscan_internal.services.report_attack_paths import (
+        resolve_domain_assessment,
+    )
+
+    shell = SimpleNamespace(current_workspace_dir=str(workspace_dir))
+    entries = raw_domains if isinstance(raw_domains, dict) else {}
+    changed = False
+    for domain in domains:
+        try:
+            enumerated, basis = resolve_domain_assessment(
+                workspace_dir, domain, entries.get(domain)
+            )
+            record_domain_assessment(
+                shell, domain, enumerated=enumerated, basis=basis
+            )
+            changed = True
+        except Exception as exc:  # noqa: BLE001 - a report never fails on this
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    return changed
+
+
 @dataclass(frozen=True)
 class LiteReportArtifacts:
     """What one LITE report generation produced.
@@ -1694,6 +1873,22 @@ def generate_lite_report_artifacts(
             )
             return None
 
+        workspace_dir = str(
+            getattr(shell, "current_workspace_dir", None) or tr_path.parent
+        )
+
+        # Reconcile the findings against the attack graph BEFORE reading them.
+        # The per-save sync during a scan normally leaves the two artifacts in
+        # agreement; this is the backstop for a workspace produced by an earlier
+        # build, so a document can never state a finding count that contradicts
+        # the graph it renders paths from. Resolved against the same
+        # ``workspace_dir`` the path computation and the affected-asset stamp
+        # use, so all three read one workspace (a live scan's is the ``.run_*``
+        # execution root, not the logical one).
+        reconcile_workspace_attack_graph_findings(
+            workspace_dir, technical_report_path=str(tr_path)
+        )
+
         technical_report = read_json_file(str(tr_path))
         if not isinstance(technical_report, dict):
             print_error("The technical report is unreadable; cannot build the report.")
@@ -1706,10 +1901,18 @@ def generate_lite_report_artifacts(
             else []
         )
 
-        workspace_dir = str(
-            getattr(shell, "current_workspace_dir", None) or tr_path.parent
-        )
         raw_paths = _compute_report_paths(workspace_dir, domain_names)
+
+        # Record, per domain, whether this engagement actually enumerated it, so
+        # the cover and the page footers count coverage rather than every domain
+        # name the scan ever met. Resolved from the workspace (did the collector
+        # produce a graph?) so a clean assessed domain is not mistaken for an
+        # untouched one; the marker is persisted, so the PRO kit and the web read
+        # the same verdict. Best-effort — the model falls back to inference.
+        if _stamp_domain_assessments(workspace_dir, domain_names, domains):
+            restamped_scope = read_json_file(str(tr_path))
+            if isinstance(restamped_scope, dict):
+                technical_report = restamped_scope
 
         # Resolve what each finding is ABOUT before the model is built. The seam
         # writes back to the workspace's technical report, so re-read it when it
@@ -1729,14 +1932,31 @@ def generate_lite_report_artifacts(
         # technical_report.json is written LATER (at exit) and on a first run is
         # simply not there — reading it alone made a scan that minted machine
         # accounts and mutated templates tell the client nothing was touched.
+        # Co-brand the masthead with the assessed client's own logo when one has
+        # been picked/persisted (config or --client-logo). Shared SSOT resolves +
+        # embeds it as a data-URI; empty string renders only the ADscan mark.
+        from adscan_internal.services.client_logo import resolve_client_logo_data_uri
+
+        changes_resolution = resolve_environment_changes(
+            ledger=getattr(shell, "environment_change_ledger", None),
+            workspace_dir=workspace_dir,
+            report_block=technical_report.get("environment_changes"),
+        )
         model = build_report_model(
             workspace_name=workspace_name,
             technical_report=technical_report,
             raw_paths=raw_paths,
-            environment_changes=resolve_environment_changes(
-                ledger=getattr(shell, "environment_change_ledger", None),
-                workspace_dir=workspace_dir,
-                report_block=technical_report.get("environment_changes"),
+            environment_changes=changes_resolution,
+            client_logo_uri=resolve_client_logo_data_uri(),
+            # What the proven compromise obliges. Same SSOT the paid kit reads,
+            # so a reader who sees the free report and later the deliverable is
+            # told the same thing to do.
+            obligations=obligations_to_dicts(
+                load_post_compromise_obligations(
+                    workspace_dir,
+                    environment_changes=changes_resolution.block,
+                    domain_order=domain_names,
+                )
             ),
         )
         html_text = render_report_html(model)
@@ -1878,7 +2098,11 @@ def _print_report_ready_panel(
             [
                 Text("This is the free exposure report. The client kit adds:"),
                 Text(""),
-                Text("  Security Assessment Report mapped to DORA, NIS2, ENS and ISO 27001"),
+                # "or", not "and": the kit carries the regimes the operator
+                # selects, never all of them. Kept under 70 characters so the
+                # bullet does not wrap on an 80-column terminal (see the same
+                # note on adscan_core.pro_upsell._KIT_ITEMS).
+                Text("  Security Assessment Report mapped to DORA, NIS2, ENS or ISO 27001"),
                 Text("  Per-finding remediation your client's sysadmin can execute"),
                 Text("  AD Hardening Playbook"),
                 Text("  AD Control Coverage Report"),
@@ -1895,8 +2119,8 @@ def _print_report_ready_panel(
     else:
         lines.append(
             Text.from_markup(
-                "Client-ready version with DORA / NIS2 / ENS mapping, per-finding "
-                "remediation and your own branding: "
+                "Client-ready version mapped to your engagement's regime, "
+                "per-finding remediation and your own branding: "
                 + cta_markup(
                     "report_ready_panel", cta_display_url("report_ready_panel")
                 ),
@@ -1989,10 +2213,21 @@ _TEMPLATE = r"""<!DOCTYPE html>
    headline. The running footer keeps the name as TEXT and gains no mark: a
    per-page logo band is brochure register, and this audience reads real
    penetration-test reports, which do not carry one. */
+.masthead-mark { display: flex; align-items: center; gap: 5mm; }
 .masthead-mark svg { display: block; height: 11mm; width: auto; }
 .masthead-mark .wordmark {
   font-family: var(--font-serif); font-weight: 800; font-size: 18pt;
   letter-spacing: -0.4px; color: var(--text);
+}
+/* Co-brand lockup: a hairline divider then the client's own logo, set slightly
+   smaller than the 11mm ADscan mark so ours stays the primary signature and the
+   client's reads as "prepared for". object-fit keeps any aspect ratio intact and
+   the max-width stops a wide wordmark from crowding the Confidential tag. */
+.masthead-mark .cobrand-divider {
+  display: inline-block; width: 1px; height: 9mm; background: var(--line-2);
+}
+.masthead-mark .client-logo {
+  display: block; height: 9mm; width: auto; max-width: 56mm; object-fit: contain;
 }
 .masthead-tag {
   font-size: 6pt; font-weight: 700; letter-spacing: 0.24em;
@@ -2090,6 +2325,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
   font-size: 7.5pt; color: var(--text-2); margin-top: 1.5mm; line-height: 1.45;
 }
 .path-via .ds-arrow { color: var(--accent); margin: 0 1mm; }
+.path-accounts { font-size: 7.5pt; color: var(--text-2); margin-top: 1mm; line-height: 1.45; }
 .path-more { font-size: 7.5pt; color: var(--text-4); margin-top: 2mm; }
 /* The step technique reads as a lead-in to its own sentence, not as a label
    floating above it: same line, weight carries the distinction. */
@@ -2102,6 +2338,49 @@ _TEMPLATE = r"""<!DOCTYPE html>
 .omitted b { color: var(--text-2); }
 .empty { font-size: 8.5pt; color: var(--text-3); font-style: italic; }
 .omitted a, .ds-fineprint a { color: var(--accent); font-weight: 600; text-decoration: none; }
+
+/* ── Containment obligations ────────────────────────────────────────────
+   What the proven compromise obliges. One card per obligation, each kept
+   whole across a page break so a heading never lands alone at a page foot
+   with its steps overleaf. */
+.oblig {
+  border-top: 2pt solid var(--critical); padding-top: 4mm; margin-top: 6mm;
+  page-break-inside: avoid; break-inside: avoid;
+}
+.oblig-k {
+  font-family: var(--font-mono); font-size: 6.5pt; font-weight: 700;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--critical);
+  margin-bottom: 1.4mm;
+}
+.oblig-t {
+  font-family: var(--font-display); font-size: 12pt; font-weight: 600;
+  color: var(--text); line-height: 1.25; margin-bottom: 2mm;
+  page-break-after: avoid; break-after: avoid;
+}
+.oblig p { font-size: 8.5pt; color: var(--text-2); line-height: 1.55; margin: 0 0 2mm; }
+.oblig-proof { color: var(--text) !important; }
+ol.oblig-steps { margin: 1mm 0 2mm; padding-left: 5mm; }
+ol.oblig-steps > li {
+  font-size: 8.5pt; color: var(--text-2); line-height: 1.5; margin: 0 0 2.5mm;
+  page-break-inside: avoid; break-inside: avoid;
+}
+.oblig-cmd {
+  font-family: var(--font-mono); font-size: 6.8pt; color: var(--text);
+  background: var(--bg-1); border: 1px solid var(--line);
+  padding: 1.4mm 2mm; margin-top: 1.4mm;
+  white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45;
+}
+.oblig-runbook-k {
+  font-size: 6.5pt; font-weight: 700; letter-spacing: 0.2em;
+  text-transform: uppercase; color: var(--text-4); margin-top: 3mm;
+}
+.oblig-caveat {
+  border-top: 1px solid var(--line); padding-top: 2.2mm; margin-top: 3mm;
+}
+.oblig-caveat b {
+  display: block; font-size: 6.5pt; font-weight: 700; letter-spacing: 0.2em;
+  text-transform: uppercase; color: var(--text-4); margin-bottom: 1mm;
+}
 
 /* ── Change disclosure ──────────────────────────────────────────────────── */
 .changes-caption {
@@ -2161,6 +2440,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
         {# Trusted, bundled brand asset (adscan_internal/assets/logos), resolved
            through the shared brand_assets SSOT — safe to inline unescaped. #}
         {% if m.brand_logo_svg %}{{ m.brand_logo_svg | safe }}{% else %}<span class="wordmark">ADscan</span>{% endif %}
+        {# Assessed client's own logo, ALONGSIDE the ADscan mark (never replacing
+           it — full white-label is a separate paid boundary). A data-URI, so the
+           file stays self-contained and the mark survives the Chromium render. #}
+        {% if m.client_logo_uri %}<span class="cobrand-divider" aria-hidden="true"></span><img class="client-logo" src="{{ m.client_logo_uri }}" alt="Client logo">{% endif %}
       </div>
       <div class="masthead-tag">Confidential</div>
     </div>
@@ -2186,7 +2469,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div>
         <div class="ds-meta-k">Scope</div>
-        <div class="ds-meta-v">{{ m.domain_count }} domain{{ '' if m.domain_count == 1 else 's' }}</div>
+        <div class="ds-meta-v">{{ m.domain_count }} domain{{ '' if m.domain_count == 1 else 's' }} assessed</div>
       </div>
       <div>
         <div class="ds-meta-k">Findings</div>
@@ -2236,6 +2519,18 @@ _TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </section>
 
+  {# A domain reached over a trust but never enumerated contributes to nothing
+     above, so it is stated separately rather than counted as scope. Naming it
+     is the useful part: it is the surface this engagement did not measure. #}
+  {% if m.discovered_domains_note %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">Not assessed</div>
+      <div class="ds-note-t">{{ m.discovered_domains_note }}</div>
+    </div>
+  </section>
+  {% endif %}
+
   <section class="ds-section">
     <div class="sev-bar-wrap">
       <div class="sev-bar-label">Severity distribution &middot; {{ m.total_findings }} finding{{ '' if m.total_findings == 1 else 's' }}</div>
@@ -2249,6 +2544,61 @@ _TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
   </section>
+
+  {# What the assessment PROVED, and therefore what has to happen regardless of
+     which finding gets fixed first. Same derivation as the paid deliverable
+     (services/post_compromise_obligations): withholding a safety-critical
+     instruction is not a tier boundary. Rendered only when the engagement
+     actually reached these outcomes — a scan that recovered nothing must never
+     tell a reader to reset krbtgt. Placed straight after the executive page so
+     it is read before the evidence, not after it. #}
+  {% if m.obligations %}
+  {% set _one = (m.obligations | length) == 1 %}
+  <section class="ds-section section-new-page">
+    <div class="ds-section-head">
+      <div class="ds-eyebrow">Do this first</div>
+      <h2 class="ds-section-title">What the proof obliges</h2>
+      <p class="ds-section-lead">
+        The {{ 'action' if _one else (m.obligations | length) ~ ' actions' }} below
+        {{ 'is' if _one else 'are' }} not {{ 'a finding' if _one else 'findings' }}.
+        {{ 'It exists' if _one else 'They exist' }} because the assessment succeeded:
+        material that authenticates against your directory is now outside your control,
+        and only your team can take it back. Nothing else in this report is effective
+        while {{ 'it is' if _one else 'they are' }} outstanding.
+      </p>
+    </div>
+
+    {% for ob in m.obligations %}
+    <div class="oblig">
+      <div class="oblig-k">Containment {{ loop.index }} of {{ m.obligations | length }}</div>
+      <div class="oblig-t">{{ ob.title }}</div>
+      <p class="oblig-proof">{{ ob.proof }}</p>
+      {% if ob.rationale %}<p>{{ ob.rationale }}</p>{% endif %}
+      {% if ob.steps %}
+      <ol class="oblig-steps">
+        {% for step in ob.steps %}
+        <li>
+          {{ step.text }}
+          {% for cmd in step.commands %}<div class="oblig-cmd">{{ cmd }}</div>{% endfor %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+      {# The procedure the change ledger already rendered for this obligation.
+         The paid kit prints it in full in its own section and points at it
+         from here; this document has no such section, so it carries it. #}
+      {% if ob.runbook %}
+      <div class="oblig-runbook-k">The procedure, with this engagement's values</div>
+      <div class="oblig-cmd">{% for line in ob.runbook %}{{ line }}
+{% endfor %}</div>
+      {% endif %}
+      {% if ob.caveat %}
+      <p class="oblig-caveat"><b>What stays true afterwards</b>{{ ob.caveat }}</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
 
   {% if m.choke_points %}
   <section class="ds-section section-new-page">
@@ -2369,6 +2719,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
              "Validated path to …" and would contradict the status chip on the
              same line for a theoretical or partially-validated path. #}
           <div class="ds-reach">{{ p.reach_label_short }}{% if p.domain %} &middot; {{ p.domain }}{% endif %}</div>
+          {% if p.via_accounts_note %}<div class="path-accounts">{{ p.via_accounts_note }}</div>{% endif %}
         </div>
         <span class="chip {{ p.status_tone }}">{{ p.status_label }}</span>
       </div>
@@ -2547,7 +2898,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
     <div class="colophon-upsell">
       <a href="{{ m.pro_url }}">ADscan PRO</a> turns this into the document you hand a client:
       how to close each technique above, written for the administrator who has to apply it,
-      and the same evidence mapped to DORA, NIS2, ENS and ISO 27001.
+      and the same evidence mapped to the regime that engagement answers to:
+      DORA, NIS2, ENS, ISO 27001 or PCI DSS.
     </div>
   </footer>
 
@@ -2586,7 +2938,9 @@ __all__ = (
     "finding_asset_state",
     "generate_lite_html_report",
     "generate_lite_report_artifacts",
+    "iter_reportable_findings",
     "render_report_html",
+    "reportable_finding_keys",
     "render_report_pdf",
     "status_presentation",
 )

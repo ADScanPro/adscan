@@ -226,6 +226,14 @@ class ProgressDashboardConfig:
             annotate well-known keys with a terse service name in the ranked
             line (e.g. ``{"445/tcp": "SMB", "389/tcp": "LDAP"}``). Non-sensitive,
             rendered verbatim; keys with no entry render without an annotation.
+        indeterminate_label: Optional phrase for the indeterminate-mode line.
+            ``None`` (the default) keeps the discovery-oriented
+            ``working… found {done} {unit}`` wording, so every existing
+            indeterminate caller renders byte-identically. When set, the line
+            renders ``{spinner} {indeterminate_label} · elapsed X`` instead —
+            for an OPAQUE blocking scan (e.g. the CredSweeper secret scan) that
+            has NO per-item tick and NO honest ETA, so "found N" would be
+            misleading. Rendered verbatim; pass non-sensitive text only.
     """
 
     title: str
@@ -241,6 +249,7 @@ class ProgressDashboardConfig:
     breakdown_label: str = "breakdown"
     breakdown_unit: str = ""
     breakdown_annotations: Optional[Dict[str, str]] = None
+    indeterminate_label: Optional[str] = None
 
 
 class ProgressDashboard:
@@ -616,6 +625,16 @@ class ProgressDashboard:
                 f"elapsed {format_eta(self.elapsed)} · ETA {format_eta(eta)}",
                 style=COLOR_MUTED,
             )
+            grid.add_row(left, right)
+        elif self._config.indeterminate_label:
+            # Indeterminate OPAQUE scan: spinner + a caller-supplied phrase +
+            # elapsed, with NO "found N" (the op has no per-item signal and no
+            # honest ETA, so a discovery counter would mislead).
+            left = Text(
+                f"{self._spinner_frame} {self._config.indeterminate_label}",
+                style=ADSCAN_PRIMARY,
+            )
+            right = Text(f"elapsed {format_eta(self.elapsed)}", style=COLOR_MUTED)
             grid.add_row(left, right)
         else:
             # Indeterminate: spinner + elapsed + "found N".

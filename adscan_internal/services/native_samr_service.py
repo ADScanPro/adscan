@@ -107,6 +107,27 @@ def _is_access_denied(err: Any) -> bool:
     return "ACCESS_DENIED" in str(err).upper()
 
 
+def _report_samr_exception(exc: Exception) -> None:
+    """Route a swallowed SAMR exception to the right sink by expectedness.
+
+    ``STATUS_ACCESS_DENIED`` (and its ``rpc_s_access_denied`` /
+    RestrictAnonymousSAM siblings) is an EXPECTED outcome when the authenticating
+    principal is not a local admin on the target — at enterprise scale it is the
+    common case across most member hosts. Rendering a red error line plus a full
+    traceback for every such host floods the operator terminal and the session
+    recording with noise, and pollutes error-tracking with a non-bug. Log it
+    quietly at debug and let the caller classify it as ``"denied"``. Reserve the
+    traceback + error-tracking sinks for genuinely unexpected failures.
+    """
+    if _is_access_denied(exc):
+        print_info_debug(
+            f"native-samr access denied (expected, not a local admin): {exc}"
+        )
+        return
+    telemetry.capture_exception(exc)
+    print_exception(exception=exc)
+
+
 def _resolve_smb_connection(machine_or_conn: Any) -> Any:
     """Accept either a raw SMBConnection or an SMBMachine and return the connection.
 
@@ -154,8 +175,7 @@ async def list_users_in_domain_handle(
                 break
         return users, "done", None
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         msg = str(exc)
         if _is_access_denied(exc):
             return users, "denied", msg
@@ -196,8 +216,7 @@ async def query_user_all_info(
             user.user_flags = 0
         return user, "done", None
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         return user, ("denied" if _is_access_denied(exc) else "error"), str(exc)
     finally:
         if uhandle is not None:
@@ -269,8 +288,7 @@ async def _open_samrpc_and_pick_domain(
 
         return samrpc, domain_handle, "done", None
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         await _safe_close(samrpc)
         msg = str(exc)
         return None, None, ("denied" if _is_access_denied(exc) else "error"), msg
@@ -419,8 +437,7 @@ async def _list_alias_members_into(
                 SAMRAliasMember(sid=sid_str, rid=_parse_trailing_rid(sid_str))
             )
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         return (
             members,
             ("denied" if _is_access_denied(exc) else "error"),
@@ -495,8 +512,7 @@ async def enumerate_alias_members_via(
                         last_err = err_msg
                     print_info_debug(f"[native-samr] alias rid={rid} error: {err_msg}")
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         return (
             result,
             ("denied" if _is_access_denied(exc) else "error"),
@@ -577,8 +593,7 @@ async def get_local_admin_rids_via(
                     admin_rids.add(m.rid)
             return admin_rids, st, err_msg
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         return (
             admin_rids,
             ("denied" if _is_access_denied(exc) else "error"),
@@ -631,8 +646,7 @@ async def get_user_flags_for_rids_via(
         await asyncio.gather(*[_one(r) for r in rids], return_exceptions=True)
         return flags, "done", last_error_holder[0] if last_error_holder else None
     except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _report_samr_exception(exc)
         return flags, "error", str(exc)
     finally:
         await _safe_close(samrpc)

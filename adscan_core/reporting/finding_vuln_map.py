@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from adscan_core.reporting.finding_aliases import collapse_finding_aliases
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 
 
@@ -156,7 +157,10 @@ def build_vuln_map_from_findings(
     vuln_map: dict[str, Any] = {}
     if not isinstance(findings, list):
         return vuln_map
-    for finding in findings:
+    # One weakness, one entry: two producers recording the same weakness under
+    # their own spellings collapse into the family's canonical key before the
+    # map is built, so a client never sees it listed twice at two severities.
+    for finding in collapse_finding_aliases(findings):
         if not isinstance(finding, dict):
             continue
         if not is_reportable_finding(finding, catalog_meta=catalog_meta):

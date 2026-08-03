@@ -16,6 +16,8 @@ Never raises. All exceptions are mapped to a ProbeStatus.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import socket
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -55,17 +57,46 @@ class TCPProbeResult:
     elapsed_ms: float
 
 
-async def tcp_probe(
-    host: str,
-    port: int,
-    *,
-    timeout: float = 3.0,
-) -> TCPProbeResult:
-    """Probe a single TCP port. Never raises."""
+def _is_ip_literal(value: str) -> bool:
+    """Return whether ``value`` is already an IP address (no DNS needed)."""
+    try:
+        ipaddress.ip_address(str(value or "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+async def _resolve_candidate_ips(host: str, port: int) -> list[str]:
+    """Return the unique IPs ``host`` resolves to, in resolution order.
+
+    An IP literal resolves to itself. A hostname is expanded via
+    ``getaddrinfo`` so a multi-homed name (several A/AAAA records) yields ALL
+    of its addresses — the caller can then give each candidate its own connect
+    budget. Returns ``[]`` when resolution fails, so the caller falls back to a
+    direct connect on the original host string (unchanged legacy path).
+    """
+    if _is_ip_literal(host):
+        return [host]
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception:  # noqa: BLE001 — resolution failure → let direct connect handle it
+        return []
+    seen: list[str] = []
+    for info in infos:
+        sockaddr = info[4] if len(info) > 4 else None
+        candidate = str(sockaddr[0]) if sockaddr else ""
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
+async def _connect_probe(target: str, port: int, timeout: float) -> tuple[ProbeStatus, float]:
+    """Single TCP connect attempt against ONE address. Never raises."""
     t0 = time.monotonic()
     try:
         _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
+            asyncio.open_connection(target, port),
             timeout=timeout,
         )
         elapsed = (time.monotonic() - t0) * 1000
@@ -74,13 +105,57 @@ async def tcp_probe(
             await writer.wait_closed()
         except Exception:  # noqa: BLE001
             pass
-        return TCPProbeResult(host=host, port=port, status="open", elapsed_ms=elapsed)
+        return "open", elapsed
     except ConnectionRefusedError:
-        elapsed = (time.monotonic() - t0) * 1000
-        return TCPProbeResult(host=host, port=port, status="closed", elapsed_ms=elapsed)
+        return "closed", (time.monotonic() - t0) * 1000
     except (asyncio.TimeoutError, OSError, Exception):  # noqa: BLE001
-        elapsed = (time.monotonic() - t0) * 1000
-        return TCPProbeResult(host=host, port=port, status="filtered", elapsed_ms=elapsed)
+        return "filtered", (time.monotonic() - t0) * 1000
+
+
+def _select_reachable_probe(
+    results: list[tuple[ProbeStatus, float]],
+) -> tuple[ProbeStatus, float]:
+    """Pick the reachable-candidate verdict from per-address probe results.
+
+    Preference ``open`` > ``closed`` > ``filtered``: an ``open`` or ``closed``
+    verdict came from an address that actually answered (SYN-ACK or RST), i.e.
+    a reachable NIC — so it must outrank a ``filtered`` timeout from an
+    unreachable secondary interface. Ties within a class take the fastest.
+    """
+    for wanted in ("open", "closed"):
+        matching = [r for r in results if r[0] == wanted]
+        if matching:
+            return min(matching, key=lambda r: r[1])
+    return results[0]
+
+
+async def tcp_probe(
+    host: str,
+    port: int,
+    *,
+    timeout: float = 3.0,
+) -> TCPProbeResult:
+    """Probe a single TCP port. Never raises.
+
+    Multi-homed hosts (a name resolving to several IPs where only one is
+    reachable from the current vantage) are handled correctly: each resolved
+    address gets its OWN ``timeout`` budget and they are probed concurrently,
+    so an unreachable secondary interface (e.g. an internal-only NIC advertised
+    in DNS alongside a routable address) can never starve a reachable candidate
+    within one shared budget. The verdict is the reachable candidate's (open >
+    closed > filtered). A single-address host or IP literal keeps the original
+    direct-connect behavior.
+    """
+    candidates = await _resolve_candidate_ips(host, port)
+    if len(candidates) > 1:
+        results = await asyncio.gather(
+            *(_connect_probe(ip, port, timeout) for ip in candidates)
+        )
+        status, elapsed = _select_reachable_probe(list(results))
+        return TCPProbeResult(host=host, port=port, status=status, elapsed_ms=elapsed)
+    target = candidates[0] if candidates else host
+    status, elapsed = await _connect_probe(target, port, timeout)
+    return TCPProbeResult(host=host, port=port, status=status, elapsed_ms=elapsed)
 
 
 async def tcp_probe_multi(

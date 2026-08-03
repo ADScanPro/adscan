@@ -284,9 +284,26 @@ def _render_smbv1_summary(domain: str, summary: dict[str, object]) -> None:
 
 
 def _record_smbv1_finding(
-    shell: Any, *, domain: str, parsed: dict[str, object]
+    shell: Any, *, domain: str, parsed: dict[str, object], smbv1_hosts: list[str]
 ) -> None:
-    """Persist SMBv1 exposure evidence into the technical report."""
+    """Persist the SMBv1 posture of one domain into the technical report.
+
+    ``smbv1_hosts`` is the audit's verdict — the hosts that ACCEPTED the SMBv1
+    dialect — and is passed explicitly rather than read back out of ``parsed``.
+    The summary's ``all_computers`` is every host the audit PROBED (what the
+    console panel counts), so reading the verdict out of it would name hosts the
+    audit had just cleared; an earlier lookup of a ``"hosts"`` key that the
+    summary never carried made the verdict permanently negative instead.
+
+    An empty list is a real, reportable result: the recorder routes it to the
+    Control Coverage evidence as verified-clear rather than to a finding.
+
+    Args:
+        shell: Shell carrying the workspace/report context.
+        domain: Domain the audit covered.
+        parsed: The audit summary (probed hosts, DC/non-DC split, counts).
+        smbv1_hosts: Hosts that accepted SMBv1; empty when none did.
+    """
     if not parsed:
         return
 
@@ -294,16 +311,20 @@ def _record_smbv1_finding(
         from adscan_core.reporting.technical_report import record_technical_finding
 
         artifact_path = domain_relpath(shell.domains_dir, domain, "smb", "smbv1.log")
+        details = dict(parsed)
+        # ``hosts`` is the conventional container the affected-asset composer
+        # reads, so the finding names the hosts it is actually about.
+        details["hosts"] = list(smbv1_hosts)
         record_technical_finding(
             shell,
             domain,
             key="smbv1_enabled",
-            value=bool(parsed.get("hosts")),
-            details=parsed,
+            value=bool(smbv1_hosts),
+            details=details,
             evidence=[
                 {
                     "type": "artifact",
-                    "summary": "NetExec SMB banner output with SMBv1 posture",
+                    "summary": "SMB dialect negotiation output with SMBv1 posture",
                     "artifact_path": artifact_path,
                 }
             ],
@@ -2194,7 +2215,9 @@ def _record_smbv1_audit(
             "non_dcs": non_dc_hosts or None,
         }
         shell.update_report_field(domain, "smbv1_enabled", value_to_store)
-        _record_smbv1_finding(shell, domain=domain, parsed=summary)
+        _record_smbv1_finding(
+            shell, domain=domain, parsed=summary, smbv1_hosts=vulnerable_hosts
+        )
         _render_smbv1_summary(domain, summary)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -5393,7 +5416,22 @@ def _run_rclone_copy_loot_download(
         return {"status": "failed", "host": host, "share": share, "rc": return_code}
 
     if target_pairs:
-        with ThreadPoolExecutor(max_workers=tuning.target_workers) as executor:
+        # Live fetch progress: an X / N shares bar + rate + ETA over the
+        # rclone copy fan-out. DISPLAY-ONLY and fail-open — every completion
+        # is still counted/logged identically whether or not the live surface
+        # builds (live_progress yields None on any dashboard failure).
+        from adscan_internal.services.loot_progress import live_progress
+        from adscan_core.tui.progress_dashboard import ProgressDashboardConfig
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=tuning.target_workers) as executor, live_progress(
+            ProgressDashboardConfig(
+                title=f"SMB Share Exposure · Fetch ({operation_label})",
+                total=len(target_pairs),
+                unit="shares",
+                last_item_type="hostname",
+            )
+        ) as fetch_dashboard:
             futures = {
                 executor.submit(_download_one_target, target): target
                 for target in target_pairs
@@ -5404,22 +5442,32 @@ def _run_rclone_copy_loot_download(
                 host = str(result.get("host", ""))
                 share = str(result.get("share", ""))
                 rc = result.get("rc")
+                completed += 1
                 if status == "copied":
                     copied_targets += 1
-                    continue
-                if status == "partial":
+                elif status == "partial":
                     partial_targets += 1
                     copied_targets += 1
                     print_warning_debug(
                         f"rclone {operation_label} target returned non-zero after partial download: "
                         f"host={host} share={share} rc={rc}"
                     )
-                    continue
-                failed_targets += 1
-                print_warning_debug(
-                    f"rclone {operation_label} target download failed: "
-                    f"host={host} share={share} rc={rc}"
-                )
+                else:
+                    failed_targets += 1
+                    print_warning_debug(
+                        f"rclone {operation_label} target download failed: "
+                        f"host={host} share={share} rc={rc}"
+                    )
+                if fetch_dashboard is not None:
+                    try:
+                        fetch_dashboard.update(
+                            done=completed,
+                            success=copied_targets,
+                            error=failed_targets,
+                            last=f"{host}\\{share}" if host else None,
+                        )
+                    except Exception:  # noqa: BLE001 -- render must not abort the fetch
+                        pass
 
     return {
         "success": copied_targets > 0 or (not target_pairs),

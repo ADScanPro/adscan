@@ -13,9 +13,11 @@ Important:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable
 
 from adscan_internal.services.attack_step_catalog import (
+    get_attack_step_catalog,
     get_attack_step_entry,
     get_relation_notes_by_support_kind,
     normalize_execution_relation,
@@ -156,8 +158,43 @@ SEARCH_MODE_ALIASES: dict[str, str] = {
 }
 
 
+# Reasons this module authors itself, for relations the catalog does not cover.
+# Engineering register, exactly like the catalog's ``support_reason`` values.
+_MISSING_RELATION_REASON = "Missing relation"
+_NOT_IMPLEMENTED_REASON = "Not implemented yet in ADscan"
+_LOCAL_SUPPORT_REASONS: tuple[str, ...] = (
+    _MISSING_RELATION_REASON,
+    _NOT_IMPLEMENTED_REASON,
+)
+
+
 def _norm(relation: str) -> str:
     return (relation or "").strip().lower()
+
+
+@lru_cache(maxsize=1)
+def internal_support_reasons() -> frozenset[str]:
+    """Return every internal ``support_reason`` string, casefolded.
+
+    ``support_reason`` explains to an ENGINEER why ADscan does or does not
+    automate a relation ("Not implemented yet in ADscan", "High-risk /
+    potentially disruptive (disabled by design)"). It is diagnostic text and
+    must never reach a client deliverable — a paying client reading "Not
+    implemented yet in ADscan" in their report gets a capability-gap confession
+    instead of a finding.
+
+    The set is derived from the catalog plus this module's own fallbacks, so a
+    newly authored reason is covered without anyone remembering to register it.
+    Consumed by ``destructive_action_policy.is_internal_engineering_reason``,
+    which every client-facing renderer screens its reason strings through.
+    """
+    reasons = {
+        str(entry.support_reason or "").strip().casefold()
+        for entry in get_attack_step_catalog()
+    }
+    reasons.update(reason.casefold() for reason in _LOCAL_SUPPORT_REASONS)
+    reasons.discard("")
+    return frozenset(reasons)
 
 
 def classify_relation_support(relation: str) -> RelationSupport:
@@ -172,7 +209,7 @@ def classify_relation_support(relation: str) -> RelationSupport:
     """
     key = normalize_execution_relation(relation)
     if not key:
-        return RelationSupport(kind="unsupported", reason="Missing relation")
+        return RelationSupport(kind="unsupported", reason=_MISSING_RELATION_REASON)
     entry = get_attack_step_entry(key)
     if entry:
         return RelationSupport(
@@ -183,7 +220,7 @@ def classify_relation_support(relation: str) -> RelationSupport:
         )
     return RelationSupport(
         kind="unsupported",
-        reason="Not implemented yet in ADscan",
+        reason=_NOT_IMPLEMENTED_REASON,
         compromise_semantics="other",
         compromise_effort="other",
     )

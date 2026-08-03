@@ -407,6 +407,40 @@ def _is_privileged_escalator_target(node: Mapping[str, Any] | None) -> bool:
     return _node_name(node).lower() in _PRIVILEGED_ESCALATOR_GROUP_NAMES
 
 
+def _is_privileged_escalator_principal(node: Mapping[str, Any] | None) -> bool:
+    """Return whether *node* IS a Tier 0 escalation-capable group (axis 1).
+
+    Matches the same two axes as :func:`_is_direct_domain_breaker_target`,
+    against the same frozensets used everywhere else — the well-known group RID
+    first (locale-independent), then the name with a trailing ``@domain`` label
+    suffix stripped. No group list is duplicated; only the normalization
+    differs.
+
+    That normalization is why this is a separate function from
+    :func:`_is_privileged_escalator_target` rather than a fix to it. An
+    attack-graph node carries its identity as a LABEL
+    (``DNSADMINS@ESSOS.LOCAL``), so the bare comparison in that predicate
+    matches only the ``{"name": "DnsAdmins"}`` stub shape and never a real graph
+    node. Widening it in place is the correct end state, but it feeds
+    :func:`derive_compromise_class_from_path` and
+    ``tier_lattice.domain_compromise_tier``, and raising an escalation group's
+    rank in that total order changes which representative the domain-listing
+    collapse keeps: measured on ``Goad-example``/``essos.local`` it traded ten
+    distinct terminals (including a ``partial``, whose validated segment must
+    never be hidden) for one. That is a path-engine change and belongs in its
+    own measured change set, not in a reporting fix.
+    """
+    if not node:
+        return False
+    rid = _node_rid(node)
+    if rid is not None and rid in _PRIVILEGED_ESCALATOR_GROUP_RIDS:
+        return True
+    name = _node_name(node).strip().lower()
+    if not name:
+        return False
+    return name.split("@", 1)[0].strip() in _PRIVILEGED_ESCALATOR_GROUP_NAMES
+
+
 def is_privileged_escalator_target(node: Mapping[str, Any] | None) -> bool:
     """Public wrapper for :func:`_is_privileged_escalator_target`.
 
@@ -809,6 +843,55 @@ def privilege_tier_for_computer_node(
     )
 
 
+def privilege_tier_for_principal_node(
+    node: Mapping[str, Any] | None,
+    *,
+    is_tier0_asset: bool = False,
+) -> PrivilegeTier:
+    """Return the :class:`PrivilegeTier` a user/group graph node IS GRANTED.
+
+    The principal-side sibling of :func:`privilege_tier_for_computer_node`, for
+    callers that hold an attack-graph node rather than a resolved membership
+    closure. Grades against the SAME frozensets the path classifier and the tier
+    lattice use — :func:`_is_direct_domain_breaker_target` then
+    :func:`_is_privileged_escalator_principal` — so a group's tier is derived
+    from one taxonomy. No group list is duplicated here.
+
+    Without this, a caller holding only a node had no way to grade a group and
+    fell back to the node's ``isTierZero``/``highvalue`` tag. That tag is a
+    collector convenience, not the taxonomy: DnsAdmins ships untagged and would
+    grade Tier 2 (it is Tier 0 escalation-capable), and Domain Admins ships
+    tagged and would grade escalation-capable through the conservative fallback
+    (it is Tier 0 direct). Both misreadings contradict the client glossary.
+
+    Args:
+        node: A BloodHound/ADscan-shaped principal node dict (``kind``,
+            ``label``/``name``, ``objectId``). ``None`` or a non-mapping yields
+            :attr:`PrivilegeTier.TIER2` — never raises.
+        is_tier0_asset: Degraded Tier 0 signal the caller resolved outside group
+            identity (an ``isTierZero``/``highvalue`` tag). Consulted only when
+            neither detector matched, and then grades the conservative
+            non-direct verdict.
+
+    Returns:
+        :attr:`PrivilegeTier.TIER0_DIRECT` for the domain object and the direct
+        domain-breaker principals (Domain Admins, Enterprise Admins,
+        BUILTIN\\Administrators, Domain Controllers, krbtgt, RID 500),
+        :attr:`PrivilegeTier.TIER0_ESCALATION_CAPABLE` for an escalation group
+        (DnsAdmins, Cert Publishers, Key Admins, the Operators, Exchange, …),
+        else :attr:`PrivilegeTier.TIER2`.
+    """
+    if not isinstance(node, Mapping):
+        return PrivilegeTier.TIER2
+    if _is_direct_domain_breaker_target(node):
+        return PrivilegeTier.TIER0_DIRECT
+    if _is_privileged_escalator_principal(node):
+        return PrivilegeTier.TIER0_ESCALATION_CAPABLE
+    if is_tier0_asset:
+        return PrivilegeTier.TIER0_ESCALATION_CAPABLE
+    return PrivilegeTier.TIER2
+
+
 # ---------------------------------------------------------------------------
 # Client label SSOT — the two functions Phase 2 (CLI / report / platform) all
 # translate from. One source; make the strings final and clear.
@@ -967,7 +1050,8 @@ def tier_glossary() -> list[dict[str, str]]:
             "groups": (
                 "Backup Operators, Account Operators, Server Operators, "
                 "Print Operators, DnsAdmins, Cert Publishers, Key Admins, "
-                "and the Exchange privileged groups."
+                "Group Policy Creator Owners, the read-only Domain Controller "
+                "groups, and the Exchange privileged groups."
             ),
             "meaning": (
                 "Inside the Tier 0 boundary: not immediate domain ownership, "
@@ -1431,6 +1515,70 @@ _COMPROMISE_CLASS_TO_OUTCOME: dict[CompromiseClass, str] = {
 def compromise_class_to_outcome_class(cls: CompromiseClass) -> str:
     """Return the legacy ``outcome_class`` string for a canonical class."""
     return _COMPROMISE_CLASS_TO_OUTCOME.get(cls, "pivot")
+
+
+# The inverse of the table above, plus the OLDER legacy spellings that predate
+# it and still appear in cached/synthetic records. Two distinct legacy
+# vocabularies exist and they are NOT interchangeable: the renderer strings
+# (``direct_compromise`` / ``followup_terminal`` / ``graph_extension``) and the
+# pre-canonical taxonomy (``direct_domain_control`` / ``domain_compromise_enabler``
+# / ``high_impact_privilege``). Any consumer that keys a table on the canonical
+# class name must normalise through here first — the compliance annex did not,
+# so every ``domain_breaker`` path (including the only chain executed end to end)
+# silently missed its controls while the handful of classes that happen to share
+# a spelling were the only evidence the annex ever showed.
+_OUTCOME_CLASS_TO_COMPROMISE_CLASS: dict[str, CompromiseClass] = {
+    # Renderer strings emitted by ``compromise_class_to_outcome_class``.
+    "direct_compromise": CompromiseClass.DOMAIN_BREAKER,
+    "followup_terminal": CompromiseClass.PRIVILEGED_ESCALATOR,
+    "tier0_foothold": CompromiseClass.TIER0_FOOTHOLD,
+    "graph_extension": CompromiseClass.COMPROMISE_ENABLER,
+    "pivot": CompromiseClass.NONE,
+    # Pre-canonical taxonomy.
+    "direct_domain_control": CompromiseClass.DOMAIN_BREAKER,
+    "domain_compromise_enabler": CompromiseClass.PRIVILEGED_ESCALATOR,
+    "high_impact_privilege": CompromiseClass.PRIVILEGED_ESCALATOR,
+    # Canonical names, so the resolver accepts either vocabulary.
+    "domain_breaker": CompromiseClass.DOMAIN_BREAKER,
+    "privileged_escalator": CompromiseClass.PRIVILEGED_ESCALATOR,
+    "compromise_enabler": CompromiseClass.COMPROMISE_ENABLER,
+    "unauthenticated_principal": CompromiseClass.UNAUTHENTICATED_PRINCIPAL,
+    "none": CompromiseClass.NONE,
+}
+
+
+def compromise_class_from_outcome_class(value: str | None) -> CompromiseClass | None:
+    """Return the canonical class for a legacy ``outcome_class`` string.
+
+    The documented inverse of :func:`compromise_class_to_outcome_class`, widened
+    to accept the pre-canonical taxonomy and the canonical names themselves.
+    Returns ``None`` for an unrecognised value so a caller can decide whether to
+    fall back rather than silently getting ``NONE``.
+    """
+    if not value:
+        return None
+    return _OUTCOME_CLASS_TO_COMPROMISE_CLASS.get(str(value).strip().lower())
+
+
+def resolve_record_compromise_class(record: Mapping[str, Any]) -> CompromiseClass:
+    """Return the canonical compromise class for one attack-path record.
+
+    Prefers the engine-stamped ``compromise_class``; falls back to normalising
+    ``outcome_class`` for legacy/synthetic records. Mirrors the precedence
+    already used by ``exposure_score_service.report_tier_for_record``, so every
+    consumer reads a path's class the same way.
+    """
+    if not isinstance(record, Mapping):
+        return CompromiseClass.NONE
+    resolved = compromise_class_from_outcome_class(record.get("compromise_class"))
+    if resolved is not None:
+        return resolved
+    details = record.get("details")
+    fallback = record.get("outcome_class")
+    if not fallback and isinstance(details, Mapping):
+        fallback = details.get("outcome_class")
+    resolved = compromise_class_from_outcome_class(fallback)
+    return resolved if resolved is not None else CompromiseClass.NONE
 
 
 def _record_path_edges(record: dict[str, Any]) -> list[dict[str, Any]]:

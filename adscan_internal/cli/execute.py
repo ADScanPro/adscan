@@ -586,6 +586,9 @@ def _establish_credentials(shell: Any, config: ExecuteConfig) -> bool:
         return False
 
     from adscan_internal.cli.creds import add_credential  # noqa: PLC0415
+    from adscan_internal.services.credentials.credential_origin import (  # noqa: PLC0415
+        ORIGIN_AUTHENTICATED_SCAN,
+    )
 
     dc_ip = _resolve_execute_dc_ip(shell, config)
     try:
@@ -598,6 +601,11 @@ def _establish_credentials(shell: Any, config: ExecuteConfig) -> bool:
             prompt_for_user_privs_after=False,
             prompt_local_reuse_after=False,
             ui_silent=True,
+            # The operator's own login for this run — the INPUT to the
+            # execution, not something it compromised. Stamping it keeps it out
+            # of the compromised-credential counters and the report's
+            # provenance table (see NON_COMPROMISE_ORIGINS).
+            credential_origin=ORIGIN_AUTHENTICATED_SCAN,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

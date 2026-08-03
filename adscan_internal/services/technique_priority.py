@@ -58,7 +58,7 @@ from typing import Any
 from adscan_internal.services.attack_relation_labels import (
     format_business_relation_label,
 )
-from adscan_internal.services.path_state import NO_EXPOSURE_STATUSES
+from adscan_internal.services.path_state import carries_client_exposure
 from adscan_internal.services.remediability import (
     classify_edge_remediability,
     remediability_for_step,
@@ -166,38 +166,6 @@ def normalize_path_status(raw: Any) -> str:
     """
     token = str(raw or "theoretical").strip().lower()
     return _SEVERITY_TO_STATUS.get(_STATUS_SEVERITY.get(token, 4), "theoretical")
-
-
-def carries_client_exposure(raw: Any) -> bool:
-    """Return True when a path's status describes exposure worth remediating.
-
-    The inclusion filter every remediation ranking applies before it counts
-    anything. Three statuses answer "no", and each for a reason the client would
-    recognise:
-
-    * ``closed_by_configuration`` — their own configuration already closed this
-      avenue and ADscan observed it. It is the report's POSITIVE bucket, and
-      ranking it as work to do tells a client to remediate their own hardening.
-    * ``unsupported`` / ``unavailable`` — ADscan had no reachable surface to
-      walk. That is a gap in our coverage, not an exposure in their directory.
-
-    Everything else counts, including ``attempted`` and ``blocked``: ADscan
-    failing to land a technique, or withholding a destructive one, says nothing
-    about whether the avenue is open (CLAUDE.md § Exposure Validation).
-
-    Args:
-        raw: A path's raw ``status`` token, in any casing.
-
-    Returns:
-        ``False`` only for the three statuses above. An unknown or missing token
-        counts as exposure — the safe direction, since the alternative is
-        dropping a real route from the client's fix list.
-
-    SSOT for the excluded set:
-    :data:`~adscan_internal.services.path_state.NO_EXPOSURE_STATUSES`, which the
-    exposure score reads too, so a path excluded from one is excluded from both.
-    """
-    return str(raw or "").strip().lower() not in NO_EXPOSURE_STATUSES
 
 
 def status_severity(status: str) -> int:

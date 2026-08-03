@@ -41,6 +41,10 @@ from adscan_core.theme import (
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.attack_fanout_rollup import FanoutStep
+from adscan_internal.services.compromise_class import (
+    CompromiseClass,
+    compromise_reach_label_short,
+)
 from adscan_internal.services.edge_kind import EdgeKind
 
 Outcome = Literal["domain_compromised", "findings", "clean"]
@@ -58,6 +62,13 @@ _SEVERITY_STYLE: dict[str, str] = {
 }
 
 _SEVERITY_ORDER: tuple[str, ...] = ("critical", "high", "medium", "low")
+
+#: The one reach phrase the recap is allowed to print, lower-cased for prose.
+#: Sourced from the label SSOT so the panel, the PDF cards and the web KPI table
+#: cannot drift into three wordings for one concept.
+_FULL_COMPROMISE_PHRASE: str = compromise_reach_label_short(
+    CompromiseClass.DOMAIN_BREAKER
+).lower()
 
 
 @dataclass(frozen=True)
@@ -82,8 +93,24 @@ class ScanRecapModel:
     domain: str
     outcome: Outcome
     findings: FindingsSummary
+    # Every OTHER domain this run proved it compromised. The subject carries the
+    # headline and every figure below it, so a second compromised domain is
+    # stated in its own right rather than being dropped — the panel must not let
+    # a reader infer that one domain fell when several did.
+    also_compromised: tuple[str, ...] = field(default_factory=tuple)
+    # The report's own coverage label ("1 assessed · 2 discovered"), set only
+    # when this engagement saw a domain it never enumerated. Same wording as the
+    # PDF cover and the LITE footer, from the same formatter.
+    scope_label: str = ""
     headline_path: RecapPath | None = None
-    paths_to_tier0: int = 0
+    # Attack-path cardinalities, resolved by the orchestration seam from the
+    # counts SSOT (:mod:`adscan_internal.services.attack_path_counts`) so the
+    # panel states the SAME figures the client's report states. Never a raw
+    # graph-walk enumeration: that quantity is combinatorial, depth-sensitive
+    # and status-blind, and it is barred from every human-facing surface.
+    paths_total: int = 0
+    paths_full_domain_compromise: int = 0
+    paths_proven: int = 0
     ttc_label: str | None = None
     ttfc_label: str | None = None
     report_path: str | None = None
@@ -110,7 +137,7 @@ def _headline(model: ScanRecapModel) -> Text:
             Text("   "),
             domain,
             Text("   "),
-            Text("full domain compromise", style="dim"),
+            Text(_FULL_COMPROMISE_PHRASE, style="dim"),
         )
     if model.outcome == "findings":
         return Text.assemble(
@@ -125,37 +152,100 @@ def _headline(model: ScanRecapModel) -> Text:
     )
 
 
+#: How many further compromised domains the recap names before it counts them.
+#: The panel is a digest; past a handful of names the list stops being readable
+#: and the number is the finding.
+_ALSO_COMPROMISED_NAMES_MAX: int = 3
+
+
+def _also_compromised_line(model: ScanRecapModel) -> Text | None:
+    """Name the other domains this run compromised, or ``None``.
+
+    The headline can only carry one domain, and every figure in the panel is
+    scoped to it. Without this line a run that took over three domains would
+    read as a run that took over one.
+    """
+    others = tuple(name for name in model.also_compromised if name)
+    if not others:
+        return None
+    shown = others[:_ALSO_COMPROMISED_NAMES_MAX]
+    names = ", ".join(mark_sensitive(name, "domain") for name in shown)
+    remaining = len(others) - len(shown)
+    if remaining > 0:
+        names = f"{names} and {remaining} more"
+    return Text(f"Also compromised: {names}", style="dim")
+
+
+def _scope_line(model: ScanRecapModel) -> Text | None:
+    """Render the coverage label when a domain was seen but never enumerated.
+
+    A trusted domain ADscan only learned the NAME of is real, unmeasured attack
+    surface — worth stating — but it is not coverage, and none of the figures
+    above it account for one. The label comes from the report formatter, so the
+    panel and the client document count scope the same way.
+    """
+    if not model.scope_label:
+        return None
+    return Text(
+        f"Scope   {model.scope_label} (trusted domains, not enumerated)",
+        style="dim",
+    )
+
+
+def _paths_line(model: ScanRecapModel) -> Text | None:
+    """Render the attack-path count clause, in the report's own words.
+
+    The recap prints the SAME sentence the client's exposure report opens with
+    ("22 of 33 identified attack paths reach full domain compromise"), from the
+    same computation, so the two documents cannot state different answers to one
+    question seconds apart.
+
+    Three wordings are deliberate:
+
+    * "identified" is the inventory word, because the total includes avenues the
+      environment's own configuration already closed. Calling that set
+      "validated" would claim evidence for paths ADscan never walked and would
+      count the positive hardening bucket as exposure.
+    * The reach phrase comes from the label SSOT, not from this file.
+    * When nothing was walked end to end, the clause says so. Otherwise a run
+      headed "no full compromise: this domain held" would sit directly above a
+      line reading "reach full domain compromise" and read as a contradiction.
+
+    It gets its OWN line rather than sharing the timing line: joined, the two
+    ran to ~84 columns and wrapped on an 80-column terminal, leaving a single
+    orphaned word under the separator.
+    """
+    total = max(0, int(model.paths_total))
+    if total <= 0:
+        return None
+    plural = "" if total == 1 else "s"
+    reached = max(0, int(model.paths_full_domain_compromise))
+    if reached <= 0:
+        return Text(
+            f"{total} identified attack path{plural}, "
+            f"none reaching {_FULL_COMPROMISE_PHRASE}",
+            style="dim",
+        )
+    verb = "reaches" if reached == 1 else "reach"
+    clause = (
+        f"{reached} of {total} identified attack path{plural} "
+        f"{verb} {_FULL_COMPROMISE_PHRASE}"
+    )
+    if max(0, int(model.paths_proven)) <= 0:
+        clause += ", none walked end to end"
+    return Text(clause, style="dim")
+
+
 def _timing_line(model: ScanRecapModel) -> Text | None:
-    """Render the dim time-to / path-reach line beneath the headline."""
+    """Render the dim time-to line beneath the headline."""
     if model.outcome == "domain_compromised":
-        parts: list[Text] = []
         if model.ttc_label:
-            parts.append(Text(f"Proven in {model.ttc_label}", style="dim"))
-        if model.paths_to_tier0 > 0:
-            plural = "path" if model.paths_to_tier0 == 1 else "paths"
-            parts.append(
-                Text(
-                    f"{model.paths_to_tier0} validated {plural} to a Tier 0 asset",
-                    style="dim",
-                )
-            )
-        return _join_dim(parts)
+            return Text(f"Proven in {model.ttc_label}", style="dim")
+        return None
     if model.outcome == "findings":
-        parts = []
         if model.ttfc_label:
-            parts.append(
-                Text(f"First credential in {model.ttfc_label}", style="dim")
-            )
-        if model.paths_to_tier0 > 0:
-            plural = "path" if model.paths_to_tier0 == 1 else "paths"
-            parts.append(
-                Text(
-                    f"{model.paths_to_tier0} {plural} reach a Tier 0 asset "
-                    "(control pending validation)",
-                    style="dim",
-                )
-            )
-        return _join_dim(parts)
+            return Text(f"First credential in {model.ttfc_label}", style="dim")
+        return None
     # clean: a graceful, honest paragraph — no dead-end framing.
     return Text(
         "No attack paths, no misconfigurations, and no exposed credentials in "
@@ -163,18 +253,6 @@ def _timing_line(model: ScanRecapModel) -> Text | None:
         "both.",
         style="dim",
     )
-
-
-def _join_dim(parts: list[Text]) -> Text | None:
-    """Join non-empty Text parts with a dim middle dot separator."""
-    if not parts:
-        return None
-    out = Text()
-    for index, part in enumerate(parts):
-        if index:
-            out.append("  ·  ", style="dim")
-        out.append_text(part)
-    return out
 
 
 def _path_block(model: ScanRecapModel) -> RenderableType | None:
@@ -423,16 +501,29 @@ def _report_line(model: ScanRecapModel) -> Text | None:
 def build_recap_body(model: ScanRecapModel) -> RenderableType:
     """Return the recap body as a Rich ``Group`` (no CTA — that is tier-gated).
 
-    Layout: headline · hairline · timing/verdict · optional path block · optional
-    findings strip + top-list · optional ``Try next`` · optional report line. Each
-    section is skipped cleanly when its data is absent, so all three outcome
-    states render from the same function.
+    Layout: headline · hairline · timing/verdict · other compromised domains ·
+    attack-path counts · coverage scope · optional path block · optional findings
+    strip + top-list · optional ``Try next`` · optional report line. Each section
+    is skipped cleanly when its data is absent, so all three outcome states
+    render from the same function.
     """
     parts: list[RenderableType] = [_headline(model), recap_hairline()]
 
     timing = _timing_line(model)
     if timing is not None:
         parts.append(timing)
+
+    also = _also_compromised_line(model)
+    if also is not None:
+        parts.append(also)
+
+    paths = _paths_line(model)
+    if paths is not None:
+        parts.append(paths)
+
+    scope = _scope_line(model)
+    if scope is not None:
+        parts.append(scope)
 
     path_block = _path_block(model)
     if path_block is not None:

@@ -1251,6 +1251,25 @@ def print_attack_paths_summary(
                 if cp_idx > 1:
                     path_str.append("  ", style="dim")
                 path_str.append_text(_format_choke_point_badge(details))
+        # Collapsed sibling-pivot note: the pivot account in the chain stands for
+        # N interchangeable accounts (e.g. any of these roastable service accounts
+        # opens the same path). Surfacing the count + a sample keeps the row a
+        # single finding while naming the credentials the client must rotate.
+        via_count = path.get("via_accounts_count") if isinstance(path, dict) else None
+        if isinstance(via_count, int) and via_count > 1:
+            via_sample = path.get("via_accounts")
+            proven = path.get("via_accounts_proven_count")
+            path_str.append("\n", style="dim")
+            path_str.append(
+                f"via any of {via_count} interchangeable accounts", style="dim"
+            )
+            if isinstance(proven, int) and proven > 0:
+                path_str.append(f" ({proven} proven)", style="dim")
+            if isinstance(via_sample, list) and via_sample:
+                shown = [format_node_label(str(a), domain) for a in via_sample[:3]]
+                extra = via_count - len(shown)
+                suffix = f" +{extra} more" if extra > 0 else ""
+                path_str.append(f": {', '.join(shown)}{suffix}", style="dim")
         length = path.get("length", len(rels))
         status = str(path.get("status") or "theoretical")
         # Drift diagnostic: recompute the path-level status from the live

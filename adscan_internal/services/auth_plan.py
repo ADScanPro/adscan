@@ -704,9 +704,17 @@ def build_smb_plan(
     # guard with a non-recoverable ValueError. Treat that as not-viable so the
     # Kerberos-first policy (Rule 0) does not upgrade a doomed attempt — NTLM is
     # used instead (still gated by the NTLM-disabled posture rule below).
+    # A LOCAL account (one that lives in the target host's own SAM) has no
+    # Active Directory identity, so no KDC will ever issue it a ticket. That is
+    # a structural impossibility, not a preference: asking for one returns
+    # KDC_ERR_PREAUTH_FAILED, which reads like a wrong password and hides the
+    # real cause. Same class of guard as "no principal" and "no credential
+    # material" above.
+    is_local_account = bool(getattr(config, "is_local_account", False))
     kerberos_viable = bool(
         has_principal
         and has_credential_material
+        and not is_local_account
         and (getattr(config, "kdc_ip", None) or getattr(config, "domain", None))
     )
 

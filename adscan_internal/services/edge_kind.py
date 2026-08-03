@@ -169,8 +169,6 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         "ForgedTicketFor",
         "ReadGMSAPasswordOf",
         "OwnsCertificateFor",
-        # Golden certificate — forged from recovered CA private key (like ForgedTicketFor)
-        "GoldenCert",
         # Credential dump techniques — also used as virtual bridge edges by the
         # implicit DumpLSA overlay in attack_graph_core._build_implicit_dumplsa_overlay
         "DumpLSA",

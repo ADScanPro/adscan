@@ -1,7 +1,7 @@
-"""Workspace and domain selection UI using curses.
+"""Workspace selection UI using curses.
 
-This module provides interactive curses-based selection interfaces for
-workspaces and domains.
+This module provides the interactive curses-based selection interface for
+workspaces.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import curses
 from typing import Any, Protocol
 
 from adscan_internal.rich_output import mark_sensitive, print_success
-from adscan_internal.workspaces import activate_domain, activate_workspace
+from adscan_internal.workspaces import activate_workspace
 
 
 class WorkspaceCursesShell(Protocol):
@@ -18,9 +18,7 @@ class WorkspaceCursesShell(Protocol):
 
     current_workspace: str | None
     current_workspace_dir: str | None
-    current_domain: str | None
     workspaces_dir: str
-    domains_dir: str
 
     def load_workspace_data(self, workspace_path: str) -> None: ...
 
@@ -76,54 +74,5 @@ def select_workspace_curses(
     print_success(f"Workspace '{marked_current_workspace}' selected.")
 
 
-def select_domain_curses(
-    shell: WorkspaceCursesShell, stdscr: Any, domains: list[str]
-) -> None:
-    """Curses function to select a domain.
-
-    Args:
-        shell: CLI shell instance that implements WorkspaceCursesShell protocol
-        stdscr: Curses standard screen object
-        domains: List of domain names to choose from
-    """
-    curses.curs_set(0)  # Hide the cursor
-    stdscr.clear()
-
-    selected_index = 0
-    num_domains = len(domains)
-
-    while True:
-        stdscr.clear()
-        stdscr.addstr(0, 0, "Select a domain using the arrow keys and Enter:\n")
-
-        for idx, domain in enumerate(domains):
-            if idx == selected_index:
-                stdscr.addstr(idx + 1, 0, f"> {domain}", curses.A_REVERSE)
-            else:
-                stdscr.addstr(idx + 1, 0, f" {domain}")
-
-        stdscr.refresh()
-
-        key = stdscr.getch()
-        if key == curses.KEY_UP:
-            selected_index = (selected_index - 1) % num_domains
-        elif key == curses.KEY_DOWN:
-            selected_index = (selected_index + 1) % num_domains
-        elif key == curses.KEY_ENTER or key in [10, 13]:
-            activate_domain(
-                shell,
-                workspace_dir=shell.current_workspace_dir or "",
-                domains_dir_name=shell.domains_dir,
-                domain=domains[selected_index],
-            )
-            shell.load_workspace_data(shell.current_domain_dir or "")
-            stdscr.addstr(
-                num_domains + 2, 0, f"[+] Domain '{shell.current_domain}' selected."
-            )
-            stdscr.refresh()
-            stdscr.getch()
-            break
-
-
-__all__ = ["select_domain_curses", "select_workspace_curses", "WorkspaceCursesShell"]
+__all__ = ["select_workspace_curses", "WorkspaceCursesShell"]
 

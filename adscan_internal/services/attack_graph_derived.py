@@ -41,9 +41,6 @@ from typing import Any
 from adscan_core import telemetry
 from adscan_core.rich_output import print_error, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
-from adscan_internal.services.attack_paths_materialized_cache import (
-    invalidate_attack_path_artifacts,
-)
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.workspaces import domain_subpath
 from adscan_core.rich_output import print_exception
@@ -94,15 +91,18 @@ def _attack_graph_path(shell: object, domain: str) -> Path:
 
 
 def _load_graph(graph_path: Path) -> dict[str, Any]:
+    # ``nodes`` defaults to a MAPPING, the shape every persisted attack graph
+    # uses (``upsert_nodes`` keys it by node id) and the shape the canonical save
+    # path reads when it prunes Tier-0-source edges.
     if not graph_path.exists():
-        return {"nodes": [], "edges": []}
+        return {"nodes": {}, "edges": []}
     try:
         data = json.loads(graph_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return {"nodes": [], "edges": []}
+        return {"nodes": {}, "edges": []}
     if not isinstance(data, dict):
-        return {"nodes": [], "edges": []}
-    data.setdefault("nodes", [])
+        return {"nodes": {}, "edges": []}
+    data.setdefault("nodes", {})
     data.setdefault("edges", [])
     return data
 
@@ -204,24 +204,22 @@ def insert_derived_edge(
 
     edges_list.append(new_edge)
 
+    # Persist through the canonical seam, never a raw write: it is what stamps
+    # ``category`` / ``vuln_key`` onto the new edge (without which the finding
+    # derivation cannot see it), invalidates the materialized attack-path
+    # artifacts, and syncs technical findings. A raw ``write_text`` here is
+    # exactly how noPac and PrintNightmare stayed out of the client's report.
     try:
-        graph_path.write_text(
-            json.dumps(graph, indent=2, sort_keys=True, ensure_ascii=False),
-            encoding="utf-8",
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            save_attack_graph,
         )
-    except OSError as exc:
+
+        save_attack_graph(shell, domain, graph)
+    except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_error(f"[attack_graph_derived] failed to write attack_graph.json: {exc}")
         return False
-
-    # Materialized attack-path artifacts are now stale — drop them so the
-    # next attack_paths run recomputes from the fresh graph.
-    try:
-        invalidate_attack_path_artifacts(shell, domain)
-    except Exception as exc:  # noqa: BLE001 — telemetry sink
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
 
     print_info_verbose(
         f"[attack_graph_derived] inserted derived edge "

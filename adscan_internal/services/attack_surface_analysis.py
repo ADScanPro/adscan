@@ -333,6 +333,100 @@ def compute_attack_surface_analysis(
     )
 
 
+#: Minimum number of exposure-bearing paths that must run through an
+#: intermediate node before it counts as a convergence point. Two is the same
+#: threshold the node-based remediation targets already use above (a node one
+#: path crosses is not a junction), so the count reported here and the node
+#: entries a client sees in the remediation ranking always agree.
+CONVERGENCE_FLOOR = 2
+
+
+def convergence_metrics(
+    analysis: AttackSurfaceAnalysis,
+    *,
+    floor: int = CONVERGENCE_FLOOR,
+) -> dict[str, int]:
+    """Return the convergence (choke-point) shape of an analysis, as counts.
+
+    Pure projection of an :class:`AttackSurfaceAnalysis` that
+    :func:`compute_attack_surface_analysis` already built — nothing is
+    recomputed and no path is re-walked. Every value is a plain ``int``, which
+    is what makes the result safe to send as telemetry: no node id, principal,
+    host or domain name can travel with it.
+
+    The axis measured here is TOPOLOGICAL convergence — how many attack paths
+    funnel through one object. It is deliberately NOT
+    :mod:`~adscan_internal.services.choke_point_classifier`, which flags a
+    privilege TRANSITION on a single edge; the two answer different questions
+    and must never be mixed in one published figure.
+
+    Convergence is counted on ``exposed_path_count``, not ``path_count``, for
+    the same reason the node-based remediation targets are: a path whose avenue
+    the client's own configuration already closed still crosses the node
+    topologically but is not exposure, and a path ADscan had no surface to walk
+    is our data gap rather than their risk.
+
+    Args:
+        analysis: Output of :func:`compute_attack_surface_analysis`.
+        floor: Minimum exposure-bearing paths through an intermediate node for
+            it to count as a convergence point. Values below 1 are clamped.
+
+    Returns:
+        A mapping with five integer keys:
+
+        * ``paths_total_analyzed`` — paths the analysis was built from.
+        * ``nodes_on_paths_total`` — distinct objects appearing on any path.
+          The denominator for "what share of the attack surface converges".
+        * ``choke_point_nodes`` — intermediate objects (never a path's entry
+          point and never its target) that at least ``floor`` exposure-bearing
+          paths run through.
+        * ``max_paths_through_node`` — the largest exposure-bearing path count
+          of any single intermediate object; ``0`` when there is none. Entry
+          points and targets are excluded because every path trivially touches
+          its own endpoints, which would make the figure meaningless.
+        * ``paths_closed_by_top_3_fixes`` — an UPPER BOUND on how many paths the
+          three highest-ranked remediation targets close between them. Targets
+          can cover the same path, and a :class:`RemediationTarget` carries a
+          count rather than a path set, so the true union lies between the
+          largest single target and this sum. Clamped to
+          ``paths_total_analyzed``. Read it as "no more than N", never as an
+          exact union.
+    """
+    empty = {
+        "choke_point_nodes": 0,
+        "max_paths_through_node": 0,
+        "nodes_on_paths_total": 0,
+        "paths_total_analyzed": 0,
+        "paths_closed_by_top_3_fixes": 0,
+    }
+    if not isinstance(analysis, AttackSurfaceAnalysis):
+        return empty
+
+    threshold = max(1, int(floor))
+    total_paths = max(0, int(analysis.total_paths or 0))
+    centrality = analysis.node_centrality or []
+
+    # Strictly intermediate: a node that is never an entry point and never a
+    # target. This is the exact predicate the node-based remediation targets
+    # use, so the two views of "choke point" cannot drift apart.
+    intermediate_counts = [
+        max(0, int(entry.exposed_path_count or 0))
+        for entry in centrality
+        if not entry.is_entry_point and not entry.is_tier0_target
+    ]
+
+    top_three = top_remediation_targets(analysis, top_n=3)
+    closed_upper_bound = sum(max(0, int(t.paths_eliminated or 0)) for t in top_three)
+
+    return {
+        "choke_point_nodes": sum(1 for c in intermediate_counts if c >= threshold),
+        "max_paths_through_node": max(intermediate_counts, default=0),
+        "nodes_on_paths_total": len(centrality),
+        "paths_total_analyzed": total_paths,
+        "paths_closed_by_top_3_fixes": min(closed_upper_bound, total_paths),
+    }
+
+
 def top_remediation_targets(
     analysis: AttackSurfaceAnalysis,
     *,

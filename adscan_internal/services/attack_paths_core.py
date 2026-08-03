@@ -7,6 +7,7 @@ It performs no I/O and does not depend on shell context.
 
 from __future__ import annotations
 
+import copy
 import time
 import os
 import re
@@ -17,9 +18,11 @@ from typing import Any, Callable, Iterable
 from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services import attack_graph_core
+from adscan_internal.services import attack_path_progress
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
+from adscan_internal.services.path_state import _PROVEN_STATUSES
 from adscan_internal.services.tier_lattice import (
     TargetTier,
     classify_target_tier,
@@ -1435,6 +1438,350 @@ def collapse_memberof_prefixes(
     return list(grouped.values())
 
 
+#: Bounded evidence sample of interchangeable pivot accounts shown on a collapsed
+#: sibling-pivot row ("…and N more accounts"). The full count is always carried in
+#: ``via_accounts_count`` so nothing is under-reported; only the *sample* is capped.
+_SIBLING_PIVOT_SAMPLE_MAX: int = 6
+
+#: Minimum sibling-set size to collapse. A floor of 2 collapses ANY set of paths
+#: that differ only in the interchangeable pivot (the product intent: one finding
+#: listing the accounts, never N rows for one decision). Env-overridable for the
+#: rare engagement that wants a higher threshold.
+_SIBLING_PIVOT_COLLAPSE_FLOOR: int = 2
+
+
+def _read_sibling_pivot_collapse_floor() -> int:
+    """Return the effective sibling-pivot collapse floor (env-overridable, >= 2)."""
+    raw = str(os.getenv("ADSCAN_PIVOT_COLLAPSE_FLOOR", "")).strip()
+    if raw:
+        try:
+            return max(2, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return max(2, _SIBLING_PIVOT_COLLAPSE_FLOOR)
+
+
+def _sibling_pivot_status_strength(status: Any) -> int:
+    """Rank a display status by evidentiary strength for sibling-pivot collapse.
+
+    Strongest first so the collapsed row inherits the BEST sibling's status and
+    steps — a cracked/exploited roast must NEVER be flattened into ``theoretical``
+    just because its 49 siblings are theoretical (the 2026-07-22 rollup under-count
+    bug family). ``_PROVEN_STATUSES`` is the SSOT for "proven"; ``partial`` (a
+    chain with a validated segment) outranks ``attempted`` which outranks
+    ``theoretical``. Doctrine-critical abstentions (``blocked`` safety,
+    ``closed_by_configuration`` positive hardening, ``unavailable``/``unsupported``
+    data-gap) rank at the floor: they must never be *promoted* over a real proven
+    sibling, and a collapse never manufactures one.
+    """
+    token = str(status or "").strip().lower()
+    if token in _PROVEN_STATUSES:
+        return 4
+    if token == "partial":
+        return 3
+    if token in {"attempted", "failed", "error"}:
+        return 2
+    if token == "theoretical":
+        return 1
+    return 0
+
+
+def collapse_sibling_pivot_paths(
+    records: list[dict[str, Any]],
+    *,
+    sample_limit: int = _SIBLING_PIVOT_SAMPLE_MAX,
+    floor: int | None = None,
+) -> list[dict[str, Any]]:
+    """Collapse sibling paths that differ ONLY in one interchangeable pivot node.
+
+    A **display-layer** view (mirrors :func:`collapse_memberof_prefixes`): it never
+    deletes an edge from the graph, only merges near-identical rows so the report,
+    CLI and web show one finding instead of a wall of N. The canonical case is a
+    Kerberoast fan-out ``SRC → MemberOf → GROUP → Kerberoasting → {acct1..acctN} →
+    … → DCSync → DOMAIN`` where the 50 rows differ only in which service account is
+    roasted — one decision, one remediation ("rotate these N accounts").
+
+    Collapse key (the five invariants that keep it correct):
+
+    * **Full technique signature** — the entire ``relations`` tuple is in the key,
+      so Kerberoast / ADCS ESC1 / shadow-creds paths (different techniques) never
+      merge even when their endpoints match.
+    * **Same source and same terminal** — ``nodes[0]`` and ``nodes[-1]`` are pinned
+      in the key; two paths to different Tier-0 targets, or via different terminal
+      relations, are distinct reach findings and stay separate.
+    * **Exactly one interior node differs** — an INTERIOR index (never the source
+      or terminal) is wildcarded; siblings are byte-identical everywhere else, so
+      the two pivots are structurally interchangeable (same incoming and outgoing
+      edge). Sets differing at >1 index are NOT collapsed.
+    * **Status heterogeneity → surface the BEST** — the representative is the
+      strongest-status sibling (:func:`_sibling_pivot_status_strength`, backed by
+      the ``_PROVEN_STATUSES`` SSOT), so a proven roast is never flattened. A
+      ``via_accounts_proven_count`` records how many pivots are proven.
+    * **Never-drop / recoverable** — the collapsed row carries every pivot's count
+      (``via_accounts_count``) plus a bounded sample (``via_accounts``); the
+      underlying per-account records remain in the graph/materialized artifacts.
+
+    Args:
+        records: Display records (each with ``nodes``/``relations``/``steps``).
+        sample_limit: Max pivot labels to list in ``via_accounts`` (proven first).
+        floor: Minimum sibling-set size to collapse; ``None`` consults
+            ``ADSCAN_PIVOT_COLLAPSE_FLOOR`` (default 2).
+
+    Returns:
+        A new list with each qualifying sibling set replaced by one collapsed
+        representative; non-sibling records pass through unchanged and in order.
+    """
+    if len(records) <= 1:
+        return records
+    effective_floor = _read_sibling_pivot_collapse_floor() if floor is None else max(2, int(floor))
+
+    # (interior_index, relations, prefix, suffix) -> [record index]. Two records in
+    # the same bucket share source, terminal, technique signature and every interior
+    # node except the wildcarded one — i.e. they differ ONLY at that pivot.
+    index_groups: dict[
+        tuple[int, tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[int]
+    ] = {}
+    node_seqs: list[list[str] | None] = []
+    for i, record in enumerate(records):
+        nodes = record.get("nodes")
+        rels = record.get("relations")
+        if (
+            not isinstance(nodes, list)
+            or not isinstance(rels, list)
+            or len(nodes) < 3
+        ):
+            node_seqs.append(None)
+            continue
+        node_str = [str(n) for n in nodes]
+        rel_sig = tuple(str(r) for r in rels)
+        node_seqs.append(node_str)
+        length = len(node_str)
+        for idx in range(1, length - 1):
+            key = (
+                idx,
+                rel_sig,
+                tuple(node_str[:idx]),
+                tuple(node_str[idx + 1 :]),
+            )
+            index_groups.setdefault(key, []).append(i)
+
+    qualifying = [
+        (key, members)
+        for key, members in index_groups.items()
+        if len(members) >= effective_floor
+    ]
+    if not qualifying:
+        return records
+    # Deterministic, non-overlapping assignment: largest sets first, then by first
+    # member. A record consumed by one collapse can never join another (a record
+    # cannot be two pivots at once).
+    qualifying.sort(key=lambda km: (-len(km[1]), km[1][0]))
+
+    consumed: set[int] = set()
+    collapsed_by_rep: dict[int, dict[str, Any]] = {}
+    for (idx, _rel_sig, _prefix, _suffix), members in qualifying:
+        live = [m for m in members if m not in consumed]
+        if len(live) < effective_floor:
+            continue
+
+        # Distinct pivot labels with their status strength (proven pivots first).
+        pivots: list[tuple[str, int, int]] = []
+        seen_pivot: set[str] = set()
+        for m in live:
+            seq = node_seqs[m]
+            if seq is None:
+                continue
+            pivot_label = seq[idx]
+            if pivot_label in seen_pivot:
+                continue
+            seen_pivot.add(pivot_label)
+            pivots.append(
+                (
+                    pivot_label,
+                    _sibling_pivot_status_strength(records[m].get("status")),
+                    m,
+                )
+            )
+        if len(pivots) < 2:
+            # All live members share the pivot label (exact duplicates handled
+            # elsewhere) — nothing interchangeable to collapse.
+            continue
+
+        # Representative = strongest-status live sibling (ties: earliest record).
+        rep_idx = max(
+            live,
+            key=lambda m: (
+                _sibling_pivot_status_strength(records[m].get("status")),
+                -m,
+            ),
+        )
+        ordered = sorted(pivots, key=lambda p: (-p[1], p[2]))
+        via_labels = [p[0] for p in ordered]
+        proven_count = sum(1 for p in ordered if p[1] >= 4)
+
+        rep = dict(records[rep_idx])
+        sampled_labels = via_labels[:sample_limit] if sample_limit > 0 else []
+        rep["via_accounts"] = list(sampled_labels)
+        rep["via_accounts_count"] = len(via_labels)
+        rep["via_accounts_proven_count"] = proven_count
+        meta = rep.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        else:
+            meta = dict(meta)
+        meta["collapsed_sibling_pivots"] = True
+        meta["collapsed_pivot_index"] = idx
+        # Stash each sampled sibling's real path shape so a later re-target to a
+        # non-representative pivot executes the ACTUAL sibling (not a label-swap
+        # approximation). Bounded by ``sample_limit`` (proven pivots first).
+        label_to_rec = {p[0]: p[2] for p in ordered}
+        via_account_paths: dict[str, dict[str, Any]] = {}
+        for pivot_label in sampled_labels:
+            src_idx = label_to_rec.get(pivot_label)
+            if src_idx is None:
+                continue
+            via_account_paths[pivot_label] = _extract_pivot_path_shape(
+                records[src_idx]
+            )
+        if via_account_paths:
+            meta["via_account_paths"] = via_account_paths
+        rep["meta"] = meta
+
+        for m in live:
+            consumed.add(m)
+        collapsed_by_rep[rep_idx] = rep
+
+    if not collapsed_by_rep:
+        return records
+
+    result: list[dict[str, Any]] = []
+    for i, record in enumerate(records):
+        if i in collapsed_by_rep:
+            result.append(collapsed_by_rep[i])
+        elif i in consumed:
+            continue
+        else:
+            result.append(record)
+    return result
+
+
+#: Path-shape keys copied when re-targeting a collapsed row to a chosen pivot.
+#: These fully describe one sibling's executable path; the summary's OTHER keys
+#: (target metadata, compromise_class, …) are identical across siblings and kept.
+_PIVOT_PATH_SHAPE_KEYS: tuple[str, ...] = (
+    "nodes",
+    "relations",
+    "steps",
+    "source",
+    "target",
+    "length",
+    "status",
+    "_exact_signature",
+)
+
+
+def _extract_pivot_path_shape(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep copy of one sibling record's executable path shape."""
+    shape: dict[str, Any] = {}
+    for key in _PIVOT_PATH_SHAPE_KEYS:
+        if key in record:
+            shape[key] = copy.deepcopy(record[key])
+    return shape
+
+
+def collapsed_pivot_index(record: dict[str, Any]) -> int | None:
+    """Return the interchangeable-pivot node index of a collapsed row, else None."""
+    meta = record.get("meta")
+    if not isinstance(meta, dict) or not meta.get("collapsed_sibling_pivots"):
+        return None
+    idx = meta.get("collapsed_pivot_index")
+    return int(idx) if isinstance(idx, int) else None
+
+
+def collapsed_pivot_fanout_relation(record: dict[str, Any]) -> str | None:
+    """Return the fan-out technique relation of a collapsed sibling-pivot row.
+
+    The interchangeable pivot node sits at ``meta['collapsed_pivot_index']``; the
+    edge that PRODUCES that pivot is ``relations[idx-1]`` — the technique whose
+    determinism (crack/guess vs write) decides single- vs multi-select in the
+    execution UX. Returns None for a non-collapsed record.
+    """
+    idx = collapsed_pivot_index(record)
+    if idx is None:
+        return None
+    rels = record.get("relations")
+    if not isinstance(rels, list):
+        return None
+    producing = idx - 1
+    if 0 <= producing < len(rels):
+        return str(rels[producing])
+    return None
+
+
+def retarget_collapsed_summary_to_pivot(
+    summary: dict[str, Any], pivot_label: str
+) -> dict[str, Any]:
+    """Return a copy of a collapsed summary re-targeted to one chosen pivot.
+
+    When the operator picks a specific interchangeable pivot to execute, swap in
+    that pivot's REAL per-sibling path shape (stashed at collapse time in
+    ``meta['via_account_paths']``) so execution runs the ACTUAL sibling, not a
+    label-swap approximation. When the stash is unavailable the pivot label is
+    substituted into the pivot node and the adjacent steps' ``from``/``to`` — sound
+    because the collapse invariant guarantees the siblings are structurally
+    interchangeable. The collapse markers are cleared so the result executes as an
+    ordinary single path. A non-collapsed summary is returned unchanged.
+    """
+    idx = collapsed_pivot_index(summary)
+    if idx is None:
+        return summary
+
+    new_summary: dict[str, Any] = dict(summary)
+    meta_in = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    via_paths = meta_in.get("via_account_paths")
+    shape = (
+        via_paths.get(pivot_label)
+        if isinstance(via_paths, dict) and isinstance(via_paths.get(pivot_label), dict)
+        else None
+    )
+
+    if shape is not None:
+        for key in _PIVOT_PATH_SHAPE_KEYS:
+            if key in shape:
+                new_summary[key] = copy.deepcopy(shape[key])
+    else:
+        # Fallback: substitute the pivot label into the pivot node + adjacent steps.
+        nodes = list(new_summary.get("nodes") or [])
+        if 0 <= idx < len(nodes):
+            old_pivot = str(nodes[idx])
+            nodes[idx] = pivot_label
+            new_summary["nodes"] = [str(n) for n in nodes]
+            steps = copy.deepcopy(new_summary.get("steps") or [])
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                details = step.get("details")
+                if isinstance(details, dict):
+                    for field in ("from", "to"):
+                        if str(details.get(field) or "") == old_pivot:
+                            details[field] = pivot_label
+            new_summary["steps"] = steps
+
+    # Clear the collapse markers so the retargeted path executes as a normal path.
+    for key in ("via_accounts", "via_accounts_count", "via_accounts_proven_count"):
+        new_summary.pop(key, None)
+    new_meta = dict(meta_in)
+    for key in (
+        "collapsed_sibling_pivots",
+        "collapsed_pivot_index",
+        "via_account_paths",
+    ):
+        new_meta.pop(key, None)
+    new_meta["selected_pivot_account"] = pivot_label
+    new_summary["meta"] = new_meta
+    return new_summary
+
+
 def apply_affected_user_metadata(
     records: list[dict[str, Any]],
     *,
@@ -2740,6 +3087,14 @@ def compute_display_paths_for_domain(
         started_at=minimized_started_at,
         records=minimized,
     )
+    pivot_collapsed_started_at = time.monotonic()
+    minimized = collapse_sibling_pivot_paths(minimized)
+    _log_phase_timing(
+        scope="domain",
+        phase="collapse_sibling_pivot_paths",
+        started_at=pivot_collapsed_started_at,
+        records=minimized,
+    )
     annotated_started_at = time.monotonic()
     annotated = apply_affected_user_metadata(
         minimized,
@@ -2932,6 +3287,15 @@ def compute_display_paths_for_start_node(
         records=minimized_records,
     )
     _debug_paths_checkpoint("after minimize_display_paths", minimized_records)
+    pivot_collapsed_started_at = time.monotonic()
+    minimized_records = collapse_sibling_pivot_paths(minimized_records)
+    _log_phase_timing(
+        scope="start_node",
+        phase="collapse_sibling_pivot_paths",
+        started_at=pivot_collapsed_started_at,
+        records=minimized_records,
+    )
+    _debug_paths_checkpoint("after collapse_sibling_pivot_paths", minimized_records)
     annotated_started_at = time.monotonic()
     annotated = apply_affected_user_metadata(
         minimized_records,
@@ -3086,7 +3450,14 @@ def compute_display_paths_for_principals(
 
     if n_workers < 2:
         # --- Sequential DFS (default / fallback) ----------------------------
-        for username in normalized_principals:
+        # Per-principal progress for the live compute panel (no-op when no UI is
+        # registered — the compute is byte-identical for web/report/debug). Each
+        # principal's DFS is the ~seconds-per-principal cost the ETA extrapolates
+        # from; the parallel branch above cannot report per-principal cheaply, so
+        # progress falls back to stage-only there (the sequential path is default).
+        _principals_total = len(normalized_principals)
+        for _principals_done, username in enumerate(normalized_principals):
+            attack_path_progress.notify_principal(_principals_done, _principals_total)
             remaining = None
             if isinstance(max_paths, int) and max_paths > 0:
                 remaining = max_paths - len(all_records)
@@ -3104,6 +3475,7 @@ def compute_display_paths_for_principals(
                 filter_shortest_paths=filter_shortest_paths,
             )
             all_records.extend(records)
+        attack_path_progress.notify_principal(_principals_total, _principals_total)
 
     raw_started_at = pipeline_started_at
     _log_phase_timing(
@@ -3134,6 +3506,14 @@ def compute_display_paths_for_principals(
         scope="principals",
         phase="minimize_display_paths",
         started_at=minimized_started_at,
+        records=minimized,
+    )
+    pivot_collapsed_started_at = time.monotonic()
+    minimized = collapse_sibling_pivot_paths(minimized)
+    _log_phase_timing(
+        scope="principals",
+        phase="collapse_sibling_pivot_paths",
+        started_at=pivot_collapsed_started_at,
         records=minimized,
     )
     annotated_started_at = time.monotonic()

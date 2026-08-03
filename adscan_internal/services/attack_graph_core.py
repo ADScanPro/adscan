@@ -22,6 +22,7 @@ from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from adscan_internal.services import attack_path_progress
 from adscan_internal.services.domain_controller_classifier import (
     RODC_TARGET_PRIORITY_RANK,
     classify_computer_node_role,
@@ -272,6 +273,7 @@ def _host_control_withheld_after_access(
     from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
         access_unlocks_self_credential,
         get_access_lane,
+        grants_host_system_session,
         is_self_credential_followup,
     )
 
@@ -280,8 +282,15 @@ def _host_control_withheld_after_access(
 
     for rel in reversed(path_relations):
         # A self-credential follow-up "becomes" the host machine account →
-        # the host's own outbound control edges are legitimately available.
-        if is_self_credential_followup(rel):
+        # the host's own outbound control edges are legitimately available. The
+        # MSSQL SYSTEM-escalation self-loops (SeImpersonate / Token-Theft) reach
+        # NT AUTHORITY\SYSTEM, which IS the host machine account — the same
+        # ownership, so they likewise stop the walk-back and re-enable the host's
+        # outbound control edges (incl. the synthetic direct-DCSync bridge on a
+        # writable DC). They must be seen BEFORE the SQL access lane that unlocked
+        # them (SQLAccess / SQLAdmin / MssqlLinkedServerLateral), which does not
+        # itself confer self-credential and would otherwise withhold the bridge.
+        if is_self_credential_followup(rel) or grants_host_system_session(rel):
             return False
         lane = get_access_lane(rel)
         if lane is None:
@@ -1354,19 +1363,28 @@ def filter_contained_paths_for_domain_listing(
         kept_entries: list[tuple[AttackCore | None, dict[str, Any]]] = []
         kept_terminal_by_id: dict[int, str | None] = {}
         # Sub-quadratic scheduling index (byte-identical to the naive all-pairs
-        # scan).  A kept path can only be CONTAINED (prefix OR contiguous
-        # sub-sequence) in the candidate when the kept core's FIRST actionable
-        # step appears among the candidate's steps — a NECESSARY condition of
-        # containment (``attack_core_is_prefix``/``_is_subsequence`` both require
-        # the kept step tuple to be a contiguous block of the candidate's, so its
-        # first step must be one of the candidate's steps).  Indexing kept cores by
-        # their first step lets each candidate test only the kept paths that could
-        # possibly contain-match, instead of every kept path.  The predicate and
-        # the tier/terminal guards below are unchanged; only the set of pairs they
-        # run on is pruned.  ``is_super_path`` is an existence (OR) over the
+        # scan).  A kept sub-path is CONTAINED (prefix OR contiguous sub-sequence)
+        # in the candidate only when its step tuple is a contiguous block of the
+        # candidate's — which forces BOTH its first AND its last actionable step to
+        # appear (at the block's two ends) among the candidate's steps.  Indexing
+        # kept cores by the ``(first_step, last_step)`` ENDPOINT pair (not the
+        # first step alone) is what tames the sibling-pivot explosion: thousands of
+        # near-duplicate paths that share the same first step (e.g. one source
+        # roasting every service account — ``… → Kerberoast → SVC_i``) land in the
+        # SAME first-step bucket, so a first-step index still tests every sibling
+        # against every other (O(N²)); their DISTINCT terminals give distinct
+        # endpoint pairs, so the endpoint index buckets them apart and each
+        # candidate only tests the few kept cores that could actually contain-match.
+        # A contained kept core with endpoints ``(k0, km)`` sits at some contiguous
+        # offset in the candidate, so ``(k0, km)`` is one of the candidate's own
+        # ``(steps[i], steps[j]), i <= j`` endpoint pairs — the candidate probes
+        # exactly those, so no true containment is skipped.  The predicate and the
+        # tier/terminal guards below are unchanged; only the set of pairs they run
+        # on is pruned, and ``is_super_path`` is an existence (OR) over the
         # qualifying kept paths, so the pruned iteration order does not change it.
-        kept_by_first_step: dict[
-            tuple[str, str], list[tuple[AttackCore, dict[str, Any]]]
+        kept_by_endpoints: dict[
+            tuple[tuple[str, str], tuple[str, str]],
+            list[tuple[AttackCore, dict[str, Any]]],
         ] = {}
         removed_multi = 0
         for nodes_t, rels_t, record in normalized:
@@ -1375,64 +1393,79 @@ def filter_contained_paths_for_domain_listing(
             cand_terminal = nodes_t[-1] if nodes_t else None
             is_super_path = False
             if cand_core is not None and cand_core[1]:
-                for step in set(cand_core[1]):
+                cand_steps = cand_core[1]
+                n_cand_steps = len(cand_steps)
+                probed_endpoints: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+                for i in range(n_cand_steps):
                     if is_super_path:
                         break
-                    for kept_core, kept_rec in kept_by_first_step.get(step, ()):
-                        contained = attack_core_is_prefix(
-                            kept_core, cand_core
-                        ) or attack_core_is_subsequence(kept_core, cand_core)
-                        if not contained:
+                    for j in range(i, n_cand_steps):
+                        endpoints = (cand_steps[i], cand_steps[j])
+                        if endpoints in probed_endpoints:
                             continue
-                        kept_tier = tiers_by_id[id(kept_rec)]
-                        # Keep the longer candidate when it reaches a strictly higher
-                        # domain-compromise tier than the kept sub-path.
-                        if cand_tier > kept_tier:
+                        probed_endpoints.add(endpoints)
+                        bucket = kept_by_endpoints.get(endpoints)
+                        if not bucket:
                             continue
-                        # Keep the longer candidate when it reaches a DISTINCT terminal
-                        # of EQUAL domain-compromise tier: it is a separately
-                        # compromisable target, not merely a longer route to the same
-                        # place.  (Vintage: ``FS01$→…→GMSA01$`` is a prefix of three
-                        # distinct equal-tier service-account terminals SVC_ARK /
-                        # SVC_LDAP / SVC_SQL — all three must survive, not collapse into
-                        # the bare GMSA01$ prefix.)  The redundant bare prefix is
-                        # dropped in Pass 2 instead.  Same-terminal longer routes still
-                        # collapse here, and a lower-tier wander past the kept terminal
-                        # (cand_tier < kept_tier) still collapses as noise.
-                        if (
-                            cand_tier == kept_tier
-                            and cand_terminal is not None
-                            and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
-                        ):
-                            continue
-                        # Keep the longer candidate when it reaches the SAME terminal
-                        # at EQUAL tier but from a strictly BROADER origin — a larger
-                        # affected-principal population.  The extra leading prefix
-                        # (e.g. DOMAIN USERS -> Kerberoast -> ... -> domain, 14
-                        # affected) widens "who can walk this" vs the single-principal
-                        # suffix (1 affected); that is headline blast-radius value, not
-                        # redundant length.  Domain-listing scope only
-                        # (``affected_widening_carveout``); the redundant narrow twin is
-                        # dropped in Pass 2.  Owned/principals keep the direct route.
-                        if (
-                            affected_widening_carveout
-                            and cand_tier == kept_tier
-                            and _record_affected_principal_count(record)
-                            > _record_affected_principal_count(kept_rec)
-                        ):
-                            continue
-                        is_super_path = True
-                        break
+                        for kept_core, kept_rec in bucket:
+                            contained = attack_core_is_prefix(
+                                kept_core, cand_core
+                            ) or attack_core_is_subsequence(kept_core, cand_core)
+                            if not contained:
+                                continue
+                            kept_tier = tiers_by_id[id(kept_rec)]
+                            # Keep the longer candidate when it reaches a strictly higher
+                            # domain-compromise tier than the kept sub-path.
+                            if cand_tier > kept_tier:
+                                continue
+                            # Keep the longer candidate when it reaches a DISTINCT terminal
+                            # of EQUAL domain-compromise tier: it is a separately
+                            # compromisable target, not merely a longer route to the same
+                            # place.  (Vintage: ``FS01$→…→GMSA01$`` is a prefix of three
+                            # distinct equal-tier service-account terminals SVC_ARK /
+                            # SVC_LDAP / SVC_SQL — all three must survive, not collapse into
+                            # the bare GMSA01$ prefix.)  The redundant bare prefix is
+                            # dropped in Pass 2 instead.  Same-terminal longer routes still
+                            # collapse here, and a lower-tier wander past the kept terminal
+                            # (cand_tier < kept_tier) still collapses as noise.
+                            if (
+                                cand_tier == kept_tier
+                                and cand_terminal is not None
+                                and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
+                            ):
+                                continue
+                            # Keep the longer candidate when it reaches the SAME terminal
+                            # at EQUAL tier but from a strictly BROADER origin — a larger
+                            # affected-principal population.  The extra leading prefix
+                            # (e.g. DOMAIN USERS -> Kerberoast -> ... -> domain, 14
+                            # affected) widens "who can walk this" vs the single-principal
+                            # suffix (1 affected); that is headline blast-radius value, not
+                            # redundant length.  Domain-listing scope only
+                            # (``affected_widening_carveout``); the redundant narrow twin is
+                            # dropped in Pass 2.  Owned/principals keep the direct route.
+                            if (
+                                affected_widening_carveout
+                                and cand_tier == kept_tier
+                                and _record_affected_principal_count(record)
+                                > _record_affected_principal_count(kept_rec)
+                            ):
+                                continue
+                            is_super_path = True
+                            break
+                        if is_super_path:
+                            break
             if is_super_path:
                 removed_multi += 1
             else:
                 kept_entries.append((cand_core, record))
                 kept_terminal_by_id[id(record)] = cand_terminal
-                # Index this kept path by its first step so later candidates can
-                # find it as a possible contained sub-path.  Empty-step cores never
+                # Index this kept path by its ``(first_step, last_step)`` endpoint
+                # pair so later candidates can find it as a possible contained
+                # sub-path via one bucket lookup.  Empty-step cores never
                 # contain-match (the predicates guard ``n == 0``), so skip them.
                 if cand_core is not None and cand_core[1]:
-                    kept_by_first_step.setdefault(cand_core[1][0], []).append(
+                    endpoint_key = (cand_core[1][0], cand_core[1][-1])
+                    kept_by_endpoints.setdefault(endpoint_key, []).append(
                         (cand_core, record)
                     )
 
@@ -1447,17 +1480,34 @@ def filter_contained_paths_for_domain_listing(
         #     super-path (1 >= 4 is False) — preserves the F2 anti-regression.
         # Sub-quadratic scheduling index (byte-identical to the naive all-pairs
         # scan).  Path A is dominated only by a super-path B that CONTAINS A's core
-        # (prefix OR contiguous sub-sequence) — which requires A's FIRST step to
-        # appear among B's steps.  Index every kept super-path B under EACH of its
-        # steps, so a given A tests only the B's that carry A's first step, instead
-        # of every kept path.  ``dominated`` is an existence (OR) over qualifying
-        # B's, so the pruned iteration order does not change it.
-        super_path_by_step: dict[str, list[tuple[AttackCore, dict[str, Any]]]] = {}
+        # (prefix OR contiguous sub-sequence) — which forces A's FIRST and LAST
+        # steps to sit at the two ends of a contiguous block of B's steps, i.e.
+        # ``(a_first, a_last)`` is one of B's own ``(steps[i], steps[j]), i <= j``
+        # endpoint pairs.  Indexing every kept super-path B under ALL its endpoint
+        # pairs lets a given A find its dominators with ONE bucket lookup instead of
+        # scanning every B that merely shares A's first step — the same
+        # sibling-pivot fan-out (all siblings share a first step) that the by-step
+        # index degraded to O(N²).  ``dominated`` is an existence (OR) over
+        # qualifying B's, so the pruned iteration order does not change it.
+        super_by_endpoints: dict[
+            tuple[tuple[str, str], tuple[str, str]],
+            list[tuple[AttackCore, dict[str, Any]]],
+        ] = {}
         for b_core, other in kept_entries:
             if b_core is None or not b_core[1]:
                 continue
-            for step in set(b_core[1]):
-                super_path_by_step.setdefault(step, []).append((b_core, other))
+            b_steps = b_core[1]
+            n_b_steps = len(b_steps)
+            seen_b_endpoints: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+            for i in range(n_b_steps):
+                for j in range(i, n_b_steps):
+                    endpoints = (b_steps[i], b_steps[j])
+                    if endpoints in seen_b_endpoints:
+                        continue
+                    seen_b_endpoints.add(endpoints)
+                    super_by_endpoints.setdefault(endpoints, []).append(
+                        (b_core, other)
+                    )
         pass2_kept: list[dict[str, Any]] = []
         pass2_removed = 0
         for a_core, record in kept_entries:
@@ -1467,7 +1517,8 @@ def filter_contained_paths_for_domain_listing(
             dominated = False
             if a_core is not None and a_core[1]:
                 a_aff = _record_affected_principal_count(record)
-                for b_core, other in super_path_by_step.get(a_core[1][0], ()):
+                a_endpoints = (a_core[1][0], a_core[1][-1])
+                for b_core, other in super_by_endpoints.get(a_endpoints, ()):
                     if other is record:
                         continue
                     if not (
@@ -2075,8 +2126,10 @@ def _build_implicit_dc_dcsync_overlay(
     For every **writable Domain Controller** Computer node reached via a
     deterministic local-admin access edge (see
     :func:`_edge_grants_local_admin_session` — AdminTo, ReadLAPSPassword,
-    Ntlmv1RelayRBCD, SPNJack, and AllowedToDelegate with protocol transition),
-    injects a synthetic ``Computer -> DCSync -> <Domain object>`` edge.
+    Ntlmv1RelayRBCD, SPNJack, AllowedToDelegate with protocol transition, and the
+    MSSQL SYSTEM-escalation self-loops MssqlSeImpersonateEscalation /
+    MssqlTokenTheftEscalation, which reach NT AUTHORITY\\SYSTEM = the DC machine
+    account), injects a synthetic ``Computer -> DCSync -> <Domain object>`` edge.
 
     AD rationale: an admin/SYSTEM context on a writable DC can DCSync directly.
     Running as SYSTEM IS the DC machine account, which is a member of Domain
@@ -3514,13 +3567,25 @@ def compute_maximal_attack_paths(
         if not extended:
             emit(acc_steps)
 
+    # Per-principal progress for the live compute panel. The sequential DFS is
+    # the dominant, otherwise-unobserved phase (each source's walk is the
+    # ~seconds-per-principal cost the ETA extrapolates from), so report the
+    # position from inside the loop. ``notify_principal`` is a no-op single
+    # global read when no UI is registered — the DFS is byte-identical for
+    # web / report / debug-script callers. Sources + rooted choke points share
+    # one denominator so the bar reaches 100% exactly when the DFS finishes.
+    _dfs_total = len(sources) + len(chokepoint_roots)
+    _dfs_done = 0
+
     # Sources first: they drop their redundant leading MemberOf hop into every
     # rooted choke point (see the DFS suppression), so each shared subtree is
     # walked once below instead of once per member.
     for source in sources:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             break
+        attack_path_progress.notify_principal(_dfs_done, _dfs_total)
         dfs(source, visited={source}, acc_steps=[])
+        _dfs_done += 1
 
     # Then walk each choke-point subtree ONCE, rooted at the group, with the two
     # byte-identity guards active (emit-span guard for over-long extras, and the
@@ -3529,9 +3594,12 @@ def compute_maximal_attack_paths(
     for chokepoint in chokepoint_roots:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             break
+        attack_path_progress.notify_principal(_dfs_done, _dfs_total)
         active_guard_members = chokepoint_root_members.get(chokepoint)
         dfs(chokepoint, visited={chokepoint}, acc_steps=[])
+        _dfs_done += 1
     active_guard_members = None
+    attack_path_progress.notify_principal(_dfs_done, _dfs_total)
 
     return paths
 

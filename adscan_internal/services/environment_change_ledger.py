@@ -779,6 +779,21 @@ def _backfill_schema_1_1(data: dict[str, Any]) -> None:
     data["schema_version"] = _SCHEMA_VERSION
 
 
+def _remediation_lines(command: str) -> list[str]:
+    """Split a remediation string into the lines a renderer should print.
+
+    Blank lines are dropped so a document never prints an empty row, and
+    indentation is preserved so a numbered procedure keeps its shape.
+
+    Args:
+        command: The remediation string, one line or a whole procedure.
+
+    Returns:
+        The non-empty lines, in order. Empty list when there is no command.
+    """
+    return [line for line in command.splitlines() if line.strip()]
+
+
 def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
     """Project one ledger record into the normalized render-ready shape."""
     status = str(entry.get("revert_status") or _tax.STATUS_PENDING)
@@ -792,6 +807,19 @@ def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
             if candidate:
                 object_dn = candidate
                 break
+    # A remediation is either a single command or a whole procedure, and the
+    # two want different composition: a one-liner reads fine beside its object,
+    # a procedure has to be printed at the document's full width or its long
+    # tokens — a certificate serial, an ``-out`` field list — break mid-string
+    # and the client cannot copy the command. Deciding which it is belongs
+    # HERE, once, so every renderer (the paid report, the free report, the web)
+    # agrees rather than re-detecting it from the string.
+    remediation_command = str(
+        entry.get("remediation_command")
+        or entry.get("manual_cleanup_instructions")
+        or ""
+    )
+    remediation_lines = _remediation_lines(remediation_command)
     return {
         "change_id": str(entry.get("change_id") or ""),
         "kind": str(entry.get("kind") or ""),
@@ -811,11 +839,9 @@ def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
         "manual_reason_label": _tax.manual_reason_label(entry.get("manual_reason"))
         if entry.get("manual_reason")
         else None,
-        "remediation_command": str(
-            entry.get("remediation_command")
-            or entry.get("manual_cleanup_instructions")
-            or ""
-        ),
+        "remediation_command": remediation_command,
+        "remediation_lines": remediation_lines,
+        "remediation_is_procedure": len(remediation_lines) > 1,
         "performed_as": entry.get("min_credential_principal"),
     }
 

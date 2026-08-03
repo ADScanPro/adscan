@@ -48,7 +48,9 @@ from typing import Any, Mapping, Sequence
 from adscan_internal.services.compromise_class import (
     CompromiseClass,
     PrivilegeTier,
+    derive_compromise_class_from_path,
     privilege_tier_for_computer_node,
+    privilege_tier_for_principal_node,
     privilege_tier_label,
 )
 from adscan_internal.services.edge_kind import (
@@ -212,19 +214,27 @@ def resolve_fanout_target_tier(
 ) -> PrivilegeTier:
     """Return the granted :class:`PrivilegeTier` of a fan-out target node.
 
-    Pure node-dict → tier resolution for the fan-out bucketing axis. Reuses the
-    computer SSOT :func:`privilege_tier_for_computer_node` (DC / Tier-0-asset /
-    server / workstation grading). Domain objects are Tier-0-direct. Non-computer
-    principals (users, groups) are Tier 2 unless flagged as a Tier 0 asset, in
-    which case they grade escalation-capable (the conservative non-direct
-    verdict) — matching the degraded fallback in
-    :func:`privilege_tier_for_computer`.
+    Pure node-dict → tier resolution for the fan-out bucketing axis, delegated
+    in both directions to the axis-1 SSOT in :mod:`compromise_class`:
+    :func:`privilege_tier_for_computer_node` for a Computer (DC / Tier-0-asset /
+    server / workstation grading) and
+    :func:`privilege_tier_for_principal_node` for a user, group or container
+    (direct domain breaker → Tier 0 direct, escalation group → Tier 0
+    escalation-capable, else Tier 2). Domain objects are Tier-0-direct.
+
+    Because the tier is part of the rollup KEY and is rendered as the bucket's
+    client label, a mis-graded target both mislabels the row and files it in the
+    wrong bucket. Grading a principal from the node's ``isTierZero`` tag alone
+    did exactly that — DnsAdmins (untagged) landed in a "Tier 2: Standard"
+    bucket and Domain Admins (tagged) in an "escalation-capable" one, each
+    contradicting the report's own client glossary.
 
     Args:
         node: A BloodHound/ADscan-shaped node dict, or ``None``.
         is_tier0_asset: True when the caller has already flagged this node a
-            Tier 0 asset outside group membership (``isTierZero`` / ``highvalue``
-            / ADCS CA / Exchange).
+            Tier 0 asset outside group identity (``isTierZero`` / ``highvalue``
+            / ADCS CA / Exchange). A degraded fallback only — a node whose group
+            identity resolves is graded from that.
 
     Returns:
         The :class:`PrivilegeTier`; :attr:`PrivilegeTier.TIER2` for ``None``.
@@ -237,12 +247,7 @@ def resolve_fanout_target_tier(
         return PrivilegeTier.TIER0_DIRECT
     if kind == "computer":
         return privilege_tier_for_computer_node(node, is_tier0_asset=is_tier0_asset)
-
-    # User / group / container target — no per-object computer role. Defer to
-    # the Tier 0 asset flag; else standard Tier 2.
-    if is_tier0_asset:
-        return PrivilegeTier.TIER0_ESCALATION_CAPABLE
-    return PrivilegeTier.TIER2
+    return privilege_tier_for_principal_node(node, is_tier0_asset=is_tier0_asset)
 
 
 def _coerce_compromise_class(value: Any) -> CompromiseClass | None:
@@ -353,6 +358,13 @@ def fanout_input_from_edge(
     A membership / structural edge, or an edge whose endpoints are missing from
     ``node_index``, yields ``None``.
 
+    The spoke's REACH (``path_compromise_class``) is derived from the SSOT
+    :func:`derive_compromise_class_from_path` over this single edge — a fan-out
+    spoke IS a one-edge path, so its reach class is the same question the path
+    classifier answers. Leaving it unset made every edge-derived bucket fall
+    back to a hardcoded ``compromise_enabler``, so a row whose targets are
+    Domain Admins still reported the weakest class on the ladder.
+
     Args:
         edge: A raw graph edge dict (``from``, ``to``, ``relation``).
         node_index: node-id → node-dict map. Nodes may carry a stamped
@@ -388,7 +400,7 @@ def fanout_input_from_edge(
         ),
         source_compromise_class=_coerce_compromise_class(from_node.get("compromise_class")),
         target_compromise_class=_coerce_compromise_class(to_node.get("compromise_class")),
-        path_compromise_class=None,
+        path_compromise_class=derive_compromise_class_from_path([dict(edge)], to_node),
         target_is_domain=target_is_domain,
     )
 

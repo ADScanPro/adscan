@@ -18,9 +18,9 @@ must exist here with a byte-identical ``mitre`` list.
 
 Entries whose ``mitre`` list is empty are findings that map to a hygiene /
 configuration weakness with no single ATT&CK technique (e.g. obsolete OS,
-krbtgt password age, machine-account-quota, RC4-only accounts, credentials
-in LDAP attributes). They are kept in the slice so the keyset stays
-complete; the Navigator builder simply emits no technique cell for them.
+krbtgt password age, machine-account-quota, RC4-only accounts). They are kept
+in the slice so the keyset stays complete; the Navigator builder simply emits
+no technique cell for them.
 """
 
 from __future__ import annotations
@@ -246,8 +246,9 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
                        'title': 'RC4-Only Kerberos Accounts (No AES Support)',
                        'mitre': []},
  'credential_in_ldap_attribute': {'severity': 'high',
-                                  'title': 'Credentials Found in LDAP Attributes',
-                                  'mitre': []},
+                                  'title': 'Credentials Stored in Directory Account Attributes',
+                                  'mitre': [{'id': 'T1552',
+                                             'name': 'Unsecured Credentials'}]},
  'ldap_user_description_password_leak': {'severity': 'medium',
                                          'title': 'Password Material in User Description Attributes (LDAP)',
                                          'mitre': [{'id': 'T1552',

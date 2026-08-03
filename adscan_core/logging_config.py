@@ -152,6 +152,15 @@ _debug_file_handler: Optional[RotatingFileHandler] = None
 _workspace_file_handler: Optional[RotatingFileHandler] = None
 _workspace_debug_file_handler: Optional[RotatingFileHandler] = None
 _telemetry_console_handler: Optional[RichHandler] = None
+# Last workspace directory that workspace logging was (re)configured for.
+# The process re-executes ``adscan.py`` in-process mid-run (a spawn context
+# re-imports ``__main__`` at the preflight->scan boundary), and that re-import
+# calls ``init_logging()`` WITHOUT a ``workspace_dir``. Remembering the active
+# workspace dir here lets such a re-init re-attach the workspace file handlers
+# instead of silently dropping them (which froze ``<workspace>/logs/
+# adscan.debug.log`` after preflight). Cleared only on an intentional detach
+# (``update_workspace_logging(None)``).
+_active_workspace_dir: Optional[Path] = None
 
 
 class MarkerStrippingFormatter(logging.Formatter):
@@ -316,7 +325,17 @@ def init_logging(
     """
     global _logger, _console_handler, _file_handler, _debug_file_handler
     global _workspace_file_handler, _workspace_debug_file_handler
-    global _telemetry_console_handler
+    global _telemetry_console_handler, _active_workspace_dir
+
+    # Re-attach the last-known workspace on an in-process re-init that passes no
+    # workspace_dir. adscan.py's module top-level re-executes mid-run (a spawn
+    # context re-imports __main__ at the preflight->scan boundary) and calls
+    # init_logging() with workspace_dir=None; without this the workspace file
+    # handlers are dropped for the rest of the run and <workspace>/logs/
+    # adscan.debug.log freezes after preflight. RotatingFileHandler opens in
+    # append mode, so re-attaching the remembered dir never truncates.
+    if workspace_dir is None:
+        workspace_dir = _active_workspace_dir
 
     # CRITICAL: Preserve active verbose/debug modes from rich_output if they're already active
     # This prevents losing debug/verbose mode when module re-executes (e.g., PyInstaller)
@@ -535,6 +554,9 @@ def init_logging(
             )
             logger.addHandler(workspace_debug_file_handler)
             _workspace_debug_file_handler = workspace_debug_file_handler
+            # Remember the active workspace so a later re-init with no
+            # workspace_dir re-attaches these handlers (see the top of init_logging).
+            _active_workspace_dir = Path(workspace_dir)
         except PermissionError:
             _workspace_file_handler = None
             _workspace_debug_file_handler = None
@@ -985,9 +1007,15 @@ def update_workspace_logging(workspace_dir: Optional[Path]):
         workspace_dir: Workspace directory path. If None, removes workspace handler.
     """
     global _logger, _workspace_file_handler, _workspace_debug_file_handler
+    global _active_workspace_dir
 
     if _logger is None:
         return
+
+    # Remember/forget the active workspace so an in-process re-init that passes
+    # no workspace_dir re-attaches (or, on an intentional detach, does not
+    # re-attach) these handlers. See the top of init_logging.
+    _active_workspace_dir = Path(workspace_dir) if workspace_dir else None
 
     # Remove existing workspace handler if present
     if _workspace_file_handler is not None:

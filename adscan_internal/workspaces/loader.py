@@ -927,7 +927,11 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
 
     Args:
         shell: CLI shell instance that implements WorkspaceLoaderShell protocol
-        workspace_path: Absolute path to the workspace directory
+        workspace_path: Absolute path to a workspace ROOT directory. Never a
+            per-domain directory: that ``variables.json`` is a derived write-only
+            snapshot with no ``domains_data``, and loading it would wipe the
+            in-memory credential store (see
+            ``apply_workspace_variables_to_shell``).
     """
     # Clean NetExec workspaces to avoid schema mismatch errors
     shell._clean_netexec_workspaces(use_sudo_if_needed=False)
@@ -966,14 +970,21 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             # false "cancelled" loop. Capture the activated identity and re-assert
             # it after applying variables so corrupt, absent, or stale values can
             # never win. (``workspace_path`` is deliberately NOT used as the source
-            # here: this loader is also invoked with a DOMAIN directory, so its
-            # basename is not reliably the workspace name.)
+            # here: its basename is not reliably the workspace name.)
             activation_current_workspace = getattr(shell, "current_workspace", None)
             activation_current_workspace_dir = getattr(
                 shell, "current_workspace_dir", None
             )
 
-            apply_workspace_variables_to_shell(shell, variables)
+            # ``reset_missing_to_defaults=True`` is correct HERE and only here:
+            # ``workspace_path`` is a workspace ROOT, so ``variables`` is the full
+            # state of the workspace being switched to and every key it omits must
+            # fall back to a default rather than inherit the previously-loaded
+            # workspace's value. Never pass a per-domain (or otherwise partial)
+            # payload through this call — see the helper's docstring.
+            apply_workspace_variables_to_shell(
+                shell, variables, reset_missing_to_defaults=True
+            )
 
             if activation_current_workspace:
                 shell.current_workspace = activation_current_workspace
@@ -1381,9 +1392,20 @@ def load_workspace_variables(variables_file: str) -> dict[str, Any] | None:
     return read_json_file(variables_file)
 
 
-def apply_loaded_workspace_variables(shell: Any, variables: dict[str, Any]) -> None:  # type: ignore[type-arg]
-    """Apply loaded variables to the CLI shell instance."""
-    apply_workspace_variables_to_shell(shell, variables)
+def apply_loaded_workspace_variables(
+    shell: Any,  # type: ignore[type-arg]
+    variables: dict[str, Any],
+    *,
+    reset_missing_to_defaults: bool = False,
+) -> None:
+    """Apply loaded variables to the CLI shell instance.
+
+    Thin pass-through to ``apply_workspace_variables_to_shell``; see that
+    docstring for why ``reset_missing_to_defaults`` defaults to ``False``.
+    """
+    apply_workspace_variables_to_shell(
+        shell, variables, reset_missing_to_defaults=reset_missing_to_defaults
+    )
 
 
 __all__ = [

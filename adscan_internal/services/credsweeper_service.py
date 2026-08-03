@@ -19,6 +19,7 @@ from importlib import metadata as importlib_metadata
 from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import nullcontext
 import logging
 import os
 import re
@@ -1120,20 +1121,39 @@ class CredSweeperService(BaseService):
                 "[credsweeper] Library execution budget: "
                 f"doc={doc} depth={depth} timeout_seconds={int(timeout)}"
             )
-        findings = self._run_library_path_scan(
-            path_to_scan=path_to_scan,
-            rules_path=rules_path,
-            include_custom_rules=include_custom_rules,
-            rules_profile=rules_profile,
-            drop_ml_none=drop_ml_none,
-            ml_threshold=str(ml_threshold),
-            custom_ml_threshold=custom_ml_threshold,
-            doc=doc,
-            depth=depth,
-            no_filters=no_filters,
-            find_by_ext=find_by_ext,
-            jobs=jobs,
+        # The library scan is a single OPAQUE call — no per-file signal — so a
+        # directory scan shows an honest indeterminate spinner (spinner +
+        # "Scanning N files for secrets…" + elapsed, no fabricated ETA) while it
+        # runs. DISPLAY-ONLY and fail-open: on any dashboard failure the scan
+        # runs plainly and returns identical findings.
+        from adscan_internal.services.loot_progress import (
+            count_files_under,
+            indeterminate_scan_spinner,
         )
+
+        spinner_ctx = (
+            indeterminate_scan_spinner(
+                "SMB Share Exposure · Secret Scan",
+                label=f"Scanning {count_files_under(path_to_scan)} files for secrets…",
+            )
+            if target_is_directory
+            else nullcontext()
+        )
+        with spinner_ctx:
+            findings = self._run_library_path_scan(
+                path_to_scan=path_to_scan,
+                rules_path=rules_path,
+                include_custom_rules=include_custom_rules,
+                rules_profile=rules_profile,
+                drop_ml_none=drop_ml_none,
+                ml_threshold=str(ml_threshold),
+                custom_ml_threshold=custom_ml_threshold,
+                doc=doc,
+                depth=depth,
+                no_filters=no_filters,
+                find_by_ext=find_by_ext,
+                jobs=jobs,
+            )
 
         if _enable_xml_sanitization_pass and os.path.isdir(path_to_scan) and not doc:
             supplemental_findings = self._analyze_sanitized_xml_overlay(

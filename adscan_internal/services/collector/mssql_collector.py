@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_info_debug, print_info_verbose
+from adscan_core.rich_output import print_info, print_info_debug, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
 from adscan_core.rich_output import print_exception
 
@@ -476,35 +476,9 @@ def parse_mssql_spn_host(spn: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Instance discovery — SPN (from the graph) ∩ mssql/ips.txt (from the scan)
+# Instance discovery — union of SYN-scan (mssql/ips.txt), SPN (graph MSSQLSvc/*)
+# and pivot-reachable hosts, via the service-target-resolution SSOT
 # ---------------------------------------------------------------------------
-
-
-def _load_mssql_ips(workspace_dir: str, domains_dir: str, domain: str) -> list[str]:
-    """Read the reachable MSSQL host IPs from ``<domain>/mssql/ips.txt``."""
-    try:
-        from adscan_internal.workspaces import domain_subpath
-
-        path = domain_subpath(workspace_dir, domains_dir, domain, "mssql", "ips.txt")
-    except Exception as exc:  # noqa: BLE001 — path helper must never break discovery
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return []
-    if not path or not os.path.exists(path):
-        return []
-    ips: list[str] = []
-    seen: set[str] = set()
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            for line in handle:
-                ip = line.strip()
-                if ip and ip not in seen:
-                    seen.add(ip)
-                    ips.append(ip)
-    except OSError as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-    return ips
 
 
 def _spn_hosts_from_graph(graph: dict[str, Any]) -> dict[str, str]:
@@ -532,34 +506,29 @@ def discover_mssql_instances(
     domain: str,
     *,
     graph: dict[str, Any] | None = None,
-    ip_hostname_inventory: dict[str, list[str]] | None = None,
 ) -> list[MSSQLInstance]:
-    """Discover MSSQL instances: ``mssql/ips.txt`` (reachable) enriched by SPNs.
+    """Discover MSSQL instances by UNIONING three evidence sources (SSOT).
 
-    Reachable IPs from the port scan are the authoritative connect targets. Each
-    is enriched with an FQDN — first from the IP→hostname inventory, then by
-    matching a graph ``MSSQLSvc/*`` SPN host against the inventory's FQDNs — so a
-    hardened (AES-only / NTLM-disabled) instance still gets a correct Kerberos SPN.
+    Delegates target resolution to
+    :func:`service_target_resolution.resolve_service_targets`, which unions:
 
-    SPN-only instances (no reachable IP) are intentionally NOT probed in v1 — we
-    cannot open a TDS connection to them — but the SPN map is used purely for FQDN
-    enrichment of the reachable set.
+      * **syn** — the SYN-scan-reachable IPs in ``mssql/ips.txt``.
+      * **spn** — graph ``MSSQLSvc/*`` SPN hosts, resolved to an IP via the
+        workspace inventory. This is what fixes the pivot / filtered-port gap:
+        a host we KNOW runs MSSQL (from its SPN) becomes a connect target even
+        when the direct SYN scan never saw port 1433 open.
+      * **pivot** — hosts a pivot confirmed reachable on 1433.
+
+    Each target carries an FQDN promoted to a fully-qualified name, so a hardened
+    (AES-only / NTLM-disabled) instance still gets a correct ``MSSQLSvc/<fqdn>``
+    Kerberos SPN. A per-instance TDS connect is attempted for every target; the
+    existing per-instance Kerberos→NTLM fallback + bounded wall budget make a
+    dead SPN-seeded host fail cleanly, so the union never introduces a new
+    failure mode — only recovers a service the ``ips.txt``-only gate would have
+    silently skipped.
     """
     domain_clean = str(domain or "").strip()
     if not domain_clean:
-        return []
-
-    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
-    domains_dir = str(getattr(shell, "domains_dir", "") or "")
-    if not workspace_dir or not domains_dir:
-        return []
-
-    ips = _load_mssql_ips(workspace_dir, domains_dir, domain_clean)
-    if not ips:
-        print_info_debug(
-            "[mssql-collector] no reachable MSSQL IPs in mssql/ips.txt for "
-            f"{mark_sensitive(domain_clean, 'domain')}; skipping authorization collection"
-        )
         return []
 
     if graph is None:
@@ -574,56 +543,47 @@ def discover_mssql_instances(
 
     spn_by_host = _spn_hosts_from_graph(graph or {})
 
-    # IP → FQDN inventory (best-effort).
-    inventory = ip_hostname_inventory
-    if inventory is None:
-        inventory = _load_ip_hostname_inventory(shell, domain_clean)
+    from adscan_internal.services.service_target_resolution import (
+        resolve_service_targets,
+    )
 
-    instances: list[MSSQLInstance] = []
-    for ip in ips:
-        fqdn: str | None = None
-        candidates = inventory.get(ip) if isinstance(inventory, dict) else None
-        if isinstance(candidates, list):
-            for candidate in candidates:
-                cand = str(candidate or "").strip().rstrip(".").lower()
-                if cand:
-                    fqdn = cand
-                    break
-        spn = None
-        if fqdn and fqdn in spn_by_host:
-            spn = spn_by_host[fqdn]
-        instances.append(MSSQLInstance(host=ip, fqdn=fqdn, spn=spn))
+    resolution = resolve_service_targets(
+        shell, domain_clean, service="mssql", spn_hosts=spn_by_host
+    )
+    instances = [
+        MSSQLInstance(host=target.host, fqdn=target.fqdn, spn=target.spn)
+        for target in resolution.targets
+    ]
+
+    if not instances:
+        print_info_debug(
+            "[mssql-collector] no MSSQL targets (syn/spn/pivot) for "
+            f"{mark_sensitive(domain_clean, 'domain')}; skipping authorization collection"
+        )
+        return instances
+
+    # Promote the "SYN scan saw nothing but SPNs/pivot know a host runs MSSQL"
+    # case from DEBUG to a visible advisory — this is exactly the pivot /
+    # filtered-port scenario the union recovers, and the operator should see it.
+    spn_only = resolution.spn_only_hosts
+    if spn_only:
+        seeded = ", ".join(
+            mark_sensitive(t.fqdn or t.host, "hostname") for t in spn_only
+        )
+        print_info(
+            f"MSSQL: {len(spn_only)} instance(s) seeded from SPN/pivot evidence "
+            f"(not seen by the direct port scan): {seeded}. "
+            "Attempting anyway (reachable over a pivot or a non-standard port)."
+        )
 
     print_info_debug(
         "[mssql-collector] discovered "
         f"{len(instances)} MSSQL instance(s) for "
         f"{mark_sensitive(domain_clean, 'domain')} "
-        f"(spn_hosts={len(spn_by_host)})"
+        f"(syn={resolution.syn_count} spn={resolution.spn_count} "
+        f"pivot={resolution.pivot_count} spn_hosts={len(spn_by_host)})"
     )
     return instances
-
-
-def _load_ip_hostname_inventory(shell: object, domain: str) -> dict[str, list[str]]:
-    """Load the workspace IP→FQDN inventory; ``{}`` on any failure (best-effort)."""
-    try:
-        from adscan_internal.services.kerberos_hostname_inventory import (
-            load_workspace_ip_hostname_inventory,
-        )
-
-        workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
-        domains_dir = str(getattr(shell, "domains_dir", "") or "")
-        if not workspace_dir or not domains_dir:
-            return {}
-        inventory = load_workspace_ip_hostname_inventory(
-            workspace_dir=workspace_dir,
-            domains_dir=domains_dir,
-            domain=domain,
-        )
-        return inventory if isinstance(inventory, dict) else {}
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +608,10 @@ def _enumerate_one_instance(
 
     out = MSSQLInstanceAuthorization(instance=instance, connected=False)
     try:
+        # Reachable-IP split already resolved upstream: ``instance.host`` is the
+        # reachable IP (from mssql/ips.txt via the service-target-resolution SSOT,
+        # see the MSSQLInstance.host field) and ``instance.fqdn`` is the Kerberos
+        # SPN — no per-site resolve_connect_and_spn needed here.
         backend = ImpacketMSSQLBackend(
             host=instance.host,
             port=config.port,

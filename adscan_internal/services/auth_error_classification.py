@@ -163,6 +163,49 @@ def is_impacket_tds_kerberos_infra_error(exc_or_msg: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Impacket TDS transport / socket failures — the TCP connection never completed
+# (host offline, filtered, or the connect landed on an unreachable multi-homed
+# NIC). These are NOT credential rejections and must be reported as a transport
+# failure (host offline), never as an authentication failure.
+# ---------------------------------------------------------------------------
+IMPACKET_TDS_TRANSPORT_ERROR_MARKERS: tuple[str, ...] = (
+    # Impacket's ``tds.MSSQL`` leaves ``self.socket`` as the int ``0`` when the
+    # TCP connect never completed; a later ``self.socket.sendall(...)`` then
+    # raises this AttributeError. It is a socket-state artifact of a failed
+    # connect, not a login rejection.
+    "'INT' OBJECT HAS NO ATTRIBUTE 'SENDALL'",
+    "HAS NO ATTRIBUTE 'SENDALL'",
+    "HAS NO ATTRIBUTE 'RECV'",
+    "HAS NO ATTRIBUTE 'SEND'",
+    # Raw socket / OS connect failures.
+    "CONNECTION REFUSED",
+    "CONNECTIONREFUSED",
+    "CONNECTION RESET",
+    "CONNECTION ABORTED",
+    "BROKEN PIPE",
+    "NOT CONNECTED",
+    "TIMED OUT",
+    "TIMEDOUT",
+    "NO ROUTE TO HOST",
+    "NETWORK IS UNREACHABLE",
+    "HOST IS UNREACHABLE",
+    "CONNECTION ERROR (",
+    "[ERRNO ",
+)
+
+
+def is_impacket_tds_transport_error(exc_or_msg: Any) -> bool:
+    """Return True for an Impacket TDS transport/socket failure (not auth).
+
+    Distinguishes a failed TCP connect (host offline / filtered / an unreachable
+    multi-homed NIC) from a credential rejection so the attack-path verifier can
+    report ``host_offline`` instead of mislabeling connectivity as
+    ``auth_failed``.
+    """
+    return _matches_any_marker(exc_or_msg, IMPACKET_TDS_TRANSPORT_ERROR_MARKERS)
+
+
+# ---------------------------------------------------------------------------
 # Kerberos soft errors — KDC reachable but cannot authenticate this principal
 # for account-level reasons. Kerberos cannot proceed, but NTLM with the same
 # credential might still work, so these trigger the same NTLM fallback path

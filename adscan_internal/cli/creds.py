@@ -11,6 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -52,6 +53,8 @@ from adscan_internal.services.session_compromise_state_service import (
     mark_session_user_compromised,
 )
 from adscan_internal.services.credentials.credential_origin import (
+    CredentialAcquisition,
+    build_method_set,
     origin_display_label,
 )
 from adscan_internal.services.secret_recovery_service import (
@@ -101,6 +104,55 @@ UUID_VALUE_RE = re.compile(
 )
 LAPS_CREDENTIAL_SOURCE_RELATIONS = {"readlapspassword", "synclapspassword"}
 DEFAULT_LOCAL_ADMIN_RID = "500"
+
+
+class CredentialVerdict(str, Enum):
+    """What the domain (or the target host) said about one credential.
+
+    :func:`add_credential` is the funnel every capture goes through and the only
+    place a captured ``(principal, secret)`` pair is actually authenticated. Its
+    verdict is therefore the single source of truth for "is this a credential or
+    only a candidate", and a caller that reports a finding must key on it rather
+    than on its own detector's opinion — a pattern match is a hypothesis, an
+    authentication is proof.
+
+    Only :attr:`VERIFIED` is proof. The other three are distinct kinds of
+    not-proof and must never be collapsed into one: a rejection and a
+    never-attempted check say opposite things about the environment, and a
+    finding that treats them alike either invents a confirmation or throws away
+    a real observation.
+
+    Attributes:
+        VERIFIED: The directory (or the host, for a local account) accepted the
+            secret. The principal is compromised.
+        REJECTED: The secret was tried and did not authenticate. The value may
+            still be a real secret — a rotated password, a disabled account, an
+            appliance or application login that is not a directory principal —
+            so a caller reports it as an observation, never as a credential.
+        UNVERIFIED: Stored without proof. Verification was not requested, was
+            trusted (an operator-validated or bulk-imported secret), or could
+            not run at all because no domain controller was resolvable. A data
+            gap is neither a confirmation nor a refutation.
+        NOT_STORED: Nothing was recorded — the input was unusable (no domain,
+            empty secret).
+    """
+
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    UNVERIFIED = "unverified"
+    NOT_STORED = "not_stored"
+
+
+def credential_verdict_is_verified(verdict: object) -> bool:
+    """Return whether :func:`add_credential` proved this pair against the domain.
+
+    The one predicate every consumer uses, so "is this proven" cannot drift
+    between the surfaces that report it. Anything that is not an explicit
+    :attr:`CredentialVerdict.VERIFIED` — a rejection, a check that could not
+    run, or a caller/test double that returned ``None`` — reads as not proven,
+    which makes every confirmed finding fail-closed by construction.
+    """
+    return verdict == CredentialVerdict.VERIFIED
 
 
 @dataclass(frozen=True)
@@ -312,6 +364,109 @@ def _resolve_credential_provenance_label(
     return None
 
 
+def _resolve_credential_provenance_routes(
+    shell: Any, *, domain: str, user: str
+) -> list[dict[str, str]]:
+    """Return every recorded route to a stored credential, primary first.
+
+    An account is often reachable by more than one technique, and whether
+    closing one of them removes the exposure is exactly what the operator needs
+    to see. The scalar ``credential_origin`` only answers "which technique got
+    here first", so a credential recovered by DCSync AND by an ADCS escalation
+    used to render as a single route in ``creds show`` while the PDF report and
+    the web platform already showed both.
+
+    Derivation is the shared SSOT
+    (:func:`~adscan_internal.services.credentials.credential_origin.build_method_set`),
+    so all three surfaces agree on the route set and its ordering. When nothing
+    is recorded this falls back to the attack-graph provenance edges through
+    :func:`_resolve_credential_provenance_label`, which yields at most one
+    route.
+
+    Args:
+        shell: Active shell exposing ``domains_data``.
+        domain: Domain the credential belongs to.
+        user: Principal owning the credential (store key, already lowercased).
+
+    Returns:
+        List of ``{method, method_label, acquisition}`` dicts, primary first.
+        Empty when no provenance is recorded at all.
+    """
+    try:
+        domain_data = (shell.domains_data or {}).get(domain, {}) or {}
+    except Exception:  # noqa: BLE001
+        domain_data = {}
+
+    meta_root = domain_data.get("credentials_meta") or {}
+    user_meta = meta_root.get(user) if isinstance(meta_root, dict) else None
+    if isinstance(user_meta, dict):
+        routes = build_method_set(
+            str(user_meta.get("credential_origin") or ""), user_meta.get("origins")
+        )
+        routes = [route for route in routes if route.get("method_label")]
+        if routes:
+            return routes
+
+    # No recorded origin: fall back to the attack-graph provenance edges, which
+    # can only ever evidence a single route.
+    fallback = _resolve_credential_provenance_label(shell, domain=domain, user=user)
+    if fallback:
+        return [
+            {
+                "method": "",
+                "method_label": fallback,
+                "acquisition": CredentialAcquisition.EXECUTED.value,
+            }
+        ]
+    return []
+
+
+def _render_provenance_cell(routes: list[dict[str, str]]) -> Text:
+    """Render the ``creds show`` Provenance cell for one credential.
+
+    One line per independent route: the primary reads ``via <technique>`` and
+    each additional route is listed under it as ``+ <technique>``, so a
+    credential reachable two ways is visibly reachable two ways at a glance
+    without widening the column. A derived acquisition (an offline transform of
+    material already held, never a fresh act against the domain) is dimmed and
+    suffixed so it is not read as another way in.
+
+    Routes are de-duplicated by their resolved LABEL, not by slug: the origin
+    vocabulary carries legacy aliases for the same technique (``asreproasting``
+    and ``asreproast`` both render "AS-REP roast"), and listing one technique
+    twice would read as two independent ways in.
+
+    Args:
+        routes: Output of :func:`_resolve_credential_provenance_routes`.
+
+    Returns:
+        A Rich ``Text`` — the neutral bullet when nothing is recorded, never
+        the literal "unknown".
+    """
+    if not routes:
+        return Text(GLYPH_BULLET, style=COLOR_MUTED)
+
+    cell = Text()
+    seen_labels: set[str] = set()
+    for route in routes:
+        label = str(route.get("method_label") or "").strip()
+        if not label or label.lower() in seen_labels:
+            continue
+        seen_labels.add(label.lower())
+        is_derived = (
+            str(route.get("acquisition") or "").strip().lower()
+            == CredentialAcquisition.DERIVED.value
+        )
+        prefix = "via " if not cell.plain else "+ "
+        if cell.plain:
+            cell.append("\n")
+        style = COLOR_MUTED if is_derived else COLOR_STEEL
+        cell.append(f"{prefix}{label}", style=style)
+        if is_derived:
+            cell.append(" (derived)", style=COLOR_MUTED)
+    return cell if cell.plain else Text(GLYPH_BULLET, style=COLOR_MUTED)
+
+
 def show_creds(shell: Any) -> None:
     """Display all stored credentials using Rich Tables, Panels, and Trees.
 
@@ -378,13 +533,10 @@ def show_creds(shell: Any) -> None:
                     else Text(f"{GLYPH_BULLET} pass", style=COLOR_STEEL)
                 )
                 glyph_cell = Text(GLYPH_VERIFIED, style=COLOR_SAGE)
-                provenance = _resolve_credential_provenance_label(
-                    shell, domain=domain, user=user
-                )
-                provenance_cell = (
-                    Text(f"via {provenance}", style=COLOR_STEEL)
-                    if provenance
-                    else Text(GLYPH_BULLET, style=COLOR_MUTED)
+                provenance_cell = _render_provenance_cell(
+                    _resolve_credential_provenance_routes(
+                        shell, domain=domain, user=user
+                    )
                 )
                 domain_creds_table.add_row(
                     glyph_cell,
@@ -584,13 +736,8 @@ def _prompt_for_domain_user_selection(
 
     for idx, user_name in enumerate(user_list):
         marked_user_name = mark_sensitive(user_name, "user")
-        provenance = _resolve_credential_provenance_label(
-            shell, domain=domain, user=user_name
-        )
-        provenance_cell = (
-            Text(f"via {provenance}", style=COLOR_STEEL)
-            if provenance
-            else Text(GLYPH_BULLET, style=COLOR_MUTED)
+        provenance_cell = _render_provenance_cell(
+            _resolve_credential_provenance_routes(shell, domain=domain, user=user_name)
         )
         table.add_row(
             str(idx + 1),
@@ -2158,6 +2305,7 @@ def add_credential(
     skip_user_privs_enumeration: bool = False,
     verify_credential: bool = True,
     verify_local_credential: bool = True,
+    local_credential_prevalidated: bool = False,
     prompt_local_reuse_after: bool = True,
     ui_silent: bool = False,
     ensure_fresh_kerberos_ticket: bool = True,
@@ -2170,7 +2318,7 @@ def add_credential(
     local_account_rid: str | None = None,
     metadata: "CredentialMetadata | None" = None,
     force_recheck_user_privs: bool = False,
-) -> None:
+) -> CredentialVerdict:
     """Add a credential to the workspace.
 
     This function handles both domain and local credentials, verifies them,
@@ -2206,6 +2354,15 @@ def add_credential(
             DCSync dumps) where per-credential verification would be too costly.
         verify_local_credential: When True (default), verify local credentials on
             the target host before storing them.
+        local_credential_prevalidated: Set by a caller that ALREADY proved this
+            local credential with a real logon (for example the LAPS flow, which
+            authenticates against the host to establish which local account the
+            recovered password belongs to). The credential is then stored as
+            verified without a second logon — the proof is not weaker for having
+            been obtained by the caller, and repeating it would only re-run the
+            same authentication against a possibly less reachable address. This
+            is distinct from ``verify_local_credential=False``, which means
+            "store without any verification".
         prompt_local_reuse_after: When True (default), offer local credential
             reuse checks after successfully adding local SMB credentials.
         ui_silent: When True, suppress user-facing Rich panels/messages from this
@@ -2232,7 +2389,11 @@ def add_credential(
             this to False.
         credential_origin: Optional machine-readable provenance label for this
             credential (for example ``kerberoast``, ``dcsync``, ``spray``,
-            ``ReadLAPSPassword``). Persisted into
+            ``ReadLAPSPassword``). When omitted AND an attack step is executing
+            on this thread for this domain, it is DERIVED from that step's
+            relation (``ADCSESC1`` -> ``adcsesc1``) — provenance is a property
+            of this seam, not of the caller. An explicit value always wins.
+            Persisted into
             ``credentials_meta[user]["credential_origin"]`` so the ``creds show``
             Provenance column can attribute the source. Two origins identify a
             SELF-INTRODUCED credential and are excluded from the
@@ -2251,6 +2412,14 @@ def add_credential(
             already assessed" dedup guard so a user whose privileges just changed
             (for example: an existing account just promoted to Domain Admins) is
             re-enumerated even if it was assessed earlier this session.
+
+    Returns:
+        The :class:`CredentialVerdict` for this pair. Callers that report a
+        finding — "we found a password in this account's description" — must key
+        the confirmed reading on :attr:`CredentialVerdict.VERIFIED` and nothing
+        else; this function is the only place the pair is actually
+        authenticated, so its answer is what separates a proven credential from
+        a candidate. Every other caller may ignore the value.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -2261,7 +2430,7 @@ def add_credential(
     normalized_domain = str(domain or "").strip().rstrip(".").lower()
     if not normalized_domain:
         print_error("Domain credential cannot be stored without a valid domain name.")
-        return
+        return CredentialVerdict.NOT_STORED
     domain = normalized_domain
 
     # SSOT UPN normalization — ``add_credential`` is the funnel every
@@ -2296,6 +2465,25 @@ def add_credential(
                     f"{mark_sensitive(upn_local_part, 'user')} anyway."
                 )
             user = upn_local_part
+
+    # SSOT provenance seam. ``add_credential`` is the funnel every capture goes
+    # through, and when it runs inside an executing attack step the technique
+    # that produced this credential is already known — it IS the step's
+    # relation. Deriving it HERE, once, is what makes provenance a property of
+    # the seam instead of something each of the ~78 call sites has to remember:
+    # the ADCS Pass-the-Certificate path alone reaches this funnel from ESC1,
+    # ESC3, ESC4, ESC7, ESC8, ESC9 and ESC13, and only the step context knows
+    # which one is running. An explicit ``credential_origin`` from the caller
+    # always wins; the seam only fills a gap. Placed before the first use of
+    # ``credential_origin`` below so every downstream branch sees one value.
+    if not str(credential_origin or "").strip():
+        from adscan_internal.services.credentials import (  # noqa: PLC0415
+            resolve_active_step_credential_origin,
+        )
+
+        credential_origin = (
+            resolve_active_step_credential_origin(shell, domain=domain) or None
+        )
 
     if not skip_hash_cracking and not ui_silent:
         # Professional credential addition header
@@ -2416,11 +2604,11 @@ def add_credential(
                         "re-verification for a user with a non-empty stored "
                         "secret must not purge it."
                     )
-                    return
+                    return CredentialVerdict.UNVERIFIED
                 if _dispose_or_retain_unverified_domain_credential(
                     shell, domain=domain, user=user, ui_silent=ui_silent
                 ):
-                    return
+                    return CredentialVerdict.REJECTED
                 credential_verification_skipped = True
         if trusted_manual_validation:
             credential_verified = True
@@ -2449,15 +2637,45 @@ def add_credential(
         shell.domains_data[domain] = {}
 
     if host and service:
+        # Defect detector, not a policy gate. A local credential's username
+        # names an account inside the host's SAM; the host's OWN name (short,
+        # FQDN or HOST$) is never such an account, so anything filed under it
+        # is unusable. Storing it anyway is still better than losing a real
+        # secret, so this warns loudly and reports instead of dropping — the
+        # name has to be fixed where it is derived, not here.
+        from adscan_internal.services.credential_store_service import (
+            username_is_host_identifier,
+        )
+
+        if username_is_host_identifier(user, host):
+            print_warning_debug(
+                f"add_credential: local credential for host "
+                f"{mark_sensitive(host, 'hostname')} is being stored under "
+                f"{mark_sensitive(user, 'user')}, which is the host's own name, "
+                "not a local account. The account name was resolved incorrectly "
+                "upstream and this credential will not authenticate."
+            )
+            try:
+                telemetry.capture(
+                    "local_credential_host_identifier_username",
+                    {"service": str(service or "").lower()},
+                )
+            except Exception as exc:  # noqa: BLE001 - telemetry must never break a flow
+                print_info_debug(f"add_credential: telemetry signal failed: {exc}")
+
         # Verify local credentials before adding them unless caller requested
-        # candidate-only persistence (for example: SAM single-host workflows).
+        # candidate-only persistence (for example: SAM single-host workflows) or
+        # already proved the credential with its own logon.
         local_verified = True
-        if verify_local_credential:
+        if verify_local_credential and not local_credential_prevalidated:
             local_verified = bool(
                 shell.check_local_creds(domain, user, cred, host, service)
             )
+        local_credential_proven = bool(
+            local_credential_prevalidated or verify_local_credential
+        )
         if local_verified:
-            credential_source_verified = bool(verify_local_credential)
+            credential_source_verified = local_credential_proven
             is_hash = shell.is_hash(cred)
             if is_hash and not user.endswith("$") and not skip_hash_cracking:
                 cred, is_hash = handle_hash_cracking(shell, domain, user, cred)
@@ -2514,7 +2732,7 @@ def add_credential(
                     credential_type="hash" if is_hash else "password",
                     scope="local",
                     verification_status=(
-                        "verified" if verify_local_credential else "trusted_import"
+                        "verified" if local_credential_proven else "trusted_import"
                     ),
                     message=f"Local access established for {user} on {host}.",
                 )
@@ -2564,7 +2782,7 @@ def add_credential(
                 print_info_verbose(
                     "[ui_silent] Local credential not added - verification failed"
                 )
-            return
+            return CredentialVerdict.REJECTED
 
     else:
         # Handle domain credentials
@@ -2577,6 +2795,11 @@ def add_credential(
         )
 
         skip_store_update = False
+        # ``True`` when the stored plaintext outranked an incoming hash. The
+        # secret we keep is then the STORED one, so an incoming
+        # ``metadata.secret_kind`` (which describes the hash we discarded) no
+        # longer describes what is stored and must not overwrite the kind.
+        incoming_secret_superseded = False
         if current_cred is not None:
             current_is_hash = shell.is_hash(current_cred)
             if not current_is_hash and is_hash:
@@ -2586,14 +2809,24 @@ def add_credential(
                 cred = current_cred
                 is_hash = False
                 skip_store_update = True
+                incoming_secret_superseded = True
             elif current_cred == cred:
                 print_info_verbose(
                     "Current credential is the same as the new credential. Reusing existing."
                 )
                 skip_store_update = True
         store_update_skipped = skip_store_update
+        offline_crack_recovered = False
         if is_hash and not user.endswith("$") and not skip_hash_cracking:
+            pre_crack_cred = cred
             cred, is_hash = handle_hash_cracking(shell, domain, user, cred)
+            if not is_hash and cred != pre_crack_cred:
+                # The offline crack resolved the stored hash to its plaintext.
+                # That is a strictly better secret, so the store must take it
+                # even though the incoming HASH matched what was already there
+                # — otherwise the recovered plaintext is silently discarded.
+                offline_crack_recovered = True
+                skip_store_update = False
 
         # Verify domain credentials before adding them (skip when domain is already pwned)
         if trusted_manual_validation:
@@ -2633,14 +2866,18 @@ def add_credential(
                         "re-verification for a user with a non-empty stored "
                         "secret must not purge it."
                     )
-                    return
+                    return CredentialVerdict.UNVERIFIED
                 if _dispose_or_retain_unverified_domain_credential(
                     shell, domain=domain, user=user, ui_silent=ui_silent
                 ):
-                    return
+                    return CredentialVerdict.REJECTED
                 credential_verification_skipped = True
 
-        if (cred is not None) and (allow_empty_credential or cred != "") and not skip_store_update:
+        credential_present = (cred is not None) and (
+            allow_empty_credential or cred != ""
+        )
+
+        if credential_present and not skip_store_update:
             # Update domain credential using the service
             update_result = store_service.update_domain_credential(
                 domains_data=shell.domains_data,
@@ -2650,8 +2887,26 @@ def add_credential(
                 is_hash=is_hash,
             )
             credential_persisted = True
+            # Respect store precedence rules (e.g. keep existing plaintext over new hash).
+            is_hash = update_result.is_hash
+
+        if credential_present:
+            # Metadata and provenance are recorded on EVERY capture, including
+            # one whose secret already matches what is stored. A second
+            # technique reaching the same credential brings material the first
+            # did not — Kerberos AES keys from a replication read after an
+            # enrolment-based capture, for example — and a second, independent
+            # route to that account. Gating these on the store write discarded
+            # both: the AES keys were dropped, so pass-the-key and
+            # Golden-Ticket-with-AES were unavailable on an AES-enforced
+            # domain, and the report showed one route where two existed.
             _apply_credential_metadata(
-                shell, domain=domain, user=user, metadata=metadata, secret=cred
+                shell,
+                domain=domain,
+                user=user,
+                metadata=metadata,
+                secret=cred,
+                trust_metadata_secret_kind=not incoming_secret_superseded,
             )
             if credential_origin:
                 # Persist provenance into ``credentials_meta`` so the
@@ -2660,14 +2915,38 @@ def add_credential(
                 # (``authenticated_scan`` / ``user_provided``) from counters,
                 # panel, telemetry, and PostHog.
                 from adscan_internal.services.credentials import (  # noqa: PLC0415
-                    set_credential_origin,
+                    append_credential_origin,
                 )
 
-                set_credential_origin(
-                    shell, domain=domain, username=user, origin=credential_origin
+                append_credential_origin(
+                    shell,
+                    domain=domain,
+                    username=user,
+                    origin=credential_origin,
+                    secret=cred,
+                    evidence=_first_source_relation(source_steps),
                 )
-            # Respect store precedence rules (e.g. keep existing plaintext over new hash).
-            is_hash = update_result.is_hash
+            if offline_crack_recovered:
+                # The plaintext came from an offline transform of a hash we
+                # already held, not from a new act against the environment, so
+                # it is recorded as a DERIVED acquisition alongside — never
+                # instead of — the technique that recovered the hash.
+                from adscan_internal.services.credentials import (  # noqa: PLC0415
+                    append_credential_origin,
+                )
+                from adscan_internal.services.credentials.credential_origin import (  # noqa: PLC0415
+                    ORIGIN_OFFLINE_CRACK,
+                )
+
+                append_credential_origin(
+                    shell,
+                    domain=domain,
+                    username=user,
+                    origin=ORIGIN_OFFLINE_CRACK,
+                    secret=cred,
+                )
+
+        if credential_present and not skip_store_update:
             if is_hash:
                 marked_user = mark_sensitive(user, "user")
                 marked_domain = mark_sensitive(domain, "domain")
@@ -2946,6 +3225,12 @@ def add_credential(
             print_info_verbose(
                 f"[ui_silent] Empty or invalid credential for '{marked_user}' in domain {marked_domain}"
             )
+
+    if credential_verified or credential_source_verified:
+        return CredentialVerdict.VERIFIED
+    if credential_persisted or store_update_skipped:
+        return CredentialVerdict.UNVERIFIED
+    return CredentialVerdict.NOT_STORED
 
 
 def store_kerberos_principal_material(
@@ -3502,6 +3787,7 @@ def _check_local_creds_native_smb(
     username: str,
     cred_value: str,
     host: str,
+    account_domain: str | None = None,
 ) -> bool:
     """Verify a *local* credential has SMB admin on *host* via native aiosmb.
 
@@ -3512,6 +3798,14 @@ def _check_local_creds_native_smb(
     ``domains_data[domain]["local_credentials"]``, not the domain user
     branch. ``domain_name`` is workspace context, not an AD identity
     for the user.
+
+    Because of that, the logon is pinned to the host's own account domain via
+    :func:`verify_local_account_smb_access`. Sending ``domain_name`` in the
+    NTLMSSP domain field would make the target forward the logon to a domain
+    controller, so a perfectly correct local account and password come back as
+    ``STATUS_LOGON_FAILURE``. ``account_domain`` overrides the derived value
+    when the caller already read the host's account-domain name (for example
+    from the RID lookup that resolved the account).
 
     Graph mutation is intentionally NOT performed here. AdminTo edges
     are owned by:
@@ -3538,19 +3832,21 @@ def _check_local_creds_native_smb(
     from adscan_internal.services.async_bridge import run_async_sync
     from adscan_internal.services.smb_privilege import (
         SMBPrivilegeStatus,
-        verify_domain_user_local_admin,
+        local_account_logon_domain,
+        verify_local_account_smb_access,
     )
 
     is_hash = bool(shell.is_hash(cred_value))
     cred_type = "Hash" if is_hash else "Password"
+    logon_domain = local_account_logon_domain(host, account_domain)
     print_operation_header(
         "Local Credential Verification",
         details={
             "Domain Context": domain_name,
             "Target Host": host,
             "Service": "SMB",
-            "Username": username,
-            cred_type: cred_value,
+            "Local account": f"{logon_domain}\\{username}",
+            cred_type: mark_sensitive(cred_value, "password"),
         },
         icon="🔑",
     )
@@ -3560,26 +3856,18 @@ def _check_local_creds_native_smb(
 
     print_info_verbose("Executing host credential verification (native aiosmb)")
     print_info_debug(
-        f"[creds] native SMB Pwn3d! probe host={marked_host} "
-        f"user={marked_username} cred_kind={'nt_hash' if is_hash else 'password'}"
+        f"creds: native SMB Pwn3d! probe host={marked_host} "
+        f"user={logon_domain}\\{marked_username} "
+        f"cred_kind={'nt_hash' if is_hash else 'password'}"
     )
-
-    # Pull a KDC hint from domains_data when available — keeps Kerberos
-    # fallback working in NTLM-disabled environments.
-    kdc_ip: str | None = None
-    try:
-        kdc_ip = resolve_dc_ip((shell.domains_data.get(domain_name, {}) or {}))
-    except Exception:  # noqa: BLE001
-        kdc_ip = None
 
     try:
         result = run_async_sync(
-            verify_domain_user_local_admin(
-                domain=domain_name,
+            verify_local_account_smb_access(
+                host=host,
                 username=username,
                 credential=cred_value,
-                host=host,
-                kdc_ip=kdc_ip,
+                account_domain=account_domain,
             )
         )
     except Exception as exc:  # pylint: disable=broad-except
@@ -3711,12 +3999,25 @@ def _check_local_creds_native_nonsmb(
                 run_mssql_access_probe_sweep,
             )
 
+            # Multi-homed split: hand the probe the reachable CONNECT IP (impacket
+            # TDS takes only getaddrinfo()[0] and dead-ends on an unreachable NIC)
+            # while keeping the FQDN as the Kerberos SPN. The collection sweep in
+            # cli/privileges.py already feeds reachable IPs + an IP->FQDN map; this
+            # single-host verify path is the other caller, so resolve it here.
+            from adscan_internal.services.host_address_resolver import (
+                resolve_connect_and_spn,
+            )
+
+            _connect_host, _spn_host = resolve_connect_and_spn(
+                shell, host=host, domain=domain_name, resolver_ip=kdc_ip, service="mssql", probe_port=1433
+            )
             findings = run_async_sync(
                 run_mssql_access_probe_sweep(
                     domain=domain_name,
                     username=username,
                     secret=cred_value,
-                    targets=[host],
+                    targets=[_connect_host],
+                    target_hostnames={_connect_host: _spn_host},
                     use_kerberos=False,
                     kdc_host=kdc_ip,
                 )
@@ -3724,12 +4025,18 @@ def _check_local_creds_native_nonsmb(
             finding = findings[0] if findings else None
             is_admin = bool(finding and finding_is_sysadmin(finding))
         elif svc == "winrm":
+            from adscan_internal.services.smb_privilege import (
+                local_account_logon_domain,
+            )
             from adscan_internal.services.winrm_access_probe_service import (
                 run_winrm_access_probe_sweep,
             )
 
+            # Same rule as the SMB branch: a LOCAL Windows account must be
+            # authenticated against the host's own account domain, never the
+            # AD domain, or the target forwards the logon to a DC.
             findings = run_winrm_access_probe_sweep(
-                domain=domain_name,
+                domain=local_account_logon_domain(host),
                 username=username,
                 password=cred_value,
                 targets=[host],
@@ -3787,12 +4094,18 @@ def check_local_creds(
     cred_value: str,
     host: str,
     service: str,
+    account_domain: str | None = None,
 ) -> bool:
     """Verify host-specific credentials for a service.
 
     Every service is verified natively (no subprocess): SMB via aiosmb
     (:func:`_check_local_creds_native_smb`); MSSQL and WinRM via their native
     access probes (:func:`_check_local_creds_native_nonsmb`).
+
+    ``account_domain`` is the host's own account-domain name when the caller
+    already knows it (for example from the RID lookup that resolved the
+    account). It is only a hint — the SMB branch derives a safe value from
+    ``host`` when it is not supplied.
     """
     if str(service or "").strip().lower() == "smb":
         return _check_local_creds_native_smb(
@@ -3801,6 +4114,7 @@ def check_local_creds(
             username=username,
             cred_value=cred_value,
             host=host,
+            account_domain=account_domain,
         )
 
     return _check_local_creds_native_nonsmb(
@@ -6050,6 +6364,25 @@ def handle_found_credentials(
 # ---------------------------------------------------------------------------
 
 
+def _first_source_relation(source_steps: list[object] | None) -> str | None:
+    """Return the attack-graph relation of the last provenance step, or None.
+
+    The provenance steps describe the chain that produced the credential; its
+    LAST step is the technique that actually yielded the secret, so that is the
+    edge a credential-origin entry points at as evidence. Best-effort: any
+    unexpected shape yields ``None`` rather than raising into the credential
+    persist.
+    """
+    try:
+        for step in reversed(list(source_steps or [])):
+            relation = str(getattr(step, "relation", "") or "").strip()
+            if relation:
+                return relation
+    except Exception:  # noqa: BLE001 — evidence is optional, never fatal
+        return None
+    return None
+
+
 def _apply_credential_metadata(
     shell: Any,
     *,
@@ -6057,6 +6390,7 @@ def _apply_credential_metadata(
     user: str,
     metadata: "CredentialMetadata | None",
     secret: str | None = None,
+    trust_metadata_secret_kind: bool = True,
 ) -> None:
     """Apply :class:`CredentialMetadata` via the privilege_role helpers.
 
@@ -6079,6 +6413,12 @@ def _apply_credential_metadata(
     :func:`_infer_secret_kind` — one place, so no offensive call-site has to
     remember to stamp it and the ``/goal`` ``min_secret_kind`` gate reads a
     correct ``nt_hash``/``password`` classification.
+
+    ``trust_metadata_secret_kind`` is set False by the one caller whose stored
+    plaintext outranked an incoming hash: the metadata then describes the hash
+    that was discarded, so its ``secret_kind`` would mislabel the plaintext
+    that is actually stored. The Kerberos key material still applies — AES keys
+    belong to the account regardless of which form of its secret is stored.
 
     Exception-safe by design — every helper call is wrapped in its own
     try/except so a failing tag does not lose the underlying credential
@@ -6105,7 +6445,11 @@ def _apply_credential_metadata(
     # still get a correct classification instead of a null.
     resolved_secret_kind = (
         metadata.secret_kind
-        if metadata is not None and metadata.secret_kind is not None
+        if (
+            trust_metadata_secret_kind
+            and metadata is not None
+            and metadata.secret_kind is not None
+        )
         else (_infer_secret_kind(secret) if secret else None)
     )
     try:

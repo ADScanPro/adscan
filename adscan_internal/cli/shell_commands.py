@@ -254,11 +254,20 @@ def _run_writeup(shell: Any, args: str) -> None:
 
     The single positional argument is an output directory, so the operator can
     drop the spine straight into a blog repository instead of the workspace.
+
+    The trigger is passed explicitly rather than left to the default, so this
+    on-ramp is distinguishable in the funnel from the spine a lab scan writes on
+    its own — which is the comparison the auto-generation is measured by.
     """
+    from adscan_internal.services.post_scan_report import TRIGGER_REPL_WRITEUP
     from adscan_internal.services.writeup_spine import generate_writeup_spine
 
     tokens = shlex.split(args) if args.strip() else []
-    generate_writeup_spine(shell, output_dir=tokens[0] if tokens else None)
+    generate_writeup_spine(
+        shell,
+        output_dir=tokens[0] if tokens else None,
+        trigger=TRIGGER_REPL_WRITEUP,
+    )
 
 
 def _run_mitre_navigator(shell: Any, args: str) -> None:

@@ -54,6 +54,15 @@ class LSASecrets:
     dpapi_user_key: bytes | None = None  # DPAPI_SYSTEM user key
     cached_domain_logons: list[str] = field(default_factory=list)  # DCC2 hashes in hashcat 2100 format
     service_secrets: dict[str, str] = field(default_factory=dict)  # key_name -> decoded secret string
+    # key_name -> raw undecoded bytes. Not every ``_SC_*`` secret is a string:
+    # ``_SC_GMSA_{GUID}_<hash>`` is an MSDS_MANAGEDPASSWORD_BLOB and only the raw
+    # bytes can be parsed into credentials, so they must survive the decode step.
+    service_secrets_raw: dict[str, bytes] = field(default_factory=dict)
+    # key_name -> service logon account, when the offline SYSTEM hive could be
+    # walked. Usually empty: the ``Services`` subkey list on a real server uses
+    # an index-leaf record the offline hive reader does not traverse, which is
+    # why the live remote-registry lookup is the primary source.
+    service_secret_owners: dict[str, str] = field(default_factory=dict)
     security_questions: dict[str, list[dict]] = field(default_factory=dict)  # SID -> [{question, answer}]
     raw_secrets: list[dict] = field(default_factory=list)  # full to_dict() output from LSASecret objects
 
@@ -261,6 +270,8 @@ def _sync_parse_lsa_secrets(
     dpapi_user: bytes | None = None
     dcc_hashes: list[str] = []
     service_secrets: dict[str, str] = {}
+    service_secrets_raw: dict[str, bytes] = {}
+    service_secret_owners: dict[str, str] = {}
     security_questions: dict[str, list[dict]] = {}
     raw_secrets: list[dict] = []
 
@@ -308,14 +319,24 @@ def _sync_parse_lsa_secrets(
                     dpapi_machine = secret.machine_key
                     dpapi_user = secret.user_key
             elif isinstance(secret, LSASecretService):
-                # Service account passwords: skip history entries to avoid
-                # overwriting the current password with the old one when the
-                # key_name is identical for both CurrVal and OldVal iterations.
+                # Service Control Manager cached credentials. The key name is a
+                # SERVICE identifier, never an account name, and the payload is
+                # not always a string: a ``_SC_GMSA_*`` key holds a binary
+                # managed-password blob that only survives as raw bytes. Keep
+                # both, and let the attribution layer decide what each one is.
+                # History entries are skipped so the old password never
+                # overwrites the current one under the same key.
                 is_history = bool(getattr(secret, "history", False))
                 svc_key = str(secret.key_name or "")
                 if not is_history or svc_key not in service_secrets:
                     svc_secret = secret.secret or ""
                     service_secrets[svc_key] = str(svc_secret)
+                    svc_raw = getattr(secret, "raw_secret", None)
+                    if isinstance(svc_raw, (bytes, bytearray)) and svc_raw:
+                        service_secrets_raw[svc_key] = bytes(svc_raw)
+                    svc_owner = str(getattr(secret, "username", "") or "").strip()
+                    if svc_owner and svc_owner.upper() != "UNKNOWN":
+                        service_secret_owners[svc_key] = svc_owner
             elif isinstance(secret, LSASecretDefaultPassword):
                 # AutoLogon / DefaultPassword LSA secret.
                 # Use the actual owner username when available (read from
@@ -398,6 +419,8 @@ def _sync_parse_lsa_secrets(
         dpapi_user_key=dpapi_user,
         cached_domain_logons=dcc_hashes,
         service_secrets=service_secrets,
+        service_secrets_raw=service_secrets_raw,
+        service_secret_owners=service_secret_owners,
         security_questions=security_questions,
         raw_secrets=raw_secrets,
     )

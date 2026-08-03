@@ -30,6 +30,7 @@ import os
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.reporting.domain_scope import has_collection_evidence
 from adscan_core.rich_output import (
     mark_sensitive,
     print_exception,
@@ -131,3 +132,48 @@ def compute_report_attack_paths(
     if not isinstance(paths, list):
         return []
     return [path for path in paths if isinstance(path, dict)]
+
+
+def resolve_domain_assessment(
+    workspace_dir: str,
+    domain: str,
+    report_entry: Any = None,
+) -> tuple[bool, str]:
+    """Return ``(enumerated, basis)`` for one domain in a workspace.
+
+    Answers the question the report headline depends on: did this engagement
+    actually enumerate the domain, or does the name only appear because a trust
+    on another domain pointed at it? Both report pipelines call this so the two
+    tiers cannot disagree about what "assessed" means.
+
+    The decisive evidence is the collector's own output — a domain with an
+    ``attack_graph.json`` under ``<workspace>/domains/<domain>/`` is a domain the
+    collector enumerated. That fact holds even for a perfectly clean domain,
+    which is why it is checked before the report evidence: inferring from "no
+    findings" alone would report a clean assessed domain as untested.
+
+    Args:
+        workspace_dir: Workspace root (container path).
+        domain: The domain to classify.
+        report_entry: Optional per-domain block from ``technical_report.json`` /
+            the renderer's ``report_data``, used as the secondary signal.
+
+    Returns:
+        ``(True, "attack_graph")`` when the collector produced a graph,
+        ``(True, "report_evidence")`` when the report carries collected data for
+        it, else ``(False, "no_collection_evidence")``.
+    """
+    from adscan_internal.services import attack_graph_service
+
+    try:
+        graph_path = attack_graph_service._graph_path(  # noqa: SLF001
+            _ReportShell(workspace_dir), domain
+        )
+        if graph_path and os.path.exists(graph_path):
+            return True, "attack_graph"
+    except Exception:  # noqa: BLE001 - a resolution error just means "no graph"
+        pass
+
+    if has_collection_evidence(report_entry):
+        return True, "report_evidence"
+    return False, "no_collection_evidence"

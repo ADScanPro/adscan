@@ -6,9 +6,10 @@ effective state now is) lives here so it can be tested without driving the
 shell.
 
 Scope model — see :mod:`adscan_core.telemetry_preference` for the resolution
-rule. ``set telemetry off`` opts the OPERATOR out everywhere; the optional
-``workspace`` scope narrows a change to the current engagement only. A
-workspace can be stricter than the global preference, never looser.
+rule. ``set telemetry off`` (no keyword) changes only the CURRENT workspace/
+engagement (the default scope); add the ``global`` keyword to change the
+operator-wide default that new workspaces inherit. An explicit per-workspace
+preference wins over the global one in either direction — there is no ratchet.
 """
 
 from __future__ import annotations
@@ -47,9 +48,9 @@ _SCOPE_TOKENS = {
 
 # No square brackets: Rich parses them as markup and would swallow the token.
 USAGE = (
-    "Usage: set telemetry <on|off> — applies everywhere. "
-    "Add 'workspace' to change only the current workspace: "
-    "set telemetry off workspace"
+    "Usage: set telemetry <on|off> — applies to this workspace. "
+    "Add 'global' to change the default for every workspace: "
+    "set telemetry off global"
 )
 
 
@@ -76,8 +77,9 @@ def parse_telemetry_setting(value: str) -> TelemetrySettingRequest | None:
     """Parse the ``set telemetry`` value into a request.
 
     Accepts ``on``/``off`` (and the usual synonyms) plus an optional scope
-    token. Returns ``None`` when the input is not understood; the caller prints
-    :data:`USAGE`.
+    token. With no scope token the change applies to the current WORKSPACE (the
+    default scope); ``global`` targets the operator-wide default. Returns
+    ``None`` when the input is not understood; the caller prints :data:`USAGE`.
     """
     tokens = [token for token in str(value or "").lower().split() if token]
     if not tokens or len(tokens) > 2:
@@ -91,7 +93,7 @@ def parse_telemetry_setting(value: str) -> TelemetrySettingRequest | None:
     else:
         return None
 
-    scope = SCOPE_GLOBAL
+    scope = SCOPE_WORKSPACE
     if len(tokens) == 2:
         resolved = _SCOPE_TOKENS.get(tokens[1])
         if resolved is None:
@@ -146,6 +148,7 @@ def apply_telemetry_setting(
         request=request,
         effective=effective,
         persisted=persisted,
+        global_preference=global_preference,
         workspace_preference=workspace_preference,
         workspace_label=_workspace_label(shell),
     )
@@ -164,10 +167,11 @@ def _report(
     request: TelemetrySettingRequest,
     effective: bool,
     persisted: bool,
+    global_preference: Optional[bool],
     workspace_preference: Optional[bool],
     workspace_label: str,
 ) -> None:
-    """Print what actually happened, naming the scope every time."""
+    """Print what actually happened, naming the scope and the recovery command."""
     if request.scope == SCOPE_GLOBAL:
         if not persisted:
             print_error(
@@ -176,35 +180,40 @@ def _report(
                 "state directory and set it again."
             )
         if request.enabled:
-            print_success("Telemetry is on for every workspace and session.")
+            print_success(
+                "Telemetry is on globally — the default for every workspace."
+            )
             if workspace_preference is False:
                 print_warning(
                     f"Telemetry stays off in {workspace_label}, which has its own "
-                    "opt-out. Run 'set telemetry on workspace' to change that too."
+                    "opt-out. Run 'set telemetry on' to change that too."
                 )
         else:
             print_success(
-                "Telemetry is off everywhere. This applies to every workspace, "
-                "including new ones, and persists across sessions."
+                "Telemetry is off globally — the default for every workspace, "
+                "including new ones, and it persists across sessions."
             )
-            print_info("Turn it back on with 'set telemetry on'.")
+            print_info(
+                "Turn it back on everywhere with 'set telemetry on global', or "
+                "just for this workspace with 'set telemetry on'."
+            )
         return
 
+    # Workspace scope: an explicit workspace preference wins, so the effective
+    # state matches the request.
     if request.enabled:
-        if effective:
-            print_success(f"Telemetry is on for {workspace_label}.")
-        else:
-            print_warning(
-                "Telemetry stays off: you are opted out globally, and a "
-                "workspace cannot override that. Run 'set telemetry on' to "
-                "turn it back on everywhere."
+        print_success(f"Telemetry is on for {workspace_label}.")
+        if global_preference is False:
+            print_info(
+                "This overrides your global opt-out for this workspace only. "
+                "Opt in everywhere with 'set telemetry on global'."
             )
         return
 
-    print_success(f"Telemetry is off for {workspace_label}.")
+    print_success(f"Telemetry is off for {workspace_label} (this engagement only).")
     print_info(
-        "Other workspaces are unaffected. Use 'set telemetry off' to opt out "
-        "everywhere."
+        "Other workspaces are unaffected. Re-enable it here with "
+        "'set telemetry on', or opt out everywhere with 'set telemetry off global'."
     )
 
 

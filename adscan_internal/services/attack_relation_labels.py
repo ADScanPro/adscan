@@ -93,7 +93,6 @@ def format_relation_label(relation: str) -> str:
         "dumplsass": "DumpLSASS",
         "getchanges": "GetChanges",
         "getchangesall": "GetChangesAll",
-        "goldencert": "GoldenCert",
         "sqladmin": "SQLAdmin",
         "sqlaccess": "SQLAccess",
         "managerodcprp": "ManageRODCPrp",
@@ -167,7 +166,6 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "dumplsass": "Extract Credentials from Memory",
     "getchanges": "Directory Replication Right",
     "getchangesall": "Directory Replication Right",
-    "goldencert": "Forge a Domain Authentication Certificate",
     # Credential-theft roasting ───────────────────────────────────────────
     "kerberoasting": "Service Account Credential Theft",
     "asreproasting": "Pre-Authentication-less Credential Theft",

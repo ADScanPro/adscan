@@ -61,6 +61,10 @@ from adscan_internal.rich_output import (
     print_panel_with_table,
 )
 from adscan_internal.services import EnumerationService
+from adscan_internal.services.credential_disclosure_detection import (
+    is_builtin_principal,
+    scan_attribute_values,
+)
 from adscan_internal.services.kerberos_username_wordlist_service import (
     LINKEDIN_SUPPORTED_PATTERN_KEYS,
     SUPPORTED_KERBEROS_PATTERN_KEYS,
@@ -192,7 +196,7 @@ class LdapShell(Protocol):
 
     def add_credential(
         self, domain: str, username: str, credential: str, **kwargs: object
-    ) -> None: ...
+    ) -> object: ...
 
     def do_sync_clock_with_pdc(self, domain: str) -> None: ...
 
@@ -4739,8 +4743,19 @@ def run_ldap_descriptions(
         downstream credsweeper analysis)
       * ``domains/<domain>/ldap/descriptions.json`` structured findings
 
-    Sensitive-keyword matches in any of the description-class fields are
-    surfaced as ``ldap_user_description_password_leak`` technical findings.
+    What reaches the client report is decided by verification, not by the
+    pattern sweep. Every candidate secret is routed through ``add_credential``,
+    the one place a ``(principal, secret)`` pair is authenticated:
+
+      * the directory accepted it -> ``credential_in_ldap_attribute``, the
+        confirmed credential disclosure, naming the account it compromises;
+      * it did not authenticate, or the check could not run ->
+        ``ldap_user_description_password_leak``, an observation that a readable
+        attribute holds secret-shaped text. Still worth clearing (the password
+        may have been rotated, or belong to an appliance rather than to the
+        directory), never stated as a proven credential;
+      * the detector's evidence gate never tripped -> no finding. This is where
+        a built-in account's stock description lands.
     """
     # The authenticated Phase 3 quick-win is part of ``quick_credential_wins``;
     # honor a scan-config disable. The anonymous/unauth-surface call path is a
@@ -4796,6 +4811,10 @@ def run_ldap_descriptions(
         icon="📝",
     )
 
+    # ``objectSid`` is requested purely so the credential-disclosure detector
+    # can recognise a Windows built-in by RID (krbtgt is 502 in every install
+    # and in every language) rather than by its description text, which is
+    # localised. It costs no extra round trip and is not persisted.
     sensitive_attrs = (
         "sAMAccountName",
         "description",
@@ -4803,6 +4822,7 @@ def run_ldap_descriptions(
         "comment",
         "unixUserPassword",
         "userPassword",
+        "objectSid",
     )
     ldap_filter = "(&(objectCategory=person)(objectClass=user))"
 
@@ -4813,7 +4833,9 @@ def run_ldap_descriptions(
     # exists, reuse it and skip the live LDAP query entirely; otherwise fall
     # back to the live native search. Both sources converge on the same
     # downstream artefacts, display, analysis and credential extraction.
-    cred_fields = _load_credential_fields_from_inventory(shell, target_domain)
+    cred_fields, object_sid_by_sam = _load_user_snapshot_from_inventory(
+        shell, target_domain
+    )
     using_inventory = bool(cred_fields)
 
     rows: list[dict[str, object]] = []
@@ -4880,6 +4902,7 @@ def run_ldap_descriptions(
             return
 
         cred_fields = _credential_fields_from_live_rows(rows)
+        object_sid_by_sam = _object_sids_from_live_rows(rows)
 
     # ── Persist artefacts (text + JSON) ──────────────────────────────────
     workspace_cwd = shell._get_workspace_cwd()
@@ -4894,43 +4917,22 @@ def run_ldap_descriptions(
     # full per-field map (``cred_fields``) drives the CredSweeper analysis.
     user_descriptions: dict[str, str] = _descriptions_only_view(cred_fields)
     json_records: list[dict[str, object]] = []
-    sensitive_pattern = re.compile(r"(?i)password|pwd|pass|secret|cred|key|p@ss|p4ss")
-    sensitive_findings: list[dict[str, object]] = []
 
     if using_inventory:
-        # Build JSON records / sensitive findings from the persisted per-field
-        # map. ``comment`` is not a credential-bearing field, so it is omitted
-        # here (the live path tracks it for parity only).
+        # Build JSON records from the persisted per-field map. ``comment`` is
+        # not a credential-bearing field, so it is omitted here (the live path
+        # tracks it for parity only).
         for sam, fields in cred_fields.items():
-            desc = str(fields.get("description") or "").strip()
-            info = str(fields.get("info") or "").strip()
-            unix_pw = str(fields.get("unixUserPassword") or "").strip()
-            user_pw = str(fields.get("userPassword") or "").strip()
             json_records.append(
                 {
                     "samaccountname": sam,
-                    "description": desc,
-                    "info": info,
+                    "description": str(fields.get("description") or "").strip(),
+                    "info": str(fields.get("info") or "").strip(),
                     "comment": "",
-                    "unixUserPassword": unix_pw,
-                    "userPassword": user_pw,
+                    "unixUserPassword": str(fields.get("unixUserPassword") or "").strip(),
+                    "userPassword": str(fields.get("userPassword") or "").strip(),
                 }
             )
-            blob = " || ".join(filter(None, [desc, info, unix_pw, user_pw]))
-            if blob and sensitive_pattern.search(blob):
-                sensitive_findings.append(
-                    {
-                        "samaccountname": sam,
-                        "matched_text": blob[:300],
-                        "fields": {
-                            "description": desc,
-                            "info": info,
-                            "comment": "",
-                            "unixUserPassword": unix_pw,
-                            "userPassword": user_pw,
-                        },
-                    }
-                )
         try:
             with open(descriptions_log, "w", encoding="utf-8") as log_fp:
                 log_fp.write("User:                     Description:\n")
@@ -4967,27 +4969,14 @@ def run_ldap_descriptions(
                             "userPassword": user_pw,
                         }
                     )
-                    blob = " || ".join(
-                        filter(None, [desc, info, comment, unix_pw, user_pw])
-                    )
-                    if blob and sensitive_pattern.search(blob):
-                        sensitive_findings.append(
-                            {
-                                "samaccountname": sam,
-                                "matched_text": blob[:300],
-                                "fields": {
-                                    "description": desc,
-                                    "info": info,
-                                    "comment": comment,
-                                    "unixUserPassword": unix_pw,
-                                    "userPassword": user_pw,
-                                },
-                            }
-                        )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_warning(f"Failed to write descriptions.log: {exc}")
+
+    sensitive_findings = _sensitive_findings_from_records(
+        json_records, object_sid_by_sam
+    )
 
     try:
         import json as _json
@@ -5013,22 +5002,33 @@ def run_ldap_descriptions(
     # ── Render + analysis (sweep all four credential-bearing fields) ──────
     if user_descriptions:
         _display_ldap_descriptions_with_rich(user_descriptions)
+    verification_outcomes: list[AttributeSecretOutcome] = []
     if cred_fields:
         try:
-            _analyze_descriptions_for_passwords(
-                shell,
-                descriptions_log,
-                cred_fields,
-                target_domain,
-                anonymous=anonymous,
+            verification_outcomes = (
+                _analyze_descriptions_for_passwords(
+                    shell,
+                    descriptions_log,
+                    cred_fields,
+                    target_domain,
+                    anonymous=anonymous,
+                )
+                or []
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_warning(f"Description analysis failed: {exc}")
 
-    # ── Surface sensitive findings into the report ───────────────────────
-    if sensitive_findings:
+    # ── Surface the UNPROVEN observations into the report ────────────────
+    # The proven ones already left through ``credential_in_ldap_attribute``
+    # above, recorded from the pairs the directory accepted. What is left is a
+    # readable attribute that holds something shaped like a secret which did
+    # not authenticate — still worth clearing, never a confirmed credential.
+    unproven_findings = _unproven_attribute_disclosures(
+        sensitive_findings, verification_outcomes
+    )
+    if unproven_findings:
         try:
             from adscan_core.reporting.technical_report import record_technical_finding
 
@@ -5036,15 +5036,22 @@ def run_ldap_descriptions(
                 shell,
                 target_domain,
                 key="ldap_user_description_password_leak",
-                value={"count": len(sensitive_findings)},
+                value={"count": len(unproven_findings)},
                 details={
                     "anonymous": anonymous,
                     "samples": [
                         {
                             "samaccountname": entry["samaccountname"],
+                            # The attribute holding the secret, so the report
+                            # names the object a sysadmin has to go and clear.
+                            "field": entry["field"],
                             "matched_text": entry["matched_text"],
+                            # Not authenticated. Carried explicitly so the
+                            # distinction survives the alias-family merge with
+                            # the confirmed finding, whose records carry True.
+                            "verified": False,
                         }
-                        for entry in sensitive_findings[:10]
+                        for entry in unproven_findings[:10]
                     ],
                 },
                 evidence=[
@@ -5757,7 +5764,19 @@ def _load_computer_hostnames_from_inventory(
 def _load_credential_fields_from_inventory(
     shell: LdapShell, domain: str
 ) -> dict[str, dict[str, str]]:
+    """Return only the credential-field map of :func:`_load_user_snapshot_from_inventory`."""
+    return _load_user_snapshot_from_inventory(shell, domain)[0]
+
+
+def _load_user_snapshot_from_inventory(
+    shell: LdapShell, domain: str
+) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
     """Read persisted credential-bearing LDAP fields from ``inventory/users.json``.
+
+    Returns a ``(cred_fields, object_sid_by_sam)`` pair from a single read. The
+    SID map exists so the credential-disclosure detector can tell a Windows
+    built-in (krbtgt, RID 502) from a real account by RID rather than by its
+    description text, which differs per install language.
 
     The native collector already enumerated and persisted ``description``,
     ``unixUserPassword``, ``userPassword`` and ``info`` for every user into the
@@ -5767,9 +5786,11 @@ def _load_credential_fields_from_inventory(
     ``LocalGraphService._inventory_records`` — never a hand-rolled path.
 
     Returns:
-        Mapping of ``sAMAccountName`` -> ``{field_label: value}`` for users that
-        carry at least one non-empty credential-bearing field. Empty when the
-        inventory file is absent or holds no such fields.
+        ``(cred_fields, object_sid_by_sam)`` where ``cred_fields`` maps
+        ``sAMAccountName`` -> ``{field_label: value}`` for users that carry at
+        least one non-empty credential-bearing field, and ``object_sid_by_sam``
+        maps every user in the inventory to its SID. Both are empty when the
+        inventory file is absent.
     """
     workspace_cwd = (
         shell._get_workspace_cwd()  # noqa: SLF001
@@ -5781,7 +5802,7 @@ def _load_credential_fields_from_inventory(
         workspace_cwd, domains_dir, domain, "inventory", "users.json"
     )
     if not os.path.exists(inventory_path):
-        return {}
+        return {}, {}
 
     try:
         payload = read_json_file(inventory_path)
@@ -5789,13 +5810,14 @@ def _load_credential_fields_from_inventory(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"[ldap-desc] failed to read users inventory: {exc}")
-        return {}
+        return {}, {}
 
     records = payload.get("records") if isinstance(payload, dict) else None
     if not isinstance(records, list):
-        return {}
+        return {}, {}
 
     cred_fields: dict[str, dict[str, str]] = {}
+    object_sid_by_sam: dict[str, str] = {}
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -5805,6 +5827,11 @@ def _load_credential_fields_from_inventory(
         properties = record.get("properties")
         if not isinstance(properties, dict):
             continue
+        sid = str(
+            record.get("object_id") or properties.get("objectid") or ""
+        ).strip()
+        if sid:
+            object_sid_by_sam[sam] = sid
         per_user: dict[str, str] = {}
         for prop_key, label in _CRED_FIELD_INVENTORY_KEYS:
             value = str(properties.get(prop_key) or "").strip()
@@ -5812,7 +5839,7 @@ def _load_credential_fields_from_inventory(
                 per_user[label] = value
         if per_user:
             cred_fields[sam] = per_user
-    return cred_fields
+    return cred_fields, object_sid_by_sam
 
 
 def _credential_fields_from_live_rows(
@@ -5840,6 +5867,125 @@ def _credential_fields_from_live_rows(
     return cred_fields
 
 
+def _object_sids_from_live_rows(rows: list[dict[str, object]]) -> dict[str, str]:
+    """Map ``sAMAccountName`` -> SID string from live description-query rows.
+
+    ``objectSid`` arrives as raw bytes over LDAP; the collector's decoder is
+    reused rather than re-implemented. A DC that hides the attribute from an
+    anonymous bind simply yields no entry, and the detector falls back to the
+    small set of built-in names Windows never localises.
+    """
+    from adscan_internal.services.collector.ldap_collector import _decode_sid
+
+    sids: dict[str, str] = {}
+    for row in rows:
+        sam = str(row.get("sAMAccountName") or "").strip()
+        raw = row.get("objectSid")
+        if not sam or not raw:
+            continue
+        try:
+            decoded = _decode_sid(raw)
+        except Exception as exc:  # noqa: BLE001 — a SID we cannot read is not fatal
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            continue
+        if decoded:
+            sids[sam] = decoded
+    return sids
+
+
+def _sensitive_findings_from_records(
+    json_records: list[dict[str, object]],
+    object_sid_by_sam: dict[str, str],
+) -> list[dict[str, object]]:
+    """Return one report record per directory attribute that discloses a secret.
+
+    The judgement itself lives in
+    :mod:`adscan_internal.services.credential_disclosure_detection`, shared with
+    the unauthenticated sweep, so both paths agree on what a leak is. A keyword
+    alone is prose ("user must change password at next logon"); a password
+    attribute with any readable value, or a keyword travelling with an actual
+    value, is a leak.
+    """
+    findings: list[dict[str, object]] = []
+    for record in json_records:
+        sam = str(record.get("samaccountname") or "").strip()
+        if not sam:
+            continue
+        fields = {
+            label: str(record.get(label) or "").strip()
+            for label in ("description", "info", "comment", "unixUserPassword", "userPassword")
+        }
+        builtin = is_builtin_principal(
+            samaccountname=sam, object_sid=object_sid_by_sam.get(sam, "")
+        )
+        for hit in scan_attribute_values(fields, builtin=builtin):
+            findings.append(
+                {
+                    "samaccountname": sam,
+                    "field": hit.field,
+                    "reason": hit.reason,
+                    "matched_text": hit.value[:300],
+                    "fields": dict(fields),
+                }
+            )
+    return findings
+
+
+def _unproven_attribute_disclosures(
+    sensitive_findings: list[dict[str, object]],
+    outcomes: list["AttributeSecretOutcome"],
+) -> list[dict[str, object]]:
+    """Return the disclosures that are still only an observation.
+
+    Three outcomes exist for an attribute that looks like it holds a secret, and
+    they are not interchangeable:
+
+    1. the secret **authenticated** — a confirmed credential disclosure, already
+       reported through ``credential_in_ldap_attribute`` at its own severity,
+       naming the account it compromises. Removed here so the same attribute is
+       not also listed as unproven;
+    2. the secret **did not authenticate**, or could not be tried at all because
+       no domain controller answered. The value is still a secret-shaped string
+       sitting in an attribute every authenticated domain user can read, and a
+       sysadmin should still go and clear it — the password may simply have been
+       rotated, the account disabled, or the secret may belong to an appliance
+       or a web panel rather than to the directory. It is reported as an
+       observation and never as a proven credential;
+    3. nothing tripped the detector's evidence gate — no finding at all. This is
+       where a built-in account's stock description lands, structurally and
+       permanently.
+
+    A verification that could not run is deliberately grouped with (2): a data
+    gap is not a confirmation, and it is not a refutation either.
+
+    Args:
+        sensitive_findings: The detector's evidence-gated hits, one per
+            attribute, as written to ``descriptions.json``.
+        outcomes: What verification said about each candidate secret.
+
+    Returns:
+        The subset of *sensitive_findings* whose attribute was not proven to
+        hold a working credential, in the original order.
+    """
+    proven = {
+        (str(outcome.owner).strip().lower(), str(outcome.field).strip())
+        for outcome in outcomes
+        if outcome.verified
+    }
+    if not proven:
+        return list(sensitive_findings)
+    return [
+        entry
+        for entry in sensitive_findings
+        if (
+            str(entry.get("samaccountname") or "").strip().lower(),
+            str(entry.get("field") or "").strip(),
+        )
+        not in proven
+    ]
+
+
 def _descriptions_only_view(
     cred_fields: dict[str, dict[str, str]],
 ) -> dict[str, str]:
@@ -5856,6 +6002,50 @@ def _descriptions_only_view(
     }
 
 
+@dataclass(frozen=True)
+class AttributeSecretOutcome:
+    """One secret read out of a directory attribute, with the domain's verdict.
+
+    The pairing is what matters: ``owner``/``field`` say where the value was
+    read, and ``verified`` says whether the directory accepted it. A report
+    finding that claims a credential was disclosed must be built from the
+    entries where ``verified`` is true and from nothing else.
+
+    Attributes:
+        owner: The account whose attribute held the value.
+        field: The attribute the value was read from.
+        secret: The candidate secret itself.
+        rule: The detector rule that extracted it, for the report record.
+        ml_probability: The detector's confidence, carried through unchanged.
+        verified: ``True`` only when :func:`add_credential` authenticated the
+            pair against the domain. Everything else — a rejection, a check
+            that could not run, an operator who skipped the candidate — is
+            ``False``, so the confirmed reading can never be reached by
+            accident.
+    """
+
+    owner: str
+    field: str
+    secret: str
+    rule: str = ""
+    ml_probability: object | None = None
+    verified: bool = False
+
+
+def _credential_add_was_verified(verdict: object) -> bool:
+    """Return whether ``add_credential`` proved this pair against the domain.
+
+    Thin lazy-import wrapper over the SSOT predicate so this module keeps its
+    import graph unchanged; the judgement itself lives in ``cli/creds.py``,
+    next to the verdict it reads.
+    """
+    from adscan_internal.cli.creds import (  # noqa: PLC0415
+        credential_verdict_is_verified,
+    )
+
+    return credential_verdict_is_verified(verdict)
+
+
 def _analyze_descriptions_for_passwords(
     shell: LdapShell,
     descriptions_file: str,
@@ -5863,7 +6053,7 @@ def _analyze_descriptions_for_passwords(
     domain: str,
     *,
     anonymous: bool = False,
-) -> None:
+) -> list[AttributeSecretOutcome]:
     """Analyze credential-bearing LDAP fields with CredSweeper (in-memory).
 
     Sweeps all four migrated fields per user — ``description``,
@@ -5874,6 +6064,14 @@ def _analyze_descriptions_for_passwords(
     ldap_description rules, ml_threshold=0.0, no_filters=True, doc=True. The
     library avoids the CLI subprocess and credsweeper_path dependency entirely.
 
+    Every candidate this finds is routed through ``add_credential``, which is
+    the only place a ``(principal, secret)`` pair is actually authenticated.
+    The confirmed finding ``credential_in_ldap_attribute`` is recorded from the
+    pairs the directory accepted and from nothing else, AFTER the review loop
+    has run — recording it up front, from the pattern matches alone, is what
+    let a description that merely reads like a password reach a client report
+    as a disclosed credential.
+
     Args:
         shell: Runtime shell for credential storage and prompts.
         descriptions_file: Path to the persisted descriptions artefact (used as
@@ -5883,9 +6081,15 @@ def _analyze_descriptions_for_passwords(
             ``userPassword`` or ``info``.
         domain: Target domain.
         anonymous: Whether the source bind was anonymous (provenance only).
+
+    Returns:
+        One :class:`AttributeSecretOutcome` per candidate that was routed
+        through verification, in review order. The caller uses the verified
+        entries to decide which attributes it may report as a confirmed
+        credential disclosure and which stay an unproven observation.
     """
     if not cred_fields:
-        return
+        return []
 
     targets: list[InMemoryCredSweeperTarget] = []
     # file_path → (samaccountname, field_label)
@@ -5908,11 +6112,13 @@ def _analyze_descriptions_for_passwords(
             path_index[key] = (sam, field_label)
 
     if not targets:
-        return
+        return []
 
     # Description-only view kept for the harvest display and the NTLM-hash
     # keyword extractor, which are anchored to the description field.
     descriptions_only = _descriptions_only_view(cred_fields)
+
+    outcomes: list[AttributeSecretOutcome] = []
 
     try:
         raw = CredSweeperLibraryService().analyze_targets_with_options(
@@ -5943,7 +6149,7 @@ def _analyze_descriptions_for_passwords(
             for item in ntlm_hash_candidates:
                 username_norm = str(item["username"]).strip().lower()
                 ntlm_hash = str(item["ntlm_hash"]).strip().lower()
-                shell.add_credential(
+                verdict = shell.add_credential(
                     domain,
                     username_norm,
                     ntlm_hash,
@@ -5953,6 +6159,15 @@ def _analyze_descriptions_for_passwords(
                         secret=ntlm_hash,
                     ),
                     credential_origin="userdescription",
+                )
+                outcomes.append(
+                    AttributeSecretOutcome(
+                        owner=username_norm,
+                        field="description",
+                        secret=ntlm_hash,
+                        rule="ntlm_hash",
+                        verified=_credential_add_was_verified(verdict),
+                    )
                 )
 
             descriptions_dir = os.path.dirname(descriptions_file) or "."
@@ -6004,20 +6219,7 @@ def _analyze_descriptions_for_passwords(
             print_info_verbose(
                 "No passwords detected in LDAP credential-bearing fields."
             )
-            return
-
-        # Record the finding for the technical report from the computed
-        # candidates (carrying rule / ml_probability / username / field). This
-        # runs in both interactive and CI flows — the phase executes when
-        # shell.auto is True — so the report no longer depends on the collector
-        # having analysed the fields itself.
-        _record_credential_in_ldap_attribute_finding(
-            shell,
-            domain,
-            candidates,
-            anonymous=anonymous,
-            source_path=descriptions_file,
-        )
+            return outcomes
 
         # Display the matching field value per candidate (not only the
         # description), labelled by field, so non-description leaks are visible.
@@ -6035,6 +6237,7 @@ def _analyze_descriptions_for_passwords(
             max_rows=30,
         )
 
+        confirmed: list[dict] = []
         for item in candidates:
             field_label = str(item["field"])
             marked_user = mark_sensitive(str(item["username"]), "user")
@@ -6056,7 +6259,7 @@ def _analyze_descriptions_for_passwords(
 
             username_norm = str(item["username"]).strip().lower()
             value_norm = str(item["password"]).strip()
-            shell.add_credential(
+            verdict = shell.add_credential(
                 domain,
                 username_norm,
                 value_norm,
@@ -6067,10 +6270,38 @@ def _analyze_descriptions_for_passwords(
                 ),
                 credential_origin="userdescription",
             )
+            was_verified = _credential_add_was_verified(verdict)
+            outcomes.append(
+                AttributeSecretOutcome(
+                    owner=username_norm,
+                    field=field_label,
+                    secret=value_norm,
+                    rule=str(item.get("rule") or ""),
+                    ml_probability=item.get("ml_probability"),
+                    verified=was_verified,
+                )
+            )
+            if was_verified:
+                confirmed.append(item)
+
+        # Record the confirmed finding LAST, from the pairs the directory
+        # actually accepted. The review loop above is where the proof happens,
+        # so this cannot run before it: a pattern match is a hypothesis, and a
+        # report that states "this account's description holds its password"
+        # must rest on an authentication, not on a regular expression.
+        _record_credential_in_ldap_attribute_finding(
+            shell,
+            domain,
+            confirmed,
+            anonymous=anonymous,
+            source_path=descriptions_file,
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Error analyzing LDAP credential-bearing fields for passwords.")
         print_exception(show_locals=False, exception=exc)
+
+    return outcomes
 
 
 def _record_credential_in_ldap_attribute_finding(
@@ -6081,11 +6312,13 @@ def _record_credential_in_ldap_attribute_finding(
     anonymous: bool,
     source_path: str,
 ) -> None:
-    """Persist the ``credential_in_ldap_attribute`` technical finding.
+    """Persist the CONFIRMED ``credential_in_ldap_attribute`` technical finding.
 
-    Emitted from the computed CredSweeper candidates (carrying rule,
-    ml_probability, username and field), moved here from the collector
-    intelligence step so the report finding tracks the analysis that owns it.
+    This is the high-severity reading — "an account's password is written in
+    its directory attributes, and we logged in with it" — so ``candidates`` must
+    contain only pairs the directory authenticated. The caller supplies them
+    from the ``add_credential`` verdict; nothing here re-judges the text.
+
     LITE-safe: imports ``record_technical_finding`` from ``adscan_core``.
     """
     if not candidates:
@@ -6107,6 +6340,10 @@ def _record_credential_in_ldap_attribute_finding(
                         "field": str(item.get("field") or ""),
                         "rule_name": str(item.get("rule") or ""),
                         "ml_probability": item.get("ml_probability"),
+                        # Every record here authenticated. Carried explicitly so
+                        # the distinction survives the alias-family merge, which
+                        # unions this list with the unproven observations.
+                        "verified": True,
                     }
                     for item in candidates[:50]
                 ],

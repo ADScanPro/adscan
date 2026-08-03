@@ -102,6 +102,13 @@ def _probe_one_target(
     check (row value ⇒ sysadmin).
     """
     try:
+        # ``host`` is already the CONNECT target and ``kerberos_target_hostname``
+        # the SPN — the reachable-IP split is owned by the shell-holding callers
+        # (cli/privileges.py passes SYN-scan IPs + an IP->FQDN map; cli/creds.py
+        # resolves the single verify host through resolve_connect_and_spn). This
+        # module-level probe runs in a worker thread with no ``shell`` in scope,
+        # so it cannot resolve here — see CLAUDE.md "Resolving a host to its
+        # reachable IP".
         backend = ImpacketMSSQLBackend(
             host=host,
             port=port,

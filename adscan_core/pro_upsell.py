@@ -53,8 +53,18 @@ _PDFS = (
 # what a consultant weighs: the regulatory mapping and the remediation depth
 # first (the hours saved per engagement), then the two hardening documents, then
 # the branding boundary stated plainly.
+#
+# The regime list reads "or", not "and": the kit maps to the regimes the
+# operator SELECTS for the engagement, and a kit built for one client's regime
+# never carries another's. Promising all of them would be the same misdescription
+# the report itself was fixed for.
+#
+# PCI DSS is supported too and is named in the exposure report's own PRO note,
+# which has room for it. It is left out HERE because a bullet must survive an
+# 80-column terminal: the panel adds 6 columns of padding and 2 of border, so an
+# item over 70 characters wraps and splits a regime name across two lines.
 _KIT_ITEMS = (
-    "Security Assessment Report mapped to DORA, NIS2, ENS and ISO 27001",
+    "Security Assessment Report mapped to DORA, NIS2, ENS or ISO 27001",
     "Per-finding remediation your client's sysadmin can execute",
     "AD Hardening Playbook",
     "AD Control Coverage Report",

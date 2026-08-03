@@ -21,6 +21,7 @@ Admin detection method:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -64,6 +65,10 @@ class SMBPrivilegeConfig:
     auth_domain:     Credential domain when different from target domain (cross-domain).
     kdc_ip:          KDC for auth_domain (required for Kerberos in cross-domain scenarios).
     use_kerberos:    Force Kerberos; skip NTLM entirely.
+    is_local_account: The account lives in the target's own SAM, not in AD, so
+                     Kerberos is structurally impossible for it. Threaded into
+                     the ``SMBConfig`` so the auth planner never promotes the
+                     attempt to Kerberos (see ``SMBConfig.is_local_account``).
     timeout:         Per-host connection timeout in seconds.
     posture_sink:    Optional sink for Intelligence Updates emitted by the
                      transport when it observes a domain-wide hardening signal.
@@ -81,6 +86,7 @@ class SMBPrivilegeConfig:
     auth_domain: str | None = None
     kdc_ip: str | None = None
     use_kerberos: bool = False
+    is_local_account: bool = False
     timeout: int = 15
     posture_sink: Optional[PostureSink] = None
     posture_snapshot: Optional["DomainPosture"] = None
@@ -164,6 +170,7 @@ async def check_smb_privilege(config: SMBPrivilegeConfig) -> SMBPrivilegeResult:
         auth_domain=config.auth_domain,
         kdc_ip=config.kdc_ip,
         use_kerberos=config.use_kerberos,
+        is_local_account=config.is_local_account,
         timeout=config.timeout,
         posture_sink=config.posture_sink,
         posture_snapshot=config.posture_snapshot,
@@ -371,6 +378,85 @@ def _looks_like_nt_hash(value: str) -> bool:
     if not isinstance(value, str) or len(value) != 32:
         return False
     return all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def local_account_logon_domain(host: str, account_domain: str | None = None) -> str:
+    """Return the NTLM domain to send when logging on as a LOCAL account.
+
+    A local account does not live in Active Directory. If the AD domain is put
+    in the NTLMSSP domain field, the target forwards the logon to a domain
+    controller and the LOCAL account with that name is never consulted — the
+    logon fails even when the account name and password are both correct
+    (reproduced against a GOAD member server: the same LAPS password that
+    authenticates as ``BRAAVOS\\Administrator`` returns ``STATUS_LOGON_FAILURE``
+    as ``essos.local\\Administrator``).
+
+    The value the target resolves against its own SAM is its own account-domain
+    name. Prefer the name the host reported for itself, fall back to its short
+    hostname, and use ``"."`` when only an IP is known — Windows treats any
+    domain it does not recognise as a request for a local logon.
+    """
+    resolved = str(account_domain or "").strip()
+    if resolved:
+        return resolved
+    raw = str(host or "").strip()
+    if not raw:
+        return "."
+    # An IP literal has no usable short name.
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", raw) or ":" in raw:
+        return "."
+    short = raw.split(".", 1)[0].strip()
+    return short or "."
+
+
+async def verify_local_account_smb_access(
+    *,
+    host: str,
+    username: str,
+    credential: str,
+    account_domain: str | None = None,
+    target_hostname: str | None = None,
+    timeout: int = 15,
+) -> SMBPrivilegeResult:
+    """Verify a LOCAL account's SMB access on ``host`` (never a domain logon).
+
+    Same probe as :func:`verify_domain_user_local_admin`, but the logon is
+    pinned to the host's own account domain (see
+    :func:`local_account_logon_domain`) and Kerberos is never requested — a
+    local account has no AD identity and therefore no Kerberos principal.
+
+    Returns:
+        SMBPrivilegeResult. ``auth_succeeded`` is the signal that the account
+        name and password are both correct; ``is_admin`` additionally proves
+        local administrator rights. Never raises.
+    """
+    logon_domain = local_account_logon_domain(host, account_domain)
+    try:
+        is_hash = _looks_like_nt_hash(credential)
+        cfg = SMBPrivilegeConfig(
+            target_ip=host,
+            target_hostname=target_hostname,
+            domain=logon_domain,
+            username=username,
+            password=None if is_hash else credential,
+            nt_hash=credential if is_hash else None,
+            auth_domain=logon_domain,
+            use_kerberos=False,
+            is_local_account=True,
+            timeout=timeout,
+        )
+        return await check_smb_privilege(cfg)
+    except Exception as exc:  # noqa: BLE001 — must never raise to caller
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return SMBPrivilegeResult(
+            target_ip=host,
+            target_hostname=target_hostname,
+            username=username,
+            domain=logon_domain,
+            status=SMBPrivilegeStatus.ERROR,
+            error=str(exc),
+        )
 
 
 async def verify_domain_user_local_admin(

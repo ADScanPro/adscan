@@ -14,12 +14,18 @@ and ``adscan_core`` is the one package all three may import.
 The scheme
 ----------
 
-``https://adscanpro.com/<path>?utm_source=cli&utm_medium=<placement>``
+``https://adscanpro.com/<path>?utm_source=<source>&utm_medium=<placement>``
 
 * Host is always the apex ``adscanpro.com``. ``www.adscanpro.com`` answers with
   a 308 to the apex, so a ``www`` link would only split the same click across
   two hostnames in analytics.
-* ``utm_source`` is always ``cli``.
+* ``utm_source`` is ``cli`` for the terminal, and ``report`` for a link that
+  lives inside a generated document. That distinction is the whole point of
+  the field here: the exposure report is routinely forwarded, so a click on
+  its PRO link usually comes from a *reader* who never ran ADscan — a
+  different person, on a different day, from the operator at the prompt.
+  Attributing both to ``cli`` collapses those two into one number and makes it
+  impossible to tell whether the free report converts on its own.
 * ``utm_medium`` **is** the placement name, so the tracking value is readable
   in a report without a lookup table and cannot drift from the call site.
 
@@ -54,6 +60,7 @@ __all__ = [
     "ADSCAN_SITE_HOST",
     "ADSCAN_SITE_URL",
     "UTM_SOURCE",
+    "UTM_SOURCE_REPORT",
     "cta_display",
     "cta_display_url",
     "cta_link_style",
@@ -69,8 +76,14 @@ ADSCAN_SITE_HOST = "adscanpro.com"
 #: Canonical public origin.
 ADSCAN_SITE_URL = f"https://{ADSCAN_SITE_HOST}"
 
-#: ``utm_source`` for every link the command line emits.
+#: ``utm_source`` for a link the command line emits — the operator clicks it
+#: from their own terminal, during their own run.
 UTM_SOURCE = "cli"
+
+#: ``utm_source`` for a link embedded in a generated document. The reader is
+#: often not the operator: the exposure report is built to be forwarded, so
+#: this click typically comes from whoever received the PDF.
+UTM_SOURCE_REPORT = "report"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,10 +94,14 @@ class _Placement:
         path: Site path, leading slash included (e.g. ``"/pro"``).
         fragment: Optional anchor, no ``#`` (e.g. ``"virtualenv-setup"``).
             Kept separate because the query string must precede the fragment.
+        source: ``utm_source`` for this placement. Defaults to the terminal;
+            set it to :data:`UTM_SOURCE_REPORT` for a link that ships inside a
+            document rather than being printed at the prompt.
     """
 
     path: str
     fragment: str = ""
+    source: str = UTM_SOURCE
 
 
 # Placement -> destination. The key doubles as the ``utm_medium`` value.
@@ -97,10 +114,13 @@ _PLACEMENTS: dict[str, _Placement] = {
     # ── Commercial call to action (/pro) ────────────────────────────────────
     # The upsell panel shown when a LITE user reaches for a PRO deliverable.
     "pro_upsell_panel": _Placement("/pro"),
-    # "Exposure report ready" panel at the end of a scan, and the upgrade
-    # links inside the LITE HTML/PDF report it announces.
+    # "Exposure report ready" panel at the end of a scan — printed at the
+    # prompt, so the operator is the one who clicks.
     "report_ready_panel": _Placement("/pro"),
-    "lite_report": _Placement("/pro"),
+    # The upgrade links *inside* the generated LITE HTML/PDF report. Separate
+    # source: this document gets forwarded, and a click on it is evidence the
+    # free report converts a reader who never touched the command line.
+    "lite_report": _Placement("/pro", source=UTM_SOURCE_REPORT),
     # Post-scan hint when attack paths were proven end to end.
     "scan_complete_paths": _Placement("/pro"),
     # Session summary on exit, after a session that produced findings.
@@ -109,8 +129,10 @@ _PLACEMENTS: dict[str, _Placement] = {
     "victory_da_compromise": _Placement("/pro"),
     # `adscan demo` closing panels.
     "demo_closing": _Placement("/pro"),
-    # The two "Get beta access" lines shown when a PRO-only import is absent.
-    "beta_access_graph_validation": _Placement("/pro"),
+    # The "Get beta access" line shown when a PRO-only import is absent.
+    # (``beta_access_graph_validation`` was retired when attack-graph finding
+    # validation moved into the tier-shared derivation and stopped being a
+    # PRO-only capability.)
     "beta_access_report_init": _Placement("/pro"),
     # ── Share (/share) ──────────────────────────────────────────────────────
     "victory_domain_compromised": _Placement("/share"),
@@ -187,7 +209,10 @@ def cta_url(placement: str) -> str:
         e.g. ``https://adscanpro.com/pro?utm_source=cli&utm_medium=demo_closing``
     """
     target = _resolve(placement)
-    url = f"{ADSCAN_SITE_URL}{target.path}?utm_source={UTM_SOURCE}&utm_medium={placement}"
+    url = (
+        f"{ADSCAN_SITE_URL}{target.path}"
+        f"?utm_source={target.source}&utm_medium={placement}"
+    )
     if target.fragment:
         url = f"{url}#{target.fragment}"
     return url

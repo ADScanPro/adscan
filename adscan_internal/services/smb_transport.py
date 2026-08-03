@@ -30,6 +30,7 @@ from adscan_internal import (
     print_info_debug,
     telemetry,
 )
+from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.async_bridge import run_async_sync
 from adscan_internal.services.domain_posture import (
     ConstraintCategory,
@@ -42,7 +43,7 @@ from adscan_internal.services.posture_sink import (  # noqa: F401  (re-exported)
     PostureSink,
     make_workspace_posture_sink,
 )
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_info_verbose
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,22 @@ class SMBConfig:
     port: int = 445
     timeout: int = 30
     use_kerberos: bool = False
+    is_local_account: bool = False
+    """The credential names an account in the TARGET's own SAM, not in AD.
+
+    A local account has no Active Directory identity, so it has no Kerberos
+    principal and no KDC that would issue it a ticket. Kerberos is therefore
+    structurally impossible for it — not merely unpreferred — and the auth
+    planner treats it as not Kerberos-viable, exactly like a session with no
+    principal or no credential material. Without this the Kerberos-first policy
+    promotes the attempt and the run asks the domain controller for a ticket for
+    an account the directory has never heard of, which comes back as
+    ``KDC_ERR_PREAUTH_FAILED`` and reads like a wrong password.
+
+    ``auth_domain`` must carry the host's own account-domain name (see
+    ``smb_privilege.local_account_logon_domain``) so the target resolves the
+    logon against its SAM instead of forwarding it to a DC.
+    """
     sign: bool = False
     encrypt: bool = False
     disable_self_heal: bool = False
@@ -904,6 +921,77 @@ def _classify_recoverable_smb_failure(
     return None
 
 
+async def _prepare_explicit_ccache_for_smb(config: SMBConfig) -> SMBConfig:
+    """Renew (or discard) an explicit, already-expired Kerberos ccache.
+
+    Mirror of the LDAP seam helper, sharing the same SSOT
+    (:mod:`kerberos_ccache_renewal`). Outcomes:
+
+    * **capability-bearing** — the marked ESC13 PAC-TGT / scoped S4U/RBCD/silver
+      ticket is returned untouched. This is the same exemption the URL builder
+      documents for slot 1, now decided from the ticket's own marker instead of
+      being assumed.
+    * **expired and renewable** — the config points at a freshly minted TGT for
+      the same principal.
+    * **expired and not renewable** — the dead ticket is dropped so slots 2/3/4
+      (AES key, NT hash, password) and, above this, the Kerberos→NTLM fallback
+      in :func:`smb_machine_with_fallback` can still get in. With no alternative
+      secret the ticket is kept so the authentic Kerberos error surfaces.
+    """
+    path = str(getattr(config, "ccache_path", "") or "").strip()
+    if not path:
+        return config
+
+    from adscan_internal.services.kerberos_ccache_renewal import (  # noqa: PLC0415
+        prepare_ccache_for_bind_async,
+    )
+
+    try:
+        preparation = await prepare_ccache_for_bind_async(
+            ccache_path=path,
+            username=config.username,
+            domain=config.domain,
+            auth_domain=config.auth_domain,
+            dc_ip=str(config.kdc_ip or config.target_kdc_ip or "").strip() or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — renewal must never break a connection
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            "[smb_transport] ccache renewal raised "
+            f"{type(exc).__name__}: {exc}; connecting with the ticket as-is"
+        )
+        return config
+
+    if preparation.capability_bearing or not preparation.expired:
+        return config
+
+    import dataclasses as _dc_ccache
+
+    if preparation.renewed and preparation.ccache_path:
+        print_info_verbose(
+            "Kerberos ticket had expired; a fresh one was issued for "
+            f"{mark_sensitive(str(config.username or ''), 'user')} before the "
+            "SMB connection."
+        )
+        return _dc_ccache.replace(config, ccache_path=preparation.ccache_path)
+
+    if not (config.password or config.nt_hash or config.aes_key):
+        print_info_debug(
+            "[smb_transport] expired ccache could not be renewed and no other "
+            "credential is present; connecting with it so the authentic "
+            "Kerberos error surfaces"
+        )
+        return config
+
+    print_info_verbose(
+        "Kerberos ticket has expired and could not be renewed; falling back to "
+        "the remaining authentication options for "
+        f"{mark_sensitive(str(config.username or ''), 'user')}."
+    )
+    return _dc_ccache.replace(config, ccache_path=None)
+
+
 @asynccontextmanager
 async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
     """Async context manager that yields a connected ``SMBMachine``.
@@ -964,6 +1052,15 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
             )
         except Exception:  # noqa: BLE001 — never let the sync break the connection
             pass
+
+        # Transversal explicit-ccache renewal at the same auth seam: a
+        # caller-supplied ``ccache_path`` is a TICKET and tickets expire, so
+        # renew (or discard) it before the URL builder puts it in slot 1.
+        # Every SMB caller — collector, dumps, coercion, lateral exec, sweeps —
+        # inherits renewal here rather than re-implementing it. Capability-
+        # bearing tickets (marked ESC13 PAC-TGTs, scoped S4U/RBCD/silver
+        # service tickets) are recognised from their markers and used verbatim.
+        config = await _prepare_explicit_ccache_for_smb(config)
 
     # Self-healing retry budget: at most one retry per call, scoped to
     # the recovery key (sign-flag flip). Identical pattern to the LDAP

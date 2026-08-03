@@ -50,7 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
-from typing import Any
+from typing import Any, Iterable
 
 from adscan_internal.workspaces import domain_subpath
 
@@ -227,6 +227,77 @@ def infer_target_reachability(
         globally_unreachable=True,
         rationale=rationale,
     )
+
+
+def collect_pivot_reachable_targets(
+    shell: Any,
+    *,
+    domain: str,
+    service: str,
+    ports: Iterable[int] | None = None,
+) -> dict[str, list[int]]:
+    """Return ``{target_ip: reachable_ports}`` confirmed reachable via any pivot.
+
+    Positive evidence only: walks every ``<service>/<host>_pivot_reachability_report.json``
+    and returns the targets a pivot actually reached (non-empty ``reachable_ports``).
+    When ``ports`` is given, a target is included only when its reachable set
+    intersects ``ports`` — so an MSSQL caller (``ports=[1433]``) gets the hosts a
+    pivot confirmed listening on 1433, NOT every host the pivot could see. This is
+    the load-bearing input that lets a service reachable ONLY over a pivot (where
+    the direct SYN scan missed the port) still become a connect target.
+
+    Best-effort: ``{}`` when there is no pivot evidence. Never raises.
+    """
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    domains_dir = getattr(shell, "domains_dir", "domains")
+    service_clean = str(service or "").strip().lower()
+    if not workspace_dir or not service_clean:
+        return {}
+    want_ports: set[int] | None = None
+    if ports is not None:
+        want_ports = set()
+        for port in ports:
+            try:
+                want_ports.add(int(port))
+            except (TypeError, ValueError):
+                continue
+
+    service_dir = domain_subpath(workspace_dir, domains_dir, domain, service_clean)
+    if not service_dir or not os.path.isdir(service_dir):
+        return {}
+
+    out: dict[str, list[int]] = {}
+    for entry_name in sorted(os.listdir(service_dir)):
+        if not entry_name.endswith("_pivot_reachability_report.json"):
+            continue
+        payload = _load_json(os.path.join(service_dir, entry_name))
+        if not isinstance(payload, dict):
+            continue
+        targets = payload.get("targets")
+        if not isinstance(targets, list):
+            continue
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            ip = _normalize_ip(target.get("ip"))
+            if not ip:
+                continue
+            raw_ports = target.get("reachable_ports")
+            if not isinstance(raw_ports, list) or not raw_ports:
+                continue
+            reachable: list[int] = []
+            for port in raw_ports:
+                try:
+                    reachable.append(int(port))
+                except (TypeError, ValueError):
+                    continue
+            if not reachable:
+                continue
+            if want_ports is not None and not (want_ports & set(reachable)):
+                continue
+            merged = set(out.get(ip, [])) | set(reachable)
+            out[ip] = sorted(merged)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +491,7 @@ def _load_json(path: str) -> Any:
 __all__ = [
     "PivotProbeVerdict",
     "TargetReachabilityInference",
+    "collect_pivot_reachable_targets",
     "infer_target_reachability",
     "is_target_known_unreachable_from_current_vantage",
 ]

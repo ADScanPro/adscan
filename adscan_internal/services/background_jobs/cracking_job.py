@@ -29,6 +29,12 @@ from adscan_internal.services.background_jobs.results_bus import (
     JobResultSink,
 )
 from adscan_internal.services.cracking_wordlist_policy import EffortTier
+from adscan_internal.services.credentials.credential_origin import (
+    ORIGIN_ASREPROAST,
+    ORIGIN_KERBEROAST,
+    ORIGIN_NTLMV1_CAPTURE_CRACK,
+    ORIGIN_NTLMV2_CAPTURE_CRACK,
+)
 from adscan_core.rich_output import print_exception
 
 # NetNTLM hashcat modes (fixed per protocol version, unlike the etype-dependent
@@ -61,6 +67,27 @@ def _resolve_runtime_mode(mode: Optional[str], ntlm_version: str) -> str:
     if mode is not None and str(mode).strip():
         return str(mode).strip()
     return _hashcat_mode_for_version(ntlm_version)
+
+
+def _credential_origin_for_mode(mode: str) -> str:
+    """Return the credential-origin slug for the technique behind a crack mode.
+
+    A crack does not itself reach the domain — it resolves material some earlier
+    technique already recovered — so the origin recorded is that technique
+    (roasting, or a captured network authentication), which is what the client
+    report has to name. ``add_credential`` separately appends the offline-crack
+    acquisition as DERIVED, so both facts survive.
+    """
+    m = str(mode or "").strip()
+    if m in _KERBEROAST_MODES:
+        return ORIGIN_KERBEROAST
+    if m in _ASREP_MODES:
+        return ORIGIN_ASREPROAST
+    if m == _NTLM_V1_MODE:
+        return ORIGIN_NTLMV1_CAPTURE_CRACK
+    if m == _NTLM_V2_MODE:
+        return ORIGIN_NTLMV2_CAPTURE_CRACK
+    return ""
 
 
 def _mode_label(mode: str) -> str:
@@ -914,6 +941,7 @@ def _persist_matches(runtime: "CrackingJobRuntime", matches: dict) -> list[str]:
       auto-owns a credential nor prints/prompts.
     """
     cracked_users: list[str] = []
+    origin = _credential_origin_for_mode(runtime.mode)
     for user, password in matches.items():
         if not password:
             continue
@@ -926,6 +954,10 @@ def _persist_matches(runtime: "CrackingJobRuntime", matches: dict) -> list[str]:
                     ui_silent=True,
                     prompt_for_user_privs_after=False,
                     skip_user_privs_enumeration=True,
+                    # A crack runs off the scan flow, not inside an attack step,
+                    # so the provenance seam cannot infer it. The origin is the
+                    # technique that produced the hash this pass resolved.
+                    credential_origin=origin,
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)

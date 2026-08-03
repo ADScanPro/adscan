@@ -5,7 +5,6 @@ from typing import Any
 from adscan_core.rich_output import print_info_verbose
 from adscan_core.telemetry_preference import (
     WORKSPACE_PREFERENCE_ATTR,
-    default_workspace_telemetry,
     load_global_preference,
     resolve_effective_telemetry,
 )
@@ -30,6 +29,15 @@ _LEGACY_NEO4J_STATE_KEYS: tuple[str, ...] = (
 # graph collection is performed natively.
 _LEGACY_BLOODHOUND_EDGE_TYPE = "bloodhound_ce"
 _CURRENT_GRAPH_EDGE_TYPE = "graph_collection"
+
+# Emitted as a ``_snapshot_note`` key into every per-domain ``variables.json``
+# so anyone inspecting one on disk knows what it is before they trust it.
+DOMAIN_SNAPSHOT_NOTE = (
+    "Derived write-only snapshot of the shell state at the moment this domain was "
+    "last saved. ADscan never loads it back, so it can be arbitrarily stale. The "
+    "single source of truth for workspace state - domains_data, credentials, the "
+    "domain list - is the workspace-root variables.json one directory up."
+)
 
 
 def migrate_legacy_workspace_state(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -133,31 +141,29 @@ def _coerce_json_safe(value: Any) -> Any:
     return str(value)
 
 
-def _workspace_telemetry_preference_for_save(shell: Any) -> bool:
+def _workspace_telemetry_preference_for_save(shell: Any) -> bool | None:
     """Return the workspace's own telemetry preference for persistence.
 
-    Prefers the explicitly tracked workspace preference; falls back to the
-    shell's effective flag for shells that never loaded a workspace.
+    Returns the explicitly tracked workspace preference (``True``/``False``), or
+    ``None`` when the workspace is UNSET — a new/untouched workspace must not
+    freeze a boolean, so it can keep inheriting the global preference live.
     """
     preference = getattr(shell, WORKSPACE_PREFERENCE_ATTR, None)
     if isinstance(preference, bool):
         return preference
-    effective = getattr(shell, "telemetry", None)
-    if isinstance(effective, bool):
-        return effective
-    return default_workspace_telemetry()
+    return None
 
 
 def _apply_telemetry_preference_to_shell(shell: Any, raw_value: Any) -> None:
     """Split the loaded ``telemetry`` value into workspace vs effective state.
 
-    ``shell.telemetry`` is the EFFECTIVE state (global opt-out wins), while
-    ``shell.telemetry_workspace_preference`` keeps what this workspace itself
-    recorded so it survives a round-trip through save/load.
+    ``shell.telemetry`` is the EFFECTIVE state (resolved live against the global
+    preference), while ``shell.telemetry_workspace_preference`` keeps what this
+    workspace itself recorded — ``True``/``False`` for an explicit choice, or
+    ``None`` when the key is absent (unset) so the workspace inherits the global
+    preference rather than freezing a value at creation.
     """
     workspace_preference = raw_value if isinstance(raw_value, bool) else None
-    if workspace_preference is None:
-        workspace_preference = default_workspace_telemetry()
     setattr(shell, WORKSPACE_PREFERENCE_ATTR, workspace_preference)
     shell.telemetry = resolve_effective_telemetry(
         load_global_preference(), workspace_preference
@@ -188,7 +194,8 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         "auto": getattr(shell, "auto", False),
         # Persist the WORKSPACE's own preference, not the resolved effective
         # state: a global opt-out must not be written back here as though the
-        # user had disabled telemetry for this engagement specifically.
+        # user had disabled telemetry for this engagement specifically. ``None``
+        # (unset) is dropped below so the workspace keeps inheriting the global.
         "telemetry": _workspace_telemetry_preference_for_save(shell),
         "type": getattr(shell, "type", None),
         "lab_provider": getattr(shell, "lab_provider", None),
@@ -224,11 +231,24 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
             sanitized[domain_key] = domain_data
         workspace_vars["domains_data"] = sanitized
 
+    # An UNSET workspace telemetry preference is represented by the ABSENCE of
+    # the key (not a frozen boolean), so it keeps inheriting the global default.
+    if workspace_vars.get("telemetry") is None:
+        workspace_vars.pop("telemetry", None)
+
     return workspace_vars
 
 
 def collect_domain_variables_from_shell(shell: Any) -> dict[str, Any]:
-    """Collect domain-level variables from the CLI shell instance."""
+    """Collect domain-level variables for the per-domain snapshot file.
+
+    This payload is written to ``<workspace>/domains/<domain>/variables.json`` and
+    is **write-only** — nothing in ADscan loads it back into a shell. It is a
+    flattened point-in-time view (no ``domains_data``, no ``domains``), so it can
+    never serve as the credential store; the workspace-root ``variables.json`` is
+    the single source of truth. The payload carries a ``_snapshot_note`` saying so,
+    because a stale copy of it has already cost a debugging cycle.
+    """
     domain = getattr(shell, "current_domain", None)
     variables: dict[str, Any] = {
         "hosts": getattr(shell, "hosts", None),
@@ -252,14 +272,44 @@ def collect_domain_variables_from_shell(shell: Any) -> dict[str, Any]:
         domain_entry = domains_data.get(domain)
         if isinstance(domain_entry, dict):
             variables.update(domain_entry)
+    # Stamped last so a domain entry can never overwrite it.
+    variables["_snapshot_note"] = DOMAIN_SNAPSHOT_NOTE
     return variables
 
 
-def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) -> None:
+def apply_workspace_variables_to_shell(
+    shell: Any,
+    variables: dict[str, Any],
+    *,
+    reset_missing_to_defaults: bool = False,
+) -> None:
     """Apply loaded workspace variables to the CLI shell instance.
 
     Legacy BloodHound/Neo4j keys are stripped before application so older
     workspaces load cleanly against the current shell schema.
+
+    Args:
+        shell: CLI shell instance to populate.
+        variables: Parsed payload to apply.
+        reset_missing_to_defaults: When ``True``, every schema key absent from
+            ``variables`` is reset to its default. Only a load of a workspace-root
+            ``variables.json`` may ask for this — see below.
+
+    Why the default is ``False``. This helper is a blunt ``setattr`` loop, and the
+    defaults it can apply include ``domains_data={}`` and ``domains=[]`` — the
+    in-memory credential store and domain list for the whole engagement. Applying
+    those defaults from a payload that simply does not carry the keys empties the
+    store in memory, and the next ``save_workspace_data()`` (the hot-path autosave,
+    called from dozens of places) then persists the empty store over the
+    workspace-root ``variables.json``, destroying every captured credential with
+    no way back. That is exactly what happened when a flattened per-domain
+    snapshot was fed in here.
+
+    So a partial payload applies only what it actually carries. A genuine
+    workspace-root load asks for the reset explicitly, because switching
+    workspaces must not leak the previous workspace's state into the new one.
+    Forgetting the flag leaves a stale value behind; passing it wrongly destroys
+    data, so the harmless mistake is the default.
     """
     if isinstance(variables, dict):
         variables, migrated = migrate_legacy_workspace_state(variables)
@@ -308,11 +358,15 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
             continue
         if key in variables:
             setattr(shell, key, variables.get(key))
-        else:
+        elif reset_missing_to_defaults:
             setattr(shell, key, default)
 
     # Telemetry is resolved, not copied: the persisted workspace value is only
-    # one of the two inputs (the global opt-out is the other, and it wins).
+    # one of the two inputs (the global opt-out is the other, and it wins). It is
+    # resolved on every apply regardless of ``reset_missing_to_defaults`` — the
+    # effective state is a live function of the global preference, so leaving a
+    # previous workspace's resolved value in place would be wrong, and a boolean
+    # preference is not part of the data-loss class the flag guards.
     _apply_telemetry_preference_to_shell(shell, variables.get("telemetry"))
 
     domains_data = getattr(shell, "domains_data", None)
@@ -323,6 +377,7 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
 
 
 __all__ = [
+    "DOMAIN_SNAPSHOT_NOTE",
     "apply_workspace_variables_to_shell",
     "collect_domain_variables_from_shell",
     "collect_workspace_variables_from_shell",

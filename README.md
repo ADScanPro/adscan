@@ -14,7 +14,7 @@
 
 **Free active directory pentesting tool for Linux. Replace your AD pentest toolchain with one CLI.**
 
-ADscan is a free Linux CLI for pentesters, red teamers, and security consultants. It covers 104 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. No Windows required.
+ADscan is a free Linux CLI for pentesters, red teamers, and security consultants. It covers 103 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. No Windows required.
 
 **[Docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_cta)** | [Discord](https://discord.com/invite/fXBR3P8H74) | [Website](https://adscanpro.com)
 
@@ -108,7 +108,7 @@ ADscan is not a replacement for every tool in every scenario. It is the fastest 
 
 ## Kerberoasting, ADCS and AD Attack Coverage
 
-ADscan covers 104 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
+ADscan covers 103 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
 
 <table>
 <tr>

@@ -12,8 +12,9 @@ Design goals:
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from adscan_internal import print_info_debug
@@ -30,6 +31,13 @@ class ActiveAttackGraphStep:
     relation: str
     to_label: str
     notes: dict[str, object]
+    #: Identity of the thread that entered this step. The shell is a single
+    #: long-lived object shared with background job runtimes (poisoning,
+    #: cracking), so "an attack step is executing" is only true for the thread
+    #: that entered it. Consumers that INFER something from the active step
+    #: (credential provenance, for instance) must not let a worker thread pick
+    #: up the foreground's step and mis-attribute its own result to it.
+    thread_ident: int = field(default=0)
 
 
 def set_active_step(
@@ -58,6 +66,7 @@ def set_active_step(
         relation=relation,
         to_label=to_label,
         notes=notes or {},
+        thread_ident=threading.get_ident(),
     )
     setattr(shell, "_active_attack_graph_step", payload)
     try:
@@ -71,6 +80,36 @@ def set_active_step(
     except Exception:
         # Logging should never break execution flow.
         pass
+
+
+def get_active_step(shell: Any) -> ActiveAttackGraphStep | None:
+    """Return the attack-graph step executing on THIS thread, if any.
+
+    The single read accessor for the active-step context. Anything that infers
+    a fact from "an attack step is running right now" goes through here rather
+    than reaching for ``shell._active_attack_graph_step`` directly, so the
+    thread-affinity rule cannot be forgotten at a new consumer.
+
+    Returns ``None`` when no step is set, or when the step was entered by a
+    DIFFERENT thread — a background job runtime shares the shell object, and a
+    result it produces has nothing to do with whatever the foreground REPL
+    thread happens to be executing at that moment.
+
+    Args:
+        shell: Shell-like object carrying the runtime context.
+
+    Returns:
+        The active :class:`ActiveAttackGraphStep`, or ``None``.
+    """
+    active = getattr(shell, "_active_attack_graph_step", None)
+    if not isinstance(active, ActiveAttackGraphStep):
+        return None
+    # ``thread_ident`` defaults to 0 only for a step built by hand (older
+    # pickled state, a test fixture). Treat 0 as "unknown thread" and accept it
+    # rather than silently dropping provenance for such a step.
+    if active.thread_ident and active.thread_ident != threading.get_ident():
+        return None
+    return active
 
 
 def clear_active_step(shell: Any) -> None:
@@ -178,6 +217,7 @@ __all__ = [
     "clear_active_step",
     "clear_attack_path_execution",
     "clear_attack_path_followup_context",
+    "get_active_step",
     "get_attack_path_followup_context",
     "get_attack_path_step_context",
     "is_attack_path_execution_active",

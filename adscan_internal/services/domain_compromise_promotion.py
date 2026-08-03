@@ -59,20 +59,31 @@ def is_full_ntds_replicated(shell, domain: str) -> bool:
     return bool((dd.get(domain) or {}).get("dcsync_all_done"))
 
 
-def mark_full_ntds_replicated(shell, domain: str) -> None:
+def mark_full_ntds_replicated(
+    shell, domain: str, *, executed_as: str | None = None
+) -> None:
     """Record that the full NTDS ("all") has been replicated for ``domain``.
 
     Single source of truth for the ``dcsync_all_done`` marker consumed by
     :func:`is_full_ntds_replicated`. Best-effort: never raises.
 
-    A full replication is the authoritative proof that DCSync (GetNCChanges)
-    works against this domain's Domain Controller, so it also reconciles every
-    ``DCSync -> Domain`` attack-graph edge to ``success``. This is what turns a
-    real, completed domain takeover — including one performed by a standalone
-    DCSync run from an already-Domain-Admin context, which never flows through
-    the per-path execution machinery — into ``exploited`` attack-path steps and
-    a domain-compromise verdict in the client report. Without it the report
-    renders a proven takeover as "probed but not fully executed".
+    A full replication also proves the terminal DCSync step of an attack path,
+    so it records the ONE ``DCSync -> Domain`` attack-graph edge the executing
+    principal replicated through. That is what turns a real takeover —
+    including one performed by a standalone DCSync run from an
+    already-Domain-Admin context, which never flows through the per-path
+    execution machinery — into an ``exploited`` attack-path step instead of
+    "probed but not fully executed".
+
+    Args:
+        shell: The ADscan shell instance.
+        domain: Domain key in ``shell.domains_data``.
+        executed_as: The principal ADscan authenticated as to perform the
+            replication. It is what names the edge when no DCSync attack-path
+            step is executing: a replication is evidence only for the grant its
+            executor actually held, so without it nothing is marked (a
+            ``Domain Controllers`` grant ADscan never used is a directory fact,
+            not a demonstrated execution).
     """
     dd = getattr(shell, "domains_data", None)
     if isinstance(dd, dict):
@@ -81,16 +92,15 @@ def mark_full_ntds_replicated(shell, domain: str) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    # Reconcile the attack graph so the proven DCSync is reflected on the
-    # DCSync attack-path steps (SSOT: the edge status in attack_graph.json).
-    # Lazy import — attack_graph_service is a heavy module and importing it at
-    # module load would create an import cycle.
+    # Record the proven DCSync on its own attack-path step (SSOT: the edge
+    # status in attack_graph.json). Lazy import — attack_graph_service is a
+    # heavy module and importing it at module load would create an import cycle.
     try:
         from adscan_internal.services.attack_graph_service import (
-            reconcile_dcsync_edges_after_domain_compromise,
+            record_executed_dcsync_edge,
         )
 
-        reconcile_dcsync_edges_after_domain_compromise(shell, domain)
+        record_executed_dcsync_edge(shell, domain, user=executed_as)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -153,6 +163,7 @@ def promote_to_pwned(
     # 1. Telemetry — match the legacy payload at adscan.py:21931.
     summary_text: str | None = compromise_summary
     try:
+        from adscan_core.lab_context import build_workspace_telemetry_fields
         from adscan_internal.cli.common import build_lab_event_fields
 
         duration_seconds: float | None = None
@@ -168,6 +179,15 @@ def promote_to_pwned(
             "auto": getattr(shell, "auto", None),
             "evidence": str(evidence),
         }
+        # ``type`` is not a safe-listed telemetry string (it arrives
+        # pseudonymized); ``workspace_type`` is what lets a compromise row be
+        # filtered to real audits. Shared normalizer, so the value matches
+        # every other event's audit/ctf split.
+        properties.update(
+            build_workspace_telemetry_fields(
+                workspace_type=getattr(shell, "type", None)
+            )
+        )
         try:
             properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         except Exception as exc:  # noqa: BLE001

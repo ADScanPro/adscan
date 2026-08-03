@@ -603,8 +603,14 @@ def offer_backup_operators_escalation(
                 display.stream_credential(CredentialType.SAM, sam.username, sam.nt_hash)
 
         machine_nt_hash = result.machine_account_nt_hash
+        # The DC named itself over the remote registry during the dump. That
+        # beats the workspace's record of it, and beats the "DC" placeholder,
+        # which would file the hash under an account that does not exist.
+        dc_hostname_final = str(
+            result.computer_name or pdc_hostname or "DC"
+        ).split(".")[0]
         if machine_nt_hash:
-            dc_acct = f"{(pdc_hostname or 'DC').upper()}$"
+            dc_acct = f"{dc_hostname_final.upper()}$"
             display.stream_credential(CredentialType.LSA, dc_acct,
                                       machine_nt_hash, extras="[DC machine account]")
 
@@ -636,7 +642,6 @@ def offer_backup_operators_escalation(
                                       notes={"reason": "no_machine_hash"})
             return False
 
-        dc_hostname_final = pdc_hostname or (pdc_hostname or "DC")
         machine_account = f"{dc_hostname_final.upper()}$"
 
         _mark_backup_ops_success(shell, domain=domain, username=username,

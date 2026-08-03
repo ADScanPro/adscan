@@ -33,6 +33,7 @@ make_global_finding_severity_fn(json_data)
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -47,6 +48,7 @@ from adscan_core.cvss.models import (
     FindingType,
 )
 from adscan_core.cvss.severity_mapper import score_to_severity
+from adscan_core.cvss.vector_score import score_from_vector
 
 
 # ---------------------------------------------------------------------------
@@ -55,15 +57,33 @@ from adscan_core.cvss.severity_mapper import score_to_severity
 
 @dataclass(frozen=True)
 class BaseCvssResult:
-    """Formal CVSS Base output.
+    """The baseline score of a finding, and its formal CVSS Base when it has one.
+
+    Two different numbers live here and only one of them is CVSS:
+
+    * ``score`` is ADscan's own baseline for the finding key, read from the
+      vulnerability catalog. It is the floor the contextual priority overlay
+      builds on. It is **not** a CVSS score and must never be labelled as one.
+    * ``formal_score`` is the CVSS Base score recomputed from ``vector`` per the
+      FIRST v3.1 equations, and is ``None`` for any finding without a Base
+      vector (posture findings, chain prerequisites, and any vulnerability we
+      have not scored formally). A reader can verify it; that is the whole
+      point of calling something CVSS.
+
+    Presenting ``score`` as "CVSS Base" is what let one deliverable print
+    ``CVSS Base 5.0`` above the line "no CVSS Base applies", and print a Base
+    score a reader could falsify against the vector shown beside it. Consumers
+    show a CVSS Base **only** when :attr:`has_formal_base` is true, and use
+    :attr:`formal_score` — never ``score`` — as its value.
 
     Attributes:
         scheme: Scoring scheme name.
         version: CVSS version, e.g. "3.1". ``None`` when no formal vector exists.
-        score: Numeric base score.
-        severity: Severity label mapped from the score.
+        score: ADscan's catalog baseline for the key (the priority floor).
+        severity: Severity label mapped from ``score``.
         vector: CVSS Base vector string, or ``None``.
-        source: Where the base score came from.
+        source: Where the baseline score came from.
+        formal_score: CVSS Base score derived from ``vector``, or ``None``.
     """
 
     scheme: str
@@ -72,6 +92,12 @@ class BaseCvssResult:
     severity: str
     vector: str | None
     source: str
+    formal_score: float | None = None
+
+    @property
+    def has_formal_base(self) -> bool:
+        """Whether this finding has a verifiable CVSS Base score."""
+        return self.formal_score is not None
 
 
 @dataclass(frozen=True)
@@ -127,8 +153,14 @@ class FindingSeverityResult:
     display_severity: str
 
     @property
-    def cvss_base_score(self) -> float:
-        return self.base.score
+    def cvss_base_score(self) -> float | None:
+        """The verifiable CVSS Base score, or ``None`` when there is none."""
+        return self.base.formal_score
+
+    @property
+    def has_formal_cvss_base(self) -> bool:
+        """Whether a CVSS Base score may be shown for this finding."""
+        return self.base.has_formal_base
 
     @property
     def cvss_base_vector(self) -> str | None:
@@ -400,22 +432,29 @@ def compute_base_cvss_result(
     *,
     catalog_base_score: float | None = None,
 ) -> BaseCvssResult:
-    """Return the formal CVSS Base result for a finding type."""
+    """Return the baseline score for a finding key, plus its formal CVSS Base.
+
+    ``score`` stays the catalog baseline the contextual overlay builds on.
+    ``formal_score`` is computed from the finding's Base vector, so it is
+    present only where a vector exists and always agrees with that vector.
+    """
     looked_up_score, source = _base_score_from_catalog(vuln_key)
     base_score = catalog_base_score if catalog_base_score is not None else looked_up_score
 
     definition = get_vuln_cvss_definition(vuln_key)
     cvss_vector = definition.cvss_vector if definition else None
+    formal_score = score_from_vector(cvss_vector)
 
-    version = "3.1" if cvss_vector else None
+    version = "3.1" if formal_score is not None else None
 
     return BaseCvssResult(
         scheme="CVSS",
         version=version,
         score=float(base_score),
         severity=score_to_severity(float(base_score)),
-        vector=cvss_vector,
+        vector=cvss_vector if formal_score is not None else None,
         source="override" if catalog_base_score is not None else source,
+        formal_score=formal_score,
     )
 
 
@@ -552,6 +591,39 @@ def compute_finding_severity(
         display_score=adscan.score,
         display_severity=adscan.severity,
     )
+
+
+def finding_severity_for_record(
+    vuln_key: str,
+    details: Any = None,
+) -> FindingSeverityResult:
+    """Return the severity model for a finding AS THE SCAN RECORDED IT.
+
+    The one call every client-facing surface makes to score a finding it holds
+    the details of: the assessment report's finding cards, the hardening
+    playbook, the security checklist and the compliance sections. It resolves
+    the finding's own context (Tier-0 targets, DC targets, confirmed
+    exploitation) and returns the full model, whose ``display_score`` is the
+    ADscan Priority the deliverable prints.
+
+    Three surfaces used to each build this call themselves, and each drift was
+    the same shape: one document printed the contextual priority (ESC2 at 9.9)
+    while another printed the catalog baseline it is built on (8.5), for the
+    same finding in the same kit. Route new surfaces through here instead of
+    composing ``extract_context_from_details`` + ``compute_finding_severity``
+    again.
+
+    Args:
+        vuln_key: Vulnerability catalog key.
+        details: The finding's recorded details mapping, if any.
+
+    Returns:
+        The finding's :class:`FindingSeverityResult`.
+    """
+    context = extract_context_from_details(
+        vuln_key, dict(details) if isinstance(details, Mapping) else None
+    )
+    return compute_finding_severity(vuln_key, context)
 
 
 # ---------------------------------------------------------------------------

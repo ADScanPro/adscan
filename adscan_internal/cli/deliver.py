@@ -266,6 +266,149 @@ def _resolve_client_meta(args: argparse.Namespace) -> tuple[str, str]:
     return client, engagement
 
 
+class _LogoImportShell:
+    """Minimal shell surface the host file-picker helpers read.
+
+    ``deliver`` runs as a standalone CLI command with no ``PentestShell``, but the
+    host-helper file picker only needs the current workspace directory (to import
+    the picked host file into it) and falls back to the module-level container-
+    runtime check when the shell lacks ``_is_full_adscan_container_runtime``.
+    """
+
+    def __init__(self, workspace_dir: Path) -> None:
+        self.current_workspace_dir = str(workspace_dir)
+
+
+def _pick_client_logo_host_path(workspace_dir: Path) -> str:
+    """Interactively select a client logo from the host, imported into the volume.
+
+    Uses the shared host-helper GUI picker (the same one the cracking wordlist
+    flow uses), then a manual host-path prompt as a fallback, then imports the
+    chosen file into ``<workspace>/branding/`` through the host helper so the
+    container can read it. Returns the container-visible path, or ``""``.
+    """
+    from adscan_internal.cli.host_file_picker import (
+        maybe_import_host_file_to_workspace,
+        select_host_file_via_gui,
+    )
+    from adscan_internal.services.client_logo import (
+        SUPPORTED_LOGO_SUFFIXES,
+        is_supported_logo_suffix,
+    )
+
+    shim = _LogoImportShell(workspace_dir)
+    picked = (
+        select_host_file_via_gui(
+            shim,
+            title="Select the client logo (host file)",
+            initial_dir=str(Path.home()),
+            log_prefix="client_logo",
+        )
+        or ""
+    ).strip()
+    if not picked:
+        try:
+            from questionary import text  # type: ignore[import-untyped]
+
+            picked = (
+                text(
+                    "Client logo — full host path "
+                    f"({', '.join(SUPPORTED_LOGO_SUFFIXES)}), blank to skip:"
+                ).ask()
+                or ""
+            ).strip()
+        except Exception:  # noqa: BLE001
+            picked = ""
+    if not picked:
+        return ""
+    if not is_supported_logo_suffix(picked):
+        print_warning(
+            "Unsupported logo file type; keeping the ADscan mark only. "
+            f"Supported: {', '.join(SUPPORTED_LOGO_SUFFIXES)}."
+        )
+        return ""
+    return (
+        maybe_import_host_file_to_workspace(
+            shim,
+            domain="client",
+            source_path=picked,
+            dest_dir="branding",
+            log_prefix="client_logo",
+        )
+        or ""
+    ).strip()
+
+
+def _prefill_client_logo(args: argparse.Namespace) -> None:
+    """Interactively pick a client logo in the SYNC context (before the loop).
+
+    Like the client/engagement/theme prompts, the host GUI picker and the
+    questionary fallback spin their own prompt_toolkit ``Application`` and must
+    run OUTSIDE ``asyncio.run``'s loop (see :func:`_prefill_interactive_inputs`).
+    Runs only when no ``--client-logo`` flag was given, nothing is persisted yet,
+    and the session is interactive; the chosen container path is written back to
+    ``args.client_logo`` so :func:`_resolve_and_persist_client_logo` persists it.
+    Best-effort: a cosmetic logo never blocks a delivery.
+    """
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    from adscan_internal.services.client_logo import resolve_client_logo_path
+
+    if (getattr(args, "client_logo", None) or "").strip():
+        return
+    if _is_non_interactive():
+        return
+    if resolve_client_logo_path():
+        return
+    try:
+        from adscan_core.rich_output import confirm_ask
+
+        if not confirm_ask("Add a client logo to the report cover?", default=False):
+            return
+        workspace = _resolve_workspace(args)
+        if workspace is None or not workspace.is_dir():
+            return
+        picked = _pick_client_logo_host_path(workspace)
+        if picked:
+            args.client_logo = picked
+    except Exception as exc:  # noqa: BLE001 — cosmetic; never block delivery
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _resolve_and_persist_client_logo(args: argparse.Namespace) -> None:
+    """Persist the resolved client logo for the report cover and later reuse.
+
+    The value comes from the ``--client-logo`` flag (the launcher already staged
+    the file into the mounted volume and forwards a container-visible path) or
+    from :func:`_prefill_client_logo`. It is written to ``config.json`` via the
+    shared SSOT so later ``deliver`` / ``ci`` runs reuse it without re-selecting.
+    This is non-interactive and safe to call from the async delivery path.
+    """
+    from adscan_internal.services.client_logo import (
+        SUPPORTED_LOGO_SUFFIXES,
+        is_supported_logo_suffix,
+        resolve_client_logo_path,
+        save_client_logo_setting,
+    )
+
+    explicit = (getattr(args, "client_logo", None) or "").strip()
+    if not explicit:
+        return
+    if not is_supported_logo_suffix(explicit):
+        print_warning(
+            "Unsupported --client-logo file type; keeping the ADscan mark only. "
+            f"Supported: {', '.join(SUPPORTED_LOGO_SUFFIXES)}."
+        )
+        return
+    save_client_logo_setting(explicit)
+    if resolve_client_logo_path(explicit):
+        print_info("Client logo applied to the report cover.")
+    else:
+        print_warning(
+            "Client logo file was not found; the report keeps the ADscan mark only."
+        )
+
+
 def _parse_only(raw: str | None) -> tuple[_KitItem, ...]:
     """Filter ``_KIT`` by a comma-separated slug list.
 
@@ -1222,7 +1365,24 @@ async def run_deliver(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Reconcile the workspace's findings against its attack graph ONCE, before
+    # anything reads ``technical_report.json`` — the supportability filter below,
+    # the assessment report, the bonuses and the affected-assets appendix all
+    # render in parallel off the same file. The per-save sync during a scan
+    # normally leaves the two artifacts in agreement; this is the backstop for a
+    # workspace produced by an earlier build, so the kit can never ship a
+    # finding count that contradicts the attack paths in the same document.
+    from adscan_internal.services.attack_graph_findings import (
+        reconcile_workspace_attack_graph_findings,
+    )
+
+    reconcile_workspace_attack_graph_findings(str(workspace_dir))
+
     client, engagement = _resolve_client_meta(args)
+
+    # Persist the client logo (flag or picked in the sync prefill) so the report
+    # cover co-brands and later runs reuse it. Best-effort; never blocks delivery.
+    _resolve_and_persist_client_logo(args)
 
     items = _drop_unsupportable_items(items, workspace_dir)
     if not items:
@@ -1402,6 +1562,17 @@ def add_deliver_subparser(
         help="Override the deliverables output directory.",
     )
     parser.add_argument(
+        "--client-logo",
+        dest="client_logo",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Client logo (PNG/SVG/JPG) placed beside the ADscan mark on the "
+            "report cover. Persisted and reused on later runs. The ADscan mark "
+            "is kept; suppressing it (full white-label) is a separate paid tier."
+        ),
+    )
+    parser.add_argument(
         "--only",
         dest="only",
         type=str,
@@ -1509,6 +1680,9 @@ def _prefill_interactive_inputs(args: argparse.Namespace) -> None:
     client, engagement = _resolve_client_meta(args)
     args.client = client
     args.engagement = engagement
+    # Client logo picker (host GUI + manual fallback) — must run here, outside the
+    # event loop, like every other prompt. Sets args.client_logo when picked.
+    _prefill_client_logo(args)
     # Deliverable selection FIRST: a checkbox (everything pre-selected) so the
     # operator can deselect down to e.g. only the Security Assessment Report. An
     # explicit ``--only`` is returned verbatim and never overridden; CI/web run

@@ -152,6 +152,24 @@ def status_label(revert_status: str | None) -> str:
 # the assessment does not hold, so it is always a MANUAL cleanup item.
 KIND_ISSUED_CERTIFICATE = "issued_certificate"
 
+# AD CS ESC5 (CA key theft + offline forge) disclosure kinds.
+#
+# The CA private key copied off the CA host. A signing key outside the client's
+# control is a permanent CA compromise — the only remediation is retiring the
+# key, never a per-object revert, so this is ALWAYS a manual item.
+KIND_CA_PRIVATE_KEY_EXFILTRATED = "ca_private_key_exfiltrated"
+# A certificate forged offline with that stolen key. It has NO enrollment request
+# and NO row in the CA database, so the normal revocation procedure cannot reach
+# it — distinct from ``issued_certificate`` (which the CA did issue and can
+# revoke by request id). Always manual.
+KIND_FORGED_CERTIFICATE = "forged_certificate"
+# The transient Windows service created on the CA host to run the key-backup
+# command, and the temporary key file it writes. Both have a lifecycle: ADscan
+# tries to delete them and marks the record reverted only on a confirmed delete,
+# otherwise manual_required.
+KIND_CA_BACKUP_SERVICE = "ca_backup_service"
+KIND_CA_BACKUP_TEMP_PFX = "ca_backup_temp_pfx"
+
 # ── Change-kind display strings (SSOT) ────────────────────────────────────────
 # Every kind any writer registers needs an entry here, or the client-facing
 # disclosure prints the raw snake_case token. Keep this in step with the
@@ -167,6 +185,10 @@ KIND_DISPLAY: dict[str, str] = {
     "template_mutated": "Certificate template modified",
     "ca_template_enabled": "Certificate template published",
     KIND_ISSUED_CERTIFICATE: "Certificate issued by your CA",
+    KIND_CA_PRIVATE_KEY_EXFILTRATED: "CA private key copied off the CA host",
+    KIND_FORGED_CERTIFICATE: "Forged certificate (outside your CA database)",
+    KIND_CA_BACKUP_SERVICE: "Temporary service on the CA host",
+    KIND_CA_BACKUP_TEMP_PFX: "Temporary key-backup file on the CA host",
     "acl_modified": "ACL modified",
     "shadow_credentials_added": "Shadow credentials",
     "dacl_ace_added": "DACL ACE (GenericAll)",
@@ -304,6 +326,138 @@ MANUAL_ISSUED_CERTIFICATE = (
     "account, reset that account's password once the revocation is confirmed."
 )
 
+# ── AD CS ESC5 (CA key theft + offline forge) remediation templates ───────────
+# The private CA key left the CA host, so no per-object revert exists: the only
+# fix is to retire the compromised key and rebuild trust. Placeholders
+# (CA_IDENTITY / CA_CONFIG) are filled by :func:`ca_private_key_remediation`.
+MANUAL_CA_PRIVATE_KEY_EXFILTRATED = (
+    "The private key of this certification authority (CA_IDENTITY) was copied off the CA "
+    "host during the assessment. A copy of a CA signing key outside your control is a "
+    "permanent compromise of the CA: anyone holding it can forge a certificate for ANY "
+    "identity in the forest — including Domain Admins and domain controllers — that your "
+    "PKI will trust, with no enrollment request and no record in the CA database. Deleting "
+    "files or revoking individual certificates does NOT undo this; the only remediation is "
+    "to retire the compromised key.\n"
+    "  1. Treat this CA's key as compromised and plan a maintenance window: retiring a CA "
+    "certificate invalidates every certificate it issued.\n"
+    "  2. Back up the CA database, then stand up a replacement CA with a NEW key pair — do "
+    "not reuse the key or its backup:\n"
+    '     certutil -config "CA_CONFIG" -backupDB "C:\\CA-DB-Backup"\n'
+    "  3. Retire the compromised CA certificate — revoke it at its parent for a subordinate "
+    "CA, or roll out a new root and trust chain for a root CA — then publish a fresh CRL so "
+    "domain members learn of it:\n"
+    '     certutil -config "CA_CONFIG" -CRL\n'
+    "  4. Remove the old CA certificate from the enterprise NTAuth store and the trusted "
+    "root/intermediate stores once migration is complete, and confirm it is gone:\n"
+    "     certutil -viewdelstore -enterprise NTAuth\n"
+    "  5. Because a forged certificate can carry any identity, once the new PKI is trusted "
+    "reset the krbtgt account password twice and reset the passwords of privileged accounts "
+    "(Domain Admins, Enterprise Admins) and domain controller machine accounts.\n"
+    "Until the compromised key is retired, assume any certificate-based authentication in "
+    "the forest can be spoofed."
+)
+
+# A forged certificate cannot be revoked individually — it is not in the CA
+# database. Placeholders filled by :func:`forged_certificate_remediation`.
+MANUAL_FORGED_CERTIFICATE = (
+    "A certificate was forged offline during the assessment using the compromised CA "
+    "private key, and it authenticates as FORGED_IDENTITY. Because it was signed outside "
+    "the CA, it has NO enrollment request, does NOT appear in the CA database, and the "
+    "normal revocation procedure cannot reach it — there is no request id or database row "
+    "to revoke. Its serial number (SERIAL_NUMBER) was chosen by the assessment.\n"
+    "  1. You cannot revoke this certificate individually. It stays usable for "
+    "authentication until it expires (valid until VALID_UNTIL) OR until the signing CA key "
+    "it was forged with is retired.\n"
+    "  2. Retire the compromised CA key as described in the CA private-key remediation — "
+    "that is the only action that invalidates this forged certificate.\n"
+    "  3. Reset the password of the impersonated account (FORGED_IDENTITY) so any Kerberos "
+    "material already obtained with the forged certificate stops granting access, and "
+    "review Event 4768 (a Kerberos ticket was requested) with a certificate mapping to "
+    "that account from unexpected hosts."
+)
+
+# The transient service used to run the backup. Placeholders filled by
+# :func:`ca_backup_service_remediation`.
+MANUAL_CA_BACKUP_SERVICE = (
+    "A temporary Windows service (SERVICE_NAME) was created on the CA host (CA_HOST) to run "
+    "the key-backup command, and ADscan could not confirm it was removed. Remove it "
+    "manually with local administrator rights on that host:\n"
+    "  1. Confirm it exists:\n"
+    '     Get-Service -ComputerName "CA_HOST" -Name "SERVICE_NAME"\n'
+    "  2. Delete it:\n"
+    '     sc.exe \\\\CA_HOST delete "SERVICE_NAME"\n'
+    "  3. Review Event ID 7045 (a service was installed in the system) on CA_HOST around "
+    "the assessment window and confirm no other unexpected service remains."
+)
+
+# The temporary CA key file written under C:\Windows\Tasks. Placeholders filled
+# by :func:`ca_backup_temp_pfx_remediation`.
+MANUAL_CA_BACKUP_TEMP_PFX = (
+    "The CA private key was written to a temporary file on the CA host during the backup "
+    "(PFX_PATH), protected only by a fixed, publicly-known password, and ADscan could not "
+    "confirm the file was deleted. Anyone who can read it recovers the CA signing key. "
+    "Remove it with local administrator rights on the CA host:\n"
+    "  1. Delete the file (and the parent working directory if present):\n"
+    '     Remove-Item -Path "PFX_PATH" -Force\n'
+    "  2. Search the working directory for any leftover key material:\n"
+    "     Get-ChildItem 'C:\\Windows\\Tasks' -Include *.p12,*.pfx -Recurse\n"
+    "  3. Because the file held the CA signing key under a known password, treat the CA key "
+    "as exposed and follow the CA private-key remediation even if the file is already gone."
+)
+
+
+def _ca_config_string(ca_name: str | None, ca_host: str | None) -> str:
+    """Build the ``host\\CA name`` config string certutil expects."""
+    if ca_host and ca_name:
+        return f"{ca_host}\\{ca_name}"
+    if ca_name:
+        return ca_name
+    return "CA_HOST\\CA_NAME"
+
+
+def ca_private_key_remediation(
+    *,
+    ca_subject: str | None = None,
+    ca_name: str | None = None,
+    ca_host: str | None = None,
+) -> str:
+    """Render the client-facing remediation for an exfiltrated CA private key."""
+    identity = ca_subject or ca_name or (f"the CA on {ca_host}" if ca_host else "this CA")
+    body = MANUAL_CA_PRIVATE_KEY_EXFILTRATED.replace("CA_IDENTITY", identity)
+    return body.replace("CA_CONFIG", _ca_config_string(ca_name, ca_host))
+
+
+def forged_certificate_remediation(
+    *,
+    principal: str | None = None,
+    serial: str | None = None,
+    not_after: str | None = None,
+) -> str:
+    """Render the client-facing remediation for an offline-forged certificate."""
+    body = MANUAL_FORGED_CERTIFICATE.replace(
+        "FORGED_IDENTITY", principal or "an unnamed principal"
+    )
+    body = body.replace("SERIAL_NUMBER", str(serial) if serial else "an assessment-chosen serial")
+    return body.replace("VALID_UNTIL", not_after or "its embedded expiry")
+
+
+def ca_backup_service_remediation(
+    *, service_name: str | None = None, ca_host: str | None = None
+) -> str:
+    """Render the client-facing remediation for the transient CA-backup service."""
+    body = MANUAL_CA_BACKUP_SERVICE.replace(
+        "SERVICE_NAME", service_name or "the temporary service"
+    )
+    return body.replace("CA_HOST", ca_host or "the CA host")
+
+
+def ca_backup_temp_pfx_remediation(*, unc_path: str | None = None) -> str:
+    """Render the client-facing remediation for the temporary CA key file."""
+    return MANUAL_CA_BACKUP_TEMP_PFX.replace(
+        "PFX_PATH", unc_path or "C:\\Windows\\Tasks"
+    )
+
+
 # Per-kind remediation template (raw, with TARGET/SPN/GROUP/MEMBER placeholders).
 KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     "shadow_credentials_added": MANUAL_SHADOW_CREDS,
@@ -317,6 +471,10 @@ KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     "keycredentiallink_added": MANUAL_KEYCREDENTIALLINK,
     "machine_account_created": MANUAL_MACHINE_ACCOUNT,
     KIND_ISSUED_CERTIFICATE: MANUAL_ISSUED_CERTIFICATE,
+    KIND_CA_PRIVATE_KEY_EXFILTRATED: MANUAL_CA_PRIVATE_KEY_EXFILTRATED,
+    KIND_FORGED_CERTIFICATE: MANUAL_FORGED_CERTIFICATE,
+    KIND_CA_BACKUP_SERVICE: MANUAL_CA_BACKUP_SERVICE,
+    KIND_CA_BACKUP_TEMP_PFX: MANUAL_CA_BACKUP_TEMP_PFX,
 }
 
 
@@ -424,6 +582,18 @@ __all__ = [
     "MANUAL_ISSUED_CERTIFICATE",
     "KIND_ISSUED_CERTIFICATE",
     "issued_certificate_remediation",
+    "KIND_CA_PRIVATE_KEY_EXFILTRATED",
+    "KIND_FORGED_CERTIFICATE",
+    "KIND_CA_BACKUP_SERVICE",
+    "KIND_CA_BACKUP_TEMP_PFX",
+    "MANUAL_CA_PRIVATE_KEY_EXFILTRATED",
+    "MANUAL_FORGED_CERTIFICATE",
+    "MANUAL_CA_BACKUP_SERVICE",
+    "MANUAL_CA_BACKUP_TEMP_PFX",
+    "ca_private_key_remediation",
+    "forged_certificate_remediation",
+    "ca_backup_service_remediation",
+    "ca_backup_temp_pfx_remediation",
     "KIND_REMEDIATION_TEMPLATE",
     "remediation_template_for_kind",
 ]

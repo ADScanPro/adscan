@@ -1,20 +1,23 @@
-"""Global (user-scoped) telemetry preference — the opt-out single source of truth.
+"""Telemetry preference — the opt-out single source of truth.
 
-Telemetry consent belongs to the OPERATOR, not to one engagement. Before this
-module the only persisted switch was the per-workspace ``telemetry`` flag in
-``variables.json``: a user who opted out on one engagement was silently
-recorded again on the next workspace, because a freshly created workspace
-defaults to telemetry enabled. That is a consent bug, so the preference now
-lives once, outside any workspace, and a workspace can only be *stricter*.
+Telemetry consent has two scopes, and neither one is a one-way ratchet:
+
+* a **global** preference, recorded once per operator, that new/unset workspaces
+  inherit — set with ``set telemetry <on|off> global``;
+* a **per-workspace** preference for a single engagement — set with
+  ``set telemetry <on|off>`` (no keyword), the default scope.
 
 Resolution rule (see :func:`resolve_effective_telemetry`):
 
-* global OFF wins over everything a workspace says — silence never resolves in
-  the product's favour;
-* a workspace may still switch telemetry off while the global preference is on
-  (a single sensitive engagement);
-* a workspace can never switch telemetry back on when the global preference is
-  off.
+* an **explicit** per-workspace preference always wins, in EITHER direction — a
+  workspace may turn telemetry off while global is on, AND back on while global
+  is off (so a stale global-off can always be recovered per engagement);
+* a workspace with **no** explicit preference inherits the global preference,
+  live (a later change to global reaches every still-unset workspace);
+* when neither scope has a preference, the tier default applies (ON for the
+  Community/PRO tiers — the appliance / air-gapped OFF posture is enforced
+  separately at the telemetry gate via ``ADSCAN_OFFLINE`` and is orthogonal to
+  these REPL scopes).
 
 Storage lives in the ADscan **state** directory (``~/.adscan/state/`` on the
 host, ``/opt/adscan/state/`` in the container). That directory is the
@@ -23,8 +26,12 @@ is bind-mounted into the runtime container, so a preference set inside the
 container survives the container and is visible to the host launcher (and vice
 versa). ``~/.adscan/config.json`` is deliberately NOT used: it is not mounted
 into the container, so a preference written there from a Docker session would
-be discarded when the container exits, which is exactly the class of bug this
-module fixes.
+be discarded when the container exits.
+
+A per-workspace preference is persisted in each workspace's ``variables.json``
+under the ``telemetry`` key. A new workspace records NO explicit value (the key
+is absent / ``null``), so it stays UNSET and inherits the global preference at
+resolution time rather than freezing a boolean at creation.
 """
 
 from __future__ import annotations
@@ -41,13 +48,23 @@ from adscan_core.path_utils import get_adscan_home, get_adscan_state_dir
 #: File name of the persisted global preference, under the state directory.
 PREFERENCE_FILENAME = "telemetry_preference.json"
 
-#: Shell attribute holding the WORKSPACE's own recorded preference, kept apart
-#: from ``shell.telemetry`` (the resolved effective state) so a global opt-out
-#: is never written back into the workspace as if the user had chosen it there.
+#: Shell attribute holding the WORKSPACE's own recorded preference (``True`` /
+#: ``False`` / ``None`` = unset), kept apart from ``shell.telemetry`` (the
+#: resolved effective state) so a global opt-out is never written back into the
+#: workspace as if the user had chosen it there.
 WORKSPACE_PREFERENCE_ATTR = "telemetry_workspace_preference"
 
+#: Tier default when neither scope has recorded a preference. Community/PRO ship
+#: telemetry ON; the appliance / air-gapped OFF posture is enforced upstream at
+#: the telemetry gate (``ADSCAN_OFFLINE`` / ``ADSCAN_TELEMETRY``), not here.
+_TIER_DEFAULT_TELEMETRY = True
+
 _ENABLED_KEY = "enabled"
+_SOURCE_KEY = "source"
 _MIGRATION_KEY = "workspace_migration"
+#: ``source`` value written by the 11.0.0 workspace->global promotion. A record
+#: bearing it is NOT a deliberate global opt-out and is treated as unset.
+_MIGRATION_SOURCE = "workspace_migration"
 
 # Cache key: (resolved path, mtime_ns, size) — the last two are ``None`` when
 # the file is absent. A stat() per read is cheap and keeps an externally edited
@@ -57,17 +74,18 @@ _CACHE: Optional[tuple[tuple[str, Optional[int], Optional[int]], Optional[bool]]
 
 @dataclass(frozen=True)
 class WorkspaceMigrationOutcome:
-    """Result of the one-time per-workspace opt-out migration.
+    """Result of neutralizing the legacy workspace->global opt-out promotion.
 
     Attributes:
-        migrated: True when at least one workspace had telemetry disabled and
-            the global preference was therefore set to off.
-        workspaces: Names of the workspaces that were already opted out.
-        already_checked: True when the migration had already run (or the user
-            had already recorded a global preference), so nothing was scanned.
+        neutralized: True when a stale 11.0.0 promotion record was found and its
+            fake global-off was dropped.
+        workspaces: Names of the workspaces the stale record had listed (their
+            own per-workspace opt-out in ``variables.json`` is left untouched).
+        already_checked: True when there was nothing to undo (no promotion
+            record, or a genuine global preference was in place).
     """
 
-    migrated: bool = False
+    neutralized: bool = False
     workspaces: tuple[str, ...] = field(default_factory=tuple)
     already_checked: bool = False
 
@@ -129,15 +147,30 @@ def _coerce_enabled(document: dict[str, Any]) -> Optional[bool]:
     return None
 
 
+def _global_enabled_from_document(document: dict[str, Any]) -> Optional[bool]:
+    """Effective GLOBAL preference from a raw document.
+
+    A record written by the 11.0.0 workspace->global promotion
+    (``source == "workspace_migration"``) is NOT a deliberate global opt-out —
+    it is treated as UNSET so a per-engagement opt-out never floors telemetry
+    everywhere. Genuine ``set telemetry ... global`` records (source ``cli``)
+    are honoured.
+    """
+    if document.get(_SOURCE_KEY) == _MIGRATION_SOURCE:
+        return None
+    return _coerce_enabled(document)
+
+
 def load_global_preference(*, path: Path | None = None) -> Optional[bool]:
     """Return the persisted global preference.
 
     Returns:
-        ``True``/``False`` when the operator has recorded a preference,
-        ``None`` when they never have (so the product default applies).
+        ``True``/``False`` when the operator has recorded a deliberate global
+        preference, ``None`` when they never have (so the tier default applies).
+        A stale migration-promotion record resolves to ``None``.
     """
     resolved = path or preference_path()
-    return _coerce_enabled(_read_document(resolved))
+    return _global_enabled_from_document(_read_document(resolved))
 
 
 def save_global_preference(
@@ -148,24 +181,26 @@ def save_global_preference(
 ) -> bool:
     """Persist the global telemetry preference. Returns whether the write won.
 
-    Merges into the existing document so the migration marker (and any future
-    key) is preserved. Never raises — a failed write is reported through the
-    return value so the caller can tell the operator the truth instead of
-    claiming an opt-out that was not stored.
+    Merges into the existing document but overwrites ``source`` so a deliberate
+    change (default source ``cli``) supersedes any stale migration marker. Never
+    raises — a failed write is reported through the return value so the caller
+    can tell the operator the truth instead of claiming an opt-out that was not
+    stored.
     """
     resolved = path or preference_path()
     document = _read_document(resolved)
     document[_ENABLED_KEY] = bool(enabled)
-    document["source"] = source
+    document[_SOURCE_KEY] = source
     document["updated_at"] = datetime.now(timezone.utc).isoformat()
     return _write_document(resolved, document)
 
 
 def global_telemetry_disabled(*, path: Path | None = None) -> bool:
-    """Return True when the operator opted out globally.
+    """Return True when the operator has a deliberate global opt-out.
 
     Hot path: consulted on every telemetry gate check, so the parsed value is
-    cached and revalidated with a single ``stat()``.
+    cached and revalidated with a single ``stat()``. A stale migration record
+    is treated as unset (not disabled).
     """
     global _CACHE
     resolved = path or preference_path()
@@ -173,7 +208,7 @@ def global_telemetry_disabled(*, path: Path | None = None) -> bool:
     cached = _CACHE
     if cached is not None and cached[0] == key:
         return cached[1] is False
-    value = _coerce_enabled(_read_document(resolved))
+    value = _global_enabled_from_document(_read_document(resolved))
     _CACHE = (key, value)
     return value is False
 
@@ -184,14 +219,16 @@ def resolve_effective_telemetry(
 ) -> bool:
     """Resolve the effective telemetry state from both scopes.
 
-    Off wins in both directions of *strictness*: a workspace may override the
-    global preference towards OFF, never towards ON.
+    An explicit per-workspace preference wins in EITHER direction (it can turn
+    telemetry off while global is on, and back on while global is off — there is
+    no ratchet). A workspace with no explicit preference inherits the global
+    preference; when global is also unset, the tier default applies.
     """
-    if global_preference is False:
-        return False
-    if workspace_preference is False:
-        return False
-    return True
+    if workspace_preference is not None:
+        return workspace_preference
+    if global_preference is not None:
+        return global_preference
+    return _TIER_DEFAULT_TELEMETRY
 
 
 def effective_telemetry_for_workspace(
@@ -206,12 +243,14 @@ def effective_telemetry_for_workspace(
 
 
 def default_workspace_telemetry(*, path: Path | None = None) -> bool:
-    """Value a NEW workspace should record for its own ``telemetry`` flag.
+    """Effective telemetry a workspace with NO explicit preference resolves to.
 
-    A workspace created while the operator is globally opted out must not be
-    born with telemetry on.
+    This is a LIVE read (global preference or, failing that, the tier default) —
+    it is for display/indicator use, NOT for freezing a boolean into a new
+    workspace. A new workspace stays unset so a later global change still
+    reaches it.
     """
-    return not global_telemetry_disabled(path=path)
+    return resolve_effective_telemetry(load_global_preference(path=path), None)
 
 
 def _workspaces_root(workspaces_dir: Path | None) -> Path:
@@ -252,36 +291,47 @@ def find_opted_out_workspaces(*, workspaces_dir: Path | None = None) -> list[str
 
 def migrate_workspace_opt_out(
     *,
-    workspaces_dir: Path | None = None,
+    workspaces_dir: Path | None = None,  # noqa: ARG001 - kept for call-site parity
     path: Path | None = None,
 ) -> WorkspaceMigrationOutcome:
-    """Promote a pre-existing per-workspace opt-out to the global preference.
+    """Neutralize the legacy 11.0.0 workspace->global opt-out promotion.
 
-    Runs at most once. A user who had already disabled telemetry in a workspace
-    made a consent decision under the old per-workspace semantics; moving the
-    switch to global scope must not silently re-enable them.
+    11.0.0 (never shipped to production) promoted a single per-engagement
+    opt-out to a GLOBAL off, which defeated scoping: opting out of one
+    engagement silenced telemetry everywhere, including brand-new workspaces.
+    Per-workspace opt-outs live in each workspace's ``variables.json`` and are
+    honoured by the resolver directly, so no promotion was ever needed.
+
+    This now only *undoes* a stale promotion: when the persisted global record
+    was written by that migration (``source == "workspace_migration"``), drop
+    its fake global-off while keeping the audit marker so it runs at most once.
+    The affected workspaces keep their own ``variables.json`` opt-out, so their
+    telemetry stays off; every other workspace returns to the tier default.
     """
     resolved = path or preference_path()
     document = _read_document(resolved)
-    if _ENABLED_KEY in document or _MIGRATION_KEY in document:
+    if document.get(_SOURCE_KEY) != _MIGRATION_SOURCE:
         return WorkspaceMigrationOutcome(already_checked=True)
 
-    opted_out = find_opted_out_workspaces(workspaces_dir=workspaces_dir)
-    now = datetime.now(timezone.utc).isoformat()
-    document[_MIGRATION_KEY] = {"completed_at": now, "workspaces": list(opted_out)}
-    if opted_out:
-        document[_ENABLED_KEY] = False
-        document["source"] = "workspace_migration"
-        document["updated_at"] = now
+    marker = document.get(_MIGRATION_KEY)
+    workspaces: tuple[str, ...] = ()
+    if isinstance(marker, dict):
+        listed = marker.get("workspaces")
+        if isinstance(listed, list):
+            workspaces = tuple(str(name) for name in listed)
+
+    document.pop(_ENABLED_KEY, None)
+    document.pop(_SOURCE_KEY, None)
+    document.pop("updated_at", None)
     _write_document(resolved, document)
     return WorkspaceMigrationOutcome(
-        migrated=bool(opted_out), workspaces=tuple(opted_out)
+        neutralized=True, workspaces=workspaces, already_checked=True
     )
 
 
 def notify_workspace_opt_out_migration(outcome: WorkspaceMigrationOutcome) -> None:
-    """Tell the operator once that their opt-out is now global. Best-effort."""
-    if not outcome.migrated:
+    """Tell the operator once that consent is per-workspace again. Best-effort."""
+    if not outcome.neutralized or not outcome.workspaces:
         return
     try:
         from adscan_core.rich_output import print_info
@@ -290,9 +340,10 @@ def notify_workspace_opt_out_migration(outcome: WorkspaceMigrationOutcome) -> No
         if len(outcome.workspaces) > 3:
             names += ", ..."
         print_info(
-            "Telemetry stays off. Your earlier opt-out "
-            f"(workspace: {names}) now applies to every workspace and every "
-            "session. Re-enable it any time with 'set telemetry on'."
+            "Telemetry consent is per-workspace again. Your earlier opt-out "
+            f"(workspace: {names}) still applies to that engagement; other "
+            "workspaces use the default. Opt out everywhere with "
+            "'set telemetry off global'."
         )
     except Exception:  # noqa: BLE001 - a notice must never break startup
         return
@@ -303,7 +354,7 @@ def migrate_and_notify(
     workspaces_dir: Path | None = None,
     path: Path | None = None,
 ) -> WorkspaceMigrationOutcome:
-    """Run the one-time migration and tell the operator when it took effect."""
+    """Run the one-time neutralization and tell the operator when it took effect."""
     try:
         outcome = migrate_workspace_opt_out(workspaces_dir=workspaces_dir, path=path)
     except Exception:  # noqa: BLE001 - never break startup on a preference read

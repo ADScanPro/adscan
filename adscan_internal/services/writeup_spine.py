@@ -79,6 +79,17 @@ from adscan_internal.services.credentials.credential_origin import origin_displa
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.path_state import _PROVEN_STATUSES
 
+# The post-scan seam owns the trigger vocabulary and the per-run bookkeeping for
+# both artifacts, so a spine built by hand and one written automatically are
+# counted on the same axis and neither is produced twice in a run. Safe to
+# import at module level: that module's own reference to this one is lazy,
+# inside the function that generates.
+from adscan_internal.services.post_scan_report import (
+    TRIGGER_REPL_WRITEUP,
+    is_automatic_trigger,
+    remember_post_scan_writeup_path,
+)
+
 # Where a generated spine lands inside the workspace. One directory per run so
 # a second generation never overwrites an edited draft.
 WRITEUP_DIRNAME = "writeups"
@@ -159,7 +170,6 @@ _TECHNIQUE_NAMES: dict[str, str] = {
     "getchanges": "DS-Replication-Get-Changes",
     "getchangesall": "DS-Replication-Get-Changes-All",
     "getchangesinfilteredset": "DS-Replication-Get-Changes-In-Filtered-Set",
-    "goldencert": "Golden Certificate",
     "gppautologon": "GPP autologon password",
     "gppcpassword": "GPP cpassword",
     "gpppassword": "GPP cpassword",
@@ -945,11 +955,15 @@ def _execution_index(
     path_edge_key: dict[str, tuple] = {}
     attempting_stages = {"step_attempting", "path_started"}
     success_stages = {"step_succeeded", "path_completed"}
-    accepted_stages = attempting_stages | success_stages | {
-        "step_failed",
-        "step_blocked",
-        "path_aborted",
-    }
+    accepted_stages = (
+        attempting_stages
+        | success_stages
+        | {
+            "step_failed",
+            "step_blocked",
+            "path_aborted",
+        }
+    )
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -1480,7 +1494,9 @@ def _order_proven_edges(proven: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Every principal a proven edge PRODUCES (control of, or a session on) — an
     # account or a group. A source that appears here is a waypoint the chain
     # reaches, never a starting foothold, so it must not be seeded.
-    produced = {_group_token(e["to_label"]) for e in proven if _group_token(e["to_label"])}
+    produced = {
+        _group_token(e["to_label"]) for e in proven if _group_token(e["to_label"])
+    }
     reached: set[str] = set(_BROAD_GROUP_TOKENS)
     for edge in proven:
         from_tok = _group_token(edge["from_label"])
@@ -2714,9 +2730,18 @@ def _print_ready_panel(artifacts: SpineArtifacts, markers: int) -> None:
 
 
 def generate_writeup_spine(
-    shell: Any, *, output_dir: str | None = None
+    shell: Any,
+    *,
+    output_dir: str | None = None,
+    trigger: str = TRIGGER_REPL_WRITEUP,
 ) -> SpineArtifacts | None:
     """Write the evidence spine for the active workspace and return what it wrote.
+
+    The single instrumented entry point for every spine, so the one number this
+    feature is judged on stays readable: how many writeups exist because ADscan
+    wrote them at the end of a lab scan versus because somebody typed the verb.
+    That is what ``trigger`` records, and it is the same vocabulary the exposure
+    report reports on, so the two artifacts can be compared directly.
 
     Best-effort and never raises: this is a convenience on top of a finished
     scan, so a missing artifact degrades the document rather than failing the
@@ -2726,6 +2751,9 @@ def generate_writeup_spine(
         shell: The active CLI shell (workspace context).
         output_dir: Explicit destination directory. Defaults to a timestamped
             directory under ``<workspace>/writeups/``.
+        trigger: Which on-ramp asked for the spine, one of the ``TRIGGER_*``
+            constants in :mod:`adscan_internal.services.post_scan_report`.
+            Defaults to the operator typing ``writeup``.
 
     Returns:
         The written artifacts, or ``None`` when there was no scan data.
@@ -2801,6 +2829,7 @@ def generate_writeup_spine(
             directory=str(target_dir),
             assets=assets,
         )
+        remember_post_scan_writeup_path(shell, artifacts.markdown_path)
         _print_ready_panel(artifacts, count_write_markers(markdown))
         return artifacts
     except Exception as exc:  # noqa: BLE001 - a convenience must never break a scan
@@ -2811,6 +2840,8 @@ def generate_writeup_spine(
     finally:
         _emit_generated(
             {
+                "trigger": str(trigger),
+                "automatic": is_automatic_trigger(trigger),
                 "success": artifacts is not None,
                 "stage_count": len(inputs.stages) if inputs else 0,
                 "step_count": len(inputs.chain_steps) if inputs else 0,

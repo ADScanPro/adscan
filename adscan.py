@@ -114,8 +114,8 @@ from adscan_internal.reporting_compat import (
 )
 from adscan_internal.session_summary import (
     count_workspace_credentials,
-    get_attack_path_snapshot_metrics,
-    get_attack_path_summary_breakdown,
+    get_attack_path_metrics_for_verdict,
+    resolve_client_path_totals,
     resolve_session_attack_paths_for_summary,
     select_attack_path_verdict,
 )
@@ -818,6 +818,10 @@ def _process_exit_cleanup():
     metadata = _build_command_metadata(shell=shell)
     print_info_debug("[atexit] Uploading session recording from cleanup handler")
     telemetry.capture_session_end(console=TELEMETRY_CONSOLE, metadata=metadata)
+    try:
+        telemetry.drain_telemetry_dispatch()
+    except Exception:  # noqa: BLE001 - best-effort shutdown, never raise
+        pass
     _SESSION_CAPTURE_FINALIZED = True
 
 
@@ -4277,13 +4281,15 @@ def _show_exit_summary(shell) -> str | None:
     """
     victories = getattr(shell, "_session_victories", [])
     session_attack_paths = getattr(shell, "_session_attack_paths_count", 0)
-    attack_paths = resolve_session_attack_paths_for_summary(
+    # One resolver, one projection: the same curated path set the recap panel,
+    # the scan_complete event and the client's report all count.
+    path_totals = resolve_client_path_totals(
         shell, fallback_count=session_attack_paths
     )
+    attack_paths = path_totals.paths_total
     creds = getattr(shell, "_session_credentials_count", 0)
     hashes = getattr(shell, "_session_hashes_count", 0)
     workspace_creds = count_workspace_credentials(shell)
-    path_breakdown = get_attack_path_summary_breakdown(shell)
 
     start_time = getattr(shell, "_session_start_time", None)
     duration_str = ""
@@ -4308,18 +4314,18 @@ def _show_exit_summary(shell) -> str | None:
     if attack_paths:
         s = "s" if attack_paths != 1 else ""
         lines.append(f"[cyan]{attack_paths}[/cyan] attack path{s} identified")
-    theoretical_paths = int(path_breakdown.get("total") or 0)
-    blocked_paths = int(path_breakdown.get("blocked") or 0)
-    unsupported_paths = int(path_breakdown.get("unsupported") or 0)
-    if theoretical_paths and theoretical_paths != attack_paths:
-        suffix_parts = []
-        if blocked_paths:
-            suffix_parts.append(f"{blocked_paths} blocked")
-        if unsupported_paths:
-            suffix_parts.append(f"{unsupported_paths} unsupported")
-        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+    # The split, from the same totals. "Identified" is the inventory word: it
+    # includes avenues the environment's own configuration already closed, which
+    # are a POSITIVE fact and are named as such rather than counted as exposure.
+    reached = path_totals.paths_full_domain_compromise
+    if reached:
+        verb = "reaches" if reached == 1 else "reach"
+        lines.append(f"[dim]{reached} of them {verb} full domain compromise[/dim]")
+    closed = path_totals.paths_closed_by_configuration
+    if closed:
+        s = "s" if closed != 1 else ""
         lines.append(
-            f"[dim]{theoretical_paths} theoretical graph path(s) persisted{suffix}[/dim]"
+            f"[dim]{closed} avenue{s} already closed by your configuration[/dim]"
         )
     if creds:
         s = "s" if creds != 1 else ""
@@ -11023,11 +11029,11 @@ class PentestShell:
         # TTC is in domain_compromise.duration_minutes
         self._session_first_attack_path_time: Optional[float] = None  # TTFAP
         self._session_first_hash_time: Optional[float] = None  # TTFH
-        # Vestigial: never incremented anywhere. The attack-path counts come from
-        # the persisted snapshot SSOT (session_summary.get_attack_path_snapshot_metrics
-        # / select_attack_path_verdict); this attribute survives only as the 0
-        # fallback_count for resolve_session_attack_paths_for_summary. Do NOT
-        # resurrect it as a live counter — the snapshot is the source of truth.
+        # Vestigial: never incremented anywhere. The attack-path counts come
+        # from the counts SSOT (services.attack_path_counts, resolved via
+        # session_summary.resolve_client_path_totals); this attribute survives
+        # only as the 0 fallback_count for that resolver. Do NOT resurrect it as
+        # a live counter — the curated client path set is the source of truth.
         self._session_attack_paths_count: int = 0
         self._session_credentials_count: int = 0  # Total credentials obtained
         self._session_hashes_count: int = 0  # Total hashes extracted
@@ -11035,8 +11041,8 @@ class PentestShell:
         self._session_compromised_users: set[str] = set()
 
         # Scan-level metrics for case studies (reset per scan, not per session)
-        # Note: Attack path metrics are computed from attack_graph.json at scan completion
-        # using _compute_attack_path_metrics() rather than tracked at runtime
+        # Note: attack-path counts are derived from the curated client path set
+        # at scan completion (services.attack_path_counts), not tracked at runtime
         self._scan_first_credential_time: Optional[float] = None  # For scan-level TTFC
         self._scan_compromise_time: Optional[float] = None  # For scan-level TTC
 
@@ -11068,6 +11074,25 @@ class PentestShell:
             print_exception(exception=exc)
             print_info_debug(
                 f"(clock-resync-backstop) arming failed: {type(exc).__name__}: {exc}"
+            )
+
+        # Arm Kerberos ccache renewal ONCE per session. Every transport auth
+        # seam (LDAP, SMB, WinRM) then renews an expired explicit ticket — and
+        # recognises a capability-bearing one that must never be re-minted —
+        # without importing the shell. Without this an attack step handed a
+        # stale ccache dies on KRB_AP_ERR_TKT_EXPIRED even though the
+        # principal's secret is one AS-REQ away in the credential store.
+        try:
+            from adscan_internal.services.kerberos_ccache_renewal import (
+                register_ccache_renewal_for_shell,
+            )
+
+            register_ccache_renewal_for_shell(self)
+        except Exception as exc:  # noqa: BLE001 — arming must not break startup
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"(ccache-renewal) arming failed: {type(exc).__name__}: {exc}"
             )
 
         # Arm the stale-DNS SPN self-heal (dependency-inversion): inject a
@@ -15082,8 +15107,16 @@ class PentestShell:
         content.append(str(snapshot.get("current_workspace")) + "\n", style="white")
         content.append("Telemetry: ", style=f"bold {BRAND_COLORS['info']}")
         enabled = bool(snapshot.get("telemetry_enabled"))
-        suffix = f" ({snapshot.get('telemetry_source', 'persisted')})"
-        content.append(f"{'ON' if enabled else 'OFF'}{suffix}\n", style="white")
+        if enabled:
+            suffix = f" ({snapshot.get('telemetry_source', 'persisted')})"
+            content.append(f"ON{suffix}\n", style="white")
+        else:
+            scope = snapshot.get("telemetry_scope", "default")
+            content.append(f"OFF ({scope})\n", style="white")
+            hint = snapshot.get("telemetry_reenable_hint")
+            if hint:
+                content.append("  Re-enable with: ", style="dim")
+                content.append(f"{hint}\n", style="dim")
 
         content.append("\nDomain Information:\n", style="bold green")
         domain_data_text = self.show_domains_data()
@@ -15266,100 +15299,11 @@ class PentestShell:
 
         workspace_save(self)
 
-    # def do_domain(self, args):
-    #     """Handles domain commands.
-    #     Usage: domain <create|delete|select|show>
-    #     """
-    #     if not args:
-    #         print("Usage: domain <create|delete|select|show>")
-    #         return
-
-    #     command, *sub_args = args.split()
-
-    #     if command == 'create':
-    #         self.domain_create(*sub_args)
-    #     elif command == 'delete':
-    #         self.domain_delete(*sub_args)
-    #     elif command == 'select':
-    #         self.domain_select(*sub_args)
-    #     elif command == 'show':
-    #         self.domain_show()
-    #     elif command == 'save':
-    #         self.domain_save()
-    #     else:
-    #         print_error(f"Command not recognized")
-
     def domain_save(self):
-        """Saves the variables and credentials of the current domain."""
+        """Refreshes the current domain's write-only snapshot file on disk."""
         from adscan_internal.cli.domains import domain_save
 
         domain_save(self)
-
-    def domain_create(self, domain_name):
-        """Creates a new domain in the current directory."""
-        from adscan_internal.cli.domains import domain_create
-
-        domain_create(self, domain_name)
-
-    def domain_delete(self, domain_name):
-        """Deletes an existing domain."""
-        from adscan_internal.cli.domains import domain_delete
-
-        domain_delete(self, domain_name)
-
-    def domain_select(self):
-        """Selects a specific domain."""
-        from adscan_internal.cli.domains import domain_select
-
-        domain_select(self)
-
-    def select_domain_curses(self, stdscr, domains):
-        """Curses function to select a domain."""
-        curses.curs_set(0)  # Hide the cursor
-        stdscr.clear()
-
-        selected_index = 0
-        num_domains = len(domains)
-
-        while True:
-            stdscr.clear()
-            stdscr.addstr(0, 0, "Select a domain using the arrow keys and Enter:\n")
-
-            for idx, ws in enumerate(domains):
-                if idx == selected_index:
-                    stdscr.addstr(idx + 1, 0, f"> {ws}", curses.A_REVERSE)
-                else:
-                    stdscr.addstr(idx + 1, 0, f" {ws}")
-
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == curses.KEY_UP:
-                selected_index = (selected_index - 1) % num_domains
-            elif key == curses.KEY_DOWN:
-                selected_index = (selected_index + 1) % num_domains
-            elif key == curses.KEY_ENTER or key in [10, 13]:
-                from adscan_internal.workspaces import activate_domain
-
-                activate_domain(
-                    self,
-                    workspace_dir=self.current_workspace_dir,
-                    domains_dir_name=self.domains_dir,
-                    domain=domains[selected_index],
-                )
-                self.load_workspace_data(self.current_domain_dir)
-                stdscr.addstr(
-                    num_domains + 2, 0, f"[+] Domain '{self.current_domain}' selected."
-                )
-                stdscr.refresh()
-                stdscr.getch()
-                break
-
-    def domain_show(self):
-        """Displays the available domains."""
-        from adscan_internal.cli.domains import domain_show
-
-        domain_show(self)
 
     def _get_nxc_workspaces_dir(self) -> str:
         """Return the NetExec workspaces directory for the effective user."""
@@ -15820,7 +15764,9 @@ class PentestShell:
         )
         return new_password
 
-    def check_local_creds(self, domain_name, username, cred_value, host, service):
+    def check_local_creds(
+        self, domain_name, username, cred_value, host, service, account_domain=None
+    ):
         from adscan_internal.cli.creds import check_local_creds
 
         return check_local_creds(
@@ -15830,6 +15776,7 @@ class PentestShell:
             cred_value=cred_value,
             host=host,
             service=service,
+            account_domain=account_domain,
         )
 
     def add_credential(
@@ -15847,6 +15794,7 @@ class PentestShell:
         skip_user_privs_enumeration: bool = False,
         verify_credential: bool = True,
         verify_local_credential: bool = True,
+        local_credential_prevalidated: bool = False,
         prompt_local_reuse_after: bool = True,
         ui_silent: bool = False,
         ensure_fresh_kerberos_ticket: bool = True,
@@ -15860,7 +15808,12 @@ class PentestShell:
         metadata=None,
         force_recheck_user_privs: bool = False,
     ):
-        """Add a credential (domain or local) delegating to the CLI helper for reuse."""
+        """Add a credential (domain or local) delegating to the CLI helper for reuse.
+
+        Returns the helper's ``CredentialVerdict`` unchanged, so a caller that
+        must distinguish a proven credential from a candidate (a report finding,
+        for example) can key on it instead of on its own detector's opinion.
+        """
         from adscan_internal.cli.creds import add_credential
 
         return add_credential(
@@ -15877,6 +15830,7 @@ class PentestShell:
             skip_user_privs_enumeration=skip_user_privs_enumeration,
             verify_credential=verify_credential,
             verify_local_credential=verify_local_credential,
+            local_credential_prevalidated=local_credential_prevalidated,
             prompt_local_reuse_after=prompt_local_reuse_after,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
@@ -17336,6 +17290,14 @@ class PentestShell:
                     "workspace_type": getattr(self, "type", None),
                 }
                 properties.update(build_lab_event_fields(shell=self, include_slug=True))
+                # Anonymous workspace identity, same derivation as every other
+                # event: without it estate-size rows can be counted per operator
+                # but never "across N distinct environments".
+                ws_hash = telemetry.compute_workspace_id_hash(
+                    getattr(self, "current_workspace", None)
+                )
+                if ws_hash:
+                    properties["workspace_id_hash"] = ws_hash
                 telemetry.capture("environment_enumerated", properties)
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
@@ -17649,14 +17611,15 @@ class PentestShell:
         # Report CTA and zero-findings diagnostic after scan
         # Hormozi: CTA with "what + why now" at victory (show the stack);
         # Perceived Likelihood when 0 findings (transparency builds credibility)
-        # Verdict is keyed on the PERSISTED snapshot (the SSOT that
-        # ``_show_exit_summary`` also reads), never the legacy in-memory counter
-        # ``_session_attack_paths_count`` — that counter is never incremented, so
-        # keying on it falsely reported EVERY authenticated scan as "hardened"
-        # even when exploited paths existed.
+        # Verdict is keyed on the CURATED client path set — the same projection
+        # ``_show_exit_summary``, the recap panel and the client's report count
+        # (persisted snapshot as the fallback) — never the legacy in-memory
+        # counter ``_session_attack_paths_count``: that counter is never
+        # incremented, so keying on it falsely reported EVERY authenticated scan
+        # as "hardened" even when exploited paths existed.
         _scan_mode = getattr(self, "scan_mode", None)
         _ap_verdict = select_attack_path_verdict(
-            get_attack_path_snapshot_metrics(self, domains=[domain]),
+            get_attack_path_metrics_for_verdict(self, domains=[domain]),
             scan_mode=_scan_mode,
         )
         if _ap_verdict.kind == "exploited":
@@ -18056,12 +18019,29 @@ class PentestShell:
                 self.domains_data.get(domain, {}).get("auth") == "pwned"
             )
 
-            # Compute attack path metrics from the attack graph
-            from adscan_internal.services.attack_graph_service import (
-                compute_attack_path_metrics,
+            # Attack-path cardinalities, from the counts SSOT. The event used to
+            # carry TWO mutually incomparable path denominators under adjacent
+            # names — a raw graph-walk enumeration (`paths_to_tier0`, ~14x the
+            # report's figure on the same workspace) next to the curated
+            # `paths_total_analyzed`. A ratio read against the wrong one is
+            # published-quality wrong. Now every path denominator on this event
+            # comes from the same curated set the client's own report renders.
+            from adscan_internal.services.attack_path_counts import (
+                client_path_totals_for_shell,
             )
 
-            path_metrics = compute_attack_path_metrics(self, domain, max_depth=10)
+            path_totals = client_path_totals_for_shell(self, domain)
+
+            # Field-data convergence + dead-end counts (integers only). Measured
+            # against the SAME finding inventory and the SAME attack-path
+            # projection the client's own report renders, so a published
+            # "share of findings that reach nothing" matches what a customer
+            # counts in their own PDF.
+            from adscan_internal.services.field_convergence_telemetry import (
+                build_field_convergence_properties,
+            )
+
+            convergence = build_field_convergence_properties(self, domain)
 
             lab_slug = self._get_lab_slug()
             properties = {
@@ -18071,12 +18051,6 @@ class PentestShell:
                 "ttfh_minutes": ttfh_minutes,
                 "ttfc_minutes": ttfc_minutes,
                 "ttc_minutes": ttc_minutes,
-                # Attack path metrics (complete paths to Tier 0)
-                "paths_to_tier0": path_metrics.get("paths_to_tier0", 0),
-                "paths_exploited": path_metrics.get("paths_exploited", 0),
-                "paths_partial": path_metrics.get("paths_partial", 0),
-                "paths_not_attempted": path_metrics.get("paths_not_attempted", 0),
-                "paths_by_type": path_metrics.get("paths_by_type", {}),
                 # Finding metrics
                 "credentials_obtained": getattr(self, "_session_credentials_count", 0),
                 "hashes_extracted": getattr(self, "_session_hashes_count", 0),
@@ -18087,6 +18061,8 @@ class PentestShell:
                 "auto_mode": getattr(self, "auto", False),
                 "lab_slug": lab_slug,
             }
+            properties.update(path_totals.telemetry_properties())
+            properties.update(convergence)
             properties.update(
                 build_lab_telemetry_fields(
                     lab_provider=self.lab_provider,
@@ -18096,6 +18072,17 @@ class PentestShell:
                     lab_slug=lab_slug,
                 )
             )
+            # Anonymous workspace identity. Without it the event can only answer
+            # "N audit scans by N operators" — a repeat scan of one client's AD
+            # is indistinguishable from two different clients, which is exactly
+            # the distinction a published "across N audits" figure needs. Same
+            # anonymised derivation every other event uses; the raw workspace
+            # name never leaves the host.
+            ws_hash = telemetry.compute_workspace_id_hash(
+                getattr(self, "current_workspace", None)
+            )
+            if ws_hash:
+                properties["workspace_id_hash"] = ws_hash
 
             telemetry.capture("scan_complete", properties)
         except Exception as exc:
@@ -19307,7 +19294,12 @@ class PentestShell:
                                 found_credentials[user] = password
                                 # Store credentials
                                 self.add_credential(
-                                    domain, user, password, host=host, service="firefox"
+                                    domain,
+                                    user,
+                                    password,
+                                    host=host,
+                                    service="firefox",
+                                    credential_origin="browser_credential_store",
                                 )
 
                     # Display results with professional table
@@ -21720,7 +21712,12 @@ class PentestShell:
                                 f"Previous NT hash from the PDC: {latest_hash}"
                             )
                             self.hash = latest_hash
-                            self.add_credential(domain, user_found, latest_hash)
+                            self.add_credential(
+                                domain,
+                                user_found,
+                                latest_hash,
+                                credential_origin="zerologon",
+                            )
                             self.zerologon_restore("")
                         else:
                             print_warning("Previous history hash not found.")
@@ -22052,6 +22049,7 @@ class PentestShell:
                                     credential_domain,
                                     entry.username,
                                     entry.password,
+                                    credential_origin="gpp_cpassword",
                                 )
                                 continue
 
@@ -22072,6 +22070,7 @@ class PentestShell:
                                         entry.password,
                                         trusted_manual_validation=True,
                                         prompt_for_user_privs_after=False,
+                                        credential_origin="gpp_cpassword",
                                     )
                                     continue
                                 marked_username = mark_sensitive(entry.username, "user")
@@ -22143,6 +22142,7 @@ class PentestShell:
                                 credential_domain,
                                 entry.username,
                                 entry.password,
+                                credential_origin="gpp_autologon",
                             )
                     if found_autologin and domain:
                         try:
@@ -22503,6 +22503,7 @@ class PentestShell:
                 password,
                 source_steps=source_steps,
                 prompt_for_user_privs_after=False,
+                credential_origin="passwordinkeepass",
             )
 
         self._offer_keepass_password_spraying(
@@ -22734,7 +22735,12 @@ class PentestShell:
                         marked_nt_hash = mark_sensitive(nt_hash, "password")
                         print_warning(f"User: {marked_username}")
                         print_warning(f"NT Hash: {marked_nt_hash}")
-                        self.add_credential(domain, username, nt_hash)
+                        self.add_credential(
+                            domain,
+                            username,
+                            nt_hash,
+                            credential_origin="lsass_dump",
+                        )
                 else:
                     print_warning("No valid credentials found in the dump file")
             else:
@@ -25278,7 +25284,7 @@ class PentestShell:
         )
 
     def adcs_golden_cert(self, domain, username, password, ca_target_host=None):
-        """Wrapper for GoldenCert exploitation."""
+        """Wrapper for AD CS ESC5 (CA key theft and certificate forge) exploitation."""
         from adscan_internal.cli.adcs_exploitation import (
             adcs_golden_cert as _adcs_golden_cert,
         )
@@ -25735,6 +25741,7 @@ class PentestShell:
                     target_user,
                     result.nt_hash,
                     prompt_for_user_privs_after=False,
+                    credential_origin="shadow_credentials",
                 )
                 return True
 
@@ -26049,6 +26056,13 @@ class PentestShell:
                     )
 
             if store_credential and result.nt_hash:
+                # No explicit ``credential_origin`` on purpose. Pass-the-Certificate
+                # is reached from ESC1/3/4/7/8/9/13 and the SubCA flow, so this one
+                # call site has no single true origin — only the attack step
+                # running around it does. ``add_credential`` derives it from that
+                # step (see services/credentials/provenance_context.py). Hardcoding
+                # a slug here would attribute every certificate escalation to
+                # whichever one was named.
                 self.add_credential(resolved_domain, result.username, result.nt_hash)
             elif store_credential and not result.nt_hash:
                 # No NT hash (NTLM-disabled / AES-only). Do NOT store a null
@@ -26207,6 +26221,10 @@ class PentestShell:
                     nt_hash = nt_hash_match.group(1)
                     marked_nt_hash = mark_sensitive(nt_hash, "password")
                     print_success(f"NT Hash obtained: {marked_nt_hash}")
+                    # Same reasoning as ptc_certipy: this is the UnPAC-the-hash
+                    # tail of a Pass-the-Certificate reached from whichever ADCS
+                    # escalation is executing, so the origin comes from the active
+                    # attack step rather than a hardcoded slug.
                     self.add_credential(domain, target_user, nt_hash)
                     return True
                 else:
@@ -27316,19 +27334,13 @@ class PentestShell:
             print_error("Usage: validate_attack_graph <domain>")
             return
 
-        try:
-            from adscan_internal.services.report_service import (
-                validate_attack_graph_findings,
-            )
-        except ImportError:
-            print_info(
-                "Attack graph report validation is available with ADscan PRO."
-            )
-            print_info(
-                "Get beta access: "
-                + cta_display_url("beta_access_graph_validation")
-            )
-            return
+        # The correlation check lives in the tier-shared derivation, so it runs
+        # in both builds. It used to be gated behind the PRO report service —
+        # the same gate that silently stopped LITE recording graph findings at
+        # all, which is exactly the state this command exists to detect.
+        from adscan_internal.services.attack_graph_findings import (
+            validate_attack_graph_findings,
+        )
 
         errors = validate_attack_graph_findings(self, target_domain)
         marked_domain = mark_sensitive(target_domain, "domain")
@@ -27654,8 +27666,15 @@ class PentestShell:
         )
         netbios = self.do_extract_netbios(domain)  # Extract NetBIOS
 
+        # Seed the per-domain snapshot. Same contract as save_domain_data(): a
+        # derived, write-only, routinely-stale file. It is never loaded back into
+        # a shell; the workspace-root variables.json is the single source of truth
+        # for domains_data, credentials and the domain list.
+        from adscan_internal.workspaces.state import DOMAIN_SNAPSHOT_NOTE
+
         # Inherit parent workspace variables, but with the 'domain' variable customized
         sub_workspace_variables = {
+            "_snapshot_note": DOMAIN_SNAPSHOT_NOTE,
             "hosts": self.hosts,
             "myip": self.myip,
             "interface": self.interface,
@@ -30485,7 +30504,13 @@ class PentestShell:
         # Filter the files and folders to delete
         items_to_delete = [item for item in items if item not in protected_files]
 
-        # Delete files and folders
+        # Delete files and folders. A partial failure — typically root-owned
+        # workspace artifacts left behind by a container run (PermissionError /
+        # EACCES) — must be reported honestly: name each item that could not be
+        # removed and summarise the count, instead of surfacing a bare repeated
+        # generic error. This changes only the reporting, never what is deleted.
+        failed_items: list[str] = []
+        permission_denied = False
         for item in items_to_delete:
             item_path = os.path.join(current_dir, item)
 
@@ -30494,9 +30519,18 @@ class PentestShell:
                     os.remove(item_path)  # Delete file
                 elif os.path.isdir(item_path):
                     shutil.rmtree(item_path)  # Delete folder and its contents
+            except PermissionError as e:
+                telemetry.capture_exception(e)
+                permission_denied = True
+                failed_items.append(item)
+                print_warning(
+                    f"Could not remove {mark_sensitive(item, 'path')} (permission denied)."
+                )
+                print_exception(show_locals=False, exception=e)
             except Exception as e:
                 telemetry.capture_exception(e)
-                print_error("Error deleting {item}.")
+                failed_items.append(item)
+                print_warning(f"Could not remove {mark_sensitive(item, 'path')}.")
                 print_exception(show_locals=False, exception=e)
 
         # Reset the authentication values for each domain
@@ -30510,7 +30544,19 @@ class PentestShell:
         self.domain = None
         self.domains.clear()
         self.domains_data = {}
-        print_success("Workspace cleared.")
+        if failed_items:
+            reason = "permission denied" if permission_denied else "unremovable"
+            hint = (
+                "re-run with elevated privileges or remove them manually"
+                if permission_denied
+                else "check the workspace and retry"
+            )
+            print_warning(
+                f"{len(failed_items)} item(s) could not be removed ({reason}) — {hint}."
+            )
+            print_success("Workspace cleared (partial).")
+        else:
+            print_success("Workspace cleared.")
 
     def do_clear_auths(self, arg):
         """
@@ -30786,6 +30832,16 @@ class PentestShell:
             session_summary.update(build_session_compromise_metadata(self))
             session_summary.update(build_session_ad_scale_metadata(self))
             telemetry.capture("session_end", session_summary)
+
+        # Bounded drain of the fire-and-forget telemetry dispatcher so a slow
+        # proxy at shutdown can never hang the CLI. Undrained sends fall back to
+        # the on-disk queue for next-run retry.
+        try:
+            telemetry.drain_telemetry_dispatch()
+        except Exception as exc:  # noqa: BLE001
+            print_info_debug(
+                f"(telemetry) exit drain failed: {type(exc).__name__}: {exc}"
+            )
 
         _SESSION_CAPTURE_FINALIZED = True
         self._restore_ntp_service()
@@ -32001,6 +32057,16 @@ def add_ci_subparser(subparsers):
         dest="display_name",
         default=None,
         help="Client-facing name shown on the report cover (e.g. the web workspace name).",
+    )
+    ci_parser.add_argument(
+        "--client-logo",
+        dest="client_logo",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Client logo (PNG/SVG/JPG) placed beside the ADscan mark on the "
+            "report cover; persisted and reused on later runs."
+        ),
     )
     return ci_parser
 

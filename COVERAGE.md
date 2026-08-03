@@ -19,7 +19,7 @@ catalog and regenerate.
 
 <!-- BEGIN GENERATED: technique-inventory -->
 
-**104 techniques** across 14 categories · 70 executed end to end · AD CS ESC1–ESC17 · 77 reported finding types.
+**103 techniques** across 14 categories · 70 executed end to end · AD CS ESC1–ESC17 · 79 reported finding types.
 
 ### ACL / ACE Abuse (18)
 
@@ -43,7 +43,7 @@ catalog and regenerate.
 | Write SPN | Set SPN to force kerberoastable ticket generation | Executed | [T1558.003](https://attack.mitre.org/techniques/T1558/003/) |
 | WriteDACL | Rewrite ACLs to grant further privileges | Executed | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) |
 | WriteOwner | Take ownership to unlock privilege escalation | Executed | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) |
-### AD CS — Certificate Services (18)
+### AD CS — Certificate Services (17)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
@@ -58,13 +58,12 @@ catalog and regenerate.
 | AD CS ESC2 | ADCS ESC2 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC3 | Use enrollment agent cert to request impersonation certs | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC4 | Modify template permissions/configuration for abuse | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
-| AD CS ESC5 | ADCS ESC5 privilege escalation path | Detected | [T1649](https://attack.mitre.org/techniques/T1649/) |
+| AD CS ESC5 — Vulnerable PKI Object Access Control | ADCS ESC5 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC6 | ADCS ESC6 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC7 | ADCS ESC7 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC8 | ADCS ESC8 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC9 | ADCS ESC9 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | Coerce and Relay NTLM to AD CS (ESC8) | Coerce NTLM authentication and relay it to ADCS endpoints | Executed | [T1187](https://attack.mitre.org/techniques/T1187/) |
-| Golden Certificate (CA Key Theft) | Certificate authority compromise persistence path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 ### Authentication Coercion (3)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |

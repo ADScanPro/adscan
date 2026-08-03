@@ -774,6 +774,15 @@ def _build_parser() -> argparse.ArgumentParser:
                 "--report-theme", dest="ws_report_theme", default="",
                 help="Legacy alias for --theme (kept for back-compat).",
             )
+            _deliv_p.add_argument(
+                "--client-logo", dest="ws_client_logo", default=None,
+                metavar="PATH",
+                help=(
+                    "Client logo (PNG/SVG/JPG) placed beside the ADscan mark on "
+                    "the report cover. Copied into ~/.adscan and reused on later "
+                    "runs. The ADscan mark stays; full white-label is a paid tier."
+                ),
+            )
 
     upd = sub.add_parser(
         "update", help="Update the launcher (pip) and pull the latest ADscan image"
@@ -1150,6 +1159,110 @@ def _ci_scan_config_from_flags(
     extra_env = [("ADSCAN_SCAN_CONFIG", _CI_SCAN_CONFIG_CONTAINER_PATH)]
     extra_mounts = [(resolved, _CI_SCAN_CONFIG_CONTAINER_PATH)]
     return extra_env, extra_mounts, cleaned
+
+
+# Accepted client-logo suffixes. The AUTHORITATIVE set lives in the container SSOT
+# ``adscan_internal.services.client_logo.SUPPORTED_LOGO_SUFFIXES``; the launcher
+# (host-only, must not import ``adscan_internal``) keeps this small mirror purely
+# to reject an obviously-wrong file before copying it into the volume. The
+# container re-validates.
+_CLIENT_LOGO_SUFFIXES: tuple[str, ...] = (".png", ".svg", ".jpg", ".jpeg", ".gif", ".webp")
+
+#: Sub-directory under the ADscan home where a staged client logo is copied. Must
+#: match ``adscan_internal.services.client_logo.CLIENT_LOGO_DIRNAME``.
+_CLIENT_LOGO_DIRNAME = "branding"
+
+
+def _stage_client_logo(host_path: str) -> str | None:
+    """Copy a host client-logo file into the mounted ``~/.adscan`` volume.
+
+    The report renders INSIDE the container, which can only read the operator's
+    logo if it lives under the bind-mounted ADscan home. This copies the selected
+    host file to ``~/.adscan/branding/<name>`` (host side) and returns the path
+    RELATIVE to the ADscan home (e.g. ``branding/acme.png``). The container joins
+    that against its own ADscan home (``/opt/adscan``), so the one value stays
+    valid across the host/container path split — the launcher never hardcodes a
+    container path.
+
+    Args:
+        host_path: Path to the logo on the host filesystem.
+
+    Returns:
+        The home-relative POSIX path to forward to the container, or ``None`` when
+        the file is missing or of an unsupported type (a warning is printed; a
+        cosmetic logo never aborts the command).
+    """
+    import shutil
+
+    from adscan_core.paths import get_adscan_home_dir
+
+    resolved = os.path.abspath(os.path.expanduser(str(host_path)))
+    if not os.path.isfile(resolved):
+        print_error(f"Client logo file not found: {resolved}")
+        return None
+    suffix = Path(resolved).suffix.lower()
+    if suffix not in _CLIENT_LOGO_SUFFIXES:
+        print_error(
+            f"Unsupported client logo type '{suffix}'. "
+            f"Supported: {', '.join(_CLIENT_LOGO_SUFFIXES)}."
+        )
+        return None
+    try:
+        dest_dir = get_adscan_home_dir() / _CLIENT_LOGO_DIRNAME
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_name = Path(resolved).name
+        dest_path = dest_dir / dest_name
+        shutil.copyfile(resolved, dest_path)
+    except OSError as exc:
+        print_error(f"Could not stage the client logo into the ADscan volume: {exc}")
+        return None
+    return f"{_CLIENT_LOGO_DIRNAME}/{dest_name}"
+
+
+def _ci_client_logo_from_flags(
+    ns: argparse.Namespace, passthrough: list[str]
+) -> list[str]:
+    """Stage a ``--client-logo`` host file and rewrite it to a container path.
+
+    ``ci`` forwards its arguments verbatim through ``argparse.REMAINDER``, so a
+    ``--client-logo <host-path>`` the operator typed carries a HOST path the
+    container cannot read. This copies the file into the mounted volume
+    (:func:`_stage_client_logo`) and substitutes the home-relative container path
+    back into the passthrough, so the container's ``ci`` parser receives a value
+    it can resolve. An unstageable value is dropped with a warning.
+
+    Both the parsed namespace attribute (when the flag preceded the positional)
+    and the raw passthrough list are inspected, mirroring
+    :func:`_ci_scan_config_from_flags`.
+    """
+    host_path = getattr(ns, "client_logo", None)
+
+    cleaned: list[str] = []
+    index = 0
+    tokens = list(passthrough)
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--client-logo":
+            if index + 1 < len(tokens):
+                host_path = tokens[index + 1]
+                index += 2
+                continue
+            print_error("--client-logo requires a file path argument.")
+            raise SystemExit(2)
+        if token.startswith("--client-logo="):
+            host_path = token.split("=", 1)[1]
+            index += 1
+            continue
+        cleaned.append(token)
+        index += 1
+
+    if not host_path:
+        return cleaned
+
+    staged = _stage_client_logo(str(host_path))
+    if staged:
+        cleaned.extend(["--client-logo", staged])
+    return cleaned
 
 
 def _apply_host_posture_env(ns: argparse.Namespace, raw_argv: list[str]) -> None:
@@ -2182,6 +2295,10 @@ def main(argv: list[str] | None = None) -> None:
         scan_config_env, scan_config_mounts, passthrough = _ci_scan_config_from_flags(
             ns, passthrough
         )
+        # Copy a --client-logo host file into the mounted volume and rewrite the
+        # flag to the container-visible path, so the post-scan report co-brands
+        # its cover. Consumed at the seam, like --scan-config.
+        passthrough = _ci_client_logo_from_flags(ns, passthrough)
         ci_extra_env = list(posture_env) + list(scan_config_env)
         raise SystemExit(
             _run_host_command_with_session_capture(
@@ -2261,6 +2378,14 @@ def main(argv: list[str] | None = None) -> None:
             ws_report_theme = getattr(ns, "ws_report_theme", "") or ""
             if ws_report_theme:
                 deliv_args.extend(["--report-theme", str(ws_report_theme)])
+            # Copy the host logo into the mounted volume and forward the
+            # container-visible path, so the report cover co-brands and later
+            # runs reuse it.
+            ws_client_logo = getattr(ns, "ws_client_logo", None)
+            if ws_client_logo:
+                staged_logo = _stage_client_logo(str(ws_client_logo))
+                if staged_logo:
+                    deliv_args.extend(["--client-logo", staged_logo])
         # ``mitre-navigator``-specific flags. Distinct ``nav_*`` dests so the
         # navigator's directory ``--output`` and boolean flags never clash
         # with the PDF deliverables' ``output_path``/``no_open``/``no_render``.

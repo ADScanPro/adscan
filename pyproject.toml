@@ -64,6 +64,13 @@ dev = [
     # ``thread`` method so the timeout works regardless of whether the
     # test is blocked on Python or in a C-level call.
     "pytest-timeout>=2.3,<3.0",
+    # pytest-xdist distributes the unit suite across worker processes. The
+    # suite is ~13k tests and takes about ten minutes in one process, which is
+    # too long to run before every commit and far too long to run on every
+    # push to an active branch. Across the cores of a normal dev machine it is
+    # about a hundred seconds, which is short enough to be both. See
+    # pytest.ini for why the split is `--dist loadfile` and why it is a default.
+    "pytest-xdist>=3.6,<4.0",
     "PyYAML>=6.0,<7.0",
     "ruff>=0.9.0,<1.0",
     "build>=1.2.0,<2.0",

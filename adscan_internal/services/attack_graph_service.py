@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Iterator, cast
 
 from adscan_internal import telemetry
-from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info,
@@ -31,6 +30,8 @@ from adscan_internal.workspaces import domain_subpath, read_json_file, write_jso
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
 from adscan_internal.services import attack_graph_core, attack_paths_core
+from adscan_internal.services import attack_path_progress
+from adscan_internal.services.attack_graph_findings import sync_attack_graph_findings
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
     is_dependency_only_tier_zero_group,
@@ -60,6 +61,7 @@ from adscan_internal.services.attack_step_support_registry import (
 )
 from adscan_internal.services.attack_step_catalog import (
     build_step_knowledge,
+    classify_edge_relation,
     derive_step_display_status,
     get_exploitation_relation_vuln_keys,
     normalize_execution_relation,
@@ -152,7 +154,6 @@ ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS = os.getenv(
     "ADSCAN_ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-_REPORT_SYNC_FN: Callable[[object, str, dict[str, Any]], None] | None | bool = None
 _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED = True
 _EVERYONE_SID = "S-1-1-0"
 _AUTHENTICATED_USERS_SID = "S-1-5-11"
@@ -215,6 +216,38 @@ def suppress_dev_engine_picker() -> Iterator[None]:
         yield
     finally:
         _SUPPRESS_DEV_ENGINE_PICKER.reset(token)
+
+
+# Carries the engine/parallelism selection resolved BEFORE the compute enters a
+# LiveSession alt-screen. When set, ``_ask_or_get_attack_path_engine`` returns
+# it without prompting, so the dev pickers never fire from inside the compute
+# (where the alt-screen hides the prompt and hangs the run until Ctrl-C).
+_PRESELECTED_DEV_ENGINE: ContextVar[tuple[str, int] | None] = ContextVar(
+    "_preselected_dev_engine", default=None
+)
+
+
+@contextmanager
+def preselect_dev_engine_for_display(shell: object) -> Iterator[None]:
+    """Resolve the dev engine/parallelism selection ONCE, before a LiveSession.
+
+    The attack-path compute runs inside a ``LiveSession`` alt-screen. In dev
+    mode the engine/parallelism questionary pickers fire from deep inside the
+    compute (``_ask_or_get_attack_path_engine`` at the DFS entry) — but the
+    alt-screen hides the prompt, so the compute hangs waiting for input that
+    never arrives (only Ctrl-C cancels it, then it falls back to defaults). This
+    resolves the selection HERE, while the terminal is still normal (prompt
+    visible + answerable), stashes it in a ContextVar, and the in-compute picker
+    returns the stashed value without prompting again. In production (non-dev)
+    this resolves ``("local", 0)`` without prompting, so it is a no-op there.
+    Re-entrant / asyncio-safe (ContextVar-backed).
+    """
+    engine_workers = _ask_or_get_attack_path_engine(shell)
+    token = _PRESELECTED_DEV_ENGINE.set(engine_workers)
+    try:
+        yield
+    finally:
+        _PRESELECTED_DEV_ENGINE.reset(token)
 
 
 def _maybe_print_attack_paths_summary_debug(
@@ -3176,12 +3209,12 @@ def _normalize_relation_key(value: str) -> str:
 
 
 def _classify_edge_relation(relation: str) -> tuple[str, str | None]:
-    """Return (category, vuln_key) for a relation."""
-    relation_key = _normalize_relation_key(relation)
-    vuln_key = EXPLOITATION_EDGE_VULN_KEYS.get(relation_key)
-    if vuln_key:
-        return "exploitation", vuln_key
-    return "relationship", None
+    """Return (category, vuln_key) for a relation.
+
+    Thin alias over the catalog SSOT :func:`classify_edge_relation`, kept because
+    several call sites in this module already read this private name.
+    """
+    return classify_edge_relation(relation)
 
 
 def _writable_attribute_report_path(
@@ -5101,6 +5134,26 @@ def _edge_has_tier0_source(
        edges so chains can form.
     """
     relation_lc = str(relation or "").strip().lower()
+    # A self-loop MSSQL SYSTEM-escalation proof step (MssqlSeImpersonateEscalation
+    # / MssqlTokenTheftEscalation) recorded ON a Tier-0 DC is NOT "you already own
+    # the domain" lateral noise: it is the coupled step that PROVES
+    # ``NT AUTHORITY\SYSTEM`` (= the DC machine account) was reached, and it is
+    # exactly what the direct-DCSync overlay (F6, attack_graph_core.
+    # _build_implicit_dc_dcsync_overlay) couples onto to render the
+    # domain-compromise terminal. Pruning it as a Tier-0 source edge would strip
+    # the escalation step AND its DCSync follow-up, leaving the path dead at a
+    # Tier-0 foothold with the KPI reading 0. Keep the self-loop proof step.
+    from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
+        grants_host_system_session,
+    )
+
+    if (
+        from_id
+        and to_id
+        and str(from_id).strip() == str(to_id).strip()
+        and grants_host_system_session(relation_lc)
+    ):
+        return False
     is_cross_forest_lateral = relation_lc in _CROSS_FOREST_LATERAL_RELATIONS
     # Cross-forest lateral relations (MssqlLinkedServerLateral) carry
     # support_kind=context so the DFS/execution loop treats them as a pass-through
@@ -6729,13 +6782,21 @@ def _policy_blocked_edge_notes(
     if verdict.hard_blocked:
         return {
             "blocked_kind": "dangerous_destructive",
-            "reason": verdict.client_safe_reason or support.reason,
+            # Both keys carry the SAME authored, client-facing sentence — never
+            # ``support.reason``, which is the catalog's engineering-register
+            # note and must not reach a deliverable.
+            "reason": verdict.client_safe_reason,
             "client_safe_reason": verdict.client_safe_reason,
             "exec_support": "policy_blocked",
         }
+    # Opt-in-only (not hard-blocked). ``support.reason`` is the catalog's
+    # engineering-register note, so the authored client-facing sentence from the
+    # classifier is stamped alongside it — the deliverable renders
+    # ``client_safe_reason`` and never the internal note.
     return {
         "blocked_kind": "dangerous",
         "reason": support.reason,
+        "client_safe_reason": verdict.client_safe_reason,
         "exec_support": "policy_blocked",
     }
 
@@ -6792,11 +6853,152 @@ def _classify_edge_execution_support(
     return base_support
 
 
+def _desired_exec_support_state(
+    graph: dict[str, Any],
+    *,
+    relation: str,
+    to_id: str,
+) -> tuple[str, dict[str, Any]]:
+    """Return the ``(status, notes)`` the execution-support classifier wants.
+
+    The one definition of "can ADscan run this relation, and if not, why" that
+    the persistence seam and the version reconcile both apply, so a graph saved
+    in the session that discovered an edge and the same graph reopened later
+    cannot disagree about it.
+    """
+    support = _classify_edge_execution_support(graph, relation=relation, to_id=to_id)
+    version = getattr(telemetry, "VERSION", "unknown")
+    notes: dict[str, Any] = {
+        "exec_support": support.kind,
+        "exec_support_version": version,
+    }
+    if support.kind == "policy_blocked":
+        notes.update(
+            _policy_blocked_edge_notes(
+                graph, relation=relation, to_id=to_id, support=support
+            )
+        )
+        return "blocked", notes
+    if support.kind == "unsupported":
+        notes.update(
+            {
+                "blocked_kind": "unsupported",
+                "reason": support.reason,
+                "exec_support": "unsupported",
+            }
+        )
+        return "unsupported", notes
+    return "discovered", notes
+
+
+#: Statuses that mean "nothing has been decided about this edge yet", so the
+#: persistence seam may stamp the execution-support verdict over them.
+#: ``theoretical`` is here because it is a PATH display token that raw builders
+#: borrowed as an edge placeholder — the reconcile has always overwritten it, and
+#: an edge left on it reads to the client as a live, runnable avenue.
+#: Everything else — ``success`` / ``attempted`` / ``failed`` / ``error`` /
+#: ``unavailable`` (execution outcomes), ``closed_by_configuration`` (the client's
+#: own hardening) and a safety ``blocked`` — is a verdict the seam must never
+#: touch.
+_UNDECIDED_EDGE_STATUSES: frozenset[str] = frozenset({"", "discovered", "theoretical"})
+
+
+def classify_graph_edges(graph: dict[str, Any]) -> int:
+    """Give every edge the classification the canonical writer would have given it.
+
+    Classification is a property of *persisting* the document, not of whichever
+    writer happened to build the edge. :func:`upsert_edge` classifies what it
+    creates, but a writer that appends a dict to ``graph["edges"]`` directly does
+    not — and two of them (the CVE scanner's derived-edge inserter and the NTLMv1
+    relay builder) shipped noPac, PrintNightmare and the whole NTLMv1 family with
+    no ``category`` and no execution-support verdict. The finding derivation
+    filters on ``category == "exploitation"``, so it never saw them at all;
+    ``CrackNTLMv1`` additionally sat on its builder's ``theoretical`` placeholder,
+    which reads as a live avenue when the technique has no crack backend at all.
+    Running both stamps here means no writer can persist a half-classified edge.
+
+    Two stamps, with different rules:
+
+    * ``category`` / ``vuln_key`` — a pure function of the relation, so it is
+      re-derived for EVERY edge on every save and always agrees with the catalog.
+      Cheap, and it also corrects a key a since-renamed catalog entry left stale.
+    * execution support — applied ONLY to an **exploitation** edge that carries no
+      ``exec_support`` note yet AND whose status is still undecided
+      (:data:`_UNDECIDED_EDGE_STATUSES`). Exploitation is the exact set the
+      finding derivation and the exposure gate read, and restricting the stamp to
+      it keeps the seam from rewriting the notes of every ``MemberOf`` /
+      ``GenericAll`` edge in a large directory. It is one-shot per edge and
+      normally does nothing: an edge from ``upsert_edge`` already carries the
+      note, and an execution outcome or a configuration close is never overwritten.
+
+    The stamp is deliberately NOT the version reconcile
+    (:func:`refresh_attack_graph_execution_support`), which re-evaluates edges
+    that ALREADY carry a verdict so an upgraded ADscan can open a technique it
+    now supports. That is a version concern and stays on the reopen path; this is
+    a persistence concern and only ever fills a blank.
+
+    O(E) over a dict this same call already sorts and serializes, so it costs
+    nothing measurable next to the save it is part of — unlike the load-time
+    backstop, which is gated precisely because it charges a read-only path for
+    the same pass.
+
+    Args:
+        graph: The attack graph about to be written.
+
+    Returns:
+        How many edges were stamped.
+    """
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return 0
+    changed = 0
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip()
+        if not relation:
+            continue
+        category, vuln_key = classify_edge_relation(relation)
+        if edge.get("category") != category or edge.get("vuln_key") != vuln_key:
+            edge["category"] = category
+            edge["vuln_key"] = vuln_key
+            changed += 1
+
+        if category != "exploitation":
+            continue
+        notes = edge.get("notes")
+        notes = notes if isinstance(notes, dict) else {}
+        if notes.get("exec_support"):
+            continue
+        if (
+            str(edge.get("status") or "").strip().lower()
+            not in _UNDECIDED_EDGE_STATUSES
+        ):
+            continue
+        desired_status, desired_notes = _desired_exec_support_state(
+            graph, relation=relation, to_id=str(edge.get("to") or "")
+        )
+        edge["status"] = desired_status
+        notes.update(desired_notes)
+        edge["notes"] = notes
+        changed += 1
+    return changed
+
+
 def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None:
-    """Persist the attack graph to disk with stable formatting."""
+    """Persist the attack graph to disk with stable formatting.
+
+    The ONE writer of ``domains/<domain>/attack_graph.json``. Everything a
+    persisted graph must be true of lives here — edge classification, the Tier-0
+    source prune, stable edge ordering, an atomic write, cache invalidation and
+    the technical-findings sync — so a caller that appends edges by hand inherits
+    all of it by persisting through this function instead of serializing the file
+    itself. Locked by ``tests/unit/services/test_attack_graph_write_seam.py``.
+    """
     graph["schema_version"] = ATTACK_GRAPH_SCHEMA_VERSION
     graph["domain"] = domain
     graph["generated_at"] = _utc_now_iso()
+    classify_graph_edges(graph)
     _prune_tier0_source_attack_edges(graph)
     _flush_tier0_source_attack_edge_skip_summary(graph)
     path = _graph_path(shell, domain)
@@ -6886,32 +7088,22 @@ def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
 def _sync_attack_graph_findings_best_effort(
     shell: object, domain: str, graph: dict[str, Any]
 ) -> None:
-    """Sync findings when report service is available.
+    """Materialize this graph's exploitation edges as technical findings.
 
-    Lite/private runtime images may omit report_service. Cache that availability
-    so we avoid repeated import failures on every graph save.
+    The derivation lives in the LITE-safe
+    :mod:`adscan_internal.services.attack_graph_findings`, so it ships in BOTH
+    images and runs on every graph save regardless of tier. It used to be loaded
+    through the optional PRO report-service seam, which meant a LITE runtime
+    cached it as unavailable and recorded no graph-derived finding at all — do
+    not reintroduce an optional-import gate here.
+
+    Best-effort: a failure never breaks the graph save.
     """
-    global _REPORT_SYNC_FN  # noqa: PLW0603
-
-    if _REPORT_SYNC_FN is False:
-        return
-
-    if _REPORT_SYNC_FN is None:
-        sync_attack_graph_findings = load_optional_report_service_attr(
-            "sync_attack_graph_findings",
-            action="Technical findings sync",
-            debug_printer=print_info_debug,
-            prefix="[attack_graph]",
-        )
-        if not callable(sync_attack_graph_findings):
-            _REPORT_SYNC_FN = False
-            return
-        _REPORT_SYNC_FN = sync_attack_graph_findings
-
     try:
-        assert callable(_REPORT_SYNC_FN)
-        _REPORT_SYNC_FN(shell, domain, graph)
+        sync_attack_graph_findings(shell, domain, graph)
     except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
         print_info_debug(
             f"[attack_graph] Failed to sync technical findings: {type(exc).__name__}: {exc}"
         )
@@ -6942,7 +7134,6 @@ def refresh_attack_graph_execution_support(
     to_unsupported = 0
     to_discovered = 0
     metadata_updated = 0
-    version = getattr(telemetry, "VERSION", "unknown")
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -6994,35 +7185,11 @@ def refresh_attack_graph_execution_support(
             ):
                 continue
 
-        support = _classify_edge_execution_support(
+        desired_status, desired_notes = _desired_exec_support_state(
             graph,
             relation=relation,
             to_id=str(edge.get("to") or ""),
         )
-        desired_status = "discovered"
-        desired_notes: dict[str, Any] = {
-            "exec_support": support.kind,
-            "exec_support_version": version,
-        }
-        if support.kind == "policy_blocked":
-            desired_status = "blocked"
-            desired_notes.update(
-                _policy_blocked_edge_notes(
-                    graph,
-                    relation=relation,
-                    to_id=str(edge.get("to") or ""),
-                    support=support,
-                )
-            )
-        elif support.kind == "unsupported":
-            desired_status = "unsupported"
-            desired_notes.update(
-                {
-                    "blocked_kind": "unsupported",
-                    "reason": support.reason,
-                    "exec_support": "unsupported",
-                }
-            )
 
         if desired_status != current_status:
             edge["status"] = desired_status
@@ -8545,8 +8712,8 @@ def update_edge_status_by_labels(
     """Update an edge status by matching node labels (best-effort).
 
     This is used by interactive CLI flows where we only have display labels.
-    Note: Attack path metrics are computed from the persisted graph at scan completion
-    using compute_attack_path_metrics() rather than tracked at runtime.
+    Note: attack-path counts are derived from the curated client path set at scan
+    completion (``services.attack_path_counts``) rather than tracked at runtime.
     """
     graph = load_attack_graph(shell, domain)
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -8648,46 +8815,86 @@ def update_edge_status_by_labels(
     return True
 
 
-def reconcile_dcsync_edges_after_domain_compromise(
-    shell: object,
-    domain: str,
+#: Note key recording the principal ADscan authenticated as when it performed a
+#: replication. Distinguishes an edge proven by an observed execution from one
+#: that merely describes who holds replication rights.
+_DCSYNC_EXECUTED_AS_NOTE = "dcsync_executed_as"
+
+
+def _dcsync_grant_exercised_by(
+    graph: dict[str, Any],
     *,
-    user: str | None = None,
-) -> int:
-    """Mark every ``DCSync -> Domain`` edge ``success`` after a proven DCSync.
+    user: str,
+) -> tuple[str, str] | None:
+    """Return the ``(from_label, to_label)`` of the DCSync grant ``user`` used.
 
-    Called when ADscan has replicated the domain's credential database from the
-    Domain Controller (a full NTDS "all" DCSync / krbtgt extraction — the
-    authoritative ``dcsync_all_done`` signal). The GetNCChanges replication
-    ADscan performed proves the *terminal* DCSync technique against the DC, so
-    every ``DCSync -> Domain`` edge — whichever principal it is sourced from —
-    now represents a proven replication capability rather than a theoretical
-    one.
+    A ``DCSync -> Domain`` edge answers one of two very different questions.
+    Either ADscan authenticated as a principal covered by that grant and pulled
+    the directory through it, or the directory simply grants some principal
+    replication rights — canonically ``Domain Controllers``, which holds them
+    because replicating is what the group is for. Only the first is evidence.
 
-    This deliberately reconciles only the DCSync edge (the terminal step). It
-    does NOT touch the earlier control-acquisition edges of any path, so a path
-    is still rendered ``exploited`` only when its full chain is proven — the
-    fix reflects "DCSync works against this domain's DC", it does not fabricate
-    a whole attack path. Without it, a domain compromised via a standalone
-    DCSync run (e.g. from an already-Domain-Admin context) leaves its
-    attack-path DCSync steps stuck at ``attempted``/``discovered`` and no path
-    transitions to domain compromise, so the client report contradicts its own
-    "domain compromised" headline.
+    Which grant authorised a replication is decided by the executing
+    principal's Kerberos token: its own SID plus every group SID it transitively
+    belongs to. An edge sourced from inside that token was exercised; anything
+    else was not. Group expansion reuses the cycle-safe, depth-capped SID
+    closure SSOT (:func:`build_sid_group_closure`) over the graph's own
+    ``MemberOf`` edges, so the ids compare directly against an edge's ``from``.
 
-    Best-effort: never raises. Returns the number of edges updated.
+    Only EXISTING ``DCSync -> Domain`` edges are considered, and exactly one is
+    returned. Both matter: the caller feeds the labels to
+    :func:`update_edge_status_by_labels`, which would otherwise CREATE an edge
+    that the directory never granted; and when a token happens to cover two
+    grants, one replication is evidence for one of them, so claiming both would
+    reintroduce the inflation this resolution exists to remove. A grant on the
+    principal's own account wins over a grant it inherits from a group, then
+    node id, so the choice is stable across runs.
+
+    Args:
+        graph: The loaded attack graph.
+        user: The principal ADscan authenticated as (sAMAccountName, UPN or
+            ``DOMAIN\\user`` — resolved alias-aware).
+
+    Returns:
+        The endpoint labels of the exercised grant, or ``None`` when the
+        principal does not resolve in this graph (a foreign principal reaching
+        in over a trust) or holds no DCSync edge onto the domain.
     """
-    try:
-        graph = load_attack_graph(shell, domain)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return 0
-    if not isinstance(graph, dict):
-        return 0
-    nodes = graph.get("nodes")
-    edges = graph.get("edges")
-    if not isinstance(nodes, dict) or not isinstance(edges, list):
-        return 0
+    from adscan_internal.services.collector.share_ntfs_verification import (
+        build_sid_group_closure,
+    )
+
+    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    if not nodes or not edges:
+        return None
+
+    candidates = resolve_graph_node_candidates(nodes, user)
+    if not candidates:
+        return None
+    # An AD graph legitimately renders several objects under one label (a
+    # CertTemplate named after the account it was cloned for, say), and only an
+    # account can carry a Kerberos token.
+    seed = next(
+        (
+            node_id
+            for node_id in candidates
+            if str((nodes.get(node_id) or {}).get("kind") or "")
+            in {"User", "Computer", "Group", "ManagedServiceAccount"}
+        ),
+        candidates[0],
+    )
+    seed_key = seed.upper()
+
+    member_of = [
+        (str(edge.get("from") or ""), str(edge.get("to") or ""))
+        for edge in edges
+        if isinstance(edge, dict)
+        and _normalize_relation_key(edge.get("relation")) == "memberof"
+    ]
+    token_scope = {seed_key} | set(
+        build_sid_group_closure(member_of).get(seed_key, frozenset())
+    )
 
     domain_node_ids = {
         node_id
@@ -8695,10 +8902,9 @@ def reconcile_dcsync_edges_after_domain_compromise(
         if isinstance(node, dict) and _node_is_domain(node)
     }
     if not domain_node_ids:
-        return 0
+        return None
 
-    updated = 0
-    now = _utc_now_iso()
+    matches: list[tuple[int, str, str, str]] = []
     for edge in edges:
         if not isinstance(edge, dict):
             continue
@@ -8707,30 +8913,150 @@ def reconcile_dcsync_edges_after_domain_compromise(
         to_id = str(edge.get("to") or edge.get("to_id") or "")
         if to_id not in domain_node_ids:
             continue
-        if str(edge.get("status") or "").strip().lower() == "success":
+        from_id = str(edge.get("from") or edge.get("from_id") or "")
+        if from_id.upper() not in token_scope:
             continue
-        edge["status"] = "success"
-        edge["last_seen"] = now
-        notes = edge.get("notes")
-        if not isinstance(notes, dict):
-            notes = {}
-            edge["notes"] = notes
-        notes["reconciled_from"] = "domain_compromise_dcsync"
-        # The synthetic DC-bridge carries ``theoretical: True`` to model an
-        # unexecuted replication; a proven DCSync is no longer theoretical.
-        if notes.get("theoretical") is True:
-            notes["theoretical"] = False
-        if user and not notes.get("user"):
-            notes["user"] = user
-        updated += 1
-
-    if updated:
-        save_attack_graph(shell, domain, graph)
-        print_info_debug(
-            "[attack-graph] Reconciled DCSync edges after domain compromise: "
-            f"domain={mark_sensitive(domain, 'domain')} edges={updated}"
+        from_label = str((nodes.get(from_id) or {}).get("label") or "").strip()
+        to_label = str((nodes.get(to_id) or {}).get("label") or "").strip()
+        if not from_label or not to_label:
+            continue
+        matches.append(
+            (0 if from_id.upper() == seed_key else 1, from_id, from_label, to_label)
         )
-    return updated
+
+    if not matches:
+        return None
+    matches.sort()
+    _, _, best_from_label, best_to_label = matches[0]
+    if len(matches) > 1:
+        print_info_debug(
+            "attack-graph: the replicating principal holds several DCSync grants; "
+            "one replication proves one grant, so recording only "
+            f"{mark_sensitive(best_from_label, 'node')} "
+            f"(candidates={len(matches)})."
+        )
+    return best_from_label, best_to_label
+
+
+def record_executed_dcsync_edge(
+    shell: object,
+    domain: str,
+    *,
+    user: str | None = None,
+) -> bool:
+    """Mark the one ``DCSync -> Domain`` edge ADscan actually replicated through.
+
+    Called when ADscan has replicated the domain's credential database from the
+    Domain Controller (a full NTDS "all" walk — the authoritative
+    ``dcsync_all_done`` signal). A DCSync driven by the attack-path executor
+    marks its own edge like any other step; this exists for the replication that
+    does NOT flow through that machinery — the post-compromise "all" dump from
+    an already-Domain-Admin context. Without it that takeover leaves its
+    terminal DCSync step at ``discovered`` and the client report contradicts its
+    own "domain compromised" headline.
+
+    DCSync is recorded exactly like every other attack step: one execution marks
+    the one edge it executed, through the shared per-edge seam
+    (:func:`update_edge_status_by_labels`, matching on
+    ``(from_label, relation, to_label)``). It does NOT sweep the relation. A
+    ``Domain Controllers -> DCSync -> <domain>`` edge stays as collected —
+    replication rights that group holds by design, real exposure worth
+    reporting, but not something ADscan demonstrated — and becomes ``success``
+    only if a step is ever executed from there. Presenting it otherwise reuses
+    one replication as several and attributes a step to a principal ADscan never
+    authenticated as, which costs more than the missing status it was fixing:
+    proof is the whole claim.
+
+    Naming the edge is the only work this function adds over the seam. When a
+    DCSync step is executing, its own context already names it. Otherwise the
+    grant is resolved from the executing principal's token
+    (:func:`_dcsync_grant_exercised_by`), because a standalone replication has
+    no step context to name an edge with.
+
+    Best-effort: never raises.
+
+    Args:
+        shell: The ADscan shell instance.
+        domain: Domain whose directory was replicated.
+        user: The principal ADscan authenticated as. Without it, and with no
+            active DCSync step, nothing is recorded — a replication can only be
+            evidence for the grant its executor actually held.
+
+    Returns:
+        ``True`` when an edge was recorded.
+    """
+    executing_user = str(user or "").strip()
+    notes: dict[str, Any] = {
+        # The synthetic DC-bridge models an unexecuted replication as
+        # ``theoretical``; the one we just performed no longer is.
+        "theoretical": False,
+    }
+    if executing_user:
+        notes["user"] = executing_user
+        notes[_DCSYNC_EXECUTED_AS_NOTE] = executing_user
+
+    # A DCSync attack-path step names its own edge — the same context every
+    # other step marks itself through, and more authoritative than any
+    # after-the-fact attribution.
+    try:
+        from adscan_internal.services.attack_graph_runtime_service import (
+            get_active_step,
+            update_active_step_status,
+        )
+
+        active = get_active_step(shell)
+        if (
+            active is not None
+            and active.domain == domain
+            and _normalize_relation_key(active.relation) == "dcsync"
+        ):
+            return bool(
+                update_active_step_status(
+                    shell, domain=domain, status="success", notes=notes
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    if not executing_user:
+        print_info_debug(
+            "attack-graph: DCSync replication recorded without an executing "
+            f"principal for domain={mark_sensitive(domain, 'domain')} — no edge "
+            "can be attributed, so none is marked."
+        )
+        return False
+
+    try:
+        graph = load_attack_graph(shell, domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+    if not isinstance(graph, dict):
+        return False
+
+    exercised = _dcsync_grant_exercised_by(graph, user=executing_user)
+    if exercised is None:
+        print_info_debug(
+            "attack-graph: no DCSync grant in this domain's graph is covered by "
+            f"the replicating principal: domain={mark_sensitive(domain, 'domain')} "
+            f"user={mark_sensitive(executing_user, 'user')} — leaving every DCSync "
+            "edge as collected rather than crediting a principal ADscan never "
+            "authenticated as."
+        )
+        return False
+
+    from_label, to_label = exercised
+    return update_edge_status_by_labels(
+        shell,
+        domain,
+        from_label=from_label,
+        relation="DCSync",
+        to_label=to_label,
+        status="success",
+        notes=notes,
+    )
 
 
 def get_node_by_label(
@@ -8910,7 +9236,6 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         }
         if relation_key.startswith("adcs") or relation_key in {
             "coerceandrelayntlmtoadcs",
-            "goldencert",
         }:
             step_details.setdefault(
                 "templates_summary",
@@ -13183,6 +13508,19 @@ def _apply_local_postprocessing_pipeline(
         _build_recursive_membership_closure(domain, snapshot) if snapshot else None
     )
 
+    # Surface pipeline progress (stage + counts + timing) to any registered
+    # observer. No-op when none is registered — the compute is unchanged; see
+    # ``attack_path_progress``. Record the raw path count and graph size before
+    # any filtering so the progress panel and the ``attack_path_compute_performance``
+    # telemetry event both start from the true totals.
+    _base_nodes = _base_graph.get("nodes") if isinstance(_base_graph, dict) else None
+    _base_edges = _base_graph.get("edges") if isinstance(_base_graph, dict) else None
+    attack_path_progress.notify_graph_size(
+        len(_base_nodes) if isinstance(_base_nodes, (list, dict)) else 0,
+        len(_base_edges) if isinstance(_base_edges, (list, dict)) else 0,
+    )
+    attack_path_progress.notify_stage("raw", len(records))
+
     # Log scope / rule matrix (mirrors BH CE pipeline header).
     _apply_leading = display_friendly and (
         scope == "domain" or (scope in {"owned", "principals"} and _is_multi)
@@ -13218,6 +13556,10 @@ def _apply_local_postprocessing_pipeline(
             f"(records={len(current_records)})"
         )
         _stage_mark[0] = now
+        # Surface the stage boundary to the progress observer (no-op when none
+        # is registered). This is the same seam the debug log uses — it does not
+        # alter the records or the compute.
+        attack_path_progress.notify_stage(label, len(current_records))
 
     scope_filtered_records: list[dict[str, Any]] = []
     scope_terminal_removed = 0
@@ -14530,6 +14872,14 @@ def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
         ``"rustworkx"`` and dev_workers is the worker count override
         (-1 = auto, 0 = sequential, used only for this computation).
     """
+    # A selection pre-resolved by ``preselect_dev_engine_for_display`` (called
+    # BEFORE the LiveSession alt-screen) short-circuits the pickers so they never
+    # fire from inside the compute, where the alt-screen would hide the prompt and
+    # hang the run. See that context manager for the rationale.
+    _preselected = _PRESELECTED_DEV_ENGINE.get()
+    if _preselected is not None:
+        return _preselected
+
     # In production (non-dev) always use local DFS in sequential mode.
     is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
     if not is_dev:
@@ -15425,203 +15775,3 @@ def compute_display_paths_for_principals(
     )
     _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
     return records
-
-
-def compute_attack_path_metrics(
-    shell: object,
-    domain: str,
-    *,
-    max_depth: int = 10,
-) -> dict[str, Any]:
-    """Compute attack path metrics for case studies.
-
-    This function analyzes the attack graph to compute metrics about complete
-    attack paths to Tier 0 targets, suitable for case study reports.
-
-    Args:
-        shell: Shell instance for loading the attack graph.
-        domain: Domain to analyze.
-        max_depth: Maximum path depth to consider.
-
-    Returns:
-        Dictionary with path metrics:
-        - paths_to_tier0: Total complete paths found
-        - paths_exploited: Paths where all steps succeeded
-        - paths_partial: Paths where exploitation was attempted but incomplete
-        - paths_not_attempted: Paths discovered but not executed
-        - paths_by_type: Breakdown by attack type (adcs, kerberos, acl, etc.)
-    """
-    try:
-        graph = load_attack_graph(shell, domain)
-        if not graph:
-            return _empty_path_metrics()
-
-        # Compute maximal paths to Tier 0
-        paths = compute_maximal_attack_paths(
-            graph,
-            max_depth=max_depth,
-            target="highvalue",
-            terminal_mode="domain",
-        )
-
-        if not paths:
-            return _empty_path_metrics()
-
-        # Analyze each path
-        paths_exploited = 0
-        paths_partial = 0
-        paths_not_attempted = 0
-        paths_by_type: dict[str, dict[str, int]] = {}
-
-        # Context relations that don't count as executable steps
-        context_relations = _CONTEXT_RELATIONS_LOWER
-
-        for path in paths:
-            # Get executable steps (exclude context relations like MemberOf)
-            executable_steps = [
-                s
-                for s in path.steps
-                if isinstance(getattr(s, "relation", None), str)
-                and str(s.relation).strip().lower() not in context_relations
-            ]
-
-            if not executable_steps:
-                continue
-
-            # Determine path status
-            statuses = [
-                s.status.lower()
-                if isinstance(s.status, str) and s.status
-                else "discovered"
-                for s in executable_steps
-            ]
-
-            if all(s == "success" for s in statuses):
-                path_status = "exploited"
-                paths_exploited += 1
-            elif any(
-                s in {"attempted", "failed", "error", "success"} for s in statuses
-            ):
-                path_status = "partial"
-                paths_partial += 1
-            else:
-                path_status = "not_attempted"
-                paths_not_attempted += 1
-
-            # Determine path type from primary relation
-            path_type = _determine_path_type(executable_steps)
-
-            # Track by type
-            if path_type not in paths_by_type:
-                paths_by_type[path_type] = {
-                    "found": 0,
-                    "exploited": 0,
-                    "partial": 0,
-                    "not_attempted": 0,
-                }
-            paths_by_type[path_type]["found"] += 1
-            paths_by_type[path_type][path_status] += 1
-
-        return {
-            "paths_to_tier0": len(paths),
-            "paths_exploited": paths_exploited,
-            "paths_partial": paths_partial,
-            "paths_not_attempted": paths_not_attempted,
-            "paths_by_type": paths_by_type,
-        }
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return _empty_path_metrics()
-
-
-def _empty_path_metrics() -> dict[str, Any]:
-    """Return empty path metrics structure."""
-    return {
-        "paths_to_tier0": 0,
-        "paths_exploited": 0,
-        "paths_partial": 0,
-        "paths_not_attempted": 0,
-        "paths_by_type": {},
-    }
-
-
-def _determine_path_type(steps: list[AttackPathStep]) -> str:
-    """Determine the primary type of an attack path from its steps.
-
-    The type is determined by the most significant relation in the path:
-    - ADCS relations take precedence (ESC1, ESC3, etc.)
-    - Then Kerberos (kerberoasting, asreproasting)
-    - Then delegation
-    - Then DCSync
-    - Then ACL
-    - Then access
-    - Otherwise "other"
-    """
-    relations = [
-        str(s.relation).strip().lower()
-        for s in steps
-        if isinstance(getattr(s, "relation", None), str)
-    ]
-
-    # Check for ADCS
-    adcs_relations = {
-        "adcsesc1",
-        "adcsesc3",
-        "adcsesc4",
-        "adcsesc6",
-        "adcsesc8",
-        "adcsesc9",
-        "adcsesc10",
-    }
-    if any(r in adcs_relations for r in relations):
-        return "adcs"
-
-    # Check for Kerberos
-    kerberos_relations = {"kerberoasting", "asreproasting"}
-    if any(r in kerberos_relations for r in relations):
-        return "kerberos"
-
-    # Check for delegation
-    delegation_relations = {
-        "allowedtodelegate",
-        "coercetotgt",
-        "allowedtoactonbehalfofotheridentity",
-    }
-    if any(r in delegation_relations for r in relations):
-        return "delegation"
-
-    # Check for DCSync
-    dcsync_relations = {
-        "dcsync",
-        "getchanges",
-        "getchangesall",
-        "getchangesinfilteredset",
-    }
-    if any(r in dcsync_relations for r in relations):
-        return "dcsync"
-
-    # Check for ACL
-    acl_relations = {
-        "genericall",
-        "genericwrite",
-        "writedacl",
-        "writeowner",
-        "owns",
-        "forcechangepassword",
-        "addmember",
-        "addself",
-        "writespn",
-        "addkeycreatentiallink",
-        "readlapspassword",
-        "readgmsapassword",
-    }
-    if any(r in acl_relations for r in relations):
-        return "acl"
-
-    # Check for access
-    access_relations = {"adminto", "canrdp", "canpsremote", "executedcom"}
-    if any(r in access_relations for r in relations):
-        return "access"
-
-    return "other"

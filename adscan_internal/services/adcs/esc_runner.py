@@ -10,7 +10,6 @@ from adscan_internal.services.adcs.esc_preflight import (
 )
 from adscan_internal.services.adcs.esc_enrollment import (
     run_esc2,
-    run_esc5,
     run_esc6,
     run_esc13,
     run_esc15,
@@ -32,8 +31,10 @@ async def run_esc(config: EscConfig) -> EscResult:
         return await run_esc2(config)
     if n == 4:
         return await run_esc4(config)
-    if n == 5:
-        return await run_esc5(config)
+    # ESC5 (CA-key theft + offline forge) is dispatched to the working
+    # adcs_golden_cert implementation from the attack-path executor, not through
+    # this enrollment runner. It stays gated behind ledger disclosure — see
+    # esc_enrollment.py and BACKLOG.md § "ESC5 (CA key theft + offline forge)".
     if n == 6:
         return await run_esc6(config)
     if n == 7:

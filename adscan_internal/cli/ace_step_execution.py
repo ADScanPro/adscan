@@ -231,7 +231,434 @@ def _pick_execution_user(
     return None
 
 
-def _resolve_execution_user_with_source(
+# Well-known SIDs that are NOT enumerable member-list groups — every
+# authenticated principal is effectively a member. A source step whose principal
+# is one of these is controlled by ANY owned principal, so there is no member set
+# to intersect. Domain Users / Domain Computers are deliberately NOT here: they
+# carry real member lists (the membership SSOT merges the implicit primary-group
+# membership) and resolve through the normal group-member intersection.
+_WELLKNOWN_ALL_PRINCIPALS_STEMS: frozenset[str] = frozenset(
+    {
+        "everyone",
+        "authenticated users",
+        "users",
+    }
+)
+
+
+def _source_label_stem(from_label: str | None) -> str:
+    """Return the lowercased ``DOMAIN\\``-stripped, ``@realm``-stripped stem."""
+    raw = str(from_label or "").strip()
+    if "\\" in raw:
+        raw = raw.split("\\", 1)[1]
+    if "@" in raw:
+        raw = raw.split("@", 1)[0]
+    return raw.strip().lower()
+
+
+# Domain-wide broad groups whose membership is EVERY domain principal of the
+# relevant type. Unlike the well-known SIDs above these DO carry a real member
+# list (the membership SSOT merges the implicit primary-group), so when that list
+# is available it is authoritative. They matter only for the INDETERMINATE case:
+# when no membership snapshot is available, a missing list must NOT over-block a
+# legitimate Domain Users step — every owned domain principal is a member. A
+# NON-broad group (Administrators, Domain Admins) with the same indeterminate
+# state stays locked, because a false "actionable" on a Tier-0 group is the
+# dangerous direction.
+_BROAD_DOMAIN_SOURCE_STEMS: frozenset[str] = _WELLKNOWN_ALL_PRINCIPALS_STEMS | frozenset(
+    {
+        "domain users",
+        "domain computers",
+    }
+)
+
+
+def is_wellknown_all_principals_source(from_label: str | None) -> bool:
+    """Return whether ``from_label`` is a well-known "all principals" SID group.
+
+    These (Everyone / Authenticated Users / BUILTIN Users) are not enumerable
+    member-list groups: every authenticated principal is a member, so any owned
+    principal legitimately acts as the source.
+    """
+    return _source_label_stem(from_label) in _WELLKNOWN_ALL_PRINCIPALS_STEMS
+
+
+def is_broad_domain_source(from_label: str | None) -> bool:
+    """Return whether ``from_label`` is a broad domain-wide group.
+
+    The well-known "all principals" SIDs PLUS Domain Users / Domain Computers.
+    Used only as an INDETERMINATE-membership fallback: any owned principal is a
+    member of one of these, so a missing snapshot must not over-block it.
+    """
+    return _source_label_stem(from_label) in _BROAD_DOMAIN_SOURCE_STEMS
+
+
+def source_ownership_bucket(relation: str | None) -> str:
+    """Classify how a step's SOURCE principal must be controlled to act.
+
+    Returns:
+        ``"carry_forward"`` — a post-exploitation technique chained off a prior
+        access edge (``EdgeKind.DERIVED``: DumpLSA/DumpSAM/xp_cmdshell/linked-
+        server/token-theft/coercion/…). The acting credential is the session
+        carried forward from the completed access step, never ownership of the
+        source host.
+
+        ``"own_source"`` — every other executable relation (access/auth edges AND
+        control/ACL/delegation/escalation edges). Actionable only when ADscan
+        controls the source principal by its ACTUAL type (own the user, own a real
+        group member, or own the computer-account credential).
+
+    The discriminator is the RELATION's ``EdgeKind`` — NOT the source object type.
+    A COMPUTER source lands in ``own_source`` for ``AllowedToDelegate`` (own
+    ``SRV01$``) and in ``carry_forward`` for ``DumpLSA`` (carried session), decided
+    purely by the relation.
+    """
+    from adscan_internal.services.edge_kind import (  # noqa: PLC0415
+        EdgeKind,
+        classify_edge_kind,
+    )
+
+    return "carry_forward" if classify_edge_kind(relation) is EdgeKind.DERIVED else "own_source"
+
+
+def _group_member_sams(shell: Any, domain: str, from_label: str | None) -> set[str] | None:
+    """Return the lowercased sAMAccountNames of a group's direct+nested members.
+
+    Group membership is the SOURCE OF TRUTH for who can act as a group
+    ``from_label``. Reuses the membership SSOT (``build_group_member_index`` over
+    the cached ``membership_snapshot``) so the actor resolver, the stale-context
+    guard, and the readiness predicate all agree.
+
+    Returns a set (possibly empty for a real empty group / a non-group label when
+    the snapshot HAS data), or ``None`` when membership is **indeterminate** — no
+    snapshot data is available, so callers must NOT treat "not found" as "not a
+    member" (that would drop a legitimate explicit-context principal).
+    """
+    label = str(from_label or "").strip()
+    if not label:
+        return set()
+    try:
+        from adscan_internal.services.attack_paths_core import (  # noqa: PLC0415
+            build_group_member_index,
+        )
+        from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+            load_membership_snapshot,
+        )
+
+        snapshot = load_membership_snapshot(shell, domain)
+        user_members, computer_members, has_principals = build_group_member_index(
+            snapshot,
+            domain,
+            exclude_tier0=False,
+            include_computers=True,
+        )
+        if not has_principals:
+            return None
+        from_label_norm = label.upper()
+        member_labels: set[str] = set()
+        member_labels.update(user_members.get(from_label_norm, set()) or set())
+        member_labels.update(computer_members.get(from_label_norm, set()) or set())
+        sams: set[str] = set()
+        for member in member_labels:
+            sam = str(member or "").strip().split("@", 1)[0].strip().lower()
+            if sam:
+                sams.add(sam)
+        return sams
+    except Exception as exc:  # noqa: BLE001 — membership lookup is best-effort
+        telemetry.capture_exception(exc)
+        return None
+
+
+def resolve_source_node_kind(shell: Any, domain: str, from_label: str | None) -> str:
+    """Return the attack-graph node kind of a step's SOURCE label.
+
+    The single implementation of "what kind of thing is this step sourced from"
+    (``User`` / ``Group`` / ``Computer`` / ...). Returns ``""`` when the label is
+    empty, the node is absent from the graph, or it carries no kind — callers
+    must read that as *indeterminate*, never as "not a group".
+
+    It exists as a named helper because the answer decides whether an owned
+    principal may act for the step at all, and every consumer must reach the
+    same answer: :func:`resolve_execution_candidates` derives it here when a
+    caller does not supply one, so the ownership gate and the executor cannot
+    disagree about a step the gate already approved.
+    """
+    label = str(from_label or "").strip()
+    if not label:
+        return ""
+    try:
+        node = get_node_by_label(shell, domain, label=label)
+    except Exception as exc:  # noqa: BLE001 — graph lookup is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return ""
+    kind = _node_kind(node)
+    return "" if kind == "Unknown" else kind
+
+
+def _label_matches_step_source(step: dict[str, Any], from_label: str) -> bool:
+    """Return whether ``step``'s source label is the one being resolved."""
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    step_from = str(details.get("from") or "").strip()
+    if not step_from:
+        return False
+    return step_from.upper() == from_label.strip().upper()
+
+
+def resolve_step_relation(summary: dict[str, Any] | None, from_label: str | None) -> str:
+    """Return the relation of the step in ``summary`` sourced at ``from_label``.
+
+    The companion of :func:`resolve_source_node_kind` for the second argument
+    every dispatch call site omits. The relation decides whether a carried
+    session legitimately stays the actor (a post-exploitation ``carry_forward``
+    edge) or the source principal must be owned by its own type — so deriving
+    the node kind WITHOUT the relation would silently drop the carried context
+    on every post-ex step, which is a self-loop on the COMPUTER it runs against.
+
+    Resolution is deliberately conservative: an attack path is a simple chain,
+    so a source label identifies its step uniquely. When several steps share the
+    label and disagree on the relation, this returns ``""`` (indeterminate)
+    rather than guessing, which leaves the caller on the pre-existing
+    ``own_source`` default.
+    """
+    label = str(from_label or "").strip()
+    if not label or not isinstance(summary, dict):
+        return ""
+    steps = summary.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    actions = {
+        str(step.get("action") or "").strip()
+        for step in steps
+        if isinstance(step, dict) and _label_matches_step_source(step, label)
+    }
+    actions.discard("")
+    if len(actions) != 1:
+        return ""
+    return actions.pop()
+
+
+def _exec_user_memo_key(domain: str, from_label: str | None) -> tuple[str, str]:
+    """Key the per-run execution-user selection memo by (domain, source principal).
+
+    Keyed on the SOURCE principal (not the relation/target) so the operator's
+    "which owned member of this group do I act as" decision is asked ONCE per run
+    and reused for every step and every resolver call that acts from the same
+    source — collapsing the repeat "Select a user to execute this step" prompts.
+    """
+    return (str(domain or "").lower(), _normalize_account(from_label or ""))
+
+
+def _get_exec_user_memo(shell: Any, key: tuple[str, str]) -> str | None:
+    """Return the memoized chosen principal for this step's source, if any."""
+    memo = getattr(shell, "_attack_step_exec_user_memo", None)
+    if isinstance(memo, dict):
+        value = memo.get(key)
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+def _set_exec_user_memo(shell: Any, key: tuple[str, str], value: str) -> None:
+    """Memoize the operator's chosen principal for this step's source (per run)."""
+    memo = getattr(shell, "_attack_step_exec_user_memo", None)
+    if not isinstance(memo, dict):
+        memo = {}
+        try:
+            shell._attack_step_exec_user_memo = memo  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — best-effort; memo is a UX nicety
+            return
+    memo[key] = value
+
+
+def reset_execution_user_memo(shell: Any) -> None:
+    """Clear the per-run execution-user selection memo.
+
+    Called once at the start of an attack-path execution run so the operator's
+    memoized choices do not silently carry across separate runs — each run
+    re-asks (at most once per source) rather than reusing a stale prior choice.
+    """
+    try:
+        shell._attack_step_exec_user_memo = {}  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+
+
+# Principals that exist in nearly every domain, hold nothing worth exercising,
+# and frequently sort early in credential-capture order. They stay candidates
+# (a step with nothing else to try may still want them) but never lead. This is
+# a tail-sink, NOT the ranking: the ranking below is what stops the next stale
+# service account from leading, which no name list could.
+_LOW_VALUE_ACCOUNT_STEMS: frozenset[str] = frozenset(
+    {
+        "guest",
+        "krbtgt",
+        "defaultaccount",
+        "anonymous",
+        "wdagutilityaccount",
+    }
+)
+
+# Cache of {sAMAccountName: transitive group labels} per membership snapshot.
+# Keyed by the snapshot's identity AND holding a reference to it, so an entry
+# can never be served to a different snapshot that reused a freed id().
+_PRINCIPAL_GROUP_CLOSURE_CACHE: dict[
+    tuple[int, str], tuple[dict[str, Any], dict[str, set[str]]]
+] = {}
+_PRINCIPAL_GROUP_CLOSURE_CACHE_LIMIT = 4
+
+
+def _principal_group_closures(shell: Any, domain: str) -> dict[str, set[str]]:
+    """Return ``{sAMAccountName: transitive group labels}`` for the domain.
+
+    Built by inverting the membership SSOT's group->members index
+    (``build_group_member_index``), which already expands nested ancestors and
+    merges the implicit primary group, so the values ARE the transitive closure.
+    Never hand-roll a MemberOf walk here (``CLAUDE.md`` § Group membership).
+
+    Returns an empty mapping when no membership snapshot is available — the
+    caller must degrade to "privilege unknown", never to "no privilege".
+    """
+    try:
+        from adscan_internal.services.attack_paths_core import (  # noqa: PLC0415
+            build_group_member_index,
+        )
+        from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+            load_membership_snapshot,
+        )
+
+        snapshot = load_membership_snapshot(shell, domain)
+        if not isinstance(snapshot, dict):
+            return {}
+        cache_key = (id(snapshot), str(domain or "").strip().lower())
+        cached = _PRINCIPAL_GROUP_CLOSURE_CACHE.get(cache_key)
+        if cached is not None and cached[0] is snapshot:
+            return cached[1]
+
+        user_members, computer_members, has_principals = build_group_member_index(
+            snapshot,
+            domain,
+            exclude_tier0=False,
+            include_computers=True,
+        )
+        if not has_principals:
+            return {}
+        closures: dict[str, set[str]] = {}
+        for index in (user_members, computer_members):
+            for group_label, members in index.items():
+                for member in members:
+                    sam = str(member or "").strip().split("@", 1)[0].strip().lower()
+                    if sam:
+                        closures.setdefault(sam, set()).add(group_label)
+        if len(_PRINCIPAL_GROUP_CLOSURE_CACHE) >= _PRINCIPAL_GROUP_CLOSURE_CACHE_LIMIT:
+            _PRINCIPAL_GROUP_CLOSURE_CACHE.clear()
+        _PRINCIPAL_GROUP_CLOSURE_CACHE[cache_key] = (snapshot, closures)
+        return closures
+    except Exception as exc:  # noqa: BLE001 — ranking input is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return {}
+
+
+def _principal_privilege_rank(group_labels: set[str]) -> int:
+    """Rank a principal by its own group memberships (higher = more privileged).
+
+    Reuses the tier SSOT ``classify_principal_by_groups`` — there is no second
+    principal-ranking taxonomy (``CLAUDE.md`` § Nomenclature Standard).
+    """
+    if not group_labels:
+        return 0
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            CompromiseClass,
+            classify_principal_by_groups,
+        )
+
+        compromise_class = classify_principal_by_groups(sorted(group_labels))
+        if compromise_class is CompromiseClass.DOMAIN_BREAKER:
+            return 2
+        if compromise_class is CompromiseClass.PRIVILEGED_ESCALATOR:
+            return 1
+    except Exception as exc:  # noqa: BLE001 — ranking input is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return 0
+
+
+def rank_execution_candidates(
+    shell: Any,
+    *,
+    domain: str,
+    candidates: list[str],
+    from_label: str | None,
+    context_username: str | None,
+) -> list[str]:
+    """Order owned candidates so the FIRST one is the defensible actor.
+
+    A non-interactive run takes the head of this list (the picker's default
+    index), and the ownership gate reads the head to decide whether a usable
+    credential exists — so the order is a correctness input, not presentation.
+    Before this ranking the head was whichever credential happened to be
+    captured first, which on one real engagement was ``guest``.
+
+    Order, best first:
+
+    1. the step's own source principal, when it is itself a candidate;
+    2. the principal carried forward from the preceding step in this chain;
+    3. the most privileged candidate, by the tier SSOT
+       (``classify_principal_by_groups``);
+    4. otherwise the incoming order, preserved (a stable sort), so an ordering
+       a caller already applied is never scrambled.
+
+    Two sinks override all of the above: a principal with no usable stored
+    credential (it cannot authenticate — its only effect at the head of the list
+    is to abort the step) and a well-known low-value account. Both are kept at
+    the tail rather than dropped, so a step whose only candidates are sunk still
+    has something to try.
+
+    Network-logon ordering (``order_logon_capable_first``) is applied by the
+    caller AFTER this, since it is host-specific ground truth and must win.
+    """
+    if len(candidates) < 2:
+        return list(candidates)
+
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        get_stored_domain_credential_for_user,
+    )
+
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    closures = _principal_group_closures(shell, domain)
+    source_key = _normalize_account(from_label or "")
+    context_key = _normalize_account(context_username or "")
+
+    def _sort_key(indexed: tuple[int, str]) -> tuple[int, int, int, int, int]:
+        index, candidate = indexed
+        key = _normalize_account(candidate)
+        has_secret = bool(
+            get_stored_domain_credential_for_user(
+                domains_data, domain=domain, username=candidate
+            )
+        )
+        sunk = (not has_secret) or (key in _LOW_VALUE_ACCOUNT_STEMS)
+        return (
+            1 if sunk else 0,
+            0 if (source_key and key == source_key) else 1,
+            0 if (context_key and key == context_key) else 1,
+            -_principal_privilege_rank(closures.get(key, set())),
+            index,
+        )
+
+    ordered = [
+        candidate for _, candidate in sorted(enumerate(candidates), key=_sort_key)
+    ]
+    if ordered != list(candidates):
+        print_info_debug(
+            "[exec-user] Ranked candidates by source/context/privilege: "
+            f"{', '.join(mark_sensitive(user, 'user') for user in ordered[:5])}"
+        )
+    return ordered
+
+
+def resolve_execution_candidates(
     shell: Any,
     *,
     domain: str,
@@ -240,9 +667,22 @@ def _resolve_execution_user_with_source(
     from_label: str | None,
     from_node_kind: str | None = None,
     host: str | None = None,
-    max_options: int = 20,
-) -> tuple[str | None, str]:
-    """Resolve an execution user and indicate which source was used.
+    strict_source: bool = False,
+    relation: str | None = None,
+) -> tuple[list[str], str]:
+    """PURE, read-only resolution of the owned principals that could run a step.
+
+    NO prompt, NO selection, NO side effects. Returns ``(candidates, source_tag)``
+    — the ordered list of owned principals source-faithful to this step (empty
+    when ADscan controls no valid source principal), plus a debug tag naming how
+    they were derived. This is the SSOT every NON-execution consumer uses:
+
+    * the actionability predicate (``is the candidate list non-empty?``),
+    * the readiness ``N/M`` column and which steps are shown/selectable,
+    * the pre-execution ownership gate.
+
+    None of those fire the interactive picker — the ONE interactive selection
+    lives in :func:`select_execution_user`, invoked only at actual step execution.
 
     When ``host`` is provided (a NETWORK-authenticating step — SMB/WinRM/RDP/
     MSSQL), candidate principals the host has already denied a network logon
@@ -252,6 +692,30 @@ def _resolve_execution_user_with_source(
     (TGT/AS-REQ/scoped-ticket callers, or callers without a host in scope) leaves
     ordering unchanged — the denial is network-logon-specific and must not gate
     those flows.
+
+    ``relation`` makes the carried-context decision EDGE-KIND-AWARE (see
+    :func:`source_ownership_bucket`). A post-exploitation technique chained off a
+    prior access edge (``carry_forward``) keeps the carried session as the actor;
+    a control/delegation edge (``own_source``) requires owning the source
+    principal by its actual type, so a stale carried context is dropped.
+
+    ``from_node_kind`` and ``relation`` are DERIVED HERE when a caller does not
+    supply them — from the graph node behind ``from_label`` and from the step in
+    ``summary`` sourced at that label. Both are overrides, not the only source.
+    Whether a source principal can hold a credential at all is a property of the
+    step, so it must not depend on each of two dozen dispatch branches
+    remembering to pass a keyword: when they did not, a group-sourced step fell
+    through to "any stored credential" and executed as a principal that was not
+    a member of the source group, while the ownership gate — which does pass the
+    kind — had already approved the step for the real member. For a verifier that
+    authenticates to a host (``AdminTo`` / ``CanRDP`` / ``CanPSRemote`` /
+    ``SQLAccess``) that mismatch can even SUCCEED by an unrelated route and stamp
+    the edge ``success`` naming the wrong actor, so the deliverable claims ADscan
+    validated a grant it never tested.
+
+    The returned list is RANKED (see :func:`rank_execution_candidates`): its head
+    is the best actor, which is what the non-interactive picker default and the
+    ownership gate both read.
     """
 
     def _preview_users(users: list[str], *, max_items: int = 5) -> str:
@@ -265,13 +729,6 @@ def _resolve_execution_user_with_source(
             rendered = f"{rendered}, +{len(cleaned) - max_items} more"
         return f"[{rendered}]"
 
-    exec_username = _normalize_account(context_username or "")
-    if exec_username:
-        print_info_debug(
-            f"[exec-user] Using context username: {mark_sensitive(exec_username, 'user')}"
-        )
-        return exec_username, "context_username"
-
     creds = getattr(shell, "domains_data", {}).get(domain, {}).get("credentials", {})
     cred_keys = (
         {
@@ -282,181 +739,218 @@ def _resolve_execution_user_with_source(
         else {}
     )
     from_user = _normalize_account(from_label or "")
+    # Derive the step's own properties when the caller did not state them. A
+    # supplied value is authoritative (including an explicit "" from a caller
+    # that already looked and found nothing); ``None`` means "not stated".
+    if from_node_kind is None:
+        from_node_kind = resolve_source_node_kind(shell, domain, from_label)
+    if relation is None:
+        relation = resolve_step_relation(summary, from_label)
+    node_kind_lower = str(from_node_kind or "").strip().lower()
+    bucket = source_ownership_bucket(relation)
+    # Resolve membership for a group source OR any broad domain source (Domain
+    # Users / Domain Computers may arrive with an unresolved node kind in
+    # degraded/partial graphs — we still need the real None-vs-set distinction so
+    # the indeterminate-membership fallback can fire).
+    _resolve_membership = node_kind_lower == "group" or is_broad_domain_source(from_label)
+
+    # Membership of the source group (SSOT; merges the implicit primary-group
+    # [Domain Users] and well-known nesting). ``None`` = indeterminate (no
+    # snapshot data — must NOT be read as "not a member"); a set = authoritative.
+    member_sams_raw = _group_member_sams(shell, domain, from_label) if _resolve_membership else set()
+    member_sams = member_sams_raw or set()
+
+    # Carried-forward context: trust it by DEFAULT (the pre-execution ownership
+    # gate and the target's own ACL check are the backstop), and DROP it only when
+    # ADscan can prove it is the WRONG actor. The decision is EDGE-KIND-AWARE — a
+    # carried context is dropped only for a control/ACL/delegation edge
+    # (``own_source``) whose source we can prove the context does not control:
+    #   * source is a USER the context does not match → drop; a user's ACE is
+    #     exercised SOLELY by that user.
+    #   * source is a COMPUTER → drop; a delegation/RBCD write (AllowedToDelegate)
+    #     is minted only by the source COMPUTER ACCOUNT, never a carried user
+    #     session (contrast a post-ex DumpLSA, which IS carry_forward and kept).
+    #   * source is a GROUP with a CONFIRMED non-membership → drop; the context is
+    #     not a real member and would run the write as the wrong principal (the
+    #     DCSync-from-a-group-you-don't-control bug).
+    # Everything else keeps the context: a post-ex carry_forward session, a
+    # well-known all-principals source (every principal is a member), a group with
+    # indeterminate/confirmed membership (runtime membership a snapshot can't see),
+    # or an unknown node kind (conservative — the gate/ACL is the backstop).
+    exec_username = _normalize_account(context_username or "")
+    if exec_username:
+        if not from_user or exec_username == from_user:
+            print_info_debug(
+                f"[exec-user] Using context username: {mark_sensitive(exec_username, 'user')}"
+            )
+            return [exec_username], "context_username"
+        keep_context = True
+        if bucket != "carry_forward" and not is_broad_domain_source(from_label):
+            if node_kind_lower == "user":
+                keep_context = False
+            elif node_kind_lower == "computer":
+                keep_context = False
+            elif node_kind_lower == "group":
+                keep_context = member_sams_raw is None or exec_username in member_sams
+        if keep_context:
+            print_info_debug(
+                f"[exec-user] Using context username: {mark_sensitive(exec_username, 'user')} "
+                f"(bucket={bucket}, source={mark_sensitive(from_label or '?', 'node')})"
+            )
+            return [exec_username], "context_username"
+        print_info_debug(
+            "[exec-user] Ignoring stale context username "
+            f"{mark_sensitive(exec_username, 'user')}: the step source "
+            f"{mark_sensitive(from_label or '?', 'node')} is a control/ACL/delegation "
+            "principal the context does not control; resolving the actor from the "
+            "source instead."
+        )
+
     if from_user and from_user in cred_keys:
         print_info_debug(
             f"[exec-user] Using from_label credential: {mark_sensitive(from_user, 'user')}"
         )
-        return from_user, "from_label_credential"
+        return [from_user], "from_label_credential"
     if from_user and str(from_node_kind or "").strip().lower() == "user":
         print_info_debug(
             "[exec-user] Using from_label as execution user candidate without "
             "stored credential match."
         )
-        return from_user, "from_label_user_node"
+        return [from_user], "from_label_user_node"
 
-    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
-    affected_users = meta.get("affected_users") if isinstance(meta, dict) else None
-    if isinstance(meta, dict):
-        affected_count = meta.get("affected_user_count")
-        affected_users_len = (
-            len(affected_users) if isinstance(affected_users, list) else None
-        )
-        affected_preview = (
-            _preview_users(
-                [str(user) for user in affected_users if isinstance(user, str)]
-            )
-            if isinstance(affected_users, list)
-            else "[]"
-        )
-        print_info_debug(
-            "[exec-user] meta.affected_users summary: "
-            f"count={affected_count!r}, list_len={affected_users_len!r}, "
-            f"users={affected_preview}"
-        )
-    else:
-        print_info_debug("[exec-user] No meta object available on path summary.")
-    if not (isinstance(affected_users, list) and affected_users) and isinstance(
-        meta, dict
-    ):
-        print_info_debug("[exec-user] meta.affected_users missing/empty.")
-
-    node_kind_lower = str(from_node_kind or "").strip().lower()
     candidate_users: list[str] = []
+    source_tag = "unresolved"
 
     # For Group from_label, membership is the SOURCE OF TRUTH for who can
     # execute the step.  The graph collector writes the edge from the
     # group that ACTUALLY holds the right (e.g. DCSync edges originate
     # from ``DOMAIN ADMINS`` / ``DOMAIN CONTROLLERS`` / ``ADMINISTRATORS``
-    # — the groups granted ``DS-Replication-Get-Changes-All``).  Therefore:
-    #
-    #   - We MUST prefer real group members over ``affected_users``: the
-    #     path source (``affected_users``) may reach ``from_label`` via a
-    #     MemberOf chain without being a direct member that holds the
-    #     right.  Picking the source as the execution principal then
-    #     fails with ``ERROR_DS_DRA_BAD_DN`` (or equivalent) because the
-    #     principal lacks the underlying ACE.
-    #
-    #   - Membership lookup intersected with stored credentials is the
-    #     implicit *privilege guard* for high-rights relations.  No
-    #     separate per-relation table is needed: the collector already
-    #     encoded the privilege requirement in the group choice.
-    #
-    #   - This is also what makes the multi-step carry-forward work
-    #     naturally: when step N produces a credential that is a real
-    #     member of step N+1's ``from_label`` group (e.g. ADCSESC8
-    #     producing a DC machine account that belongs to
-    #     ``DOMAIN CONTROLLERS``), step N+1 picks it without needing
-    #     ``affected_users`` to be re-materialised mid-execution.
+    # — the groups granted ``DS-Replication-Get-Changes-All``). An owned
+    # principal may act ONLY if it is a REAL member of that group (the
+    # membership SSOT merges the implicit primary-group [Domain Users] and
+    # nested membership). This is also what makes the multi-step carry-forward
+    # work naturally: when a prior step produces a credential that is a real
+    # member of the next step's ``from_label`` group (e.g. ADCSESC1 → a Domain
+    # Admin that belongs to ``ADMINISTRATORS``), the next step picks it here.
+    # There is intentionally NO ``affected_users`` fallback: the path's
+    # entry-point users are never evidence of controlling a mid-path group, and
+    # using them ran the write as the wrong principal (the DCSync-from-a-group-
+    # you-don't-control bug).
     group_members_resolved = False
-    if node_kind_lower == "group" and isinstance(creds, dict) and creds:
-        try:
-            from adscan_internal.services.attack_paths_core import (
-                build_group_member_index,
-            )
-            from adscan_internal.services.membership_snapshot import (
-                load_membership_snapshot,
-            )
-
-            snapshot = load_membership_snapshot(shell, domain)
-            user_members, computer_members, _has_principals = (
-                build_group_member_index(
-                    snapshot,
-                    domain,
-                    exclude_tier0=False,
-                    include_computers=True,
-                )
-            )
-            from_label_norm = (str(from_label or "").strip()).upper()
-            member_labels: set[str] = set()
-            member_labels.update(user_members.get(from_label_norm, set()) or set())
-            member_labels.update(
-                computer_members.get(from_label_norm, set()) or set()
-            )
-
-            def _member_label_to_sam(label: str) -> str:
-                """Strip the ``@DOMAIN`` suffix and lowercase the SAM."""
-                raw = str(label or "").strip()
-                if not raw:
-                    return ""
-                left = raw.split("@", 1)[0]
-                return left.strip().lower()
-
-            matched_via_membership: list[str] = []
-            for label in member_labels:
-                sam = _member_label_to_sam(label)
-                if not sam:
-                    continue
-                stored_key = cred_keys.get(sam)
-                if stored_key:
-                    matched_via_membership.append(stored_key)
-
-            if matched_via_membership:
-                candidate_users = matched_via_membership
-                group_members_resolved = True
-                print_info_debug(
-                    "[exec-user] Group-membership resolution: selected "
-                    f"{len(candidate_users)} candidate(s) for "
-                    f"from_label={mark_sensitive(str(from_label or ''), 'node')}: "
-                    f"{_preview_users(candidate_users)}"
-                )
-            else:
-                print_info_debug(
-                    "[exec-user] Group-membership resolution: no stored "
-                    "credential matches any actual member of "
-                    f"group={mark_sensitive(str(from_label or ''), 'node')} "
-                    f"(members={len(member_labels)}); "
-                    "falling back to affected_users intersection."
-                )
-        except Exception as _exc:  # noqa: BLE001
-            telemetry.capture_exception(_exc)
-            print_exception(exception=_exc)
-            print_info_debug(
-                f"[exec-user] Group-membership resolution failed: {type(_exc).__name__}; "
-                "falling back to affected_users intersection."
-            )
-
-    # ``affected_users`` intersection: used for non-Group from_label, or
-    # as best-effort fallback when Group membership resolution turned up
-    # no match (snapshot missing, exotic group, etc.).
-    if not candidate_users and isinstance(affected_users, list) and cred_keys:
-        for raw_user in affected_users:
-            if not isinstance(raw_user, str):
-                continue
-            normalized = _normalize_account(raw_user)
-            if not normalized:
-                continue
-            stored_key = cred_keys.get(normalized)
+    if _resolve_membership and isinstance(creds, dict) and creds:
+        matched_via_membership: list[str] = []
+        for sam in member_sams:
+            stored_key = cred_keys.get(sam)
             if stored_key:
-                candidate_users.append(stored_key)
+                matched_via_membership.append(stored_key)
+
+        if matched_via_membership:
+            candidate_users = list(dict.fromkeys(matched_via_membership))
+            group_members_resolved = True
+            source_tag = "group_membership"
+            print_info_debug(
+                "[exec-user] Group-membership resolution: selected "
+                f"{len(candidate_users)} candidate(s) for "
+                f"from_label={mark_sensitive(str(from_label or ''), 'node')}: "
+                f"{_preview_users(candidate_users)}"
+            )
+        elif member_sams_raw is None:
+            # INDETERMINATE, not "nobody". No membership snapshot exists, so we
+            # did not check and find nothing — we could not check at all. Both
+            # read the same in the candidate list (a non-broad group stays
+            # locked either way, per the doctrine below) but they are opposite
+            # conclusions, and an operator debugging a locked step is owed the
+            # difference.
+            print_info_debug(
+                "[exec-user] Group-membership resolution: membership of "
+                f"group={mark_sensitive(str(from_label or ''), 'node')} is "
+                "INDETERMINATE (no membership snapshot for this domain); "
+                "treating the source group as not controlled rather than "
+                "assuming any stored credential is a member."
+            )
+        else:
+            print_info_debug(
+                "[exec-user] Group-membership resolution: no stored "
+                "credential matches any actual member of "
+                f"group={mark_sensitive(str(from_label or ''), 'node')} "
+                f"(members={len(member_sams)}); the source group is not controlled."
+            )
+
+    # Broad source where any owned principal legitimately acts:
+    #   * a well-known "all principals" SID (Everyone / Authenticated Users /
+    #     BUILTIN Users) — always; or
+    #   * a domain-wide group (Domain Users / Domain Computers) whose real
+    #     membership is INDETERMINATE (no snapshot) — every domain principal is a
+    #     member, so a missing snapshot must not over-block it. When membership is
+    #     KNOWN, the real member intersection above is authoritative and this
+    #     fallback does not fire. A NON-broad group (Administrators, Domain Admins)
+    #     stays unresolved -> locked even when membership is indeterminate.
+    broad_any_owned = is_wellknown_all_principals_source(from_label) or (
+        is_broad_domain_source(from_label) and member_sams_raw is None
+    )
+    if not candidate_users and broad_any_owned and cred_keys:
+        candidate_users = [str(stored_user) for stored_user in creds.keys()]
+        source_tag = "broad_source"
+        print_info_debug(
+            "[exec-user] Broad source "
+            f"{mark_sensitive(str(from_label or ''), 'node')}: any owned principal is a "
+            f"member ({len(candidate_users)} candidate(s))."
+        )
 
     if (
         not candidate_users
+        and not strict_source
         and isinstance(creds, dict)
         and creds
         and node_kind_lower != "group"
     ):
         print_info_debug(
-            "[exec-user] No meta.affected_users match; falling back to all stored credentials "
+            "[exec-user] No source-faithful actor; falling back to all stored credentials "
             f"(from_node_kind={mark_sensitive(node_kind_lower or 'unknown', 'detail')})."
         )
         candidate_users = [str(stored_user) for stored_user in creds.keys()]
+        source_tag = "all_stored_credentials"
+    elif (
+        not candidate_users
+        and strict_source
+        and node_kind_lower != "group"
+    ):
+        # Ownership-gate (strict) path: the SOURCE principal is not owned via any
+        # source-faithful route (from_label credential, group membership, or a
+        # path-affected principal). Do NOT fall back to "any stored credential" —
+        # that is exactly the over-count that offers a step whose real source we
+        # do not control. Leave the actor unresolved so the gate locks the step.
+        print_info_debug(
+            "[exec-user] Strict source resolution: no source-faithful actor for "
+            f"from_label={mark_sensitive(str(from_label or '?'), 'node')}; "
+            "not falling back to any stored credential."
+        )
     elif (
         not candidate_users
         and node_kind_lower == "group"
         and not group_members_resolved
     ):
-        # Group from_label AND membership lookup failed AND
-        # affected_users intersection also empty.  Without authoritative
-        # membership data we can't safely fall back to "any stored cred"
-        # (would invent privilege the principal doesn't hold).
+        # Group from_label AND no owned member.  Without an owned real member we
+        # can't safely fall back to "any stored cred" (that would invent a
+        # privilege the principal doesn't hold — the DCSync-from-a-group-you-
+        # don't-control bug). Leave the actor unresolved so the gate locks it.
         print_info_debug(
-            "[exec-user] Group from_label with no candidate match: "
-            "membership snapshot unavailable and affected_users intersection empty. "
+            "[exec-user] Group from_label with no owned member: "
+            "no stored credential is a real member of the source group. "
             "Skipping fallback to avoid selecting a non-member principal."
         )
 
     if candidate_users:
         candidate_users = list(dict.fromkeys(candidate_users))
+        # Rank BEFORE the host-specific ordering, so logon-denial ground truth
+        # (per-host and observed) still wins the head of the list.
+        candidate_users = rank_execution_candidates(
+            shell,
+            domain=domain,
+            candidates=candidate_users,
+            from_label=from_label,
+            context_username=context_username,
+        )
         if host:
             # Network-auth step: prefer a logon-capable principal (denied ones
             # sink to the tail, retained as last resort). Single source.
@@ -481,86 +975,186 @@ def _resolve_execution_user_with_source(
             f"candidates={_preview_users(candidate_users)} "
             f"stored_credentials={stored_credential_preview}"
         )
-
-        # Auto-select without a prompt when there is only one candidate;
-        # showing a panel + questionary for a decision that doesn't exist is
-        # noise that repeats for every step in a multi-step path.
-        if len(candidate_users) == 1:
-            print_info_debug(
-                f"[exec-user] Auto-selected sole candidate: {mark_sensitive(candidate_users[0], 'user')}"
-            )
-            return _normalize_account(candidate_users[0]), "affected_users"
-
-        marked_domain = mark_sensitive(domain, "domain")
-        print_panel(
-            "\n".join(
-                [
-                    f"Domain: {marked_domain}",
-                    f"Users with stored credentials: {len(candidate_users)}",
-                ]
-            ),
-            title=Text("Select Execution User", style=f"bold {BRAND_COLORS['info']}"),
-            border_style=BRAND_COLORS["info"],
-            expand=False,
-        )
-
-        if hasattr(shell, "_questionary_select"):
-            options = [
-                mark_sensitive(user, "user") for user in candidate_users[:max_options]
-            ]
-            if len(candidate_users) > max_options:
-                options.append(
-                    f"Enter username (showing {max_options} of {len(candidate_users)})"
-                )
-            options.append("Cancel")
-            idx = shell._questionary_select(
-                "Select a user to execute this step:",
-                options,
-                default_idx=0,
-            )
-            if idx is None or idx >= len(options) - 1:
-                print_info_debug("[exec-user] User selection cancelled.")
-                return None, "cancelled"
-            if len(candidate_users) > max_options and idx == len(options) - 2:
-                manual_user = Prompt.ask("Enter username")
-                if not manual_user:
-                    print_info_debug("[exec-user] Manual username entry empty.")
-                    return None, "manual_empty"
-                normalized = _normalize_account(manual_user)
-                if not normalized:
-                    print_info_debug("[exec-user] Manual username entry invalid.")
-                    print_warning("Invalid username entered.")
-                    return None, "manual_invalid"
-                stored = cred_keys.get(normalized)
-                if not stored:
-                    marked_user = mark_sensitive(normalized, "user")
-                    print_warning(
-                        f"No stored credential found for {marked_user}. "
-                        "Please select a user with saved credentials."
-                    )
-                    print_info_debug(
-                        f"[exec-user] Manual username not in credentials: {marked_user}"
-                    )
-                    return None, "manual_missing_credential"
-                print_info_debug(
-                    f"[exec-user] Manual username matched credentials: {mark_sensitive(stored, 'user')}"
-                )
-                return _normalize_account(stored), "manual_selection"
-            print_info_debug(
-                f"[exec-user] Selected candidate: {mark_sensitive(candidate_users[idx], 'user')}"
-            )
-            return _normalize_account(
-                str(candidate_users[idx])
-            ), "interactive_selection"
-
-        return _normalize_account(candidate_users[0]), "fallback_stored_credential"
+        return candidate_users, source_tag
 
     print_info_debug(
         "[exec-user] No execution user resolved: "
-        f"from_label={from_label!r}, "
-        f"meta.affected_users_len={len(affected_users) if isinstance(affected_users, list) else None!r}"
+        f"from_label={from_label!r}, node_kind={node_kind_lower!r}, "
+        f"bucket={bucket!r}, group_member_count={len(member_sams)}"
     )
-    return None, "unresolved"
+    return [], "unresolved"
+
+
+def select_execution_user(
+    shell: Any,
+    *,
+    domain: str,
+    candidates: list[str],
+    source_tag: str,
+    from_label: str | None,
+    relation: str | None = None,
+    max_options: int = 20,
+) -> tuple[str | None, str]:
+    """The ONE interactive seam that picks WHICH owned principal runs a step.
+
+    Fires the "Select a user to execute this step" prompt at EXACTLY this call
+    site — invoked only when the operator actually executes a step. Read-only
+    consumers (annotation, readiness, actionability, the pre-execution gate) call
+    :func:`resolve_execution_candidates` directly and NEVER reach here, so merely
+    computing the display never prompts.
+
+    Rules:
+    * empty candidate list -> unresolved (nothing to run from);
+    * a single candidate -> auto-select, no prompt;
+    * a choice already memoized for this step's SOURCE in the current run ->
+      reuse it silently (so the same step / source is never re-asked);
+    * non-interactive runs auto-resolve to the default index (``shell.
+      _questionary_select`` delegates to the centralized helper).
+
+    Net effect: the operator is prompted AT MOST ONCE per source principal per run.
+
+    ``default_idx=0`` is deliberate and only defensible because
+    :func:`resolve_execution_candidates` hands back a RANKED list (see
+    :func:`rank_execution_candidates`): index 0 is the best candidate, not the
+    first credential that happened to be captured. Do not add a second ordering
+    here — the ranking belongs beside the candidate set, where the ownership
+    gate reads it too.
+    """
+    if not candidates:
+        return None, source_tag
+
+    if len(candidates) == 1:
+        print_info_debug(
+            f"[exec-user] Auto-selected sole candidate: {mark_sensitive(candidates[0], 'user')}"
+        )
+        return _normalize_account(candidates[0]), source_tag
+
+    memo_key = _exec_user_memo_key(domain, from_label)
+    normalized_candidates = {_normalize_account(user) for user in candidates}
+    memoized = _get_exec_user_memo(shell, memo_key)
+    if memoized and memoized in normalized_candidates:
+        print_info_debug(
+            "[exec-user] Reusing memoized execution-user selection for source "
+            f"{mark_sensitive(from_label or '?', 'node')}: "
+            f"{mark_sensitive(memoized, 'user')} (not re-prompting)."
+        )
+        return memoized, "memoized_selection"
+
+    creds = getattr(shell, "domains_data", {}).get(domain, {}).get("credentials", {})
+    cred_keys = (
+        {_normalize_account(str(user or "")): str(user) for user in creds.keys()}
+        if isinstance(creds, dict)
+        else {}
+    )
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {marked_domain}",
+                f"Users with stored credentials: {len(candidates)}",
+            ]
+        ),
+        title=Text("Select Execution User", style=f"bold {BRAND_COLORS['info']}"),
+        border_style=BRAND_COLORS["info"],
+        expand=False,
+    )
+
+    if hasattr(shell, "_questionary_select"):
+        options = [mark_sensitive(user, "user") for user in candidates[:max_options]]
+        if len(candidates) > max_options:
+            options.append(
+                f"Enter username (showing {max_options} of {len(candidates)})"
+            )
+        options.append("Cancel")
+        idx = shell._questionary_select(
+            "Select a user to execute this step:",
+            options,
+            default_idx=0,
+        )
+        if idx is None or idx >= len(options) - 1:
+            print_info_debug("[exec-user] User selection cancelled.")
+            return None, "cancelled"
+        if len(candidates) > max_options and idx == len(options) - 2:
+            manual_user = Prompt.ask("Enter username")
+            if not manual_user:
+                print_info_debug("[exec-user] Manual username entry empty.")
+                return None, "manual_empty"
+            normalized = _normalize_account(manual_user)
+            if not normalized:
+                print_info_debug("[exec-user] Manual username entry invalid.")
+                print_warning("Invalid username entered.")
+                return None, "manual_invalid"
+            stored = cred_keys.get(normalized)
+            if not stored:
+                marked_user = mark_sensitive(normalized, "user")
+                print_warning(
+                    f"No stored credential found for {marked_user}. "
+                    "Please select a user with saved credentials."
+                )
+                print_info_debug(
+                    f"[exec-user] Manual username not in credentials: {marked_user}"
+                )
+                return None, "manual_missing_credential"
+            print_info_debug(
+                f"[exec-user] Manual username matched credentials: {mark_sensitive(stored, 'user')}"
+            )
+            chosen = _normalize_account(stored)
+            _set_exec_user_memo(shell, memo_key, chosen)
+            return chosen, "manual_selection"
+        print_info_debug(
+            f"[exec-user] Selected candidate: {mark_sensitive(candidates[idx], 'user')}"
+        )
+        chosen = _normalize_account(str(candidates[idx]))
+        _set_exec_user_memo(shell, memo_key, chosen)
+        return chosen, "interactive_selection"
+
+    return _normalize_account(candidates[0]), "fallback_stored_credential"
+
+
+def _resolve_execution_user_with_source(
+    shell: Any,
+    *,
+    domain: str,
+    context_username: str | None,
+    summary: dict[str, Any],
+    from_label: str | None,
+    from_node_kind: str | None = None,
+    host: str | None = None,
+    max_options: int = 20,
+    strict_source: bool = False,
+    relation: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve AND interactively select the execution user for a step to EXECUTE.
+
+    The execution seam: it computes the source-faithful candidate set via the
+    pure :func:`resolve_execution_candidates` and then routes it through the ONE
+    interactive picker :func:`select_execution_user` (single candidate auto-
+    selects; multiple prompt once, memoized per run; non-interactive auto-
+    resolves). Read-only callers (readiness / actionability / the ownership gate)
+    must call :func:`resolve_execution_candidates` directly, never this — so
+    merely annotating the path list never prompts.
+    """
+    candidates, source_tag = resolve_execution_candidates(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+        from_node_kind=from_node_kind,
+        host=host,
+        strict_source=strict_source,
+        relation=relation,
+    )
+    return select_execution_user(
+        shell,
+        domain=domain,
+        candidates=candidates,
+        source_tag=source_tag,
+        from_label=from_label,
+        relation=relation,
+        max_options=max_options,
+    )
 
 
 def resolve_execution_user(
@@ -573,13 +1167,19 @@ def resolve_execution_user(
     from_node_kind: str | None = None,
     host: str | None = None,
     max_options: int = 20,
+    strict_source: bool = False,
+    relation: str | None = None,
 ) -> str | None:
-    """Resolve an execution user for attack steps that require credentials.
+    """Resolve an execution user for a step to EXECUTE (interactive selection).
 
     Pass ``host`` for a NETWORK-authenticating step so principals already denied
     a network logon on that host are deprioritized (see
     :func:`_resolve_execution_user_with_source`). Omit it for TGT/AS-REQ/
-    scoped-ticket flows.
+    scoped-ticket flows. Pass ``strict_source=True`` from the ownership-gate
+    predicate to forbid the "any stored credential" fallback. Pass ``relation`` so
+    the carried-context decision is edge-kind-aware (post-ex carry-forward vs
+    control/delegation own-source). This is the EXECUTION path and may prompt
+    (once, memoized); a read-only caller uses :func:`resolve_execution_candidates`.
     """
     exec_username, _ = _resolve_execution_user_with_source(
         shell,
@@ -590,6 +1190,8 @@ def resolve_execution_user(
         from_node_kind=from_node_kind,
         host=host,
         max_options=max_options,
+        strict_source=strict_source,
+        relation=relation,
     )
     return exec_username
 
@@ -784,11 +1386,15 @@ def build_ace_step_context(
     context_username: str | None,
     context_password: str | None,
     member_to_add: str | None = None,
+    strict_source: bool = False,
 ) -> AceStepContext | None:
     """Build an ACE execution context for a given step (best-effort).
 
     ``member_to_add`` (RBCD coordination) overrides the group-membership default
     when a downstream AllowedToAct needs a specific owned SPN-bearing member.
+    ``strict_source=True`` (the ownership-gate predicate) forbids resolving the
+    actor from the "any stored credential" fallback, so the context is built
+    ONLY when the step's real SOURCE principal is controlled.
     """
     from_node = get_node_by_label(shell, domain, label=from_label)
     to_node = get_node_by_label(shell, domain, label=to_label)
@@ -799,6 +1405,8 @@ def build_ace_step_context(
         summary=summary,
         from_label=from_label,
         from_node_kind=_node_kind(from_node),
+        strict_source=strict_source,
+        relation=relation,
     )
     if not exec_username:
         marked_domain = mark_sensitive(domain, "domain")

@@ -1044,6 +1044,7 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         render_unauth_summary,
         run_unauth_probes,
     )
+    from adscan_internal.services.host_address_resolver import resolve_host_address
 
     # Without a PDC we cannot probe — skip entirely.
     if not pdc or pdc == "N/A":
@@ -1063,6 +1064,37 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         guest_targets = []
     if not guest_targets:
         guest_targets = [pdc]
+
+    # Resolve guest targets to IPs before probing. ``guest_smb_targets`` is seeded
+    # with raw hostnames/FQDNs (from ``shell.hosts``), and in-container DNS does not
+    # resolve AD names — a raw FQDN fed to aiosmb fails with "No address associated
+    # with hostname". The Null probe never hits this because it targets ``pdc`` (an
+    # IP) directly. Map every guest target through the centralized resolver so it
+    # matches: IPs pass through, hostnames resolve via the DC's DNS (``resolver_ip``
+    # = the PDC IP the Null session already used). No Kerberos here (anonymous NTLM
+    # / null SMB), so an IP target is correct. ``allow_operator_prompt=False`` keeps
+    # the automated scan flow from prompting / hanging.
+    resolved_guest_targets: list[str] = []
+    seen_ips: set[str] = set()
+    for target in guest_targets:
+        address = resolve_host_address(
+            self,
+            host=target,
+            domain=domain,
+            resolver_ip=pdc,
+            allow_operator_prompt=False,
+        )
+        resolved_ip = address.resolved_ip
+        if not resolved_ip:
+            print_info_debug(
+                f"unauth-guest: dropping target {target} — could not resolve to an IP."
+            )
+            continue
+        if resolved_ip in seen_ips:
+            continue
+        seen_ips.add(resolved_ip)
+        resolved_guest_targets.append(resolved_ip)
+    guest_targets = resolved_guest_targets
 
     config = UnauthProbeConfig(
         domain=domain,
@@ -1667,6 +1699,9 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
     # ``domains_data["credentials"][user] = pwd`` insertion silently bypassed
     # all of that and left the credential invisible to the auth flow.
     from adscan_internal.cli.creds import add_credential as _add_credential
+    from adscan_internal.cli.creds import (
+        credential_verdict_is_verified as _description_credential_was_verified,
+    )
     from adscan_internal.services.high_value import normalize_samaccountname
     from adscan_internal.services.share_credential_provenance_service import (
         ShareCredentialProvenanceService,
@@ -1849,8 +1884,17 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
     for cred in desc_creds_verified:
         if not cred.raw_value:
             continue
+        # ``add_credential`` is the only place the pair is authenticated, so its
+        # verdict is what says whether this is a proven credential or a value
+        # that merely reads like one. Recorded per leak so the distinction
+        # survives into the report — this finding shares an alias family with
+        # the authenticated sweep's ``credential_in_ldap_attribute``, and a
+        # merged record where only one producer marked its rows would be
+        # unreadable. Anything short of an explicit VERIFIED (a rejection, a
+        # check that could not run, an exception) reads as unproven.
+        verified = False
         try:
-            _add_credential(
+            verdict = _add_credential(
                 self,
                 domain,
                 cred.samaccountname,
@@ -1859,6 +1903,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 prompt_for_user_privs_after=False,
                 force_authenticated_enumeration=False,
             )
+            verified = _description_credential_was_verified(verdict)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -1872,6 +1917,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 "field": cred.field,
                 "rule": cred.rule_name,
                 "ml_probability": cred.ml_probability,
+                "verified": verified,
             }
         )
         described_evidence.append(

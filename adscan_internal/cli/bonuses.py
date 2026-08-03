@@ -44,6 +44,11 @@ from typing import Any, Callable
 from jinja2 import BaseLoader, Environment, select_autoescape
 
 from adscan_core import telemetry
+from adscan_core.cvss import (
+    ADSCAN_PRIORITY_LABEL,
+    ADSCAN_PRIORITY_SHORT_LABEL,
+    CVSS_BASE_LABEL,
+)
 from adscan_core.paths import get_adscan_home_dir
 from adscan_core.rich_output import (
     print_error,
@@ -696,6 +701,20 @@ _CONTEXT_BUILDERS_DYNAMIC: dict[
 }
 
 
+def _with_score_labels(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Inject the score vocabulary every bonus document prints.
+
+    The per-finding number the bonuses show is the SAME context-elevated score
+    the Security Assessment Report ranks by — ADscan's own model, not a CVSS
+    Base. The names come from one place (``adscan_core.cvss.labels``) so a
+    bonus cannot drift back to labelling it "CVSS".
+    """
+    ctx.setdefault("adscan_priority_label", ADSCAN_PRIORITY_LABEL)
+    ctx.setdefault("adscan_priority_short_label", ADSCAN_PRIORITY_SHORT_LABEL)
+    ctx.setdefault("cvss_base_label", CVSS_BASE_LABEL)
+    return ctx
+
+
 def _build_context(
     bonus_key: str,
     workspace_dir: Path | None,
@@ -749,7 +768,7 @@ def _build_context(
         ctx.setdefault("brand_logo_white", _brand_logo_data_uri("light"))
         ctx.setdefault("brand_logo_charcoal", _brand_logo_data_uri("dark"))
         ctx.setdefault("brand_logo_light", _brand_logo_data_uri("light"))
-        return ctx
+        return _with_score_labels(ctx)
 
     if bonus_key in _CONTEXT_BUILDERS_STATIC:
         return _with_brand(_CONTEXT_BUILDERS_STATIC[bonus_key]())

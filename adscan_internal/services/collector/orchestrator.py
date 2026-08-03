@@ -67,6 +67,23 @@ class CollectionTiming:
     # coverage statement: {"early_stopped", "hosts_swept", "hosts_total",
     # "hosts_remaining", "source"}. The identity graph is always 100%.
     host_coverage: dict[str, Any] = field(default_factory=dict)
+    # --- Observability-only wall-clock + host-distribution telemetry (additive). ---
+    # These carry the perf signals up to the CLI emit; they never alter collection.
+    # host_wall is the REAL fan-out duration measured around the host-collection
+    # call — distinct from host_negotiate/host_samr/host_shares, which are
+    # OVERLAPPING CONCURRENT per-stage sums (read their ratio, not their absolute).
+    host_wall: float = 0.0
+    gate_probe: float = 0.0  # 445 reachability-gate probe duration (seconds)
+    persist: float = 0.0  # end-of-sweep graph persist duration (seconds)
+    host_count: int = 0  # candidate hosts fed to the 445 gate
+    reachable_445: int = 0  # hosts that passed the 445 gate
+    concurrency: int = 0  # per-host SMB sweep concurrency knob
+    dead_host_count: int = 0  # candidates that failed the 445 gate (unreachable)
+    budget_timeouts: int = 0  # per-host safety-net abandonments
+    host_p50: float = 0.0  # per-host wall-clock p50 (seconds)
+    host_p95: float = 0.0  # per-host wall-clock p95 (seconds)
+    host_max: float = 0.0  # per-host wall-clock max (seconds)
+    host_outcomes: dict[str, int] = field(default_factory=dict)  # outcome histogram
 
     @property
     def host_total(self) -> float:
@@ -266,6 +283,7 @@ class CollectionOrchestrator:
         if collect_smb or collect_shares:
             from adscan_internal.services.collector.host_collector import (
                 HostCollectorConfig,
+                _percentile,
                 collect_domain_hosts,
             )
 
@@ -321,7 +339,12 @@ class CollectionOrchestrator:
                     host_cfg, shell=shell, domain=target_domain,
                     collection_scope=collection_scope, result=result,
                 )
+            # Seam 1 — REAL host fan-out wall-clock (distinct from the overlapping
+            # concurrent negotiate/samr/shares sums). Monotonic per the clock-step
+            # doctrine. Only the surrounding timers are added; the call is unchanged.
+            _host_wall_start = time.monotonic()
             host_timing = collect_domain_hosts(result, host_cfg)
+            timing.host_wall = time.monotonic() - _host_wall_start
             # Carry the share-collection abort coverage into domains_data so Phase
             # 7 (SMB Share Exposure), which runs later off the graph and cannot
             # re-derive it, can distinguish an aborted enumeration (incomplete)
@@ -345,6 +368,30 @@ class CollectionOrchestrator:
             timing.host_negotiate = host_timing.negotiate
             timing.host_samr = host_timing.samr
             timing.host_shares = host_timing.shares
+            # Seams 2 + 3 — propagate the already-measured 445-gate + host
+            # distribution fields (gate probe, reachable/candidate counts,
+            # concurrency, per-host p50/p95/max, dead-host + budget-timeout counts,
+            # outcome histogram). Best-effort: a copy failure never aborts collection.
+            try:
+                timing.gate_probe = host_timing.gate_probe_ms / 1000.0
+                timing.host_count = int(host_timing.candidate_count)
+                timing.reachable_445 = int(host_timing.reachable_445_count)
+                timing.dead_host_count = max(
+                    0,
+                    int(host_timing.candidate_count)
+                    - int(host_timing.reachable_445_count),
+                )
+                timing.budget_timeouts = int(host_timing.host_budget_timeouts)
+                timing.concurrency = int(getattr(host_cfg, "concurrency", 0) or 0)
+                _durations = list(host_timing.per_host_durations or [])
+                if _durations:
+                    timing.host_p50 = _percentile(_durations, 50)
+                    timing.host_p95 = _percentile(_durations, 95)
+                    timing.host_max = max(_durations)
+                timing.host_outcomes = dict(host_timing.outcome_counts or {})
+            except Exception as exc:  # noqa: BLE001 — observability must never abort collection
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
             # Carry the operator early-stop coverage up to the report/web. Only
             # populated when the sweep was halted early; otherwise stays empty
             # (full coverage) so the surfaces read "100% host enrichment".
@@ -606,9 +653,13 @@ class CollectionOrchestrator:
                     f"[orchestrator] injected {injected} well-known SID node(s) "
                     f"for {scope.domain}"
                 )
+            # Seam 7 — persist wall-clock (monotonic). Only the timer is added; the
+            # persist call itself is unchanged.
+            _persist_start = time.monotonic()
             counters[scope.domain] = self._persistence.persist(
                 shell, domain=scope.domain, result=result
             )
+            timing.persist = time.monotonic() - _persist_start
             # Host-granular Domain-Collection resume: the end-of-sweep persist
             # above wrote the full partial graph, so finalize the checkpoint now
             # (ordering: graph first, then the record). A clean sweep flips to

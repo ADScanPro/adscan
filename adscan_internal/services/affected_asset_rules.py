@@ -282,11 +282,17 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
     # container key. The affected asset is that account plus the attribute the
     # secret sits in — the two things a sysadmin needs to go clear it. Without a
     # rule these fell through to the domain object, which is unactionable.
+    # The CANONICAL key of the description-secret alias family, so this rule is
+    # what runs over the MERGED record when more than one of the three
+    # detectors fired. It therefore reads every detector's own container —
+    # ``findings`` (credential-field analyzer and unauthenticated sweep) and
+    # ``samples`` (LDAP description sweep) — or the merged finding would list
+    # only the accounts one producer happened to see.
     "credential_in_ldap_attribute": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,
         scope=Scope.HOST_SCOPED,
-        record_containers=("findings",),
+        record_containers=("findings", "samples"),
         record_qualifier="field",
     ),
     "ldap_user_description_password_leak": AssetRule(
@@ -294,8 +300,10 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         target=TargetMode.NONE,
         scope=Scope.HOST_SCOPED,
         record_containers=("samples",),
-        # No qualifier: this detector reads ``description`` by definition, and
-        # each record's other field is the matched secret itself.
+        # This detector sweeps every credential-bearing attribute, not only
+        # ``description``, so each sample names the attribute the secret sits
+        # in — the same qualifier the canonical merged rule above reads.
+        record_qualifier="field",
     ),
     # The unauthenticated-enrichment sibling of the two above. Read from the
     # producer (``cli/scan.py`` ``record_technical_finding(key=
@@ -448,6 +456,10 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         target=TargetMode.NONE,
         scope=Scope.HOST_SCOPED,
     ),
+    # Canonical key of the SMBv1 alias family. No extra containers are needed:
+    # the SMB scan posture path persists its hosts under ``all_computers`` /
+    # ``dcs`` / ``non_dcs``, which the direct-asset keys already harvest, so a
+    # merged record names every host either producer saw.
     "smb_v1_enabled": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,

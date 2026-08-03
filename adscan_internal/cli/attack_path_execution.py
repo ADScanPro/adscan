@@ -36,6 +36,10 @@ from adscan_internal import (
     print_warning_debug,
     telemetry,
 )
+from adscan_core.rich_output import (
+    questionary_checkbox_values,
+    questionary_select_index,
+)
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.passwords import (
@@ -55,6 +59,7 @@ from adscan_internal.services.attack_graph_service import (
     infer_directory_object_enabled_state,
     get_node_by_label,
     get_attack_path_summaries,
+    get_owned_domain_usernames_for_attack_paths,
     resolve_netexec_target_for_node_label,
     resolve_group_name_by_rid,
     resolve_group_user_members,
@@ -62,7 +67,16 @@ from adscan_internal.services.attack_graph_service import (
 )
 from adscan_internal.services.credential_store_service import (
     get_capability_bearing_ccache,
+    get_stored_domain_credential_for_user,
     resolve_execution_credential,
+    resolve_local_credential_for_host,
+)
+from adscan_internal.services.execution_credential_scope import (
+    CarriedCredential,
+    derive_carried_credential,
+    islocal_flag_for,
+    local_service_for_relation,
+    scope_carried_credential_to_step,
 )
 from adscan_internal.services.attack_graph_runtime_service import (
     clear_attack_path_execution,
@@ -82,7 +96,11 @@ from adscan_internal.cli.ace_step_execution import (
     describe_ace_step_support,
     execute_ace_step,
     get_last_ace_execution_outcome,
+    is_wellknown_all_principals_source,
+    reset_execution_user_memo,
+    resolve_execution_candidates,
     resolve_execution_user as _shared_resolve_execution_user,
+    resolve_source_node_kind,
 )
 from adscan_internal.cli.control_escalation import (
     ensure_control_to_wield_next_edge,
@@ -111,8 +129,14 @@ from adscan_internal.services.ldap_transport_service import (
 )
 from adscan_internal.services.attack_step_catalog import (
     build_step_knowledge,
+    is_probabilistic_step,
     relation_counts_for_execution_readiness,
     relation_requires_execution_context,
+)
+from adscan_internal.services.attack_paths_core import (
+    collapsed_pivot_fanout_relation,
+    collapsed_pivot_index,
+    retarget_collapsed_summary_to_pivot,
 )
 from adscan_internal.services.attack_step_target_access_service import (
     resolve_attack_step_target_access_profile,
@@ -162,6 +186,48 @@ ATTACK_PATH_SNAPSHOT_FILENAME = "attack_paths_snapshot.json"
 # the paid web backend consumes matches the PDF report's live computation with
 # zero drift — both surfaces then render the same reconciled truth.
 _REMATERIALIZE_MAX_DEPTH = 10
+
+# Attack-step statuses that are NEVER re-runnable from the step selector — there
+# is nothing safe or meaningful to execute. ``blocked`` / ``safety_blocked`` =
+# ADscan abstained for safety (destructive/disruptive); ``closed_by_configuration``
+# = the avenue is hardened shut and observed as such; ``unsupported`` /
+# ``unavailable`` = ADscan cannot run it here. EVERY other status
+# (``success``/``attempted``/``discovered``/``theoretical``/…) stays selectable so
+# an operator on an already-compromised domain can RE-RUN a proven step (DCSync,
+# ESC, …) they still control — the per-step default-No confirm is the safety gate.
+_NON_RERUNNABLE_STEP_STATUSES: frozenset[str] = frozenset(
+    {"blocked", "closed_by_configuration", "unsupported", "unavailable", "safety_blocked"}
+)
+
+# Attack-step statuses that mean "this step ALREADY RAN" — drive the selector's
+# prior-outcome badge and prefer a fresh (never-run) step as the default cursor.
+# Fresh statuses (``discovered`` / ``theoretical`` / "") are deliberately absent.
+_STEP_SUCCEEDED_STATUSES: frozenset[str] = frozenset({"success", "succeeded"})
+_STEP_DID_NOT_COMPLETE_STATUSES: frozenset[str] = frozenset(
+    {"attempted", "failed", "error", "partial"}
+)
+_ALREADY_RUN_STEP_STATUSES: frozenset[str] = (
+    _STEP_SUCCEEDED_STATUSES | _STEP_DID_NOT_COMPLETE_STATUSES
+)
+
+
+def _attack_path_step_prior_outcome_badge(status: str) -> str:
+    """Return an inline selector badge describing a step's PRIOR outcome.
+
+    A step that already ran carries its outcome into the selector label so the
+    operator sees at a glance that selecting it re-executes proven work:
+
+    * succeeded                -> ``✓ already run · succeeded``
+    * attempted/failed/error/partial -> ``⚠ already run · did not complete``
+
+    A fresh (never-run) step returns an empty string (no badge).
+    """
+    normalized = str(status or "").strip().lower()
+    if normalized in _STEP_SUCCEEDED_STATUSES:
+        return "✓ already run · succeeded"
+    if normalized in _STEP_DID_NOT_COMPLETE_STATUSES:
+        return "⚠ already run · did not complete"
+    return ""
 
 
 def _summary_path_state(summary: dict[str, Any], *, display_status: str) -> str | None:
@@ -228,48 +294,17 @@ def _is_audit_mode(shell: Any) -> bool:
 def _get_stored_domain_credential_for_user(
     shell: Any, *, domain: str, username: str
 ) -> str | None:
-    """Return stored credential for a domain user using case-insensitive lookup.
+    """Return the stored credential for a domain user (shell-bound wrapper).
 
-    Prefers a password / NT hash from the ``credentials`` map. Falls back to a
-    registered Kerberos ccache path from ``kerberos_tickets`` when no password/
-    hash is stored — the NTLM-disabled / AES-only case, where a PKINIT TGT
-    (e.g. from ADCS Pass-the-Certificate) is the only usable credential. The
-    ccache path is itself a valid credential: downstream Kerberos-backed steps
-    (DCSync/DRSUAPI, LDAP, SMB) accept a ``.ccache`` path and select it.
+    Thin adapter over the credential-store SSOT
+    :func:`get_stored_domain_credential_for_user`, which owns the preference
+    order (capability-bearing ccache -> password/NT hash -> Kerberos ccache).
+    The actor resolver consults the same SSOT when ranking candidates, so "does
+    this principal have a usable credential" has exactly one answer.
     """
-    normalized_target = _normalize_account(username)
-    if not normalized_target:
-        return None
-    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    # Capability-bearing override (ESC13 PtC): when a ccache is explicitly marked
-    # prefer-over-password for THIS user, hand it back instead of the password —
-    # the password cannot reproduce the synthetic PAC group SID. Marker absent
-    # for the user => keep the password-first default below (no global change).
-    capability_ccache = get_capability_bearing_ccache(
-        getattr(shell, "domains_data", {}), domain=domain, username=normalized_target
+    return get_stored_domain_credential_for_user(
+        getattr(shell, "domains_data", {}), domain=domain, username=username
     )
-    if capability_ccache:
-        return capability_ccache
-    credentials = domain_data.get("credentials")
-    if isinstance(credentials, dict):
-        for stored_user, stored_credential in credentials.items():
-            if _normalize_account(str(stored_user)) != normalized_target:
-                continue
-            if isinstance(stored_credential, str) and stored_credential.strip():
-                return stored_credential.strip()
-            break
-    # Fallback: a registered Kerberos ccache (no password/hash available).
-    # kerberos_tickets maps {username: ccache_path} and is populated by
-    # Pass-the-Certificate even when UnPAC-the-hash recovered no NT hash.
-    kerberos_tickets = domain_data.get("kerberos_tickets")
-    if isinstance(kerberos_tickets, dict):
-        for stored_user, ticket_path in kerberos_tickets.items():
-            if _normalize_account(str(stored_user)) != normalized_target:
-                continue
-            if isinstance(ticket_path, str) and ticket_path.strip():
-                return ticket_path.strip()
-            break
-    return None
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -1111,16 +1146,30 @@ def _execution_readiness_meta(
                 "execution_context_action": action,
             }
         if stored_creds:
+            # Kerberoasting authenticates as ANY principal, so any stored
+            # credential legitimately drives it — the ownership predicate is the
+            # SSOT for "do we hold a usable credential" (never the over-count).
+            kerberoast_ok, _ = attack_path_step_source_is_actionable(
+                shell,
+                domain=domain,
+                step={"action": action, "details": details},
+                context_username=context_username,
+                context_password=context_password,
+            )
             return {
                 "execution_context_required": True,
                 "execution_support_status": "supported",
                 "execution_support_target_kind": "",
                 "execution_target_enabled": None,
                 "execution_target_enabled_source": "unknown",
-                "execution_ready_count": len(stored_creds),
+                "execution_ready_count": len(stored_creds) if kerberoast_ok else 0,
                 "execution_candidate_count": len(stored_creds),
-                "execution_candidate_source": "all_stored_credentials_fallback",
-                "execution_readiness_reason": "all_stored_credentials_fallback",
+                "execution_candidate_source": "kerberoast_any_authenticated",
+                "execution_readiness_reason": (
+                    "kerberoast_any_authenticated"
+                    if kerberoast_ok
+                    else "no_authenticated_credential"
+                ),
                 "execution_context_action": action,
             }
         return {
@@ -1430,78 +1479,22 @@ def _execution_readiness_meta(
             "execution_context_action": action,
         }
 
-    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
-    affected_users = meta.get("affected_users") if isinstance(meta, dict) else None
-    affected_count = _affected_user_count(summary)
-    if isinstance(affected_users, list) and affected_users:
-        ready_users: list[str] = []
-        for raw_user in affected_users:
-            if not isinstance(raw_user, str):
-                continue
-            normalized = _normalize_account(raw_user)
-            if normalized and normalized in stored_creds:
-                ready_users.append(normalized)
-        ready_users = list(dict.fromkeys(ready_users))
-        return {
-            "execution_context_required": True,
-            "execution_support_status": "supported",
-            "execution_support_target_kind": target_kind or "",
-            "execution_target_enabled": target_enabled,
-            "execution_target_enabled_source": target_enabled_source,
-            "execution_target_viability_status": target_viability_status,
-            "execution_target_viability_summary": target_viability_summary,
-            "execution_target_viability_reason": target_viability_reason,
-            "execution_target_reachable": target_reachable,
-            "execution_target_reachable_source": target_reachable_source,
-            "execution_target_resolved": target_resolved,
-            "execution_target_matched_ips": list(target_matched_ips),
-            "execution_target_vantage_mode": target_vantage_mode,
-            "execution_target_execution_advisory": target_execution_advisory,
-            "execution_target_access_requirement": target_access_requirement,
-            "execution_target_access_mode": target_access_mode,
-            "execution_target_required_service": target_required_service,
-            "execution_target_required_ports": list(target_required_ports),
-            "execution_target_access_rationale": target_access_rationale,
-            "execution_target_label": to_label,
-            "execution_ready_count": len(ready_users),
-            "execution_candidate_count": affected_count or len(affected_users),
-            "execution_candidate_source": "affected_users",
-            "execution_readiness_reason": (
-                "affected_users_intersection"
-                if ready_users
-                else "no_stored_credential_for_affected_users"
-            ),
-            "execution_context_action": action,
-        }
-
-    if stored_creds:
-        return {
-            "execution_context_required": True,
-            "execution_support_status": "supported",
-            "execution_support_target_kind": target_kind or "",
-            "execution_target_enabled": target_enabled,
-            "execution_target_enabled_source": target_enabled_source,
-            "execution_target_viability_status": target_viability_status,
-            "execution_target_viability_summary": target_viability_summary,
-            "execution_target_viability_reason": target_viability_reason,
-            "execution_target_reachable": target_reachable,
-            "execution_target_reachable_source": target_reachable_source,
-            "execution_target_resolved": target_resolved,
-            "execution_target_matched_ips": list(target_matched_ips),
-            "execution_target_vantage_mode": target_vantage_mode,
-            "execution_target_execution_advisory": target_execution_advisory,
-            "execution_target_access_requirement": target_access_requirement,
-            "execution_target_access_mode": target_access_mode,
-            "execution_target_required_service": target_required_service,
-            "execution_target_required_ports": list(target_required_ports),
-            "execution_target_access_rationale": target_access_rationale,
-            "execution_ready_count": len(stored_creds),
-            "execution_candidate_count": len(stored_creds),
-            "execution_candidate_source": "all_stored_credentials_fallback",
-            "execution_readiness_reason": "all_stored_credentials_fallback",
-            "execution_context_action": action,
-        }
-
+    # Readiness defers entirely to the ONE ownership predicate. The old code had
+    # an ``affected_users`` intersection branch here that reported a path READY
+    # whenever an ENTRY-POINT user held a credential — even when that user is not
+    # a member of the step's SOURCE group. That is the over-count that offered a
+    # step whose real source ADscan does not control (the DCSync-from-a-group-you-
+    # don't-control bug). A path is ready ONLY when a source-faithful actor
+    # genuinely controls the source: an owned group member, the source
+    # computer-account credential, a scoped ServiceTicket to the target, an ESC13
+    # capability ccache, or a valid carry-forward session for a post-ex step.
+    source_actionable, source_reason = attack_path_step_source_is_actionable(
+        shell,
+        domain=domain,
+        step={"action": action, "details": details},
+        context_username=context_username,
+        context_password=context_password,
+    )
     return {
         "execution_context_required": True,
         "execution_support_status": "supported",
@@ -1522,10 +1515,14 @@ def _execution_readiness_meta(
         "execution_target_required_service": target_required_service,
         "execution_target_required_ports": list(target_required_ports),
         "execution_target_access_rationale": target_access_rationale,
-        "execution_ready_count": 0,
-        "execution_candidate_count": 0,
-        "execution_candidate_source": "unresolved",
-        "execution_readiness_reason": "no_stored_credentials_available",
+        "execution_ready_count": 1 if source_actionable else 0,
+        "execution_candidate_count": len(stored_creds),
+        "execution_candidate_source": "source_ownership_predicate",
+        "execution_readiness_reason": (
+            "source_principal_controlled"
+            if source_actionable
+            else (source_reason or "source_principal_not_controlled")
+        ),
         "execution_context_action": action,
     }
 
@@ -2128,6 +2125,214 @@ def _format_non_actionable_reason_summary(reasons: dict[str, int]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
+def _resolve_from_node_kind(shell: Any, domain: str, from_label: str | None) -> str:
+    """Return the graph node kind (``user`` / ``group`` / ``computer`` / ...).
+
+    Delegates to :func:`resolve_source_node_kind`, the single implementation the
+    actor resolver also uses when a caller supplies no kind — so the ownership
+    gate and the executor cannot reach different answers for the same step.
+    """
+    return resolve_source_node_kind(shell, domain, from_label)
+
+
+def _attack_path_step_source_actor_reason(
+    shell: Any,
+    *,
+    domain: str,
+    from_label: str,
+    relation: str | None,
+    context_username: str | None,
+    context_password: str | None,
+) -> str:
+    """Return ``""`` when the step's SOURCE principal is controlled, else a reason.
+
+    Two moves, both reusing the executor's own SSOTs so the gate and the executor
+    agree on the acting principal:
+
+    1. **Resolve the actor with SOURCE fidelity** — ``strict_source=True`` forbids
+       the "any stored credential" fallback that over-counts, so an actor is
+       returned ONLY when it is source-faithful: the carried context (kept only
+       when it is edge-kind-legitimate — a post-ex carry-forward session, or a
+       real member of a group source), a stored credential for the source
+       principal, an owned member of the source group, or the source
+       computer-account credential. ``relation`` drives the edge-kind-aware
+       carried-context decision (see :func:`source_ownership_bucket`).
+    2. **Confirm a usable credential for that actor** via
+       :func:`_get_stored_domain_credential_for_user` (the credential-store SSOT:
+       password / NT hash / TGT ccache / ESC13 capability ccache), or a
+       context-supplied secret for the matched actor.
+    """
+    # READ-ONLY resolution: this ownership check must NEVER render the interactive
+    # "Select Execution User" prompt (it drives annotation / readiness / the
+    # pre-execution gate, all of which merely need to know whether ADscan controls
+    # a valid source principal). The candidate-list resolver is pure; the operator
+    # picks a specific principal only at actual step EXECUTION time.
+    candidates, _source_tag = resolve_execution_candidates(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary={},
+        from_label=from_label,
+        from_node_kind=_resolve_from_node_kind(shell, domain, from_label),
+        strict_source=True,
+        relation=relation,
+    )
+    if not candidates:
+        return f"source principal {from_label or '?'} not yet compromised"
+    exec_username = _normalize_account(str(candidates[0]))
+    if _get_stored_domain_credential_for_user(
+        shell, domain=domain, username=exec_username
+    ):
+        return ""
+    if context_password and _normalize_account(context_username or "") == _normalize_account(
+        exec_username
+    ):
+        return ""
+    return f"missing credential for source principal {exec_username}"
+
+
+# Host-session relations whose acting principal is resolved by a DEDICATED
+# handler (not by owning the source host). The generic ownership gate defers to
+# that handler and only confirms a controlled principal exists to attempt it.
+_HOST_SESSION_SELF_RESOLVED_RELATIONS: frozenset[str] = frozenset({"hassession"})
+
+
+def attack_path_step_source_is_actionable(
+    shell: Any,
+    *,
+    domain: str,
+    step: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
+) -> tuple[bool, str]:
+    """Return ``(actionable, client_safe_reason)`` for one attack-path step.
+
+    THE single predicate for "can ADscan authenticate as this step's required
+    SOURCE principal RIGHT NOW?". It is the SSOT the selectors, the readiness
+    annotation, and the pre-execution gate all consult, so the operator is never
+    offered — and ADscan never attempts — a step whose source principal is not
+    controlled (which otherwise runs the write as the wrong, carried-over
+    principal and fails with a confusing ``insufficientAccessRights``).
+
+    Consults the credential-store SSOT in order:
+
+    (a) carried context matches the step's ``from_label`` (owned via the chain);
+    (b) a stored domain credential — password / NT hash / TGT — for the source
+        principal (or, for a group source, an owned member; for a broad
+        well-known source, any controlled principal);
+    (c) a capability-bearing ccache (ESC13 PtC) marked for the source principal
+        (honoured inside the credential resolver);
+    (d) a host-scoped ``ServiceTicket`` (RBCD / S4U2Proxy / constrained / silver)
+        that opens exactly this step's TARGET — a capability a fresh re-auth
+        cannot reproduce.
+
+    Branches (c) and (d) are the capability/scoped-ticket axis: they MUST keep a
+    step actionable even though the source principal holds no password.
+    """
+    if not isinstance(step, dict):
+        return False, "invalid step payload"
+    action = str(step.get("action") or "").strip()
+    if not action:
+        return False, "no action"
+    key = action.lower()
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    from_label = str(details.get("from") or "").strip()
+    to_label = str(details.get("to") or "").strip()
+
+    # A step ADscan observed to be CLOSED with certainty by the environment's
+    # configuration/topology is a POSITIVE hardening fact, never executable.
+    from adscan_internal.services.relay_status_constants import (  # noqa: PLC0415
+        CONFIGURATION_CLOSE_STATUS,
+    )
+
+    if str(step.get("status") or "").strip().lower() == CONFIGURATION_CLOSE_STATUS:
+        return False, "closed by configuration (hardening observed)"
+
+    # Unauthenticated AS-REP roasting needs no controlled source principal.
+    if key in {"asreproasting", "asreproast"}:
+        return True, ""
+
+    # Kerberoasting authenticates as ANY principal — actionable whenever we hold
+    # a context credential or any stored domain credential.
+    if key in {"kerberoasting", "kerberoast"}:
+        if context_username or context_password:
+            return True, ""
+        if _get_stored_credential_map(shell, domain):
+            return True, ""
+        return False, "no authenticated credential available"
+
+    # HasSession is exploited via ADMIN ACCESS to the SOURCE HOST (steal a
+    # logged-on session's token), NOT by owning the host account. Its acting
+    # principal is resolved by the dedicated HasSession handler from the path
+    # context (a prior AdminTo, or the path's applies-to principal), so the
+    # generic ownership gate only confirms a controlled principal exists to
+    # attempt it and defers the precise host-access decision to that handler.
+    if key in _HOST_SESSION_SELF_RESOLVED_RELATIONS:
+        if (
+            context_username
+            or context_password
+            or get_owned_domain_usernames_for_attack_paths(shell, domain)
+            or _get_stored_credential_map(shell, domain)
+        ):
+            return True, ""
+        return False, "no controlled principal available"
+
+    # Catalog relations that need no execution context at all (non-ACE).
+    if key not in ACL_ACE_RELATIONS and not relation_requires_execution_context(key):
+        return True, ""
+
+    # (d) host-scoped ServiceTicket opening exactly this step's TARGET — checked
+    # FIRST so the scoped-ticket axis is never hidden by a "no password for the
+    # source" verdict.
+    if to_label:
+        try:
+            target_host = (
+                resolve_netexec_target_for_node_label(
+                    shell, domain, node_label=to_label
+                )
+                or to_label
+            )
+            if (
+                resolve_execution_credential(
+                    shell, domain=domain, host=target_host, relation=key
+                )
+                is not None
+            ):
+                return True, ""
+        except Exception as exc:  # noqa: BLE001 — scoped-ticket lookup is best-effort
+            telemetry.capture_exception(exc)
+
+    # Well-known "all principals" source (Everyone / Authenticated Users /
+    # BUILTIN Users): non-enumerable SIDs — every authenticated principal is a
+    # member, so ANY controlled principal legitimately exercises the edge. (Domain
+    # Users / Domain Computers are NOT here: they carry real member lists via the
+    # membership SSOT and satisfy the general rule below trivially — every owned
+    # domain principal IS a member.)
+    if is_wellknown_all_principals_source(from_label):
+        if (
+            context_username
+            or context_password
+            or get_owned_domain_usernames_for_attack_paths(shell, domain)
+            or _get_stored_credential_map(shell, domain)
+        ):
+            return True, ""
+        return False, "no controlled principal available"
+
+    # (a)/(b)/(c) — resolve the acting principal with source fidelity (edge-kind-
+    # aware: a post-ex step keeps the carried-forward session; a control/ACL/
+    # delegation step requires owning the source user / group member / computer
+    # account) and confirm it holds a usable credential.
+    reason = _attack_path_step_source_actor_reason(
+        shell,
+        domain=domain,
+        from_label=from_label,
+        relation=key,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    return (not reason), reason
+
+
 def _attack_path_step_readiness_reason(
     shell: Any,
     *,
@@ -2144,6 +2349,10 @@ def _attack_path_step_readiness_reason(
     user-facing explanation of which precondition is missing (credentials,
     target reachability, ...). Kept separate so the boolean fast path stays
     cheap for the existing skip-success logic.
+
+    The SOURCE-ownership half is delegated to the ONE predicate
+    :func:`attack_path_step_source_is_actionable` (SSOT); the tail keeps the
+    per-relation TARGET-reachability / endpoint preconditions.
     """
     if step_index < 1 or step_index > len(steps):
         return "invalid step index"
@@ -2161,66 +2370,19 @@ def _attack_path_step_readiness_reason(
     if not step_action:
         return "no action"
 
-    # A step ADscan observed to be CLOSED with certainty by the environment's
-    # configuration/topology (single-DC self-relay reflection, LDAP signing+CBT,
-    # no ADCS) is a POSITIVE hardening fact — it belongs in the "Attack Surface
-    # Reduced" bucket, NOT the executable set. It must never render ``[ready]``
-    # (the credential/reachability gate below would otherwise mark a closed
-    # self-relay runnable and auto-execute it). Guarded here so even a custom
-    # start-step selection surfaces it as locked. B1 already keeps the PATH out
-    # of the offer list; this is the step-level backstop.
-    from adscan_internal.services.relay_status_constants import (  # noqa: PLC0415
-        CONFIGURATION_CLOSE_STATUS,
-    )
-
-    step_status = str(step_item.get("status") or "").strip().lower()
-    if step_status == CONFIGURATION_CLOSE_STATUS:
-        return "closed by configuration (hardening observed)"
-
-    if step_key in ACL_ACE_RELATIONS:
-        try:
-            exec_context = build_ace_step_context(
-                shell,
-                domain,
-                relation=step_action,
-                summary=summary,
-                from_label=from_label,
-                to_label=to_label,
-                context_username=context_username,
-                context_password=context_password,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return "context resolution failed"
-        if not str(getattr(exec_context, "exec_username", "") or "").strip():
-            return f"no controller for {from_label or '?'}"
-        if not str(getattr(exec_context, "exec_password", "") or "").strip():
-            principal = (
-                str(getattr(exec_context, "exec_username", "") or "").strip()
-                or from_label
-                or "?"
-            )
-            return f"missing credentials for {principal}"
-        return ""
-
-    exec_username = _resolve_execution_user(
+    # SOURCE ownership is the ONE predicate's job (config-close, scoped-ticket,
+    # capability-ccache, group-membership, and stale-context handling all live
+    # there). A step whose source principal ADscan does not control is never
+    # ``[ready]``.
+    source_actionable, source_reason = attack_path_step_source_is_actionable(
         shell,
         domain=domain,
-        context_username=context_username,
-        summary=summary,
-        from_label=from_label,
-    )
-    if not exec_username:
-        return f"no executor resolved for {from_label or '?'}"
-    exec_password = _resolve_attack_path_step_password(
-        shell,
-        domain=domain,
-        exec_username=exec_username,
+        step=step_item,
         context_username=context_username,
         context_password=context_password,
     )
-    if not exec_password:
-        return f"missing credentials for {exec_username}"
+    if not source_actionable:
+        return source_reason
 
     if step_key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
         if not (
@@ -2313,6 +2475,7 @@ def _choose_custom_attack_path_start_step(
     steps: list[dict[str, Any]],
     executable_indices: list[int],
     default_step_idx: int,
+    default_to_cancel: bool = False,
     context_username: str | None = None,
     context_password: str | None = None,
 ) -> int | None:
@@ -2326,6 +2489,13 @@ def _choose_custom_attack_path_start_step(
       target, ...). The option is still selectable so power users can override
       a stale resolver decision; selecting it triggers an auto-resolve confirm
       that offers to start from the first ready step instead.
+
+    A step that already ran also carries a prior-outcome badge
+    (``✓ already run · succeeded`` / ``⚠ already run · did not complete``).
+    When *default_to_cancel* is set (every offered step already ran), the cursor
+    lands on ``Cancel execution`` so an already-compromised path recommends
+    skipping — the operator can still arrow to a proven step and re-run it, which
+    then passes the default-No per-step confirm in the execution loop.
     """
     if not hasattr(shell, "_questionary_select"):
         return default_step_idx
@@ -2368,21 +2538,28 @@ def _choose_custom_attack_path_start_step(
         if is_ready and first_ready_idx is None:
             first_ready_idx = step_idx
         readiness_tag = "[ready]" if is_ready else f"[locked — {lock_reason}]"
+        prior_badge = _attack_path_step_prior_outcome_badge(status)
+        badge_suffix = f" · {prior_badge}" if prior_badge else ""
         options.append(
             f"Step #{step_idx}: {action} [{status}] {from_label} -> {to_label} "
-            f"{readiness_tag}"
+            f"{readiness_tag}{badge_suffix}"
         )
         if step_idx == default_step_idx:
             default_option_idx = option_idx
     options.append("Cancel execution")
+    cancel_option_idx = len(executable_indices)
 
-    # If the suggested default is locked but a ready step exists, prefer it
-    # so the cursor lands on something the user can run without overrides.
-    if (
+    if default_to_cancel:
+        # Every offered step already ran: default to skip. The operator can still
+        # arrow to a proven step to re-run it (guarded by the per-step confirm).
+        default_option_idx = cancel_option_idx
+    elif (
         readiness
         and not readiness[default_option_idx][0]
         and first_ready_idx is not None
     ):
+        # The suggested default is locked but a ready step exists — prefer it so
+        # the cursor lands on something the user can run without overrides.
         default_option_idx = executable_indices.index(first_ready_idx)
 
     selection = shell._questionary_select(
@@ -2508,87 +2685,22 @@ def _attack_path_step_has_executable_context(
     context_username: str | None,
     context_password: str | None,
 ) -> bool:
-    """Return whether ADscan could execute one step with the current context."""
-    if step_index < 1 or step_index > len(steps):
-        return False
-    step_item = steps[step_index - 1]
-    if not isinstance(step_item, dict):
-        return False
+    """Return whether ADscan could execute one step with the current context.
 
-    step_action = str(step_item.get("action") or "").strip()
-    step_key = step_action.lower()
-    step_details = (
-        step_item.get("details") if isinstance(step_item.get("details"), dict) else {}
-    )
-    from_label = str(step_details.get("from") or "").strip()
-    to_label = str(step_details.get("to") or "").strip()
-    if not step_action:
-        return False
-
-    if step_key in ACL_ACE_RELATIONS:
-        try:
-            exec_context = build_ace_step_context(
-                shell,
-                domain,
-                relation=step_action,
-                summary=summary,
-                from_label=from_label,
-                to_label=to_label,
-                context_username=context_username,
-                context_password=context_password,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return False
-        return bool(
-            str(getattr(exec_context, "exec_username", "") or "").strip()
-            and str(getattr(exec_context, "exec_password", "") or "").strip()
-        )
-
-    exec_username = _resolve_execution_user(
+    Boolean sibling of :func:`_attack_path_step_readiness_reason` — both share
+    the ONE source-ownership predicate plus the same per-relation TARGET
+    preconditions, so the readiness tag, the bypass logic, and the pre-execution
+    gate can never disagree on whether a step is runnable.
+    """
+    return not _attack_path_step_readiness_reason(
         shell,
         domain=domain,
-        context_username=context_username,
         summary=summary,
-        from_label=from_label,
-    )
-    exec_password = _resolve_attack_path_step_password(
-        shell,
-        domain=domain,
-        exec_username=exec_username or "",
+        steps=steps,
+        step_index=step_index,
         context_username=context_username,
         context_password=context_password,
     )
-    if not exec_username or not exec_password:
-        return False
-
-    if step_key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
-        return bool(
-            to_label
-            and resolve_netexec_target_for_node_label(
-                shell,
-                domain,
-                node_label=to_label,
-            )
-        )
-    if step_key == "allowedtodelegate":
-        return bool(from_label and to_label)
-    if step_key == "allowedtoact":
-        # Target endpoint is the load-bearing requirement; the handler resolves
-        # the owned SPN-bearing trustee member at execution time and reports a
-        # precise failure when none is available.
-        return bool(to_label)
-    if step_key == "writelogonscript":
-        domain_data = (
-            getattr(shell, "domains_data", {}).get(domain, {})
-            if isinstance(getattr(shell, "domains_data", None), dict)
-            else {}
-        )
-        return bool(
-            str(step_details.get("host") or "").strip()
-            or _resolve_default_domain_controller(domain_data, domain)
-        )
-    return True
 
 
 def _attack_path_processed_step_is_bypassable(
@@ -2618,6 +2730,108 @@ def _attack_path_processed_step_is_bypassable(
         step_index=next_step_index,
         context_username=context_username,
         context_password=context_password,
+    )
+
+
+def _attack_path_actionable_start_indices(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    executable_indices: list[int],
+    context_username: str | None,
+    context_password: str | None,
+) -> list[int]:
+    """Return executable step indices whose SOURCE principal ADscan controls now.
+
+    Excludes only the :data:`_NON_RERUNNABLE_STEP_STATUSES` (nothing safe or
+    meaningful to run) and applies the ONE ownership predicate
+    :func:`attack_path_step_source_is_actionable`, so a start step is offered /
+    auto-selected iff it is genuinely runnable from a controlled principal.
+    Already-run steps (``success`` / ``attempted`` / …) STAY selectable — the
+    operator can re-run a proven step they still control; the per-step default-No
+    confirm in the execution loop is the safety gate.
+    """
+    out: list[int] = []
+    for idx in executable_indices:
+        if idx < 1 or idx > len(steps):
+            continue
+        step_item = steps[idx - 1]
+        if not isinstance(step_item, dict):
+            continue
+        if (
+            str(step_item.get("status") or "").strip().lower()
+            in _NON_RERUNNABLE_STEP_STATUSES
+        ):
+            continue
+        actionable, _reason = attack_path_step_source_is_actionable(
+            shell,
+            domain=domain,
+            step=step_item,
+            context_username=context_username,
+            context_password=context_password,
+        )
+        if actionable:
+            out.append(idx)
+    return out
+
+
+def _attack_path_entry_principal_label(
+    summary: dict[str, Any], steps: list[dict[str, Any]]
+) -> str:
+    """Return the path's entry principal — the source you must compromise first."""
+    source = str(summary.get("source") or "").strip()
+    if source:
+        return source
+    for step_item in steps:
+        if not isinstance(step_item, dict):
+            continue
+        details = step_item.get("details") if isinstance(step_item.get("details"), dict) else {}
+        from_label = str(details.get("from") or "").strip()
+        if from_label:
+            return from_label
+    return ""
+
+
+def _render_no_actionable_start_panel(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    """Explain that this path is not executable from the operator's position.
+
+    Rendered instead of a selector full of steps ADscan cannot run: none of the
+    path's steps start from a principal ADscan currently controls, so the honest
+    action is to name the entry principal to obtain first, not to offer a step
+    that would fail.
+    """
+    entry = _attack_path_entry_principal_label(summary, steps)
+    entry_line = (
+        f"Compromise {mark_sensitive(entry, 'node')} to unlock this path."
+        if entry
+        else "Compromise the path's entry principal to unlock this path."
+    )
+    body = "\n".join(
+        [
+            "None of this path's steps start from a principal you control yet, so",
+            "there is nothing to execute from your current position.",
+            "",
+            entry_line,
+            "Once you own it, this path becomes executable and reappears as a choice.",
+        ]
+    )
+    print_panel(
+        body,
+        title=Text("Path Not Yet Reachable", style=f"bold {BRAND_COLORS['warning']}"),
+        border_style=BRAND_COLORS["warning"],
+        expand=False,
+    )
+    print_info_debug(
+        "[attack_paths] no actionable start step; rendered not-reachable panel: "
+        f"domain={mark_sensitive(domain, 'domain')} "
+        f"entry={mark_sensitive(entry or '?', 'node')}"
     )
 
 
@@ -2700,12 +2914,30 @@ def _resolve_attack_path_start_step(
     )
     domain_pwned = domain_auth == "pwned"
 
-    default_start_idx = (
-        first_execution_required_idx or first_pending_idx or first_executable_idx
-    )
     non_interactive = is_non_interactive(shell)
 
-    # --- Non-interactive: use computed default, skip if nothing to do ---
+    # Steps we can actually START from — source principal controlled RIGHT NOW.
+    actionable_start_indices = _attack_path_actionable_start_indices(
+        shell,
+        domain=domain,
+        steps=steps,
+        executable_indices=executable_indices,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    # For the AUTOMATIC paths (non-interactive CI + text-only fallback) never
+    # auto-START from an already-SUCCEEDED step: a proven step must not be
+    # silently re-executed unattended. Re-running a succeeded step is an explicit
+    # OPERATOR affordance in the interactive selector (default-No confirm), not a
+    # CI default. Attempted/failed steps (not proven) remain auto-startable.
+    auto_start_indices = [
+        idx
+        for idx in actionable_start_indices
+        if str(steps[idx - 1].get("status") or "").strip().lower()
+        not in _STEP_SUCCEEDED_STATUSES
+    ]
+
+    # --- Non-interactive: start from the first ACTIONABLE step, skip otherwise ---
     if non_interactive:
         if domain_pwned and first_pending_idx is None:
             print_info_debug(
@@ -2715,96 +2947,84 @@ def _resolve_attack_path_start_step(
             return None
         if first_execution_required_idx is None:
             return None
-        return default_start_idx
+        # Pick the first step whose SOURCE principal we control at or after the
+        # computed start point — never blindly the first non-success step, which
+        # would authenticate as a carried-over principal and fail with
+        # insufficientAccessRights.
+        for idx in auto_start_indices:
+            if idx >= first_execution_required_idx:
+                return idx
+        print_info_debug(
+            "[attack_paths] no actionable start step (source principal not "
+            f"controlled); skipping execution: domain={mark_sensitive(domain, 'domain')}"
+        )
+        return None
 
     # --- Text-only fallback (no _questionary_select) ---
     if not hasattr(shell, "_questionary_select"):
-        if domain_pwned and first_pending_idx is None:
-            print_info(
-                "No fresh executable steps remain in this attack path. "
-                "Skipping re-execution because the domain is already compromised."
+        if not actionable_start_indices:
+            _render_no_actionable_start_panel(
+                shell, domain=domain, steps=steps, summary=summary
             )
-            return (
-                first_executable_idx
-                if Confirm.ask(
-                    "Re-run from the first step?",
-                    default=False,
-                )
-                else None
-            )
-        if first_execution_required_idx is None:
-            print_info(
-                "All executable steps in this attack path are already marked as success."
-            )
-            return (
-                first_executable_idx
-                if Confirm.ask(
-                    "All executable steps are already successful. Re-run from the first step?",
-                    default=False,
-                )
-                else None
-            )
-        print_info(f"Starting execution from step #{default_start_idx}.")
-        return default_start_idx
-
-    # --- Interactive: always offer step selector with smart default ---
-
-    # Edge case: no fresh steps — confirm before opening selector
-    if domain_pwned and first_pending_idx is None:
-        print_info(
-            "No fresh executable steps remain in this attack path "
-            "(domain is already compromised)."
-        )
-        choice = shell._questionary_select(
-            "What do you want to do?",
-            ["Skip execution (Recommended)", "Choose a step to re-run"],
-            default_idx=0,
-        )
-        if choice is None or choice == 0:
             return None
-        return _choose_custom_attack_path_start_step(
-            shell,
-            domain=domain,
-            summary=summary,
-            steps=steps,
-            executable_indices=executable_indices,
-            default_step_idx=first_executable_idx,
-            context_username=context_username,
-            context_password=context_password,
+        # Start from the first actionable step at or after the computed start
+        # point. If that step already ran, the execution loop's default-No
+        # per-step confirm is the single re-run gate — no separate whole-path
+        # "re-run?" pre-prompt here, so the operator is never double-asked.
+        threshold = first_execution_required_idx or actionable_start_indices[0]
+        start_idx = next(
+            (idx for idx in actionable_start_indices if idx >= threshold),
+            actionable_start_indices[0],
         )
+        print_info(f"Starting execution from step #{start_idx}.")
+        return start_idx
 
-    if first_execution_required_idx is None:
-        print_info(
-            "All executable steps in this attack path are already marked as success."
-        )
-        choice = shell._questionary_select(
-            "What do you want to do?",
-            ["Skip execution (Recommended)", "Choose a step to re-run"],
-            default_idx=0,
-        )
-        if choice is None or choice == 0:
-            return None
-        return _choose_custom_attack_path_start_step(
-            shell,
-            domain=domain,
-            summary=summary,
-            steps=steps,
-            executable_indices=executable_indices,
-            default_step_idx=first_executable_idx,
-            context_username=context_username,
-            context_password=context_password,
-        )
+    # --- Interactive: ONE selector offers every runnable step (fresh AND
+    # already-run), and the per-step default-No confirm in the execution loop is
+    # the SINGLE re-run safety gate. So an operator on an already-compromised
+    # domain can re-run a proven step without a redundant whole-path
+    # "re-run from the first step?" pre-prompt (the old double-prompt). ---
 
-    # Normal case: show step selector directly with smart default pre-selected
-    if len(executable_indices) == 1:
-        return default_start_idx
+    # ZERO actionable steps: do NOT open a selector full of locked steps the
+    # operator cannot run. Explain that this path is not executable from the
+    # current position and skip.
+    if not actionable_start_indices:
+        _render_no_actionable_start_panel(
+            shell, domain=domain, steps=steps, summary=summary
+        )
+        return None
+
+    # Land the cursor on the first FRESH (never-run) actionable step. When every
+    # actionable step already ran, default the selector to Cancel so the
+    # recommended action stays "skip" on an already-compromised path — the
+    # operator can still arrow to a proven step and re-run it (default-No confirm).
+    fresh_actionable = [
+        idx
+        for idx in actionable_start_indices
+        if str(steps[idx - 1].get("status") or "discovered").strip().lower()
+        not in _ALREADY_RUN_STEP_STATUSES
+    ]
+
+    # Auto-start when exactly ONE step is actionable: a single-choice selector is
+    # noise. A single already-run step still passes the per-step re-run confirm in
+    # the execution loop, so a proven step is never silently re-executed.
+    if len(actionable_start_indices) == 1:
+        return actionable_start_indices[0]
+
+    # Multiple actionable steps: the selector offers ONLY the steps whose source
+    # principal ADscan controls right now (locked ones stay in the Path Details
+    # table but are never a selectable choice); each already-run step is badged
+    # with its prior outcome.
     return _choose_custom_attack_path_start_step(
         shell,
         domain=domain,
         summary=summary,
         steps=steps,
-        executable_indices=executable_indices,
-        default_step_idx=default_start_idx,
+        executable_indices=actionable_start_indices,
+        default_step_idx=(
+            fresh_actionable[0] if fresh_actionable else actionable_start_indices[0]
+        ),
+        default_to_cancel=not fresh_actionable,
         context_username=context_username,
         context_password=context_password,
     )
@@ -3111,14 +3331,23 @@ def _resolve_execution_user(
     context_username: str | None,
     summary: dict[str, object],
     from_label: str | None,
+    from_node_kind: str | None = None,
     host: str | None = None,
     max_options: int = 20,
+    strict_source: bool = False,
+    relation: str | None = None,
 ) -> str | None:
     """Resolve an execution user for attack steps that require credentials.
 
     Pass ``host`` for a NETWORK-authenticating step (SMB/WinRM/RDP/MSSQL) so a
     principal already denied a network logon on that host is deprioritized in
     favour of a logon-capable one. Omit it for TGT/AS-REQ/scoped-ticket flows.
+    Pass ``strict_source=True`` (the ownership-gate predicate) to forbid the "any
+    stored credential" fallback so only a source-faithful actor is returned. Pass
+    ``relation`` so the carried-context decision is edge-kind-aware. This is the
+    EXECUTION path and may prompt (once, memoized) when several owned candidates
+    exist; a read-only caller (annotation / readiness / the ownership gate) uses
+    :func:`resolve_execution_candidates` instead so it never prompts.
     """
     return _shared_resolve_execution_user(
         shell,
@@ -3126,8 +3355,11 @@ def _resolve_execution_user(
         context_username=context_username,
         summary=summary,
         from_label=from_label,
+        from_node_kind=from_node_kind,
         host=host,
         max_options=max_options,
+        strict_source=strict_source,
+        relation=relation,
     )
 
 
@@ -3139,7 +3371,7 @@ def _resolve_golden_cert_execution_user(
     summary: dict[str, object],
     from_label: str | None,
 ) -> str | None:
-    """Resolve execution user for GoldenCert, preferring CA machine account creds."""
+    """Resolve execution user for AD CS ESC5, preferring CA machine account creds."""
     domains_data = getattr(shell, "domains_data", None)
     domain_data = (
         domains_data.get(domain)
@@ -3153,7 +3385,7 @@ def _resolve_golden_cert_execution_user(
         if from_user.endswith("$") and from_user in cred_keys:
             selected = cred_keys[from_user]
             print_info_debug(
-                "[goldencert] Using CA machine credential from step source: "
+                "adcsesc5: Using CA machine credential from step source: "
                 f"{mark_sensitive(selected, 'user')}"
             )
             return selected
@@ -3174,7 +3406,7 @@ def _resolve_golden_cert_target_host(
     from_label: str | None,
     domain_data: dict[str, Any],
 ) -> str | None:
-    """Resolve target CA host for GoldenCert."""
+    """Resolve target CA host for AD CS ESC5."""
     if from_label:
         resolved = resolve_netexec_target_for_node_label(
             shell,
@@ -3229,6 +3461,73 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _resolve_host_step_credential(
+    shell: Any,
+    *,
+    domain: str,
+    relation: str,
+    username: str,
+    target_host: str | None,
+    carried: CarriedCredential | None,
+    context_password: str | None,
+) -> tuple[str, str]:
+    """Resolve ``(secret, islocal)`` for a step that authenticates to a host.
+
+    The host-aware sibling of the domain-only resolvers.  Every step that binds
+    to one machine — the dump family, the local-access family — goes through
+    here so the credential arrives with its authority intact instead of as a
+    bare name that the domain store will happily answer with a different
+    account of the same name.
+
+    Order:
+
+    1. the credential the previous step handed over, *if the loop already
+       decided it applies to this step* (:func:`scope_carried_credential_to_step`
+       runs once per step and withholds a host-scoped credential everywhere
+       except its own host);
+    2. the stored DOMAIN credential for the principal — unchanged from before,
+       so a path that never touched a local account behaves exactly as it did;
+    3. a LOCAL account in this host's SAM.  Strictly additive: it is reached
+       only when there is no domain credential at all, which previously ended
+       the step with "no stored domain credential found".
+
+    ``islocal`` is ``"true"`` only for a credential this function knows is a
+    local account — never inferred from the account name.
+    """
+    if not str(username or "").strip():
+        return "", "false"
+
+    if context_password:
+        secret = str(context_password)
+        return secret, islocal_flag_for(carried, username=username, secret=secret)
+
+    stored = _resolve_domain_password(shell, domain, username)
+    if stored:
+        return str(stored), "false"
+
+    host = str(target_host or "").strip()
+    if not host:
+        return "", "false"
+    record = resolve_local_credential_for_host(
+        shell,
+        domain=domain,
+        host=host,
+        username=username,
+        service=local_service_for_relation(relation),
+    ) or resolve_local_credential_for_host(
+        shell, domain=domain, host=host, username=username
+    )
+    if record is not None:
+        print_info_debug(
+            "[attack_paths] resolved a host-scoped local credential: "
+            f"user={mark_sensitive(record.username, 'user')} "
+            f"host={mark_sensitive(record.host, 'hostname')} "
+            f"service={mark_sensitive(record.service or '?', 'service')}"
+        )
+        return record.secret, "true"
+    return "", "false"
 
 
 def _resolve_owned_spn_member_for_rbcd(
@@ -6178,10 +6477,10 @@ def _attempt_post_adminto_credential_harvest(
     exec_password: str,
     resolved_target_host: str,
 ) -> None:
-    """Try to harvest host creds after AdminTo when a later GoldenCert needs them.
+    """Try to harvest host creds after AdminTo when a later ESC5 needs them.
 
     This is a best-effort optimization for mixed paths such as:
-    ``... -> AdminTo -> COMPUTER$ -> GoldenCert -> Domain``.
+    ``... -> AdminTo -> COMPUTER$ -> ADCSESC5 -> Domain``.
     """
     if str(
         os.getenv("ADSCAN_ATTACK_PATH_POST_ADMINTO_HARVEST", "1")
@@ -6194,7 +6493,7 @@ def _attempt_post_adminto_credential_harvest(
         return
 
     next_goldencert = _find_next_step_by_action(
-        steps, start_index=current_step_index, action_key="goldencert"
+        steps, start_index=current_step_index, action_key="adcsesc5"
     )
     if not next_goldencert:
         return
@@ -6235,7 +6534,7 @@ def _attempt_post_adminto_credential_harvest(
     marked_user = mark_sensitive(golden_exec_user, "user")
     print_info(
         "AdminTo verified. Trying opportunistic host credential collection "
-        f"on {marked_host} for upcoming GoldenCert ({marked_user})."
+        f"on {marked_host} for upcoming AD CS ESC5 ({marked_user})."
     )
 
     dump_lsa = getattr(shell, "dump_lsa", None)
@@ -6282,7 +6581,7 @@ def _attempt_post_adminto_credential_harvest(
     marked_user = mark_sensitive(golden_exec_user, "user")
     print_warning(
         "AdminTo was successful, but no credential was recovered for "
-        f"{marked_user}. GoldenCert may fail."
+        f"{marked_user}. AD CS ESC5 may fail."
     )
 
 
@@ -6449,6 +6748,11 @@ def _map_detail_to_reason(service: str, detail: str) -> _VerifyFailReason:
     if "rdp_verdict=false" in d:
         return _VerifyFailReason.NO_PRIVILEGE
     # MSSQL
+    if "mssql_transport_error" in d:
+        # A failed TCP connect (host offline / filtered / an unreachable
+        # multi-homed NIC) surfacing as a socket-state artifact — NOT a
+        # credential rejection.
+        return _VerifyFailReason.HOST_OFFLINE
     if "mssql_no_login" in d:
         return _VerifyFailReason.SERVICE_DOWN
     if "mssql_login_failed" in d:
@@ -6570,6 +6874,8 @@ async def _verify_attack_step_native(
     target_hostname: str | None = None,
     kdc_ip: str | None = None,
     workspace_dir: str | None = None,
+    shell: Any = None,
+    is_local_account: bool = False,
 ) -> tuple[bool, _VerifyFailReason, str]:
     """Native access verifier for AdminTo / SqlAccess / SqlAdmin / CanRDP / CanPSRemote.
 
@@ -6577,11 +6883,24 @@ async def _verify_attack_step_native(
     async native stack: aiosmb (SMB), aardwolf (RDP), winrm async backend
     and impacket TDS via :class:`ImpacketMSSQLBackend` (MSSQL).
 
+    Set ``is_local_account`` when the credential names an account inside the
+    target's own SAM rather than a domain principal. The logon is then pinned
+    to the host's account domain and Kerberos is never requested — a local
+    account has no AD identity, and sending its logon to a DC is why a correct
+    local password comes back as ``STATUS_LOGON_FAILURE``.
+
     Returns ``(ok, reason, detail)``:
       - ``ok`` is True only when the relation is actively confirmed.
       - ``reason`` is a ``_VerifyFailReason`` classifying WHY it failed.
       - ``detail`` is a short machine-readable tag for debug logs.
     """
+    if is_local_account:
+        from adscan_internal.services.smb_privilege import (  # noqa: PLC0415
+            local_account_logon_domain,
+        )
+
+        domain = local_account_logon_domain(target_hostname or target_host)
+        kdc_ip = None
     # Pre-flight TCP probe — fail fast (3s) before committing to a full auth attempt
     # that may time out after 15s. Distinguishes host-offline from service-down
     # so the failure panel shows the correct reason without waiting.
@@ -6599,14 +6918,27 @@ async def _verify_attack_step_native(
 
     try:
         if service == "smb":
-            result = await verify_domain_user_local_admin(
-                domain=domain,
-                username=username,
-                credential=secret,
-                host=target_host,
-                target_hostname=target_hostname,
-                kdc_ip=kdc_ip,
-            )
+            if is_local_account:
+                from adscan_internal.services.smb_privilege import (  # noqa: PLC0415
+                    verify_local_account_smb_access,
+                )
+
+                result = await verify_local_account_smb_access(
+                    host=target_host,
+                    username=username,
+                    credential=secret,
+                    account_domain=domain,
+                    target_hostname=target_hostname,
+                )
+            else:
+                result = await verify_domain_user_local_admin(
+                    domain=domain,
+                    username=username,
+                    credential=secret,
+                    host=target_host,
+                    target_hostname=target_hostname,
+                    kdc_ip=kdc_ip,
+                )
             detail = f"smb_status={result.status.value}"
             ok = result.status == SMBPrivilegeStatus.ADMIN
             reason = (
@@ -6615,40 +6947,81 @@ async def _verify_attack_step_native(
             return ok, reason, detail
 
         if service == "mssql":
-            backend = ImpacketMSSQLBackend(
+            from adscan_internal.integrations.mssql import (  # noqa: PLC0415
+                queries as mssql_queries,
+            )
+            from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
+                is_impacket_tds_transport_error,
+            )
+
+            # Resolve the CONNECT target to its reachable IP through the central
+            # service-agnostic SSOT seam (multi-homed aware), keeping the FQDN as
+            # the Kerberos SPN / ``remoteName``. Impacket's TDS resolves the name
+            # itself and can land on an unreachable interface on a multi-homed DC;
+            # handing it the reachable IP the collector already validated avoids
+            # the false ``auth_failed`` from a socket-state artifact. See CLAUDE.md
+            # "Resolving a host to its reachable IP".
+            from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+                resolve_connect_and_spn,
+            )
+
+            connect_host, spn_host = await asyncio.to_thread(
+                resolve_connect_and_spn,
+                shell,
                 host=target_host,
                 domain=domain,
-                kerberos_target_hostname=target_hostname,
+                resolver_ip=kdc_ip,
+                spn_hostname=target_hostname,
+                # Probe the port we actually connect on (MSSQL 1433) so a
+                # multi-homed DC whose routable NIC has 445/135/88/389/3389
+                # filtered but 1433 open is still selected — not the internal
+                # NIC that dead-ends the impacket TDS connect. ``service`` keys
+                # the pivot-reachability fallback for a pivot-only instance.
+                service="mssql",
+                probe_port=1433,
+            )
+
+            backend = ImpacketMSSQLBackend(
+                host=connect_host,
+                domain=domain,
+                kerberos_target_hostname=spn_host,
                 kdc_host=kdc_ip,
             )
-            if require_admin:
-                sweep = await asyncio.to_thread(
-                    backend.sweep_privileges,
-                    domain=domain,
-                    username=username,
-                    secret=secret,
-                )
-                if sweep is None:
-                    detail = "mssql_no_login"
-                    return False, _map_detail_to_reason(service, detail), detail
-                detail = f"mssql_sysadmin={sweep.is_sysadmin}"
-                ok = bool(sweep.is_sysadmin)
-                reason = (
-                    _VerifyFailReason.OK
-                    if ok
-                    else _map_detail_to_reason(service, detail)
-                )
-                return ok, reason, detail
-            identity = await asyncio.to_thread(
-                backend.fingerprint_identity,
+            # Single identity probe that surfaces the structured transport error
+            # so a failed connect is classified as HOST_OFFLINE, never AUTH_FAILED.
+            probe = await asyncio.to_thread(
+                backend.execute_query,
+                domain=domain,
+                username=username,
+                secret=secret,
+                query=mssql_queries.IDENTITY_FINGERPRINT,
+                timeout=60,
+            )
+            if not (probe.success and probe.rows):
+                if is_impacket_tds_transport_error(
+                    probe.error_message or probe.stderr or ""
+                ):
+                    detail = "mssql_transport_error"
+                else:
+                    detail = "mssql_login_failed"
+                return False, _map_detail_to_reason(service, detail), detail
+            if not require_admin:
+                return True, _VerifyFailReason.OK, "mssql_login_ok"
+            sweep = await asyncio.to_thread(
+                backend.sweep_privileges,
                 domain=domain,
                 username=username,
                 secret=secret,
             )
-            if identity is not None:
-                return True, _VerifyFailReason.OK, "mssql_login_ok"
-            detail = "mssql_login_failed"
-            return False, _map_detail_to_reason(service, detail), detail
+            if sweep is None:
+                detail = "mssql_no_login"
+                return False, _map_detail_to_reason(service, detail), detail
+            detail = f"mssql_sysadmin={sweep.is_sysadmin}"
+            ok = bool(sweep.is_sysadmin)
+            reason = (
+                _VerifyFailReason.OK if ok else _map_detail_to_reason(service, detail)
+            )
+            return ok, reason, detail
 
         if service == "rdp":
             results = await scan_rdp_hosts(
@@ -6692,6 +7065,90 @@ async def _verify_attack_step_native(
         return False, _VerifyFailReason.HOST_OFFLINE, detail
 
 
+def resolve_collapsed_pivot_targets(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+) -> list[str]:
+    """Ask the operator which interchangeable pivot account(s) to target.
+
+    A collapsed sibling-pivot row (``via_accounts``, count > 1) reaches the same
+    downstream path through any of several interchangeable accounts. The control
+    depends on the fan-out step's determinism:
+
+    * **Probabilistic** (Kerberoasting / AS-REP Roasting / spraying — success is a
+      crack or a guess): a **multi-select** — trying several raises the odds and it
+      is OPSEC-cheap, so the operator can target several and stop at the first that
+      yields a usable credential.
+    * **Deterministic** (a write / ACL / delegation primitive that succeeds
+      outright): a **single-select** — one is enough and doing it to N objects would
+      be N destructive changes.
+
+    Non-interactively (``adscan ci``) the prompt auto-resolves to the single
+    strongest candidate — the proven pivot if any, else the representative — so the
+    work stays bounded and nothing blocks on stdin. Returns the chosen pivot
+    labels (strongest first, at least one); returns ``[]`` when the summary is not a
+    collapsible fan-out (caller keeps today's exact behaviour).
+    """
+    if collapsed_pivot_index(summary) is None:
+        return []
+    via_accounts = [
+        str(a) for a in (summary.get("via_accounts") or []) if str(a).strip()
+    ]
+    if len(via_accounts) < 2:
+        return []
+    representative = via_accounts[0]
+    try:
+        proven_count = int(summary.get("via_accounts_proven_count") or 0)
+    except (TypeError, ValueError):
+        proven_count = 0
+    proven_labels = via_accounts[: max(0, proven_count)]
+    total = summary.get("via_accounts_count") or len(via_accounts)
+
+    relation = collapsed_pivot_fanout_relation(summary) or ""
+    probabilistic = is_probabilistic_step(relation)
+
+    if probabilistic:
+        if is_non_interactive(shell):
+            # Bound the unattended work: the single strongest candidate, not all.
+            default_values = [proven_labels[0] if proven_labels else representative]
+        else:
+            default_values = proven_labels if proven_labels else [representative]
+        selected = questionary_checkbox_values(
+            title=(
+                f"This step reaches the path through {total} interchangeable "
+                "accounts. Select which to target — trying several raises the odds "
+                "and execution stops at the first that yields a usable credential."
+            ),
+            options=via_accounts,
+            default_values=default_values,
+            shell=shell,
+        )
+        chosen = [str(a) for a in (selected or []) if str(a).strip()]
+        if not chosen:
+            chosen = [representative]
+        # Preserve the strongest-first order regardless of selection order.
+        order = {label: i for i, label in enumerate(via_accounts)}
+        chosen.sort(key=lambda label: order.get(label, len(via_accounts)))
+        return chosen
+
+    # Deterministic → one is enough; single-select, default = the representative.
+    idx = questionary_select_index(
+        title=(
+            f"This step reaches the path through {total} interchangeable accounts, "
+            "but the primitive is guaranteed — pick ONE to target (one destructive "
+            "action is enough)."
+        ),
+        options=via_accounts,
+        default_idx=0,
+        shell=shell,
+    )
+    if idx is None or idx < 0 or idx >= len(via_accounts):
+        idx = 0
+    return [via_accounts[idx]]
+
+
 def execute_selected_attack_path(
     shell: Any,
     domain: str,
@@ -6709,6 +7166,40 @@ def execute_selected_attack_path(
     Returns:
         True if an execution attempt was started, False otherwise.
     """
+    # --- Collapsed sibling-pivot selection ---
+    # When the selected path is a collapsed fan-out (N interchangeable pivot
+    # accounts reaching the same downstream path), let the operator CHOOSE which
+    # pivot(s) to target before anything runs. The control depends on the fan-out
+    # step's determinism (multi-select for crack/guess steps, single-select for
+    # deterministic writes). The representative/non-interactive default reproduces
+    # today's exact path, so this is strictly additive for the common case.
+    if collapsed_pivot_index(summary) is not None:
+        _chosen_pivots = resolve_collapsed_pivot_targets(
+            shell, domain=domain, summary=summary
+        )
+        if _chosen_pivots:
+            _primary_pivot = _chosen_pivots[0]
+            _via_accounts = summary.get("via_accounts") or []
+            _representative = str(_via_accounts[0]) if _via_accounts else ""
+            if _primary_pivot != _representative:
+                summary = retarget_collapsed_summary_to_pivot(summary, _primary_pivot)
+            if len(_chosen_pivots) > 1:
+                # Multi-candidate execution loop (retry the next account if the
+                # first crack fails) is a tracked follow-up — the one-shot executor
+                # cannot yet iterate candidates. Target the strongest now.
+                print_info(
+                    "Targeting "
+                    + mark_sensitive(_primary_pivot, "user")
+                    + f" first; the {len(_chosen_pivots) - 1} further selected "
+                    "candidate(s) are a manual follow-up for now."
+                )
+            else:
+                print_info_debug(
+                    "attack_paths collapsed pivot selected: "
+                    + mark_sensitive(_primary_pivot, "user")
+                )
+    # --- End collapsed sibling-pivot selection ---
+
     # --- Boundary enforcement: re-apply the readiness gate ---
     # Any caller may pass a raw (un-annotated) summary. We re-annotate here so
     # the reachability and credential gate is evaluated exactly once at the
@@ -6772,6 +7263,10 @@ def execute_selected_attack_path(
         pass
 
     set_attack_path_execution(shell)
+    # Fresh per-run execution-user selection memo: the operator is prompted at
+    # most ONCE per source principal within this run and the choice is reused,
+    # but a NEW run must re-ask rather than silently reuse a stale prior choice.
+    reset_execution_user_memo(shell)
     # Surface any HasSession artifact left by a previous crashed run before
     # starting new exploitation — keeps the domain clean and alerts the operator.
     _check_hassession_pending_cleanup(shell, domain=domain)
@@ -6944,7 +7439,7 @@ def execute_selected_attack_path(
             """Single mandatory success path for every credential-producing step.
 
             Every dispatch branch that authenticates / mints / dumps a new
-            principal's credential (ADCS ESC1..ESC15 PKINIT, GoldenCert,
+            principal's credential (ADCS ESC1..ESC15 PKINIT, ESC5 CA-key forge,
             HasSession create-user, DumpLSA / DumpDPAPI, BackupOperator
             escalation, and the ACE / roasting / spray families) converges
             here on success so the two things that always have to happen,
@@ -7462,12 +7957,52 @@ def execute_selected_attack_path(
                 followups=followups,
             )
 
+        def _set_carried_execution_credential(
+            *,
+            username: str,
+            secret: str,
+            source_action: str = "",
+            declared_scope: str | None = None,
+            declared_host: str | None = None,
+            declared_service: str | None = None,
+        ) -> CarriedCredential | None:
+            """Record the credential this path now carries, with its SCOPE.
+
+            The ONE place a step-to-step handoff is written.  The scope is what
+            distinguishes a domain principal from an account that exists only
+            inside one host's SAM; dropping it is how a local ``Administrator``
+            recovered on a member server used to reach the next step as the
+            domain ``Administrator`` — a different account entirely.
+
+            The active ``context_*`` pair is refreshed here too, so anything
+            still running inside the CURRENT step sees the new credential
+            exactly as before.  The next step re-derives its own view from the
+            carried credential at the top of the loop, where the scope is
+            applied.
+            """
+            nonlocal carried_username, carried_password, carried_credential
+            nonlocal context_username, context_password
+
+            carried_credential = derive_carried_credential(
+                getattr(shell, "domains_data", {}),
+                domain=domain,
+                username=username,
+                secret=secret,
+                source_action=source_action,
+                declared_scope=declared_scope,
+                declared_host=declared_host,
+                declared_service=declared_service,
+            )
+            carried_username = username
+            carried_password = secret
+            context_username = username
+            context_password = secret
+            return carried_credential
+
         def _apply_execution_outcome_context_handoff(
             outcome: dict[str, Any] | None,
         ) -> None:
             """Update the in-path execution context after obtaining a new user credential."""
-            nonlocal context_username, context_password
-
             if not isinstance(outcome, dict):
                 return
             if (
@@ -7487,18 +8022,32 @@ def execute_selected_attack_path(
                 )
                 return
 
-            previous_user = _normalize_account(context_username or "")
-            context_username = compromised_user
-            context_password = credential
+            previous_user = _normalize_account(carried_username or "")
+            source_action = str(outcome.get("source_action") or "").strip()
+            carried = _set_carried_execution_credential(
+                username=compromised_user,
+                secret=credential,
+                source_action=source_action,
+                declared_scope=str(outcome.get("credential_scope") or "") or None,
+                declared_host=str(outcome.get("credential_host") or "") or None,
+                declared_service=str(outcome.get("credential_service") or "") or None,
+            )
             marked_user = mark_sensitive(compromised_user, "user")
             followup_context = get_attack_path_followup_context(shell)
             print_info_debug(
                 "[attack_paths] execution context handed off to newly compromised user: "
                 f"previous_user={mark_sensitive(previous_user or 'none', 'detail')} "
                 f"new_user={marked_user} "
+                f"credential_scope={mark_sensitive(carried.describe() if carried else 'unknown', 'detail')} "
                 f"nested_followup_active={bool(followup_context)!r} "
                 f"context={mark_sensitive(str(followup_context or {}), 'detail')}"
             )
+            if carried is not None and carried.is_local:
+                print_info(
+                    f"{mark_sensitive(compromised_user, 'user')} is a local account on "
+                    f"{mark_sensitive(carried.host or '?', 'hostname')}. Later steps will "
+                    "use it against that host only."
+                )
 
             # Centralised active-step success transition. Any action that
             # produces a ``user_credential_obtained`` outcome (ESC1..15 PKINIT,
@@ -7512,7 +8061,6 @@ def execute_selected_attack_path(
                     update_active_step_status,
                 )
 
-                source_action = str(outcome.get("source_action") or "").strip()
                 update_active_step_status(
                     shell,
                     domain=domain,
@@ -7738,6 +8286,25 @@ def execute_selected_attack_path(
                 return "skip"
             return "cancel"
 
+        # The credential this path carries from one step to the next, WITH the
+        # authority it belongs to. ``carried_*`` is the durable pair; the
+        # ``context_*`` pair below is re-derived per step from it, because a
+        # credential local to one host must not be inherited by a step that
+        # authenticates somewhere else.
+        carried_username: str | None = context_username
+        carried_password: str | None = context_password
+        carried_credential: CarriedCredential | None = (
+            derive_carried_credential(
+                getattr(shell, "domains_data", {}),
+                domain=domain,
+                username=str(context_username),
+                secret=str(context_password),
+                source_action="path_entry",
+            )
+            if context_username and context_password
+            else None
+        )
+
         for idx, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
                 continue
@@ -7796,6 +8363,46 @@ def execute_selected_attack_path(
             )
             from_label = str(details.get("from") or "")
             to_label = str(details.get("to") or "")
+
+            # Scope the carried credential to THIS step, once, before anything
+            # reads it. A domain credential carries everywhere. One that names
+            # an account inside a single host's SAM carries only to a step that
+            # authenticates to that same host — everywhere else it is withheld,
+            # and the step resolves its own principal rather than inheriting a
+            # name whose authority does not reach it. Withholding at this one
+            # point is what makes every step correct, including steps added
+            # later: no branch below has to remember to check.
+            step_carried, _carry_reason = scope_carried_credential_to_step(
+                carried_credential,
+                relation=key,
+                from_label=from_label,
+                to_label=to_label,
+            )
+            if carried_credential is not None and step_carried is None:
+                context_username = None
+                context_password = None
+                marked_carried_user = mark_sensitive(
+                    carried_credential.username, "user"
+                )
+                marked_carried_host = mark_sensitive(
+                    carried_credential.host or "?", "hostname"
+                )
+                print_warning(
+                    f"The credential recovered for {marked_carried_user} is local to "
+                    f"{marked_carried_host} and cannot authenticate {action}. "
+                    "ADscan will resolve a separate principal for this step instead "
+                    "of reusing the account name."
+                )
+                print_info_debug(
+                    "[attack_paths] carried credential withheld for step: "
+                    f"index={idx} action={mark_sensitive(action, 'detail')} "
+                    f"carried_scope={mark_sensitive(carried_credential.describe(), 'detail')} "
+                    f"reason={mark_sensitive(_carry_reason, 'detail')}"
+                )
+            else:
+                context_username = carried_username
+                context_password = carried_password
+
             existing_step_decision = _decide_existing_step_handling(
                 step=step,
                 step_index=idx,
@@ -7825,6 +8432,55 @@ def execute_selected_attack_path(
                     executable_step_position = executable_indices.index(idx) + 1
                 except ValueError:
                     executable_step_position = 0
+
+            # Central pre-execution ownership gate (SSOT). Before authenticating,
+            # confirm ADscan controls THIS step's SOURCE principal. If not, REFUSE
+            # rather than run the write as the carried-over / wrong principal —
+            # that path fails with a confusing insufficientAccessRights that reads
+            # like an ADscan defect instead of "you have not obtained this
+            # credential yet". The same predicate drives the offer/readiness/
+            # auto-start decisions, so a refusal here only fires on a step the
+            # operator explicitly overrode into (or a mid-chain step whose source
+            # a prior failure never produced).
+            _source_actionable, _source_reason = attack_path_step_source_is_actionable(
+                shell,
+                domain=domain,
+                step=step,
+                context_username=context_username,
+                context_password=context_password,
+            )
+            if not _source_actionable:
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_blocked",
+                    message=(
+                        "Cannot execute this step: its source principal is not "
+                        "controlled yet."
+                    ),
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="blocked",
+                    reason="source_principal_not_controlled",
+                )
+                marked_source = mark_sensitive(from_label or "?", "node")
+                print_warning(
+                    f"This step starts from {marked_source}, which is not yet "
+                    "compromised. Obtain control of it first via the preceding "
+                    "step in this path, then retry."
+                )
+                print_info_debug(
+                    "[attack_paths] pre-execution ownership gate refused step: "
+                    f"index={idx} action={mark_sensitive(action, 'detail')} "
+                    f"from={marked_source} reason={mark_sensitive(_source_reason, 'detail')}"
+                )
+                return execution_started
 
             if key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
                 if not to_label:
@@ -7858,8 +8514,18 @@ def execute_selected_attack_path(
                     from_label=from_label,
                 )
 
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
+                # Host-aware resolution: these relations authenticate to the
+                # TARGET machine, so an account that exists only in that host's
+                # SAM is a legitimate actor here — and its logon must name the
+                # host, not the domain.
+                password, access_islocal = _resolve_host_step_credential(
+                    shell,
+                    domain=domain,
+                    relation=key,
+                    username=exec_username or "",
+                    target_host=to_label,
+                    carried=step_carried,
+                    context_password=context_password,
                 )
                 if not exec_username or not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
@@ -8008,6 +8674,8 @@ def execute_selected_attack_path(
                                 or ""
                             )
                             or None,
+                            shell=shell,
+                            is_local_account=access_islocal == "true",
                         )
                     )
                     print_info_debug(
@@ -9698,11 +10366,16 @@ def execute_selected_attack_path(
                         )
                         return True
 
-                    context_username = target_user
-                    context_password = recovered_credential
+                    _sprayed_carried = _set_carried_execution_credential(
+                        username=target_user,
+                        secret=recovered_credential,
+                        source_action=action,
+                    )
                     print_info_debug(
                         f"[attack_paths] execution context handed off after {action}: "
                         f"user={marked_target} "
+                        "credential_scope="
+                        f"{mark_sensitive(_sprayed_carried.describe() if _sprayed_carried else 'unknown', 'detail')} "
                         f"spray_type={marked_spray_type}"
                     )
                     try:
@@ -11965,9 +12638,9 @@ def execute_selected_attack_path(
                     )
                 continue
 
-            if key == "goldencert":
+            if key == "adcsesc5":
                 if not from_label or not to_label:
-                    print_warning("Cannot execute GoldenCert: missing from/to details.")
+                    print_warning("Cannot execute AD CS ESC5: missing from/to details.")
                     return execution_started
 
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
@@ -11976,7 +12649,7 @@ def execute_selected_attack_path(
                 if not domain_data.get("pdc") or not domain_data.get("ca"):
                     marked_domain = mark_sensitive(domain, "domain")
                     print_warning(
-                        f"Cannot execute GoldenCert for {marked_domain}: missing PDC/CA info."
+                        f"Cannot execute AD CS ESC5 for {marked_domain}: missing PDC/CA info."
                     )
                     _mark_blocked_step(
                         action,
@@ -12000,7 +12673,7 @@ def execute_selected_attack_path(
                 if not exec_username or not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
                     print_warning(
-                        "Cannot execute GoldenCert: no stored credential found for "
+                        "Cannot execute AD CS ESC5: no stored credential found for "
                         f"{marked_user}."
                     )
                     _mark_blocked_step(
@@ -12021,7 +12694,7 @@ def execute_selected_attack_path(
                 if not ca_target_host:
                     marked_domain = mark_sensitive(domain, "domain")
                     print_warning(
-                        f"Cannot execute GoldenCert for {marked_domain}: CA host is not resolvable."
+                        f"Cannot execute AD CS ESC5 for {marked_domain}: CA host is not resolvable."
                     )
                     _mark_blocked_step(
                         action,
@@ -12034,7 +12707,7 @@ def execute_selected_attack_path(
 
                 execution_started = True
                 with _active_step_context(
-                    action="GoldenCert",
+                    action="ADCSESC5",
                     from_label=from_label,
                     to_label=to_label,
                     notes={
@@ -12047,7 +12720,7 @@ def execute_selected_attack_path(
                             shell,
                             domain,
                             from_label=from_label,
-                            relation="GoldenCert",
+                            relation="ADCSESC5",
                             to_label=to_label,
                             status="attempted",
                             notes={
@@ -12077,18 +12750,18 @@ def execute_selected_attack_path(
                             password=password,
                             ca_target_host=ca_target_host,
                         )
-                    # GoldenCert returns no status flag; a captured-principal
-                    # outcome emitted by adcs_golden_cert on Pass-the-Certificate
-                    # success is the signal that the forged DA credential landed
-                    # in the store. Promote it through the centralised helper so
-                    # the next step runs as the impersonated DA, not the executor.
+                    # ESC5 returns no status flag; a captured-principal outcome
+                    # emitted by adcs_golden_cert on Pass-the-Certificate success
+                    # is the signal that the forged DA credential landed in the
+                    # store. Promote it through the centralised helper so the next
+                    # step runs as the impersonated DA, not the executor.
                     gold_outcome = get_last_ace_execution_outcome(shell) or {}
                     gold_principal = str(
                         gold_outcome.get("compromised_user") or ""
                     ).strip()
                     if gold_principal:
                         _handle_successful_credential_step(
-                            "GoldenCert",
+                            "ADCSESC5",
                             from_label,
                             to_label,
                             notes={
@@ -13199,6 +13872,7 @@ def execute_selected_attack_path(
                 scoped = resolve_execution_credential(
                     shell, domain=domain, host=source_host, relation=action
                 )
+                dump_islocal = "false"
                 if scoped is not None:
                     exec_username, password = scoped
                     print_info_debug(
@@ -13219,8 +13893,25 @@ def execute_selected_attack_path(
                         from_label=from_label,
                         host=source_host,
                     )
-                    password = context_password or _resolve_domain_password(
-                        shell, domain, exec_username
+                    # Host-aware resolution: a credential carried from the
+                    # previous step keeps its authority, and an account that
+                    # exists only in this host's SAM is usable here. ``islocal``
+                    # decides whether the logon names the host or the domain,
+                    # so it is derived from the credential, never from the name.
+                    password, dump_islocal = _resolve_host_step_credential(
+                        shell,
+                        domain=domain,
+                        relation=key,
+                        username=exec_username or "",
+                        target_host=source_host,
+                        carried=step_carried,
+                        context_password=context_password,
+                    )
+                    print_info_debug(
+                        f"attack_paths {action}: credential resolved for "
+                        f"{mark_sensitive(exec_username or '?', 'user')} on "
+                        f"{mark_sensitive(source_host, 'hostname')} "
+                        f"scope={'local' if dump_islocal == 'true' else 'domain'}"
                     )
                 if not exec_username or not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
@@ -13276,13 +13967,35 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    dump_handler(
-                        domain,
-                        exec_username,
-                        password,
-                        source_host,
-                        "false",
+                    # This step exists to recover the credential of the edge's
+                    # TARGET principal. When that principal is a machine
+                    # account, the machine-account secrets have to be kept or
+                    # the step discards exactly what it was run for and the
+                    # path stops one line after a successful dump.
+                    # ``to_label`` is a graph node label (``BRAAVOS$@ESSOS.LOCAL``),
+                    # so the sAMAccountName has to be recovered before the
+                    # ``$``-suffix test — the raw label never ends in ``$``.
+                    dump_wants_machine_accounts = is_machine_account_name(
+                        _normalize_account(to_label)
                     )
+                    try:
+                        dump_handler(
+                            domain,
+                            exec_username,
+                            password,
+                            source_host,
+                            dump_islocal,
+                            include_machine_accounts=dump_wants_machine_accounts,
+                        )
+                    except TypeError:
+                        # DumpDPAPI (and older shell shims) take no such flag.
+                        dump_handler(
+                            domain,
+                            exec_username,
+                            password,
+                            source_host,
+                            dump_islocal,
+                        )
 
                 target_user = _normalize_account(to_label)
                 recovered_credential = (

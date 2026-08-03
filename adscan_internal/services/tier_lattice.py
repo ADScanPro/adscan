@@ -38,6 +38,7 @@ from adscan_internal.services.compromise_class import (
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.post_exploitation.access_followups import (
     get_access_lane,
+    grants_host_system_session,
     is_principal_compromise_followup,
     is_self_credential_followup,
 )
@@ -91,12 +92,19 @@ def source_grants_local_admin_for_relation(
     (ESCALATION) relation that deterministically grants local admin.
     ``AllowedToDelegate`` does so ONLY when the source has protocol transition
     (``hastrustedtoauth`` / TrustedToAuthForDelegation) — the C1 conditional.
+    The MSSQL SYSTEM-escalation self-loops (``MssqlSeImpersonateEscalation`` /
+    ``MssqlTokenTheftEscalation``) grant local admin unconditionally: reaching
+    ``NT AUTHORITY\\SYSTEM`` on the host IS the host machine account, so the
+    self-credential DumpLSA bridge and the direct-DCSync bridge (F6) both unlock
+    off them, exactly as they do off ``AdminTo`` (``grants_host_system_session``).
     """
     rel = str(relation or "").strip().lower()
     lane = get_access_lane(rel)
     if lane is not None:
         return lane.unlocks_self_credential
     if rel == "spnjack":
+        return True
+    if grants_host_system_session(rel):
         return True
     if rel == "allowedtodelegate":
         props = (

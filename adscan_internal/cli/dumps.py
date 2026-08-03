@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import asyncio
 import os
 import re
+import time
 
 from rich.prompt import Confirm
 
@@ -72,6 +73,10 @@ from adscan_internal.services.exploitation.dpapi_native_dump import (
 from adscan_internal.services.exploitation.dump_display import (
     DumpDisplay,
     CredentialType,
+)
+from adscan_internal.services.lsa_secret_attribution import (
+    LsaHarvestGroup,
+    build_lsa_harvest,
 )
 from adscan_internal.services.smb_transport import SMBConfig
 from adscan_internal.services.async_bridge import run_async_sync
@@ -689,11 +694,32 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
                     "intended principal."
                 )
 
+    # A local-scope credential must present the HOST's own account domain, not
+    # the AD domain: with the AD domain in the NTLMSSP domain field the target
+    # forwards the logon to a domain controller and never consults its own SAM,
+    # so the correct account name and the correct password still fail. The
+    # sentinel that reaches here is an empty ``auth_domain`` (set by
+    # ``_temporary_dump_creds`` for ``islocal=true``); the host is only known at
+    # this point, which is why the translation happens here.
+    if force_ntlm_local:
+        from adscan_internal.services.smb_privilege import (  # noqa: PLC0415
+            local_account_logon_domain,
+        )
+
+        effective_auth_domain = local_account_logon_domain(spn_host or host)
+        print_info_debug(
+            f"[dump] local-scope credential on {host} → NTLM logon domain "
+            f"{mark_sensitive(effective_auth_domain, 'domain')}"
+        )
+    else:
+        effective_auth_domain = creds.get("auth_domain") or domain
+
     return SMBConfig(
         target_ip=host,
         target_hostname=spn_host,
         domain=domain,
-        auth_domain=creds.get("auth_domain") or domain,
+        auth_domain=effective_auth_domain,
+        is_local_account=force_ntlm_local,
         username=creds.get("username"),
         password=creds.get("password"),
         nt_hash=creds.get("nt_hash"),
@@ -3276,7 +3302,10 @@ def run_dump_registries(
             stored.append((sam.username, sam.nt_hash))
 
     if result.machine_account_nt_hash:
-        dc_acct = f"{(pdc_hostname or 'DC').upper()}$"
+        # The DC named itself during the dump; fall back to the workspace's
+        # record of it only when that read did not answer.
+        dc_short = str(result.computer_name or pdc_hostname or "DC").split(".")[0]
+        dc_acct = f"{dc_short.upper()}$"
         display.stream_credential(
             CredentialType.LSA, dc_acct, result.machine_account_nt_hash, extras="[DC$]"
         )
@@ -4112,7 +4141,22 @@ def _native_execute_dump_lsa_bulk(
         machine_hash = getattr(result, "machine_account_nt_hash", None)
         if not machine_hash:
             return 0, []
-        machine_user = f"{host.split('.')[0]}$"
+        # The machine account belongs to the host that was dumped, and a
+        # campaign frequently addresses hosts by IP, where a naive first-label
+        # split yields "10$". Ask the host, then the workspace.
+        machine_user, reason = _resolve_dumped_machine_account(
+            shell,
+            domain=domain,
+            host=host,
+            computer_name=getattr(result, "computer_name", None),
+        )
+        if not machine_user:
+            print_info_debug(f"[lsa] {host}: machine account unattributed: {reason}")
+            return 0, [
+                f"    [{_MUTED}][LSA][/{_MUTED}]"
+                f"  [{_AMBER}]{host}[/{_AMBER}]"
+                f"  [{_MUTED}]→  machine account hash recovered, host could not be named[/{_MUTED}]"
+            ]
         finding_count += 1
         _record_bulk_finding(
             bulk_summary, host=host, username=machine_user, is_hash=True
@@ -4721,6 +4765,320 @@ def _native_execute_dump_sam(
     )
 
 
+# ---------------------------------------------------------------------------
+# LSA secret attribution — a ``_SC_*`` key is a service, never an account
+# ---------------------------------------------------------------------------
+
+def _harvest_hint(count: int, singular: str, plural: str) -> str:
+    """Return ``"<n> <noun>"`` with the noun agreeing with the number."""
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _hostname_candidates_for_target(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+) -> list[str]:
+    """Return the hostnames the workspace has already resolved for an address.
+
+    Best-effort: an empty list simply means the caller has no name for this
+    target and must say so rather than substitute one.
+    """
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (
+            load_workspace_ip_hostname_inventory,
+        )
+
+        workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+        domains_dir = str(getattr(shell, "domains_dir", "domains") or "domains")
+        if not workspace_dir or not domain:
+            return []
+        inventory = load_workspace_ip_hostname_inventory(
+            workspace_dir=workspace_dir, domains_dir=domains_dir, domain=domain
+        )
+        return list(inventory.get(str(host or "").strip(), []) or [])
+    except Exception as exc:  # noqa: BLE001 - a missing name is not a failure
+        print_info_debug(f"[lsa] hostname inventory lookup failed: {exc}")
+        return []
+
+
+def _resolve_dumped_machine_account(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    computer_name: str | None,
+) -> "tuple[str | None, str]":
+    """Name the machine account of the host a dump was taken from.
+
+    Returns ``(machine_account, reason)``; ``reason`` is filled only when the
+    host could not be named, and the caller then records the recovered material
+    as unattributed rather than filing it under another machine.
+    """
+    from adscan_internal.services.lsa_secret_attribution import (
+        resolve_machine_account_principal,
+    )
+
+    candidates: list[str] = []
+    if not str(computer_name or "").strip():
+        candidates = _hostname_candidates_for_target(shell, domain=domain, host=host)
+    return resolve_machine_account_principal(
+        computer_name=computer_name,
+        host=host,
+        hostname_candidates=candidates,
+    )
+
+
+def _attribute_lsa_secrets_for_host(
+    shell: Any,
+    secrets: "tuple[Any, ...] | list[Any]",
+    *,
+    domain: str,
+    host: str,
+    machine_account: str,
+) -> "dict[str, Any]":
+    """Resolve each recovered ``_SC_*`` secret to the account it belongs to.
+
+    The gMSA candidates come from the attack graph's ``ReadGMSAPassword`` edges
+    for this host's machine account: a member server only caches a managed
+    password it is authorised to read, so the edge the collector already
+    recorded identifies the owning account without touching the domain again.
+    """
+    from adscan_internal.services.lsa_secret_attribution import (
+        attribute_lsa_secret,
+        classify_lsa_secret_key,
+        INTERNAL_LSA_SECRET_NAMES,
+        LsaSecretKind,
+    )
+
+    gmsa_candidates: list[str] = []
+    try:
+        from adscan_internal.services.attack_graph_service import load_attack_graph
+        from adscan_internal.services.lsa_secret_attribution import (
+            gmsa_candidates_for_host,
+        )
+
+        gmsa_candidates = gmsa_candidates_for_host(
+            load_attack_graph(shell, domain), machine_account
+        )
+    except Exception as exc:  # noqa: BLE001 - attribution degrades to evidence
+        print_exception(exception=exc)
+        print_info_debug(f"[lsa] gMSA candidate lookup failed: {exc}")
+
+    attributions: dict[str, Any] = {}
+    for secret in secrets:
+        name = str(getattr(secret, "name", "") or "")
+        if not name or name in INTERNAL_LSA_SECRET_NAMES:
+            continue
+        kind, _service = classify_lsa_secret_key(name)
+        if kind is LsaSecretKind.OTHER and not getattr(secret, "plaintext", None):
+            continue
+        try:
+            attributions[name] = attribute_lsa_secret(
+                name,
+                plaintext=getattr(secret, "plaintext", None),
+                raw=getattr(secret, "raw", None),
+                host=host,
+                domain=domain,
+                service_logon_accounts=(
+                    {_service: secret.service_account}
+                    if _service and getattr(secret, "service_account", None)
+                    else {}
+                ),
+                gmsa_candidates=gmsa_candidates,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[lsa] attribution failed for a secret: {exc}")
+    return attributions
+
+
+def _persist_attributed_lsa_secrets(
+    shell: Any,
+    attributions: "dict[str, Any]",
+    *,
+    domain: str,
+    host: str,
+    auth_username: str | None,
+) -> None:
+    """Store each attributed LSA secret in the credential store it belongs to.
+
+    A domain service account goes to the domain store under its own
+    sAMAccountName; an account local to the dumped host goes to that host's
+    local store; a gMSA is a domain principal, so its derived NT hash and
+    Kerberos keys are stored under the gMSA's own name. Nothing is ever stored
+    under the ``_SC_*`` registry key, and an unattributable secret is not stored
+    as a credential at all — it would only produce an account that cannot
+    authenticate.
+    """
+    from adscan_internal.cli.creds import store_kerberos_principal_material
+    from adscan_internal.services.lsa_secret_attribution import (
+        LsaSecretKind,
+        LsaSecretScope,
+    )
+
+    for attributed in attributions.values():
+        if not attributed.is_credential:
+            if attributed.evidence_reason:
+                print_info_debug(
+                    f"[lsa] {attributed.key_name}: recorded as evidence — "
+                    f"{attributed.evidence_reason}"
+                )
+            continue
+
+        try:
+            if attributed.kind is LsaSecretKind.GMSA_MANAGED_PASSWORD:
+                # Store the Kerberos key material first: in an AES-only domain a
+                # verification bind with the NT hash alone would fail before the
+                # AES keys are available to fall back on.
+                store_kerberos_principal_material(
+                    shell=shell,
+                    domain=domain,
+                    username=attributed.principal,
+                    nt_hash=attributed.secret,
+                    aes256=attributed.aes256,
+                    aes128=attributed.aes128,
+                    source="lsa_secrets",
+                    target_host=host,
+                )
+                shell.add_credential(
+                    domain,
+                    attributed.principal,
+                    attributed.secret,
+                    source_steps=_build_dump_source_steps(
+                        domain=domain,
+                        dump_kind="LSA",
+                        host=host,
+                        auth_username=auth_username,
+                        credential_username=attributed.principal,
+                        secret=attributed.secret,
+                    ),
+                    skip_hash_cracking=True,
+                    prompt_for_user_privs_after=False,
+                    credential_origin="gmsa",
+                )
+                continue
+
+            if attributed.scope is LsaSecretScope.LOCAL:
+                shell.add_credential(
+                    domain,
+                    attributed.principal,
+                    attributed.secret,
+                    host,
+                    "smb",
+                    verify_local_credential=False,
+                    prompt_local_reuse_after=False,
+                    ui_silent=True,
+                    credential_origin="lsa_secrets",
+                )
+                continue
+
+            shell.add_credential(
+                domain,
+                attributed.principal,
+                attributed.secret,
+                source_steps=_build_dump_source_steps(
+                    domain=domain,
+                    dump_kind="LSA",
+                    host=host,
+                    auth_username=auth_username,
+                    credential_username=attributed.principal,
+                    secret=attributed.secret,
+                ),
+                prompt_for_user_privs_after=True,
+                credential_origin="lsa_secrets",
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+
+def _write_lsa_evidence_file(
+    shell: Any,
+    result: Any,
+    attributions: "dict[str, Any]",
+    *,
+    domain: str,
+    host: str,
+    machine_account: str | None,
+    machine_account_reason: str = "",
+) -> None:
+    """Write every recovered LSA secret to the workspace, attributed or not.
+
+    Material that cannot be tied to an account is still worth keeping — it is
+    evidence of what the host caches, and a later finding may attribute it. It
+    belongs in the workspace record, not in the credential store.
+    """
+    from adscan_internal.services.lsa_secret_attribution import (
+        INTERNAL_LSA_SECRET_NAMES,
+        MACHINE_ACCOUNT_SECRET_NAME,
+    )
+
+    domains_dir = getattr(shell, "domains_dir", "") or ""
+    if not domains_dir:
+        return
+
+    output_path = _dump_output_path(
+        domains_dir=domains_dir,
+        domain=domain,
+        dump_kind="lsa",
+        requested_host=host,
+    )
+    try:
+        lines = [f"# LSA secrets  ·  {host}  ·  {domain}", ""]
+        if result.machine_account_nt_hash:
+            if machine_account:
+                lines.append(
+                    f"[machine account] {machine_account} -> "
+                    f"{result.machine_account_nt_hash}"
+                )
+            else:
+                # Recoverable, but naming it after another host would be a
+                # false claim. Keep the hash, keep the reason.
+                lines.append(
+                    "[machine account] unattributed: "
+                    f"{machine_account_reason or 'owner not established'}"
+                )
+                lines.append(f"    nt_hash: {result.machine_account_nt_hash}")
+        for secret in result.secrets:
+            name = str(getattr(secret, "name", "") or "")
+            attributed = attributions.get(name)
+            if attributed is None:
+                if name in INTERNAL_LSA_SECRET_NAMES:
+                    raw = getattr(secret, "raw", None)
+                    if raw and name != MACHINE_ACCOUNT_SECRET_NAME:
+                        lines.append(f"[{name}] {raw.hex()}")
+                continue
+            if attributed.is_credential:
+                lines.append(
+                    f"[{name}] {attributed.label} -> "
+                    f"{attributed.principal} : {attributed.secret}"
+                    f" ({attributed.secret_kind})"
+                )
+                if attributed.aes256:
+                    lines.append(f"    aes256: {attributed.aes256}")
+                if attributed.aes128:
+                    lines.append(f"    aes128: {attributed.aes128}")
+            else:
+                raw = getattr(secret, "raw", None)
+                lines.append(
+                    f"[{name}] {attributed.label} -> unattributed: "
+                    f"{attributed.evidence_reason}"
+                )
+                if raw:
+                    lines.append(f"    material: {raw.hex()}")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        print_info_debug(f"[lsa] evidence written to {output_path}")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[lsa] evidence file write failed: {exc}")
+
+
 def _native_execute_dump_lsa(
     shell: Any,
     *,
@@ -4734,6 +5092,9 @@ def _native_execute_dump_lsa(
     workspace_dir = _native_workspace_dir(shell, domain)
     config = _build_smb_config_from_shell(shell, host, domain)
     svc = NativeDumpService()
+    # Monotonic: the scan physically steps the wall clock for DC time sync,
+    # so a wall-clock delta across a dump can come back negative or huge.
+    started = time.monotonic()
 
     display.operation_header("LSA Dump", host=host, phases=4)
     display.phase_start(1, 4, "Building SMB connection")
@@ -4758,47 +5119,86 @@ def _native_execute_dump_lsa(
         display.no_credentials_found("LSA")
         return
 
-    # Resolve DC short hostname for machine account naming and AES salt.
-    # When host is an IP (e.g. "10.129.229.17"), host.split('.')[0] = "10" which
-    # is meaningless. Prefer the pdc_hostname from domains_data; fall back to
-    # stripping the domain label from an FQDN; last resort use the raw host value.
-    import re as _re
-    _is_ip = bool(_re.match(r"^\d+\.\d+\.\d+\.\d+$", host or ""))
-    if _is_ip:
-        _dc_short = (
-            str(
-                (shell.domains_data.get(domain) or {}).get("pdc_hostname") or host
-            ).split(".")[0]
-        )
-    elif "." in host:
-        _dc_short = host.split(".")[0]
-    else:
-        _dc_short = host
+    # ``$MACHINE.ACC`` is the computer-account password of THIS host, so the
+    # name it is filed under has to come from this host. The domain
+    # controller's name is a different machine: reaching for it when the
+    # target was addressed by IP filed one member server's machine account
+    # under the DC's name.
+    machine_user, machine_account_reason = _resolve_dumped_machine_account(
+        shell,
+        domain=domain,
+        host=host,
+        computer_name=getattr(result, "computer_name", None),
+    )
+    if has_machine_hash and not machine_user:
+        print_info_debug(f"[lsa] machine account unattributed: {machine_account_reason}")
 
-    counts: dict[CredentialType, int] = {CredentialType.LSA: 0}
-    machine_user: str | None = None
+    # Resolve every ``_SC_*`` secret to the account it actually belongs to
+    # before anything is shown or stored. The registry key a secret was cached
+    # under is a service identifier, never a username.
+    attributions = _attribute_lsa_secrets_for_host(
+        shell,
+        result.secrets,
+        domain=domain,
+        host=host,
+        machine_account=machine_user or "",
+    )
+
+    # One pass decides what each recovered item IS, so the table, the counts
+    # and the summary can never disagree about it.
+    harvest = build_lsa_harvest(
+        result.secrets,
+        attributions,
+        domain=domain,
+        host=host,
+        machine_account=machine_user,
+        machine_account_nt_hash=result.machine_account_nt_hash,
+    )
+    credentials = [r for r in harvest if r.group is LsaHarvestGroup.CREDENTIAL]
+    key_material = [r for r in harvest if r.group is LsaHarvestGroup.KEY_MATERIAL]
+    unattributed = [r for r in harvest if r.group is LsaHarvestGroup.UNATTRIBUTED]
+    counts: dict[CredentialType, int] = {CredentialType.LSA: len(credentials)}
 
     # Phase 1: display only (Live active, no console prints allowed).
+    # Grouped, because a login and a master key are different things and a flat
+    # list invites the operator to read the second as the first.
     display.start_credential_stream("LSA Secrets")
     try:
-        if has_machine_hash:
-            machine_user = f"{_dc_short.upper()}$"
-            display.stream_credential(
-                CredentialType.LSA,
-                f"{domain}\\{machine_user}" if domain else machine_user,
-                result.machine_account_nt_hash or "",
-                extras="machine account",
+        if credentials:
+            display.stream_section(
+                "CREDENTIALS",
+                _harvest_hint(
+                    len(credentials),
+                    "account you can authenticate as",
+                    "accounts you can authenticate as",
+                ),
             )
-            counts[CredentialType.LSA] += 1
-        for secret in result.secrets:
-            value = secret.plaintext or (secret.raw.hex() if secret.raw else "")
-            display.stream_credential(
-                CredentialType.LSA,
-                secret.name,
-                value,
-                extras="LSA secret",
+            for row in credentials:
+                display.stream_credential(
+                    CredentialType.LSA, row.account, row.value, extras=row.detail
+                )
+        if key_material:
+            display.stream_section(
+                "KEY MATERIAL",
+                _harvest_hint(
+                    len(key_material),
+                    "item that unlocks other secrets, not a login",
+                    "items that unlock other secrets, not logins",
+                ),
             )
-            counts[CredentialType.LSA] += 1
+            for row in key_material:
+                display.stream_key_material(row.account, row.value, row.detail)
+        if unattributed:
+            display.stream_section(
+                "UNATTRIBUTED",
+                _harvest_hint(
+                    len(unattributed),
+                    "secret recovered, owning account not established",
+                    "secrets recovered, owning account not established",
+                ),
+            )
+            for row in unattributed:
+                display.stream_unattributed(row.account, row.value, row.detail)
     finally:
         display.stop_credential_stream()
 
@@ -4814,7 +5214,7 @@ def _native_execute_dump_lsa(
                 machine_account=machine_user,
                 nt_hash=result.machine_account_nt_hash,
                 kerberos_password=result.machine_account_kerberos_password,
-                dc_hostname=_dc_short or None,
+                dc_hostname=machine_user.rstrip("$") or None,
                 source_steps=_build_dump_source_steps(
                     domain=domain,
                     dump_kind="LSA",
@@ -4834,29 +5234,39 @@ def _native_execute_dump_lsa(
             telemetry.capture_exception(add_exc)
             print_exception(exception=add_exc)
 
-    # Phase 3: persist service secrets (plaintext passwords from LSA).
-    # These include DefaultPassword (attributed to the real user via Winlogon
-    # query), service account credentials stored in LSA, and any other
-    # non-internal LSA secrets with a recoverable plaintext value.
-    _SKIP_LSA_NAMES = {"$MACHINE.ACC", "DPAPI_SYSTEM(machine)", "DPAPI_SYSTEM(user)"}
-    for secret in result.secrets:
-        if not secret.plaintext:
-            continue
-        if secret.name in _SKIP_LSA_NAMES:
-            continue
-        try:
-            shell.add_credential(
-                domain,
-                secret.name,
-                secret.plaintext,
-                prompt_for_user_privs_after=True,
-                credential_origin="lsa_secrets",
-            )
-        except Exception as svc_exc:
-            telemetry.capture_exception(svc_exc)
-            print_exception(exception=svc_exc)
+    # Phase 3: persist the attributed secrets under the account each belongs to.
+    # These include DefaultPassword (attributed to the real user via Winlogon),
+    # service-account passwords resolved through the service's logon account,
+    # and gMSA managed passwords recovered from a cached blob. Anything that
+    # could not be attributed with certainty is recorded as evidence in phase 4
+    # and never stored as a credential.
+    _persist_attributed_lsa_secrets(
+        shell,
+        attributions,
+        domain=domain,
+        host=host,
+        auth_username=auth_username,
+    )
 
-    display.summary(counts, sum(counts.values()), host, elapsed=0)
+    # Phase 4: evidence file — every recovered secret, attributed or not.
+    _write_lsa_evidence_file(
+        shell,
+        result,
+        attributions,
+        domain=domain,
+        host=host,
+        machine_account=machine_user,
+        machine_account_reason=machine_account_reason,
+    )
+
+    display.summary(
+        counts,
+        len(credentials),
+        host,
+        elapsed=time.monotonic() - started,
+        key_material_count=len(key_material),
+        unattributed_count=len(unattributed),
+    )
 
 
 def _native_execute_dump_lsass(

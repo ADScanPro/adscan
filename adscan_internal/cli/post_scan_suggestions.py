@@ -24,6 +24,7 @@ from adscan_internal.cli.shell_commands import (
 
 if TYPE_CHECKING:
     from adscan_internal.cli.widgets.scan_recap import ScanRecapModel
+    from adscan_internal.services.scan_outcome_scope import ScanOutcomeScope
 
 
 # LITE-friendly next-step commands. Each verb MUST map to a real
@@ -59,9 +60,7 @@ class ScanSummary:
     report_path: str | None = None
 
     def render_findings_line(self) -> str:
-        return (
-            f"{self.critical} critical · {self.high} high · {self.medium} medium"
-        )
+        return f"{self.critical} critical · {self.high} high · {self.medium} medium"
 
 
 def _render_header(summary: ScanSummary | None) -> list[str]:
@@ -109,14 +108,18 @@ def _render_pro_body(
     return "\n".join(lines)
 
 
-def _resolve_recap_domain(shell: Any) -> str | None:
-    """Return the most-recently-initialized scanned domain, or ``None``."""
-    domains = getattr(shell, "domains", None)
-    if isinstance(domains, list):
-        for candidate in reversed(domains):
-            if isinstance(candidate, str) and candidate:
-                return candidate
-    return None
+def _resolve_recap_scope(shell: Any) -> "ScanOutcomeScope":
+    """Return the scan's :class:`ScanOutcomeScope` — which domain to speak about.
+
+    Delegates to the SSOT (:mod:`adscan_internal.services.scan_outcome_scope`),
+    which composes the assessed/discovered split the client reports use with the
+    per-domain proven-compromise marker. The recap must never pick a domain by
+    position in ``shell.domains``: that list carries trust-discovered names the
+    engagement never enumerated, and its order is not even recency.
+    """
+    from adscan_internal.services.scan_outcome_scope import resolve_scan_outcome_scope
+
+    return resolve_scan_outcome_scope(shell)
 
 
 def _format_scan_delta(shell: Any, attr: str) -> str | None:
@@ -307,13 +310,15 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
             summarize_findings,
         )
         from adscan_internal.cli.widgets.scan_recap import ScanRecapModel
-        from adscan_internal.services.session_compromise_state_service import (
-            normalize_session_compromise_status,
-        )
     except Exception:  # noqa: BLE001 - never break the scan success path
         return None
 
-    domain = _resolve_recap_domain(shell)
+    # WHICH domain the outcome is about — never "the last name the session
+    # learned". A domain reached only through a trust is not a domain this
+    # engagement can make a claim about, and the counts below must resolve for
+    # the same domain the headline names or they go silently to zero.
+    scope = _resolve_recap_scope(shell)
+    domain = scope.subject
     if not domain:
         return None
 
@@ -323,35 +328,27 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
     except Exception:  # noqa: BLE001
         findings = FindingsSummary()
 
-    status = normalize_session_compromise_status(
-        getattr(shell, "_session_compromise_status", None)
-    )
-    domain_pwned = False
-    try:
-        domains_data = getattr(shell, "domains_data", None) or {}
-        entry = domains_data.get(domain) if isinstance(domains_data, dict) else None
-        domain_pwned = isinstance(entry, dict) and entry.get("auth") == "pwned"
-    except Exception:  # noqa: BLE001
-        domain_pwned = False
-
-    if status == "domain" or domain_pwned:
+    if scope.domain_compromised:
         outcome = "domain_compromised"
     elif findings.total > 0:
         outcome = "findings"
     else:
         outcome = "clean"
 
-    paths_to_tier0 = 0
-    try:
-        from adscan_internal.services.attack_graph_service import (
-            compute_attack_path_metrics,
-        )
+    # Attack-path counts come from the counts SSOT, which prefers the
+    # ``exposure_kpis`` block this run already stamped into
+    # ``technical_report.json`` (the post-scan report runs BEFORE this panel).
+    # So the recap states the figures the client's own report states, and reads
+    # them instead of re-walking the graph.
+    from adscan_internal.services.attack_path_counts import (
+        ClientPathTotals,
+        client_path_totals_for_shell,
+    )
 
-        metrics = compute_attack_path_metrics(shell, domain, max_depth=10)
-        if isinstance(metrics, dict):
-            paths_to_tier0 = int(metrics.get("paths_to_tier0", 0) or 0)
+    try:
+        path_totals = client_path_totals_for_shell(shell, domain)
     except Exception:  # noqa: BLE001
-        paths_to_tier0 = 0
+        path_totals = ClientPathTotals()
 
     headline_path = None
     try:
@@ -387,8 +384,14 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
         domain=domain,
         outcome=outcome,  # type: ignore[arg-type]
         findings=findings,
+        also_compromised=scope.also_compromised,
+        # Only when the engagement saw a domain it never enumerated: the label is
+        # the report's own, so the panel and the cover state coverage identically.
+        scope_label=scope.scope_label if scope.scope.has_discovered else "",
         headline_path=headline_path,
-        paths_to_tier0=max(0, paths_to_tier0),
+        paths_total=path_totals.paths_total,
+        paths_full_domain_compromise=path_totals.paths_full_domain_compromise,
+        paths_proven=path_totals.paths_proven,
         ttc_label=_format_scan_delta(shell, "_scan_compromise_time"),
         ttfc_label=_format_scan_delta(shell, "_scan_first_credential_time"),
         report_path=report_path,
@@ -428,8 +431,27 @@ def _build_lite_cta(model: "ScanRecapModel"):
     )
 
 
+# What ``deliver`` decides and what it costs, in the moment the operator is
+# deciding whether to run it. The verb alone was already here; these are the two
+# things that stop someone launching it — not knowing that the frameworks, the
+# scope and the branding are theirs to pick, and not knowing whether it returns
+# in seconds or in an hour. Kept out of the registry's ``short_help`` on purpose:
+# that string is the global one-liner shown in every command listing, and this
+# sentence only makes sense at the end of a scan.
+_DELIVER_NOTE = (
+    "It asks what to include (compliance frameworks, which documents, your "
+    "client's logo) and takes a few minutes to render."
+)
+
+
 def _build_pro_cta(suggestions: Iterable[ShellCommandSpec]):
-    """Return the PRO deliverable-verb block, or ``None`` when none registered."""
+    """Return the PRO deliverable-verb block, or ``None`` when none registered.
+
+    Rendered inside the ``Scan complete`` panel rather than as a panel of its
+    own: on a paid engagement the deliverable IS the result, so it belongs at
+    the weight of the result, and a second panel in the same moment competes
+    with the one the operator is already reading.
+    """
     rows = list(suggestions)
     if not rows:
         return None
@@ -450,7 +472,33 @@ def _build_pro_cta(suggestions: Iterable[ShellCommandSpec]):
                 Text(spec.short_help, style="dim"),
             )
         )
+    if any(spec.verb == "deliver" for spec in rows):
+        from rich.padding import Padding
+
+        # Padding, not a two-space prefix: the note wraps at panel width, and a
+        # prefixed string indents only its first line, so the paragraph's left
+        # edge would break away from the verb column underneath it.
+        lines.append(Text(""))
+        lines.append(Padding(Text(_DELIVER_NOTE, style="dim"), (0, 0, 0, 2)))
     return Group(*lines)
+
+
+def _pro_cta_warranted(shell: Any | None) -> bool:
+    """Return whether this run left the deliverable kit something to build.
+
+    Delegates to the post-scan moment, which already resolved it: the kit is
+    named on an engagement that collected data, and stays quiet on a practice
+    box (no client behind it, and the writeup spine already landed) or after a
+    scan that produced nothing. Fails open, exactly like the predicate it calls.
+    """
+    if shell is None:
+        return True
+    try:
+        from adscan_internal.services.post_scan_report import pro_kit_offer_warranted
+
+        return bool(pro_kit_offer_warranted(shell))
+    except Exception:  # noqa: BLE001 - never hide the paid CTA on a lookup error
+        return True
 
 
 def _print_recap_panel(
@@ -458,6 +506,7 @@ def _print_recap_panel(
     *,
     is_pro: bool,
     suggestions: Iterable[ShellCommandSpec],
+    shell: Any | None = None,
 ) -> None:
     """Render the premium recap panel (shared body + tier-gated CTA footer)."""
     from rich.console import Group
@@ -467,7 +516,10 @@ def _print_recap_panel(
 
     parts: list[Any] = [build_recap_body(model)]
 
-    cta = _build_pro_cta(suggestions) if is_pro else _build_lite_cta(model)
+    if is_pro:
+        cta = _build_pro_cta(suggestions) if _pro_cta_warranted(shell) else None
+    else:
+        cta = _build_lite_cta(model)
     if cta is not None:
         parts.append(Text(""))
         parts.append(recap_hairline())
@@ -515,7 +567,9 @@ def print_post_scan_suggestions(
         except Exception:  # noqa: BLE001 - fall back to the legacy panel
             model = None
         if model is not None:
-            _print_recap_panel(model, is_pro=is_pro, suggestions=suggestions)
+            _print_recap_panel(
+                model, is_pro=is_pro, suggestions=suggestions, shell=shell
+            )
             return
 
     # Legacy fallback. Silent for unknown verbs unless we have something

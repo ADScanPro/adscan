@@ -27,6 +27,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from adscan_core.lab_context import build_workspace_telemetry_fields
 from adscan_internal import telemetry
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.services.domain_posture import (
@@ -207,6 +208,15 @@ def build_scan_outcome_properties(shell: Any, command_name: str) -> dict[str, An
         "time_to_first_cred_minutes": _elapsed_minutes(scan_start, first_cred_time),
         "time_to_compromise_minutes": _elapsed_minutes(scan_start, compromise_time),
     }
+
+    # ``type`` above is NOT in the telemetry sanitizer's safe-string set, so it
+    # arrives pseudonymized and the whole event cannot be filtered down to real
+    # audits. ``workspace_type`` is the safe-listed field; emit it through the
+    # shared normalizer so every event names the audit/ctf split identically.
+    # ``type`` is kept for continuity with existing queries.
+    properties.update(
+        build_workspace_telemetry_fields(workspace_type=getattr(shell, "type", None))
+    )
 
     # Hardening signals — the "why-not" correlation context.
     properties.update(_build_hardening_signals(shell, _resolve_domain_for_posture(shell)))

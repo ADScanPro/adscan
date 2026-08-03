@@ -171,6 +171,11 @@ CI_PASSTHROUGH = PassthroughCommand(
             "Client-facing name shown on the report cover.",
             metavar="NAME",
         ),
+        PassthroughArg(
+            ("--client-logo",),
+            "Client logo (PNG/SVG/JPG) shown beside the ADscan mark on the report cover.",
+            metavar="PATH",
+        ),
         PassthroughArg(("--verbose", "-v"), "Verbose output."),
         PassthroughArg(("--debug", "-d"), "Debug output."),
     ),

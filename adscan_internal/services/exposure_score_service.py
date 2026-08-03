@@ -65,6 +65,7 @@ from adscan_internal.services.path_state import (
     _PROVEN_STATUSES,
     NO_EXPOSURE_STATUSES,
     PathState,
+    carries_client_exposure,
 )
 
 # --------------------------------------------------------------------------- #
@@ -323,6 +324,8 @@ def report_tier_for_record(record: Mapping[str, Any]) -> str | None:
 
 def count_report_tiers(
     records: Sequence[Mapping[str, Any]],
+    *,
+    exposure_only: bool = False,
 ) -> dict[str, int]:
     """Tally attack-path records into the three canonical report tiers.
 
@@ -334,6 +337,13 @@ def count_report_tiers(
         records: Attack-path records, each a mapping carrying
             ``compromise_class`` (as produced by ``get_attack_path_summaries``
             and threaded onto the report path dicts).
+        exposure_only: Count only paths that describe OPEN exposure — the same
+            filter the exposure score applies
+            (:func:`~adscan_internal.services.path_state.carries_client_exposure`),
+            so an avenue the client's own configuration closed and a path
+            ADscan had no surface to walk do not land in a number the report
+            presents as their exposure. Leave ``False`` for the raw inventory
+            tally.
 
     Returns:
         ``{"T1": <full domain compromise>, "T2": <Tier-0 footholds>,
@@ -342,6 +352,8 @@ def count_report_tiers(
     counts = {"T1": 0, "T2": 0, "T3": 0}
     for record in records:
         if not isinstance(record, Mapping):
+            continue
+        if exposure_only and not carries_client_exposure(record.get("status")):
             continue
         tier = report_tier_for_record(record)
         if tier is not None:
@@ -366,6 +378,14 @@ def derive_posture_path_inputs(
     (:func:`report_tier_for_record`), never via a per-record ``is_tier_zero``
     flag:
 
+    Both counts describe OPEN exposure, so a path whose status carries none is
+    skipped — the same
+    :func:`~adscan_internal.services.path_state.carries_client_exposure` filter
+    the exposure score applies through ``_PROOF_WEIGHT``. Without it the posture
+    score and the executive headline counted avenues the client's own
+    configuration had closed, plus paths ADscan never had the surface to walk,
+    and reported the sum as exposure demanding immediate attention.
+
     * ``paths_to_da`` — the **T1** count (``domain_breaker``): paths that reach
       full domain compromise. Counted per PATH, not deduplicated by
       source/target/relations: two distinct chains to the same target are two
@@ -388,7 +408,9 @@ def derive_posture_path_inputs(
             resolved it from the engine-stamped ``exposure_kpis`` ``path_axis``
             block (the PRO report's preferred source) pass it here so this
             helper does not recount; every other caller leaves it ``None`` and
-            gets the records-derived T1 count. The two agree by construction.
+            gets the records-derived T1 count. The two agree by construction —
+            the caller must pass the block's ``exposure_total``, not its raw
+            ``total``, or it reintroduces the no-exposure paths this filters.
 
     Returns:
         A ``(paths_to_da, tier0_exposed)`` tuple of non-negative ints.
@@ -397,6 +419,8 @@ def derive_posture_path_inputs(
     t1_count = 0
     for record in records:
         if not isinstance(record, Mapping):
+            continue
+        if not carries_client_exposure(record.get("status")):
             continue
         tier = report_tier_for_record(record)
         if tier == "T1":
@@ -701,6 +725,92 @@ def _reconcile_status(record: Mapping[str, Any], has_execution: bool) -> str:
     return str(record.get("status") or "theoretical").strip().lower()
 
 
+#: Keys the engine stamps inside a ``path_axis[<class>]`` bucket that are NOT
+#: per-status counts. ``total`` is the class inventory; ``exposure_total`` is the
+#: subset that still describes OPEN exposure. Anything iterating a bucket as a
+#: status map must skip both. Mirrored by the web view
+#: (``exposure_kpis_view._PATH_AXIS_NON_STATUS_KEYS``).
+PATH_AXIS_NON_STATUS_KEYS: frozenset[str] = frozenset({"total", "exposure_total"})
+
+
+@dataclass(frozen=True)
+class OpenExposureSplit:
+    """One ``path_axis`` class bucket, split the way a client reads it.
+
+    Three buckets that always sum to :attr:`total` — the SAME figure every
+    client-facing "N routes to full domain compromise" headline prints:
+
+    * :attr:`proven` — walked end-to-end against the live environment.
+    * :attr:`partial` — a segment executed successfully, not run end-to-end.
+      Its own bucket precisely because folding it into either neighbour lies:
+      calling it proven overclaims, calling it configuration analysis erases
+      the steps ADscan actually executed.
+    * :attr:`unproven` — everything else that still carries exposure
+      (theoretical, attempted, withheld for safety).
+
+    Avenues the client's own configuration closes, and avenues ADscan had no
+    surface to assess, are excluded — they are not routes into the domain.
+    """
+
+    proven: int
+    partial: int
+    unproven: int
+
+    @property
+    def total(self) -> int:
+        """Open-exposure paths in the class (``proven + partial + unproven``)."""
+        return self.proven + self.partial + self.unproven
+
+
+def open_exposure_total(bucket: Mapping[str, Any] | None) -> int:
+    """Return a ``path_axis`` class bucket's OPEN-exposure path count.
+
+    Reads ``exposure_total`` (the subset describing exposure the client still
+    carries), falling back to ``total`` for an artifact produced before the
+    engine stamped it, so an older workspace still renders a figure.
+    """
+    if not isinstance(bucket, Mapping):
+        return 0
+    key = "exposure_total" if "exposure_total" in bucket else "total"
+    try:
+        return int(bucket.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def split_open_exposure(bucket: Mapping[str, Any] | None) -> OpenExposureSplit:
+    """Split one ``path_axis`` class bucket into the client-facing three.
+
+    The ONE rule for reading a compromise class as "validated / partially
+    validated / identified by configuration". Every surface that prints that
+    split calls this, so the hero band, the executive narrative and the section
+    counts cannot answer the same question three different ways.
+
+    ``unproven`` absorbs the remainder against :func:`open_exposure_total`, so
+    the three buckets are guaranteed to reconcile to the headline figure even
+    for an artifact whose status tokens this build does not recognise.
+    """
+    if not isinstance(bucket, Mapping):
+        return OpenExposureSplit(0, 0, 0)
+    proven = 0
+    partial = 0
+    for token, count in bucket.items():
+        if token in PATH_AXIS_NON_STATUS_KEYS:
+            continue
+        if not carries_client_exposure(token):
+            continue
+        try:
+            value = int(count or 0)
+        except (TypeError, ValueError):
+            continue
+        if token in _PROVEN_STATUSES:
+            proven += value
+        elif token == "partial":
+            partial += value
+    unproven = max(0, open_exposure_total(bucket) - proven - partial)
+    return OpenExposureSplit(proven=proven, partial=partial, unproven=unproven)
+
+
 def compute_exposure_kpis(
     summaries: Sequence[Mapping[str, Any]],
     *,
@@ -764,7 +874,12 @@ def compute_exposure_kpis(
             records = [r for r in summaries if isinstance(r, Mapping)]
             has_exec_by_index = [False] * len(records)
 
-    # path_axis[class][status] = count ; path_axis[class]["total"] = all in class.
+    # path_axis[class][status] = count ; path_axis[class]["total"] = all in class ;
+    # path_axis[class]["exposure_total"] = the subset that describes OPEN
+    # exposure (`carries_client_exposure`). Both are kept because they answer
+    # different questions: `total` is the inventory (and keeps the positive
+    # `closed_by_configuration` bucket visible), `exposure_total` is the only
+    # one a client-facing "you have N routes to domain compromise" may use.
     path_axis: dict[str, dict[str, int]] = {cls: {} for cls in _KPI_COMPROMISE_CLASSES}
     # user_axis accumulators: per (class, status) -> (user_set, all_users_flag);
     # per class -> (any_user_set, any_all_users_flag, distinct_path_count).
@@ -800,6 +915,10 @@ def compute_exposure_kpis(
 
         path_axis[cls][status] = path_axis[cls].get(status, 0) + 1
         path_axis[cls]["total"] = path_axis[cls].get("total", 0) + 1
+        if carries_client_exposure(status):
+            path_axis[cls]["exposure_total"] = (
+                path_axis[cls].get("exposure_total", 0) + 1
+            )
         distinct_paths[cls] += 1
 
         users, is_broad, breakdown, tier_map = _record_affected_users(record)

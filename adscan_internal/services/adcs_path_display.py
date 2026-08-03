@@ -128,10 +128,11 @@ _ADCS_RELATIONS = {
     "adcsesc15",
     "adcsesc16",
     "adcsesc17",
+    "adcsesc5",
     "coerceandrelayntlmtoadcs",
-    "goldencert",
 }
 _CA_FIRST_RELATIONS = {
+    "adcsesc5",
     "adcsesc6",
     "adcsesc6a",
     "adcsesc6b",
@@ -139,7 +140,6 @@ _CA_FIRST_RELATIONS = {
     "adcsesc11",
     "adcsesc16",
     "coerceandrelayntlmtoadcs",
-    "goldencert",
 }
 
 

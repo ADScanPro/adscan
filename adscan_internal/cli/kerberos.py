@@ -59,6 +59,7 @@ from adscan_internal.rich_output import (
     print_warning_debug,
     print_warning_verbose,
 )
+from adscan_core.lab_context import build_workspace_telemetry_fields
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.services import EnumerationService
 from adscan_internal.integrations.impacket import (
@@ -1324,6 +1325,14 @@ def finalize_roast_results(
                 "hash_count": total_users,
                 "scan_mode": getattr(shell, "scan_mode", None),
             }
+            # Time-to-first-hash is only a field figure once real audits can be
+            # separated from lab runs; ``workspace_type`` is the safe-listed
+            # field that makes the split queryable.
+            ttfh_properties.update(
+                build_workspace_telemetry_fields(
+                    workspace_type=getattr(shell, "type", None)
+                )
+            )
             ttfh_properties.update(
                 build_lab_event_fields(shell=shell, include_slug=True)
             )

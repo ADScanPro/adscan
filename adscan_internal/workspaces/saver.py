@@ -93,7 +93,21 @@ def save_workspace_data(shell: WorkspaceSaverShell) -> bool:
 
 
 def save_domain_data(shell: WorkspaceSaverShell) -> bool:
-    """Save the current domain data (variables) to JSON files.
+    """Write the per-domain snapshot to ``domains/<domain>/variables.json``.
+
+    This file is a DERIVED, WRITE-ONLY artifact and it is routinely stale: it is
+    only refreshed when something calls this function, while the shell's real
+    state keeps moving. Nothing in ADscan loads it back — it exists for operators
+    reading a domain directory, and the web falls back to three of its fields
+    (``pdc``, ``pdc_hostname``, ``base_dn``) for a domain absent from the root
+    file. The payload carries a ``_snapshot_note`` restating this on disk.
+
+    The single source of truth for workspace state — ``domains_data``, every
+    captured credential, the domain list — is the workspace-root
+    ``variables.json`` written by ``save_workspace_data`` one directory up. Do not
+    read this snapshot back into a shell: it is flattened and carries none of
+    those keys, so applying it empties the credential store in memory and the next
+    autosave persists the emptied store over the root file.
 
     Args:
         shell: CLI shell instance that implements WorkspaceSaverShell protocol

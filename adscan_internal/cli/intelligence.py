@@ -542,9 +542,6 @@ def run_native_collection(
             f"dns={timing.dns:.1f}s "
             f"post={timing.post_processing:.1f}s"
         )
-        _emit_collection_performance_telemetry(
-            shell, target_domain, domain_counters, timing
-        )
         _surface_host_enrichment_coverage(shell, target_domain, timing)
         collector_result = collection_results.get(target_domain)
         # Set the shell's logical domain context to the domain we just collected
@@ -564,13 +561,34 @@ def run_native_collection(
         # ADSCAN_NO_PORT_SCAN opts out → collectors keep their existing async
         # floor and Phase 3 falls back to its legacy operator-prompted scan.
         # Best-effort: a scan failure must never abort collection.
+        # Seam 4 — nmap port-scan wall-clock (monotonic). The phase may be skipped
+        # internally (ADSCAN_NO_PORT_SCAN) and still returns fast → ~0.0s.
+        _nmap_started = time.monotonic()
         _run_phase2_port_scan(shell, target_domain)
+        nmap_port_scan_s = time.monotonic() - _nmap_started
         # MSSQL authorization collector — Phase-2 peer that consumes the
         # mssql/ips.txt the scan just produced. Uses the already-built
         # CollectionCredential (incl. ccache) so the SSOT detects Kerberos
         # correctly. Gated by the operator's collector selection.
+        # Seam 5 — MSSQL collection wall-clock. Defaults to 0.0 when the phase is
+        # not selected (or when there are no MSSQL instances → the SSOT returns fast).
+        mssql_collection_s = 0.0
         if getattr(selection, "collect_mssql", True):
+            _mssql_started = time.monotonic()
             _run_phase2_mssql_collection(shell, target_domain, credential)
+            mssql_collection_s = time.monotonic() - _mssql_started
+        # Seam 6 — emit AFTER nmap + MSSQL so the event spans the FULL collection.
+        # elapsed_full_collection_s is monotonic across the whole do_native_collection.
+        # Best-effort / fail-open: a telemetry failure never touches the scan.
+        _emit_collection_performance_telemetry(
+            shell,
+            target_domain,
+            domain_counters,
+            timing,
+            nmap_port_scan_s=nmap_port_scan_s,
+            mssql_collection_s=mssql_collection_s,
+            elapsed_full_collection_s=time.monotonic() - started,
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -721,16 +739,64 @@ def _emit_collection_performance_telemetry(
     domain: str,
     counters: dict[str, int],
     timing: "CollectionTiming",
+    *,
+    nmap_port_scan_s: float = 0.0,
+    mssql_collection_s: float = 0.0,
+    elapsed_full_collection_s: float = 0.0,
 ) -> None:
+    """Emit the observability-only ``native_collection_performance`` event.
+
+    Extends the existing event with a per-phase ``stage_seconds`` map spanning the
+    FULL collection (LDAP through post-nmap/MSSQL) plus the host-fan-out
+    distribution (445-gate, per-host p50/p95/max, outcome histogram). All figures
+    are counts or monotonic durations — no secrets, no host names/IPs. ``nmap`` and
+    ``mssql`` default to ``0.0`` when a phase was skipped (flag / no instances) so a
+    skipped phase never breaks the shape. Fully fail-open: a telemetry failure is
+    captured and swallowed, never propagated to the scan.
+    """
     try:
+        from adscan_core.lab_context import build_workspace_telemetry_fields
         from adscan_internal.cli.common import build_lab_event_fields
 
+        # Per-phase wall-clock map. Every value is a monotonic-measured duration.
+        stage_seconds: dict[str, float] = {
+            "ldap": round(timing.ldap, 2),
+            "adcs": round(timing.adcs, 2),
+            "dns": round(timing.dns, 2),
+            "post_processing": round(timing.post_processing, 2),
+            "gate_probe": round(timing.gate_probe, 2),
+            "host_wall": round(timing.host_wall, 2),
+            "persist": round(timing.persist, 2),
+            "nmap_port_scan": round(nmap_port_scan_s, 2),
+            "mssql_collection": round(mssql_collection_s, 2),
+        }
         properties: dict[str, Any] = {
             "domain": mark_sensitive(domain, "domain"),
             "nodes": counters.get("nodes", 0),
             "edges": counters.get("edges", 0),
+            # Retain every existing elapsed_*_s key for continuity.
             **timing.as_dict(),
+            "stage_seconds": stage_seconds,
+            # Host fan-out distribution (counts + duration percentiles).
+            "host_count": int(timing.host_count),
+            "reachable_445": int(timing.reachable_445),
+            "concurrency": int(timing.concurrency),
+            "dead_host_count": int(timing.dead_host_count),
+            "budget_timeouts": int(timing.budget_timeouts),
+            "host_p50_s": round(timing.host_p50, 2),
+            "host_p95_s": round(timing.host_p95, 2),
+            "host_max_s": round(timing.host_max, 2),
+            "host_outcomes": dict(timing.host_outcomes or {}),
+            "elapsed_full_collection_s": round(elapsed_full_collection_s, 2),
         }
+        # Collection-performance rows are only actionable once they can be split
+        # by audit vs lab — a GOAD run and a 40k-object estate have nothing to
+        # say to each other. Shared normalizer, safe-listed field.
+        properties.update(
+            build_workspace_telemetry_fields(
+                workspace_type=getattr(shell, "type", None)
+            )
+        )
         try:
             properties.update(build_lab_event_fields(shell=shell, include_slug=False))
         except Exception:  # noqa: BLE001

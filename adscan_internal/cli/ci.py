@@ -227,10 +227,16 @@ def _build_ci_loot_card(
                 tr_domains.get(domain, {}) if isinstance(tr_domains, dict) else {}
             ) or {}
             findings = entry.get("findings")
+            # Collapse alias-family duplicates so the rollup counts a weakness
+            # once, matching what the report shows.
+            from adscan_core.reporting.finding_aliases import (
+                collapse_finding_aliases,
+            )
+
             iterable = (
                 findings.values()
                 if isinstance(findings, dict)
-                else (findings if isinstance(findings, list) else [])
+                else collapse_finding_aliases(findings)
             )
             for finding in iterable:
                 if not isinstance(finding, dict):
@@ -285,6 +291,29 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     license_mode = deps.resolve_license_mode(config.requested_pro)
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
+
+    # Persist a client logo passed via --client-logo (the launcher already staged
+    # the file into the mounted volume and forwards a container-visible path), so
+    # the post-scan report co-brands its cover with the client's mark and later
+    # runs reuse it. Best-effort; a cosmetic logo never blocks a scan.
+    _client_logo_arg = (getattr(args, "client_logo", None) or "").strip()
+    if _client_logo_arg:
+        try:
+            from adscan_internal.services.client_logo import (
+                is_supported_logo_suffix,
+                save_client_logo_setting,
+            )
+
+            if is_supported_logo_suffix(_client_logo_arg):
+                save_client_logo_setting(_client_logo_arg)
+            else:
+                print_warning(
+                    "Unsupported --client-logo file type; the report keeps the "
+                    "ADscan mark only."
+                )
+        except Exception as exc:  # noqa: BLE001 — cosmetic; never block a scan
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     # Load the optional scan configuration (--scan-config). The launcher
     # bind-mounts the file read-only and points ADSCAN_SCAN_CONFIG at it; an

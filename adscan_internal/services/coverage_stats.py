@@ -99,6 +99,10 @@ DISPLAY_NAME_OVERRIDES: dict[str, str] = {
     "allextendedrights": "All Extended Rights",
     "allowedtoact": "Resource-Based Constrained Delegation (inbound)",
     "allowedtodelegate": "Constrained Delegation",
+    # ESC5's public name is the ACL weakness, not the MITRE technique title
+    # (T1649 belongs in the MITRE field). The exploitation ADscan carries for it
+    # is CA-object takeover → CA private-key theft → offline certificate forgery.
+    "adcsesc5": "AD CS ESC5 — Vulnerable PKI Object Access Control",
     "asreproasting": "AS-REP Roasting",
     "backupoperatorescalation": "Backup Operators Escalation",
     "blankpassword": "Blank Password",
@@ -124,7 +128,6 @@ DISPLAY_NAME_OVERRIDES: dict[str, str] = {
     "getchanges": "DS-Replication-Get-Changes",
     "getchangesall": "DS-Replication-Get-Changes-All",
     "getchangesinfilteredset": "DS-Replication-Get-Changes-In-Filtered-Set",
-    "goldencert": "Golden Certificate (CA Key Theft)",
     "gpppassword": "Group Policy Preferences Password",
     "guestsession": "Guest Session",
     "hasshadowcredentials": "Shadow Credentials Present",

@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 from adscan_core import telemetry
+from adscan_core.reporting.finding_aliases import normalize_technical_report
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 from adscan_core.rich_output import (
     print_error,
@@ -92,6 +93,14 @@ class ReportShell(Protocol):
 # never set and the default ``VULN_CATALOG_META`` builder is used.
 _FINDING_CATALOG_PROVIDER: Optional[Callable[[], dict[str, dict[str, Any]]]] = None
 
+# Memoized result of the active provider. Building the catalog is NOT cheap in
+# PRO — the provider walks the whole ``VULN_CATALOG`` computing a CVSS base and
+# a knowledge block per key — and every recorder call plus every attack-graph
+# finding needs a lookup, so rebuilding it per lookup turned an O(1) read into
+# an O(catalog) rebuild. The snapshot is dropped whenever the provider changes,
+# which is the only thing that can change its contents.
+_FINDING_CATALOG_SNAPSHOT: Optional[dict[str, dict[str, Any]]] = None
+
 
 def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, Any]]:
     """Build the LITE-safe finding catalog from the meta slice.
@@ -116,24 +125,48 @@ def set_finding_catalog_provider(
 ) -> None:
     """Install a richer finding-catalog provider (PRO-only injection seam).
 
-    The PRO report service calls this at import time to inject a
-    ``VULN_CATALOG``-derived catalog that also carries ``category``. LITE never
+    The PRO build installs a ``VULN_CATALOG``-derived catalog that also carries
+    ``category``, a formal CVSS base and the rich knowledge block. LITE never
     calls it and falls back to the ``VULN_CATALOG_META`` builder. Pass ``None``
     to reset to the LITE default (used by tests).
+
+    Installing a provider drops the memoized snapshot, so the next lookup
+    rebuilds from the new provider.
     """
-    global _FINDING_CATALOG_PROVIDER
+    global _FINDING_CATALOG_PROVIDER, _FINDING_CATALOG_SNAPSHOT
     _FINDING_CATALOG_PROVIDER = provider
+    _FINDING_CATALOG_SNAPSHOT = None
 
 
-def _finding_catalog() -> dict[str, dict[str, Any]]:
-    """Return the active finding catalog (PRO-injected if present, else meta)."""
+def finding_catalog() -> dict[str, dict[str, Any]]:
+    """Return the active finding catalog (PRO-injected if present, else meta).
+
+    Built at most once per installed provider. Treat the returned mapping and
+    every value inside it as READ-ONLY — it is shared by every caller. A
+    consumer that needs to personalise an entry (the attack-graph finding
+    derivation weaving per-instance specifics into ``knowledge``) must copy
+    first; the specifics weaver already returns a new dict for exactly this
+    reason.
+    """
+    global _FINDING_CATALOG_SNAPSHOT
+    if _FINDING_CATALOG_SNAPSHOT is not None:
+        return _FINDING_CATALOG_SNAPSHOT
+    catalog: dict[str, dict[str, Any]] | None = None
     if _FINDING_CATALOG_PROVIDER is not None:
         try:
-            return _FINDING_CATALOG_PROVIDER()
+            catalog = _FINDING_CATALOG_PROVIDER()
         except Exception as exc:  # noqa: BLE001 - fall back to LITE-safe default
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
-    return _build_technical_finding_catalog_from_meta()
+            catalog = None
+    if not isinstance(catalog, dict):
+        catalog = _build_technical_finding_catalog_from_meta()
+    _FINDING_CATALOG_SNAPSHOT = catalog
+    return catalog
+
+
+#: Historical private alias kept so existing internal call sites keep resolving.
+_finding_catalog = finding_catalog
 
 
 def _coerce_positive_cvss(raw: Any) -> float | None:
@@ -224,13 +257,24 @@ def initialize_technical_report(shell: ReportShell) -> None:
 
 
 def _load_technical_report(shell: ReportShell) -> dict[str, Any]:
-    """Load the technical report JSON or initialize a new one."""
+    """Load the technical report JSON or initialize a new one.
+
+    Alias-family duplicates are collapsed on the way in (see
+    :mod:`adscan_core.reporting.finding_aliases`), so every consumer that reads
+    the artifact through this loader — the recorders, the recap, and the whole
+    PRO report service — sees one finding per weakness. The collapse is applied
+    on load rather than on record because a workspace written by an earlier
+    build already holds both keys, and only a merge brings them back together.
+    The repaired shape reaches disk on the next save, which any recorder call
+    and the affected-asset stamping seam both perform.
+    """
     report_path = _get_technical_report_path(shell)
     if report_path.exists():
         try:
             with report_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                normalize_technical_report(data)
                 return data
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -314,9 +358,21 @@ def _summarize_value(value: Any) -> dict[str, Any]:
 
 
 def _is_positive_value(value: Any) -> bool:
-    """Return True if a value represents a positive finding."""
-    if value is True:
-        return True
+    """Return True when a producer's value says the condition was FOUND.
+
+    Booleans and containers speak for themselves. A NUMBER is read as a count —
+    non-zero is a hit, zero is clear — because several producers state their
+    verdict as ``{"count": N}``; without the numeric rule that shape read as
+    negative and only survived the confirmation gate below by way of the
+    attached evidence, which is exactly the crutch that gate no longer offers.
+    The numeric rule matches ``_is_positive_report_metric`` in ``adscan.py``;
+    unlike that helper a dict is inspected RECURSIVELY, so an all-empty host
+    summary such as ``{"dcs": None, "non_dcs": None}`` still reads as clear.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
     if isinstance(value, list):
         return len(value) > 0
     if isinstance(value, dict):
@@ -353,7 +409,7 @@ def record_technical_finding(
 
     finding = next((item for item in findings if item.get("key") == key), None)
     now = _utc_now_iso()
-    catalog = _finding_catalog().get(key, {})
+    catalog = finding_catalog().get(key, {})
     summary = _summarize_value(value) if value is not None else {}
 
     # Rich knowledge sub-object (description, impact, remediation, references,
@@ -375,13 +431,22 @@ def record_technical_finding(
     if finding is None:
         # SSOT confirmation gate: only materialize a NEW finding when the probe
         # actually confirmed the condition. A producer that ran the check and
-        # passed an explicit NEGATIVE value with no confirming evidence proved
-        # the condition ABSENT ("verified clear" coverage) and must NOT fabricate
-        # a false-positive finding. Branches that keep the finding:
+        # passed an explicit NEGATIVE value proved the condition ABSENT
+        # ("verified clear" coverage) and must NOT fabricate a false-positive
+        # finding. Branches that keep the finding:
         #   - value is None      -> details-only producer (runs only on a hit)
-        #   - _is_positive_value -> positive boolean/truthy value
-        #   - bool(evidence)     -> confirming evidence attached
-        confirmed = (value is None) or _is_positive_value(value) or bool(evidence)
+        #   - _is_positive_value -> the producer's verdict says FOUND
+        #
+        # ``evidence`` is deliberately NOT a confirmation signal. What producers
+        # attach there is PROVENANCE — a pointer to the artifact log the probe
+        # writes on every run, hit or miss — not proof of the condition. Reading
+        # it as confirmation overrode the producer's own negative verdict and
+        # shipped clean controls to the client as open findings: an SMBv1 audit
+        # that reported "No SMBv1 exposure detected" still recorded a confirmed
+        # "SMBv1 Protocol Enabled" finding, and the same held for obsolete
+        # operating systems, stale enabled accounts, SMB relay targets and the
+        # LDAP signing posture. An explicit verdict always wins.
+        confirmed = (value is None) or _is_positive_value(value)
         if not confirmed:
             # The probe RAN and proved the condition absent. That is real
             # positive-assurance evidence and the AD Control Coverage Report
@@ -560,6 +625,42 @@ def record_collection_coverage(
     report = _load_technical_report(shell)
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["collection_coverage"] = coverage
+    _save_technical_report(shell, report)
+
+
+def record_domain_assessment(
+    shell: ReportShell,
+    domain: str,
+    *,
+    enumerated: bool,
+    basis: str = "",
+) -> None:
+    """Record whether *domain* was actually enumerated by this engagement.
+
+    A domain entry appears in the technical report the moment any producer names
+    the domain — including a domain ADscan only learned about by reading a trust
+    off another domain and never touched. Without this marker the reports counted
+    the two identically and the cover claimed coverage the body could not back
+    (see :mod:`adscan_core.reporting.domain_scope`).
+
+    Stamps ``domains[<domain>]["assessment"]`` so the recorded fact travels with
+    the artifact: the PDF headline, the LITE report and ``adscan_web`` all read it
+    instead of guessing from the absence of findings, which a genuinely clean
+    assessed domain would also produce. ``basis`` names what the decision rested
+    on (e.g. ``attack_graph``, ``report_evidence``) so it stays auditable.
+    Best-effort: never raises into the caller.
+    """
+    if not domain:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    marker: dict[str, Any] = {
+        "enumerated": bool(enumerated),
+        "recorded_at": _utc_now_iso(),
+    }
+    if basis:
+        marker["basis"] = str(basis)
+    domain_entry["assessment"] = marker
     _save_technical_report(shell, report)
 
 

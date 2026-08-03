@@ -1,21 +1,17 @@
 """Domain CLI helpers (workspace sub-scope).
 
-This module hosts interactive domain management logic used by the legacy CLI.
-It intentionally depends on dependency injection (the shell object) to avoid
-import cycles into `adscan.py`.
+This module hosts domain-scoped CLI logic (trust enumeration and the per-domain
+save hook). It intentionally depends on dependency injection (the shell object)
+to avoid import cycles into `adscan.py`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import os
 import sys
 import time
 import subprocess
 from typing import Any, Protocol
-
-import curses
-from rich.prompt import IntPrompt
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -46,9 +42,7 @@ class DomainShell(Protocol):
     current_workspace: str | None
     current_workspace_dir: str | None
     current_domain: str | None
-    current_domain_dir: str | None
     domains_dir: str
-    domain_path: str | None
     domains: list[str]
     domains_data: dict[str, dict[str, Any]]
     cracking_dir: str
@@ -57,12 +51,6 @@ class DomainShell(Protocol):
     domain_connectivity: dict[str, dict[str, Any]]
 
     def save_domain_data(self) -> None: ...
-
-    def load_workspace_data(self, workspace_path: str) -> None: ...
-
-    def workspace_save(self) -> None: ...
-
-    def select_domain_curses(self, stdscr: Any, domains: Sequence[str]) -> None: ...
 
     def run_command(
         self, command: str, timeout: int | None = None
@@ -91,137 +79,17 @@ class DomainShell(Protocol):
 
 
 def domain_save(shell: DomainShell) -> None:
-    """Save the current domain data."""
+    """Refresh the current domain's write-only snapshot file.
+
+    Called before switching workspaces so the domain directory on disk reflects
+    the state the operator is leaving. The authoritative store stays the
+    workspace-root ``variables.json``.
+    """
     if not shell.current_domain:
         print_error("No domain selected.")
         return
     shell.save_domain_data()
     print_success(f"Domain data for '{shell.current_domain}' saved.")
-
-
-def domain_create(shell: DomainShell, domain_name: str) -> None:
-    """Create a new domain directory under the current workspace."""
-    from adscan_internal.workspaces import create_domain_dir, resolve_domain_paths
-
-    domain_path = resolve_domain_paths(
-        shell.current_workspace_dir,
-        shell.domains_dir,
-        domain_name,
-    ).domain_dir
-    if os.path.exists(domain_path):
-        marked_domain_name = mark_sensitive(domain_name, "domain")
-        print_error(f"Domain '{marked_domain_name}' already exists.")
-        return
-    create_domain_dir(shell.current_workspace_dir, shell.domains_dir, domain_name)
-    marked_domain_name = mark_sensitive(domain_name, "domain")
-    print_success(f"Domain '{marked_domain_name}' created in '{shell.domains_dir}'.")
-
-
-def domain_delete(shell: DomainShell, domain_name: str) -> None:
-    """Delete an existing domain directory."""
-    from adscan_internal.workspaces import (
-        delete_domain_dir,
-        resolve_domain_paths,
-        resolve_domains_root,
-    )
-
-    shell.domain_path = resolve_domains_root(
-        shell.current_workspace_dir, shell.domains_dir
-    )
-    domain_path = resolve_domain_paths(
-        shell.current_workspace_dir,
-        shell.domains_dir,
-        domain_name,
-    ).domain_dir
-    if not os.path.exists(domain_path):
-        marked_domain_name = mark_sensitive(domain_name, "domain")
-        print_error(f"Domain '{marked_domain_name}' does not exist.")
-        return
-    delete_domain_dir(shell.current_workspace_dir, shell.domains_dir, domain_name)
-    marked_domain_name = mark_sensitive(domain_name, "domain")
-    print_success(f"Domain '{marked_domain_name}' deleted.")
-
-
-def domain_select(shell: DomainShell) -> None:
-    """Select a domain under the current workspace."""
-    from adscan_internal.workspaces import activate_domain, list_domains
-
-    shell.domain_path = os.path.join(
-        shell.current_workspace_dir or "", shell.domains_dir
-    )
-    domains = list_domains(shell.current_workspace_dir, shell.domains_dir)
-    if not domains:
-        print_error("No domains available.")
-        return
-
-    if shell.current_domain:
-        domain_save(shell)
-
-    if shell.current_workspace:
-        shell.workspace_save()
-
-    if len(domains) == 1:
-        activate_domain(
-            shell,
-            workspace_dir=shell.current_workspace_dir,
-            domains_dir_name=shell.domains_dir,
-            domain=domains[0],
-        )
-        shell.load_workspace_data(shell.current_domain_dir or "")
-        print_success(f"Domain '{shell.current_domain}' selected automatically.\n")
-        return
-
-    try:
-        if (
-            sys.stdin.isatty()
-            and sys.stdout.isatty()
-            and os.environ.get("TERM", "") not in ("", "dumb", "unknown")
-        ):
-            curses.wrapper(shell.select_domain_curses, domains)
-            return
-    except Exception as exc:  # noqa: BLE001
-        try:
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-        except Exception:
-            pass
-
-    print_info("Select a domain:")
-    for i, domain in enumerate(domains, 1):
-        print_info(f"  {i}. {domain}", spacing="none")
-
-    try:
-        idx = IntPrompt.ask("Enter a number (0 to cancel)", default=1)
-    except Exception:
-        return
-    if idx == 0:
-        return
-    if 1 <= idx <= len(domains):
-        activate_domain(
-            shell,
-            workspace_dir=shell.current_workspace_dir,
-            domains_dir_name=shell.domains_dir,
-            domain=domains[idx - 1],
-        )
-        shell.load_workspace_data(shell.current_domain_dir or "")
-        print_success(f"Domain '{shell.current_domain}' selected.")
-
-
-def domain_show(shell: DomainShell) -> None:
-    """List available domains."""
-    from adscan_internal.workspaces import list_domains
-
-    shell.domain_path = os.path.join(
-        shell.current_workspace_dir or "", shell.domains_dir
-    )
-    domains = list_domains(shell.current_workspace_dir, shell.domains_dir)
-    if not domains:
-        print_error("No domains available.")
-        return
-    print_info("[bold]Available domains:[/bold]")
-    for domain in domains:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_info(f"  • {marked_domain}")
 
 
 def run_enum_trusts(shell: DomainShell, domain: str) -> None:

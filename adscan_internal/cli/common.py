@@ -1203,12 +1203,33 @@ def build_cli_runtime_snapshot(
 
     telemetry_enabled = False
     telemetry_source = "persisted"
+    telemetry_scope = "default"
+    telemetry_reenable_hint = ""
     try:
         from adscan_internal import telemetry
 
         env_val = os.getenv("ADSCAN_TELEMETRY", None)
         telemetry_enabled = bool(telemetry._is_telemetry_enabled())
         telemetry_source = "session override" if env_val is not None else "persisted"
+
+        # When telemetry is OFF, name the SCOPE that turned it off and the exact
+        # command to re-enable it — the recovery hint that kills the silent-loss
+        # class (a per-engagement opt-out is easy to forget you set).
+        if not telemetry_enabled:
+            from adscan_core.telemetry_preference import (
+                WORKSPACE_PREFERENCE_ATTR,
+                load_global_preference,
+            )
+
+            workspace_pref = getattr(shell, WORKSPACE_PREFERENCE_ATTR, None)
+            if env_val is not None:
+                telemetry_scope = "session (ADSCAN_TELEMETRY)"
+            elif workspace_pref is False:
+                telemetry_scope = "this workspace"
+                telemetry_reenable_hint = "set telemetry on"
+            elif load_global_preference() is False:
+                telemetry_scope = "global"
+                telemetry_reenable_hint = "set telemetry on global"
     except Exception:
         pass
 
@@ -1224,6 +1245,8 @@ def build_cli_runtime_snapshot(
         "current_workspace": getattr(shell, "current_workspace_dir", None),
         "telemetry_enabled": telemetry_enabled,
         "telemetry_source": telemetry_source,
+        "telemetry_scope": telemetry_scope,
+        "telemetry_reenable_hint": telemetry_reenable_hint,
         "context_domain": context_domain,
         "domain_source": domain_source,
         "domains_loaded": len(domains_data) if isinstance(domains_data, dict) else 0,

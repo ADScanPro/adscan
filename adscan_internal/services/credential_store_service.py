@@ -26,6 +26,7 @@ from typing import Any, MutableMapping, Optional
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.models.domain import Domain
 from adscan_core.rich_output import print_exception
+from adscan_core.sensitive import strip_sensitive_markers
 
 
 @dataclass
@@ -804,18 +805,32 @@ def host_match_keys(value: str) -> set[str]:
     """Return the alias-aware comparison keys for one host identifier.
 
     Service-ticket ``target_host`` (an SPN host, usually an FQDN) and the host a
-    follow-up step resolves to (FQDN, short name, IP, or ``HOST$``) must compare
-    equal when they denote the same machine.  This produces a normalised set so
-    a match is ``keys(a) & keys(b)`` being non-empty:
+    follow-up step resolves to (FQDN, short name, IP, ``HOST$``, or the attack
+    graph's own ``HOST$@REALM`` node label) must compare equal when they denote
+    the same machine.  This produces a normalised set so a match is
+    ``keys(a) & keys(b)`` being non-empty:
 
     - lowercased, trailing dot and trailing ``$`` stripped
     - the full value (FQDN or IP)
     - the short hostname (label before the first dot) for non-IP values
 
+    A graph node label (``BRAAVOS$@ESSOS.LOCAL``) is folded into the FQDN it
+    denotes (``braavos.essos.local``), so a host identifier read off an
+    attack-path step compares equal to the same host stored by a credential or
+    ticket writer.  Keeping the realm rather than reducing the label to its
+    short name means the FQDN form matches directly.
+
     IPs are preserved verbatim (no short-name split).  Empty/blank input yields
     an empty set so it never matches anything.
     """
-    raw = str(value or "").strip().strip(".").rstrip("$").lower()
+    raw = str(value or "").strip().strip(".").lower()
+    if "@" in raw:
+        # Attack-graph node label: ``<samaccountname>@<realm>``.
+        name, _, realm = raw.partition("@")
+        name = name.rstrip("$").strip()
+        realm = realm.strip().strip(".")
+        raw = f"{name}.{realm}" if name and realm else name
+    raw = raw.rstrip("$")
     if not raw:
         return set()
     keys = {raw}
@@ -833,6 +848,151 @@ def hosts_match(a: str, b: str) -> bool:
     keys_a = host_match_keys(a)
     keys_b = host_match_keys(b)
     return bool(keys_a and keys_b and (keys_a & keys_b))
+
+
+def username_is_host_identifier(username: str, host: str) -> bool:
+    """Return whether a local-account username is really the HOST's own name.
+
+    A local credential is keyed by ``(host, service, username)`` where the
+    username names an account inside that host's SAM. A computer's name — its
+    short name, FQDN, or ``HOST$`` machine account — is a host identifier and
+    is never one of those accounts, so a credential filed under it can never
+    authenticate.
+
+    This is a defect detector, not a policy: it exists so a path that derives a
+    local account name from the wrong field is caught loudly instead of quietly
+    producing an unusable principal (which is what happened when a recovered
+    LAPS password was stored under the computer name and then discarded as
+    "verification failed").
+    """
+    user = str(username or "").strip()
+    if not user or not str(host or "").strip():
+        return False
+    return hosts_match(user, host)
+
+
+@dataclass(frozen=True)
+class LocalCredentialRecord:
+    """One entry of ``domains_data[domain]["local_credentials"]``.
+
+    Carries the full key — ``(host, service, username)`` — because a local
+    credential is only meaningful together with the host whose SAM holds the
+    account.  A caller that keeps only ``username``/``secret`` has thrown away
+    the fact that makes the credential usable at all.
+    """
+
+    host: str
+    service: str
+    username: str
+    secret: str
+
+
+def iter_local_credential_records(
+    domains_data: Any, *, domain: str
+) -> list[LocalCredentialRecord]:
+    """Return every stored local credential for *domain* as a flat list."""
+    if not isinstance(domains_data, dict):
+        return []
+    domain_data = domains_data.get(domain)
+    if not isinstance(domain_data, dict):
+        return []
+    local_creds = domain_data.get("local_credentials")
+    if not isinstance(local_creds, dict):
+        return []
+    records: list[LocalCredentialRecord] = []
+    for host, services in local_creds.items():
+        if not isinstance(services, dict):
+            continue
+        for service, users in services.items():
+            if not isinstance(users, dict):
+                continue
+            for username, secret in users.items():
+                if not isinstance(secret, str) or not secret.strip():
+                    continue
+                records.append(
+                    LocalCredentialRecord(
+                        host=str(host or "").strip(),
+                        service=str(service or "").strip(),
+                        username=str(username or "").strip(),
+                        secret=secret,
+                    )
+                )
+    return records
+
+
+def find_local_credential_record(
+    domains_data: Any,
+    *,
+    domain: str,
+    username: str,
+    secret: Optional[str] = None,
+    host_aliases: Optional[set[str]] = None,
+    service: Optional[str] = None,
+) -> Optional[LocalCredentialRecord]:
+    """Return the local-credential entry matching the given key, if any.
+
+    Every filter is optional and additive:
+
+    * ``username`` — always applied, case/realm-insensitive.
+    * ``secret`` — exact value match.  Used to answer "is the credential I am
+      holding a LOCAL one?" without guessing.
+    * ``host_aliases`` — the alias set from :func:`expand_host_query_aliases`;
+      the record's host must alias one of them.
+    * ``service`` — ``smb`` / ``mssql`` / ``winrm`` / ``rdp``.
+
+    Returns ``None`` rather than a best guess: a wrong local credential
+    authenticates against the wrong authority, so an unresolved query must not
+    silently degrade into "some credential with the same name".
+    """
+    target_user = _normalize_marker_user(username)
+    if not target_user:
+        return None
+    wanted_service = str(service or "").strip().lower() or None
+    for record in iter_local_credential_records(domains_data, domain=domain):
+        if _normalize_marker_user(record.username) != target_user:
+            continue
+        if secret is not None and record.secret != secret:
+            continue
+        if wanted_service and record.service.lower() != wanted_service:
+            continue
+        if host_aliases is not None and not any(
+            hosts_match(record.host, alias) for alias in host_aliases
+        ):
+            continue
+        return record
+    return None
+
+
+def resolve_local_credential_for_host(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    service: Optional[str] = None,
+) -> Optional[LocalCredentialRecord]:
+    """Return a local credential for *username* in *host*'s SAM, if stored.
+
+    The host-scoped sibling of the domain-only stored-credential resolver.  It
+    is what lets a step that authenticates to a host use an account that exists
+    only inside that host — a local Administrator recovered from LAPS or a SAM
+    dump — instead of a same-named domain principal, which is a different
+    account with a different password.
+
+    Host matching goes through :func:`expand_host_query_aliases`, so the step's
+    host (label, short name, FQDN or IP) matches the form the credential was
+    stored under.
+    """
+    aliases = expand_host_query_aliases(shell, domain=domain, host=host)
+    if not aliases:
+        return None
+    return find_local_credential_record(
+        getattr(shell, "domains_data", None),
+        domain=domain,
+        username=username,
+        host_aliases=aliases,
+        service=service,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1034,6 +1194,50 @@ def status_is_logon_type_denied(status_text: str) -> bool:
     )
 
 
+def expand_host_query_aliases(shell: Any, *, domain: str, host: str) -> set[str]:
+    """Return every identifier that denotes *host*, bridging IP <-> hostname.
+
+    :func:`host_match_keys` is string-only (it deliberately keeps IPs verbatim),
+    so an IP can never alias-match an FQDN.  But a host-scoped artefact — a
+    service ticket keyed by its SPN host, a local credential keyed by the host
+    it was captured on — is usually stored under a name while the step that
+    wants it often knows the host only by IP (or the reverse).  This expands the
+    query host through the persisted workspace IP/hostname inventory so both
+    directions match.
+
+    Best-effort: with no inventory the result is just ``{host}``, which behaves
+    exactly like a direct :func:`hosts_match`.
+    """
+    normalized_host = str(host or "").strip()
+    if not normalized_host:
+        return set()
+    query_hosts: set[str] = {normalized_host}
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+            load_workspace_ip_hostname_inventory,
+        )
+
+        inventory = (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=getattr(shell, "current_workspace_dir", "") or "",
+                domains_dir=getattr(shell, "domains_dir", "domains") or "domains",
+                domain=domain,
+            )
+            or {}
+        )
+        nh_low = normalized_host.lower().rstrip(".").rstrip("$")
+        nh_short = nh_low.split(".", 1)[0]
+        for ip, names in inventory.items():
+            names_low = {str(n).lower().rstrip(".") for n in (names or [])}
+            shorts = {n.split(".", 1)[0] for n in names_low}
+            if nh_low == str(ip).lower() or nh_low in names_low or nh_short in shorts:
+                query_hosts.add(str(ip))
+                query_hosts.update(names or [])
+    except Exception:  # noqa: BLE001 — inventory bridge is best-effort
+        pass
+    return query_hosts
+
+
 def resolve_scoped_ticket_for_host(
     shell: Any,
     *,
@@ -1085,42 +1289,11 @@ def resolve_scoped_ticket_for_host(
 
     now = int(time.time())
 
-    # IP<->FQDN bridge. host_match_keys is string-only (it explicitly keeps IPs
-    # verbatim), so an IP can never alias-match an FQDN. But a scoped ticket is
-    # stored under its SPN host (an FQDN, e.g. ldap/DC01.pirate.htb) while a
-    # follow-up step often knows the host only by IP (domains_data may carry only
-    # `pdc`/dc_ip, no dc_fqdn — exactly the DCSync-after-SPNJack case). Expand the
-    # query host through the persisted workspace IP<->hostname inventory so an IP
-    # query matches an FQDN ticket and vice-versa. Best-effort: no inventory →
-    # behaves exactly as before (direct hosts_match only).
-    query_hosts: set[str] = {normalized_host}
-    try:
-        from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
-            load_workspace_ip_hostname_inventory,
-        )
-
-        inventory = (
-            load_workspace_ip_hostname_inventory(
-                workspace_dir=getattr(shell, "current_workspace_dir", "") or "",
-                domains_dir=getattr(shell, "domains_dir", "domains") or "domains",
-                domain=domain,
-            )
-            or {}
-        )
-        nh_low = normalized_host.lower().rstrip(".").rstrip("$")
-        nh_short = nh_low.split(".", 1)[0]
-        for ip, names in inventory.items():
-            names_low = {str(n).lower().rstrip(".") for n in (names or [])}
-            shorts = {n.split(".", 1)[0] for n in names_low}
-            if (
-                nh_low == str(ip).lower()
-                or nh_low in names_low
-                or nh_short in shorts
-            ):
-                query_hosts.add(str(ip))
-                query_hosts.update(names or [])
-    except Exception:  # noqa: BLE001 — inventory bridge is best-effort
-        pass
+    # IP<->FQDN bridge. A scoped ticket is stored under its SPN host (an FQDN,
+    # e.g. ldap/DC01.pirate.htb) while a follow-up step often knows the host only
+    # by IP (domains_data may carry only `pdc`/dc_ip, no dc_fqdn — exactly the
+    # DCSync-after-SPNJack case).
+    query_hosts = expand_host_query_aliases(shell, domain=domain, host=normalized_host)
 
     candidates: list = []
     for ticket in tickets:
@@ -1308,8 +1481,13 @@ _CAPABILITY_BEARING_KEY = "capability_bearing_ccache"
 
 
 def _normalize_marker_user(username: str) -> str:
-    """Normalize a username for the marker map (lowercase, no realm/domain prefix)."""
-    name = str(username or "").strip()
+    """Normalize a principal name for keyed lookups in this module.
+
+    Lowercase, ``DOMAIN\\`` prefix and ``@realm`` suffix removed, and any
+    zero-width sensitivity markers stripped first — a name that reached here
+    through a marked display string would otherwise never match its stored key.
+    """
+    name = strip_sensitive_markers(str(username or "")).strip()
     if "\\" in name:
         name = name.split("\\", 1)[1]
     if "@" in name:
@@ -1374,6 +1552,69 @@ def get_capability_bearing_ccache(
     return None
 
 
+def get_stored_domain_credential_for_user(
+    domains_data: Any,
+    *,
+    domain: str,
+    username: str,
+) -> Optional[str]:
+    """Return the stored credential for a domain principal, or ``None``.
+
+    The one answer to "does ADscan hold something that can authenticate as this
+    principal", in preference order:
+
+    1. a capability-bearing ccache explicitly marked prefer-over-password for
+       this user (ESC13 / Pass-the-Certificate — the password cannot reproduce
+       the synthetic PAC group SID);
+    2. a password / NT hash from ``credentials``;
+    3. a registered Kerberos ccache from ``kerberos_tickets`` — the
+       NTLM-disabled / AES-only case, where a PKINIT TGT is the only usable
+       credential. The ccache path is itself a valid credential: downstream
+       Kerberos-backed steps (DCSync/DRSUAPI, LDAP, SMB) accept and select it.
+
+    A blank ``credentials`` entry is NOT a credential: the lookup falls through
+    to the ccache rather than returning an empty string, so "stored" never means
+    "present but unusable".
+
+    Args:
+        domains_data: The shell's ``domains_data`` mapping.
+        domain: Domain the principal belongs to.
+        username: Principal name in any form (``DOMAIN\\user``, ``user@realm``,
+            bare sAMAccountName, marked or unmarked).
+
+    Returns:
+        The credential (password, NT hash, or ccache path), or ``None``.
+    """
+    normalized_target = _normalize_marker_user(username)
+    if not normalized_target or not isinstance(domains_data, dict):
+        return None
+    capability_ccache = get_capability_bearing_ccache(
+        domains_data, domain=domain, username=normalized_target
+    )
+    if capability_ccache:
+        return capability_ccache
+    domain_data = domains_data.get(domain)
+    if not isinstance(domain_data, dict):
+        return None
+    credentials = domain_data.get("credentials")
+    if isinstance(credentials, dict):
+        for stored_user, stored_credential in credentials.items():
+            if _normalize_marker_user(str(stored_user)) != normalized_target:
+                continue
+            if isinstance(stored_credential, str) and stored_credential.strip():
+                return stored_credential.strip()
+            break
+    kerberos_tickets = domain_data.get("kerberos_tickets")
+    if isinstance(kerberos_tickets, dict):
+        for stored_user, ticket_path in kerberos_tickets.items():
+            if _normalize_marker_user(str(stored_user)) != normalized_target:
+                continue
+            if isinstance(ticket_path, str) and ticket_path.strip():
+                return ticket_path.strip()
+            break
+    return None
+
+
 __all__ = [
     "CredentialStoreService",
     "DomainCredentialUpdateResult",
@@ -1384,6 +1625,11 @@ __all__ = [
     "resolve_execution_credential",
     "kerberos_service_for_relation",
     "RELATION_TO_KERBEROS_SERVICE",
+    "LocalCredentialRecord",
+    "expand_host_query_aliases",
+    "find_local_credential_record",
+    "iter_local_credential_records",
+    "resolve_local_credential_for_host",
     "host_match_keys",
     "hosts_match",
     "filter_logon_capable_principals",
@@ -1394,4 +1640,5 @@ __all__ = [
     "status_is_logon_type_denied",
     "mark_capability_bearing_ccache",
     "get_capability_bearing_ccache",
+    "get_stored_domain_credential_for_user",
 ]

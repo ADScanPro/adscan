@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -363,6 +363,23 @@ def _build_node_from_ldap_entry(
 # ---------------------------------------------------------------------------
 
 
+class _OidToGroupLinks(NamedTuple):
+    """Outcome of resolving issuance-policy OID → linked group DN for ESC13.
+
+    ``resolved`` distinguishes the two ways ``links`` can be empty, which the
+    ESC13 detector MUST tell apart:
+
+    * ``resolved=True`` + empty ``links`` — the LDAP query succeeded and the
+      domain simply has no ``msDS-OIDToGroupLink`` on any OID. ESC13 does not
+      exist here (existence-condition absent); the detector emits nothing.
+    * ``resolved=False`` — the query failed (data gap). We do not know whether
+      ESC13 exists, so the detector must not emit a CRITICAL false positive.
+    """
+
+    links: dict[str, str]
+    resolved: bool
+
+
 class ADCSCollector:
     """Enumerate ADCS objects from the Configuration naming context."""
 
@@ -455,9 +472,9 @@ class ADCSCollector:
         # ESC13 precondition: issuance-policy OIDs that map to a group via
         # ``msDS-OIDToGroupLink``. The map is consumed by ``detect_esc13`` to
         # enrich edge notes with the linked group DN.
-        oid_to_group_dn = self._collect_oid_to_group_links(pks_base)
+        oid_links = self._collect_oid_to_group_links(pks_base)
 
-        self._detect_escalations(result, oid_to_group_dn=oid_to_group_dn)
+        self._detect_escalations(result, oid_links=oid_links)
 
         print_info_debug(
             "[adcs-collector] done "
@@ -520,16 +537,19 @@ class ADCSCollector:
     # Phase 2/3 escalation detection (sync entry-point with async probe phase)
     # ------------------------------------------------------------------
 
-    def _collect_oid_to_group_links(self, pks_base: str) -> dict[str, str]:
+    def _collect_oid_to_group_links(self, pks_base: str) -> _OidToGroupLinks:
         """Return the issuance-policy OID → linked group DN map for ESC13.
 
         Queries ``msPKI-Enterprise-Oid`` objects under the OID container.
         Only OIDs with a non-empty ``msDS-OIDToGroupLink`` attribute are
         included — those are the ones that produce ESC13 abuse paths.
 
-        Failures degrade silently to an empty map: ESC13 detection still
-        emits ``requires_oid_resolution`` edges, just without linked-group
-        enrichment.
+        The result carries ``resolved`` so the ESC13 detector can tell the
+        two empty-map cases apart. A query FAILURE returns
+        ``resolved=False`` (a data gap — ESC13 presence is unknown); a
+        SUCCESSFUL query with no linked OIDs returns ``resolved=True`` with an
+        empty map (ESC13 genuinely does not exist in this domain). Both are
+        empty; only the failure is uncertain.
         """
         oid_base = f"CN=OID,{pks_base}"
         try:
@@ -546,7 +566,7 @@ class ADCSCollector:
             print_info_debug(
                 f"[adcs-collector] OID-to-group link query failed at {oid_base}: {exc}"
             )
-            return {}
+            return _OidToGroupLinks(links={}, resolved=False)
 
         print_info_debug(
             f"[adcs-collector] OID-to-group query returned {len(entries)} "
@@ -597,15 +617,15 @@ class ADCSCollector:
             print_info_debug(
                 f"[adcs-collector] no OID-to-group links found "
                 f"({_unlinked}/{len(entries)} OIDs without msDS-OIDToGroupLink) — "
-                "all ESC13 edges will use requires_oid_resolution=True"
+                "ESC13 does not exist in this domain; no ESC13 edges will be emitted"
             )
-        return mapping
+        return _OidToGroupLinks(links=mapping, resolved=True)
 
     def _detect_escalations(
         self,
         result: CollectionResult,
         *,
-        oid_to_group_dn: dict[str, str] | None = None,
+        oid_links: _OidToGroupLinks | None = None,
     ) -> None:
         """Run ESC detectors against all collected templates and CAs.
 
@@ -619,6 +639,9 @@ class ADCSCollector:
         cas = [n for n in result.nodes.values() if n.kind == "EnterpriseCA"]
         if not templates and not cas:
             return
+
+        oid_to_group_dn = dict(oid_links.links) if oid_links is not None else {}
+        oid_links_resolved = oid_links.resolved if oid_links is not None else False
 
         edges_by_target: dict[str, list] = {}
         for edge in result.edges:
@@ -677,7 +700,8 @@ class ADCSCollector:
                     ),
                     cert_mapping_methods=cert_mapping_methods,
                     strong_cert_binding_enforced=strong_cert_binding_enforced,
-                    oid_to_group_dn=oid_to_group_dn or {},
+                    oid_to_group_dn=oid_to_group_dn,
+                    oid_links_resolved=oid_links_resolved,
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)

@@ -38,6 +38,12 @@ DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME = "direct_domain_control.txt"
 DOMAIN_COMPROMISE_ENABLERS_FILENAME = "domain_compromise_enablers.txt"
 HIGH_IMPACT_PRIVILEGES_FILENAME = "high_impact_privileges.txt"
 
+# Parsed-snapshot cache for :func:`load_identity_risk_snapshot`. Keyed by the
+# resolved snapshot path; value is ``(fingerprint, parsed_dict)`` where the
+# fingerprint is ``(st_mtime_ns, st_size)`` so a rebuilt file is reloaded
+# automatically. See the loader's docstring for the read-only sharing contract.
+_IDENTITY_RISK_SNAPSHOT_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
 
 @dataclass(frozen=True)
 class IdentityRiskRecord:
@@ -334,12 +340,36 @@ def build_identity_risk_snapshot(shell: object, domain: str) -> dict[str, Any]:
 
 
 def load_identity_risk_snapshot(shell: object, domain: str) -> dict[str, Any] | None:
-    """Load the persisted ADscan-owned identity risk snapshot when available."""
+    """Load the persisted ADscan-owned identity risk snapshot when available.
+
+    The parsed snapshot is memoized per ``(path, file-fingerprint)`` so a batch
+    caller that resolves many users in one pass — e.g. the Tier-0 blast-radius
+    classification (:func:`high_value.classify_users_tier0_high_value`) over every
+    member of a broad group like ``Domain Users`` — parses the JSON exactly once
+    instead of once per user. On an 8k-user domain that was thousands of full
+    re-reads of the same file per attack-path compute. The cache is
+    coverage-neutral (it returns the same parsed content) and self-invalidating:
+    a rewrite of the on-disk snapshot (``build_identity_risk_snapshot``) changes
+    its ``(mtime_ns, size)`` fingerprint and busts the entry. Every caller consumes
+    the snapshot read-only (via ``.get(...)``), so a shared object is safe to hand
+    back.
+    """
     path = _identity_risk_snapshot_path(shell, domain)
-    if not os.path.exists(path):
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        _IDENTITY_RISK_SNAPSHOT_CACHE.pop(path, None)
         return None
+    fingerprint = (stat_result.st_mtime_ns, stat_result.st_size)
+    cached = _IDENTITY_RISK_SNAPSHOT_CACHE.get(path)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
     data = read_json_file(path)
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        _IDENTITY_RISK_SNAPSHOT_CACHE.pop(path, None)
+        return None
+    _IDENTITY_RISK_SNAPSHOT_CACHE[path] = (fingerprint, data)
+    return data
 
 
 def load_or_build_identity_risk_snapshot(shell: object, domain: str) -> dict[str, Any]:

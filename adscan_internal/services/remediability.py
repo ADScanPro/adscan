@@ -808,12 +808,6 @@ _FAMILY_BY_RELATION: Final[dict[str, _Family]] = {
         "that survives offline cracking for {target}.",
         "Disable LLMNR, NBT-NS and mDNS by policy.",
     ),
-    "goldencert": _f(
-        RemediationKind.CREDENTIAL_ROTATION,
-        "Revoke and reissue the certification authority key pair for {target}, "
-        "and store the new key in a hardware security module.",
-        "Revoke and reissue the certification authority key pair.",
-    ),
     "forgedticketfor": _f(
         RemediationKind.CREDENTIAL_ROTATION,
         "Reset the krbtgt account password twice, allowing for replication "

@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from adscan_internal import print_info_debug, telemetry
 from adscan_internal.workspaces import domain_subpath, read_json_file
 from adscan_core.rich_output import print_exception
 
+if TYPE_CHECKING:
+    from adscan_internal.services.attack_path_counts import ClientPathTotals
+
 
 @dataclass(frozen=True)
 class AttackPathSnapshotMetrics:
-    """Canonical user-facing attack-path metrics derived from persisted summaries.
+    """Attack-path metrics as counted from the persisted interactive snapshot.
 
-    The persisted ``attack_paths_snapshot.json`` file is the single source of truth
-    for operator-facing attack-path counts. These metrics intentionally reflect the
-    shell-aware summary pipeline rather than raw graph primitives.
+    ``attack_paths_snapshot.json`` is a point-in-time projection written with
+    whatever ``scope`` / ``target`` / ``target_mode`` the LAST interactive query
+    used, so it is the FALLBACK source for an operator-facing count, not the
+    canonical one. The canonical source is the curated client path set the
+    report renders, resolved through
+    :func:`~adscan_internal.services.attack_path_counts.client_path_totals`;
+    :func:`resolve_client_path_totals` prefers it and falls back to this
+    snapshot only when a run produced no report artifacts.
     """
 
     total: int = 0
@@ -198,16 +207,85 @@ def get_attack_path_summary_breakdown(shell: object) -> dict[str, int]:
     return get_attack_path_snapshot_metrics(shell).to_dict()
 
 
+def resolve_client_path_totals(
+    shell: object,
+    *,
+    domains: list[str] | None = None,
+    fallback_count: int = 0,
+) -> "ClientPathTotals":
+    """Resolve the canonical user-facing attack-path totals for a session.
+
+    The ONE resolver every operator-facing count goes through, so the exit
+    summary, the end-of-scan verdict and the session telemetry state the same
+    figures the client's report states. Three sources, in order:
+
+    1. The curated client path set (the counts SSOT
+       :mod:`~adscan_internal.services.attack_path_counts`), which prefers the
+       ``exposure_kpis`` block stamped by this run's report.
+    2. The persisted interactive snapshot, when the run wrote no report
+       artifacts. Its scope is whatever the last query used, so it is a
+       fallback and never the preferred answer.
+    3. ``fallback_count``, for a session with neither.
+
+    Args:
+        shell: The active shell (workspace context only).
+        domains: Restrict to these domains; ``None`` counts every loaded domain.
+        fallback_count: Last-resort total when nothing is on disk.
+
+    Returns:
+        A :class:`~adscan_internal.services.attack_path_counts.ClientPathTotals`.
+        Sources 2 and 3 populate only ``paths_total`` / ``paths_proven``, since
+        a snapshot carries no exposure or hardening split.
+    """
+    from adscan_internal.services.attack_path_counts import (
+        ClientPathTotals,
+        client_path_totals_for_session,
+    )
+
+    fallback = max(0, int(fallback_count or 0))
+    try:
+        totals = client_path_totals_for_session(shell, domains=domains)
+    except Exception as exc:  # pragma: no cover - defensive
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        totals = ClientPathTotals()
+    if totals.paths_total > 0:
+        return totals
+
+    snapshot_metrics = get_attack_path_snapshot_metrics(shell, domains=domains)
+    if snapshot_metrics.total > 0:
+        print_info_debug(
+            "[summary] attack-path count resolved from the persisted snapshot "
+            f"(no report projection): total={snapshot_metrics.total}"
+        )
+        return ClientPathTotals(
+            paths_total=snapshot_metrics.total,
+            paths_proven=snapshot_metrics.exploited,
+            paths_not_assessed=snapshot_metrics.unsupported,
+        )
+    return ClientPathTotals(paths_total=fallback)
+
+
 def resolve_session_attack_paths_for_summary(
     shell: object, *, fallback_count: int
 ) -> int:
-    """Resolve canonical user-facing attack-path counts for summaries and telemetry."""
-    fallback = max(0, int(fallback_count or 0))
-    snapshot_metrics = get_attack_path_snapshot_metrics(shell)
-    if snapshot_metrics.total > 0:
-        print_info_debug(
-            "[summary] attack-path count resolved from persisted summaries: "
-            f"total={snapshot_metrics.total} fallback={fallback}"
-        )
-        return snapshot_metrics.total
-    return fallback
+    """Resolve the canonical user-facing attack-path count for the session."""
+    return resolve_client_path_totals(shell, fallback_count=fallback_count).paths_total
+
+
+def get_attack_path_metrics_for_verdict(
+    shell: object, *, domains: list[str] | None = None
+) -> AttackPathSnapshotMetrics:
+    """Return the end-of-scan verdict's metrics, from the client path totals.
+
+    The verdict decides which closing message a scan prints AND prints its
+    ``total`` to the operator, so it must count the same paths the recap panel
+    and the report count. :func:`select_attack_path_verdict` stays a pure
+    decision object; only its input source changes.
+    """
+    totals = resolve_client_path_totals(shell, domains=domains)
+    return AttackPathSnapshotMetrics(
+        total=totals.paths_total,
+        exploited=totals.paths_proven,
+        unsupported=totals.paths_not_assessed,
+    )
