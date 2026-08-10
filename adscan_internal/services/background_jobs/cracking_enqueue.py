@@ -33,6 +33,9 @@ from adscan_internal.services.cracking_wordlist_policy import (
     resolve_effort,
     wordlist_tiers_for_workspace,
 )
+from adscan_internal.services.wordlist_service import (
+    record_cracking_coverage_for_domain,
+)
 from adscan_core.rich_output import print_exception
 
 _KIND = "cracking"
@@ -122,6 +125,11 @@ def enqueue_cracking_job(
                 return None
 
         wordlists_dir = _wordlists_dir(shell)
+        # A crack is about to run for this domain, so the deliverable must be
+        # able to say how strong it was. Absent corpora are a data gap, and an
+        # empty recovered-credentials section must never be read as proof that
+        # every password held.
+        record_cracking_coverage_for_domain(shell, domain, wordlists_dir=wordlists_dir)
         workspace_type = str(getattr(shell, "type", "") or "")
         runtime_kwargs: dict[str, Any] = {}
         max_effort = ""

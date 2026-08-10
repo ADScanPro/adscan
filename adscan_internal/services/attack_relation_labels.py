@@ -217,6 +217,8 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "ntlmv1relayrbcd": "Credential Relay to Delegation",
     "ntlmv1relayshadowcreds": "Credential Relay to Shadow Credentials",
     "crackntlmv1": "Offline NTLMv1 Credential Recovery",
+    # Trust abuse ──────────────────────────────────────────────────────────
+    "crossorgtgtdelegation": "Cross-Forest Kerberos Ticket Delegation",
 }
 
 

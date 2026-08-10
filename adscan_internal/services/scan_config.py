@@ -26,7 +26,9 @@ The schema (all keys optional)::
         password_spraying:
           disabled: [blank, pre2k]         # spray strategies to skip
     trust_enumeration:
-      policy: selected        # skip | all | selected | interactive (default)
+      policy: selected        # origin_only | all | selected | interactive (default). Decides
+                              # which DOMAINS get COLLECTED; trust relationships are ALWAYS
+                              # mapped. (`skip` is a back-compat alias of origin_only.)
       domains: [essos.local]  # only consulted when policy == selected
     attack_paths:
       policy: interactive     # none | all | selected | interactive (default)
@@ -59,13 +61,27 @@ from typing import Any, Optional
 # Valid sets — the web form MUST mirror these exactly (contract).
 # ---------------------------------------------------------------------------
 
-# Trust-enumeration policies.
-TRUST_POLICY_SKIP = "skip"
+# Domain-enumeration policies (formerly "trust_enumeration"; the key name is kept
+# for config back-compat). This policy decides WHICH DOMAINS ADscan COLLECTS
+# (BloodHound / attack-graph) after a trust is discovered — NOT whether trust
+# RELATIONSHIPS are mapped. Trust-relationship enumeration ALWAYS runs (mapping
+# the trust graph is cheap and an operator may want the map without collecting a
+# trusted forest they are not authorized to touch). So:
+#   * origin_only — collect only the origin domain (the safe audit default).
+#   * all         — collect every reachable domain (origin + trusted forests).
+#   * selected    — collect only the listed domains (allow-list in ``domains``).
+#   * interactive — ask during the scan (the platform default).
+# ``skip`` is kept as a BACK-COMPAT ALIAS of ``origin_only`` (an existing config
+# that said "skip" still means "don't collect trusted domains" — but it no longer
+# suppresses trust-relationship mapping, which is the decoupling fix).
+TRUST_POLICY_ORIGIN_ONLY = "origin_only"
+TRUST_POLICY_SKIP = "skip"  # back-compat alias of origin_only
 TRUST_POLICY_ALL = "all"
 TRUST_POLICY_SELECTED = "selected"
 TRUST_POLICY_INTERACTIVE = "interactive"
 TRUST_POLICIES: frozenset[str] = frozenset(
     {
+        TRUST_POLICY_ORIGIN_ONLY,
         TRUST_POLICY_SKIP,
         TRUST_POLICY_ALL,
         TRUST_POLICY_SELECTED,
@@ -102,10 +118,9 @@ CVE_TARGET_SCOPES: frozenset[str] = frozenset(
 # + per-service sweeps) to at most this many hosts, ordered representative-first
 # (Tier 0 / DCs / ADCS first), so a positive cap always covers the highest-value
 # hosts and bounds the wall-clock at scale (~2k-host estates). The directory graph
-# (LDAP) is always mapped in full regardless of the cap. Default 150 = the
-# published competitor (Pentera) PoV scope ("up to 150 endpoints", one-day
-# assessment) and ~one /24 subnet / single AD site. ``0`` (the sentinel) means
-# unlimited — byte-for-byte today's full sweep.
+# (LDAP) is always mapped in full regardless of the cap. Default 150 matches a
+# typical one-day PoV scope ("up to ~150 endpoints") and ~one /24 subnet / single
+# AD site. ``0`` (the sentinel) means unlimited — byte-for-byte today's full sweep.
 HOST_CAP_DEFAULT = 150
 HOST_CAP_UNLIMITED = 0
 
@@ -538,6 +553,9 @@ def _parse_trust(raw: Any) -> TrustEnumerationConfig:
             f"Invalid trust_enumeration.policy '{policy}'. "
             f"Valid values: {', '.join(sorted(TRUST_POLICIES))}."
         )
+    # Normalize the back-compat alias so every consumer sees the canonical value.
+    if policy == TRUST_POLICY_SKIP:
+        policy = TRUST_POLICY_ORIGIN_ONLY
     domains = tuple(
         d.lower()
         for d in _coerce_str_list(

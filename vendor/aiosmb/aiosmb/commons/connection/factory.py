@@ -147,11 +147,11 @@ class SMBConnectionFactory:
 				secret,
 				username,
 				domain,
-				secrettype, 
+				secrettype,
 				target = target,
 				altname=altname,
 				altdomain=altdomain,
-				etype=[23,17,18],
+				etypes=[23,17,18],
 				certdata=certdata,
 				keydata=keydata,
 			)

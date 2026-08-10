@@ -89,13 +89,43 @@ def score_to_color(score: int) -> str:
     return _COLOR_RAMP[-1][1]
 
 
+def _technique_mapping_for_key(key: str) -> list[dict[str, Any]]:
+    """Return the catalog's ATT&CK technique list for a finding key.
+
+    The ATT&CK mapping is a property of the finding CATALOG, not of a
+    particular scan, so it is resolved here rather than expected on the
+    entry. Only the PRO report path builds its vulnerability map with the
+    mapping omitted (it feeds the compliance engine, whose verdicts must
+    stay byte-identical), and that is exactly the path this module is fed
+    from — which is why every PRO layer shipped with zero techniques while
+    the catalog held a mapping for 71 of its 79 keys. Reading the catalog
+    makes the layer independent of which map shape it was handed.
+
+    Returns an empty list for an uncatalogued key or if the catalog cannot
+    be imported: a finding with no mapping simply contributes no cell.
+    """
+    if not key:
+        return []
+    try:
+        from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
+    except Exception:  # pragma: no cover - always importable in-tree
+        return []
+    meta = VULN_CATALOG_META.get(key)
+    if not isinstance(meta, Mapping):
+        return []
+    mitre = meta.get("mitre")
+    return [entry for entry in mitre if isinstance(entry, Mapping)] if isinstance(mitre, (list, tuple)) else []
+
+
 def _iter_findings(report_data: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
     """Yield finding dicts from a ``technical_report.json`` payload.
 
     Tolerates both the multi-domain shape (``{domain: {vulnerabilities:
     {key: finding}}}``) and a flat single-domain dict, since the report
-    layout has shifted between releases. Findings without a ``mitre``
-    list are yielded too — the layer builder filters them.
+    layout has shifted between releases. An entry that already carries a
+    ``mitre`` list keeps it; otherwise the mapping is resolved from the
+    finding catalog by key, so a map built without it still produces a
+    populated layer.
     """
     if not isinstance(report_data, Mapping):
         return
@@ -106,14 +136,22 @@ def _iter_findings(report_data: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
         if not isinstance(vulns, Mapping):
             continue
         for key, finding in vulns.items():
-            if not isinstance(finding, Mapping):
+            key_text = str(key or "")
+            # A detail-less finding is stored as ``True`` rather than a dict
+            # (the PRO base map collapses it). It still names a real weakness
+            # with a real technique mapping, so it must not be skipped.
+            entry: Mapping[str, Any] = finding if isinstance(finding, Mapping) else {}
+            if not isinstance(finding, Mapping) and finding is not True:
                 continue
+            mitre = entry.get("mitre")
+            if not isinstance(mitre, (list, tuple)) or not mitre:
+                mitre = _technique_mapping_for_key(key_text)
             # Surface the catalog key when the finding has no explicit title.
             yield {
-                "key": key,
-                "title": finding.get("title") or key,
-                "severity": finding.get("severity"),
-                "mitre": finding.get("mitre") or [],
+                "key": key_text,
+                "title": entry.get("title") or entry.get("_title") or key_text,
+                "severity": entry.get("severity") or entry.get("_severity"),
+                "mitre": list(mitre),
             }
 
 

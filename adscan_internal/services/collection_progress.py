@@ -50,6 +50,7 @@ malformed record or a shell without ``domains_data`` degrades to "not started"
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -61,6 +62,31 @@ COLLECTION_PROGRESS_KEY = "collection_progress"
 # (the clean end always overwrites it with ``complete``).
 STATUS_RUNNING = "running"
 STATUS_COMPLETE = "complete"
+
+# Operator escape hatch: force a fresh full sweep, ignoring (and discarding) the
+# resume cursor of a prior interrupted run. This is the explicit opt-out named in
+# the start-of-run resume notice — a re-scan is a deliberate choice, never a
+# prompt. Honoured at the single seam where the skip-set is derived
+# (:func:`resumed_done_ids`), so every consumer inherits it.
+COLLECTOR_FRESH_ENV = "ADSCAN_COLLECTOR_FRESH"
+
+
+def collector_fresh_requested() -> bool:
+    """Return True when the operator asked for a fresh full sweep (no resume).
+
+    Reads :data:`COLLECTOR_FRESH_ENV` with the collector's usual truthy idiom
+    (``1``/``true``/``yes``/``on``). Fail-open: an unreadable environment reads
+    as "not requested" (the default resume behaviour).
+    """
+    try:
+        return os.getenv(COLLECTOR_FRESH_ENV, "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    except Exception:  # noqa: BLE001 — env read must never break the scan
+        return False
 
 
 def _now_iso() -> str:
@@ -236,14 +262,54 @@ def resumed_done_ids(shell: Any, domain: str) -> frozenset[str]:
     ``complete`` record returns an empty set, so a fresh / finished scan sweeps
     every host. The set is the O(1) skip filter the fan-out applies over its
     dispatch list.
+
+    Honours the :data:`COLLECTOR_FRESH_ENV` escape hatch: when the operator asks
+    for a fresh full sweep, the resumable record is discarded and an empty set is
+    returned, so this run re-scans every host from scratch (the explicit opt-out
+    the start-of-run resume notice names).
     """
     record = read_collection_progress(shell, domain)
     if record.get("status") != STATUS_RUNNING:
+        return frozenset()
+    if collector_fresh_requested():
+        # Explicit re-scan-all: drop the cursor so the sweep starts clean and no
+        # later reload inherits a half-applied skip-set.
+        reset_collection_progress(shell, domain)
         return frozenset()
     done = record.get("hosts_done")
     if not isinstance(done, list):
         return frozenset()
     return frozenset(str(x).upper() for x in done)
+
+
+def resume_notice_counts(shell: Any, domain: str) -> tuple[int, int, int] | None:
+    """Return ``(already_done, total, remaining)`` for a resumable sweep, else None.
+
+    The START-of-run mirror of the END-of-run host-enrichment coverage: it reports
+    how many hosts a prior interrupted session already enriched (``already_done``),
+    the full swept set that run recorded (``total``), and what is left to sweep now
+    (``remaining``). Returns ``None`` when there is nothing to resume — a fresh or
+    finished workspace, or a run for which the operator requested a fresh full
+    sweep — so the caller emits no notice and a fresh workspace is byte-for-byte
+    unchanged.
+
+    ``total`` is read from the interrupted run's recorded ``hosts_total`` (the full
+    post-cap dispatch set, stable across the run and its resume). An older record
+    with a missing/too-small total falls back to the done-count so the counts are
+    always internally consistent (``remaining`` never goes negative).
+    """
+    done_ids = resumed_done_ids(shell, domain)
+    already_done = len(done_ids)
+    if already_done <= 0:
+        return None
+    record = read_collection_progress(shell, domain)
+    try:
+        total = int(record.get("hosts_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    total = max(total, already_done)
+    remaining = max(0, total - already_done)
+    return already_done, total, remaining
 
 
 def remaining_host_ids(

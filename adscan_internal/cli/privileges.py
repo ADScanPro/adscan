@@ -51,7 +51,7 @@ from adscan_internal.services.mssql_access_probe_service import (
     get_mssql_probe_worker_count,
     run_mssql_access_probe_sweep,
 )
-from adscan_internal.workspaces import domain_subpath
+from adscan_internal.workspaces import domain_subpath, resolve_workspace_cwd
 from adscan_internal.workspaces.computers import (
     count_target_file_entries,
     consume_service_targeting_fallback_notice,
@@ -1172,11 +1172,7 @@ def run_service_access_sweep(
 
     for service in services:
         try:
-            workspace_cwd = (
-                shell._get_workspace_cwd()  # type: ignore[attr-defined]
-                if hasattr(shell, "_get_workspace_cwd")
-                else getattr(shell, "current_workspace_dir", os.getcwd())
-            )
+            workspace_cwd = resolve_workspace_cwd(shell)
             domains_dir = getattr(shell, "domains_dir", "domains")
 
             cleaned_hosts = [

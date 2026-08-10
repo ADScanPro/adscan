@@ -1086,6 +1086,34 @@ class DNSDiscoveryService:
             include_loopback=True
         )
 
+    def internal_resolver_available(self) -> bool:
+        """Report whether any configured resolver could reach an internal AD zone.
+
+        An internal Active Directory domain never resolves through a public
+        recursive resolver (1.1.1.1, 8.8.8.8, ...): those servers hold no
+        authority for a `.local`/private forest zone, so a domain-only start
+        against them is guaranteed to fail SRV *and* A-record discovery. This
+        predicate lets the caller reach the "provide a DC/DNS IP" prompt without
+        first running a second, equally-doomed lookup.
+
+        Returns ``True`` (do not short-circuit) whenever there is any resolver
+        that could plausibly forward to an internal DNS server: a private-range
+        nameserver, or a loopback stub (systemd-resolved / dnsmasq forwards to
+        whatever upstream a VPN pushed, which may well be internal). It returns
+        ``False`` only when *every* configured nameserver is a public IP and
+        none is a loopback stub, i.e. the resolver set demonstrably cannot see
+        the internal zone. When ``/etc/resolv.conf`` yields nothing at all the
+        result is ``True`` (conservative: never suppress the working fallback on
+        missing information).
+        """
+        nameservers = self._get_resolv_conf_nameservers(include_loopback=True)
+        if not nameservers:
+            return True
+        for ns in nameservers:
+            if _is_private_or_loopback_ip(ns):
+                return True
+        return False
+
     def _resolve_ipv4_via_getent(self, fqdn: str) -> list[str]:
         fqdn_clean = (fqdn or "").strip()
         if not fqdn_clean:

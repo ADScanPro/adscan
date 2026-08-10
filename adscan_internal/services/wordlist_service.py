@@ -14,22 +14,95 @@ import shutil
 import subprocess
 
 from adscan_internal import telemetry
-from adscan_internal.rich_output import print_error, print_info
+from adscan_internal.rich_output import print_error, print_info, print_warning
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
 from adscan_internal import path_utils
 from adscan_core.rich_output import print_exception
 
 
+#: Status token ``verify_all``/``install_all`` use for a REQUIRED wordlist that
+#: is absent. Callers render it as a hard failure and clear ``all_ok``.
+MISSING_REQUIRED = "missing"
+
+#: Status token for an OPTIONAL wordlist that is absent. The scan proceeds; the
+#: only consequence is reduced password-cracking coverage, which the deliverable
+#: declares as a data gap (see ``cracking_coverage``).
+MISSING_OPTIONAL = "missing (optional)"
+
+
 @dataclass(frozen=True)
 class WordlistDefinition:
-    """Configuration for a single wordlist."""
+    """Configuration for a single wordlist.
+
+    ``required`` is the criticality axis. It defaults to ``True`` so a wordlist
+    added later is treated as load-bearing until someone deliberately says
+    otherwise — a silent downgrade is the failure mode worth guarding against.
+    A definition is only marked optional when every consumer already tolerates
+    its absence at run time.
+    """
 
     name: str
     url: str
     dest: str
     extract_xz: bool = False
     extract_7z: bool = False
+    required: bool = True
+
+
+#: Image repositories ADscan publishes. Anything else is a locally-built or
+#: re-tagged image, for which ``adscan update`` would pull a DIFFERENT image
+#: than the one running and so must not be offered as the repair.
+_PUBLISHED_IMAGE_REPOS = ("adscan/adscan-lite", "adscan/adscan-pro")
+
+
+def _runtime_image_is_published(image: Optional[str] = None) -> bool:
+    """Return whether the running runtime image is one ADscan publishes.
+
+    Reads ``ADSCAN_RUNTIME_IMAGE`` (the launcher sets it, e.g.
+    ``adscan/adscan-lite:latest``) unless ``image`` is given. An empty or
+    unparseable value returns ``False``: without positive evidence that the
+    image came from us, pointing the operator at ``adscan update`` would send
+    them to pull an unrelated image.
+    """
+
+    raw = image if image is not None else os.getenv("ADSCAN_RUNTIME_IMAGE")
+    normalized = str(raw or "").strip().lower()
+    if not normalized:
+        return False
+    repo = normalized.split("@", 1)[0].rsplit(":", 1)
+    # Only the FINAL path segment may carry a tag; a registry host:port prefix
+    # must not be mistaken for one.
+    if len(repo) == 2 and "/" not in repo[1]:
+        normalized = repo[0]
+    return any(normalized.endswith(candidate) for candidate in _PUBLISHED_IMAGE_REPOS)
+
+
+def missing_optional_guidance(wordlist_name: str) -> list[str]:
+    """Return the operator-facing lines for an absent optional wordlist.
+
+    The corpus is baked into the runtime image at build time; it is not a host
+    bind mount and there is no runtime download for it, so "reinstall it" is
+    not an action anyone can take. What the operator can act on is the image:
+    re-pull a published one, or rebuild a local one. Offering ``adscan update``
+    for a locally-built image would pull a different image than the one running
+    and leave the corpus exactly as absent as before.
+    """
+
+    lines = [
+        f"{wordlist_name} is not present in this image. Password cracking will "
+        "run with reduced coverage; every other phase is unaffected.",
+        "This corpus is baked into the runtime image at build time, so it "
+        "cannot be restored from inside a running container.",
+    ]
+    if _runtime_image_is_published():
+        lines.append("Re-pull the runtime image to restore it: adscan update")
+    else:
+        lines.append(
+            "This runtime image was not published by ADscan. Rebuild it with "
+            "wordlist preparation enabled, or switch to a published image."
+        )
+    return lines
 
 
 class WordlistService(BaseService):
@@ -61,8 +134,8 @@ class WordlistService(BaseService):
         self._repo_wordlists_dir = Path(__file__).resolve().parents[2] / "wordlists"
         self._definitions: Dict[str, WordlistDefinition] = {}
 
-        # Default definitions = the wordlist FILES that actually ship in the
-        # runtime image and that `adscan check` must verify are present:
+        # Default definitions = the wordlist FILES that ship in the runtime image
+        # and that `adscan check` reports on:
         #   - rockyou.txt              (the CTF/fast base, downloaded at build)
         #   - combined_audit_base.txt  (the ~94M audit base, a build-time merge)
         #
@@ -72,19 +145,29 @@ class WordlistService(BaseService):
         # from wordlists/manifest.json and DROPPED after the merge, so the image
         # ships the combined only. Those raw components are therefore NOT checked
         # here (they never exist at runtime) and combined_audit_base.txt has no
-        # runtime download URL — a missing combined is a genuinely-broken install
-        # that cannot be auto-fixed, so verify_all correctly reports it missing.
-        # See adscan_internal.services.cracking_wordlist_policy.
+        # runtime download URL — it is baked into the image layer, never fetched.
+        #
+        # BOTH are OPTIONAL. They feed password cracking and nothing else, and
+        # every consumer already tolerates their absence at run time: the crack
+        # job skips a tier whose file is missing (cracking_job), the selector
+        # warns and continues (cli/cracking), and the effort policy falls through
+        # to its documented fallback base (cracking_wordlist_policy.base_for).
+        # Blocking a whole scan — collection, attack paths, the report — on a
+        # corpus none of them read would deny far more than it protects. What a
+        # missing corpus does cost is cracking coverage, and the deliverable
+        # declares that as a data gap rather than rendering an empty section.
         raw_defs = definitions or {
             "rockyou.txt": {
                 "url": "https://github.com/brannondorsey/naive-hashcat/"
                 "releases/download/data/rockyou.txt",
                 "dest": "rockyou.txt",
+                "required": False,
             },
             "combined_audit_base.txt": {
                 # Build-time artifact — no runtime download source.
                 "url": "",
                 "dest": "combined_audit_base.txt",
+                "required": False,
             },
         }
 
@@ -95,6 +178,7 @@ class WordlistService(BaseService):
                 dest=cfg["dest"],
                 extract_xz=bool(cfg.get("extract_xz", False)),
                 extract_7z=bool(cfg.get("extract_7z", False)),
+                required=bool(cfg.get("required", True)),
             )
 
     @property
@@ -323,12 +407,50 @@ class WordlistService(BaseService):
             print_info(f"Ensuring {wl_name} is available...")
             if self.ensure_wordlist_installed(wl_name, fix=True):
                 details[wl_name] = "installed"
-            else:
+                continue
+
+            if definition.required:
                 print_error(f"Failed to download/process {wl_name}.")
                 details[wl_name] = "failed"
                 all_ok = False
+                continue
+
+            details[wl_name] = MISSING_OPTIONAL
+            for line in missing_optional_guidance(wl_name):
+                print_warning(line)
 
         return all_ok, details
+
+    def _is_present(self, definition: WordlistDefinition) -> bool:
+        """Whether a wordlist is resolvable on disk, managed dir or system dir."""
+
+        final_wl_path = self._final_path_for(definition)
+        if os.path.exists(final_wl_path):
+            return True
+        system_wl_path = os.path.join(
+            "/usr/share/wordlists", os.path.basename(final_wl_path)
+        )
+        return os.path.exists(system_wl_path)
+
+    def missing_optional_wordlists(self) -> list[str]:
+        """Names of the OPTIONAL corpora absent from this runtime.
+
+        A read-only observation used to declare the cracking data gap in the
+        deliverable. Never installs, never prints, never raises: an unreadable
+        directory yields an empty list, so an IO problem degrades into "no gap
+        observed" rather than a fabricated gap notice in a client report.
+        """
+
+        missing: list[str] = []
+        for name, definition in self._definitions.items():
+            if definition.required:
+                continue
+            try:
+                if not self._is_present(definition):
+                    missing.append(name)
+            except OSError:
+                continue
+        return missing
 
     def verify_all(self, *, fix: bool) -> Tuple[bool, Dict[str, str]]:
         """Verify that all configured wordlists are available.
@@ -358,16 +480,65 @@ class WordlistService(BaseService):
                 details[wl_name] = "installed via --fix"
                 continue
 
-            details[wl_name] = "missing"
-            print_error(
-                f"{wl_name} not found. Try reinstalling into the {self.wordlists_dir} wordlists directory.",
-            )
-            all_ok = False
+            if definition.required:
+                details[wl_name] = MISSING_REQUIRED
+                print_error(
+                    f"{wl_name} not found. Try reinstalling into the "
+                    f"{self.wordlists_dir} wordlists directory.",
+                )
+                all_ok = False
+                continue
+
+            details[wl_name] = MISSING_OPTIONAL
+            for line in missing_optional_guidance(wl_name):
+                print_warning(line)
 
         return all_ok, details
 
 
+def record_cracking_coverage_for_domain(
+    shell: Any, domain: str, *, wordlists_dir: Optional[str] = None
+) -> None:
+    """Stamp the cracking-coverage statement for *domain* into the report.
+
+    Called from the seams where a crack is about to run, so the declaration
+    only appears for an assessment that actually attempted password recovery —
+    a scan that captured no hashes has no cracking coverage to describe, and
+    stamping one anyway would put a gap notice in a report for work nobody
+    asked for.
+
+    Idempotent: both crack seams may call it many times per domain and the
+    recorder overwrites the same block with the same observation. Best-effort
+    throughout — a report is never failed over its own coverage note.
+    """
+
+    if not domain:
+        return
+    try:
+        from adscan_core.reporting.cracking_coverage import (  # noqa: PLC0415
+            build_cracking_coverage,
+        )
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            record_cracking_coverage,
+        )
+
+        service = WordlistService(wordlists_dir=wordlists_dir)
+        missing = service.missing_optional_wordlists()
+        record_cracking_coverage(
+            shell,
+            domain,
+            coverage=build_cracking_coverage(missing_wordlists=missing),
+        )
+    except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 __all__ = [
+    "MISSING_OPTIONAL",
+    "MISSING_REQUIRED",
     "WordlistDefinition",
     "WordlistService",
+    "missing_optional_guidance",
+    "record_cracking_coverage_for_domain",
 ]

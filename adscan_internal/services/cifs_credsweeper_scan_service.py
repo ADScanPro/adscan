@@ -288,6 +288,9 @@ class CIFSCredSweeperScanService(BaseService):
         file_path_str = str(file_path)
         try:
             if mode == "doc":
+                # Table-aware credential extraction is applied globally at the
+                # CredSweeper per-path seam (credsweeper_service), so shares/loot/
+                # spidering/mssql all inherit it here without per-origin wiring.
                 return credsweeper_service.analyze_file_with_options(
                     file_path_str,
                     credsweeper_path=credsweeper_path,
@@ -378,11 +381,29 @@ class CIFSCredSweeperScanService(BaseService):
         aggregate: dict[str, list[tuple[str, float | None, str, int, str]]],
         findings: dict[str, list[tuple[str, float | None, str, int, str]]],
     ) -> None:
-        """Merge grouped CredSweeper findings into one aggregate dictionary."""
+        """Merge grouped CredSweeper findings into one aggregate dictionary.
+
+        Deduplicates by ``(rule_name, value, path)`` so a credential surfaced by
+        both the document scan and the table-reconstruction scan is reported
+        once. The reconstructed sidecar carries synthetic line numbers, so line
+        number is excluded from the dedup key on purpose.
+        """
         for rule_name, entries in findings.items():
             if not isinstance(entries, list) or not entries:
                 continue
-            aggregate.setdefault(rule_name, []).extend(entries)
+            bucket = aggregate.setdefault(rule_name, [])
+            existing_keys = {
+                (str(entry[0]), str(entry[4]))
+                for entry in bucket
+                if isinstance(entry, tuple) and len(entry) >= 5
+            }
+            for entry in entries:
+                if isinstance(entry, tuple) and len(entry) >= 5:
+                    key = (str(entry[0]), str(entry[4]))
+                    if key in existing_keys:
+                        continue
+                    existing_keys.add(key)
+                bucket.append(entry)
 
     @staticmethod
     def _unique_non_empty(values: list[str]) -> list[str]:

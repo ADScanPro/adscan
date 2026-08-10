@@ -37,6 +37,7 @@ from adscan_internal.services.privileged_group_classifier import (
     is_tier_zero_group_sid,
     is_tier_zero_user_sid,
 )
+from adscan_core.reporting.password_policy_display import AD_NEVER_EXPIRES_FILETIME
 from adscan_core.rich_output import print_exception
 
 _RODC_GROUP_IDS = {516, 521}
@@ -318,6 +319,37 @@ def _first(attrs: dict[str, list[Any]], name: str) -> Any:
 def _first_str(attrs: dict[str, list[Any]], name: str) -> str:
     val = _first(attrs, name)
     return str(val).strip() if val is not None else ""
+
+
+def _100ns_to_days(raw: int | None) -> int | None:
+    """Convert an AD duration attribute (100-ns intervals) to whole days.
+
+    Mirrors ``password_policy_compliance.ad_duration_to_days`` but keeps the
+    local "``0`` floors to ``None``" semantics the offline DomainPolicy / PSO
+    models depend on (the canonical converter maps a sub-unit duration to
+    ``None`` as well). TODO: unify once the collector models tolerate ``None``
+    for zero-duration fields without changing audit output.
+
+    The int64 minimum is what ``net accounts /maxpwage:unlimited`` writes for
+    "passwords never expire". Converted arithmetically it becomes 10,675,199
+    days — a figure no administrator set and no reader can act on — so it is
+    recorded exactly like an absent value, giving every consumer one
+    representation of never-expires.
+    """
+    if not raw:
+        return None
+    if raw <= AD_NEVER_EXPIRES_FILETIME + 1:
+        return None
+    return abs(raw) // (10_000_000 * 86_400)
+
+
+def _100ns_to_minutes(raw: int | None) -> int | None:
+    """Convert an AD duration attribute (100-ns intervals) to whole minutes."""
+    if not raw:
+        return None
+    if raw <= AD_NEVER_EXPIRES_FILETIME + 1:
+        return None
+    return abs(raw) // (10_000_000 * 60)
 
 
 def _int_attr(attrs: dict[str, list[Any]], name: str) -> int | None:
@@ -862,6 +894,12 @@ class ADscanLDAPCollector:
         # Diagnostic breadcrumb: which sub-collection is in flight (sizes/counts
         # only). Set per-phase in the connection-scoped block; None when idle.
         self._active_phase: str | None = None
+        # The pentest shell, when the caller (the CLI/web scan orchestrator)
+        # supplies one. Threaded into ADCS collection so the reachable-IP SSOT
+        # can recover a CA host's IP from the workspace inventory when the DC's
+        # DNS cannot resolve its FQDN. None (lab scripts / tests) leaves ADCS
+        # collection targeting the FQDN — byte-for-byte the pre-fix behaviour.
+        self._shell: Any = None
 
     def collect(
         self,
@@ -884,12 +922,18 @@ class ADscanLDAPCollector:
         collection_scope: str = "ctf",
         posture_sink: Optional["PostureSink"] = None,
         posture_snapshot: Optional["DomainPosture"] = None,
+        shell: Any = None,
     ) -> CollectionResult:
         """Collect all AD objects for the domain and return a CollectionResult.
 
         Either provide ``credentials`` (preferred) or the legacy kwargs.
         ``scope`` defaults to :meth:`LDAPCollectionScope.full_authenticated`
         when omitted — every phase enabled, no caps.
+
+        ``shell`` (the CLI/web scan orchestrator's pentest shell, optional)
+        enables the ADCS CA-host reachable-IP recovery: when the DC's DNS cannot
+        resolve a member CA's FQDN, the reachable-IP SSOT recovers its IP from
+        the workspace inventory. None (lab scripts / tests) is unchanged.
         """
         if credentials is None:
             # Legacy path — translate the flat kwargs into a credentials
@@ -931,11 +975,17 @@ class ADscanLDAPCollector:
         if scope is None:
             scope = LDAPCollectionScope.full_authenticated()
 
-        return self._collect_with(
-            credentials=credentials,
-            scope=scope,
-            collection_scope_label=collection_scope,
-        )
+        # Stash the shell for the duration of this call so the ADCS phase can
+        # reach the reachable-IP SSOT without widening every phase signature.
+        self._shell = shell
+        try:
+            return self._collect_with(
+                credentials=credentials,
+                scope=scope,
+                collection_scope_label=collection_scope,
+            )
+        finally:
+            self._shell = None
 
     def _collect_with(
         self,
@@ -1205,22 +1255,6 @@ class ADscanLDAPCollector:
 
         attrs = _attrs(entries[0])
 
-        # NOTE: these mirror ``password_policy_compliance.ad_duration_to_days`` /
-        # ``ad_duration_to_minutes`` but intentionally keep the local
-        # "``0`` floors to ``0``" semantics that the offline DomainPolicy/PSO
-        # models depend on (the canonical converter maps a sub-unit duration to
-        # ``None``). TODO: unify once the collector models tolerate ``None`` for
-        # zero-duration fields without changing audit output.
-        def _100ns_to_days(raw: int | None) -> int | None:
-            if not raw:
-                return None
-            return abs(raw) // (10_000_000 * 86_400)
-
-        def _100ns_to_minutes(raw: int | None) -> int | None:
-            if not raw:
-                return None
-            return abs(raw) // (10_000_000 * 60)
-
         repl_blobs = _values(attrs, "msDS-ReplAttributeMetaData")
         pwd_attrs = _parse_repl_attr_metadata(repl_blobs, _DDP_PWD_ATTRS)
         # Decode the ``pwdProperties`` bitmask: bit 0 (DOMAIN_PASSWORD_COMPLEX
@@ -1294,22 +1328,6 @@ class ADscanLDAPCollector:
         entries = list(conn.entries)
         if not entries:
             return
-
-        # NOTE: these mirror ``password_policy_compliance.ad_duration_to_days`` /
-        # ``ad_duration_to_minutes`` but intentionally keep the local
-        # "``0`` floors to ``0``" semantics that the offline DomainPolicy/PSO
-        # models depend on (the canonical converter maps a sub-unit duration to
-        # ``None``). TODO: unify once the collector models tolerate ``None`` for
-        # zero-duration fields without changing audit output.
-        def _100ns_to_days(raw: int | None) -> int | None:
-            if not raw:
-                return None
-            return abs(raw) // (10_000_000 * 86_400)
-
-        def _100ns_to_minutes(raw: int | None) -> int | None:
-            if not raw:
-                return None
-            return abs(raw) // (10_000_000 * 60)
 
         def _bool_attr(attrs: dict, name: str) -> bool | None:
             val = _first(attrs, name)
@@ -1725,6 +1743,7 @@ class ADscanLDAPCollector:
         result: CollectionResult,
     ) -> None:
         from adscan_internal.services.enumeration.trust_query import (
+            cross_org_tgt_delegation_enabled,
             evaluate_trust_posture,
             query_trusted_domains,
         )
@@ -1766,6 +1785,11 @@ class ADscanLDAPCollector:
                             "trustType": entry.trust_type,
                             "trustAttributes": entry.trust_attributes,
                             "attributeFlags": list(entry.attribute_flags),
+                            # Explicit boolean so downstream consumers (attack-graph
+                            # coupling, report) never re-decode the bitmask.
+                            "crossOrgTgtDelegation": cross_org_tgt_delegation_enabled(
+                                entry.trust_attributes
+                            ),
                             "partnerSid": entry.sid,
                         },
                     )
@@ -1794,7 +1818,10 @@ class ADscanLDAPCollector:
             )
 
             adcs_result = ADCSCollector(
-                connection=conn, domain=domain, acl_parser=acl_parser
+                connection=conn,
+                domain=domain,
+                acl_parser=acl_parser,
+                shell=self._shell,
             ).collect()
             for node in adcs_result.nodes.values():
                 result.add_node(node)

@@ -83,6 +83,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "ntlm": "NTLM Weaknesses",
     "ntlm_relay": "NTLM Relay",
     "privilege": "Privilege Escalation",
+    "trust": "Trust Abuse",
 }
 
 # Short display names for catalog relations whose key does not title-case into
@@ -162,6 +163,7 @@ DISPLAY_NAME_OVERRIDES: dict[str, str] = {
     "printoperatorabuse": "Print Operators Abuse",
     "privilegedgroupcontrol": "Privileged Group Control",
     "readgmsapassword": "Read gMSA Password",
+    "crossorgtgtdelegation": "Cross-Forest TGT Delegation",
     "readlapspassword": "Read LAPS Password",
     "readshare": "Readable Share",
     "scheduledtask": "Scheduled Task Execution",

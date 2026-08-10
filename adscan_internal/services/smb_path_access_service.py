@@ -214,6 +214,28 @@ def _unc_path(host: str, share: str, file_path: str) -> str:
     return f"\\\\{host}\\{share}"
 
 
+async def _probe_can_list_directory(connection, unc: str) -> bool:
+    """Return whether the bound principal can enumerate ``unc``.
+
+    ``SMBDirectory`` exposes no ``open``/``close`` pair: each operation owns its
+    own tree-connect / CREATE / CLOSE lifecycle internally. ``list()`` is the
+    canonical read probe — it performs the directory open and one
+    ``query_directory`` round, returning ``(True, None)`` when the enumeration
+    succeeded and ``(False, err)`` when the server denied it.
+
+    Never raises; a transport failure reports "cannot list" rather than
+    aborting the caller's wider probe.
+    """
+    try:
+        from aiosmb.commons.interfaces.directory import SMBDirectory
+
+        directory = SMBDirectory.from_uncpath(unc)
+        listed, err = await directory.list(connection)
+        return bool(listed) and err is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class SMBPathWriteProbeResult:
     """Result of one SMB path write probe."""
@@ -583,25 +605,18 @@ class SMBPathAccessService(BaseService):
                 connection = machine.connection
 
                 # Directory listing probe
-                try:
-                    from aiosmb.commons.interfaces.directory import SMBDirectory
-                    list_unc = _unc_path(host_clean, share_clean, directory_clean)
-                    directory = SMBDirectory.from_uncpath(list_unc)
-                    _, err = await directory.open(connection)  # pylint: disable=no-member
-                    if err is None:
-                        can_list_directory = True
-                        await directory.close()  # pylint: disable=no-member
-                        print_info_verbose(
-                            "[smb-path] directory listing succeeded: "
-                            f"host={marked_host} share={marked_share} path={marked_directory}"
-                        )
-                    else:
-                        print_warning_debug(
-                            "[smb-path] directory listing was denied but write probe will continue: "
-                            f"host={marked_host} share={marked_share} path={marked_directory}"
-                        )
-                except Exception:  # noqa: BLE001
-                    pass
+                list_unc = _unc_path(host_clean, share_clean, directory_clean)
+                can_list_directory = await _probe_can_list_directory(connection, list_unc)
+                if can_list_directory:
+                    print_info_verbose(
+                        "[smb-path] directory listing succeeded: "
+                        f"host={marked_host} share={marked_share} path={marked_directory}"
+                    )
+                else:
+                    print_warning_debug(
+                        "[smb-path] directory listing was denied but write probe will continue: "
+                        f"host={marked_host} share={marked_share} path={marked_directory}"
+                    )
 
                 # Write probe: create a temporary file with FILE_DELETE_ON_CLOSE equivalent.
                 # aiosmb opens with FILE_OPEN_IF — we create + write + delete.
@@ -744,26 +759,19 @@ class SMBPathAccessService(BaseService):
                 connection = machine.connection
 
                 # Directory listing probe
-                try:
-                    from aiosmb.commons.interfaces.directory import SMBDirectory
-                    list_unc = _unc_path(host_clean, share_clean, directory_clean)
-                    directory = SMBDirectory.from_uncpath(list_unc)
-                    _, err = await directory.open(connection)  # pylint: disable=no-member
-                    if err is None:
-                        can_list_directory = True
-                        await directory.close()  # pylint: disable=no-member
-                        print_info_verbose(
-                            "[smb-path] directory listing succeeded before upload probe: "
-                            f"host={marked_host} share={marked_share} path={marked_directory}"
-                        )
-                    else:
-                        print_warning_debug(
-                            "[smb-path] directory listing was denied before file upload; "
-                            f"upload will continue: host={marked_host} share={marked_share} "
-                            f"path={marked_directory}"
-                        )
-                except Exception:  # noqa: BLE001
-                    pass
+                list_unc = _unc_path(host_clean, share_clean, directory_clean)
+                can_list_directory = await _probe_can_list_directory(connection, list_unc)
+                if can_list_directory:
+                    print_info_verbose(
+                        "[smb-path] directory listing succeeded before upload probe: "
+                        f"host={marked_host} share={marked_share} path={marked_directory}"
+                    )
+                else:
+                    print_warning_debug(
+                        "[smb-path] directory listing was denied before file upload; "
+                        f"upload will continue: host={marked_host} share={marked_share} "
+                        f"path={marked_directory}"
+                    )
 
                 from aiosmb.commons.interfaces.file import SMBFile
 

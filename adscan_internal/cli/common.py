@@ -481,6 +481,56 @@ def resolve_repl_domain_or_default(shell: Any, provided: str | None) -> str | No
     return None
 
 
+def resolve_effective_username_for_domain(
+    shell: Any, domain: str, *, default: str = "N/A"
+) -> str:
+    """Return the username actually used to authenticate against ``domain`` (SSOT).
+
+    A trusted domain reached across a forest trust has NO credential of its own —
+    it is enumerated with the AUTH domain's credential over a cross-realm referral
+    (``auth_domain`` != ``target_domain``). Every operation panel that shows a
+    per-domain "Username" must therefore fall back to the auth domain's credential
+    for such a domain, or it misrepresents an authenticated cross-realm scan as
+    anonymous (``Username: N/A``) — the recurring UX defect across the collection,
+    quick-credential-wins, LDAP-description, and other per-domain phase panels.
+
+    Resolution (first match wins):
+      1. ``domains_data[domain]["username"]`` when the TARGET domain has its own
+         credential (a normally-authenticated domain).
+      2. ``domains_data[shell.domain]["username"]`` — the ACTIVE auth domain's
+         credential, used for a trusted domain enumerated via a cross-realm
+         referral.
+      3. ``default`` (``"N/A"``) when neither is known (a genuinely anonymous /
+         unauthenticated context).
+
+    Args:
+        shell: The active shell (source of ``domains_data`` + the active
+            ``shell.domain`` auth domain).
+        domain: The TARGET domain the panel is about.
+        default: The value returned when no credential is resolvable (kept as
+            ``"N/A"`` so existing anonymous-context panels are unchanged).
+    """
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return default
+
+    def _clean(value: Any) -> str | None:
+        text = str(value or "").strip()
+        return text if text and text != "N/A" else None
+
+    own = _clean((domains_data.get(domain) or {}).get("username"))
+    if own:
+        return own
+
+    auth_domain = str(getattr(shell, "domain", None) or "").strip()
+    if auth_domain and auth_domain != domain:
+        auth_user = _clean((domains_data.get(auth_domain) or {}).get("username"))
+        if auth_user:
+            return auth_user
+
+    return default
+
+
 def set_active_domain(shell: Any, domain: str | None) -> None:
     """Set the shell's active domain context (single source of truth).
 

@@ -21,21 +21,24 @@ from adscan_internal.services.identity_risk_service import (
     load_or_build_identity_risk_snapshot,
 )
 from adscan_internal.services.membership_snapshot import load_membership_snapshot
-from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
+from adscan_internal.workspaces import (
+    domain_subpath,
+    read_json_file,
+    resolve_workspace_cwd,
+    write_json_file,
+)
 from adscan_core.rich_output import print_exception
 
 IDENTITY_CHOKE_POINT_SNAPSHOT_FILENAME = "identity_choke_points.json"
 
 
 def _workspace_cwd(shell: object) -> str:
-    getter = getattr(shell, "_get_workspace_cwd", None)
-    if callable(getter):
-        try:
-            return str(getter())
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-    return str(getattr(shell, "current_workspace_dir", os.getcwd()) or os.getcwd())
+    try:
+        return resolve_workspace_cwd(shell)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return os.getcwd()
 
 
 def _snapshot_path(shell: object, domain: str) -> str:

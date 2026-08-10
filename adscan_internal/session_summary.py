@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from adscan_internal import print_info_debug, telemetry
-from adscan_internal.workspaces import domain_subpath, read_json_file
+from adscan_internal.workspaces import domain_subpath, read_json_file, resolve_workspace_cwd
 from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:
@@ -143,11 +143,7 @@ def get_attack_path_snapshot_metrics(
 ) -> AttackPathSnapshotMetrics:
     """Return canonical user-facing attack-path metrics from persisted snapshots."""
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
         domains_data = getattr(shell, "domains_data", {}) or {}
         if not isinstance(domains_data, dict):

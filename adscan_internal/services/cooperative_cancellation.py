@@ -17,10 +17,35 @@ module is the single, operation-agnostic implementation of that pattern:
     at most once per token lifetime.
 
   * ONE CLI trigger (:func:`cli_cooperative_stop`) that turns the operator's
-    first ``Ctrl+C`` into a *stop-and-continue* (never an abort) and a second
-    ``Ctrl+C`` within a short window into the normal hard-abort escape hatch.
-    A no-op under ``is_non_interactive`` — automated runs (``adscan ci``)
-    never install a signal handler; the sentinel trigger still works.
+    ``Ctrl+C`` into a *stop-and-continue* and, by itself, NEVER aborts the run.
+    A no-op under ``is_non_interactive`` — automated runs (``adscan ci``) never
+    install a signal handler; the sentinel trigger still works.
+
+  The Ctrl+C state machine — PANIC-PROOF (the core invariant):
+
+    Field forensics showed operators MASH ``Ctrl+C`` in a panic (one real
+    session logged nine "Shutdown already in progress" lines), and a design
+    that asks a panicking human to press a key an exact number of times still
+    fails — they do not count, they mash. So the handler must ABSORB the
+    mashing, never interpret a count:
+
+    * The FIRST press latches the cooperative stop (:meth:`request_stop`). The
+      loop drains in-flight work and RETURNS; the caller continues the scan
+      with the partial result. The handler shows a brief "stopping" notice.
+    * EVERY subsequent press while the stop is latched is a pure NO-OP — it
+      does not raise, it does not abort, it at most re-emits a calm debug line.
+      Mashing during the drain can never do anything destructive, ever.
+    * The handler NEVER raises ``KeyboardInterrupt``. Exiting the whole run is
+      NOT a keystroke anyone can fall into: it is only ever an EXPLICIT menu
+      choice offered by the operation's own call site AFTER the loop returns
+      and its ``LiveSession`` alt-screen has popped (see
+      :mod:`adscan_internal.cli.intelligence` for the host-sweep decision
+      prompt). ``Ctrl+C`` inside THAT prompt is likewise a no-op.
+
+  This inverts the old handler, which raised ``KeyboardInterrupt`` on any tap
+  after a stop was requested (or a double-tap within a window) — the exact bug
+  that aborted a 15h sweep and lost all its work when the operator, seeing no
+  instant response, pressed the key again.
 
 The contract every consumer loop follows is the same regardless of what it is
 iterating over (hosts, username candidates, ...):
@@ -46,16 +71,16 @@ import contextlib
 import os
 import signal
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from adscan_core.interaction import is_non_interactive
 from adscan_core.rich_output import print_info_debug, print_warning
 
-# A second Ctrl+C within this window of the first escalates to a hard abort.
-# Shared across every operation using :func:`cli_cooperative_stop` so the
-# "double-tap to abort" muscle memory is consistent product-wide.
+# Historical constant. The cooperative-stop handler NO LONGER escalates a
+# second Ctrl+C to an abort (the panic-proof rewrite: the handler never
+# raises). Kept as a harmless module constant so any external reference does
+# not break; it no longer gates any behaviour here.
 DOUBLE_TAP_WINDOW_SECS = 3.0
 
 
@@ -157,30 +182,39 @@ class CooperativeCancellation:
         return self.is_requested()
 
 
+# Shown on a redundant Ctrl+C after the stop is already latched. Calm, never
+# blocks, and does NOT offer a keystroke to exit: exiting is only ever the
+# explicit menu choice at the operation's call site once the loop returns.
+_REDUNDANT_TAP_NOTICE = "Already stopping the current step; please wait for in-flight work to finish."
+
+
 @dataclass
 class _CliStopHandlerState:
     cancellation: CooperativeCancellation
     shell: Any
     stop_message: str
-    first_tap_at: float = 0.0
     previous_handler: Any = None
 
 
 def _on_sigint(state: _CliStopHandlerState) -> Any:
     def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
-        now = time.monotonic()
-        # Double-tap within the window → hard abort (the normal escape hatch).
-        if state.first_tap_at and (now - state.first_tap_at) <= DOUBLE_TAP_WINDOW_SECS:
-            raise KeyboardInterrupt
-        # If the operator already stopped the operation, a fresh Ctrl+C means abort.
+        # PANIC-PROOF: this handler NEVER raises. Ctrl+C during a cooperative
+        # operation can only request the stop (once) or be a no-op; it can never
+        # abort the run. Exiting is an explicit menu choice at the call site
+        # after the loop returns, so a mashed key has nowhere to fall into.
         if state.cancellation.is_requested():
-            raise KeyboardInterrupt
-        state.first_tap_at = now
-        # First tap → cooperative stop-and-continue. Flip the thread-safe flag;
+            # Already stopping. A redundant Ctrl+C (the panicked mash) is a pure
+            # no-op: no raise, no abort. Emit a quiet debug line so the terminal
+            # is not spammed while in-flight work drains.
+            print_info_debug(_REDUNDANT_TAP_NOTICE)
+            return
+
+        # First press: cooperative stop-and-continue. Flip the thread-safe flag;
         # the loop drains in-flight work and tears its LiveSession down. We do
-        # NOT read stdin here (signal handler on the main thread, the loop may
-        # own the alt-screen) — the decision is shown as a non-blocking,
-        # deferred notice that survives the alt-screen pop.
+        # NOT read stdin or render a prompt here (signal handler on the main
+        # thread, the loop owns the alt-screen). The decision prompt lives at
+        # the call site, AFTER the loop returns and the alt-screen has popped.
+        # The stop_message is a non-blocking notice that survives the pop.
         state.cancellation.request_stop(source="cli")
         print_warning(state.stop_message)
 
@@ -197,19 +231,22 @@ def cli_cooperative_stop(
     """Activate the Ctrl+C stop-and-continue handler for one operation.
 
     Wrap the long-running call with this context manager. On a TTY it installs
-    a ``SIGINT`` handler that turns the FIRST ``Ctrl+C`` into a cooperative
-    stop (``stop_message`` is shown, ``cancellation`` is flipped, the loop
-    keeps running and drains) and a SECOND ``Ctrl+C`` within
-    :data:`DOUBLE_TAP_WINDOW_SECS` into the normal hard abort
-    (``KeyboardInterrupt`` propagates). The previous handler is restored on
-    exit.
+    a PANIC-PROOF ``SIGINT`` handler: the FIRST ``Ctrl+C`` requests a
+    cooperative stop (``stop_message`` is shown, ``cancellation`` is flipped,
+    the loop keeps running and drains), and EVERY subsequent ``Ctrl+C`` is a
+    pure no-op. The handler NEVER raises, so mashing the key in panic can never
+    abort the run. Exiting is not a keystroke: the operation's own call site
+    offers an explicit menu choice AFTER the loop returns and its alt-screen
+    has popped (see the host-sweep decision prompt in
+    :mod:`adscan_internal.cli.intelligence`). The previous handler is restored
+    on exit.
 
-    Under ``is_non_interactive(shell)`` (``adscan ci``) it is a pure no-op —
-    the platform uses the sentinel, not Ctrl+C — so an automated run keeps the
+    Under ``is_non_interactive(shell)`` (``adscan ci``) it is a pure no-op:
+    the platform uses the sentinel, not Ctrl+C, so an automated run keeps the
     default ``KeyboardInterrupt`` semantics on a stray signal.
 
     Best-effort: if the signal cannot be installed (e.g. called off the main
-    thread), it yields without a handler rather than failing the operation —
+    thread), it yields without a handler rather than failing the operation:
     the sentinel-file trigger still works via the same ``cancellation`` token.
 
     Args:

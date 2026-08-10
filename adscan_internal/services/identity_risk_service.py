@@ -29,7 +29,12 @@ from adscan_internal.services.privileged_group_classifier import (
     normalize_sid,
     sid_rid,
 )
-from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
+from adscan_internal.workspaces import (
+    domain_subpath,
+    read_json_file,
+    resolve_workspace_cwd,
+    write_json_file,
+)
 from adscan_core.rich_output import print_exception
 
 IDENTITY_RISK_SNAPSHOT_FILENAME = "identity_risk_snapshot.json"
@@ -68,14 +73,12 @@ class IdentityRiskRecord:
 
 
 def _workspace_cwd(shell: object) -> str:
-    getter = getattr(shell, "_get_workspace_cwd", None)
-    if callable(getter):
-        try:
-            return str(getter())
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-    return str(getattr(shell, "current_workspace_dir", os.getcwd()) or os.getcwd())
+    try:
+        return resolve_workspace_cwd(shell)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return os.getcwd()
 
 
 def _identity_risk_snapshot_path(shell: object, domain: str) -> str:

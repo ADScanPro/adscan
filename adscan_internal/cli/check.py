@@ -47,6 +47,9 @@ from adscan_internal.ligolo_manager import (
     get_ligolo_agent_local_path,
     get_ligolo_proxy_local_path,
 )
+from adscan_internal.services.wordlist_service import (
+    MISSING_OPTIONAL as WORDLIST_MISSING_OPTIONAL,
+)
 from adscan_core.rich_output import print_exception
 
 
@@ -3499,6 +3502,12 @@ def run_check(
             deps.print_success(f"{wl_name} {status}")
         elif "installed" in status:
             deps.print_success(f"{wl_name} {status}")
+        elif status == WORDLIST_MISSING_OPTIONAL:
+            # An optional corpus only narrows password cracking. Reporting it as
+            # a hard failure would abort collection, attack paths and the report
+            # over a file none of them read — so it is a warning, and
+            # ``verify_all`` leaves ``all_ok`` alone.
+            deps.print_warning(f"{wl_name} {status}")
         else:
             deps.print_error(f"{wl_name} {status}")
     if not w_all_ok:

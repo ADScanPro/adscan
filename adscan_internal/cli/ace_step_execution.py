@@ -83,6 +83,11 @@ def _is_audit_mode(shell: Any) -> bool:
     return str(getattr(shell, "type", "") or "").strip().lower() == "audit"
 
 
+def _is_ctf_mode(shell: Any) -> bool:
+    """Return whether the current shell is running in CTF mode."""
+    return str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+
+
 def _sanitize_prompt_account(value: str) -> str:
     """Normalize an account value captured from interactive prompts."""
     return strip_sensitive_markers(str(value or "")).strip()
@@ -1984,14 +1989,20 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 "Only continue if you are explicitly authorized to reset this credential during the engagement."
             ),
         )
-        # Opt-in consent (default OFF, no CTF auto-execute). Resetting a user's
-        # password is irreversible, so it runs only on an explicit operator
-        # opt-in — including in CTF. The centralized helper auto-resolves to the
-        # default (skip) in non-interactive mode, so ``adscan ci`` / the web
-        # worker never hang and never auto-execute this.
+        # Consent default is mode-dependent (this point is reached only for a
+        # USER target — a computer/machine ForceChangePassword is hard-blocked
+        # above and never prompts). CTF: default ON, so an unattended ``adscan
+        # ci`` on a lab box resets the user and the path continues (a CTF target
+        # is disposable, and progressing the chain is the whole point). AUDIT:
+        # default OFF — resetting a real user's password is irreversible and
+        # disruptive, so it runs only on an explicit operator opt-in. The
+        # centralized helper auto-resolves to this default in non-interactive
+        # mode, so ``adscan ci`` / the web worker never hang: CTF auto-executes,
+        # audit auto-skips.
+        force_change_default = _is_ctf_mode(shell)
         if not confirm_ask(
             "Proceed with ForceChangePassword execution?",
-            default=False,
+            default=force_change_default,
         ):
             print_warning("ForceChangePassword execution cancelled by operator.")
             return False

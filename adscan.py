@@ -10974,6 +10974,10 @@ class PentestShell:
         self._current_dcsync_context: Dict[str, Any] | None = None
         # Guard against duplicate workspace/HTML exports during shutdown
         self._shutdown_in_progress = False
+        # Show the "shutdown already in progress" notice only ONCE — a user who
+        # panics and mashes Ctrl+C during a slow drain should not get one warning
+        # line per keypress (mirrors the cooperative-cancellation panic-absorb).
+        self._shutdown_notice_shown = False
         self.session_command_type: str | None = SESSION_COMMAND_TYPE or "start"
 
         # Tier 2 — live chunked streaming.
@@ -12061,7 +12065,9 @@ class PentestShell:
         """Handles the interrupt signal (Ctrl+C) gracefully."""
         global _SESSION_CAPTURE_FINALIZED
         if getattr(self, "_shutdown_in_progress", False):
-            print_warning("Shutdown already in progress. Please wait...")
+            if not getattr(self, "_shutdown_notice_shown", False):
+                self._shutdown_notice_shown = True
+                print_warning("Shutdown already in progress. Please wait...")
             return
 
         signal_name = str(_signum)
@@ -17252,28 +17258,18 @@ class PentestShell:
 
             # Capture environment metrics for case studies after Phase 1 completes
             try:
-                from adscan_internal.workspaces import domain_subpath
-
-                workspace_cwd = self.current_workspace_dir or os.getcwd()
-                users_file = domain_subpath(
-                    workspace_cwd, self.domains_dir, domain, "enabled_users.txt"
-                )
-                computers_file = domain_subpath(
-                    workspace_cwd, self.domains_dir, domain, "enabled_computers.txt"
+                from adscan_internal.services.estate_size_telemetry import (
+                    build_estate_size_properties,
                 )
 
-                user_count = 0
-                computer_count = 0
-
-                if os.path.exists(users_file):
-                    with open(users_file, "r", encoding="utf-8", errors="ignore") as f:
-                        user_count = sum(1 for line in f if line.strip())
-
-                if os.path.exists(computers_file):
-                    with open(
-                        computers_file, "r", encoding="utf-8", errors="ignore"
-                    ) as f:
-                        computer_count = sum(1 for line in f if line.strip())
+                # Same counter the scan-completion event uses, so an estate size
+                # read off one event equals the one read off the other. This
+                # event fires right after the enumeration that writes those
+                # artifacts, so a missing file here means "nothing enumerated" —
+                # keep its historical zero rather than the helper's ``None``.
+                estate = build_estate_size_properties(self, domain)
+                user_count = estate["user_count"] or 0
+                computer_count = estate["computer_count"] or 0
 
                 # Check if ADCS is present
                 adcs_present = bool(self.domains_data.get(domain, {}).get("adcs"))
@@ -18043,6 +18039,18 @@ class PentestShell:
 
             convergence = build_field_convergence_properties(self, domain)
 
+            # Estate size, read off the enumeration artifacts the scan already
+            # wrote (no recount, no extra AD query). Without it a mislabelled
+            # lab workspace — an HTB box carrying `workspace_type=audit` — is
+            # indistinguishable from a real corporate domain, so no field
+            # statistic built on this event can be filtered down to real
+            # estates. Counts only: no account or host name rides along.
+            from adscan_internal.services.estate_size_telemetry import (
+                build_estate_size_properties,
+            )
+
+            estate_size = build_estate_size_properties(self, domain)
+
             lab_slug = self._get_lab_slug()
             properties = {
                 # Timing metrics
@@ -18063,6 +18071,7 @@ class PentestShell:
             }
             properties.update(path_totals.telemetry_properties())
             properties.update(convergence)
+            properties.update(estate_size)
             properties.update(
                 build_lab_telemetry_fields(
                     lab_provider=self.lab_provider,
@@ -30640,7 +30649,9 @@ class PentestShell:
         global _SESSION_CAPTURE_FINALIZED
         exit_requested = exit if isinstance(exit, bool) else True
         if getattr(self, "_shutdown_in_progress", False):
-            print_warning("Shutdown already in progress. Please wait...")
+            if not getattr(self, "_shutdown_notice_shown", False):
+                self._shutdown_notice_shown = True
+                print_warning("Shutdown already in progress. Please wait...")
             return exit_requested
         self._shutdown_in_progress = True
         # ACL/attribute-level environment change cleanup
@@ -30654,6 +30665,21 @@ class PentestShell:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(f"[acl-cleanup] shutdown cleanup failed: {exc}")
+        # Deferred MSSQL SYSTEM-escalation minted-account cleanup. Reverted
+        # HERE — at true scan exit — instead of inline inside the escalation
+        # follow-up, so the account stays alive through every later scan
+        # phase that may still authenticate as it (attack-path materialization,
+        # privilege sweeps). See services/mssql_admin_account_cleanup.py.
+        try:
+            from adscan_internal.services.mssql_admin_account_cleanup import (
+                execute_deferred_mssql_admin_account_reverts,
+            )
+
+            execute_deferred_mssql_admin_account_reverts(self)
+        except Exception as exc:  # pragma: no cover - best-effort shutdown
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[mssql-cleanup] shutdown cleanup failed: {exc}")
         try:
             from adscan_internal.services.ligolo_artifact_cleanup_service import (
                 cleanup_workspace_ligolo_artifacts,
@@ -32071,6 +32097,50 @@ def add_ci_subparser(subparsers):
     return ci_parser
 
 
+def _install_ci_missing_args_hint(ci_parser):
+    """Make a bare `adscan ci` fail with a captured, actionable usage hint.
+
+    When required arguments are missing, argparse calls ``ci_parser.error()``,
+    which prints a terse usage line to STDERR and exits with code 2. That STDERR
+    line is invisible in the telemetry recording (the ``_TeeConsole`` only mirrors
+    Rich ``Console.print``) and does not tell the user which arguments to add, so
+    a user who runs bare ``adscan ci`` sees only the welcome banner in the
+    recording and retries the same command blind (observed twice in prod).
+
+    This wraps ``error()`` to first print a single captured Rich hint (naming the
+    required shape and one real example, both sourced from the pass-through SSOT
+    ``adscan_core.cli_passthrough_spec.CI_PASSTHROUGH``) through the shared
+    console, so it lands in the recording AND on the terminal. It then delegates
+    to argparse's original ``error()`` unchanged, so the usage line and non-zero
+    exit code are preserved. ``ci`` is non-interactive by definition, so the hint
+    is a print, never a prompt, and never blocks.
+
+    Args:
+        ci_parser: The container ``ci`` subparser returned by ``add_ci_subparser``.
+    """
+    from adscan_core.cli_passthrough_spec import (
+        CI_PASSTHROUGH,
+        render_required_usage_hint,
+    )
+
+    original_error = ci_parser.error
+
+    def error_with_hint(message):
+        try:
+            hint = render_required_usage_hint(CI_PASSTHROUGH)
+            example = CI_PASSTHROUGH.examples[0]
+            get_console().print(
+                f"[bold]adscan ci needs a mode and target.[/bold]\n"
+                f"  {hint}\n"
+                f"  [dim]example:[/dim] {example}"
+            )
+        except Exception:  # noqa: BLE001 - never block the real usage error
+            pass
+        return original_error(message)
+
+    ci_parser.error = error_with_hint
+
+
 if __name__ == "__main__":
     # Required for multiprocessing with spawn context inside a PyInstaller binary.
     # Must be called before any other code in the __main__ block.
@@ -32213,6 +32283,7 @@ if __name__ == "__main__":
     # the module-level ``add_ci_subparser`` so the flag surface is importable
     # (locked against the launcher pass-through SSOT by a contract test).
     ci_parser = add_ci_subparser(subparsers)
+    _install_ci_missing_args_hint(ci_parser)
 
 
 

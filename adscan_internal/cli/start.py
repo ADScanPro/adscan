@@ -2982,23 +2982,53 @@ def _domain_context_wizard(
             ):
                 return _confirm_and_preflight(domain, pdc_ip)
 
-        print_info(
-            "No PDC found via SRV; trying A/hosts lookup for a DC/DNS candidate..."
-        )
-        fallback_ip = offer_a_record_fallback(
-            shell=shell,
-            service=service,
-            domain=domain,
-            fallback_hint=fallback_hint,
-            confirm=False,
-        )
-        if fallback_ip:
-            return _confirm_and_preflight(domain, fallback_ip)
+        # When the only DNS resolvers we have are public (1.1.1.1, 8.8.8.8, ...),
+        # they hold no authority for an internal AD zone: SRV already failed and
+        # the A-record fallback would fail the same way. Skip that second lookup
+        # and take the operator straight to the DC/DNS-IP prompt, explaining why.
+        internal_resolver_available = True
+        checker = getattr(service, "internal_resolver_available", None)
+        if callable(checker):
+            try:
+                internal_resolver_available = bool(checker())
+            except Exception as exc:  # noqa: BLE001 - best-effort; never block the flow
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                internal_resolver_available = True
+
+        if internal_resolver_available:
+            print_info(
+                "No PDC found via SRV; trying A/hosts lookup for a DC/DNS candidate..."
+            )
+            fallback_ip = offer_a_record_fallback(
+                shell=shell,
+                service=service,
+                domain=domain,
+                fallback_hint=fallback_hint,
+                confirm=False,
+            )
+            if fallback_ip:
+                return _confirm_and_preflight(domain, fallback_ip)
+
+            panel_body = (
+                "[bold yellow]⚠[/bold yellow]  [bold]Could not resolve the PDC from the domain name.[/bold]\n\n"
+                f"  Domain    {mark_sensitive(domain, 'domain')}\n\n"
+                f"Provide a DC or DNS IP to continue, or {fallback_hint}."
+            )
+        else:
+            # No internal resolver configured: state the cause plainly so the
+            # operator understands this is expected, not a hang or a bug.
+            panel_body = (
+                "[bold yellow]⚠[/bold yellow]  [bold]This domain won't resolve from your current DNS.[/bold]\n\n"
+                f"  Domain    {mark_sensitive(domain, 'domain')}\n\n"
+                "An internal Active Directory domain is only known to its own DNS, which\n"
+                "runs on the domain controllers. Your resolver is public and holds no\n"
+                "record for it, so DNS discovery can't find the DC on its own.\n\n"
+                f"Point ADscan at a DC or DNS IP to continue, or {fallback_hint}."
+            )
 
         print_panel(
-            "[bold yellow]⚠[/bold yellow]  [bold]Could not resolve the PDC from the domain name.[/bold]\n\n"
-            f"  Domain    {mark_sensitive(domain, 'domain')}\n\n"
-            f"Provide a DC or DNS IP to continue, or {fallback_hint}.",
+            panel_body,
             title="[bold]» Additional Information Needed[/bold]",
             border_style="yellow",
             padding=(1, 2),
@@ -3932,11 +3962,12 @@ def _maybe_apply_domain_inference(shell: Any, domain: str | None) -> None:
         print_info_debug("[domain_inference] skip: domain is empty")
         return
 
-    # Lab context inference is meaningless for audit workspaces; skip entirely.
-    if getattr(shell, "type", None) == "audit":
-        print_info_debug("[domain_inference] skip: workspace type is audit")
-        return
-
+    # Lab attribution runs regardless of the workspace type. The operator's
+    # declared ``type`` is theirs and is never overwritten here — both
+    # application sites below only assign ``shell.type`` when it is unset — but
+    # which lab a domain belongs to is a separate, additive fact. Skipping
+    # inference for ``type=audit`` left a lab run indistinguishable from a real
+    # customer engagement in the telemetry review queue.
     marked_domain = mark_sensitive(domain, "domain")
     explicit_context_locked = _has_explicit_lab_context(shell)
     current_provider: str | None = (

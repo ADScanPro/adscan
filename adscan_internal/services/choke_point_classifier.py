@@ -11,9 +11,32 @@ from __future__ import annotations
 
 from typing import Any
 
+from adscan_internal.services.compromise_class import is_structural_hierarchy_source
 from adscan_internal.services.control_semantics import (
     classify_group_control_semantics,
     is_material_control_transition,
+)
+
+
+#: Note keys that carry ONLY this module's choke-point verdict, so a consumer can
+#: strip them when the classifier no longer returns a record for an edge (edge
+#: notes merge, so a stale verdict would otherwise outlive the rule that produced
+#: it). Deliberately excludes the keys a record shares with other producers —
+#: ``source_label`` / ``target_label`` / ``source_kind`` / ``target_kind`` /
+#: ``blast_radius`` / ``affected_principal_count`` / ``title`` are also written by
+#: collectors and read by the ADCS specifics weave, so removing them would take
+#: real data with them.
+CHOKE_POINT_VERDICT_NOTE_KEYS: frozenset[str] = frozenset(
+    {
+        "is_choke_point",
+        "choke_point_type",
+        "choke_point_directness",
+        "choke_point_reason",
+        "from_control_level",
+        "to_control_level",
+        "affected_user_samples",
+        "severity",
+    }
 )
 
 
@@ -156,6 +179,18 @@ def classify_attack_graph_edge_choke_point(
     from_node = nodes_map.get(from_id)
     to_node = nodes_map.get(to_id)
     if not isinstance(from_node, dict) or not isinstance(to_node, dict):
+        return None
+
+    # An edge out of a principal that is ALREADY Tier 0 direct is built-in AD
+    # hierarchy, not a privilege transition: Domain Controllers holds the
+    # replication rights because that is what replication is, and Domain Admins
+    # is inside BUILTIN\Administrators because Windows puts it there. There is
+    # no tier to cross, so there is no choke point to remediate — the exposure
+    # lives at whatever earlier step reaches this source. Asks the axis-1
+    # taxonomy in ``compromise_class`` rather than the group semantics below,
+    # which classify by privileged-membership and do not know the domain's own
+    # control-plane groups (``Domain Controllers`` grades "standard" there).
+    if is_structural_hierarchy_source(from_node):
         return None
 
     relation_key = str(relation or "").strip().lower()

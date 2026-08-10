@@ -267,12 +267,12 @@ async def _enumerate_users_from_smb(config) -> list[str]:
         from adscan_internal.services.smb_transport import smb_machine_with_fallback
 
         async with smb_machine_with_fallback(config) as machine:
+            # SMBDirectory has no open()/close(): list_r owns the tree-connect,
+            # directory open and close itself, and reports a denied open as an
+            # error entry on its first yield.
             directory = SMBDirectory.from_remotepath(
                 machine.connection, r"\C$\Users\\"
             )
-            _, err = await directory.open(machine.connection)  # pylint: disable=no-member
-            if err:
-                return []
             seen: set[str] = set()
             result: list[str] = []
             async for obj, otype, entry_err in directory.list_r(
@@ -287,7 +287,13 @@ async def _enumerate_users_from_smb(config) -> list[str]:
                     seen.add(name.lower())
                     result.append(name)
             return result
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            "ctf-flags: profile-folder enumeration failed; "
+            "falling back to credential-derived candidates."
+        )
         return []
 
 

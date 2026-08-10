@@ -433,6 +433,26 @@ def derive_posture_path_inputs(
     return resolved_da, len(tier0_targets)
 
 
+def _coerce_tier_breakdown(
+    breakdown: Mapping[str, Any] | None,
+) -> tuple[int, int, int] | None:
+    """Return ``(tier0, tier1, tier2)`` from a stamped breakdown, or ``None``.
+
+    ``None`` when the block is absent or malformed, which the caller treats as
+    "no Tier split available" rather than as three zeros — a zeroed split reads
+    as "nobody is privileged", which is a claim, not a missing value.
+    """
+    if not isinstance(breakdown, Mapping):
+        return None
+    values: list[int] = []
+    for bucket in ("tier0", "tier1", "tier2"):
+        try:
+            values.append(max(0, int(breakdown.get(bucket, 0) or 0)))
+        except (TypeError, ValueError):
+            return None
+    return values[0], values[1], values[2]
+
+
 @dataclass(frozen=True)
 class DomainUserReach:
     """How much of the domain's user population a compromise class reaches.
@@ -446,18 +466,39 @@ class DomainUserReach:
         affected: Distinct domain users holding at least one path of the
             requested class.
         total: The domain's enabled user population (the denominator).
-        all_users: A contributing path expanded through a broad group (Domain
-            Users / Authenticated Users / Everyone), so the reach is the whole
-            population by construction rather than by enumeration.
+        all_users: Every enabled account in the population is affected — a
+            measured fact about the resolved set, not an assumption drawn from
+            the scope being a broad group.
         available: There was a KPI block to read. ``False`` means the artifact
             predates the KPI engine and the caller should say nothing at all
             rather than render a zero it cannot stand behind.
+        ordinary_affected: The subset of :attr:`affected` that is NOT already
+            Tier 0. This is the finding. A Tier 0 account "reaching" full domain
+            compromise is the directory's own hierarchy restated — the built-in
+            Administrator can take over the domain because it IS the domain —
+            so counting it inflates the headline toward 100% by construction
+            and costs the figure its credibility when it genuinely is high.
+        ordinary_total: The enabled NON-Tier-0 population, the denominator that
+            pairs with :attr:`ordinary_affected`. Numerator and denominator are
+            drawn from the same population, so 100% means every ordinary
+            account and the metric has no hidden ceiling.
+        tier0_affected: The already-privileged accounts among :attr:`affected`,
+            kept as context rather than dropped: a reader is owed the whole
+            number as well as the part of it that is a finding.
+        ordinary_available: The Tier split reconciled with :attr:`affected`, so
+            the ordinary figures can be stood behind. ``False`` means fall back
+            to the plain reach framing rather than print a split that does not
+            add up.
     """
 
     affected: int = 0
     total: int = 0
     all_users: bool = False
     available: bool = False
+    ordinary_affected: int = 0
+    ordinary_total: int = 0
+    tier0_affected: int = 0
+    ordinary_available: bool = False
 
     @property
     def pct(self) -> float:
@@ -465,6 +506,15 @@ class DomainUserReach:
         if self.total > 0:
             return min(100.0, round(self.affected / self.total * 100.0, 1))
         return 100.0 if self.all_users else 0.0
+
+    @property
+    def ordinary_pct(self) -> float:
+        """Share of the NON-Tier-0 population, saturating at 100."""
+        if self.ordinary_total > 0:
+            return min(
+                100.0, round(self.ordinary_affected / self.ordinary_total * 100.0, 1)
+            )
+        return 0.0
 
     @property
     def is_every_account(self) -> bool:
@@ -486,8 +536,14 @@ def derive_domain_user_reach(
 
     Per-domain the requested classes are unioned (capped at that domain's own
     population), then summed across domains, which is sound because the counts
-    are domain-disjoint. A broad-group expansion saturates the domain to its
-    full population.
+    are domain-disjoint. The engine already resolved whether the affected set
+    covers the whole population, so no saturation happens here — re-applying it
+    would restore the over-claim the engine derivation exists to prevent.
+
+    The Tier-0-excluded figures ride along (``ordinary_*``), derived through the
+    shared :func:`~adscan_internal.services.compromise_class.derive_ordinary_breaker_stat`
+    so the free report, the paid report and the platform answer "how many of
+    your people are exposed" with one number.
 
     Args:
         domains: Either the ``technical_report["domains"]`` mapping or an
@@ -502,10 +558,18 @@ def derive_domain_user_reach(
     """
     entries = list(domains.values()) if isinstance(domains, Mapping) else list(domains)
 
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        derive_ordinary_breaker_stat,
+    )
+
     affected = 0
     total = 0
     any_all_users = False
     available = False
+    ordinary_affected = 0
+    ordinary_total = 0
+    tier0_affected = 0
+    ordinary_available = False
 
     for entry in entries:
         if not isinstance(entry, Mapping):
@@ -521,6 +585,7 @@ def derive_domain_user_reach(
             continue
         domain_affected = 0
         domain_all_users = False
+        domain_breakdown: Mapping[str, Any] | None = None
         for class_name in compromise_classes:
             bucket = user_axis.get(class_name)
             if not isinstance(bucket, Mapping):
@@ -528,20 +593,123 @@ def derive_domain_user_reach(
             any_bucket = bucket.get("any")
             if not isinstance(any_bucket, Mapping):
                 continue
-            domain_affected = max(
-                domain_affected, max(0, int(any_bucket.get("count", 0) or 0))
-            )
+            class_count = max(0, int(any_bucket.get("count", 0) or 0))
+            if class_count >= domain_affected:
+                domain_affected = class_count
+                candidate = any_bucket.get("tier_breakdown")
+                domain_breakdown = candidate if isinstance(candidate, Mapping) else None
             domain_all_users = domain_all_users or bool(any_bucket.get("all_users"))
-        if domain_all_users and domain_users > 0:
-            domain_affected = domain_users
         affected += domain_affected
         any_all_users = any_all_users or domain_all_users
+
+        # The Tier split may only be shown when it reconciles with the count it
+        # splits — the same gate the paid report and the platform apply, so all
+        # three fall back together rather than one of them printing a breakdown
+        # that does not add up.
+        tiers = _coerce_tier_breakdown(domain_breakdown)
+        if tiers is None or sum(tiers) != domain_affected or domain_affected <= 0:
+            continue
+        stat = derive_ordinary_breaker_stat(
+            tier0=tiers[0],
+            tier1=tiers[1],
+            tier2=tiers[2],
+            domain_user_count=domain_users,
+        )
+        ordinary_affected += int(stat["ordinary_with_breaker"])
+        ordinary_total += int(stat["ordinary_total"])
+        tier0_affected += int(stat["tier0_with_breaker"])
+        ordinary_available = True
 
     return DomainUserReach(
         affected=affected,
         total=total,
         all_users=any_all_users,
         available=available,
+        ordinary_affected=ordinary_affected,
+        ordinary_total=ordinary_total,
+        tier0_affected=tier0_affected,
+        ordinary_available=ordinary_available and ordinary_total > 0,
+    )
+
+
+def aggregate_tier0_population(
+    domains: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Aggregate the privilege-SPRAWL figure across every assessed domain.
+
+    How many accounts ALREADY hold Tier 0 by membership. This is the companion
+    to :func:`derive_domain_user_reach`, and the reason that figure is honest:
+    the path metric excludes the already-privileged accounts, and an exclusion
+    reported without its count does not clean the number, it hides the
+    population. A domain of a hundred where forty are Domain Admins can show
+    modest path exposure and be entirely lost — those forty need no route,
+    they are the destination.
+
+    Reads the engine-stamped ``population_tier_breakdown`` (the POPULATION's
+    Tier split, NOT the affected set's) and hands the estate totals to the SSOT
+    :func:`~adscan_internal.services.compromise_class.derive_tier0_population_stat`,
+    which also decides PRECEDENCE via ``leads``: where sprawl is pathological
+    it takes the headline and path exposure becomes the second line, because
+    asking whether a tier separation holds is moot where there is none left to
+    hold.
+
+    The affected set cannot stand in for the population here. In that same
+    domain of a hundred, if only twelve of the forty administrators appear on a
+    path, the affected split reads twelve and the escalation never fires — a
+    silent failure to escalate, which is the dangerous direction.
+
+    Lives in this shared layer, beside the reach derivation it qualifies,
+    because BOTH report tiers print the figure. A second copy for the free
+    report is how the two tiers end up quoting different numbers off one scan.
+
+    Args:
+        domains: Either the ``technical_report["domains"]`` mapping or an
+            iterable of per-domain dicts, each optionally carrying an
+            ``exposure_kpis`` block — the same input
+            :func:`derive_domain_user_reach` takes, so one call site can feed
+            both.
+
+    Returns:
+        The flat stat dict every surface renders directly (``tier0_count``,
+        ``domain_user_count``, ``pct``, ``leads``, ``degenerate``,
+        ``dominant_kind``, …), or ``None`` when no domain carries a graded
+        population — the caller then renders no sprawl figure rather than a
+        zeroed one, which would read as "nobody is privileged".
+    """
+    entries = list(domains.values()) if isinstance(domains, Mapping) else list(domains)
+
+    population = 0
+    tier0 = 0
+    tier0_direct = 0
+    found = False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        kpis = entry.get("exposure_kpis")
+        if not isinstance(kpis, Mapping):
+            continue
+        split = kpis.get("population_tier_breakdown")
+        if not isinstance(split, Mapping):
+            continue
+        # The denominator sums ONLY the domains that carry a breakdown.
+        # Counting a domain whose Tier 0 population could not be graded would
+        # dilute the share, and diluting is the direction that suppresses the
+        # escalation.
+        found = True
+        population += max(0, int(kpis.get("domain_user_count", 0) or 0))
+        tier0 += max(0, int(split.get("tier0", 0) or 0))
+        tier0_direct += max(0, int(split.get("tier0_direct", 0) or 0))
+    if not found or population <= 0:
+        return None
+
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        derive_tier0_population_stat,
+    )
+
+    return derive_tier0_population_stat(
+        tier0=tier0,
+        tier0_direct=tier0_direct,
+        domain_user_count=population,
     )
 
 
@@ -585,6 +753,17 @@ _MAX_AFFECTED_ACCOUNTS: int = 500
 _AFFECTED_FINE_TIER_VALUES: frozenset[str] = frozenset(
     {"tier0_direct", "tier0_escalation_capable", "tier1", "tier2"}
 )
+
+#: Fold of a FINE Privilege-Tier value onto its coarse blast-radius bucket.
+#: Mirrors ``attack_graph_service._coarse_tier_bucket``, which produced both the
+#: map and the breakdown in the first place, so a breakdown re-derived here from
+#: a filtered map is the one the producer would have written.
+_COARSE_TIER_BUCKET: dict[str, str] = {
+    "tier0_direct": "tier0",
+    "tier0_escalation_capable": "tier0",
+    "tier1": "tier1",
+    "tier2": "tier2",
+}
 
 
 def _serialize_affected_accounts(users: set[str]) -> tuple[list[str], bool]:
@@ -652,6 +831,7 @@ def _normalize_user(value: Any) -> str:
 
 def _record_affected_users(
     record: Mapping[str, Any],
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[set[str], bool, dict[str, int], dict[str, str]]:
     """Return ``(normalized_user_set, is_broad, tier_breakdown, tier_map)``.
 
@@ -675,6 +855,13 @@ def _record_affected_users(
     value ``"tier0_direct"`` / ``"tier0_escalation_capable"`` / ``"tier1"`` /
     ``"tier2"``) when present, else ``{}``. Keys are re-normalised through
     :func:`_normalize_user` so they match the ``affected_accounts`` set exactly.
+
+    ``excluded`` names accounts outside the measured population (machine-managed
+    service accounts — see ``services/account_population``). They are dropped
+    from all three outputs together, so the numerator is drawn from the same
+    population as the denominator. When the drop touches an account the record
+    graded, the Tier breakdown is re-derived from the surviving map rather than
+    decremented, which keeps it exactly reconciled with the count it splits.
     """
     meta = record.get("meta")
     if not isinstance(meta, Mapping):
@@ -706,6 +893,15 @@ def _record_affected_users(
             tier = str(raw_tier or "").strip().lower()
             if norm and tier in _AFFECTED_FINE_TIER_VALUES:
                 tier_map[norm] = tier
+    if excluded:
+        users -= excluded
+        dropped_graded = excluded & set(tier_map)
+        if dropped_graded:
+            for key in dropped_graded:
+                tier_map.pop(key, None)
+            breakdown = {"tier0": 0, "tier1": 0, "tier2": 0}
+            for tier in tier_map.values():
+                breakdown[_COARSE_TIER_BUCKET.get(tier, "tier2")] += 1
     return users, is_broad, breakdown, tier_map
 
 
@@ -817,6 +1013,9 @@ def compute_exposure_kpis(
     domain_user_count: int | None,
     executions: Sequence[Mapping[str, Any]] | None = None,
     computed_at: str | None = None,
+    domain_users: Sequence[str] | None = None,
+    excluded_users: Sequence[str] | None = None,
+    population_tier_breakdown: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the exposure KPI block (path-axis + user-axis blast radius).
 
@@ -840,6 +1039,26 @@ def compute_exposure_kpis(
             display ``status``.
         computed_at: Provenance timestamp (ISO-8601). Pure / deterministic - the
             caller passes it; this function NEVER calls ``datetime.now``.
+        domain_users: The enabled domain user population itself, when the caller
+            has it. Supplying the names as well as the count lets the block name
+            the accounts that hold NO path — which on a small domain is the fact
+            that proves the metric measures something, because a figure that
+            could only ever read "all of them" tells a reader nothing. Optional:
+            omitting it changes no count, it only leaves the exception unnamed.
+        excluded_users: Accounts the caller removed from the measured population
+            — machine-managed service accounts, whose credential is a
+            KDC-rotated random value and so is not reachable by anything this
+            metric measures (SSOT: ``services/account_population``). They are
+            dropped from every affected set here as well, so numerator and
+            denominator describe the same population, and the names are stamped
+            so the document can say why the denominator reads as it does.
+            ``domain_user_count`` is expected to be net of them already.
+        population_tier_breakdown: ``{"tier0", "tier0_direct", "tier1",
+            "tier2"}`` for the POPULATION (not the affected set) — how many
+            accounts already hold each tier by membership. Stamped verbatim and
+            consumed by the privilege-sprawl figure, which is what makes
+            excluding the already-privileged accounts from the path figure
+            defensible rather than a way of hiding them.
 
     Returns:
         The ``exposure_kpis`` dict persisted verbatim under
@@ -850,6 +1069,12 @@ def compute_exposure_kpis(
         if isinstance(domain_user_count, int) and domain_user_count > 0
         else 0
     )
+    excluded: frozenset[str] = frozenset(
+        norm for raw in (excluded_users or ()) if (norm := _normalize_user(raw))
+    )
+    population: set[str] = {
+        norm for raw in (domain_users or ()) if (norm := _normalize_user(raw))
+    } - excluded
 
     # Reconcile a single status per path. When executions are supplied, fold the
     # executed PathState in via the canonical SSOT merge so the status reflects
@@ -921,7 +1146,7 @@ def compute_exposure_kpis(
             )
         distinct_paths[cls] += 1
 
-        users, is_broad, breakdown, tier_map = _record_affected_users(record)
+        users, is_broad, breakdown, tier_map = _record_affected_users(record, excluded)
         per_status_users[cls].setdefault(status, set()).update(users)
         per_status_all_users[cls][status] = (
             per_status_all_users[cls].get(status, False) or is_broad
@@ -934,35 +1159,63 @@ def compute_exposure_kpis(
             )
         any_tier_map[cls].update(tier_map)
 
-    def _pct(count: int, all_users: bool) -> float:
-        if all_users:
-            return 100.0
+    def _resolve_population(users: set[str], broad_scope: bool) -> tuple[int, bool]:
+        """Return ``(affected_count, covers_whole_domain)`` for one bucket.
+
+        ``broad_scope`` records that a contributing path started at a broad
+        group (Domain Users / Authenticated Users / Everyone). It does NOT say
+        the affected population is every enabled account, and treating the two
+        as the same thing is what put "10 of 10 domain users · every domain user
+        is in scope" on page 2 of a run whose own enumerated list held nine: a
+        broad group is not the enabled-user population, because an account whose
+        primary group sits elsewhere — a group managed service account, a trust
+        account — is enabled and is not a member.
+
+        So the enumerated set wins whenever there is one, and ``all_users`` is
+        then a measured fact (the set covers the population) rather than an
+        assumption. Saturation survives only for the case it was written for: a
+        broad-group path whose membership could not be resolved at all, where
+        the alternative is printing 0 for a population known to be domain-wide.
+
+        The count is also what the Tier 0/1/2 breakdown has to reconcile
+        against before either surface may show the tier split, so an inflated
+        count does not merely overstate — it silently suppresses the
+        non-circular ordinary-account headline both documents lead with.
+        """
+        resolved = len(users)
+        if resolved:
+            return resolved, user_total > 0 and resolved >= user_total
+        if broad_scope and user_total > 0:
+            return user_total, True
+        return 0, False
+
+    def _pct(count: int) -> float:
         if user_total <= 0:
             return 0.0
         return min(100.0, round(count / user_total * 100.0, 1))
-
-    def _count(users: set[str], all_users: bool) -> int:
-        # A broad-group path means the whole domain is in scope; the union of
-        # explicit users is a lower bound, so saturate to the domain size.
-        if all_users and user_total > 0:
-            return user_total
-        return len(users)
 
     user_axis: dict[str, dict[str, Any]] = {}
     for cls in _KPI_COMPROMISE_CLASSES:
         per_status: dict[str, Any] = {}
         for status, users in per_status_users[cls].items():
-            all_flag = per_status_all_users[cls].get(status, False)
+            status_count, status_all = _resolve_population(
+                users, per_status_all_users[cls].get(status, False)
+            )
             per_status[status] = {
-                "count": _count(users, all_flag),
-                "all_users": all_flag,
+                "count": status_count,
+                "all_users": status_all,
             }
-        any_count = _count(any_users[cls], any_all_users[cls])
+        any_count, any_covers_domain = _resolve_population(
+            any_users[cls], any_all_users[cls]
+        )
         accounts, accounts_truncated = _serialize_affected_accounts(any_users[cls])
+        unaffected, unaffected_truncated = _serialize_affected_accounts(
+            population - any_users[cls]
+        )
         per_status["any"] = {
             "count": any_count,
-            "all_users": any_all_users[cls],
-            "pct_of_domain": _pct(any_count, any_all_users[cls]),
+            "all_users": any_covers_domain,
+            "pct_of_domain": _pct(any_count),
             # Drill-down foundation (web /assets resolution + PDF appendix). The
             # explicit list of affected accounts (deduped sAMAccountNames) and a
             # Tier 0/1/2 breakdown of who can reach this terminal. The breakdown
@@ -979,17 +1232,38 @@ def compute_exposure_kpis(
             "affected_accounts_detail": _serialize_affected_accounts_detail(
                 accounts, any_tier_map[cls]
             ),
+            # The complement: enabled accounts that hold NO path of this class.
+            # Named because a negative fact stated well is a positive result —
+            # the same reasoning as reporting an avenue the client's own
+            # configuration closed. It is also what demonstrates the figure can
+            # read something other than "everyone", which is the objection a
+            # blast-radius percentage has to survive. Empty when the caller did
+            # not supply the population.
+            "unaffected_accounts": unaffected,
+            "unaffected_accounts_truncated": unaffected_truncated,
         }
         per_status["distinct_paths"] = distinct_paths[cls]
         user_axis[cls] = per_status
 
-    return {
+    block: dict[str, Any] = {
         "schema_version": 1,
         "computed_at": computed_at or "",
         "domain_user_count": user_total,
         "path_axis": path_axis,
         "user_axis": user_axis,
     }
+    if excluded:
+        # Why the denominator reads as it does. A reader who counts the accounts
+        # in the appendix and lands one short is owed the reason, and the reason
+        # is a positive one: this account's password is machine-managed, so it is
+        # not exposed by anything this figure measures.
+        block["excluded_service_accounts"] = sorted(excluded)
+    if isinstance(population_tier_breakdown, Mapping):
+        block["population_tier_breakdown"] = {
+            bucket: max(0, int(population_tier_breakdown.get(bucket, 0) or 0))
+            for bucket in ("tier0", "tier0_direct", "tier1", "tier2")
+        }
+    return block
 
 
 #: How many top contributing paths to surface for explainability.

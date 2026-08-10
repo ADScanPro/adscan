@@ -1088,7 +1088,12 @@ def print_attack_paths_summary(
     table.add_column("Target", style="white", no_wrap=False, width=10)
     table.add_column("Type", style="white", no_wrap=False, width=18)
     table.add_column("State", style="white", no_wrap=False, width=10)
-    table.add_column("Exec", style="white", no_wrap=False, width=10)
+    # "Cred" not "Exec": this column reports whether a usable CREDENTIAL was
+    # resolved for the path's steps — nothing more. Header-level actionability
+    # also depends on the path's status and execution support, so a row can
+    # legitimately read "Ready" while the panel reports "Actionable: 0/N". Under
+    # the old "Exec" header those two read as a contradiction.
+    table.add_column("Cred", style="white", no_wrap=False, width=10)
     table.add_column("Status", style="magenta", no_wrap=False, width=10)
     table.add_column("Len", justify="right", width=4)
     format_node_label, _, format_relation_display, _ = (

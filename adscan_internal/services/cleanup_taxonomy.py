@@ -55,6 +55,7 @@ MANUAL_REASON_SESSION_DIED = "session_died"
 MANUAL_REASON_MISSING_CREDENTIAL = "missing_credential"
 MANUAL_REASON_MISSING_METADATA = "missing_metadata"
 MANUAL_REASON_ACCESS_DENIED = "access_denied"
+MANUAL_REASON_OPERATOR_DECLINED = "operator_declined"
 
 _MANUAL_REASON_LABELS: dict[str, str] = {
     MANUAL_REASON_REVERT_FAILED: "Automatic rollback failed after retries",
@@ -63,6 +64,7 @@ _MANUAL_REASON_LABELS: dict[str, str] = {
     MANUAL_REASON_MISSING_CREDENTIAL: "No usable rollback credential was available",
     MANUAL_REASON_MISSING_METADATA: "Original-state metadata was unavailable",
     MANUAL_REASON_ACCESS_DENIED: "Rollback was denied by the directory",
+    MANUAL_REASON_OPERATOR_DECLINED: "Operator chose to keep the object instead of reverting it",
 }
 
 
@@ -562,6 +564,7 @@ __all__ = [
     "MANUAL_REASON_MISSING_CREDENTIAL",
     "MANUAL_REASON_MISSING_METADATA",
     "MANUAL_REASON_ACCESS_DENIED",
+    "MANUAL_REASON_OPERATOR_DECLINED",
     "manual_reason_label",
     "cleanup_bucket",
     "status_label",

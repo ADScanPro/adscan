@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "11.0.0"
+version = "11.1.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -103,6 +103,12 @@ cli = [
     "pypykatz>=0.6.10",
     "psutil",
     "python-docx",
+    # PDF table extraction for the document credential table-reconstruction layer
+    # (services/document_table_credentials.py). MIT-licensed; deliberately NOT
+    # pymupdf/fitz, which is AGPL and license-incompatible with our commercial
+    # source-available license. openpyxl (XLSX) and python-docx (DOCX) cover the
+    # other two formats and are already present.
+    "pdfplumber>=0.11,<0.12",
     "playwright==1.60.0",
     "jinja2>=3.0",
     "graphviz>=0.20",

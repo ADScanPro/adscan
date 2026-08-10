@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import yaml
 
@@ -808,7 +809,180 @@ class CredSweeperService(BaseService):
                 f"label={label} path={path_to_scan} duration_seconds={time.perf_counter() - started_at:.2f} "
                 f"accumulated_results={self._count_total_grouped_findings(findings)}"
             )
+
+        # Global table-aware augmentation. CredSweeper flattens document tables
+        # so a secret cell is scanned in isolation from its label cell and its
+        # line-based rules never fire. For every PDF/XLSX/DOCX reached here we
+        # ALSO reconstruct each table row as "key: value" text and scan that,
+        # merging the extra findings. Because every ADscan CredSweeper entry
+        # point (analyze_file, analyze_path, analyze_*_with_options) converges on
+        # this method, all origins (shares/CIFS, WinRM loot, MSSQL loot,
+        # spidering) inherit table-aware extraction here.
+        table_findings = self._augment_with_table_extraction(
+            path_to_scan=path_to_scan,
+            drop_ml_none=drop_ml_none,
+            no_filters=no_filters,
+            find_by_ext=find_by_ext,
+            jobs=jobs,
+        )
+        if table_findings:
+            findings = self._merge_grouped_findings(findings, table_findings)
         return findings
+
+    def _augment_with_table_extraction(
+        self,
+        *,
+        path_to_scan: str,
+        drop_ml_none: bool | None,
+        no_filters: bool,
+        find_by_ext: bool,
+        jobs: int | None,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Reconstruct document tables under a path and scan them for credentials.
+
+        Walks ``path_to_scan`` for PDF/XLSX/DOCX files (or handles it directly
+        when it is a single document), reconstructs each table into ``key: value``
+        text, and scans that text through the ``filesystem_text`` rulesets. The
+        reconstructed lines are plain text, so they need the TEXT ruleset (code +
+        narrative-doc rules) rather than whatever profile the caller used for the
+        original document (a document-only profile evaluates none of its rules
+        against plain text). The custom ruleset runs at ``0.0`` so weak-but-real
+        secrets are not ML-gated out. Findings are remapped to the original
+        document path. Best-effort: any failure is swallowed so the base scan
+        result is never degraded.
+        """
+        from adscan_internal.services.document_table_credentials import (
+            is_table_reconstruction_candidate,
+            reconstruct_document_table_text,
+        )
+
+        # The reconstructed text is plain text: always scan it with the text
+        # rulesets, independent of the caller's document-mode profile.
+        primary_rules, custom_rules = get_credsweeper_rules_paths(
+            profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT
+        )
+        rulesets: list[tuple[str, str, str]] = []
+        if primary_rules:
+            rulesets.append(("primary", primary_rules, "0.1"))
+        if custom_rules:
+            rulesets.append(("custom", custom_rules, "0.0"))
+        if not rulesets:
+            return {}
+
+        candidate_files: list[str] = []
+        try:
+            if os.path.isdir(path_to_scan):
+                for dirpath, _dirnames, filenames in os.walk(path_to_scan):
+                    for filename in filenames:
+                        candidate = os.path.join(dirpath, filename)
+                        if is_table_reconstruction_candidate(candidate):
+                            candidate_files.append(candidate)
+            elif is_table_reconstruction_candidate(path_to_scan):
+                candidate_files.append(path_to_scan)
+        except OSError:
+            return {}
+
+        if not candidate_files:
+            return {}
+
+        aggregate: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        for document_path in candidate_files:
+            try:
+                reconstructed_text = reconstruct_document_table_text(document_path)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_warning_debug(
+                    f"[credsweeper] Table reconstruction failed for {document_path}: {type(exc).__name__}"
+                )
+                continue
+            if not reconstructed_text:
+                continue
+            document_findings = self._scan_reconstructed_table_text(
+                reconstructed_text=reconstructed_text,
+                original_path=document_path,
+                rulesets=rulesets,
+                drop_ml_none=drop_ml_none,
+                no_filters=no_filters,
+                find_by_ext=find_by_ext,
+                jobs=jobs,
+            )
+            if document_findings:
+                aggregate = self._merge_grouped_findings(aggregate, document_findings)
+        if aggregate:
+            print_info_debug(
+                "[credsweeper] Document table augmentation summary: "
+                f"path={path_to_scan} table_documents={len(candidate_files)} "
+                f"grouped_rules={len(aggregate)} total_findings={self._count_total_grouped_findings(aggregate)}"
+            )
+        return aggregate
+
+    def _scan_reconstructed_table_text(
+        self,
+        *,
+        reconstructed_text: str,
+        original_path: str,
+        rulesets: list[tuple[str, str, str]],
+        drop_ml_none: bool | None,
+        no_filters: bool,
+        find_by_ext: bool,
+        jobs: int | None,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Scan reconstructed ``key: value`` text through the given rulesets.
+
+        The reconstructed lines are written to a temporary ``.txt`` sidecar and
+        scanned as plain text (``doc=False``), so both the primary ruleset (at
+        its threshold) and the custom ruleset (at ``0.0``) fire on them. A ``.txt``
+        is not a table candidate, so this cannot recurse into augmentation.
+        """
+        temp_root: str | None = None
+        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        try:
+            temp_root = tempfile.mkdtemp(prefix=".adscan_doc_tables_")
+            sidecar_name = f"{Path(original_path).stem or 'document'}.tables.txt"
+            sidecar_path = os.path.join(temp_root, sidecar_name)
+            with open(sidecar_path, "w", encoding="utf-8") as handle:
+                handle.write(reconstructed_text)
+
+            for label, selected_rules, effective_ml_threshold in rulesets:
+                try:
+                    ruleset_findings = self._run_library_ruleset(
+                        path_to_scan=sidecar_path,
+                        rules_path=selected_rules,
+                        drop_ml_none=resolve_credsweeper_drop_ml_none_for_ruleset(
+                            ruleset_label=label,
+                            drop_ml_none=drop_ml_none,
+                        ),
+                        ml_threshold=effective_ml_threshold,
+                        doc=False,
+                        depth=False,
+                        no_filters=no_filters,
+                        find_by_ext=find_by_ext,
+                        jobs=jobs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+                    print_warning_debug(
+                        f"[credsweeper] Table text scan failed ({label}) for {original_path}: "
+                        f"{type(exc).__name__}"
+                    )
+                    continue
+                findings = self._merge_grouped_findings(findings, ruleset_findings)
+            return self._remap_grouped_finding_paths(
+                findings,
+                {str(sidecar_path): str(original_path)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_warning_debug(
+                f"[credsweeper] Table text scan setup failed for {original_path}: {type(exc).__name__}"
+            )
+            return findings
+        finally:
+            if temp_root:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
     @staticmethod
     def _needs_xml_sanitized_analysis(file_path: str) -> bool:

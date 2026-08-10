@@ -80,7 +80,11 @@ def ask_for_enum_domain_auth(self, domain: str) -> None:
         self.do_enum_domain_auth(domain)
     else:
         pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
-        username = self.domains_data.get(domain, {}).get("username", "N/A")
+        from adscan_internal.cli.common import (
+            resolve_effective_username_for_domain,
+        )
+
+        username = resolve_effective_username_for_domain(self, domain)
 
         if confirm_operation(
             operation_name="Authenticated Domain Enumeration",
@@ -105,7 +109,11 @@ def ask_for_enum_configs(self, domain: str) -> None:
         do_enum_configs(self, domain)
     else:
         pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
-        username = self.domains_data.get(domain, {}).get("username", "N/A")
+        from adscan_internal.cli.common import (
+            resolve_effective_username_for_domain,
+        )
+
+        username = resolve_effective_username_for_domain(self, domain)
         if confirm_operation(
             operation_name="Configuration Enumeration",
             description=(
@@ -128,7 +136,9 @@ def ask_for_enum_configs(self, domain: str) -> None:
 def do_enum_configs(self, domain: str) -> None:
     """Performs configuration enumeration for the domain."""
 
-    username = self.domains_data.get(domain, {}).get("username", "N/A")
+    from adscan_internal.cli.common import resolve_effective_username_for_domain
+
+    username = resolve_effective_username_for_domain(self, domain)
     pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
 
     # --- Premium session header ---
@@ -711,8 +721,15 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
         if run_all_hosts:
             self.do_enum_cve_all(target_domain)
     else:
+        from adscan_internal.cli.common import (
+            resolve_effective_username_for_domain,
+        )
+
         pdc = self.domains_data.get(target_domain, {}).get("pdc", "N/A")
-        username = self.domains_data.get(target_domain, {}).get("username", "N/A")
+        # SSOT: a trusted domain reached over a cross-realm referral IS credentialed
+        # (the auth domain's user), so the CVE scope + panel reflect that rather than
+        # falling to an anonymous "N/A".
+        username = resolve_effective_username_for_domain(self, target_domain)
         cves_to_check = _cve_scope_summary(has_credentials=username != "N/A")
 
         if confirm_operation(

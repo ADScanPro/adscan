@@ -76,6 +76,35 @@ def _is_expected_ca_security_denial(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _CA_ACCESS_DENIED_MARKERS)
 
 
+# LDAP ``noSuchObject`` (result code 32) / its Windows twin
+# ``ERROR_DS_OBJ_NOT_FOUND`` (0x80072030). A PKI container search that hits this
+# means the domain simply has NO Public Key Services — the EXPECTED answer for
+# essos, north, and most client domains that are not the PKI forest root — not
+# an error. Quieting it stops ~6 spurious red ``✗ Error: noSuchObject`` lines and
+# ~6 PostHog error-tracking events per ADCS-less domain.
+_ADCS_ABSENT_MARKERS = (
+    "nosuchobject",
+    "error_ds_obj_not_found",
+    "0x80072030",
+)
+
+
+def _is_adcs_container_absent(exc: BaseException) -> bool:
+    """Return whether an ADCS container search failed because there is no PKI.
+
+    Prefers badldap's structured ``resultname`` (``noSuchObject``) when the
+    exception carries it, and falls back to a substring match on the message so
+    a wrapped / re-raised error is still recognised. Any OTHER cause (a real
+    bind error, a timeout, an ``SMBConnectionError``, a permission denial) is
+    NOT matched and keeps the full error-handling path.
+    """
+    resultname = str(getattr(exc, "resultname", "") or "").strip().lower()
+    if resultname == "nosuchobject":
+        return True
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in _ADCS_ABSENT_MARKERS)
+
+
 def _register_ca_identity(ca_name: str, ca_host: str) -> None:
     """Register a CA's names with the telemetry sanitizer as soon as they resolve.
 
@@ -390,6 +419,7 @@ class ADCSCollector:
         acl_parser: ACLParser | None = None,
         smb_config_builder: SMBConfigBuilder | None = None,
         dc_binding_probe: DCBindingProbe | None = None,
+        shell: Any = None,
     ) -> None:
         self._connection = connection
         self._domain = domain
@@ -398,6 +428,19 @@ class ADCSCollector:
         # preserve the no-false-positive contract.
         self._smb_config_builder = smb_config_builder
         self._dc_binding_probe = dc_binding_probe
+        # The pentest shell, when available (the CLI/web scan path). Carries
+        # ``domains_data`` + the workspace inventory the reachable-IP SSOT reads
+        # to recover a CA host's IP when the DC's DNS cannot resolve its FQDN.
+        # ``None`` (lab scripts / direct-unit-test construction) keeps CA-host
+        # connections targeting the FQDN — byte-for-byte the pre-fix behaviour.
+        self._shell = shell
+        # Set once a PKI-container search returns ``noSuchObject`` so the whole
+        # domain reports "no ADCS" as a single quiet line, not per-container.
+        self._adcs_absent = False
+
+    def _note_adcs_absent(self) -> None:
+        """Record that a PKI container was absent (no ADCS in this domain)."""
+        self._adcs_absent = True
 
     def collect(self) -> CollectionResult:
         """Run all five enumerations and return a populated ``CollectionResult``."""
@@ -476,6 +519,13 @@ class ADCSCollector:
 
         self._detect_escalations(result, oid_links=oid_links)
 
+        # One quiet line for a domain with no PKI, instead of ~6 red errors.
+        if self._adcs_absent and not result.nodes:
+            print_info_verbose(
+                "No Active Directory Certificate Services in "
+                f"{mark_sensitive(self._domain, 'domain')} — skipping ADCS checks."
+            )
+
         print_info_debug(
             "[adcs-collector] done "
             f"domain={mark_sensitive(self._domain, 'domain')} "
@@ -504,6 +554,16 @@ class ADCSCollector:
             )
             entries = list(self._connection.entries)
         except Exception as exc:
+            if _is_adcs_container_absent(exc):
+                # No Public Key Services container in this domain — the EXPECTED
+                # answer for a domain without ADCS, NOT an error. Quiet: no red
+                # error line, no PostHog event. One summary line per domain.
+                self._note_adcs_absent()
+                print_info_debug(
+                    f"[adcs-collector] {label} container absent at {search_base} "
+                    "(no ADCS in this domain)"
+                )
+                return
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(
@@ -561,6 +621,15 @@ class ADCSCollector:
             )
             entries = list(self._connection.entries)
         except Exception as exc:
+            if _is_adcs_container_absent(exc):
+                # No OID container — same "no ADCS in this domain" signal.
+                # ESC13 presence is genuinely resolved (absent), not a data gap.
+                self._note_adcs_absent()
+                print_info_debug(
+                    f"[adcs-collector] OID container absent at {oid_base} "
+                    "(no ADCS in this domain)"
+                )
+                return _OidToGroupLinks(links={}, resolved=True)
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(
@@ -779,6 +848,16 @@ class ADCSCollector:
                 if probe is not None and probe.web is not None
                 else False
             )
+            # ESC8 data gap (Exposure-Validation doctrine): the CA host could
+            # not be resolved / reached, so ESC8 is UNKNOWN — surface it as a
+            # data gap, never let a DNS failure read as "web enrollment absent".
+            if probe is not None and probe.web is not None and probe.web.could_not_verify:
+                print_info_debug(
+                    "[adcs-collector] ESC8 could not be verified for CA "
+                    f"{mark_sensitive(ca.name or ca.object_id, 'hostname')}: "
+                    "CA host name could not be resolved or reached (data gap) — "
+                    "web enrollment status is UNKNOWN, not disabled"
+                )
             # Safe default: when registry probe failed or was unavailable,
             # treat enforce_encrypt as True so ESC11 is NOT emitted.
             # ESC11 requires CONFIRMED absence of encryption enforcement — if
@@ -1001,6 +1080,48 @@ class ADCSCollector:
             str(domain),
         )
 
+    def _resolve_ca_connect_and_spn(self, ca_host: str) -> tuple[str, str]:
+        """Split a CA FQDN into ``(connect_ip, spn_fqdn)`` via the reachable-IP SSOT.
+
+        On a hardened / container engagement the DC's DNS routinely cannot
+        resolve a member CA host's FQDN (``A lookup ... resolution lifetime
+        expired``), so a transport handed the raw FQDN dead-ends with an
+        ``SMBConnectionError`` even though ADscan reached the DC fine on its IP
+        and the workspace inventory already holds the CA host's IP. This routes
+        the connect target through ``resolve_connect_and_spn`` — the reachable
+        IP for the CONNECT, the FQDN kept as the Kerberos SPN (an IP handed to
+        Kerberos as the SPN would fail auth; the two must stay separate).
+
+        Best-effort by contract: with no ``shell`` (lab / direct-unit-test
+        construction), an already-IP host, or any resolution failure, it returns
+        ``(ca_host, ca_host)`` unchanged, so a working environment never
+        regresses to a worse address.
+        """
+        from adscan_internal.services._kerberos_spn import is_ip_address
+
+        if self._shell is None or not ca_host or is_ip_address(ca_host):
+            return ca_host, ca_host
+
+        config = getattr(self._connection, "config", None)
+        dc_ip = getattr(config, "dc_ip", None) if config else None
+        try:
+            from adscan_internal.services.host_address_resolver import (
+                resolve_connect_and_spn,
+            )
+
+            connect_ip, spn_fqdn = resolve_connect_and_spn(
+                self._shell,
+                host=ca_host,
+                domain=self._domain,
+                resolver_ip=str(dc_ip) if dc_ip else None,
+                spn_hostname=ca_host,
+            )
+            return str(connect_ip), str(spn_fqdn)
+        except Exception as exc:  # noqa: BLE001 — best-effort; keep the FQDN
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            return ca_host, ca_host
+
     async def _fetch_ca_security_edges(
         self, ca: CollectorNode
     ) -> list[CollectorEdge]:
@@ -1074,9 +1195,22 @@ class ADCSCollector:
         posture_snapshot = getattr(config, "posture_snapshot", None) if config else None
         dc_ip = getattr(config, "dc_ip", None) if config else None
 
+        # Recover the CA host's reachable IP so a DC-DNS gap on the member CA's
+        # FQDN does not dead-end the DCOM connect. IP for the CONNECT, FQDN kept
+        # as the Kerberos SPN (``target_hostname``). Run off-loop: the resolver's
+        # live NIC-probe drives its own event loop, which cannot run inside this
+        # coroutine's loop. Best-effort — falls back to the FQDN unchanged.
+        connect_ip, spn_fqdn = ca_host, ca_host
+        if self._shell is not None:
+            from adscan_internal.services.async_bridge import run_sync_off_loop
+
+            connect_ip, spn_fqdn = run_sync_off_loop(
+                self._resolve_ca_connect_and_spn, ca_host
+            )
+
         smb_config = SMBConfig(
-            target_ip=ca_host,
-            target_hostname=ca_host,
+            target_ip=connect_ip,
+            target_hostname=spn_fqdn,
             domain=str(domain),
             auth_domain=str(domain),
             username=str(username),
@@ -1096,6 +1230,8 @@ class ADCSCollector:
         print_info_debug(
             f"adcs GetCASecurity read attempted ca_host="
             f"{mark_sensitive(ca_host, 'hostname')} "
+            f"connect_ip={mark_sensitive(connect_ip, 'ip')} "
+            f"spn={mark_sensitive(spn_fqdn, 'hostname')} "
             f"ca_name={mark_sensitive(ca_name, 'hostname')} source={source}"
         )
 
@@ -1164,11 +1300,28 @@ class ADCSCollector:
             registry_result: CARegistryProbeResult | None = None
             web_result: WebEnrollmentProbeResult | None = None
 
-            # Web probe — host-only, no credentials needed.
+            # Web probe — host-only, no credentials needed. Recover the CA
+            # host's reachable IP so a DC-DNS gap on its FQDN does not read as
+            # "no web enrollment" (the ESC8 false negative). Connect on the IP,
+            # keep the FQDN for the TLS SNI / Host header / EPA SPN. Best-effort:
+            # falls back to the FQDN when there is no shell or resolution fails.
             if ca_host:
+                connect_host: str | None = None
+                if self._shell is not None:
+                    from adscan_internal.services.async_bridge import (
+                        run_sync_off_loop,
+                    )
+
+                    _ip, _spn = run_sync_off_loop(
+                        self._resolve_ca_connect_and_spn, ca_host
+                    )
+                    if _ip and _ip != ca_host:
+                        connect_host = _ip
                 try:
                     web_result = await web_probe.probe(
-                        host=ca_host, credential=web_credential
+                        host=ca_host,
+                        connect_host=connect_host,
+                        credential=web_credential,
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)

@@ -34,6 +34,14 @@ def activate_workspace(shell: Any, *, workspaces_dir: str, workspace_name: str) 
 
     shell.acl_cleanup_actions: list[dict] = []
 
+    # Deferred MSSQL SYSTEM-escalation admin-account reverts (mirrors
+    # acl_cleanup_actions). A follow-up that mints an ephemeral privileged
+    # account to prove SYSTEM registers the revert HERE instead of running it
+    # inline, so the account stays alive through every later scan phase that
+    # may still authenticate as it (attack-path materialization, privilege
+    # sweeps) — see services/mssql_system_dc_extraction.py.
+    shell.mssql_cleanup_actions: list[dict] = []
+
     return paths.root
 
 

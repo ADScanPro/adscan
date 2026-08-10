@@ -24,10 +24,13 @@ from typing import Any
 
 from adscan_internal.services import attack_path_progress
 from adscan_internal.services.domain_controller_classifier import (
+    RID_DOMAIN_CONTROLLERS,
     RODC_TARGET_PRIORITY_RANK,
+    _node_properties,
     classify_computer_node_role,
     node_is_rodc_computer,
 )
+from adscan_internal.models.domain import resolve_domain_controllers
 from adscan_internal.services.adcs_target_filter import is_adcs_tier_zero_group
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
@@ -1148,7 +1151,11 @@ def compute_display_paths_for_domain_unfiltered(
             if _path_target_is_high_value(graph, path.target_id, mode=mode):
                 continue
 
-        record = path_to_display_record(graph, candidate)
+        # Build the LIGHT record here — the DFS emits thousands of candidates and
+        # minimisation keeps ~2%; the expensive per-step decoration is deferred to
+        # the survivors via ``decorate_display_records`` at the end of the
+        # post-processing pipeline. See ``path_to_display_record``.
+        record = path_to_display_record(graph, candidate, decorate=False)
         nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
         target_node = (
             nodes_map.get(str(candidate.target_id or ""))
@@ -1896,7 +1903,11 @@ def compute_display_paths_for_start_node(
             if _path_target_is_high_value(graph, path.target_id, mode=mode):
                 continue
 
-        record = path_to_display_record(graph, candidate)
+        # Build the LIGHT record here — the DFS emits thousands of candidates and
+        # minimisation keeps ~2%; the expensive per-step decoration is deferred to
+        # the survivors via ``decorate_display_records`` at the end of the
+        # post-processing pipeline. See ``path_to_display_record``.
+        record = path_to_display_record(graph, candidate, decorate=False)
         nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
         target_node = (
             nodes_map.get(str(candidate.target_id or ""))
@@ -2118,6 +2129,508 @@ def _build_implicit_dumplsa_overlay(
     return overlay
 
 
+def _node_host_identifiers(node: dict[str, Any]) -> list[str]:
+    """Return every host identifier a Computer node carries (for DC matching).
+
+    Collects the node label, ``name``, ``samaccountname``, ``dnshostname`` and
+    (best-effort) any IP field the collector may have populated. Used to test a
+    Computer node against a known DC inventory record with the alias-aware
+    :func:`resolve_domain_controllers` matcher.
+    """
+    props = _node_properties(node)
+    candidates = [
+        node.get("label"),
+        node.get("name"),
+        props.get("name"),
+        props.get("samaccountname"),
+        props.get("dnshostname"),
+        props.get("ip"),
+        props.get("ipaddress"),
+    ]
+    seen: set[str] = set()
+    idents: list[str] = []
+    for raw in candidates:
+        token = str(raw or "").strip()
+        if token and token.lower() not in seen:
+            seen.add(token.lower())
+            idents.append(token)
+    return idents
+
+
+def _synthetic_trusted_domain_node_id(domain_name: str) -> str:
+    """Return the node id for a synthesized trusted-domain Domain object.
+
+    Keyed on the uppercase domain FQDN (no real SID is available for a
+    trust-partner domain discovered only through a pivot), matching the graph's
+    ``name:<KEY>`` node-id convention.
+    """
+    return f"name:{str(domain_name or '').strip().upper()}"
+
+
+def enrich_foreign_dc_nodes_from_inventory(
+    graph: dict[str, Any],
+    domains_data: Mapping[str, Any] | None,
+) -> bool:
+    """Back-fill the writable-DC role marker on foreign DC nodes from inventory.
+
+    A Computer node discovered only through a pivot (e.g. a cross-forest MSSQL
+    linked-server target such as ``dc02.darkzero.ext``) never went through the
+    trusted domain's own LDAP enumeration, so it carries no ``primaryGroupID`` /
+    ``userAccountControl`` — :func:`classify_computer_node_role` returns ``None``
+    and every DC-role consumer (notably the F6 direct-DCSync overlay) skips it.
+
+    Trust enumeration DID persist that DC into ``domains_data[<trusted>]`` (its
+    ``dc_ip`` / ``pdc`` / ``pdc_hostname_fqdn`` / ``dcs``). This function reads
+    that inventory across ALL ``domains_data`` entries — including trusts — via
+    the alias-aware SSOT :func:`resolve_domain_controllers`, and when a Computer
+    node matches a known DC (by IP / short / FQDN), stamps ``primaryGroupID=516``
+    (``RID_DOMAIN_CONTROLLERS``) on the node's properties. That makes the node
+    classify as ``writable_dc`` naturally, so every consumer inherits the verdict
+    — node PROPERTIES stay the source of truth; the marker is only the value the
+    collector could not read.
+
+    For a matched foreign DC whose trusted domain has no Domain-object node in
+    this (source-domain) graph, a synthetic Domain node is added from the
+    trust-enum name so the DCSync overlay has a real terminal to point at. The
+    synthetic node carries the domain SID when one is known, else name-only (no
+    SID is available for a pivot-only trust partner). A DC whose domain cannot be
+    resolved to a real or synthesizable Domain node is left untouched — the F6
+    overlay then SKIPS it rather than mis-pointing the edge at the source domain
+    (a false cross-domain DCSync edge is worse than a missing one).
+
+    In-memory only — never persisted to disk. Idempotent (re-stamping an already
+    marked node is a no-op). Returns True when it changed the graph.
+    """
+    if not isinstance(domains_data, Mapping) or not domains_data:
+        return False
+    nodes_map = graph.get("nodes")
+    if not isinstance(nodes_map, dict) or not nodes_map:
+        return False
+
+    # Build the DC inventory once per domain: domain-key -> (DomainControllers,
+    # domain_sid). ``resolve_domain_controllers`` is the alias-aware SSOT that
+    # folds ``dc_ip`` / ``pdc`` / ``pdc_hostname_fqdn`` / ``dcs`` into deduped
+    # records — never re-derive a DC walk here.
+    inventory: list[tuple[str, Any, str | None]] = []
+    for domain_key, domain_entry in domains_data.items():
+        if not isinstance(domain_entry, Mapping):
+            continue
+        controllers = resolve_domain_controllers(domain_entry)
+        if controllers.count == 0:
+            continue
+        domain_sid = str(domain_entry.get("domain_sid") or "").strip() or None
+        inventory.append((str(domain_key or "").strip(), controllers, domain_sid))
+    if not inventory:
+        return False
+
+    changed = False
+    # Collect the domains whose Domain node must be ensured AFTER the node walk —
+    # synthesizing inside the loop would mutate ``nodes_map`` mid-iteration.
+    domains_to_ensure: list[tuple[str, str | None]] = []
+    for node in list(nodes_map.values()):
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("kind") or "").strip().lower() != "computer":
+            continue
+        # Skip nodes the collector already classified from real props — node
+        # properties remain the source of truth; we only back-fill absences.
+        if classify_computer_node_role(node) is not None:
+            continue
+        identifiers = _node_host_identifiers(node)
+        if not identifiers:
+            continue
+
+        matched_domain_key: str | None = None
+        matched_domain_sid: str | None = None
+        for domain_key, controllers, domain_sid in inventory:
+            if any(
+                controllers._record_for_host(ident) is not None  # noqa: SLF001
+                for ident in identifiers
+            ):
+                matched_domain_key = domain_key
+                matched_domain_sid = domain_sid
+                break
+        if matched_domain_key is None:
+            continue
+
+        # Back-fill the writable-DC marker so classify_computer_node_role -> "writable_dc".
+        props = _node_properties(node)
+        if node.get("properties") is not props:
+            node["properties"] = props
+        props["primaryGroupID"] = RID_DOMAIN_CONTROLLERS
+        changed = True
+
+        # Queue the matched DC's own domain so its Domain-object node is ensured
+        # after the walk. Prefer the domain carried on the node itself
+        # (``properties.domain``), falling back to the domains_data key. Never
+        # point at the source domain when it does not match.
+        node_domain = str(props.get("domain") or matched_domain_key or "").strip()
+        if node_domain:
+            domains_to_ensure.append((node_domain, matched_domain_sid))
+
+    for node_domain, domain_sid in domains_to_ensure:
+        if _ensure_trusted_domain_node(nodes_map, node_domain, domain_sid):
+            changed = True
+
+    return changed
+
+
+#: Relation name of the derived cross-forest TGT-delegation escalation edge.
+#: Classified as ``EdgeKind.ESCALATION`` in ``edge_kind.py`` and catalogued in
+#: ``attack_step_catalog.py`` (``crossorgtgtdelegation``).
+_CROSS_ORG_TGT_DELEGATION_RELATION = "CrossOrgTgtDelegation"
+
+#: Relations that escalate FROM one compromised Domain object INTO another domain
+#: (the cross-domain / cross-forest escalation category). A Domain node is normally
+#: a hard DFS terminal (``is_terminal`` in object mode), but when it carries one of
+#: these OUTBOUND edges the kill chain genuinely continues across the trust boundary
+#: — e.g. ``… → DCSync → DARKZERO.EXT → CrossOrgTgtDelegation → DARKZERO.HTB``. Only
+#: these modeled escalation relations lift the terminal stop; every other outbound
+#: edge from a Domain node (structural TrustedBy, etc.) leaves it terminal, so the
+#: existing single-domain paths are unaffected. Extend this set as new cross-domain
+#: escalation steps land (SID-history abuse, unconstrained-delegation-across-trust,
+#: foreign-group-membership).
+_CROSS_DOMAIN_ESCALATION_RELATIONS: frozenset[str] = frozenset(
+    {_CROSS_ORG_TGT_DELEGATION_RELATION.lower()}
+)
+
+
+def _domain_has_cross_domain_escalation_out(
+    node_id: str,
+    adjacency: Mapping[str, list[dict[str, Any]]],
+    visited: set[str],
+) -> bool:
+    """True when a Domain node can still escalate INTO another domain.
+
+    A compromised Domain object is normally the end of a kill chain (a hard DFS
+    terminal in object mode), but a forest trust that forwards Kerberos TGTs
+    (``CrossOrgTgtDelegation`` and its cross-domain-escalation siblings) lets the
+    chain continue into the trusting forest. So a Domain node stays terminal
+    EXCEPT when it carries such an outbound escalation edge to an as-yet-unvisited
+    node — then the DFS must keep going so
+    ``… → DCSync → EXT → CrossOrgTgtDelegation → HTB`` materializes as one path.
+
+    Reuses the caller's pre-built ``adjacency`` (already excludes non-traversable
+    edges) — no rescan. The ``visited`` guard prevents a trust cycle (A→B→A) from
+    looping the DFS.
+    """
+    for edge in adjacency.get(node_id, ()):
+        if (
+            str(edge.get("relation") or "").strip().lower()
+            not in _CROSS_DOMAIN_ESCALATION_RELATIONS
+        ):
+            continue
+        to_id = str(edge.get("to") or "")
+        if to_id and to_id != node_id and to_id not in visited:
+            return True
+    return False
+
+
+def _find_domain_node_id(
+    nodes_map: Mapping[str, Any],
+    *,
+    label: str | None = None,
+    domain_sid: str | None = None,
+) -> str | None:
+    """Return the id of the Domain-kind node matching ``label`` or ``domain_sid``.
+
+    SID match is authoritative; the label match (uppercase FQDN) is the only way
+    to resolve a trust-partner domain whose node was synthesized name-only (no
+    SID available for a pivot-discovered domain). Returns ``None`` when no Domain
+    node matches — the coupling then conservatively skips (a missing edge is
+    safer than a mis-pointed one).
+    """
+    want_sid = str(domain_sid or "").strip().upper() or None
+    want_label = str(label or "").strip().upper() or None
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict) or not _node_is_domain(node):
+            continue
+        if want_sid is not None and _node_domain_sid(node) == want_sid:
+            return str(node_id)
+        node_label = str(node.get("label") or node.get("name") or "").strip().upper()
+        if want_label is not None and node_label == want_label:
+            return str(node_id)
+    return None
+
+
+def _iter_cross_org_tgt_delegation_trusts(
+    graph: dict[str, Any],
+    domains_data: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Collect trusts carrying CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION.
+
+    Reads from BOTH robust sources and de-duplicates:
+
+    * ``domains_data[<domain>]["trusts"]`` — the durable enum SSOT persisted by
+      the trust enumerator (``_persist_trust_records_to_domains_data``), each
+      record carrying ``source_domain`` / ``target_domain`` / ``trust_attributes``
+      / ``attribute_flags`` / ``partner_sid``.
+    * The graph's own ``TrustedBy`` edges — when the collector persisted one, its
+      ``notes`` carry the same ``trustAttributes`` / ``attributeFlags``.
+
+    Only a **forest-transitive** trust with the delegation attribute qualifies
+    (mirrors the report finding's condition 1), so an external / intra-forest
+    trust never couples. Each returned record is normalized to
+    ``{"source_domain", "target_domain", "partner_sid"}`` where ``source_domain``
+    is the TRUSTING domain (whose TDO carries the attribute) and
+    ``target_domain`` is the TRUSTED (partner) domain that can escalate into it.
+    """
+    from adscan_internal.services.enumeration.trust_query import (  # noqa: PLC0415
+        cross_org_tgt_delegation_enabled,
+    )
+
+    def _flags(record: Mapping[str, Any], *keys: str) -> set[str]:
+        for key in keys:
+            value = record.get(key)
+            if isinstance(value, (list, tuple, set)):
+                return {str(flag).strip().upper() for flag in value}
+        return set()
+
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _consider(
+        *,
+        source_domain: str,
+        target_domain: str,
+        trust_attributes: int | None,
+        flags: set[str],
+        partner_sid: str | None,
+    ) -> None:
+        src = str(source_domain or "").strip().upper()
+        tgt = str(target_domain or "").strip().upper()
+        if not src or not tgt:
+            return
+        has_delegation = "CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION" in flags or (
+            cross_org_tgt_delegation_enabled(trust_attributes)
+        )
+        is_forest_transitive = "FOREST_TRANSITIVE" in flags
+        if not (has_delegation and is_forest_transitive):
+            return
+        key = (src, tgt)
+        if key in seen:
+            return
+        seen.add(key)
+        results.append(
+            {
+                "source_domain": src,
+                "target_domain": tgt,
+                "partner_sid": str(partner_sid or "").strip().upper() or None,
+            }
+        )
+
+    # Source 1 — durable enum SSOT in domains_data.
+    if isinstance(domains_data, Mapping):
+        for domain_entry in domains_data.values():
+            if not isinstance(domain_entry, Mapping):
+                continue
+            trusts = domain_entry.get("trusts")
+            if not isinstance(trusts, (list, tuple)):
+                continue
+            for record in trusts:
+                if not isinstance(record, Mapping):
+                    continue
+                raw_attrs = record.get("trust_attributes")
+                try:
+                    attrs_int = int(raw_attrs) if raw_attrs is not None else None
+                except (TypeError, ValueError):
+                    attrs_int = None
+                _consider(
+                    source_domain=str(record.get("source_domain") or ""),
+                    target_domain=str(record.get("target_domain") or ""),
+                    trust_attributes=attrs_int,
+                    flags=_flags(record, "attribute_flags", "attributeFlags"),
+                    partner_sid=str(record.get("partner_sid") or ""),
+                )
+
+    # Source 2 — TrustedBy edges persisted in the graph itself.
+    nodes_map = graph.get("nodes")
+    nodes_map = nodes_map if isinstance(nodes_map, dict) else {}
+
+    def _node_label(node_id: str) -> str:
+        node = nodes_map.get(str(node_id or "").strip())
+        if isinstance(node, dict):
+            return str(node.get("label") or node.get("name") or "").strip()
+        return ""
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip().lower() != "trustedby":
+            continue
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        raw_attrs = notes.get("trustAttributes")
+        try:
+            attrs_int = int(raw_attrs) if raw_attrs is not None else None
+        except (TypeError, ValueError):
+            attrs_int = None
+        # A TrustedBy edge is source=trusting-domain -> target=partner (see
+        # ldap_collector._collect_trusts), matching the domains_data convention.
+        source_label = (
+            str(edge.get("source_name") or "").strip()
+            or _node_label(str(edge.get("from") or edge.get("source") or ""))
+        )
+        target_label = (
+            str(edge.get("target_name") or "").strip()
+            or _node_label(str(edge.get("to") or edge.get("target") or ""))
+        )
+        _consider(
+            source_domain=source_label,
+            target_domain=target_label,
+            trust_attributes=attrs_int,
+            flags=_flags(notes, "attributeFlags", "attribute_flags"),
+            partner_sid=str(notes.get("partnerSid") or ""),
+        )
+
+    return results
+
+
+def couple_cross_org_tgt_delegation_edges(
+    graph: dict[str, Any],
+    domains_data: Mapping[str, Any] | None,
+) -> bool:
+    """Couple a cross-forest TGT-delegation escalation edge onto the graph.
+
+    For every forest trust that carries
+    ``CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION``, add a derived escalation edge
+    ``compromised (trusted) Domain -> trusting Domain`` when BOTH domain objects
+    exist as nodes in the graph. This is the trust-attribute analogue of the F6
+    direct-DCSync overlay: the trusted-forest DCSync anchor already terminates a
+    kill chain at the compromised (trusted) domain node; this edge continues that
+    chain across the trust boundary into the trusting forest, because the trust
+    forwards Kerberos TGTs across the boundary.
+
+    Conservative by construction:
+
+    * Only fires when the attribute is ACTUALLY present on a forest-transitive
+      trust — never speculatively.
+    * Requires BOTH domain nodes to exist; a missing trusting-domain node means
+      the graph has no terminal to point at, so no edge is minted.
+    * The edge is marked ``theoretical`` — ADscan models the exposure from the
+      trust attribute but does not (yet) execute the cross-forest ticket capture.
+
+    In-memory only — never persisted to disk. Idempotent (re-adding an existing
+    edge is a no-op). Returns True when it changed the graph.
+    """
+    nodes_map = graph.get("nodes")
+    if not isinstance(nodes_map, dict) or not nodes_map:
+        return False
+    trusts = _iter_cross_org_tgt_delegation_trusts(graph, domains_data)
+    if not trusts:
+        return False
+
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        edges = []
+        graph["edges"] = edges
+
+    # Index existing CrossOrgTgtDelegation edges to keep the coupling idempotent.
+    existing_pairs: set[tuple[str, str]] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "") != _CROSS_ORG_TGT_DELEGATION_RELATION:
+            continue
+        frm = str(edge.get("from") or edge.get("source") or "").strip()
+        to = str(edge.get("to") or edge.get("target") or "").strip()
+        if frm and to:
+            existing_pairs.add((frm, to))
+
+    changed = False
+    for trust in trusts:
+        # trusting domain (whose TDO carries the attribute) = source_domain.
+        trusting_node_id = _find_domain_node_id(
+            nodes_map, label=trust["source_domain"]
+        )
+        # compromised / trusted (partner) domain = target_domain.
+        compromised_node_id = _find_domain_node_id(
+            nodes_map,
+            label=trust["target_domain"],
+            domain_sid=trust.get("partner_sid"),
+        )
+        if not trusting_node_id or not compromised_node_id:
+            continue
+        if compromised_node_id == trusting_node_id:
+            continue
+        pair = (compromised_node_id, trusting_node_id)
+        if pair in existing_pairs:
+            continue
+        existing_pairs.add(pair)
+        edges.append(
+            {
+                "from": compromised_node_id,
+                "to": trusting_node_id,
+                "relation": _CROSS_ORG_TGT_DELEGATION_RELATION,
+                "kind": "escalation",
+                "status": "discovered",
+                "notes": {
+                    "virtual": True,
+                    "theoretical": True,
+                    "synthesized_from": "cross_org_tgt_delegation_trust",
+                    "trusting_domain": trust["source_domain"],
+                    "compromised_domain": trust["target_domain"],
+                },
+            }
+        )
+        changed = True
+
+    return changed
+
+
+def _ensure_trusted_domain_node(
+    nodes_map: dict[str, Any],
+    domain_name: str,
+    domain_sid: str | None,
+) -> bool:
+    """Add a synthetic Domain-object node for ``domain_name`` when absent.
+
+    Returns True when a node was added. No-op when a Domain node whose label /
+    SID already denotes this domain is present. When a real SID is available the
+    synthetic node uses the SID-keyed id (matching the collector convention);
+    otherwise it is name-keyed (a pivot-only trust partner has no SID).
+    """
+    domain_upper = str(domain_name or "").strip().upper()
+    if not domain_upper:
+        return False
+    normalized_sid = str(domain_sid or "").strip().upper() or None
+
+    # Already present? Match by SID (authoritative) or by label/name.
+    for node in nodes_map.values():
+        if not isinstance(node, dict) or not _node_is_domain(node):
+            continue
+        if normalized_sid is not None and _node_domain_sid(node) == normalized_sid:
+            return False
+        label = str(node.get("label") or node.get("name") or "").strip().upper()
+        if label == domain_upper:
+            return False
+
+    node_id = (
+        f"name:{normalized_sid}"
+        if normalized_sid is not None
+        else _synthetic_trusted_domain_node_id(domain_upper)
+    )
+    if node_id in nodes_map:
+        return False
+
+    synthetic: dict[str, Any] = {
+        "id": node_id,
+        "kind": "Domain",
+        "label": domain_upper,
+        "name": domain_upper,
+        "objectId": normalized_sid,
+        "isTierZero": True,
+        "properties": {
+            "name": domain_upper,
+            "domain": domain_upper,
+            "objectid": normalized_sid,
+            "isTierZero": True,
+            "synthesized_from": "trusted_domain_inventory",
+        },
+    }
+    nodes_map[node_id] = synthetic
+    return True
+
+
 def _build_implicit_dc_dcsync_overlay(
     graph: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -2159,6 +2672,7 @@ def _build_implicit_dc_dcsync_overlay(
     # multi-domain / forest graph, pointing every DC at a single first-found
     # domain node would mint a false ``DC-A -> DCSync -> DOMAIN-B`` edge.
     domain_node_by_sid: dict[str, str] = {}
+    domain_node_by_label: dict[str, str] = {}
     domain_node_ids: list[str] = []
     for node_id, node in nodes_map.items():
         if not isinstance(node, dict) or not _node_is_domain(node):
@@ -2168,6 +2682,12 @@ def _build_implicit_dc_dcsync_overlay(
         dom_sid = _node_domain_sid(node)
         if dom_sid and dom_sid not in domain_node_by_sid:
             domain_node_by_sid[dom_sid] = nid
+        # Label index (uppercase FQDN) — the ONLY way to resolve a trust-partner
+        # domain whose Domain node was synthesized name-only (no SID available
+        # for a pivot-discovered DC; see enrich_foreign_dc_nodes_from_inventory).
+        dom_label = str(node.get("label") or node.get("name") or "").strip().upper()
+        if dom_label and dom_label not in domain_node_by_label:
+            domain_node_by_label[dom_label] = nid
     if not domain_node_ids:
         return {}
 
@@ -2201,14 +2721,26 @@ def _build_implicit_dc_dcsync_overlay(
 
         # Per-DC domain resolution (the canonical AD mapping):
         #   (a) the DC's own domain SID resolves to a domain node -> use it;
-        #   (b) else exactly one domain node in the graph -> use it (single-
+        #   (b) else the DC node's own domain LABEL (``properties.domain``)
+        #       resolves to a domain node -> use it. This is the cross-forest
+        #       trusted-domain case: a pivot-discovered DC carries no SID, so
+        #       its inventory-back-filled writable_dc marker + a name-only
+        #       (synthesized) Domain node are linked only by label — NEVER by
+        #       the source domain's SID;
+        #   (c) else exactly one domain node in the graph -> use it (single-
         #       domain workspace, preserves today's behaviour);
-        #   (c) else (multiple domains, no SID match) -> SKIP this DC. A false
-        #       cross-domain DCSync edge is worse than a missing one.
+        #   (d) else (multiple domains, no SID/label match) -> SKIP this DC. A
+        #       false cross-domain DCSync edge is worse than a missing one.
         dc_domain_sid = _node_domain_sid(target_node)
         domain_node_id: str | None = None
         if dc_domain_sid is not None:
             domain_node_id = domain_node_by_sid.get(dc_domain_sid)
+        if domain_node_id is None:
+            dc_domain_label = (
+                str(_node_properties(target_node).get("domain") or "").strip().upper()
+            )
+            if dc_domain_label:
+                domain_node_id = domain_node_by_label.get(dc_domain_label)
         if domain_node_id is None:
             domain_node_id = single_domain_node_id
         if domain_node_id is None:
@@ -3453,10 +3985,19 @@ def compute_maximal_attack_paths(
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
+        # A Domain terminal normally stops the DFS, but a compromised domain that
+        # can escalate cross-forest (CrossOrgTgtDelegation etc.) into an unvisited
+        # domain is NOT the end — keep traversing so the cross-domain step chains
+        # onto the kill chain (… → DCSync → EXT → CrossOrgTgtDelegation → HTB).
+        terminal_here = bool(acc_steps) and is_terminal(current)
+        if terminal_here and _domain_has_cross_domain_escalation_out(
+            current, adjacency, visited
+        ):
+            terminal_here = False
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
-            or (acc_steps and is_terminal(current))
+            or terminal_here
         ):
             emit(acc_steps)
             return
@@ -3700,10 +4241,19 @@ def compute_maximal_attack_paths_from_start(
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
+        # A Domain terminal normally stops the DFS, but a compromised domain that
+        # can escalate cross-forest (CrossOrgTgtDelegation etc.) into an unvisited
+        # domain is NOT the end — keep traversing so the cross-domain step chains
+        # onto the kill chain (… → DCSync → EXT → CrossOrgTgtDelegation → HTB).
+        terminal_here = bool(acc_steps) and is_terminal(current)
+        if terminal_here and _domain_has_cross_domain_escalation_out(
+            current, adjacency, visited
+        ):
+            terminal_here = False
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
-            or (acc_steps and is_terminal(current))
+            or terminal_here
         ):
             emit(acc_steps)
             return
@@ -3840,11 +4390,36 @@ def collect_source_step_signatures_on_high_value_paths(
     return results
 
 
-def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str, Any]:
-    """Convert an AttackPath to the CLI/UI-friendly dict shape."""
+def path_to_display_record(
+    graph: dict[str, Any], path: AttackPath, *, decorate: bool = True
+) -> dict[str, Any]:
+    """Convert an AttackPath to the CLI/UI-friendly dict shape.
+
+    ``decorate`` controls whether the expensive per-step decoration
+    (``remediability`` verdict + ``source_privilege_tier``) is computed now.
+    The DFS emits thousands of raw candidate records of which minimisation keeps
+    ~2%, so decorating every raw record — a remediability classification plus a
+    Privilege-Tier resolution PER STEP — is wasted work on the ~98% that are
+    collapsed/deduped away (measured: ~40s and ~570 MB on a 3k-node domain, 98%
+    discarded). With ``decorate=False`` this builds a *light* record: every field
+    the minimisation stages read (``nodes``/``relations``/``steps`` with its
+    ``action``+``status``+``details`` share identity, ``_exact_signature``,
+    ``length``, ``source``, ``target``, ``status``) is present and byte-identical,
+    but each step OMITS the two expensive fields and instead stamps the private
+    ``_decorate_from_id``/``_decorate_to_id`` node ids so
+    :func:`decorate_display_record` can fill them in on the surviving records
+    ONLY. The minimisation stages slice ``steps`` by contiguous index range and
+    re-derive status from ``action``/``status`` — they never read
+    ``remediability`` or ``source_privilege_tier`` — so the deferred fields cannot
+    change what survives. Decorating the light survivors reproduces the exact
+    record ``decorate=True`` would have produced. The single decorate seam is at
+    the end of ``attack_graph_service._apply_local_postprocessing_pipeline``,
+    after every minimisation/filter/dedup stage across both pipelines.
+    """
     from adscan_internal.services.attack_step_support_registry import (
         classify_relation_support,
     )
+    from adscan_internal.services.compromise_class import privilege_tier_for_node
     from adscan_internal.services.remediability import (
         classify_edge_remediability,
         principal_facts_from_node,
@@ -3992,63 +4567,104 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
 
     steps_for_ui: list[dict[str, Any]] = []
     for idx, step in enumerate(path.steps, start=1):
-        steps_for_ui.append(
-            {
-                "step": idx,
-                "action": step.relation,
-                # A non-executed ``context_only`` hop (MemberOf, credential-reuse
-                # pivot) is a structural FACT — surface it as ``structural`` at the
-                # data SSOT so every consumer (snapshot/PDF/web) agrees, never a
-                # per-render relabel. Proven / blocked / config-close statuses are
-                # preserved unchanged (see ``derive_step_display_status``).
-                "status": derive_step_display_status(step.relation, step.status),
-                "remediability": remediability_of(
-                    step.relation, step.from_id, step.to_id
-                ),
-                "details": {
-                    "from": label(step.from_id),
-                    "to": label(step.to_id),
-                    **(step.notes or {}),
-                },
-            }
-        )
+        # ``details`` always carries ``from``/``to`` labels + the edge ``notes``
+        # (the notes hold the SMB share name that ``_display_relation_identity_values``
+        # folds into ``_exact_signature`` for share-access edges — so dedup /
+        # containment stay byte-identical even in the light build). Only the
+        # expensive ``source_privilege_tier`` and the ``remediability`` verdict are
+        # deferred; ``decorate_display_record`` adds them for surviving records.
+        step_details: dict[str, Any] = {
+            "from": label(step.from_id),
+            "to": label(step.to_id),
+        }
+        step_record: dict[str, Any] = {
+            "step": idx,
+            "action": step.relation,
+            # A non-executed ``context_only`` hop (MemberOf, credential-reuse
+            # pivot) is a structural FACT — surface it as ``structural`` at the
+            # data SSOT so every consumer (snapshot/PDF/web) agrees, never a
+            # per-render relabel. Proven / blocked / config-close statuses are
+            # preserved unchanged (see ``derive_step_display_status``).
+            "status": derive_step_display_status(step.relation, step.status),
+            "details": step_details,
+        }
+        if decorate:
+            step_record["remediability"] = remediability_of(
+                step.relation, step.from_id, step.to_id
+            )
+            # The SOURCE's granted Privilege Tier (axis 1), resolved HERE for the
+            # same reason ``remediability`` is: this is a layer that holds both
+            # the edge and the graph NODES its endpoints resolve to. A downstream
+            # renderer sees only labels, and no label can tell you that MEEREEN$
+            # is a domain controller. Consumed by
+            # ``attack_step_catalog.render_step_remediation`` to suppress
+            # "remove it" advice on a step out of a Tier-0-direct principal
+            # (built-in AD hierarchy, not a misconfiguration). Mirrored in the
+            # sibling ``attack_graph_service.path_to_display_record``.
+            step_details["source_privilege_tier"] = privilege_tier_for_node(
+                nodes_map.get(step.from_id)
+            ).value
+            step_details.update(step.notes or {})
+        else:
+            # Light build: fold the notes now (needed for the share-name signature
+            # and carried by the index-slicing minimisation) but defer the two
+            # expensive fields. Stamp the endpoint node ids privately so the
+            # decorate seam can compute them on the survivors without a graph
+            # re-walk. These private keys are ignored by every signature/slicing
+            # stage and are removed by ``decorate_display_record``.
+            step_details.update(step.notes or {})
+            step_record["_decorate_from_id"] = step.from_id
+            step_record["_decorate_to_id"] = step.to_id
+        steps_for_ui.append(step_record)
     if synthetic_followup is not None:
         synthetic_status = str(synthetic_followup.get("status") or "theoretical")
-        steps_for_ui.append(
-            {
-                "step": len(steps_for_ui) + 1,
-                "action": str(synthetic_followup["relation"]),
-                "status": synthetic_status,
-                # A synthetic follow-up has no target NODE (its target is a
-                # rendered label), so only the source resolves — enough for every
-                # family whose fix does not depend on the target's identity.
-                "remediability": remediability_of(
-                    str(synthetic_followup["relation"]), path.target_id, ""
-                ),
-                "details": {
-                    "from": label(path.target_id),
-                    "to": str(synthetic_followup["to"]),
+        # A synthetic follow-up has no target NODE (its target is a rendered
+        # label), so only the source resolves — ``source_privilege_tier`` and the
+        # ``remediability`` verdict both read the SOURCE node. Build the cheap
+        # details first, in the exact key order the decorated form produces, then
+        # add the two expensive fields (decorate) or defer them (light).
+        followup_details: dict[str, Any] = {
+            "from": label(path.target_id),
+            "to": str(synthetic_followup["to"]),
+        }
+        if decorate:
+            # Same axis-1 stamp as the real steps above, so every step a renderer
+            # receives carries the source tier.
+            followup_details["source_privilege_tier"] = privilege_tier_for_node(
+                nodes_map.get(path.target_id)
+            ).value
+        followup_details["reason"] = str(synthetic_followup.get("reason") or "")
+        followup_details["synthetic_followup"] = True
+        followup_details["followup_source_group"] = label(path.target_id)
+        # A blocked synthetic follow-up (e.g. DNSAdmins abuse) is a safety
+        # abstention — route it through the single classifier so it is stamped
+        # ``dangerous_destructive`` and renders under "Not executed for safety",
+        # never a bare ``dangerous``.
+        if synthetic_status.strip().lower() == "blocked":
+            followup_details.update(
+                _safety_abstention_notes(str(synthetic_followup["relation"]))
+                or {
+                    "blocked_kind": "dangerous",
                     "reason": str(synthetic_followup.get("reason") or ""),
-                    "synthetic_followup": True,
-                    "followup_source_group": label(path.target_id),
-                    # A blocked synthetic follow-up (e.g. DNSAdmins abuse) is a
-                    # safety abstention — route it through the single classifier so
-                    # it is stamped ``dangerous_destructive`` and renders under
-                    # "Not executed for safety", never a bare ``dangerous``.
-                    **(
-                        (
-                            _safety_abstention_notes(str(synthetic_followup["relation"]))
-                            or {
-                                "blocked_kind": "dangerous",
-                                "reason": str(synthetic_followup.get("reason") or ""),
-                            }
-                        )
-                        if synthetic_status.strip().lower() == "blocked"
-                        else {}
-                    ),
-                },
-            }
-        )
+                }
+            )
+        followup_record: dict[str, Any] = {
+            "step": len(steps_for_ui) + 1,
+            "action": str(synthetic_followup["relation"]),
+            "status": synthetic_status,
+            "details": followup_details,
+        }
+        if decorate:
+            followup_record["remediability"] = remediability_of(
+                str(synthetic_followup["relation"]), path.target_id, ""
+            )
+        else:
+            # Defer both expensive fields; stamp the source id (target id is the
+            # empty-string sentinel the decorator passes to ``remediability_of``).
+            followup_record["_decorate_from_id"] = path.target_id
+            followup_record["_decorate_to_id"] = ""
+            followup_record["_decorate_synthetic"] = True
+        steps_for_ui.append(followup_record)
 
     return {
         "nodes": nodes,
@@ -4082,6 +4698,121 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         "status": derived_status,
         "steps": steps_for_ui,
     }
+
+
+def decorate_display_record(
+    graph: dict[str, Any], record: dict[str, Any]
+) -> dict[str, Any]:
+    """Fill in the deferred per-step decoration on a light display record.
+
+    Counterpart to ``path_to_display_record(..., decorate=False)``. For every
+    step still carrying the private ``_decorate_from_id`` marker it computes the
+    two expensive fields — the ``remediability`` verdict and the source
+    ``source_privilege_tier`` — from the stamped endpoint node ids, and rebuilds
+    the step dict so its final shape (top-level key order ``step, action, status,
+    remediability, details``; inner ``details`` order ``from, to,
+    source_privilege_tier, <notes…>``) is byte-identical to what
+    ``decorate=True`` would have produced. Mutates and returns ``record`` in
+    place. Idempotent: a step without the marker (already decorated, or an
+    externally-built step) is left untouched. Only the ~2% of raw records that
+    survive minimisation reach here, which is the whole point — the ~98%
+    collapsed away never pay the decoration cost.
+    """
+    from adscan_internal.services.compromise_class import privilege_tier_for_node
+    from adscan_internal.services.remediability import (
+        classify_edge_remediability,
+        principal_facts_from_node,
+    )
+
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    _facts_cache: dict[str, Any] = {}
+
+    def _facts(node_id: str) -> Any:
+        if node_id not in _facts_cache:
+            _facts_cache[node_id] = principal_facts_from_node(nodes_map.get(node_id))
+        return _facts_cache[node_id]
+
+    def remediability_of(relation: str, from_id: str, to_id: str) -> dict[str, str]:
+        try:
+            return classify_edge_remediability(
+                relation, source=_facts(from_id), target=_facts(to_id)
+            ).as_dict()
+        except Exception:  # pragma: no cover - a verdict is never fatal
+            return {}
+
+    # The sibling-pivot collapse (``collapse_sibling_pivot_paths``) stashes each
+    # sampled sibling's full path SHAPE — including its own ``steps`` — under
+    # ``meta.via_account_paths[<label>]`` so a later re-target executes the ACTUAL
+    # sibling. Those nested steps are light too, so decorate them here (they never
+    # reach the top-level ``steps`` seam otherwise). Same graph, same idempotency.
+    meta = record.get("meta")
+    if isinstance(meta, dict):
+        via_paths = meta.get("via_account_paths")
+        if isinstance(via_paths, dict):
+            for shape in via_paths.values():
+                if isinstance(shape, dict) and isinstance(shape.get("steps"), list):
+                    decorate_display_record(graph, shape)
+
+    steps = record.get("steps")
+    if not isinstance(steps, list):
+        return record
+
+    decorated_steps: list[Any] = []
+    for step in steps:
+        if not isinstance(step, dict) or "_decorate_from_id" not in step:
+            decorated_steps.append(step)
+            continue
+
+        from_id = str(step.get("_decorate_from_id") or "")
+        to_id = str(step.get("_decorate_to_id") or "")
+
+        old_details = step.get("details")
+        old_details = old_details if isinstance(old_details, dict) else {}
+        # Rebuild ``details`` so ``source_privilege_tier`` lands between ``to`` and
+        # the notes — the exact order the eager build produced (``from``, ``to``,
+        # ``source_privilege_tier``, then the folded edge notes). Re-appending the
+        # remaining keys preserves the notes and their order.
+        new_details: dict[str, Any] = {
+            "from": old_details.get("from", ""),
+            "to": old_details.get("to", ""),
+        }
+        new_details["source_privilege_tier"] = privilege_tier_for_node(
+            nodes_map.get(from_id)
+        ).value
+        for key, value in old_details.items():
+            if key in ("from", "to"):
+                continue
+            new_details[key] = value
+
+        # Rebuild the step in canonical top-level key order
+        # (``step, action, status, remediability, details``), dropping the private
+        # ``_decorate_*`` markers.
+        new_step: dict[str, Any] = {
+            "step": step.get("step"),
+            "action": step.get("action"),
+            "status": step.get("status"),
+            "remediability": remediability_of(
+                str(step.get("action") or ""), from_id, to_id
+            ),
+            "details": new_details,
+        }
+        decorated_steps.append(new_step)
+
+    record["steps"] = decorated_steps
+    return record
+
+
+def decorate_display_records(
+    graph: dict[str, Any], records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Decorate a batch of light display records in place (see
+    :func:`decorate_display_record`)."""
+    if not isinstance(records, list):
+        return records
+    for record in records:
+        if isinstance(record, dict):
+            decorate_display_record(graph, record)
+    return records
 
 
 def _find_user_node_id(

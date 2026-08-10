@@ -26,8 +26,12 @@ def _prop_enabled(props: dict[str, Any]) -> bool:
     return bool(v) if v is not None else True
 
 
-def _is_managed_service_account(props: dict[str, Any]) -> bool:
+def is_managed_service_account(props: dict[str, Any]) -> bool:
     """Return True when a node is a (group) managed service account.
+
+    The single source of truth for "is this principal a gMSA/sMSA", consumed by
+    the enabled inventories here and by the account-population resolver behind
+    the account KPIs (``services/account_population.py``).
 
     Detects gMSAs/sMSAs across the two shapes the data can take:
 
@@ -37,6 +41,13 @@ def _is_managed_service_account(props: dict[str, Any]) -> bool:
       graph properties, so the ``is_gmsa`` / DN signals are what fire here.
     * Raw LDAP-shaped props — an ``objectClass`` list still carrying
       ``msDS-GroupManagedServiceAccount`` / ``msDS-ManagedServiceAccount``.
+
+    Four signals rather than one because no single field is present in every
+    artifact: a graph written before ``account_type`` existed still carries the
+    DN, and raw LDAP props carry only ``objectClass``.  The trailing ``$`` on
+    the sAMAccountName is deliberately NOT one of them — every MSA has it, but
+    so does every inter-domain trust account, which is a different class handled
+    by :func:`_is_machine_or_trust_user`.
     """
     if bool(props.get("is_gmsa")):
         return True
@@ -78,14 +89,14 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
     samaccountname = str(props.get("samaccountname") or "").strip()
     if not samaccountname.endswith("$"):
         return False
-    return not _is_managed_service_account(props)
+    return not is_managed_service_account(props)
 
 
 # ---------------------------------------------------------------------------
 # LDAP-query MIRROR of the predicates above — single source of truth.
 #
 # The predicates (_prop_enabled / _is_machine_or_trust_user /
-# _is_managed_service_account) and get_enabled_users/get_enabled_computers define
+# is_managed_service_account) and get_enabled_users/get_enabled_computers define
 # "a real enabled user/computer" for the SCAN, which filters already-collected
 # graph nodes. The `adscan doctor` preflight issues a raw paged LDAP COUNT BEFORE
 # any collection, so it needs the SAME definition expressed as an LDAP filter.
@@ -100,21 +111,21 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
 #                   accounts (sAMAccountType=805306370).  Machine accounts are
 #                   objectClass=computer and never match the user branch.  This
 #                   mirrors _is_machine_or_trust_user, whose `$`-suffix exclusion
-#                   carves OUT gMSAs via `not _is_managed_service_account`.
+#                   carves OUT gMSAs via `not is_managed_service_account`.
 #                   gMSAs are objectClass=msDS-GroupManagedServiceAccount (NOT
 #                   objectCategory=person), so a person-only filter would drop
 #                   them — the explicit MSA branch keeps them.
 #   real computer = objectCategory=computer already excludes gMSAs/sMSAs (those
 #                   are objectCategory=msDS-*ManagedServiceAccount) — mirrors
-#                   _is_managed_service_account for the computer inventory.
+#                   is_managed_service_account for the computer inventory.
 #
-# The MSA objectClass names below are read from _is_managed_service_account so
+# The MSA objectClass names below are read from is_managed_service_account so
 # the two forms cannot drift.
 ENABLED_NOT_DISABLED_LDAP = "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
 # sAMAccountType for an INTERDOMAIN_TRUST_ACCOUNT (0x30000002 = 805306370).
 _SAM_ACCOUNT_TYPE_TRUST = "805306370"
 NOT_TRUST_ACCOUNT_LDAP = f"(!(sAMAccountType={_SAM_ACCOUNT_TYPE_TRUST}))"
-# gMSA/sMSA objectClass tokens, kept in lockstep with _is_managed_service_account.
+# gMSA/sMSA objectClass tokens, kept in lockstep with is_managed_service_account.
 _MSA_OBJECT_CLASSES = ("msDS-GroupManagedServiceAccount", "msDS-ManagedServiceAccount")
 _MSA_OBJECTCLASS_LDAP = "".join(f"(objectClass={oc})" for oc in _MSA_OBJECT_CLASSES)
 # Normal users OR managed service accounts (gMSA/sMSA).
@@ -140,7 +151,7 @@ def get_enabled_computers(graph: dict[str, Any], domain: str) -> list[dict[str, 
     return [
         p
         for p in _nodes_props(graph, "Computer", domain)
-        if _prop_enabled(p) and not _is_managed_service_account(p)
+        if _prop_enabled(p) and not is_managed_service_account(p)
     ]
 
 

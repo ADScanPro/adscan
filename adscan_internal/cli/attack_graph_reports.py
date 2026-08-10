@@ -82,7 +82,12 @@ from adscan_internal.services.attack_graph_service import (
 from adscan_internal.services.attack_step_support_registry import (
     describe_search_mode_label,
 )
-from adscan_internal.workspaces import domain_relpath, domain_subpath, write_json_file
+from adscan_internal.workspaces import (
+    domain_relpath,
+    domain_subpath,
+    resolve_workspace_cwd,
+    write_json_file,
+)
 
 if TYPE_CHECKING:
     from adscan_internal.services.attack_path_progress import (
@@ -1761,11 +1766,7 @@ def persist_bloodhound_membership_snapshot(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
 
-    workspace_cwd = (
-        shell._get_workspace_cwd()
-        if hasattr(shell, "_get_workspace_cwd")
-        else getattr(shell, "current_workspace_dir", os.getcwd())
-    )
+    workspace_cwd = resolve_workspace_cwd(shell)
     output_path = domain_subpath(
         workspace_cwd, shell.domains_dir, target_domain, "memberships.json"
     )

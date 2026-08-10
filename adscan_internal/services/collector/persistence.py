@@ -277,6 +277,59 @@ def _terminal_class_from_privileged_decision(decision: object) -> str:
     return "direct_compromise"
 
 
+def _register_collected_hostnames_for_telemetry(result: CollectionResult) -> None:
+    """Register every collected computer name with the telemetry sanitizer.
+
+    The workspace loader seeds the sanitizer's hostname set from
+    ``enabled_computers.txt`` at workspace-ACTIVATION time. On a fresh
+    ``adscan ci`` that file does not exist yet -- activation happens before
+    collection -- so the set is seeded EMPTY and nothing re-seeds it once
+    collection discovers the estate. An FQDN and an IP still get scrubbed by
+    their structural nets, but a single-label NetBIOS name has no structural
+    signature to anchor on, so the customer's DC short name travelled to the
+    uploaded recording in cleartext beside its own pseudonymized FQDN.
+
+    This is the right seam because every collection path converges here: both
+    the writer of ``enabled_computers.txt`` (``_process_computers_list``) and
+    the Phase-2 port scan, which writes that file directly, run downstream of
+    it. Registering the FQDN alone would not be enough either -- the sanitizer
+    derives the short label from a known domain suffix, and a computer whose
+    DNS name sits outside the collected domains has no suffix to strip -- so the
+    ``sAMAccountName`` is registered as well, stripped of its trailing ``$``.
+
+    Sanitization runs at EXPORT time over the whole buffer, so registering here
+    also masks every occurrence recorded BEFORE collection reached this point.
+
+    Best-effort by construction: telemetry hygiene must never be able to abort
+    a collection run.
+
+    Args:
+        result: The collection result whose Computer nodes should be registered.
+    """
+    try:
+        names: list[str] = []
+        for node in result.nodes.values():
+            if getattr(node, "kind", "") != "Computer":
+                continue
+            fqdn = str(getattr(node, "name", "") or "").strip()
+            if fqdn:
+                names.append(fqdn)
+            sam = str(getattr(node, "samaccountname", "") or "").strip()
+            short = sam.rstrip("$")
+            if short:
+                names.append(short)
+            dns_name = str(
+                (getattr(node, "properties", None) or {}).get("dnshostname") or ""
+            ).strip()
+            if dns_name:
+                names.append(dns_name)
+        if names:
+            telemetry.add_known_hostname(*names)
+    except Exception as exc:  # noqa: BLE001 - never break collection for telemetry
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 class CollectorPersistence:
     """Persist collector output into attack_graph.json and memberships.json."""
 
@@ -288,6 +341,8 @@ class CollectorPersistence:
         result: CollectionResult,
     ) -> dict[str, int]:
         """Persist one CollectionResult and return artifact counters."""
+
+        _register_collected_hostnames_for_telemetry(result)
 
         graph = attack_graph_service.load_attack_graph(shell, domain)
         graph.setdefault("maintenance", {})["native_collector_synced"] = True

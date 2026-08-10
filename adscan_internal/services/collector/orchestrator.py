@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from adscan_internal.services.collector.host_collector import HostPhaseProgress
+    from adscan_internal.services.collector.host_collector import (
+        HostPhaseProgress,
+        HostPhaseTiming,
+    )
     from adscan_internal.services.collector.host_sweep_cancellation import (
         HostSweepCancellation,
     )
@@ -17,6 +20,7 @@ if TYPE_CHECKING:
 from adscan_core import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
+    print_info,
     print_info_debug,
     print_info_verbose,
 )
@@ -164,8 +168,12 @@ class CollectionOrchestrator:
         output_dir: str | None = None,
         progress_callback: Callable[[int], None] | None = None,
         host_progress_callback: "Callable[[HostPhaseProgress], None] | None" = None,
+        host_stage_timing_beacon: (
+            "Callable[[HostPhaseTiming, int, int], None] | None"
+        ) = None,
         host_cancellation: "HostSweepCancellation | None" = None,
         host_cap: int = 0,
+        scale_gate_callback: "Callable[[int], Any] | None" = None,
         shell: Any = None,
     ) -> tuple[CollectionResult, CollectionTiming]:
         """Collect a single domain and return the raw result with per-phase timing.
@@ -220,6 +228,7 @@ class CollectionOrchestrator:
             collection_scope=collection_scope,
             posture_sink=posture_sink,
             posture_snapshot=posture_snapshot,
+            shell=shell,
         )
         timing.adcs = result.adcs_elapsed
         timing.ldap = time.monotonic() - _t - timing.adcs
@@ -321,7 +330,9 @@ class CollectionOrchestrator:
                 collect_samr=collect_smb,
                 collect_shares=collect_shares,
                 host_progress_callback=host_progress_callback,
+                stage_timing_beacon=host_stage_timing_beacon,
                 cancellation=host_cancellation,
+                scale_gate_callback=scale_gate_callback,
             )
             # Honor an explicit cap from the caller (scan config / web). When 0
             # (default) the field keeps its env-overridable default, preserving
@@ -392,12 +403,17 @@ class CollectionOrchestrator:
             except Exception as exc:  # noqa: BLE001 — observability must never abort collection
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
-            # Carry the operator early-stop coverage up to the report/web. Only
-            # populated when the sweep was halted early; otherwise stays empty
-            # (full coverage) so the surfaces read "100% host enrichment".
+            # Carry the host-enrichment coverage up to the report/web. Populated
+            # when the sweep was bounded — an operator early stop (Ctrl+C /
+            # platform), a proactive scale-gate decision (cap or skip before the
+            # sweep), or an env/scan-config host cap applied inside the sweep.
+            # Otherwise stays empty (full coverage) so the surfaces read "100% host
+            # enrichment". The three reasons are mutually reconciled here so the CLI
+            # records ONE coverage statement.
             if host_timing.early_stopped:
                 timing.host_coverage = {
                     "early_stopped": True,
+                    "reason": "early_stop",
                     "hosts_swept": int(host_timing.swept_before_stop),
                     "hosts_total": int(host_timing.total_dispatch),
                     "hosts_remaining": max(
@@ -406,6 +422,32 @@ class CollectionOrchestrator:
                         - int(host_timing.swept_before_stop),
                     ),
                     "source": host_timing.stop_source or "cli",
+                }
+            elif host_timing.scale_gate_reason == "skip":
+                # Operator declined SMB enrichment before the sweep. No hosts
+                # swept of the reachable set; the identity graph is complete.
+                reachable = int(host_timing.scale_gate_reachable)
+                timing.host_coverage = {
+                    "reason": "skip",
+                    "hosts_swept": 0,
+                    "hosts_total": reachable,
+                    "hosts_remaining": reachable,
+                    "source": "cli",
+                }
+            elif host_timing.host_capped or host_timing.scale_gate_reason == "cap":
+                # A cap (scale-gate proactive choice, or env/scan-config cap)
+                # truncated the representative-first reachable set. ``total_dispatch``
+                # is what the sweep enriched; ``capped_skipped`` is the remainder.
+                swept = int(host_timing.total_dispatch)
+                reachable = swept + int(host_timing.capped_skipped)
+                if host_timing.scale_gate_reachable > reachable:
+                    reachable = int(host_timing.scale_gate_reachable)
+                timing.host_coverage = {
+                    "reason": "cap",
+                    "hosts_swept": swept,
+                    "hosts_total": reachable,
+                    "hosts_remaining": max(0, reachable - swept),
+                    "source": "cli",
                 }
 
             # Second-pass audit: findings that need SMB host data (signing,
@@ -517,8 +559,18 @@ class CollectionOrchestrator:
         )
 
         # Skip-set for a reload that hit a prior interrupted sweep (empty on a
-        # fresh run — a non-``running`` record yields no skips).
+        # fresh run — a non-``running`` record yields no skips). Also applies the
+        # ``ADSCAN_COLLECTOR_FRESH`` escape hatch, which discards the cursor so the
+        # sweep re-scans every host (and, having reset the record, suppresses the
+        # resume notice below).
         host_cfg.resumed_host_ids = resumed_done_ids(shell, domain)
+        # A resumed sweep is silent by default: it just skips the already-enriched
+        # hosts. Surface it. The operator who returns to a workspace whose host
+        # enrichment was stopped early or interrupted deserves to know ADscan
+        # remembered their progress and what happens next — the START-of-run mirror
+        # of the END-of-run host-enrichment coverage statement. Advise, then
+        # continue automatically; a re-scan is an explicit opt-out, never a prompt.
+        self._announce_resume(shell=shell, domain=domain)
         scan_type = "audit" if collection_scope == "audit" else "ctf"
         host_cap = int(getattr(host_cfg, "host_cap", 0) or 0)
 
@@ -551,6 +603,45 @@ class CollectionOrchestrator:
         host_cfg.collection_on_sweep_start = _on_sweep_start
         host_cfg.collection_mark_host_done = _mark_host_done
         host_cfg.collection_checkpoint = _checkpoint
+
+    @staticmethod
+    def _announce_resume(*, shell: Any, domain: str) -> None:
+        """Print the calm resume notice when a prior session already enriched hosts.
+
+        No-op unless there is a genuine resume: an empty skip-set (a fresh or
+        finished workspace, or an ``ADSCAN_COLLECTOR_FRESH`` re-scan) yields no
+        counts and no output, so a fresh run is byte-for-byte unchanged. When a
+        prior interrupted session left enriched hosts behind, one calm info panel
+        states the memory and the plan — what was already done, what continues
+        now, and the single explicit action to re-scan everything instead. Advise
+        and continue: never a prompt, identical interactive and non-interactive
+        (in ``adscan ci`` the line lands in the log so a resume is on record).
+        Best-effort: a render glitch never breaks the sweep.
+        """
+        from adscan_internal.services.collection_progress import (
+            COLLECTOR_FRESH_ENV,
+            resume_notice_counts,
+        )
+
+        try:
+            counts = resume_notice_counts(shell, domain)
+            if counts is None:
+                return
+            already_done, total, remaining = counts
+            print_info(
+                f"Resuming host enrichment. A previous session already enriched "
+                f"{already_done:,} of {total:,} hosts; continuing with the "
+                f"{remaining:,} remaining.",
+                panel=True,
+                icon="🔄",
+                items=[
+                    f"To re-scan every host from scratch instead, "
+                    f"start with {COLLECTOR_FRESH_ENV}=1.",
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001 — the notice must never break collection
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     @staticmethod
     def _finalize_collection_progress(
@@ -602,8 +693,12 @@ class CollectionOrchestrator:
         posture_snapshot: Optional["DomainPosture"] = None,
         progress_callback: Callable[[int], None] | None = None,
         host_progress_callback: "Callable[[HostPhaseProgress], None] | None" = None,
+        host_stage_timing_beacon: (
+            "Callable[[HostPhaseTiming, int, int], None] | None"
+        ) = None,
         host_cancellation: "HostSweepCancellation | None" = None,
         host_cap: int = 0,
+        scale_gate_callback: "Callable[[int], Any] | None" = None,
     ) -> tuple[
         dict[str, dict[str, int]],
         dict[str, "CollectionResult"],
@@ -637,8 +732,10 @@ class CollectionOrchestrator:
                 output_dir=self._domain_output_dir(shell, scope.domain),
                 progress_callback=progress_callback,
                 host_progress_callback=host_progress_callback,
+                host_stage_timing_beacon=host_stage_timing_beacon,
                 host_cancellation=host_cancellation,
                 host_cap=host_cap,
+                scale_gate_callback=scale_gate_callback,
                 shell=shell,
             )
             results[scope.domain] = result

@@ -54,7 +54,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, Iterator, Optional, Set
 
-from rich.console import Group, RenderableType
+from rich.console import (
+    Console,
+    ConsoleOptions,
+    Group,
+    RenderableType,
+    RenderResult,
+)
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
@@ -252,6 +258,39 @@ class ProgressDashboardConfig:
     indeterminate_label: Optional[str] = None
 
 
+class _LazyFooter:
+    """A footer row Rich re-evaluates on EVERY draw, not just on :meth:`render`.
+
+    Rich Live re-renders the SAME cached ``Panel`` object at its
+    ``refresh_per_second`` cadence; it does not re-call
+    :meth:`ProgressDashboard.render`. A footer materialised inside ``render()``
+    is therefore frozen between :meth:`ProgressDashboard.update` calls. When the
+    footer's wording depends on live state that changes WITHOUT a fresh update
+    (e.g. an operator Ctrl+C flipping a cooperative-cancellation flag while every
+    in-flight host is still mid-work, so no host completes to push a frame), it
+    must be re-resolved at DRAW time.
+
+    Rich calls ``__rich_console__`` each time it draws this object, so wrapping
+    the provider here makes the footer update on the next auto-refresh tick
+    (~10fps) with no cross-thread push — the provider just reads the thread-safe
+    flag from Rich's own refresh thread. Best-effort: a raising provider renders
+    nothing rather than breaking the frame.
+    """
+
+    def __init__(self, provider: Callable[[], Optional[RenderableType]]) -> None:
+        self._provider = provider
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        try:
+            footer = self._provider()
+        except Exception:  # noqa: BLE001 — a footer glitch must never break the frame
+            footer = None
+        if footer is not None:
+            yield footer
+
+
 class ProgressDashboard:
     """Live progress surface driven by :meth:`update`.
 
@@ -314,6 +353,18 @@ class ProgressDashboard:
         # frame by the caller, e.g. the spray coverage orchestrator showing the
         # account closest to lockout). None -> the footer line is not rendered.
         self._budget_line: Optional[str] = None
+        # Optional footer AFFORDANCE provider: a zero-arg callable invoked ONCE
+        # per rendered frame that returns the current footer renderable (a
+        # dim ``Text`` line) or ``None``. Unlike ``_budget_line`` (a static
+        # string the caller re-sets), this is PULLED at render time — so a
+        # footer whose text depends on live, externally-mutated state (e.g. an
+        # operator Ctrl+C flipping a cooperative-cancellation flag on the main
+        # thread) reflects that state on the NEXT frame with no extra push. The
+        # provider owns its own styling/wording; the dashboard renders whatever
+        # it returns verbatim. Best-effort: a raising provider is swallowed so a
+        # footer glitch never breaks the fan-out. When set it takes precedence
+        # over ``_budget_line``.
+        self._footer_provider: Optional[Callable[[], Optional[RenderableType]]] = None
 
     # ------------------------------------------------------------------
     # Derived metrics
@@ -534,6 +585,26 @@ class ProgressDashboard:
         """
         self._budget_line = text or None
 
+    def set_footer_provider(
+        self, provider: Optional[Callable[[], Optional[RenderableType]]]
+    ) -> None:
+        """Set (or clear with ``None``) the per-frame footer affordance provider.
+
+        The provider is a zero-arg callable pulled ONCE per rendered frame; it
+        returns the current footer renderable (typically a dim
+        :class:`rich.text.Text` line) or ``None`` to render no footer this frame.
+        Use it for a footer whose wording tracks live, externally-mutated state,
+        so the footer updates on the next 10fps frame with no extra push — e.g.
+        an operator early-stop affordance that flips to a "stopping…" line the
+        instant a cooperative-cancellation flag is set on the main thread while
+        the render runs on a worker thread. The provider owns its styling and
+        wording; the dashboard renders its return value verbatim. When set it
+        takes precedence over :meth:`set_budget_line`. Never store masked values
+        in the returned renderable without :func:`mark_sensitive` (TeeConsole
+        invariant) — this footer is not sensitive by design.
+        """
+        self._footer_provider = provider
+
     def render(self) -> RenderableType:
         """Build the current dashboard renderable (Panel)."""
         rows: list[RenderableType] = []
@@ -552,8 +623,9 @@ class ProgressDashboard:
         breakdown_section = self._render_breakdown_section()
         if breakdown_section is not None:
             rows.append(breakdown_section)
-        if self._budget_line:
-            rows.append(Text(self._budget_line, style=COLOR_MUTED))
+        footer = self._render_footer_line()
+        if footer is not None:
+            rows.append(footer)
         title = Text(self._config.title, style=f"bold {ADSCAN_PRIMARY_BRIGHT}")
         return Panel(
             Group(*rows),
@@ -741,6 +813,25 @@ class ProgressDashboard:
                 line.append(f" {label}", style=COLOR_MUTED)
             line.append(f" {len(members)}{unit_suffix}", style=COLOR_SAGE)
         return Group(header, line)
+
+    def _render_footer_line(self) -> Optional[RenderableType]:
+        """Resolve the footer row: the per-draw provider first, else the static
+        budget line.
+
+        When a provider is set (``set_footer_provider``) it is wrapped in a
+        :class:`_LazyFooter`, so Rich re-invokes it on EVERY draw (each
+        auto-refresh tick, ~10fps), not only when :meth:`render` runs. That lets
+        a footer whose wording tracks live state — an operator early-stop
+        affordance flipping to a "stopping…" line the instant a cancellation
+        flag is set — update immediately even while no host completes to push a
+        fresh frame. Best-effort: a raising provider renders nothing rather than
+        breaking the frame.
+        """
+        if self._footer_provider is not None:
+            return _LazyFooter(self._footer_provider)
+        if self._budget_line:
+            return Text(self._budget_line, style=COLOR_MUTED)
+        return None
 
     # ------------------------------------------------------------------
     # LiveSession lifecycle

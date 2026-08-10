@@ -246,6 +246,34 @@ CONTAINER_PASSTHROUGH_SPECS: dict[str, PassthroughCommand] = {
 }
 
 
+def render_required_usage_hint(spec: PassthroughCommand) -> str:
+    """Render a one-line "here is the shape the run needs" usage hint.
+
+    Sourced from the same spec the launcher ``--help`` epilog renders, so the
+    hint a user sees when they omit a required argument cannot drift from the
+    documented surface. The mode positional and every required option are shown
+    as literal tokens; the mode-specific optional pair (``--domain``/``--dc-ip``)
+    is bracketed as the usual next thing to supply.
+
+    Args:
+        spec: The command specification (``CI_PASSTHROUGH``).
+
+    Returns:
+        A single ``adscan <cmd> <shape>`` line, no trailing newline.
+    """
+    tokens = [f"adscan {spec.name}"]
+    for arg in spec.positional_args():
+        tokens.append(arg.value_token().replace(",", "|"))
+    for arg in spec.required_args():
+        tokens.append(f"{arg.primary} {arg.value_token().replace(',', '|')}")
+    optional_by_name = {a.primary: a for a in spec.optional_args()}
+    trailing = [name for name in ("--domain", "--dc-ip") if name in optional_by_name]
+    if trailing:
+        bracketed = " ".join(f"{name} {optional_by_name[name].value_token()}" for name in trailing)
+        tokens.append(f"[{bracketed}]")
+    return " ".join(tokens)
+
+
 def _render_section(title: str, args: tuple[PassthroughArg, ...], pad: int) -> list[str]:
     if not args:
         return []

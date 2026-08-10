@@ -504,8 +504,11 @@ def _insert_graph_edge(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        # Full detail (including the internal derived-edge allow-list carried by
+        # a ValueError) goes to the debug log via print_exception — never to the
+        # operator's terminal, which can be shared or reach a client.
         print_exception(exception=exc)
-        print_error(f"Failed to insert derived edge for {cve.aka}: {exc}")
+        print_error(f"Could not record the {cve.aka} finding in the attack graph.")
 
 
 def _resolve_known_dc_identities(shell: Any, domain: str | None) -> frozenset[str]:

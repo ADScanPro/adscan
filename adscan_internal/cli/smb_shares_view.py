@@ -74,6 +74,7 @@ from adscan_internal.services.views.share_view_composer import (
     ShareViewSet,
     compose_share_views,
 )
+from adscan_internal.workspaces import resolve_workspace_cwd
 from adscan_internal.workspaces.subpaths import domain_path
 from adscan_core.rich_output import print_exception
 
@@ -355,11 +356,7 @@ def _run_live_probe(
 
 def _load_graph(*, shell: Any, domain: str, host: str) -> Optional[GraphShareSnapshot]:
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
         graph_path = domain_path(workspace_cwd, domains_dir, domain, "attack_graph.json")
         return load_graph_share_snapshot(graph_path=graph_path, host=host)
@@ -626,11 +623,7 @@ def _persist_snapshot(
     consumer should read this file (not re-derive the data).
     """
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
         out_dir = domain_path(workspace_cwd, domains_dir, domain, "smb")
         os.makedirs(out_dir, exist_ok=True)

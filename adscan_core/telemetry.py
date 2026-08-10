@@ -2516,6 +2516,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "asreproast_started",
         "asreproast_users_found",
         "attack_path_compute_performance",
+        "attack_path_discovery_started",
         "attribution_source",
         "audit_wordlist_cracked",
         "binary_deploy",
@@ -2596,6 +2597,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "myip_auto_configured",
         "myip_auto_updated",
         "native_collection_performance",
+        "native_collection_progress",
         "operator_role",
         "pdc_preflight_auto_switched",
         "pdc_preflight_confirmed",
@@ -3749,6 +3751,66 @@ def _looks_like_netbios_domain_prefix(token: str) -> bool:
     return bool(_NETBIOS_SHAPED_RE.match(candidate))
 
 
+def _strip_known_domain_suffix(value: str, domains: list[str]) -> Optional[str]:
+    """Return ``value``'s short label after removing its LONGEST known domain suffix.
+
+    A forest with a child domain registers both ``sevenkingdoms.local`` and
+    ``north.sevenkingdoms.local``. Taking the FIRST suffix that matches leaves
+    the wrong label -- ``winterfell.north.sevenkingdoms.local`` reduces to
+    ``winterfell.north`` instead of ``winterfell``, so the bare NetBIOS token
+    the tooling actually prints is never registered and travels to the recording
+    verbatim. Which of the two matched first depended on ``variables.json``
+    ordering and directory iteration, so the leak was a coin flip per
+    engagement.
+
+    Args:
+        value: An FQDN, already stripped of surrounding whitespace and any
+            trailing dot.
+        domains: Known domains. Case is ignored; order is irrelevant because
+            the longest match wins.
+
+    Returns:
+        The short label, or None when no known domain is a suffix of ``value``
+        (or when stripping it would leave nothing).
+    """
+    cleaned = (value or "").strip().rstrip(".")
+    if not cleaned:
+        return None
+    folded = cleaned.casefold()
+    best: Optional[str] = None
+    for domain in domains:
+        candidate = (domain or "").strip().rstrip(".").casefold()
+        if not candidate or not folded.endswith(f".{candidate}"):
+            continue
+        if best is None or len(candidate) > len(best):
+            best = candidate
+    if best is None:
+        return None
+    short = cleaned[: -(len(best) + 1)]
+    return short or None
+
+
+def _known_short_name_pattern(value: str) -> "re.Pattern[str]":
+    """Compile the boundary pattern used for a bare short / NetBIOS label.
+
+    The boundary is the whole point. An earlier lookahead of
+    ``(?![A-Za-z0-9-])`` excluded the hyphen, so a registered NetBIOS name never
+    matched inside the very shapes AD builds from it: every default ADCS
+    deployment names its CA ``<NETBIOS>-CA`` or ``<HOST>-ISSUING-CA``, which
+    means the customer's organisation name reached the recording in cleartext
+    each time the ADCS collector ran.
+
+    So the boundary tolerates exactly the suffixes AD composes onto a short
+    name -- ``-`` (CA and role names), ``$`` (machine accounts) and ``\\``
+    (``DOMAIN\\user``, ``HOST\\INSTANCE``) -- while still refusing to start or
+    end inside a longer alphanumeric word, which is what keeps the match off
+    ordinary prose.
+    """
+    return re.compile(
+        rf"(?i)(?<![A-Za-z0-9._$\\-])({re.escape(value)})(?![A-Za-z0-9._])"
+    )
+
+
 def _is_non_identifying_mac(value: str) -> bool:
     """Return whether a MAC-shaped token is a non-customer-identifying MAC.
 
@@ -3783,6 +3845,61 @@ def _is_non_identifying_mac(value: str) -> bool:
 _DOMAIN_ACCOUNT_SID_PATTERN = re.compile(
     r"\bS-1-5-21-[0-9]+-[0-9]+-[0-9]+(?:-[0-9]+)?\b"
 )
+
+# The SAME domain SID, in the binary/hex encoding SQL Server and some LDAP
+# tooling emit (``sys.server_principals.sid``, ``0x0105000000000005150000...``).
+# The text-form net above cannot see this encoding, so a hex SID carried the
+# customer's domain identifier into the recording untouched.
+#
+# The shape is fixed by MS-DTYP: revision byte ``01``, a sub-authority COUNT
+# byte, the 6-byte big-endian identifier authority ``000000000005`` (NT
+# Authority), then that many little-endian 4-byte sub-authorities. Anchored on
+# the revision, the NT authority and the first sub-authority ``15000000`` (21,
+# little-endian), so it matches exactly the S-1-5-21 family the text net
+# targets: a well-known SID such as S-1-5-32-544 encodes ``20000000`` in that
+# position and is NOT matched, mirroring the text-form carve-out.
+#
+# The tail is matched greedily and gated in :func:`_replace_hex_domain_sid` on
+# being a whole number of 4-byte sub-authorities, rather than against a fixed
+# length floor. A floor was the wrong instrument -- an early draft demanded
+# three more sub-authorities and so missed both a domain SID printed without its
+# RID and any token whose run was cut short in the output it came from.
+#
+# Deliberately NOT gated on the declared sub-authority COUNT byte matching the
+# bytes present. That check is tempting because the encoding is self-describing,
+# but it fails CLOSED in the wrong direction: a token whose count disagrees with
+# its length is usually one truncated by the display it came from, and the
+# sub-authorities it DOES carry are still the customer's real domain identifier.
+# Refusing to mask it would leak exactly the value this net exists to protect,
+# so a malformed-but-header-valid token is masked too. The ``0x`` prefix is
+# optional because tooling prints the encoding both ways.
+_HEX_DOMAIN_SID_PATTERN = re.compile(
+    r"(?i)(?<![0-9A-Fa-fx])(?P<prefix>0x)?01(?P<count>[0-9A-Fa-f]{2})"
+    r"00000000000515000000(?P<tail>[0-9A-Fa-f]*)(?![0-9A-Fa-f])"
+)
+
+
+def _replace_hex_domain_sid(match: "re.Match[str]") -> str:
+    """Pseudonymize a hex-encoded domain SID.
+
+    The candidate regex already fixes the whole MS-DTYP header — revision, the
+    NT Authority, and ``21`` as the first sub-authority — which is specific
+    enough that an unrelated hex run cannot reach here by accident. This gate
+    only requires the tail to be a whole number of 4-byte sub-authorities, and
+    at least one of them, so the token carries a domain identifier to protect.
+
+    It deliberately does NOT require the declared sub-authority count to match
+    the bytes present: a token truncated by the output it came from still
+    discloses the sub-authorities it does carry, and those ARE the customer's
+    domain identifier.
+    """
+    token = match.group(0)
+    if _is_already_sanitized(token):
+        return token
+    tail = match.group("tail")
+    if not tail or len(tail) % 8 != 0:
+        return token
+    return _record_pseudonym(token, "sid")
 
 # Candidate span for the IPv6 structural net. The regex only BOUNDS the token;
 # ipaddress.IPv6Address in _replace_ipv6_candidate is the real gate, so a
@@ -4084,6 +4201,19 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
+    # The same SID in its BINARY/HEX encoding.
+    #
+    # SQL Server prints ``sys.server_principals.sid`` as
+    # ``0x0105000000000005150000...``, which carries the customer's domain
+    # identifier exactly as the text form does. The text-form net cannot see
+    # this encoding, and no other net anchors on it, so an enumerated SQL
+    # principal list published the domain SID verbatim. The pseudonym is
+    # provably fake: it does not reproduce the fixed MS-DTYP header, and the
+    # "sid" scramble emits non-hex letters, so the result cannot be read back
+    # as an encoded SID. See _HEX_DOMAIN_SID_PATTERN for the well-known-SID
+    # carve-out (which mirrors the text form's) and the count-byte length gate.
+    content = _HEX_DOMAIN_SID_PATTERN.sub(_replace_hex_domain_sid, content)
+
     # Structural backstop for Azure AD Connect / DirSync sync-account names.
     #
     # AAD Connect provisions an on-prem sync account named MSOL_<12 hex> (e.g.
@@ -4330,6 +4460,48 @@ def _sanitize_rich_output(content: str) -> str:
         return _replace_domain_backslash_user(match)
 
     content = netbios_backslash_pattern.sub(_replace_netbios_backslash_user, content)
+
+    # Named database instances — ``HOST\\INSTANCE``.
+    #
+    # A named SQL Server instance is printed as host-backslash-instance, and the
+    # host half is customer infrastructure. The two principal nets above do not
+    # reach it: the dotted one only matches when the host is fully qualified,
+    # and the bare NetBIOS one requires the left token to be UPPER-CASE
+    # NetBIOS-shaped, so a mixed-case ``Castelblack\\SqlExpress`` came through
+    # untouched. Enumerating a SQL estate emits the string in bulk (110 raw
+    # occurrences in one reviewed recording), and the host is frequently one the
+    # workspace never registered as a computer account.
+    #
+    # This net keys on the INSTANCE half rather than the host's casing: the
+    # right-hand token must be a bare instance name (letters/digits/underscore,
+    # no dot, no ``$``), which is what separates ``HOST\\INSTANCE`` from a
+    # registry path (``HKLM:\\SOFTWARE\\...``, rejected by the ``:`` lookbehind
+    # and the ``\\`` boundaries), a UNC path (``\\\\server\\share``, rejected by
+    # the leading-backslash lookbehind) and ``DOMAIN\\user.name``. Both halves
+    # are pseudonymized -- an instance name is customer-chosen and often names
+    # the application it serves.
+    instance_backslash_pattern = re.compile(
+        r"(?<![A-Za-z0-9._$:\\/-])(?P<host>[A-Za-z0-9][A-Za-z0-9-]{1,62})"
+        r"\\(?P<instance>[A-Za-z][A-Za-z0-9_]{1,62})(?![A-Za-z0-9._$\\/-])"
+    )
+
+    def _replace_instance_backslash(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if _is_already_sanitized(token):
+            return token
+        host = match.group("host")
+        instance = match.group("instance")
+        if _is_already_sanitized(host) or _is_already_sanitized(instance):
+            return token
+        # Reuse the public-prefix guard so a Windows share/authority root
+        # (``ADMIN$``, ``SYSVOL``, ``NT AUTHORITY``) is never treated as a host.
+        if host.casefold() in _NON_DOMAIN_BACKSLASH_PREFIXES:
+            return token
+        host_repl = _record_pseudonym(host, "hostname")
+        instance_repl = _record_pseudonym(instance, "service")
+        return host_repl + "\\" + instance_repl
+
+    content = instance_backslash_pattern.sub(_replace_instance_backslash, content)
 
     # Sanitize USER@DOMAIN:PASSWORD pattern (handles placeholders, real values, and quotes)
     def _is_password_context(match: re.Match[str], text: str) -> bool:
@@ -4962,36 +5134,46 @@ def _sanitize_rich_output(content: str) -> str:
                 content,
             )
 
-    # Redact known workspace hostnames (from enabled_computers.txt).
+    # Redact known workspace hostnames (from enabled_computers.txt plus anything
+    # registered mid-run via add_known_hostname).
+    #
+    # The FQDN pass runs FIRST for every hostname, then the short-label pass, so
+    # a long name is always consumed before its own prefix can match inside it.
+    # Short labels are collected across all hostnames and deduplicated, because
+    # a forest routinely registers the same short name under several suffixes.
     known_hostnames = _get_known_hostnames()
     if known_hostnames:
-        domain_suffixes = [d.casefold() for d in known_domains] if known_domains else []
+        domain_suffixes = list(known_domains) if known_domains else []
+        short_labels: list[str] = []
+        seen_short: set[str] = set()
         for hostname in known_hostnames:
             hostname_clean = hostname.strip().rstrip(".")
             if not hostname_clean:
                 continue
-            hostname_lower = hostname_clean.casefold()
-            matched_domain = None
-            for domain in domain_suffixes:
-                if hostname_lower.endswith(f".{domain}"):
-                    matched_domain = domain
-                    break
-            if matched_domain:
-                short_hostname = hostname_clean[: -(len(matched_domain) + 1)]
-                if short_hostname:
-                    short_pattern = re.compile(
-                        rf"(?i)(?<![A-Za-z0-9-])({re.escape(short_hostname)})(?![A-Za-z0-9-])"
-                    )
-                    content = short_pattern.sub(
-                        lambda m: _record_pseudonym(m.group(1), "hostname"),
-                        content,
-                    )
             fqdn_pattern = re.compile(
                 rf"(?i)(?<![A-Za-z0-9-])({re.escape(hostname_clean)})(\.)?"
             )
             content = fqdn_pattern.sub(
                 lambda m: _record_pseudonym(m.group(1), "hostname")
                 + (m.group(2) or ""),
+                content,
+            )
+            # The short label of an FQDN is the bare NetBIOS name the tooling
+            # actually prints, and it is ALSO what AD composes CA names and
+            # machine accounts from -- so it is registered as a first-class
+            # known value matched with the composition-tolerant boundary, not
+            # with the FQDN's stricter one.
+            short = _strip_known_domain_suffix(hostname_clean, domain_suffixes)
+            if short is None and "." not in hostname_clean:
+                # A single-label registration (a CA common name, a DC short
+                # name learned mid-run) is already the short label.
+                short = hostname_clean
+            if short and short.casefold() not in seen_short:
+                seen_short.add(short.casefold())
+                short_labels.append(short)
+        for short_label in short_labels:
+            content = _known_short_name_pattern(short_label).sub(
+                lambda m: _record_pseudonym(m.group(1), "hostname"),
                 content,
             )
 
@@ -5039,8 +5221,39 @@ def _sanitize_rich_output(content: str) -> str:
                 content,
             )
 
-    # Redact known workspace NetBIOS names (from variables.json).
-    known_netbios = _get_known_netbios()
+    # Redact known workspace NetBIOS names.
+    #
+    # Two sources, and the DERIVED one is what makes this net work at all on a
+    # real scan. The registered set comes from ``domains_data[<domain>]
+    # ["netbios"]`` read at workspace-ACTIVATION time, and nothing in the
+    # product ever WRITES that key -- every consumer reads it with a
+    # ``domain.split(".")[0].upper()`` fallback. So on a real engagement the
+    # registered set is empty, and a net that depended on it protected nothing.
+    #
+    # The NetBIOS name is by construction the domain's first DNS label, and the
+    # domain registry IS populated on every scan, so deriving the label from
+    # each known domain gives this net the same reach the registered set was
+    # supposed to provide -- without depending on a key nobody sets.
+    #
+    # A label that happens to equal an ordinary word (``corp.local`` ->
+    # ``corp``) is redacted as that bounded token, on the same reasoning the
+    # known-user loop below already documents: it is a registered customer
+    # identifier, leaking it is the legal risk, and corrupting the prose word is
+    # the acceptable lesser evil. The full domain was already masked anyway.
+    known_netbios = list(_get_known_netbios())
+    seen_netbios = {value.strip().casefold() for value in known_netbios if value.strip()}
+    for domain in known_domains:
+        label = (domain or "").strip().rstrip(".").split(".", 1)[0]
+        # Same floor the known-user / known-password loops apply: a one- or
+        # two-character value cannot be substring-redacted safely under ANY
+        # boundary, because it hits every standalone "a" / "I" in the buffer.
+        # An EXPLICITLY registered NetBIOS name is trusted at any length; a
+        # DERIVED label is an inference from a domain, so it earns the floor.
+        if len(label) < _MIN_KNOWN_USER_LEN:
+            continue
+        if label.casefold() not in seen_netbios:
+            seen_netbios.add(label.casefold())
+            known_netbios.append(label)
     if known_netbios:
         for netbios in known_netbios:
             netbios_clean = netbios.strip()
@@ -5057,10 +5270,12 @@ def _sanitize_rich_output(content: str) -> str:
                 ),
                 content,
             )
-            netbios_pattern = re.compile(
-                rf"(?i)(?<![A-Za-z0-9-])({re.escape(netbios_clean)})(?![A-Za-z0-9-])"
-            )
-            content = netbios_pattern.sub(
+            # Composition-tolerant boundary: a NetBIOS name is what AD builds
+            # its default CA common name from (``<NETBIOS>-CA``,
+            # ``<HOST>-ISSUING-CA``) and what it suffixes for machine accounts
+            # (``HOST$``). Excluding "-" from the boundary meant the customer's
+            # organisation name shipped in cleartext with every ADCS run.
+            content = _known_short_name_pattern(netbios_clean).sub(
                 lambda m: _record_pseudonym(m.group(1), "domain"),
                 content,
             )
@@ -7379,8 +7594,11 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
                 #     f"console_has_export={hasattr(console, 'export_html') if console else False}"
                 # )
 
-                # Export Rich recording
-                html_content = console.export_html()
+                # Export Rich recording. export_html() defaults to clear=True,
+                # which wipes the record buffer — so export_text() must either run
+                # first or the HTML export must keep the buffer, or the text side
+                # comes back empty on every session.
+                html_content = console.export_html(clear=False)
                 text_content = console.export_text()
 
                 # DIAGNOSTIC: Check exported content size

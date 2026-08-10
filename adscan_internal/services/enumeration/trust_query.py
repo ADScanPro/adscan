@@ -88,6 +88,36 @@ def decode_trust_attributes(value: int | None) -> list[str]:
     return [name for bit, name in _TRUST_ATTR_BITS if value & bit]
 
 
+#: ``trustAttributes`` bit for cross-organization TGT-delegation forwarding
+#: (MS-ADTS 6.1.6.7.9). Verified against the vendored badldap ``TrustAttributes``
+#: enum. When set on a forest trust, Kerberos TGTs are forwarded across the
+#: forest boundary — the misconfiguration that turns a cross-forest trust into a
+#: cross-forest unconstrained-delegation escalation path.
+TRUST_ATTR_CROSS_ORG_TGT_DELEGATION: int = 0x00000800
+
+
+def cross_org_tgt_delegation_enabled(trust_attributes: int | None) -> bool:
+    """Return whether ``CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION`` is set.
+
+    A pure predicate over the raw ``trustAttributes`` bitmask, so every consumer
+    (collector persistence, attack-graph coupling, report finding) asks the same
+    question through one SSOT instead of re-deriving the bit. Reuses the vendored
+    badldap ``TrustAttributes`` enum when importable (byte-identical to the
+    BloodHound trust export) and falls back to the local bit constant otherwise.
+    """
+    if not trust_attributes:
+        return False
+    try:
+        from badldap.ldap_objects.adtrust import TrustAttributes
+
+        return (
+            TrustAttributes.CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION
+            in TrustAttributes(trust_attributes)
+        )
+    except Exception:  # noqa: BLE001 — a vendor enum quirk must not break enum
+        return bool(int(trust_attributes) & TRUST_ATTR_CROSS_ORG_TGT_DELEGATION)
+
+
 def classify_trust_type(trust_attributes: int | None, trust_type: int | None) -> str:
     """Pick a human label for the trust based on attributes/type bits."""
     flags = set(decode_trust_attributes(trust_attributes))
@@ -342,6 +372,137 @@ def _first_int(attrs: dict[str, list[Any]], name: str) -> int | None:
         return int(val) if val is not None else None
     except (TypeError, ValueError):
         return None
+
+
+@dataclass
+class DomainControllerEntry:
+    """One enumerated domain controller of a domain.
+
+    Attributes:
+        fqdn: The DC's ``dNSHostName`` (FQDN) when known, else ``None``.
+        server_dn: The Configuration-NC ``server`` object DN (evidence).
+    """
+
+    fqdn: str | None
+    server_dn: str = ""
+
+
+def _parent_dn(dn: str) -> str:
+    """Return the immediate parent DN of ``dn`` (empty when it has none)."""
+    text = str(dn or "").strip()
+    if not text or "," not in text:
+        return ""
+    # A DN component is comma-separated; the first comma that is not escaped
+    # (``\,``) delimits the RDN from its parent. AD server/nTDSDSA DNs never use
+    # escaped commas in these RDNs, so a plain split is correct and robust here.
+    return text.split(",", 1)[1].strip()
+
+
+def query_domain_controllers(conn: Any, config_dn: str) -> list[DomainControllerEntry]:
+    """Enumerate a domain's full DC set from its own Configuration NC.
+
+    Discovers every domain controller by locating the ``nTDSDSA`` objects (each
+    represents one DC's directory-service instance) under
+    ``CN=Sites,<config_dn>`` and reading the ``dNSHostName`` of each DSA's parent
+    ``server`` object. This is the DC-locator LDAP pattern: it enumerates the
+    real replicating DCs (not merely computer objects in the Domain Controllers
+    OU), so it does not miss an RODC or over-count a decommissioned entry.
+
+    MUST be called against the TARGET domain's OWN DC in its OWN realm — the
+    Configuration NC is per-forest but the ``server``/``nTDSDSA`` objects are
+    read over the already-authenticated connection to that domain's DC, so no
+    cross-realm auth is attempted here.
+
+    Args:
+        conn: An active :class:`ADscanLDAPConnection` (or any object exposing
+            ``search()`` + ``entries`` like ldap3), bound to the domain's DC.
+        config_dn: The forest Configuration NC DN, e.g.
+            ``CN=Configuration,DC=corp,DC=local``.
+
+    Returns:
+        One :class:`DomainControllerEntry` per discovered DC. On any search
+        failure returns an empty list (telemetry records the exception); the
+        caller degrades gracefully to the PDC-only view.
+    """
+    if not config_dn:
+        return []
+
+    sites_base = f"CN=Sites,{config_dn}"
+
+    # 1) Enumerate the nTDSDSA objects → their parent ``server`` DNs are the DCs.
+    server_dns: list[str] = []
+    seen_server_dns: set[str] = set()
+    try:
+        conn.search(
+            search_base=sites_base,
+            search_filter="(objectCategory=nTDSDSA)",
+            attributes=["distinguishedName"],
+            search_scope="SUBTREE",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"trust_query: nTDSDSA search failed under {sites_base}: {exc}"
+        )
+        return []
+
+    for entry in getattr(conn, "entries", []) or []:
+        try:
+            parent = _parent_dn(getattr(entry, "dn", "") or "")
+            key = parent.casefold()
+            if parent and key not in seen_server_dns:
+                seen_server_dns.add(key)
+                server_dns.append(parent)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    if not server_dns:
+        return []
+
+    # 2) Read each ``server`` object's dNSHostName (the DC FQDN). A single
+    #    SUBTREE search over the Sites container returns every ``server``; we key
+    #    by DN so only the DCs discovered in step 1 are kept, and a server whose
+    #    dNSHostName is absent still yields a DC record (FQDN None) so the count
+    #    stays correct even when the attribute is not readable.
+    fqdn_by_server_dn: dict[str, str | None] = {}
+    try:
+        conn.search(
+            search_base=sites_base,
+            search_filter="(objectClass=server)",
+            attributes=["dNSHostName", "distinguishedName"],
+            search_scope="SUBTREE",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"trust_query: server search failed under {sites_base}: {exc}"
+        )
+        # nTDSDSA discovery already succeeded — keep those DCs with unknown FQDN
+        # rather than losing the count.
+        return [DomainControllerEntry(fqdn=None, server_dn=dn) for dn in server_dns]
+
+    for entry in getattr(conn, "entries", []) or []:
+        try:
+            server_dn = str(getattr(entry, "dn", "") or "").strip()
+            if not server_dn:
+                continue
+            attrs = _attrs(entry)
+            fqdn = _first_str(attrs, "dNSHostName").lower() or None
+            fqdn_by_server_dn[server_dn.casefold()] = fqdn
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    return [
+        DomainControllerEntry(
+            fqdn=fqdn_by_server_dn.get(dn.casefold()),
+            server_dn=dn,
+        )
+        for dn in server_dns
+    ]
 
 
 def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]:

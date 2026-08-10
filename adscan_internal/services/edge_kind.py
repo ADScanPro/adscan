@@ -347,6 +347,13 @@ _ESCALATION_EDGES: Final[frozenset[str]] = frozenset(
         # (like ASREPRoasting / CrackNTLMv1); source is the unauthenticated
         # principal, so it materializes only on crack success.
         "PoisonCaptureNtlmv2Crack",
+        # Cross-forest Kerberos TGT-delegation escalation (ADscan native, not in
+        # BloodHound CE). A forest trust with CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION
+        # forwards ticket-granting tickets across the boundary, so a compromise of
+        # the trusted forest can capture a forwarded TGT and escalate into the
+        # trusting forest (Domain -> Domain). Modeled from the trust attribute;
+        # execution is a separate follow-up.
+        "CrossOrgTgtDelegation",
     }
 )
 

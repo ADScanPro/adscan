@@ -98,22 +98,23 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
     This is a CLI orchestration helper extracted from the legacy shell to keep
     `adscan.py` slimmer. It expects PRO checks to have been done by the caller.
     """
-    # Honor the scan-config trust-enumeration policy. ``skip`` short-circuits
-    # before any DC contact; ``selected`` constrains the recursive BFS to the
-    # listed partner domains; ``all`` / ``interactive`` (default) run the full
-    # enumeration exactly as before. Absent config = interactive = unchanged.
+    # Trust RELATIONSHIP mapping ALWAYS runs — mapping the trust graph is cheap
+    # and an operator may want the map without collecting a trusted forest they
+    # are not authorized to touch. The scan-config policy governs only WHICH
+    # DOMAINS get COLLECTED afterward (decided downstream in the scope selection,
+    # see ``default_scope_for_selection``), NOT whether trusts are enumerated.
+    # ``selected`` still constrains the recursive BFS to the listed partner
+    # domains (that is a mapping-scope choice, not a suppression). ``origin_only``
+    # (and its back-compat alias ``skip``) no longer short-circuit here — they
+    # only mean "collect the origin domain only" at scope-selection time.
     from adscan_internal.services.scan_config import (
         TRUST_POLICY_SELECTED,
-        TRUST_POLICY_SKIP,
     )
 
     scan_config = getattr(shell, "scan_config", None)
     trust_cfg = getattr(scan_config, "trust_enumeration", None)
     trust_policy = getattr(trust_cfg, "policy", None)
     trust_allowlist: set[str] | None = None
-    if trust_policy == TRUST_POLICY_SKIP:
-        print_info("Trust enumeration skipped (disabled in scan configuration).")
-        return
     if trust_policy == TRUST_POLICY_SELECTED:
         trust_allowlist = {d.strip().lower() for d in getattr(trust_cfg, "domains", ())}
 
@@ -372,6 +373,9 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             discovered_domains=result.discovered_domains,
             domain_pdc_mapping=result.domain_controllers,
             cross_domain_unreachable=cross_domain_unreachable,
+            domain_dc_sets=result.domain_dc_sets,
+            dc_set_degraded_reasons=result.dc_set_degraded_reasons,
+            domain_dc_fqdns=result.domain_dc_fqdns,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -448,22 +452,160 @@ def order_domains_for_scan(source_domain: str, domains: list[str]) -> list[str]:
     return [normalized_to_original.get(dom, dom) for dom in ordered_norm]
 
 
+# ---------------------------------------------------------------------------
+# Trust-scope selection default (SSOT)
+# ---------------------------------------------------------------------------
+#
+# When a pivot (e.g. an MSSQL linked-server tunnel) unlocks a NEWLY-REACHABLE
+# trusted domain, ADscan must decide which of the reachable domains to enumerate
+# (full Phase 1 BH collection + attack graph). There are two orthogonal answers:
+#
+#   * the SAFE fallback (cancel / timeout / exception) — ALWAYS origin-only, so a
+#     hung/abandoned/cancelled decision never silently enumerates a trusted forest;
+#   * the PRIMARY default (the interactive checkbox pre-selection, and the
+#     non-interactive auto-selection) — TYPE-AWARE, overridable by scan config.
+#
+# CLI-side override contract (mirrors the existing ``trust_enumeration.policy``
+# scan-config concept, so the web forwards ONE trust knob, not two):
+#   * ``shell.scan_config.trust_enumeration.policy``:
+#       - ``all``       -> enumerate every reachable domain (origin + unlocked)
+#       - ``skip``      -> origin only
+#       - ``selected``  -> origin + the listed ``domains`` that are reachable
+#       - ``interactive`` (default) -> defer to the by-type default below
+#   * env var ``ADSCAN_TRUST_SCOPE`` (for CLI/CI users with no scan-config file,
+#     following the ``ADSCAN_NO_POISONING`` pattern): ``all`` | ``origin`` —
+#     takes precedence over the by-type default, NOT over an explicit non-
+#     ``interactive`` scan-config policy.
+# By-type default (when neither override applies):
+#   * ``ctf``            -> all reachable (our labs; full enumeration is wanted)
+#   * ``audit`` / other  -> origin only (a client often does not authorize
+#     enumerating a trusted forest — legal scope).
+
+_TRUST_SCOPE_ENV = "ADSCAN_TRUST_SCOPE"
+_TRUST_SCOPE_ENV_ALL = "all"
+_TRUST_SCOPE_ENV_ORIGIN = "origin"
+
+
+def _origin_only_scope(candidates: list[str], source_domain: str) -> list[str]:
+    """Return the conservative origin-only scope (never enumerate a trust).
+
+    The single safe fallback used by every cancel / timeout / exception path so
+    an abandoned decision never silently enumerates a trusted forest. When the
+    source domain is not among the candidates it degrades to the first candidate
+    (there is always at least the origin in practice).
+    """
+    if source_domain in candidates:
+        return [source_domain]
+    return candidates[:1]
+
+
+def default_scope_for_selection(
+    shell: Any,
+    *,
+    candidates: list[str],
+    new_domains: list[str],
+    source_domain: str,
+) -> list[str]:
+    """Resolve the DEFAULT trust-scope pre-selection (type-aware + overridable).
+
+    This is the value the interactive prompt pre-checks (so the operator sees +
+    decides on the newly-unlocked domains) AND the value a non-interactive run
+    auto-selects. The safe cancel/timeout/exception fallbacks do NOT use this —
+    they call :func:`_origin_only_scope` and stay origin-only unconditionally.
+
+    An ALREADY-ENUMERATED domain (the origin, and any domain that already
+    completed Phase 1) is NEVER pre-selected — re-enumerating a domain that is
+    already done is pointless, so it is left unchecked in both CLI and web and in
+    both ctf and audit. The operator may still select it manually to force a
+    re-enumeration, but the default only ever pre-checks domains that genuinely
+    NEED enumeration (the newly-unlocked ones). So every branch below intersects
+    its choice with ``new_domains`` — an empty result means "nothing new to
+    enumerate", which is the correct default (no pre-selection).
+
+    Resolution order (first match wins):
+      1. ``shell.scan_config.trust_enumeration.policy`` when set to a non-
+         ``interactive`` value (``all`` / ``origin_only`` / ``selected``; the
+         legacy ``skip`` is accepted as an alias of ``origin_only``).
+      2. env var ``ADSCAN_TRUST_SCOPE`` (``all`` / ``origin``).
+      3. the by-type default: ``ctf`` -> all NEW domains; ``audit`` / other ->
+         none (a trusted forest is opt-in on an audit).
+
+    Args:
+        shell: The session shell (read-only; ``type`` and ``scan_config`` are
+            consulted best-effort — a missing/garbage value degrades to the
+            conservative by-type default).
+        candidates: All reachable domains (origin + newly-unlocked).
+        new_domains: The newly-reachable domains (``candidates`` minus the
+            already-enumerated set). Pre-selecting these is the whole point of
+            the prompt — enumerating them populates their attack graph so a
+            later cross-forest DCSync/TGT-delegation step can resolve.
+        source_domain: The origin domain enumeration was launched from.
+
+    Returns:
+        The subset of ``new_domains`` (order-preserved) to pre-select /
+        auto-select. Never includes an already-enumerated domain. Empty when
+        there is nothing new to enumerate.
+    """
+    # Only domains that still NEED enumeration are ever pre-selected.
+    new_set = {str(d).strip().lower() for d in new_domains}
+    all_new = [d for d in candidates if str(d).strip().lower() in new_set]
+
+    # 1. Explicit scan-config policy (the web forwards this one trust knob).
+    scan_config = getattr(shell, "scan_config", None)
+    trust_cfg = getattr(scan_config, "trust_enumeration", None)
+    policy = str(getattr(trust_cfg, "policy", "") or "").strip().lower()
+    if policy and policy != "interactive":
+        if policy == "all":
+            return all_new
+        if policy in ("origin_only", "skip"):  # skip = back-compat alias
+            return []  # collect only the origin (already done) — nothing new
+        if policy == "selected":
+            listed = {
+                str(d).strip().lower() for d in getattr(trust_cfg, "domains", ()) or ()
+            }
+            # Only the listed domains that still need enumeration (the origin,
+            # if listed, is already done and is not re-selected).
+            return [d for d in all_new if d.strip().lower() in listed]
+
+    # 2. env-var override (CLI/CI users without a scan-config file).
+    env_scope = str(os.environ.get(_TRUST_SCOPE_ENV, "") or "").strip().lower()
+    if env_scope == _TRUST_SCOPE_ENV_ALL:
+        return all_new
+    if env_scope == _TRUST_SCOPE_ENV_ORIGIN:
+        return []
+
+    # 3. by-type default.
+    scan_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if scan_type == "ctf":
+        return all_new
+    # audit / default: a trusted forest stays opt-in — nothing pre-selected.
+    return []
+
+
 def _prompt_scope_selection(
     candidates: list[str],
     source_domain: str,
     phase1_complete_domains: set[str] | None = None,
+    shell: Any = None,
 ) -> list[str]:
     """Ask the user which trusted domains to include in scope.
 
     Domains with Phase 1 already completed are shown with a re-run label so the
     operator understands only the attack graph is rebuilt, not the full BH collection.
-    In non-interactive environments only the source (origin) domain is returned —
-    trusted domains are not auto-enumerated unless the operator opts in.
+
+    The DEFAULT scope is type-aware and overridable (see
+    :func:`default_scope_for_selection`): a non-interactive run auto-selects it,
+    and the interactive prompt pre-checks it so the operator sees + decides on the
+    newly-unlocked domains. Cancel / timeout / exception always fall back to the
+    conservative origin-only scope — a trusted forest is never silently enumerated
+    on an abandoned decision.
 
     Args:
         candidates: All reachable domains to offer (including source).
         source_domain: The domain trust enumeration was launched from.
         phase1_complete_domains: Domains whose BH collection is already done.
+        shell: The session shell (read-only), consulted for ``type`` and
+            ``scan_config`` to resolve the type-aware / overridable default.
 
     Returns:
         Subset of candidates selected by the user, preserving original order.
@@ -484,13 +626,19 @@ def _prompt_scope_selection(
     if not new_domains and not rerun_domains:
         return candidates
 
+    scope_default = default_scope_for_selection(
+        shell,
+        candidates=candidates,
+        new_domains=new_domains,
+        source_domain=source_domain,
+    )
+
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
     if _is_non_interactive():
-        # Default scope = the origin domain only. Trusted domains are NOT auto-
-        # enumerated unless the operator explicitly opts in (a client often does not
-        # authorize enumerating trusted domains). The platform surfaces an interactive
-        # trust-scope selection for opt-in; headless ci stays origin-only.
-        return [source_domain] if source_domain in candidates else candidates[:1]
+        # Non-interactive default is TYPE-AWARE (ctf -> all reachable; audit ->
+        # origin only) and overridable via scan config / ``ADSCAN_TRUST_SCOPE``.
+        # A trusted forest is enumerated only when the type/config says so.
+        return scope_default
 
     try:
         from adscan_core import prompting
@@ -537,21 +685,26 @@ def _prompt_scope_selection(
             labels_by_value[d] = label
             options.append(d)
 
+        # Pre-check the type-aware default so the operator SEES the newly-unlocked
+        # domains selected and can decide, rather than the origin-only default that
+        # hid them.
+        interactive_default = [d for d in options if d in set(scope_default)]
+
         selected = prompting.questionary_checkbox_values_raw(
             title="Select domains to include in scope:",
             options=options,
-            default_values=[source_domain] if source_domain in options else options[:1],
+            default_values=interactive_default or _origin_only_scope(options, source_domain),
             labels_by_value=labels_by_value,
         )
 
         if selected is None:
             # Ctrl-C / cancelled — fall back to the origin domain only (the safe
             # default: never silently enumerate trusted domains on a cancel).
-            return [source_domain] if source_domain in candidates else candidates[:1]
+            return _origin_only_scope(candidates, source_domain)
 
         return [d for d in candidates if d in set(selected)]
     except Exception:
-        return [source_domain] if source_domain in candidates else candidates[:1]
+        return _origin_only_scope(candidates, source_domain)
 
 
 def _build_trust_scope_context(
@@ -670,9 +823,10 @@ def _remote_trust_scope_selection(
     is disabled or there is a single reachable domain, so the caller falls back
     to the local prompt (which keeps the origin-only default for headless ``ci``).
 
-    The multiselect default and the timeout result are both origin-only, so a
-    hung/abandoned/timed-out session never blocks past the request timeout and
-    never silently enumerates trusted domains.
+    The multiselect PRE-SELECTION is the type-aware / overridable default (so the
+    operator sees the newly-unlocked domains checked and decides), but the TIMEOUT
+    result stays origin-only, so a hung/abandoned/timed-out session never blocks
+    past the request timeout and never silently enumerates trusted domains.
     """
     try:
         from adscan_internal.interactive_requests import is_remote_interaction_enabled
@@ -687,8 +841,15 @@ def _remote_trust_scope_selection(
         return None
 
     done = phase1_complete_domains or set()
-    origin_default = (
-        [source_domain] if source_domain in candidates else candidates[:1]
+    new_domains = [d for d in candidates if d not in done]
+    origin_default = _origin_only_scope(candidates, source_domain)
+    # The pre-selection the operator sees checked is the type-aware default; the
+    # timeout fallback stays origin-only (never enumerate a trust on an abandon).
+    preselect_default = default_scope_for_selection(
+        shell,
+        candidates=candidates,
+        new_domains=new_domains,
+        source_domain=source_domain,
     )
     context = _build_trust_scope_context(
         shell,
@@ -704,7 +865,7 @@ def _remote_trust_scope_selection(
         selected_values = selector(
             "Select trusted domains to include in enumeration scope:",
             candidates,
-            default_values=origin_default,
+            default_values=preselect_default,
             timeout_values=origin_default,
             context=context,
         )
@@ -747,8 +908,13 @@ def _persist_scope_selection(
         )
         selected = {item.lower().strip() for item in selected_domains}
         source_data = shell.domains_data.get(source_domain, {})
-        auth_domain = str(source_data.get("auth_domain") or source_domain)
-        auth_kdc = str(source_data.get("auth_kdc") or source_data.get("pdc") or "")
+        # Source-domain broadcast auth context — the correct default for the
+        # common single-credential transitive trust, where ONE owned credential
+        # reaches every trusted domain via the trust chain.
+        source_auth_domain = str(source_data.get("auth_domain") or source_domain)
+        source_auth_kdc = str(
+            source_data.get("auth_kdc") or source_data.get("pdc") or ""
+        )
         entries: list[ScopeEntry] = []
         for candidate in candidates:
             candidate_data = shell.domains_data.get(candidate, {})
@@ -764,6 +930,19 @@ def _persist_scope_selection(
             if isinstance(summary, dict) and summary.get("reachable") is False:
                 reachability = "unreachable"
                 degraded_reason = str(summary.get("reason") or "") or None
+            # Per-forest auth context: prefer the credential/KDC that actually
+            # reached THIS candidate (persisted on its own domains_data by the
+            # path that authenticated to it) — required for a selective/one-way
+            # trust that needs a distinct credential per forest. Fall back to the
+            # source broadcast for the transitive one-credential case.
+            candidate_auth_domain = (
+                str(candidate_data.get("auth_domain") or "").strip()
+                or source_auth_domain
+            )
+            candidate_auth_kdc = (
+                str(candidate_data.get("auth_kdc") or "").strip()
+                or source_auth_kdc
+            )
             entries.append(
                 ScopeEntry(
                     domain=candidate,
@@ -772,8 +951,8 @@ def _persist_scope_selection(
                         or domain_pdc_mapping.get(candidate)
                         or ""
                     ),
-                    auth_domain=auth_domain,
-                    auth_kdc=auth_kdc,
+                    auth_domain=candidate_auth_domain,
+                    auth_kdc=candidate_auth_kdc,
                     reachability=reachability,
                     in_scope=candidate.lower().strip() in selected,
                     kerberos_target_hostname=str(
@@ -795,6 +974,118 @@ def _persist_scope_selection(
         print_info_debug(f"[scope] Failed to persist scope.json: {exc}")
 
 
+def _merge_domain_dc_set(
+    shell: DomainShell,
+    domain: str,
+    dc_fqdns: list[str],
+    degraded_reason: str | None,
+    *,
+    primary_dc_fqdn: str | None = None,
+) -> None:
+    """Persist a domain's full DC set into ``domains_data[domain]["dcs"]``.
+
+    ``finalize_domain_context`` already appended the PDC *IP*; this adds the
+    domain's other DC FQDNs (enumerated from its own Configuration NC) so
+    ``resolve_domain_controllers`` reports the true multi-DC topology of a
+    trusted forest instead of ``count == 1``.
+
+    To avoid the alias-aware resolver miscounting the PDC (known only by IP) and
+    its OWN FQDN as two DCs, the PDC's FQDN is stamped onto the primary DC
+    field-group (``dc_fqdn``) when known — so the PDC's IP and FQDN fold into one
+    record and only the *additional* DCs count as alternates.
+
+    Best-effort and idempotent: a re-run adds no duplicates; a domain with no
+    enumerated set (graceful degradation) records the reason and keeps today's
+    PDC-only view.
+    """
+    if not isinstance(getattr(shell, "domains_data", None), dict):
+        return
+    domain_info = shell.domains_data.get(domain)
+    if not isinstance(domain_info, dict):
+        return
+
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        hosts_match,
+    )
+
+    if degraded_reason:
+        domain_info["dc_set_enum_status"] = degraded_reason
+
+    # Stamp the primary DC FQDN so the PDC IP<->FQDN link exists for the resolver.
+    primary_fqdn = str(primary_dc_fqdn or "").strip()
+    if primary_fqdn and not str(domain_info.get("dc_fqdn") or "").strip():
+        domain_info["dc_fqdn"] = primary_fqdn
+
+    if not dc_fqdns:
+        return
+
+    existing = domain_info.get("dcs")
+    if not isinstance(existing, list):
+        existing = []
+    added = 0
+    for fqdn in dc_fqdns:
+        text = str(fqdn or "").strip()
+        if not text:
+            continue
+        # Skip if an existing entry already aliases this DC (IP/short/FQDN aware).
+        if any(hosts_match(text, str(e or "").strip()) for e in existing if e):
+            continue
+        existing.append(text)
+        added += 1
+    domain_info["dcs"] = existing
+
+    if added:
+        print_info_debug(
+            f"[trust] Recorded {added} additional DC(s) for "
+            f"{mark_sensitive(domain, 'domain')} from its Configuration NC "
+            f"(full DC set now {len(existing)})."
+        )
+
+
+def _persist_trust_records_to_domains_data(
+    shell: DomainShell, trusts: list[Any]
+) -> None:
+    """Store decoded trust records into ``domains_data[<source>]["trusts"]``.
+
+    Each :class:`TrustRelationship` (or its already-serialized dict form) is
+    grouped by its ``source_domain`` — the domain whose ``trustedDomain`` object
+    it was read from — so a recursive multi-domain enumeration lands every trust
+    under the domain that actually owns its TDO. This is the durable SSOT the
+    attack-graph cross-forest coupling reads on load; without it the decoded
+    ``trust_attributes`` / ``attribute_flags`` (including
+    ``CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION``) live only in the in-memory
+    enumeration result and never reach the graph load path.
+
+    Idempotent: replaces the ``trusts`` list for each touched source domain with
+    the freshly enumerated records (de-duplicated by ``target_domain``).
+    """
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict) or not trusts:
+        return
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trust in trusts:
+        record = trust.to_dict() if hasattr(trust, "to_dict") else trust
+        if not isinstance(record, dict):
+            continue
+        source_domain = str(record.get("source_domain") or "").strip()
+        if not source_domain:
+            continue
+        grouped.setdefault(source_domain, []).append(record)
+
+    for source_domain, records in grouped.items():
+        entry = domains_data.get(source_domain)
+        if not isinstance(entry, dict):
+            entry = {}
+            domains_data[source_domain] = entry
+        # De-duplicate by target domain, last write wins (freshest enumeration).
+        deduped: dict[str, dict[str, Any]] = {}
+        for record in records:
+            key = str(record.get("target_domain") or "").strip().lower()
+            deduped[key or str(len(deduped))] = record
+        entry["trusts"] = list(deduped.values())
+
+
 def _handle_trust_enumeration_result(
     shell: DomainShell,
     *,
@@ -803,6 +1094,9 @@ def _handle_trust_enumeration_result(
     discovered_domains: list[str],
     domain_pdc_mapping: dict[str, str],
     cross_domain_unreachable: set[str] | None = None,
+    domain_dc_sets: dict[str, list[str]] | None = None,
+    dc_set_degraded_reasons: dict[str, str] | None = None,
+    domain_dc_fqdns: dict[str, str] | None = None,
 ) -> None:
     """Process recursive trust enumeration results and update domain state.
 
@@ -812,12 +1106,33 @@ def _handle_trust_enumeration_result(
             These are forced to the discovered-but-unreachable path: no
             sub-workspace, no persisted PDC, no resolver/hosts entry, not offered
             for full enumeration — and any prior-run poison line is cleaned.
+        domain_dc_sets: Per-domain full DC set (FQDNs) discovered from each
+            domain's OWN Configuration NC during enumeration. Merged into
+            ``domains_data[<domain>]["dcs"]`` so ``resolve_domain_controllers``
+            reports the true count for a multi-DC trusted forest. A domain
+            absent here degraded gracefully to the PDC-only view.
+        dc_set_degraded_reasons: Per-domain reason a full DC set could not be
+            enumerated (recorded on the domain for auditability; never blocks).
     """
+    dc_sets = domain_dc_sets or {}
+    dc_degraded = dc_set_degraded_reasons or {}
+    dc_fqdns = domain_dc_fqdns or {}
     unreachable_realms = {
         name.strip().lower()
         for name in (cross_domain_unreachable or set())
         if name and name.strip()
     }
+    # Persist the decoded trust records into ``domains_data`` (the canonical SSOT
+    # the attack-graph cross-forest coupling and ``resolve_domain_controllers``
+    # read). Keyed by each trust's OWN source domain so a multi-domain forest
+    # enumeration lands each trust under the domain whose TDO it belongs to. This
+    # is what carries ``trust_attributes`` / ``attribute_flags`` (incl.
+    # CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION) durably to the graph load path.
+    try:
+        _persist_trust_records_to_domains_data(shell, trusts)
+    except Exception as exc:  # noqa: BLE001 — never break trust-enum on persist
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     try:
 
         def _domain_reachable_from_current_vantage(candidate_domain: str) -> bool:
@@ -983,6 +1298,17 @@ def _handle_trust_enumeration_result(
                     interactive=False,
                     make_active=False,
                 )
+                # Merge this domain's FULL DC set (FQDNs from its own
+                # Configuration NC) alongside the PDC that finalize_domain_context
+                # just appended, so resolve_domain_controllers() sees the true
+                # multi-DC topology of a trusted forest instead of count==1.
+                _merge_domain_dc_set(
+                    shell,
+                    main_domain,
+                    dc_sets.get(main_domain, []),
+                    dc_degraded.get(main_domain),
+                    primary_dc_fqdn=dc_fqdns.get(main_domain),
+                )
 
         from adscan_internal import (
             create_domains_table,
@@ -1125,6 +1451,7 @@ def _handle_trust_enumeration_result(
                     all_reachable,
                     source_domain=domain,
                     phase1_complete_domains=phase1_complete_set,
+                    shell=shell,
                 )
             _persist_scope_selection(
                 shell,

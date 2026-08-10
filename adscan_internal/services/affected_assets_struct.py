@@ -11,8 +11,8 @@ strings.
 The contract (one entity per affected asset)::
 
     {
-      "type":       "user" | "computer" | "domain" | "template" | "ca"
-                    | "share" | "artifact" | "credential",
+      "type":       "user" | "computer" | "group" | "domain" | "template"
+                    | "ca" | "share" | "artifact" | "credential",
       "identifier": <stable join key>,   # sAMAccountName / FQDN / template name…
       "display":    <human label>,       # "MEEREEN.ESSOS.LOCAL (192.168.180.12)"
       "role":       "source" | "target" | "affected",
@@ -57,6 +57,7 @@ from adscan_internal.services.affected_asset_rules import (
 )
 from adscan_internal.services.affected_assets import (
     PLACEHOLDER_ASSET_TOKENS,
+    SERIALIZED_ENTITIES_KEY,
     _adcs_template_names,
     _details_view,
     _drop_direct_domain_breaker_assets,
@@ -72,6 +73,7 @@ from adscan_internal.services.affected_assets import (
 # Entity type constants — the typed axis the platform correlates on.
 TYPE_USER = "user"
 TYPE_COMPUTER = "computer"
+TYPE_GROUP = "group"
 TYPE_DOMAIN = "domain"
 TYPE_TEMPLATE = "template"
 TYPE_CA = "ca"
@@ -87,7 +89,7 @@ ROLE_AFFECTED = "affected"
 # structured entities into ``technical_report.json``. The web ingestion reads
 # this key directly off ``finding.details`` (see ingestion_service) — it is the
 # single contract between the engine and the platform for affected assets.
-SERIALIZED_KEY = "_affected_assets_struct"
+SERIALIZED_KEY = SERIALIZED_ENTITIES_KEY
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +105,7 @@ class AffectedAssetEntity:
 
     * user → sAMAccountName
     * computer → FQDN (falls back to the short host / sAMAccountName)
+    * group → sAMAccountName
     * domain → the domain name
     * template → the certificate-template name
     * ca → the Enterprise CA name
@@ -271,9 +274,16 @@ def _is_dc_node(node: Mapping[str, Any], props: Mapping[str, Any]) -> bool:
 def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
     """Build an :class:`AssetIndex` from a parsed ``attack_graph.json`` graph.
 
-    Indexes every Computer and User node so a finding's bare sAMAccountName /
-    SID resolves to its FQDN + IP (+ SID / UPN). Never raises on a malformed
-    graph — a missing field simply leaves that enrichment empty.
+    Indexes every Computer, User and Group node so a finding's bare
+    sAMAccountName / SID resolves to its FQDN + IP (+ SID / UPN). Never raises
+    on a malformed graph — a missing field simply leaves that enrichment empty.
+
+    Groups are indexed for the same reason hosts are: a name on its own does
+    not say what kind of object it is. ``ACCOUNT OPERATORS`` and
+    ``DOMAIN USERS`` are groups, and the only thing distinguishing them from an
+    account with a space in its name is the directory itself. Without them in
+    the index every ADCS enrolling group reached the client's asset inventory
+    filed as a user.
     """
     index = AssetIndex(domain=str(graph.get("domain") or ""))
     nodes = graph.get("nodes")
@@ -288,7 +298,7 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
         if not isinstance(node, dict):
             continue
         kind = str(node.get("kind") or "").strip().lower()
-        if kind not in ("computer", "user"):
+        if kind not in ("computer", "user", "group"):
             continue
         props = _node_props(node)
         sam = str(props.get("samaccountname") or "").strip()
@@ -312,7 +322,7 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
             index._register(resolved, is_dc=_is_dc_node(node, props))
         else:
             resolved = _ResolvedNode(
-                kind=TYPE_USER,
+                kind=TYPE_GROUP if kind == "group" else TYPE_USER,
                 samaccountname=sam,
                 name=str(props.get("name") or node.get("label") or "").strip(),
                 sid=sid,
@@ -483,7 +493,10 @@ def _entity_for_principal(
             qualifier,
         )
 
-    # User principal.
+    # Account or group principal. Which of the two it is comes from the
+    # directory (the asset index), never from the shape of the name: a group
+    # called ``SPYS`` and an account called ``sql_svc`` are indistinguishable as
+    # strings, and guessing puts groups in the client's user inventory.
     sam = (node.samaccountname if node else "") or _strip_realm(text)
     sid = (node.sid if node else "") or sid_hint
     upn = node.upn if node else ""
@@ -492,7 +505,7 @@ def _entity_for_principal(
         display = f"{sam} ({upn})"
     return _qualified_entity(
         AffectedAssetEntity(
-            type=TYPE_USER,
+            type=TYPE_GROUP if node is not None and node.kind == TYPE_GROUP else TYPE_USER,
             identifier=sam,
             display=display,
             role=role,
@@ -911,6 +924,86 @@ def serialize_affected_asset_entities(
     return [entity.to_dict() for entity in entities]
 
 
+# --------------------------------------------------------------------------- #
+# Reading the serialized entities back                                         #
+# --------------------------------------------------------------------------- #
+
+
+def load_serialized_entities(details: Any) -> list[dict[str, Any]]:
+    """Return the typed entities a finding carries under :data:`SERIALIZED_KEY`.
+
+    The finalization pass writes these into ``technical_report.json``, so any
+    renderer downstream of it can read the RESOLVED type and display of an
+    asset instead of re-deriving them from a name. Returns ``[]`` for a finding
+    that was never stamped, so callers keep their existing behaviour.
+    """
+    view = _details_view(details)
+    raw = view.get(SERIALIZED_KEY)
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _entity_alias_tokens(entity: Mapping[str, Any]) -> set[str]:
+    """Return every token that should resolve to *entity*.
+
+    A finding names the same object in whichever spelling its detector had: the
+    bare sAMAccountName, ``HOST$@REALM`` from an LDAP read, an IP from a
+    coercion probe, the FQDN from DNS. All of them have to reach the one
+    resolved entity, or the lookup silently misses and the caller falls back to
+    the raw string it was trying to improve on.
+    """
+    tokens: set[str] = set()
+    for raw in (
+        entity.get("identifier"),
+        entity.get("display"),
+        entity.get("fqdn"),
+        entity.get("ip"),
+        entity.get("sid"),
+        entity.get("upn"),
+        entity.get("node_id"),
+    ):
+        token = _norm_key(raw)
+        if not token:
+            continue
+        tokens.add(token)
+        tokens.add(_strip_realm(token))
+    fqdn = _norm_key(entity.get("fqdn"))
+    if fqdn:
+        short = fqdn.split(".", 1)[0]
+        if short:
+            tokens.add(short)
+            tokens.add(f"{short}$")
+    identifier = _norm_key(entity.get("identifier"))
+    if identifier:
+        tokens.add(identifier.rstrip("$"))
+    return {token for token in tokens if token}
+
+
+def build_serialized_entity_index(details: Any) -> dict[str, dict[str, Any]]:
+    """Return an alias-aware lookup over a finding's serialized entities.
+
+    Maps every spelling of an object (sAMAccountName, ``HOST$``, short name,
+    FQDN, IP, SID, node id) to the typed entity the engine resolved for it.
+    Empty when the finding carries no entities.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for entity in load_serialized_entities(details):
+        for token in _entity_alias_tokens(entity):
+            index.setdefault(token, entity)
+    return index
+
+
+def resolve_serialized_entity(
+    index: Mapping[str, dict[str, Any]], token: Any
+) -> dict[str, Any] | None:
+    """Return the typed entity a raw principal token names, or ``None``."""
+    text = _norm_key(token)
+    if not text:
+        return None
+    return index.get(text) or index.get(_strip_realm(text))
+
+
 def stamp_structured_affected_assets(
     findings: list[dict[str, Any]],
     *,
@@ -986,11 +1079,56 @@ def stamp_structured_affected_assets(
     return changed
 
 
+def stamp_report_vulnerabilities(
+    vulnerabilities: Any,
+    *,
+    domain_name: str,
+    index: AssetIndex | None,
+    attack_paths: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Stamp the typed entities onto an in-memory report's vulnerability map.
+
+    :func:`stamp_workspace_affected_assets` writes the on-disk contract the
+    platform ingests. This is its in-memory twin, for the render that is
+    happening right now: the report builder loads ``technical_report.json``
+    into ``{vuln_key: flattened_details}`` BEFORE the stamp runs, so without
+    this the document being written would keep whatever entities the previous
+    run left behind — a full render out of date by exactly one report. That is
+    how a rebuilt kit could name a certificate template's enrolling groups
+    correctly in the machine-readable appendix and by their previous, wrong
+    resolution in the PDF prose beside it.
+
+    Returns ``True`` when anything changed. Best-effort; never raises.
+    """
+    if not isinstance(vulnerabilities, dict) or not vulnerabilities:
+        return False
+    # The report's flattened detail dict IS the finding's details here, so the
+    # adapter holds references and the stamp mutates the render's own data.
+    findings = [
+        {"key": key, "details": details}
+        for key, details in vulnerabilities.items()
+        if isinstance(details, dict)
+    ]
+    if not findings:
+        return False
+    for finding in findings:
+        # The builder caches the FLAT asset list on the entry, and the flat
+        # extractor returns that cache ahead of everything else. Its input has
+        # just been recomputed, so the cache is stale by definition — leaving it
+        # is what let the PDF's asset list and the appendix's disagree about the
+        # same finding in the same kit.
+        finding["details"].pop("_affected_assets", None)
+    return stamp_structured_affected_assets(
+        findings, domain_name=domain_name, index=index, attack_paths=attack_paths
+    )
+
+
 def stamp_workspace_affected_assets(
     workspace_dir: str | Path,
     domain_name: str,
     *,
     attack_paths: list[dict[str, Any]] | None = None,
+    index: AssetIndex | None = None,
 ) -> bool:
     """Resolve and persist one domain's affected assets in ``technical_report.json``.
 
@@ -1010,6 +1148,9 @@ def stamp_workspace_affected_assets(
         attack_paths: That domain's computed attack paths, so ADCS templates and
             CAs resolved from a path reach the entities too. ``None`` when the
             caller has not computed them.
+        index: A pre-built asset index, when the caller already has one (a
+            report render stamps the file and its own in-memory copy from the
+            same index rather than parsing the graph twice).
 
     Returns:
         ``True`` when at least one finding's entities changed and the report was
@@ -1035,7 +1176,9 @@ def stamp_workspace_affected_assets(
         if stamp_structured_affected_assets(
             findings,
             domain_name=domain_name,
-            index=load_asset_index(workspace_dir, domain_name),
+            index=index if index is not None else load_asset_index(
+                workspace_dir, domain_name
+            ),
             attack_paths=attack_paths,
         ):
             _save_technical_report(shell, report)

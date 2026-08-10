@@ -38,12 +38,52 @@ def get_workspace_cwd(shell: WorkspaceCwdShell) -> str:
     Returns:
         The workspace directory path, or current working directory if no workspace is active
     """
-    return shell.current_workspace_dir or os.getcwd()
+    # ``current_workspace_dir`` is declared as a class attribute defaulting to
+    # ``None`` on ``PentestShell``, so ``getattr(shell, ..., os.getcwd())`` at a
+    # call site would never fall through — the attribute always exists. Read it
+    # defensively and treat ``None``/empty/absent all as "no workspace selected".
+    return getattr(shell, "current_workspace_dir", None) or os.getcwd()
+
+
+def resolve_workspace_cwd(shell: object) -> str:
+    """Resolve the workspace root for filesystem operations, with a CWD fallback.
+
+    Single source of truth for the recurring idiom::
+
+        shell._get_workspace_cwd()
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", os.getcwd())
+
+    The bare ``getattr(..., os.getcwd())`` fallback in that idiom is a latent
+    bug: because ``PentestShell.current_workspace_dir`` is a class attribute
+    defaulting to ``None``, ``getattr`` returns that ``None`` instead of falling
+    through to ``os.getcwd()``. The ``None`` then reaches ``os.path.join`` and
+    raises ``TypeError``, which broad ``except`` blocks swallow — silently
+    degrading every workspace-reading feature when no workspace is selected.
+
+    Resolution order:
+        1. ``shell._get_workspace_cwd()`` when the shell provides it (the CLI
+           shell's stable resolver, which already handles the ``None`` case).
+        2. Otherwise ``current_workspace_dir`` when set to a non-empty value.
+        3. Otherwise ``os.getcwd()`` — correct in production, where the process
+           CWD is the workspace root inside the container.
+
+    Args:
+        shell: CLI shell instance (or any object carrying the workspace state).
+
+    Returns:
+        The resolved workspace directory path.
+    """
+    getter = getattr(shell, "_get_workspace_cwd", None)
+    if callable(getter):
+        return str(getter())
+    return get_workspace_cwd(shell)  # type: ignore[arg-type]
 
 
 __all__ = [
     "domain_dir",
     "get_workspace_cwd",
+    "resolve_workspace_cwd",
     "workspace_dir",
     "workspace_variables_path",
 ]

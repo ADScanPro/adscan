@@ -1244,6 +1244,7 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
     rich==15.0.0 \
     python-docx==1.2.0 \
     openpyxl==3.1.5 \
+    pdfplumber==0.11.10 \
     netifaces==0.11.0 \
     certifi==2026.1.4 \
     ipaddress==1.0.23 \

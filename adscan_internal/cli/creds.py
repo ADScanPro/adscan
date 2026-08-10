@@ -3147,8 +3147,16 @@ def add_credential(
                 )
 
         if credential_verified:
-            # Track credential count for case study metrics
-            if hasattr(shell, "_session_credentials_count"):
+            # Track credential count for case study metrics. A self-introduced
+            # credential (the scan's own starting credential or a manual
+            # ``creds save``) is the INPUT, not a compromise win — counting it
+            # would claim a credential was "obtained" that the operator typed
+            # in, and inflate the activation metric with operator input. Same
+            # gate as the ``first_cred_found`` capture and the
+            # identity-compromise event above.
+            if not is_self_introduced_credential and hasattr(
+                shell, "_session_credentials_count"
+            ):
                 shell._session_credentials_count += 1
 
             # Mark the verified user as owned in BloodHound (best-effort, non-blocking).
@@ -3974,7 +3982,7 @@ def _check_local_creds_native_nonsmb(
             "Target Host": host,
             "Service": service.upper(),
             "Username": username,
-            cred_type: cred_value,
+            cred_type: mark_sensitive(cred_value, "password"),
         },
         icon="🔑",
     )

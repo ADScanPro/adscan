@@ -2060,21 +2060,20 @@ def ensure_user_ccache(
         )
         return None
 
-    # Resolve the DC IP for the AS-REQ.
+    # Resolve the DC IP for the AS-REQ. ``domain`` is already the mint (home)
+    # realm here, so the KDC must be that realm's DC. Route through the
+    # ``resolve_dc_ip`` SSOT so the full fallback chain applies — including
+    # ``connectivity.summary.pdc_ip`` for a trust-partner realm discovered only via
+    # the cross-domain connectivity precheck (``pdc``/``dcs`` empty), which the raw
+    # ``.get("pdc") -> dcs[0]`` chain missed.
     if not dc_ip:
+        from adscan_internal.models.domain import resolve_dc_ip
+
         domain_record = (
             domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
         )
         if isinstance(domain_record, dict):
-            dc_ip = (
-                domain_record.get("pdc")
-                or (
-                    domain_record.get("dcs")[0]
-                    if isinstance(domain_record.get("dcs"), list)
-                    and domain_record["dcs"]
-                    else None
-                )
-            )
+            dc_ip = resolve_dc_ip(domain_record)
 
     result = service.auto_generate_tgt(
         username=user,

@@ -79,7 +79,7 @@ Honesty (CLAUDE.md § Nomenclature Standard):
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -104,6 +104,10 @@ from adscan_core.posture_score import (
     PostureInputs,
     PostureScore,
     compute_posture_score,
+)
+from adscan_core.reporting.attack_path_memory_gate import merge_attack_path_coverage
+from adscan_core.reporting.host_enrichment_coverage import (
+    merge_host_enrichment_coverage,
 )
 from adscan_core.reporting.domain_scope import (
     classify_report_domains,
@@ -158,6 +162,7 @@ from adscan_internal.services.environment_change_ledger import (
 )
 from adscan_internal.services.exposure_score_service import (
     DomainUserReach,
+    aggregate_tier0_population,
     derive_domain_user_reach,
     derive_posture_path_inputs,
 )
@@ -193,6 +198,23 @@ _LITE_REPO_URL = "https://github.com/ADScanPro/adscan"
 #: The house theme. Warm bone paper, editorial serif display, one deep-teal
 #: accent — the same tokens the paid deliverable renders on.
 LITE_THEME = "editorial"
+
+#: The label above the reference-environment note. Also the string the tests
+#: look for when they assert an ordinary render carries no such note.
+REFERENCE_ENVIRONMENT_LABEL = "About this environment"
+
+#: The half of the reference-environment note the caller does NOT get to write.
+#: Whoever publishes a sample supplies the description of the environment; this
+#: sentence is fixed, because the reason the note exists at all is to convert
+#: "obviously a training lab" into evidence that the document was not staged.
+#: It also settles the two accounts a reader will spot — the login the
+#: assessment ran as, and any credential it recovered: they are in the tables
+#: because the report does not special-case its own footprint, and hiding them
+#: would make the sample less honest, not more presentable.
+REFERENCE_ENVIRONMENT_ASSURANCE = (
+    "Everything below is that scan's real output, including the account the "
+    "assessment itself ran as."
+)
 
 
 # --- Status presentation (client-safe, doctrine-legal) ----------------------
@@ -485,6 +507,31 @@ class LiteReportModel:
     #: the one persisted logo. Suppressing the ADscan mark (full white-label) is a
     #: separate paid boundary and is deliberately NOT done here.
     client_logo_uri: str = ""
+    #: One sentence describing the environment this report was produced from,
+    #: set ONLY when the document is a published sample rather than an
+    #: assessment of someone's estate. Empty on every scan: no product code
+    #: path fills it, no flag reaches it and no workspace file declares it —
+    #: the only caller that can is the sample generator under ``scripts/``,
+    #: which is not part of the runtime. That is deliberate. A consultancy
+    #: report that told a client their own directory was a reference lab would
+    #: be far worse than the objection this paragraph answers, so the field
+    #: cannot be reached from anywhere a client engagement runs.
+    #: See :data:`REFERENCE_ENVIRONMENT_ASSURANCE` for the half the caller does
+    #: not get to write.
+    reference_environment: str = ""
+    #: Client-facing coverage boundary for attack-path discovery, set ONLY when
+    #: discovery had to stop under a memory ceiling in one or more domains. Empty
+    #: on a complete run — the attack-paths section then reads exactly as before.
+    #: A bounded run states the boundary so it never reads as exhaustive. SSOT:
+    #: :mod:`adscan_core.reporting.attack_path_memory_gate`.
+    attack_path_coverage_statement: str = ""
+    #: Client-facing coverage boundary for the SMB host-enrichment sweep, set ONLY
+    #: when the sweep was bounded on a large directory (a scale-gate cap or skip,
+    #: or an operator early stop) in one or more domains. Empty on a full sweep —
+    #: the section then reads exactly as before. A bounded sweep states the
+    #: boundary so it never reads as exhaustive; the identity graph is always 100%.
+    #: SSOT: :mod:`adscan_core.reporting.host_enrichment_coverage`.
+    host_enrichment_coverage_statement: str = ""
     pro_url: str = _PRO_URL
     repo_url: str = _LITE_REPO_URL
 
@@ -1345,20 +1392,147 @@ def build_verdict(*, paths_to_da: int, paths_total: int) -> tuple[str, str, str]
     )
 
 
-def build_verdict_reach(reach: DomainUserReach) -> str:
+def _build_sprawl_lead(sprawl: Mapping[str, Any], reach: DomainUserReach) -> str:
+    """Compose the SPRAWL headline, with path exposure demoted to its tail.
+
+    Used only where the engine set ``leads`` — a quarter or more of the account
+    population already holds Tier 0, or nobody is left outside it. There the
+    question the path figure answers, does the tier separation hold, has no
+    subject: these accounts need no route because they are the destination.
+
+    The tail states what remains. Where no ordinary population is left, saying
+    so is the honest reading and "0 of 0" is not — that shape is real, a
+    production domain where every user sat in a Tier 0 escalation group, and it
+    is the most severe finding available.
+
+    The tail's denominator is the sprawl stat's own ``ordinary_count``, not
+    :attr:`DomainUserReach.ordinary_total`. The two answer the same question
+    from different evidence and only agree when every Tier 0 account happens to
+    hold a path: the reach figure subtracts the Tier 0 accounts it OBSERVED on a
+    path, which is deliberately conservative where the population's split is
+    unknown, while here it is known and stated in the very same sentence. Taking
+    the reach denominator would print "40 already hold Tier 0 … of the remaining
+    88" against a hundred accounts — a sentence that contradicts its own
+    arithmetic.
+    """
+    count = int(sprawl.get("tier0_count", 0) or 0)
+    total = int(sprawl.get("domain_user_count", 0) or 0)
+    ordinary_total = int(sprawl.get("ordinary_count", 0) or 0)
+    pct = round(float(sprawl.get("pct", 0.0) or 0.0))
+    accounts = "account" if total == 1 else "accounts"
+    holds = "holds" if count == 1 else "hold"
+    lead = (
+        f"{count} of {total} domain user {accounts} ({pct}%) already "
+        f"{holds} Tier 0 privilege by group membership — none of them needs an "
+        f"attack path; each one is the destination."
+    )
+    if sprawl.get("degenerate") or ordinary_total <= 0:
+        return (
+            f"{lead} No account sits outside the administrative tier, so there "
+            f"is no ordinary population left for path exposure to be measured "
+            f"against."
+        )
+    # Cap at the population that is genuinely ordinary. The reach figure counts
+    # accounts observed on a path; if its Tier 0 attribution is lower than the
+    # population's, the surplus lands here and would otherwise read as more
+    # ordinary accounts exposed than exist.
+    affected = min(reach.ordinary_affected, ordinary_total)
+    if reach.ordinary_available and affected > 0:
+        remaining = "account" if ordinary_total == 1 else "accounts"
+        also = "has" if affected == 1 else "have"
+        return (
+            f"{lead} {affected} of the remaining {ordinary_total} ordinary "
+            f"(non-administrative) {remaining} also {also} a validated path to "
+            f"full domain compromise."
+        )
+    return (
+        f"{lead} Tier separation is the finding here; path exposure is measured "
+        f"against what remains of it."
+    )
+
+
+def _build_sprawl_tail(sprawl: Mapping[str, Any] | None) -> str:
+    """Count the population the ordinary headline left out, in one clause.
+
+    The ordinary figure excludes the accounts that already hold Tier 0, which is
+    only defensible while the reader can see how many that is — otherwise the
+    exclusion hides the population rather than cleaning the number. The paid
+    report prints this same clause beside its own headline; the free one must
+    not be the surface that omits it.
+
+    Empty when the artifact carries no graded population (an older scan), so an
+    absent figure stays absent rather than being reported as zero.
+    """
+    if not sprawl or not sprawl.get("available"):
+        return ""
+    count = int(sprawl.get("tier0_count", 0) or 0)
+    total = int(sprawl.get("domain_user_count", 0) or 0)
+    if count <= 0 or total <= 0:
+        return ""
+    pct = round(float(sprawl.get("pct", 0.0) or 0.0))
+    accounts = "account" if total == 1 else "accounts"
+    holds = "holds" if count == 1 else "hold"
+    excluded = "is" if count == 1 else "are"
+    return (
+        f" A further {count} of the {total} {accounts} assessed ({pct}%) "
+        f"already {holds} Tier 0 privilege by group membership and {excluded} "
+        f"excluded from the figure above."
+    )
+
+
+def build_verdict_reach(
+    reach: DomainUserReach, sprawl: Mapping[str, Any] | None = None
+) -> str:
     """Compose the account-population line that sits under the verdict.
 
-    "25 of 31 paths" counts inventory. "10 of 10 domain users hold a validated
-    path to full domain compromise" counts people, which is the unit the reader
-    owns and the one that makes the finding land. The figures come from the
-    engine-stamped KPI block via the shared derivation, never recomputed.
+    "25 of 31 paths" counts inventory. "6 of 6 ordinary domain user accounts
+    have a validated path to full domain compromise" counts people, which is the
+    unit the reader owns and the one that makes the finding land. The figures
+    come from the engine-stamped KPI block via the shared derivation, never
+    recomputed.
 
-    Returns an empty string when the artifact carries no KPI block or nobody is
-    affected: a document that says nothing there is honest, one that prints a
+    Two figures, and which one leads is the engine's call, not this renderer's:
+
+    * PRIVILEGE SPRAWL — how many accounts already hold Tier 0 — answers *do you
+      have tiering at all?* It takes the headline where
+      :func:`~adscan_internal.services.compromise_class.derive_tier0_population_stat`
+      set ``leads``, because a domain where a quarter of the population is
+      already inside the containment boundary has no separation left for the
+      path figure to interrogate.
+    * PATH EXPOSURE — how many ORDINARY accounts reach Tier 0 through a route —
+      answers *does your tiering hold?* It leads otherwise, and it excludes the
+      already-privileged accounts from both numerator and denominator, because
+      a domain administrator "reaching" full domain compromise is the
+      directory's own hierarchy restated. That exclusion is reported with its
+      count beside it (see :func:`_build_sprawl_tail`), which is what makes it
+      cleaning the number rather than hiding the population.
+
+    Both figures, the precedence between them and the wording are the ones the
+    paid report and the platform print, so one scan cannot yield three different
+    readings of one fact. The plain reach figure stays as the fallback for an
+    artifact whose Tier split did not reconcile.
+
+    Returns an empty string when the artifact carries no KPI block and no graded
+    population: a document that says nothing there is honest, one that prints a
     zero it cannot stand behind is not.
     """
+    sprawl_leads = bool(sprawl and sprawl.get("available") and sprawl.get("leads"))
+    if sprawl_leads and sprawl is not None:
+        return _build_sprawl_lead(sprawl, reach)
     if not reach.available or reach.affected <= 0 or reach.total <= 0:
         return ""
+    if reach.ordinary_available and reach.ordinary_affected > 0:
+        accounts = "account" if reach.ordinary_total == 1 else "accounts"
+        lead = (
+            f"{reach.ordinary_affected} of {reach.ordinary_total} ordinary "
+            f"(non-administrative) domain user {accounts} have a validated path "
+            f"to full domain compromise"
+        )
+        if reach.ordinary_affected >= reach.ordinary_total:
+            sentence = f"{lead}: every account outside the administrative tier."
+        else:
+            sentence = f"{lead} ({reach.ordinary_pct:g}% of them)."
+        return f"{sentence}{_build_sprawl_tail(sprawl)}"
     accounts = "account" if reach.total == 1 else "accounts"
     lead = (
         f"{reach.affected} of {reach.total} domain user {accounts} "
@@ -1403,6 +1577,7 @@ def build_report_model(
     environment_changes: Optional[EnvironmentChangeResolution] = None,
     client_logo_uri: str = "",
     obligations: Sequence[dict[str, Any]] = (),
+    reference_environment: str = "",
 ) -> LiteReportModel:
     """Build the fully-resolved, client-safe report model from loaded data.
 
@@ -1424,6 +1599,15 @@ def build_report_model(
     (see :func:`~adscan_internal.services.post_compromise_obligations.load_post_compromise_obligations`).
     It is a parameter for the same reason: deriving it reads the workspace
     credential store, and this builder stays pure.
+
+    ``reference_environment`` is for ONE caller: the sample generator that
+    produces the published example report. Pass it and the document opens by
+    naming the lab it was scanned from; leave it and the document says nothing
+    of the kind. **Do not wire it to a flag, a config key or a workspace
+    marker.** A client engagement must have no route to it at all — being told
+    your own directory is a reference lab would be a far worse defect than the
+    objection the note answers — and "there is no route" is a property this
+    parameter has only while its sole caller lives outside the runtime.
     """
     domains = technical_report.get("domains")
     if not isinstance(domains, dict):
@@ -1461,7 +1645,15 @@ def build_report_model(
     verdict_figure, verdict_text, verdict_tone = build_verdict(
         paths_to_da=inputs.paths_to_da, paths_total=paths_total
     )
-    verdict_reach = build_verdict_reach(derive_domain_user_reach(domains))
+    # Two figures off one artifact: how many ordinary accounts REACH Tier 0,
+    # and how many are already IN it. The second is what makes excluding the
+    # administrators from the first defensible, and where it is pathological it
+    # takes the headline — the engine decides which, so the free document, the
+    # paid one and the platform cannot read one scan three ways.
+    verdict_reach = build_verdict_reach(
+        derive_domain_user_reach(domains),
+        aggregate_tier0_population(domains),
+    )
 
     return LiteReportModel(
         workspace_name=workspace_name,
@@ -1506,6 +1698,13 @@ def build_report_model(
         finding_assets=finding_assets,
         client_logo_uri=client_logo_uri,
         obligations=tuple(obligations),
+        reference_environment=str(reference_environment or "").strip(),
+        attack_path_coverage_statement=(
+            merge_attack_path_coverage(domains.values()).get("statement") or ""
+        ),
+        host_enrichment_coverage_statement=(
+            merge_host_enrichment_coverage(domains.values()).get("statement") or ""
+        ),
     )
 
 
@@ -1606,6 +1805,8 @@ def render_report_html(model: LiteReportModel, *, webfonts: bool = False) -> str
     return template.render(
         m=model,
         design_css=load_design_css(LITE_THEME, webfonts=webfonts),
+        reference_environment_label=REFERENCE_ENVIRONMENT_LABEL,
+        reference_environment_assurance=REFERENCE_ENVIRONMENT_ASSURANCE,
     )
 
 
@@ -2246,6 +2447,38 @@ _TEMPLATE = r"""<!DOCTYPE html>
 }
 .masthead .ds-meta { padding-bottom: 5mm; border-bottom: 1px solid var(--line-2); }
 
+/* ── Reference-environment note (published samples only) ─────────────────
+   Set as an apparatus note, not as content: it sits between the masthead and
+   the verdict, at the smallest size in the document, so it answers "what am I
+   looking at" without competing with the figure the page is built around.
+   Kept whole across a page break — three lines of provenance split over two
+   sheets would undercut the credibility it exists to establish. */
+.refenv {
+  margin-top: 3mm; page-break-inside: avoid; break-inside: avoid;
+}
+.refenv-k {
+  font-family: var(--font-mono); font-size: 6pt; font-weight: 700;
+  letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-4);
+  page-break-after: avoid; break-after: avoid;
+}
+/* Full column measure, matching the document's other apparatus type
+   (.ds-fineprint): a narrower one would run this note to four or five lines
+   and push the severity strip off page one, which lands it alone on page two. */
+.refenv-t {
+  font-size: 7.5pt; color: var(--text-3); line-height: 1.5;
+  margin-top: 1.2mm;
+}
+/* The note pays for its own height instead of charging it to the page.
+   Measured, because the arithmetic is the whole point: page one is 268mm of
+   printable column and its last element ends at 259mm, so there are 9mm going
+   spare and the note wants about 17. Left alone it evicts the severity strip,
+   which then holds page two by itself — a worse defect than the one the note
+   answers. So the cover's two largest gaps give back what the note takes.
+   Scoped to the adjacent sibling, so a real report — which never renders the
+   note — keeps its page-one rhythm to the millimetre. */
+.refenv + .lede .ds-verdict { margin-top: 5mm; }
+.refenv + .lede .ds-cols { margin-top: 6mm; }
+
 /* ── Lede: the verdict, then the ledger ─────────────────────────────────── */
 .lede { page-break-inside: avoid; }
 .lede .ds-verdict { max-width: 30ch; margin-top: 12mm; }
@@ -2340,9 +2573,22 @@ _TEMPLATE = r"""<!DOCTYPE html>
 .omitted a, .ds-fineprint a { color: var(--accent); font-weight: 600; text-decoration: none; }
 
 /* ── Containment obligations ────────────────────────────────────────────
-   What the proven compromise obliges. One card per obligation, each kept
-   whole across a page break so a heading never lands alone at a page foot
-   with its steps overleaf. */
+   What the proven compromise obliges. One card per obligation.
+
+   Pagination here needs two different rules, because `break-inside: avoid`
+   has a hard limit: Chromium drops the hint entirely once the box is taller
+   than the page box, and the certificate-revocation card is exactly that —
+   its procedure alone runs past a full page whenever the CA issued more than
+   one certificate. Asking a card that size to stay whole buys nothing, and
+   relying on it is how the caveat heading shipped alone at the foot of a page
+   with its two-line body stranded on the next.
+
+   So: a card asks to stay whole (it usually can), and separately EVERY
+   heading inside it carries `break-after: avoid`, which Chromium does honour
+   even when the block that follows is taller than a page — measured, not
+   assumed. Blocks short enough to fit a page also ask to stay whole. Between
+   them a heading can no longer be the last thing on a page, at any card
+   length. */
 .oblig {
   border-top: 2pt solid var(--critical); padding-top: 4mm; margin-top: 6mm;
   page-break-inside: avoid; break-inside: avoid;
@@ -2351,6 +2597,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
   font-family: var(--font-mono); font-size: 6.5pt; font-weight: 700;
   letter-spacing: 0.18em; text-transform: uppercase; color: var(--critical);
   margin-bottom: 1.4mm;
+  page-break-after: avoid; break-after: avoid;
 }
 .oblig-t {
   font-family: var(--font-display); font-size: 12pt; font-weight: 600;
@@ -2373,13 +2620,16 @@ ol.oblig-steps > li {
 .oblig-runbook-k {
   font-size: 6.5pt; font-weight: 700; letter-spacing: 0.2em;
   text-transform: uppercase; color: var(--text-4); margin-top: 3mm;
+  page-break-after: avoid; break-after: avoid;
 }
 .oblig-caveat {
   border-top: 1px solid var(--line); padding-top: 2.2mm; margin-top: 3mm;
+  page-break-inside: avoid; break-inside: avoid;
 }
 .oblig-caveat b {
   display: block; font-size: 6.5pt; font-weight: 700; letter-spacing: 0.2em;
   text-transform: uppercase; color: var(--text-4); margin-bottom: 1mm;
+  page-break-after: avoid; break-after: avoid;
 }
 
 /* ── Change disclosure ──────────────────────────────────────────────────── */
@@ -2481,6 +2731,20 @@ ol.oblig-steps > li {
       </div>
     </div>
   </header>
+
+  {# Only a PUBLISHED SAMPLE carries this, and only because a stranger reading
+     the document cold would otherwise place it themselves — a ten-account
+     domain with characters out of a novel reads as a training lab, and reads
+     as too small to say anything about a four-thousand-seat estate. Naming
+     the environment first turns that from a doubt into the reason the sample
+     exists: one document that shows every technique class. A real engagement
+     can never reach this block; see LiteReportModel.reference_environment. #}
+  {% if m.reference_environment %}
+  <section class="refenv">
+    <div class="refenv-k">{{ reference_environment_label }}</div>
+    <p class="refenv-t">{{ m.reference_environment }} {{ reference_environment_assurance }}</p>
+  </section>
+  {% endif %}
 
   <section class="lede">
     <p class="ds-verdict">
@@ -2707,6 +2971,18 @@ ol.oblig-steps > li {
         not succeed is never attributed to a defensive control.
       </p>
     </div>
+    {% if m.attack_path_coverage_statement %}
+    <div class="ds-note">
+      <div class="ds-note-k">Coverage limit</div>
+      <div class="ds-note-t">{{ m.attack_path_coverage_statement }}</div>
+    </div>
+    {% endif %}
+    {% if m.host_enrichment_coverage_statement %}
+    <div class="ds-note">
+      <div class="ds-note-k">Host enrichment scope</div>
+      <div class="ds-note-t">{{ m.host_enrichment_coverage_statement }}</div>
+    </div>
+    {% endif %}
     {% if m.paths %}
     {% for p in m.paths %}
     <div class="path">

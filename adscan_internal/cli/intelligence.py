@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Callable, TYPE_CHECKING, Any
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error,
+    print_info,
     print_info_debug,
     print_info_verbose,
     print_warning,
@@ -368,6 +369,91 @@ def _make_host_progress_callback(target_domain: str):
     return _callback
 
 
+def _make_host_stage_timing_beacon(shell: Any, target_domain: str):
+    """Build a telemetry beacon for the RUNNING SMB host-phase timing.
+
+    The post-collection ``native_collection_performance`` event only fires when
+    collection RETURNS, so a run that never completes — a large estate that runs
+    for hours and is then Ctrl+C'd, or an OOM ``SIGKILL`` — leaves no timing in
+    the field, exactly the case we most need to size. This beacon is invoked by
+    the host_collector on its 250-host progress tick AND on the abort/interrupt
+    drain with a snapshot of the live :class:`HostPhaseTiming`, and it FLUSHES
+    synchronously (:func:`telemetry.drain_telemetry_dispatch`) so the event
+    survives a ``SIGKILL`` / Ctrl+C landing right after — mirroring the
+    attack-path discovery beacon. All figures are counts or monotonic-measured
+    durations (stage sums, per-host p50/p95/max, outcome histogram, budget
+    timeouts) — no host names/IPs. Fully best-effort: it never raises into the
+    sweep.
+
+    The host_collector is a shell-free pure service, so the beacon is built here
+    (where ``shell`` and the event shape live) and injected as an opaque callable
+    — the same layering as ``host_progress_callback``.
+    """
+
+    def _beacon(timing: Any, done: int, total: int, *, flush: bool = False) -> None:
+        try:
+            from adscan_internal.services.collector.host_collector import (  # noqa: PLC0415
+                _percentile,
+            )
+
+            durations = list(getattr(timing, "per_host_durations", []) or [])
+            properties: dict[str, Any] = {
+                "domain": mark_sensitive(target_domain, "domain"),
+                "hosts_done": int(done),
+                "hosts_total": int(total),
+                "stage_negotiate_s": round(float(getattr(timing, "negotiate", 0.0)), 2),
+                "stage_samr_s": round(float(getattr(timing, "samr", 0.0)), 2),
+                "stage_shares_s": round(float(getattr(timing, "shares", 0.0)), 2),
+                "host_p50_s": round(_percentile(durations, 50), 2),
+                "host_p95_s": round(_percentile(durations, 95), 2),
+                "host_max_s": round(max(durations), 2) if durations else 0.0,
+                "budget_timeouts": int(getattr(timing, "host_budget_timeouts", 0)),
+                "host_outcomes": dict(getattr(timing, "outcome_counts", {}) or {}),
+            }
+            try:
+                from adscan_core.lab_context import (  # noqa: PLC0415
+                    build_workspace_telemetry_fields,
+                )
+
+                properties.update(
+                    build_workspace_telemetry_fields(
+                        workspace_type=getattr(shell, "type", None)
+                    )
+                )
+            except Exception:  # noqa: BLE001 — enrichment is best-effort.
+                pass
+            try:
+                from adscan_internal.cli.common import (  # noqa: PLC0415
+                    build_lab_event_fields,
+                )
+
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=False)
+                )
+            except Exception:  # noqa: BLE001 — lab fields are best-effort.
+                pass
+
+            telemetry.capture("native_collection_progress", properties)
+            # On the ABORT/interrupt drain, force the beacon onto the wire NOW so a
+            # SIGKILL / Ctrl+C landing right after cannot lose it — the atexit disk
+            # drain never runs under SIGKILL, so this bounded flush is what makes the
+            # final event survive (same as the attack-path discovery beacon). The
+            # periodic per-tick beacons stay BUFFERED (flush=False): a synchronous
+            # flush every 250 hosts would block the event loop up to 2.5s mid-sweep,
+            # and the normal dispatch drains them anyway; only the terminal drain
+            # (the run that never completes) needs the guaranteed send.
+            if flush:
+                try:
+                    telemetry.drain_telemetry_dispatch(total_timeout=2.5)
+                except Exception:  # noqa: BLE001 — flush is best-effort.
+                    pass
+        except Exception as exc:  # noqa: BLE001 — beacon must never abort collection
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    return _beacon
+
+
 def _resolve_host_cap(shell: Any) -> int:
     """Resolve the active-host cap from the scan config.
 
@@ -382,6 +468,84 @@ def _resolve_host_cap(shell: Any) -> int:
         return cap if cap > 0 else 0
     except Exception:  # noqa: BLE001 — a bad config must never break collection
         return 0
+
+
+def _resolve_post_host_sweep(
+    *,
+    shell: Any,
+    domain: str,
+    host_cancellation: Any,
+    domain_timings: Any,
+) -> str:
+    """Decide what to do after the per-host SMB sweep returns.
+
+    Only an OPERATOR early-stop over Ctrl+C (``requested_source == "cli"``) with
+    hosts left to enrich, in an INTERACTIVE run, gets the decision prompt. Every
+    other outcome — a completed sweep, a platform-sentinel stop, a proactive
+    scale-gate cap/skip, or a non-interactive run — returns ``"stop"`` so the
+    scan simply continues with whatever was collected.
+
+    Returns one of ``"continue"`` / ``"stop"`` / ``"exit"``. On ``"exit"`` this
+    raises ``KeyboardInterrupt`` (the ONLY exit path, and only ever reached by a
+    deliberate menu choice), so it never returns ``"exit"`` to the caller.
+    """
+    from adscan_internal.cli.host_sweep_decision import (  # noqa: PLC0415
+        DECISION_CONTINUE,
+        DECISION_EXIT,
+        DECISION_STOP,
+        coverage_from_timing,
+        resolve_host_sweep_stop_decision,
+    )
+
+    # Only an operator Ctrl+C stop is a candidate for the prompt. A platform
+    # "Stop" (sentinel) or a completed/capped sweep continues silently.
+    try:
+        requested = bool(host_cancellation.is_requested())
+        source = getattr(host_cancellation, "requested_source", "")
+    except Exception:  # noqa: BLE001 — a token read must never break the scan
+        return DECISION_STOP
+    if not requested or source != "cli":
+        return DECISION_STOP
+
+    timing = domain_timings.get(domain) if hasattr(domain_timings, "get") else None
+    coverage = coverage_from_timing(getattr(timing, "host_coverage", None))
+    if coverage is None or coverage.remaining <= 0:
+        # Nothing left to enrich (or no coverage recorded): continuing would be a
+        # no-op, so proceed with what was collected.
+        return DECISION_STOP
+
+    decision = resolve_host_sweep_stop_decision(
+        shell=shell, domain=domain, coverage=coverage
+    )
+    if decision == DECISION_EXIT:
+        # The deliberate, explicit exit. Raise so the run ends here — this is the
+        # only place Ctrl+C-initiated flow can end ADscan, and it took a menu
+        # choice to get here.
+        raise KeyboardInterrupt
+    return DECISION_CONTINUE if decision == DECISION_CONTINUE else DECISION_STOP
+
+
+def _make_scale_gate_callback(shell: Any) -> "Callable[[int], Any]":
+    """Build the scale-gate decision callback threaded into the host collector.
+
+    Called once by the collector with the 445-reachable host count, at the seam
+    where the identity graph is complete and the per-host SMB sweep has not
+    started. It renders the premium panel + three-choice prompt (interactive) or
+    auto-resolves to the capped default (non-interactive) and returns a
+    ``ScaleGateDecision`` the collector honours. Threads ``shell`` so the
+    non-interactive predicate resolves correctly under ``adscan ci``.
+    """
+
+    def _decide(reachable_hosts: int) -> Any:
+        from adscan_internal.services.collector.scale_gate import (
+            resolve_scale_gate_choice,
+        )
+
+        return resolve_scale_gate_choice(
+            reachable_hosts=int(reachable_hosts), shell=shell
+        )
+
+    return _decide
 
 
 def run_native_collection(
@@ -492,17 +656,21 @@ def run_native_collection(
         )
 
         _workspace_root = getattr(shell, "current_workspace_dir", None)
-        host_cancellation = HostSweepCancellation(
-            sentinel_path=(
-                host_sweep_stop_sentinel_path(_workspace_root)
-                if _workspace_root
-                else None
-            )
-        )
 
-        with cli_host_sweep_stop(host_cancellation, shell=shell):
-            counters, collection_results, domain_timings = (
-                CollectionOrchestrator().collect_scope(
+        def _run_sweep_once() -> tuple[Any, Any, Any, Any]:
+            # A FRESH cancellation token per sweep pass so a "continue enriching"
+            # resume is not pre-cancelled by the prior stop. The panic-proof
+            # Ctrl+C handler NEVER exits — it only requests this token's stop and
+            # returns; the exit decision is made below, at the call site.
+            host_cancellation = HostSweepCancellation(
+                sentinel_path=(
+                    host_sweep_stop_sentinel_path(_workspace_root)
+                    if _workspace_root
+                    else None
+                )
+            )
+            with cli_host_sweep_stop(host_cancellation, shell=shell):
+                result = CollectionOrchestrator().collect_scope(
                     shell=shell,
                     scopes=[scope],
                     credential=credential,
@@ -513,10 +681,34 @@ def run_native_collection(
                     posture_snapshot=posture_snapshot,
                     progress_callback=_make_collector_progress_callback(target_domain),
                     host_progress_callback=_make_host_progress_callback(target_domain),
+                    host_stage_timing_beacon=_make_host_stage_timing_beacon(
+                        shell, target_domain
+                    ),
                     host_cancellation=host_cancellation,
                     host_cap=_resolve_host_cap(shell),
+                    scale_gate_callback=_make_scale_gate_callback(shell),
                 )
+            return result[0], result[1], result[2], host_cancellation
+
+        # Sweep, then offer the post-stop decision. On "continue enriching" the
+        # sweep is re-entered; the collector's own resume skip-set (persisted
+        # per-host progress) means the second pass skips already-enriched hosts
+        # rather than re-scanning them. The loop only repeats on an operator
+        # early-stop that the operator then chooses to continue.
+        while True:
+            counters, collection_results, domain_timings, host_cancellation = (
+                _run_sweep_once()
             )
+            _decision = _resolve_post_host_sweep(
+                shell=shell,
+                domain=target_domain,
+                host_cancellation=host_cancellation,
+                domain_timings=domain_timings,
+            )
+            if _decision == "continue":
+                # Resume the sweep from where it stopped (skip-set applies).
+                continue
+            break
         elapsed = time.monotonic() - started
         domain_counters = counters.get(target_domain, {})
         _emit_collector_operation_progress(
@@ -812,33 +1004,82 @@ def _surface_host_enrichment_coverage(
     domain: str,
     timing: "CollectionTiming",
 ) -> None:
-    """Record + show the SMB host-enrichment coverage when the sweep stopped early.
+    """Record + show the SMB host-enrichment coverage when the sweep was bounded.
 
-    No-op when the sweep ran to completion (full coverage). On an operator early
-    stop (CLI Ctrl+C or the platform button) it:
+    No-op when the sweep ran to completion (full coverage). When the sweep was
+    bounded — an operator early stop (CLI Ctrl+C / platform button), a proactive
+    scale-gate cap or skip, or an env/scan-config host cap — it:
 
       * prints a transparent coverage line to the operator; and
-      * persists a ``host_enrichment_partial`` technical finding into
-        ``technical_report.json`` so the PDF report AND the web scan summary
-        render the SAME audit-defensible statement — the identity graph is 100%,
-        host enrichment is X of Y (representative-first), the rest queued.
+      * persists the client-facing ``host_enrichment_coverage`` data-gap block
+        into ``technical_report.json`` so the PDF report, the LITE report AND the
+        web CTEM render the SAME audit-defensible statement — the identity graph
+        is 100%, host enrichment is X of Y (representative-first), the rest not
+        evaluated. An early stop ALSO persists the legacy ``collection_coverage``
+        block for continuity with existing consumers.
 
     Best-effort: a persistence failure never aborts the scan.
     """
     coverage = getattr(timing, "host_coverage", None) or {}
-    if not coverage.get("early_stopped"):
+    reason = str(coverage.get("reason") or "").strip()
+    if coverage.get("early_stopped") and not reason:
+        reason = "early_stop"
+    if reason not in ("cap", "skip", "early_stop"):
         return
     swept = int(coverage.get("hosts_swept", 0))
     total = int(coverage.get("hosts_total", 0))
     remaining = int(coverage.get("hosts_remaining", max(0, total - swept)))
     source = str(coverage.get("source") or "cli")
-    print_warning(
-        "SMB host enrichment stopped early "
-        f"({'platform' if source == 'platform' else 'operator'}). Coverage — "
-        f"identity graph: 100% (full domain); host enrichment: {swept} of {total} "
-        f"hosts (representative-first); {remaining} remaining queued. The scan "
-        "continues with the collected host data."
-    )
+
+    if reason == "early_stop":
+        print_warning(
+            "SMB host enrichment stopped early "
+            f"({'platform' if source == 'platform' else 'operator'}). Coverage — "
+            f"identity graph: 100% (full domain); host enrichment: {swept:,} of "
+            f"{total:,} hosts (representative-first); {remaining:,} remaining. The "
+            "scan continues with the collected host data."
+        )
+    elif reason == "skip":
+        print_info(
+            "SMB host enrichment skipped. Coverage — identity graph: 100% (full "
+            f"domain); host enrichment: 0 of {total:,} reachable hosts. Attack "
+            "paths and reach are computed on the complete identity graph."
+        )
+    else:  # cap
+        print_info(
+            "SMB host enrichment scoped to the highest-value hosts. Coverage — "
+            f"identity graph: 100% (full domain); host enrichment: {swept:,} of "
+            f"{total:,} reachable hosts (representative-first); {remaining:,} not "
+            "evaluated in this run."
+        )
+
+    try:
+        from adscan_core.reporting.host_enrichment_coverage import (
+            build_host_enrichment_coverage,
+        )
+        from adscan_core.reporting.technical_report import (
+            record_host_enrichment_coverage,
+        )
+
+        record_host_enrichment_coverage(
+            shell,
+            domain,
+            coverage=build_host_enrichment_coverage(
+                bounded=True,
+                reason=reason,
+                hosts_swept=swept,
+                hosts_total=total,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] host-enrichment coverage persist failed: {exc}")
+
+    if reason != "early_stop":
+        return
+    # Preserve the legacy collection_coverage block for the early-stop path so
+    # existing consumers (web ingestion) keep reading it unchanged.
     try:
         from adscan_core.reporting.technical_report import (
             record_collection_coverage,
@@ -865,7 +1106,7 @@ def _surface_host_enrichment_coverage(
     except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
-        print_info_debug(f"[intelligence] host-coverage persist failed: {exc}")
+        print_info_debug(f"[intelligence] collection-coverage persist failed: {exc}")
 
 
 def _ensure_shell_domain_context(shell: Any, target_domain: str) -> None:

@@ -125,7 +125,122 @@ class CredSweeperLibraryService(BaseService):
                 logger.exception("CredSweeper library ruleset failure")
                 continue
             findings = self._merge_grouped_findings(findings, run_findings)
+
+        # Global table-aware augmentation for the in-memory (byte-payload) path.
+        # CredSweeper flattens document tables so a secret cell is scanned apart
+        # from its label; for every PDF/XLSX/DOCX byte target we ALSO reconstruct
+        # each table row as "key: value" text and scan that, merging the extra
+        # findings. This mirrors the disk-based seam in credsweeper_service so
+        # byte-payload origins (unauth inventory, LDAP description scans) inherit
+        # table-aware extraction too.
+        table_findings = self._augment_targets_with_table_extraction(
+            targets=targets,
+            drop_ml_none=drop_ml_none,
+        )
+        if table_findings:
+            findings = self._merge_grouped_findings(findings, table_findings)
         return findings
+
+    def _augment_targets_with_table_extraction(
+        self,
+        *,
+        targets: list[InMemoryCredSweeperTarget],
+        drop_ml_none: bool | None,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Reconstruct tables from byte targets and scan them for credentials.
+
+        For each PDF/XLSX/DOCX byte target, reconstruct its tables into
+        ``key: value`` text and scan that as an in-memory text target. The
+        reconstructed lines are plain text, so they are scanned with the
+        ``filesystem_text`` rulesets (code + narrative-doc rules) rather than the
+        caller's document-mode profile, with the custom ruleset at ``0.0`` so a
+        weak-but-real secret is not ML-gated out. Findings keep the original
+        target's logical path. Best-effort: any failure is swallowed so the base
+        result is never degraded.
+        """
+        from adscan_internal.services.credsweeper_service import (
+            CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+        )
+        from adscan_internal.services.document_table_credentials import (
+            is_table_reconstruction_type,
+            reconstruct_document_table_text_from_bytes,
+        )
+
+        primary_rules, custom_rules = get_credsweeper_rules_paths(
+            profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT
+        )
+        rulesets: list[tuple[str, Optional[str], bool, str]] = []
+        if primary_rules:
+            rulesets.append((
+                "primary",
+                primary_rules,
+                resolve_credsweeper_drop_ml_none_for_ruleset(
+                    ruleset_label="primary", drop_ml_none=drop_ml_none
+                ),
+                "0.1",
+            ))
+        if custom_rules:
+            rulesets.append((
+                "custom",
+                custom_rules,
+                resolve_credsweeper_drop_ml_none_for_ruleset(
+                    ruleset_label="custom", drop_ml_none=drop_ml_none
+                ),
+                "0.0",
+            ))
+        if not rulesets:
+            return {}
+
+        aggregate: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        for target in targets:
+            if not is_table_reconstruction_type(target.file_type):
+                continue
+            try:
+                reconstructed_text = reconstruct_document_table_text_from_bytes(
+                    target.content,
+                    file_type=target.file_type,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_warning_debug(
+                    f"CredSweeper table reconstruction failed for {target.file_path}: "
+                    f"{type(exc).__name__}"
+                )
+                continue
+            if not reconstructed_text:
+                continue
+            text_target = InMemoryCredSweeperTarget(
+                content=reconstructed_text.encode("utf-8", errors="replace"),
+                file_path=target.file_path,
+                file_type="txt",
+                info=target.info,
+            )
+            for _label, selected_rules, selected_drop_ml_none, selected_ml_threshold in rulesets:
+                if not selected_rules:
+                    continue
+                try:
+                    run_findings = self._run_ruleset(
+                        targets=[text_target],
+                        rules_path=selected_rules,
+                        drop_ml_none=selected_drop_ml_none,
+                        ml_threshold=selected_ml_threshold,
+                        doc=False,
+                        depth=False,
+                        no_filters=False,
+                        jobs=None,
+                        find_by_ext=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+                    print_warning_debug(
+                        f"CredSweeper table text scan failed for {target.file_path}: "
+                        f"{type(exc).__name__}"
+                    )
+                    continue
+                aggregate = self._merge_grouped_findings(aggregate, run_findings)
+        return aggregate
 
     def _run_ruleset(
         self,

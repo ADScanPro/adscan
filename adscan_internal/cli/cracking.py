@@ -82,6 +82,9 @@ from adscan_internal.services.cracking_wordlist_policy import (
     estimate_effort,
     resolve_single_tier,
 )
+from adscan_internal.services.wordlist_service import (
+    record_cracking_coverage_for_domain,
+)
 from adscan_core.rich_output import questionary_select_index
 import rich.box
 from rich.console import Group
@@ -2277,6 +2280,12 @@ def run_cracking(
     if _count_hashes_in_file(hash_file) <= 0:
         print_info("No hashes to crack — skipping (hashfile is empty or absent).")
         return
+
+    # There are hashes and a crack is about to run, so the deliverable must be
+    # able to state how strong the attempt was. Absent corpora are a data gap;
+    # without this, an empty recovered-credentials section reads as proof that
+    # every password held. Idempotent + best-effort (see the recorder).
+    record_cracking_coverage_for_domain(shell, domain, wordlists_dir=wordlists_dir)
 
     # Mixed-etype dispatch: only for the roast hash types, only on the top-level
     # call (mode_override unset). Split the capture into per-mode hashfiles and

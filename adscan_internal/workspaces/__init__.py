@@ -34,6 +34,7 @@ from .ui import select_workspace_curses
 from .paths import (
     domain_dir,
     get_workspace_cwd,
+    resolve_workspace_cwd,
     workspace_dir,
     workspace_variables_path,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "save_domain_data",
     "save_workspace_data",
     "get_workspace_cwd",
+    "resolve_workspace_cwd",
     "workspace_dir",
     "workspace_variables_path",
     "write_initial_workspace_variables",

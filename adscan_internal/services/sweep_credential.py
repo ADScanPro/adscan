@@ -225,6 +225,36 @@ def resolve_sweep_credential(
 
     # 3. Domain principal with a password / NT hash → pre-mint ONE TGT.
     mint_domain = (auth_domain or domain or "").strip()
+
+    # Cross-forest KDC correctness: the AS-REQ for ``user@AUTH_REALM`` MUST go to
+    # the AUTH realm's KDC. Callers historically pass ``kdc_ip=<target realm DC>``
+    # (resolved from ``domains_data[domain]``), which is the WRONG realm when the
+    # credential belongs to a different forest — the pre-mint would then abort the
+    # whole cross-forest sweep. Resolve the auth-realm KDC via the SSOT whenever the
+    # realms diverge; keep the caller's ``kdc_ip`` untouched in the single-domain
+    # case (``auth_domain`` falsy or equal to ``domain``), so a same-forest sweep is
+    # byte-identical to before.
+    mint_kdc_ip = (kdc_ip or None)
+    auth_realm = (auth_domain or "").strip()
+    target_realm = (domain or "").strip()
+    if auth_realm and auth_realm.lower() != target_realm.lower():
+        from adscan_internal.services.cross_forest_kdc import (
+            resolve_auth_kdc_for_cross_forest,
+        )
+
+        resolved_auth_kdc = resolve_auth_kdc_for_cross_forest(
+            getattr(shell, "domains_data", None),
+            auth_domain=auth_realm,
+            target_domain=target_realm,
+        )
+        if resolved_auth_kdc:
+            if resolved_auth_kdc != mint_kdc_ip:
+                notes.append(
+                    "cross-forest: pre-mint AS-REQ routed to the credential's "
+                    "home-realm KDC (not the target realm's DC)"
+                )
+            mint_kdc_ip = resolved_auth_kdc
+
     minted: str | None = None
     mint_exc: Exception | None = None
     mint_note: str = ""
@@ -243,7 +273,7 @@ def resolve_sweep_credential(
             user=username,
             domain=mint_domain,
             credential=secret,
-            dc_ip=(kdc_ip or None),
+            dc_ip=mint_kdc_ip,
             error_out=mint_errors,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort; classified below

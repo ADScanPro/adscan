@@ -892,6 +892,83 @@ def privilege_tier_for_principal_node(
     return PrivilegeTier.TIER2
 
 
+def privilege_tier_for_node(
+    node: Mapping[str, Any] | None,
+    *,
+    is_tier0_asset: bool = False,
+) -> PrivilegeTier:
+    """Return the granted :class:`PrivilegeTier` of ANY attack-graph node.
+
+    The kind-dispatching front door over the two node resolvers above, so a
+    caller holding a node dict does not have to know whether it is looking at a
+    Computer, a user, a group or the Domain object. Domain objects are Tier 0
+    direct by definition; Computers grade through
+    :func:`privilege_tier_for_computer_node` (DC role / Tier-0-asset / server /
+    workstation); everything else through
+    :func:`privilege_tier_for_principal_node` (direct domain breaker →
+    Tier 0 direct, escalation group → Tier 0 escalation-capable).
+
+    No group list, RID set or name heuristic is introduced here — this only
+    routes to the existing axis-1 SSOT.
+
+    Args:
+        node: A BloodHound/ADscan-shaped node dict, or ``None``.
+        is_tier0_asset: Degraded Tier 0 signal the caller resolved outside group
+            identity (``isTierZero`` / ``highvalue`` / an ADCS CA or Exchange
+            role). Consulted only when group identity did not classify.
+
+    Returns:
+        The :class:`PrivilegeTier`; :attr:`PrivilegeTier.TIER2` for ``None``.
+    """
+    if not isinstance(node, Mapping):
+        return PrivilegeTier.TIER2
+    kind = str(node.get("kind") or "").strip().lower()
+    if kind == "domain":
+        return PrivilegeTier.TIER0_DIRECT
+    if kind == "computer":
+        return privilege_tier_for_computer_node(node, is_tier0_asset=is_tier0_asset)
+    return privilege_tier_for_principal_node(node, is_tier0_asset=is_tier0_asset)
+
+
+def is_structural_hierarchy_source(node: Mapping[str, Any] | None) -> bool:
+    """Return whether an edge OUT of *node* is built-in AD hierarchy, not a finding.
+
+    A principal that is ALREADY Tier 0 direct cannot escalate — every right it
+    holds and every group it belongs to is how Active Directory is built. The
+    rights such an edge represents are the product's own control plane:
+    ``Domain Admins`` is a member of ``BUILTIN\\Administrators`` because Windows
+    puts it there when the first DC is promoted, ``Domain Controllers`` holds
+    the replication extended rights because that is what replication IS, and a
+    DC computer account is a member of ``Domain Controllers`` because that is
+    what makes it a DC. Telling a client to remove any of those is telling them
+    to break their directory.
+
+    This is the node-level restatement of the rule
+    :func:`adscan_internal.services.severity.compute_edge_severity` already
+    implements as Rule 1 (``source_compromise_class is DOMAIN_BREAKER`` →
+    ``INFO``) and that CLAUDE.md § Nomenclature Standard states as hard rule 3
+    (``Domain Breaker → anything`` = INFO, structural AD hierarchy, not a
+    finding). It exists so the surfaces that hold a node but do not compute a
+    severity — the choke-point classifier, the per-step remediation renderer —
+    ask the SAME taxonomy instead of growing their own group list.
+
+    An edge like this stays VISIBLE in the attack path: it is how the chain
+    works, and hiding it would break the narrative. What it must not do is
+    become a choke point, carry "remove it" advice, or grade above INFO. The
+    exposure is upstream — at the step that lets a lower-tier principal reach
+    this source in the first place.
+
+    Args:
+        node: The edge's SOURCE node (any kind), or ``None``.
+
+    Returns:
+        ``True`` when the source is already Tier 0 direct, else ``False``
+        (including for ``None``, so a missing node never suppresses a real
+        finding).
+    """
+    return privilege_tier_for_node(node) is PrivilegeTier.TIER0_DIRECT
+
+
 # ---------------------------------------------------------------------------
 # Client label SSOT — the two functions Phase 2 (CLI / report / platform) all
 # translate from. One source; make the strings final and clear.
@@ -1314,6 +1391,139 @@ def domain_takeover_kpi_segments(
     }
 
 
+#: Share of the enabled user population that must ALREADY hold Tier 0 before
+#: privilege sprawl outranks path exposure as the headline. At one account in
+#: four, "does the tier separation hold" has stopped being a meaningful
+#: question — there is no separation left to hold — so the sprawl figure leads
+#: and path exposure becomes the second line.
+_TIER0_SPRAWL_SHARE: float = 0.25
+
+#: Absolute floor paired with the share, so a small directory cannot trip the
+#: precedence rule on arithmetic alone. Every domain carries a built-in
+#: Administrator, so a ten-account directory reads 10% Tier 0 before anybody has
+#: done anything wrong, and the local sample tops out at 15% (two Tier 0
+#: accounts against eleven to seventeen Tier 2) on perfectly ordinary shapes.
+#: Five is also already past Microsoft's guidance for the direct control-plane
+#: groups, which is that they hold a handful of accounts and that Enterprise and
+#: Schema Admins sit empty outside forest operations — so a directory clearing
+#: BOTH tests is outside published guidance on both axes at once, not merely
+#: small.
+_TIER0_SPRAWL_FLOOR: int = 5
+
+
+def derive_tier0_population_stat(
+    *,
+    tier0: int,
+    domain_user_count: int,
+    tier0_direct: int | None = None,
+) -> dict[str, Any]:
+    """Derive the Tier 0 PRIVILEGE SPRAWL figure — how many accounts already ARE Tier 0.
+
+    The companion to :func:`derive_ordinary_breaker_stat`, and the reason that
+    function is honest. The two answer different questions and a domain needs
+    both:
+
+    * Sprawl (here): *do you have tiering at all?* How many accounts hold the
+      control plane by membership, needing no attack path because they are
+      already the destination.
+    * Path exposure (there): *does your tiering hold?* How many ordinary
+      accounts reach the control plane through a route ADscan found.
+
+    **Why they cannot be one number.** Excluding the already-privileged accounts
+    from the path metric is only defensible while their count is reported
+    beside it — otherwise the exclusion does not clean the figure, it hides the
+    population. A domain of a hundred where forty are Domain Admins might show
+    little path exposure and still be catastrophically compromised: forty people
+    do not need a route to the destination when they are the destination. And in
+    a directory where every account sits in a Tier-0 escalation group — Account
+    Operators is the real-world case, a legacy group Microsoft documents as one
+    that should stay empty and almost nobody empties — the path metric has no
+    denominator at all and would otherwise print "0 of 0" against the most
+    severe finding available.
+
+    A single blended figure was considered and rejected: (already privileged +
+    reached by a path) over the population is one number and is honest about
+    magnitude, but it makes a directory whose fix is one certificate template
+    read identically to one whose fix is an eighteen-month identity-governance
+    programme. The two carry different remediation owners and different time
+    horizons, so collapsing them yields a figure a CISO cannot assign to
+    anybody.
+
+    **Precedence.** ``leads`` is the rule: when sprawl is pathological it is the
+    headline and path exposure is the indented second line, because asking
+    whether a separation holds is moot where there is no separation. It is
+    pathological when the share reaches :data:`_TIER0_SPRAWL_SHARE` AND the
+    count reaches :data:`_TIER0_SPRAWL_FLOOR`, or unconditionally when the
+    ordinary population is empty (there is nothing left for the path metric to
+    measure).
+
+    **One trigger, two headlines — and deliberately not two thresholds.** Forty
+    Domain Admins and forty Print Operators are both bad and not identically
+    bad: the first forty already hold domain control, the second forty are one
+    known technique away (Print Operators can load a driver on a domain
+    controller, which is SYSTEM). ADscan's prioritisation rule is that
+    directness, not tier, drives weight — so the two get DIFFERENT wording, via
+    ``dominant_kind``. They do not get different precedence thresholds, because
+    precedence answers one narrow question: is the path-exposure figure still
+    meaningful? It is moot for the same reason in both cases. Every one of those
+    accounts is already inside the containment boundary, so measuring whether
+    they can *reach* it measures nothing — a Print Operator does not need the
+    route ADscan enumerates, it has a shorter one the graph never draws.
+
+    Args:
+        tier0: Enabled accounts that ARE Tier 0, by group membership.
+        domain_user_count: The enabled user population.
+        tier0_direct: How many of ``tier0`` hold Tier 0 DIRECTLY (Domain Admins,
+            Enterprise Admins, BUILTIN\\Administrators, RID 500). The remainder
+            are escalation-capable (Account/Print/Server/Backup Operators,
+            DnsAdmins, …). ``None`` leaves the split unknown and the wording
+            falls back to the neutral form.
+
+    Returns:
+        A flat dict every surface renders directly: ``tier0_count``,
+        ``tier0_direct`` / ``tier0_escalation_capable``, ``dominant_kind``,
+        ``ordinary_count`` (the population that can be exposed), ``pct``,
+        ``leads``, ``degenerate`` (no ordinary population at all) and
+        ``available``.
+    """
+    count = max(0, int(tier0))
+    total = max(0, int(domain_user_count))
+    direct = min(count, max(0, int(tier0_direct))) if tier0_direct is not None else None
+    escalation = (count - direct) if direct is not None else None
+    ordinary = max(0, total - count)
+    pct = round(count / total * 100.0, 1) if total > 0 else 0.0
+    degenerate = total > 0 and ordinary == 0
+    leads = bool(
+        total > 0
+        and count > 0
+        and (
+            degenerate
+            or (
+                count >= _TIER0_SPRAWL_FLOOR
+                and pct >= _TIER0_SPRAWL_SHARE * 100.0
+            )
+        )
+    )
+    if direct is None:
+        dominant = "unknown"
+    elif direct >= (escalation or 0):
+        dominant = "direct"
+    else:
+        dominant = "escalation_capable"
+    return {
+        "tier0_count": count,
+        "tier0_direct": direct,
+        "tier0_escalation_capable": escalation,
+        "dominant_kind": dominant,
+        "ordinary_count": ordinary,
+        "domain_user_count": total,
+        "pct": pct,
+        "leads": leads,
+        "degenerate": degenerate,
+        "available": total > 0 and count > 0,
+    }
+
+
 def derive_ordinary_breaker_stat(
     *, tier0: int, tier1: int, tier2: int, domain_user_count: int
 ) -> dict[str, Any]:
@@ -1366,7 +1576,17 @@ def derive_ordinary_breaker_stat(
           compromise target itself — never the alarming number).
         * ``tier_breakdown`` — ``{tier0, tier1, tier2}`` echoed (the tuple the
           web-mirror contract test compares against).
-        * ``available`` — whether there is anything to render.
+        * ``available`` — whether there is anything to render. Requires an
+          ORDINARY POPULATION, not merely some affected account: a domain where
+          every enabled account already holds Tier 0 has no denominator for this
+          question, and the figure must go silent rather than print "0 of 0" or
+          a percentage of nothing. That shape is real — a production domain
+          where every user sat in Print Operators — and it is where the two
+          individually-correct behaviours combine badly: the group rightly
+          produces a finding, and this metric would rightly have nothing to say,
+          exactly when the finding is most severe. Silence here is what forces
+          the sprawl figure (:func:`derive_tier0_population_stat`) to take the
+          headline.
     """
     t0 = max(0, int(tier0))
     t1 = max(0, int(tier1))
@@ -1386,7 +1606,7 @@ def derive_ordinary_breaker_stat(
         "total_with_breaker": t0 + t1 + t2,
         "tier0_with_breaker": t0,
         "tier_breakdown": {"tier0": t0, "tier1": t1, "tier2": t2},
-        "available": (t0 + t1 + t2) > 0,
+        "available": (t0 + t1 + t2) > 0 and ordinary_total > 0,
     }
 
 

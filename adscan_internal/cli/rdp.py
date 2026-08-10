@@ -52,6 +52,7 @@ from adscan_internal.services.service_access_results import (
     select_confirmed_service_access_followup_targets,
 )
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal.workspaces import resolve_workspace_cwd
 from adscan_internal.workspaces.computers import load_target_entries
 
 
@@ -448,11 +449,7 @@ def run_rdp_service_access_sweep(
     # Concurrency: cap at 10 workers, minimum 3.
     workers = min(10, max(3, len(host_list)))
 
-    workspace_cwd = (
-        shell._get_workspace_cwd()  # type: ignore[attr-defined]
-        if hasattr(shell, "_get_workspace_cwd")
-        else getattr(shell, "current_workspace_dir", os.getcwd())
-    )
+    workspace_cwd = resolve_workspace_cwd(shell)
     domains_dir = getattr(shell, "domains_dir", "domains")
     # DC IP for Kerberos fallback (used when NTLM is disabled by GPO).
     dc_ip: str | None = getattr(shell, "dc_ip", None) or getattr(shell, "pdc_ip", None)

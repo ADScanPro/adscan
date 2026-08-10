@@ -125,6 +125,13 @@ class WebEnrollmentProbeResult:
     # closure is not certain, so a consumer must not treat it as "not listening".
     https_refused: bool = False
     http_refused: bool = False
+    # Data-gap signal (Exposure-Validation doctrine): True when the CA host's
+    # name could NOT be resolved/reached at all (DNS failure and no recovered
+    # IP), so the ESC8 verdict is UNKNOWN — "could not verify", NOT a positive
+    # "web enrollment disabled". A DNS/reachability gap must never read as the
+    # absence of the vulnerability. When True, ``web_enrollment_enabled`` is
+    # False (nothing was proven), but a consumer MUST treat it as a data gap.
+    could_not_verify: bool = False
     """Extended Protection for Authentication on the HTTPS ``/certsrv`` endpoint.
 
     ``True`` = EPA (channel binding) enforced -> NTLM relay defeated -> HTTPS is
@@ -146,6 +153,11 @@ class _SchemeProbeResult:
     # A timeout/other error leaves this False (tcp_open is also False, but the
     # closure is NOT certain — see ``_tcp_open``).
     tcp_refused: bool = False
+    # True when the CONNECT could not resolve the host name (DNS gaierror) — a
+    # data gap, distinct from a filtered/timeout port. Load-bearing: it lets the
+    # verdict be "could not verify" instead of "disabled" when the name never
+    # resolved (the DC-DNS gap ESC8 false-negative).
+    tcp_unresolved: bool = False
 
 
 class ADCSWebEnrollmentProbe:
@@ -155,9 +167,18 @@ class ADCSWebEnrollmentProbe:
         self,
         *,
         host: str,
+        connect_host: str | None = None,
         timeout: float = 5.0,
         credential: WebProbeCredential | None = None,
     ) -> WebEnrollmentProbeResult:
+        """Probe ``host`` for an exploitable certsrv endpoint (ESC8).
+
+        ``connect_host`` is the reachable IP to CONNECT on when the CA host's
+        FQDN cannot be resolved from the current vantage (the DC-DNS gap that
+        made ESC8 a false negative); ``host`` stays the FQDN used for the TLS
+        SNI, the HTTP ``Host`` header, and the EPA SPN. When ``connect_host`` is
+        None the connect uses ``host`` — byte-for-byte the pre-fix behaviour.
+        """
         if not host:
             return WebEnrollmentProbeResult(
                 target_host="",
@@ -167,12 +188,40 @@ class ADCSWebEnrollmentProbe:
                 error_message="missing host",
             )
 
+        # The address the sockets actually connect to. Defaults to the FQDN; a
+        # caller that pre-resolved a reachable IP passes it so a DC-DNS gap on
+        # the FQDN does not dead-end the connect.
+        target = connect_host or host
+
         # Probe HTTPS first so HTTPS-first scheme selection in the relay reflects
         # the operator-preferred transport when both qualify.
-        https = await self._probe_scheme(host, "https", 443, timeout)
-        http = await self._probe_scheme(host, "http", 80, timeout)
+        https = await self._probe_scheme(host, target, "https", 443, timeout)
+        http = await self._probe_scheme(host, target, "http", 80, timeout)
 
         masked = mark_sensitive(host, "host")
+
+        # Data gap: the name could not be resolved on EITHER scheme and no
+        # reachable IP was supplied to connect to — the CA host was never
+        # reached, so ESC8 is UNKNOWN ("could not verify"), NOT "disabled". A
+        # DNS/reachability failure must never read as the absence of the vuln
+        # (Exposure-Validation doctrine). ``connect_host`` given (a resolved IP)
+        # means resolution already succeeded upstream, so a gaierror here is a
+        # genuine unreachability, still a data gap — the verdict stays unknown.
+        if https.tcp_unresolved and http.tcp_unresolved:
+            print_info_debug(
+                f"[adcs-web-probe] ESC8 could-not-verify for host={masked}: "
+                "CA host name did not resolve / was not reachable — verdict "
+                "UNKNOWN (data gap, NOT 'web enrollment disabled')"
+            )
+            return WebEnrollmentProbeResult(
+                target_host=host,
+                web_enrollment_enabled=False,
+                https_enabled=False,
+                http_enabled=False,
+                could_not_verify=True,
+                error_message="CA host name could not be resolved or reached",
+            )
+
         for scheme, res in (("https", https), ("http", http)):
             if not res.tcp_open:
                 print_info_debug(
@@ -190,7 +239,7 @@ class ADCSWebEnrollmentProbe:
         epa_enforced: bool | None = None
         if https.ntlm_offered and credential is not None and credential.has_secret():
             epa_enforced = await self._probe_epa_over_https(
-                host, 443, timeout, credential
+                host, target, 443, timeout, credential
             )
             print_info_verbose(
                 f"[adcs-web-probe] EPA test host={masked}: epa_enforced={epa_enforced}"
@@ -233,7 +282,12 @@ class ADCSWebEnrollmentProbe:
         )
 
     async def _probe_epa_over_https(
-        self, host: str, port: int, timeout: float, credential: WebProbeCredential
+        self,
+        host: str,
+        target: str,
+        port: int,
+        timeout: float,
+        credential: WebProbeCredential,
     ) -> bool | None:
         """Differential channel-binding (EPA) test with a valid credential.
 
@@ -241,14 +295,15 @@ class ADCSWebEnrollmentProbe:
         channel-binding token, then with one. Mirrors Certipy's
         ``check_channel_binding`` semantics; the NTLM messages are produced by
         ``badauth`` so we control whether the ``MsvChannelBindings`` AV-pair is
-        included.
+        included. Connects on ``target`` (the reachable IP) but keeps ``host``
+        (the FQDN) as the TLS SNI and the HTTP SPN.
 
         Returns True (EPA enforced), False (EPA not enforced), or None
         (inconclusive / error / bad credential).
         """
         try:
             status_no_cbt = await self._ntlm_http_auth_status(
-                host, port, timeout, credential, use_cbt=False
+                host, target, port, timeout, credential, use_cbt=False
             )
             if status_no_cbt is None:
                 return None
@@ -257,7 +312,7 @@ class ADCSWebEnrollmentProbe:
                 return False
 
             status_cbt = await self._ntlm_http_auth_status(
-                host, port, timeout, credential, use_cbt=True
+                host, target, port, timeout, credential, use_cbt=True
             )
             if status_cbt is None:
                 return None
@@ -276,6 +331,7 @@ class ADCSWebEnrollmentProbe:
     async def _ntlm_http_auth_status(
         self,
         host: str,
+        target: str,
         port: int,
         timeout: float,
         credential: WebProbeCredential,
@@ -284,11 +340,14 @@ class ADCSWebEnrollmentProbe:
     ) -> int | None:
         """Run one full NTLM-over-HTTPS handshake against ``/certsrv``.
 
-        Sends the type-1 negotiate, reads the type-2 challenge (401 +
-        ``WWW-Authenticate: NTLM <token>``), then sends the type-3 authenticate
-        — with or without the channel-binding AV-pair — over the same keep-alive
-        TLS connection. Returns the final HTTP status, or None on any transport
-        failure (treated as inconclusive by the caller).
+        Connects on ``target`` (the reachable IP) while using ``host`` (the
+        FQDN) for the TLS SNI, the ``Host`` header, and the ``HTTP/<host>`` SPN,
+        so a DC-DNS gap on the FQDN does not defeat the EPA test. Sends the
+        type-1 negotiate, reads the type-2 challenge (401 + ``WWW-Authenticate:
+        NTLM <token>``), then sends the type-3 authenticate — with or without
+        the channel-binding AV-pair — over the same keep-alive TLS connection.
+        Returns the final HTTP status, or None on any transport failure (treated
+        as inconclusive by the caller).
         """
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
@@ -297,7 +356,7 @@ class ADCSWebEnrollmentProbe:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(
-                    host,
+                    target,
                     port,
                     ssl=ssl_context,
                     server_hostname=host,
@@ -376,26 +435,29 @@ class ADCSWebEnrollmentProbe:
                 pass
 
     async def _probe_scheme(
-        self, host: str, scheme: str, port: int, timeout: float
+        self, host: str, target: str, scheme: str, port: int, timeout: float
     ) -> _SchemeProbeResult:
         """TCP pre-check, then an HTTP GET of the certsrv endpoint.
 
+        Connects to ``target`` (the reachable IP when the FQDN cannot be
+        resolved) but sends ``host`` (the FQDN) in the ``Host`` header / TLS SNI.
         Returns ``ntlm_offered=True`` only on the true-positive ESC8 signature
         (HTTP 401 with a ``WWW-Authenticate`` header offering NTLM/Negotiate).
         Any failure / non-401 / no-NTLM keeps the false-negative bias.
         """
-        tcp_state = await self._tcp_open(host, port, timeout)
+        tcp_state = await self._tcp_open(target, port, timeout)
         if tcp_state != "open":
             return _SchemeProbeResult(
                 tcp_open=False,
                 status=None,
                 ntlm_offered=False,
                 tcp_refused=(tcp_state == "refused"),
+                tcp_unresolved=(tcp_state == "unresolved"),
             )
 
         try:
             status, www_authenticate = await self._http_get_certsrv(
-                host, scheme, port, timeout
+                host, target, scheme, port, timeout
             )
         except (
             asyncio.TimeoutError,
@@ -421,14 +483,16 @@ class ADCSWebEnrollmentProbe:
         )
 
     async def _http_get_certsrv(
-        self, host: str, scheme: str, port: int, timeout: float
+        self, host: str, target: str, scheme: str, port: int, timeout: float
     ) -> tuple[int | None, str]:
         """Issue ``GET /certsrv/certfnsh.asp`` and return (status, WWW-Authenticate).
 
-        Hand-written HTTP/1.1; no redirect following. TLS verification is
-        disabled for the https scheme because CA web certificates are commonly
-        self-signed — we only inspect the status line and headers, never trust
-        the channel for data.
+        Connects to ``target`` (the reachable IP) while sending ``host`` (the
+        FQDN) in the ``Host`` header and TLS SNI, so a DC-DNS gap on the FQDN
+        does not dead-end the connect. Hand-written HTTP/1.1; no redirect
+        following. TLS verification is disabled for the https scheme because CA
+        web certificates are commonly self-signed — we only inspect the status
+        line and headers, never trust the channel for data.
         """
         ssl_context = None
         server_hostname = None
@@ -440,7 +504,7 @@ class ADCSWebEnrollmentProbe:
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
-                host,
+                target,
                 port,
                 ssl=ssl_context,
                 server_hostname=server_hostname,
@@ -477,17 +541,23 @@ class ADCSWebEnrollmentProbe:
 
     @staticmethod
     async def _tcp_open(host: str, port: int, timeout: float) -> str:
-        """Return the TCP reachability state as a tri-state string.
+        """Return the TCP reachability state as a four-state string.
 
         ``"open"`` — a connection was established.
         ``"refused"`` — the host actively refused (ConnectionRefusedError):
             CERTAIN that nothing is listening on this port.
+        ``"unresolved"`` — the host name could not be resolved (gaierror): a
+            DATA GAP, not a closure. Load-bearing: when BOTH schemes are
+            unresolved the ESC8 verdict is "could not verify", NOT "disabled" —
+            a DNS failure must never read as the absence of the vulnerability
+            (Exposure-Validation doctrine). This is the DC-DNS-gap false
+            negative the reachable-IP recovery fixes.
         ``"unknown"`` — a timeout or other transport error: NOT a certain
             closure (a flaky/slow/filtered host looks the same as a closed one
-            over TCP). This distinction is load-bearing downstream: a CERTAIN
-            refusal on both schemes is safe to act on (abort ESC8), but a
-            timeout must NOT be treated as "closed" — doing so false-aborts a
-            genuinely viable avenue whenever the CA is momentarily unresponsive.
+            over TCP). A CERTAIN refusal on both schemes is safe to act on
+            (abort ESC8), but a timeout must NOT be treated as "closed" — doing
+            so false-aborts a genuinely viable avenue whenever the CA is
+            momentarily unresponsive.
         """
         try:
             fut = asyncio.open_connection(host, port)
@@ -505,7 +575,11 @@ class ADCSWebEnrollmentProbe:
             # Subclass of OSError — must be caught FIRST. The only certain
             # "nothing is listening here" signal.
             return "refused"
-        except (asyncio.TimeoutError, OSError, socket.gaierror):
+        except socket.gaierror:
+            # Name resolution failed — the DC-DNS gap. Distinct from a filtered
+            # port so the verdict can be a data gap, not "disabled".
+            return "unresolved"
+        except (asyncio.TimeoutError, OSError):
             return "unknown"
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)

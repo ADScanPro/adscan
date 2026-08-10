@@ -42,6 +42,7 @@ from adscan_internal import (
 )
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.core import AuthMode
+from adscan_internal.interaction import is_non_interactive
 from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
 from adscan_internal.cli.ntlm_hash_finding_flow import (
     render_ntlm_hash_findings_flow,
@@ -2189,7 +2190,12 @@ def _run_enum_domain_auth(
     except Exception:  # noqa: BLE001
         pass
 
-    username = shell.domains_data.get(domain, {}).get("username", "N/A")
+    from adscan_internal.cli.common import resolve_effective_username_for_domain
+
+    # SSOT: a trusted domain reached across a forest trust is enumerated with the
+    # AUTH domain's credential (cross-realm referral), so show that username rather
+    # than a bare "N/A" that misrepresents the scan as anonymous.
+    username = resolve_effective_username_for_domain(shell, domain)
     pdc = shell.domains_data.get(domain, {}).get("pdc", "N/A")
     is_dev_session = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
     native_graph_enabled = True
@@ -3115,6 +3121,60 @@ def _get_domain_admins_via_native_ldap(shell: LdapShell, domain: str) -> list[st
     )
 
 
+# Canonical sAMAccountName of the built-in domain administrator account (RID 500).
+# It is a well-known account present in every AD domain, so it can be resolved by
+# name without knowing the domain SID — which is exactly the case the fallback in
+# ``get_domain_admins`` must handle for a domain that was never enumerated.
+_BUILTIN_ADMINISTRATOR_SAM = "administrator"
+
+
+def _resolve_builtin_administrator_via_native_ldap(
+    shell: LdapShell, domain: str
+) -> str | None:
+    """Resolve the built-in Administrator (RID 500) by well-known sAMAccountName.
+
+    This needs no domain SID — it queries by the canonical name ``Administrator``,
+    the same way group RID lookups fall back to a well-known sAMAccountName. Returns
+    the lowercased sAMAccountName on success, or ``None`` when the account cannot be
+    resolved (no LDAP context, query error, or not present).
+    """
+    try:
+        from adscan_internal.services.ldap_query_service import (
+            query_shell_ldap_attribute_values,
+        )
+        from adscan_internal.services.native_group_membership import (
+            escape_ldap_filter_value,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+    escaped = escape_ldap_filter_value(_BUILTIN_ADMINISTRATOR_SAM)
+    try:
+        values = query_shell_ldap_attribute_values(
+            shell,
+            domain=domain,
+            ldap_filter=(
+                "(&(objectCategory=person)(objectClass=user)"
+                f"(sAMAccountName={escaped}))"
+            ),
+            attribute="sAMAccountName",
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+            operation_name="built-in Administrator lookup",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+    if not values:
+        return None
+    resolved = str(values[0] or "").strip().lower()
+    return resolved or None
+
+
 def get_domain_admins(shell: LdapShell, domain: str) -> list[str]:
     """Return members of the Domain Admins group from local artifacts or native LDAP."""
     try:
@@ -3139,6 +3199,36 @@ def get_domain_admins(shell: LdapShell, domain: str) -> list[str]:
         admins = _get_domain_admins_via_native_ldap(shell, domain)
         if admins:
             return admins
+
+        # Fallback layer 1: resolve the built-in Administrator (RID 500) by
+        # well-known sAMAccountName. This needs NO domain SID, so it works for a
+        # domain that was never enumerated (e.g. reached via a cross-forest pivot)
+        # where the RID-512 lookups returned empty because there is no LDAP context.
+        builtin_admin = _resolve_builtin_administrator_via_native_ldap(shell, domain)
+        if builtin_admin:
+            print_info_debug(
+                f"[ldap] Domain Admins unresolved for {marked_domain}; using "
+                f"built-in Administrator resolved via LDAP: "
+                f"{mark_sensitive(builtin_admin, 'user')}"
+            )
+            return [builtin_admin]
+
+        # Fallback layer 2: even the by-name LDAP query yielded nothing (no LDAP
+        # context at all). Default to the well-known Administrator account — RID 500
+        # is the built-in domain administrator present in every AD domain, and a
+        # DCSync that motivated this resolution has already replicated it. This is a
+        # well-known default, NOT a real enumeration result. In non-interactive mode
+        # (adscan ci / web PoV worker) the manual prompt below would hang, so return
+        # the default without prompting — CI never dead-ends on the manual selection.
+        # In interactive mode fall through to the manual prompt so the operator can
+        # override the default if it is somehow wrong.
+        if is_non_interactive(shell):
+            print_info_debug(
+                f"[ldap] Domain Admins and built-in Administrator unresolvable via "
+                f"LDAP for {marked_domain}; defaulting to well-known account "
+                f"'{_BUILTIN_ADMINISTRATOR_SAM}' (RID 500) in non-interactive mode."
+            )
+            return [_BUILTIN_ADMINISTRATOR_SAM]
 
         print_warning(
             f"No Domain Admins resolved via LDAP for {marked_domain}. "
@@ -3318,8 +3408,7 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         shell=shell,
         stop_message=(
             "Kerberos user enumeration: stopping early and continuing the scan "
-            "with the usernames found so far. Press Ctrl+C again to abort the "
-            "whole scan."
+            "with the usernames found so far."
         ),
     ):
         users = enum_service.kerberos.enumerate_users_kerberos(
@@ -3872,8 +3961,7 @@ def _kerberos_auto_detect_then_build(
         shell=shell,
         stop_message=(
             "Kerberos auto-detect: stopping the broad sweep early and continuing "
-            "with the usernames found so far. Press Ctrl+C again to abort the "
-            "whole scan."
+            "with the usernames found so far."
         ),
     ):
         users = EnumerationService().kerberos.enumerate_users_kerberos(

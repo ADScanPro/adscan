@@ -25,6 +25,7 @@ from adscan_internal.services.domain_posture import DomainPosture
 from adscan_internal.services.posture_sink import PostureSink
 from adscan_internal.services.enumeration.trust_query import (
     TrustedDomainEntry,
+    query_domain_controllers,
     query_trusted_domains,
 )
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
@@ -92,6 +93,21 @@ class TrustEnumerationResult:
     domain_connectivity: Dict[str, Dict[str, Any]]
     failed_domains: Dict[str, str] = field(default_factory=dict)
     per_domain_durations: Dict[str, float] = field(default_factory=dict)
+    # Full DC set per domain, discovered from that domain's OWN Configuration NC
+    # over the already-authenticated trust-enum connection. Each value is the
+    # list of DC identifiers (FQDNs when known) for that domain — so a multi-DC
+    # trusted forest is recorded with its true topology, not just the PDC. A
+    # domain absent here degraded gracefully to the PDC-only view (see
+    # ``dc_set_degraded_reasons``).
+    domain_dc_sets: Dict[str, List[str]] = field(default_factory=dict)
+    # Why a domain's full DC set could not be enumerated (pivot-only, one-way
+    # trust, unreadable Configuration NC, …). Absent = enumeration succeeded.
+    dc_set_degraded_reasons: Dict[str, str] = field(default_factory=dict)
+    # The PDC/primary DC FQDN per domain (resolved during enumeration). Used so
+    # the primary DC record carries BOTH its IP and FQDN aliases — otherwise the
+    # PDC (known only by IP) and its own FQDN in ``domain_dc_sets`` would be
+    # miscounted as two DCs by the alias-aware resolver.
+    domain_dc_fqdns: Dict[str, str] = field(default_factory=dict)
 
 
 class DomainService(BaseService):
@@ -171,6 +187,8 @@ class DomainService(BaseService):
         trusts: List[TrustRelationship] = []
         failed_domains: Dict[str, str] = {}
         per_domain_durations: Dict[str, float] = {}
+        domain_dc_sets: Dict[str, List[str]] = {}
+        dc_set_degraded_reasons: Dict[str, str] = {}
 
         def _emit(event: TrustEnumProgressEvent) -> None:
             if progress_cb is not None:
@@ -243,6 +261,34 @@ class DomainService(BaseService):
                     ldap_cfg, connect_timeout=_TRUST_FOREIGN_CONNECT_TIMEOUT_S
                 ) as conn:
                     entries = query_trusted_domains(conn, ldap_cfg.domain_dn)
+                    # Enumerate this domain's FULL DC set from its OWN
+                    # Configuration NC while the authenticated connection to its
+                    # OWN DC is live (same realm — no cross-realm auth). A
+                    # multi-DC trusted forest is then recorded with its real
+                    # topology so ``resolve_domain_controllers`` reports the true
+                    # count. Best-effort: an empty/failed enumeration degrades to
+                    # the PDC-only view (recorded below), never aborts the trust
+                    # phase.
+                    try:
+                        dc_entries = query_domain_controllers(
+                            conn, ldap_cfg.config_dn
+                        )
+                    except Exception as dc_exc:  # noqa: BLE001
+                        telemetry.capture_exception(dc_exc)
+                        print_exception(exception=dc_exc)
+                        dc_entries = []
+                    dc_ids = [
+                        dc.fqdn.strip()
+                        for dc in dc_entries
+                        if dc.fqdn and dc.fqdn.strip()
+                    ]
+                    if dc_ids:
+                        domain_dc_sets[current_domain] = dc_ids
+                    else:
+                        dc_set_degraded_reasons[current_domain] = (
+                            "full DC set not enumerable from current vantage; "
+                            "using PDC only"
+                        )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
@@ -370,6 +416,11 @@ class DomainService(BaseService):
             domain_connectivity=domain_connectivity,
             failed_domains=failed_domains,
             per_domain_durations=per_domain_durations,
+            domain_dc_sets=domain_dc_sets,
+            dc_set_degraded_reasons=dc_set_degraded_reasons,
+            domain_dc_fqdns={
+                d: h for d, h in domain_hostnames.items() if h and h.strip()
+            },
         )
 
     @staticmethod

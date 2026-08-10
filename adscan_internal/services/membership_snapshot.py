@@ -11,7 +11,12 @@ from adscan_internal.rich_output import (
     print_exception,
     print_info_debug,
 )
-from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
+from adscan_internal.workspaces import (
+    domain_subpath,
+    read_json_file,
+    resolve_workspace_cwd,
+    write_json_file,
+)
 from adscan_internal.services import attack_paths_core
 from adscan_internal.services.cache_metrics import (
     copy_stats,
@@ -51,11 +56,7 @@ def snapshot_has_sid_metadata(snapshot: dict[str, Any] | None) -> bool:
 
 def membership_snapshot_path(shell: object, domain: str) -> str:
     """Resolve memberships.json path for a domain."""
-    workspace_cwd = (
-        shell._get_workspace_cwd()  # type: ignore[attr-defined]
-        if hasattr(shell, "_get_workspace_cwd")
-        else getattr(shell, "current_workspace_dir", os.getcwd())
-    )
+    workspace_cwd = resolve_workspace_cwd(shell)
     domains_dir = getattr(shell, "domains_dir", "domains")
     path = domain_subpath(workspace_cwd, domains_dir, domain, "memberships.json")
     return path

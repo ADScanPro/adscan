@@ -1634,8 +1634,15 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="Write permissions over target object attributes",
         remediation_complexity="medium",
         remediation_effort=(
-            "Remove GenericWrite permission from the target object ACL. "
-            "Replace broad write rights with specific delegated attributes only."
+            "Remove the GenericWrite ACE from the target object's ACL: inspect it with "
+            "`dsacls \"<targetDN>\"` (or `(Get-Acl \"AD:\\<targetDN>\").Access`), then strip the "
+            "offending entry with `dsacls \"<targetDN>\" /R \"<DOMAIN\\principal>\"`. Grant back "
+            "only the specific attributes the delegation needs (`dsacls ... /G "
+            "\"<DOMAIN\\group>:WP;<attribute>\"`), never write access to the whole object — "
+            "msDS-KeyCredentialLink, servicePrincipalName and "
+            "msDS-AllowedToActOnBehalfOfOtherIdentity each hand over the account on their own. "
+            "Clear anything already written to those three attributes before removing the ACE, "
+            "or the takeover survives the fix."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1098",
@@ -1920,6 +1927,65 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         source_context_requirement="user_credentials",
     ),
     _entry(
+        "crossorgtgtdelegation",
+        support_kind="supported",
+        support_reason=(
+            "Cross-forest Kerberos TGT-delegation escalation. The forest trust "
+            "carries the CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION attribute, so a "
+            "principal authenticating from the trusted forest leaves a forwardable "
+            "ticket-granting ticket that crosses the trust boundary. From a "
+            "compromised trusted forest, ADscan coerces a trusting-forest domain "
+            "controller to authenticate to a service whose key it holds, captures "
+            "the forwarded ticket-granting ticket, and replicates the trusting "
+            "forest as that domain controller — collapsing the boundary between "
+            "the two forests."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="medium",
+        category="trust",
+        description=(
+            "Escalate across a forest trust into the trusting forest by abusing "
+            "cross-organization Kerberos TGT delegation: a forwardable ticket-"
+            "granting ticket from the trusting forest is delegated across the trust "
+            "boundary and can be captured from a compromised trusted forest"
+        ),
+        vuln_key="trust_tgt_delegation_enabled",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Disable TGT delegation on the forest trust so ticket-granting tickets "
+            "are no longer forwarded across the forest boundary, unless a documented "
+            "application explicitly requires cross-forest delegation. Confirm the "
+            "trust's delegation state with the RSAT ActiveDirectory module "
+            "(Get-ADTrust), and where cross-boundary delegation is genuinely needed, "
+            "migrate to constrained or resource-based constrained delegation scoped "
+            "to specific services. Add Domain Controllers and Tier-0 accounts on "
+            "both forests to the Protected Users group so their tickets are never "
+            "forwardable regardless of the trust setting."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1558",
+        mitre_technique_name="Steal or Forge Kerberos Tickets",
+        detection_event_ids=("4769", "4768"),
+        bh_native=False,
+        bh_cypher_names=("CrossOrgTgtDelegation",),
+        is_acl_edge=False,
+        # The exposure is OBSERVED from the trust attribute (so it is a finding
+        # regardless of execution) AND executable: the coerce→capture→replicate
+        # chain is wired through the attack-path executor.
+        finding_basis="observed_configuration",
+        source_context_requirement="user_credentials",
+        narrative_template=(
+            "{source} trusts {target} across a forest trust that forwards Kerberos "
+            "ticket-granting tickets ({relation}). Because the trust re-enables "
+            "cross-organization TGT delegation, a compromise of {target} can capture "
+            "a forwarded ticket-granting ticket for a privileged account and use it "
+            "to reach into {source}, collapsing the boundary between the two forests."
+        ),
+        short_narrative_template=(
+            "Forest trust forwards Kerberos TGTs — {target} can escalate into {source}"
+        ),
+    ),
+    _entry(
         "writelogonscript",
         support_kind="supported",
         support_reason=(
@@ -2045,6 +2111,13 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "dcsync",
         support_kind="supported",
         support_reason="ACL/ACE abuse / post-exploitation (DCSync)",
+        # DCSync replicates the domain's secrets (every account's hash/AES keys,
+        # including machine accounts), so it PRODUCES a credential-recovered
+        # context for the next edge — e.g. a cross-forest TGT-delegation step that
+        # decrypts with the trusted DC's machine key held from this DCSync. Without
+        # this the credential-context guard prunes ``DCSync -> CrossOrgTgtDelegation``
+        # (DCSync defaulted to providing "none", blocking the chain).
+        compromise_semantics="credential_access_only",
         category="credential_access",
         description="Replicate AD secrets remotely from domain controller",
         vuln_key="dcsync",
@@ -3411,9 +3484,31 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "logon script, any of which results in complete compromise of {target}."
         ),
         "remediation": (
-            "Remove the GenericAll ACE granting control from {source} over {target}.",
-            "Apply least privilege: replace with narrow rights (e.g. ReadProperty) if some access is still required.",
-            "Enable AD Protected Users / tier-0 protection on sensitive accounts.",
+            "Remove the GenericAll ACE that {source} holds over {target}. Resolve the object's "
+            "distinguished name with `Get-ADObject -LDAPFilter '(sAMAccountName=<target>)'`, list "
+            "what {source} currently holds on it with `(Get-Acl \"AD:\\<targetDN>\").Access | "
+            "Where-Object IdentityReference -like '*<principal>*'`, then delete those entries "
+            "with `dsacls \"<targetDN>\" /R \"<DOMAIN>\\<principal>\"`. Before: the entry reads "
+            "ActiveDirectoryRights=GenericAll, AccessControlType=Allow. After: the same query "
+            "returns nothing for that principal.",
+            "Grant back only the rights the delegation actually needs, never full control. "
+            "GenericAll carries password reset, key-credential write, servicePrincipalName write "
+            "and script-path write in one ACE, so any one of them left in place restores the "
+            "takeover — which is why narrowing it is the fix and auditing it is not. Use the "
+            "Delegation of Control wizard, or a scoped ACE such as "
+            "`dsacls \"<targetDN>\" /G \"<DOMAIN>\\<helpdeskGroup>:CA;Reset Password\"` when "
+            "password reset is genuinely required.",
+            "Confirm no other principal holds equivalent control over the same object: "
+            "`(Get-Acl \"AD:\\<targetDN>\").Access | Where-Object { $_.ActiveDirectoryRights "
+            "-match 'GenericAll|WriteDacl|WriteOwner' -and $_.AccessControlType -eq 'Allow' }`. "
+            "Anything returned other than Domain Admins, Enterprise Admins or SYSTEM is the same "
+            "finding under a different principal.",
+            "Add {target} to Protected Users, and keep Tier 0 accounts out of the organisational "
+            "units that ordinary delegation applies to, so a future broad grant cannot reach "
+            "them by inheritance.",
+            "Audit the change: Event ID 5136 records the modified access control list on the "
+            "object, and Event ID 4662 records the object access itself. Both require DS Access "
+            "auditing to be enabled on the container.",
         ),
     },
     "genericwrite": {
@@ -3427,8 +3522,36 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Any of these leads to full compromise of {target}."
         ),
         "remediation": (
-            "Remove the GenericWrite ACE from {source} on {target}.",
-            "Audit msDS-KeyCredentialLink writes (Event 5136) to detect Shadow Credentials.",
+            "Remove the GenericWrite ACE that {source} holds on {target}. Resolve the object's "
+            "distinguished name with `Get-ADObject -LDAPFilter '(sAMAccountName=<target>)'`, list "
+            "what {source} currently holds on it with `(Get-Acl \"AD:\\<targetDN>\").Access | "
+            "Where-Object IdentityReference -like '*<principal>*'`, then delete those entries "
+            "with `dsacls \"<targetDN>\" /R \"<DOMAIN>\\<principal>\"`. Before: the entry reads "
+            "ActiveDirectoryRights=GenericWrite (or WriteProperty covering every attribute). "
+            "After: the same query returns nothing for that principal.",
+            "Grant back only the specific attributes the delegation needs, rather than write "
+            "access to the object. GenericWrite is a takeover because three of the attributes it "
+            "covers each hand over the account on their own — msDS-KeyCredentialLink (a "
+            "certificate the account can then authenticate with), servicePrincipalName (which "
+            "exposes the account's password hash to offline cracking), and "
+            "msDS-AllowedToActOnBehalfOfOtherIdentity (which lets another host impersonate any "
+            "user to this one). A scoped grant such as "
+            "`dsacls \"<targetDN>\" /G \"<DOMAIN>\\<group>:WP;description\"` gives the delegation "
+            "its attribute and none of those.",
+            "Clear anything already written through the ACE before removing it, or the takeover "
+            "survives the fix. Check the three attributes on {target}: "
+            "`Get-ADObject \"<targetDN>\" -Properties msDS-KeyCredentialLink, servicePrincipalName, "
+            "msDS-AllowedToActOnBehalfOfOtherIdentity`. A key credential nobody deliberately "
+            "enrolled, an unexpected service principal name, or a populated delegation attribute "
+            "should be cleared with `Set-ADObject \"<targetDN>\" -Clear <attribute>`.",
+            "Sweep for the same exposure elsewhere: "
+            "`Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties "
+            "msDS-KeyCredentialLink | Select-Object DistinguishedName` lists every object "
+            "carrying a key credential, which on a domain that does not use Windows Hello for "
+            "Business should be close to empty.",
+            "Audit the change: Event ID 5136 records the modified access control list and any "
+            "subsequent write to msDS-KeyCredentialLink or servicePrincipalName on the object. "
+            "It requires DS Access auditing to be enabled on the container.",
         ),
     },
     "writedacl": {
@@ -3830,6 +3953,65 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     }
 
 
+#: Sentence terminators that do NOT end a sentence, so the lead-sentence
+#: derivation below does not cut a narrative in the middle of one. These are the
+#: abbreviations and identifiers that legitimately carry a period inside AD
+#: prose: attribute names (``ms-Mcs-AdmPwd``), object identifiers, hostnames and
+#: domains (``MEEREEN.ESSOS.LOCAL``), and the usual Latin abbreviations.
+_ABBREVIATIONS_WITH_PERIOD: tuple[str, ...] = (
+    "e.g.",
+    "i.e.",
+    "etc.",
+    "vs.",
+    "cf.",
+    "approx.",
+    "Inc.",
+    "Ltd.",
+    "No.",
+)
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
+
+
+def lead_sentence(text: str) -> str:
+    """Return the first sentence of a narrative, or the whole thing if it is one.
+
+    The catalog's technique narratives share a shape by convention: the opening
+    sentence states what THIS principal can do to THIS target — the fact that is
+    particular to one step — and everything after it explains the mechanism,
+    which is identical wherever the technique appears. That shape is what lets a
+    report explain a technique once and still show, on every route that uses it,
+    which principals it was used between.
+
+    Splitting is conservative: a period inside a hostname, a domain, an AD
+    attribute name or a common abbreviation does not end a sentence, and a text
+    with no detectable break is returned whole rather than truncated. The worst
+    case is therefore a short form that is longer than ideal, never a sentence
+    cut in half in a client's report.
+
+    Args:
+        text: A rendered narrative.
+
+    Returns:
+        The first sentence including its terminator, or ``text`` unchanged.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return ""
+    for match in _SENTENCE_END.finditer(stripped):
+        head = stripped[: match.start()]
+        # A period that closes an abbreviation, an initial, or a dotted
+        # identifier (``ms-Mcs-AdmPwd``, ``MEEREEN.ESSOS.LOCAL``) is not a
+        # sentence break — keep reading.
+        if any(head.endswith(abbr) for abbr in _ABBREVIATIONS_WITH_PERIOD):
+            continue
+        # A single capital before the period is an initial, not a sentence end.
+        if re.search(r"(?:^|[\s(])[A-Z]\.$", head):
+            continue
+        return head
+    return stripped
+
+
 def render_step_narrative(
     step: dict[str, Any],
     *,
@@ -3841,10 +4023,20 @@ def render_step_narrative(
     ``narrative_template`` (or ``short_narrative_template`` when ``short=True``),
     placeholders are substituted from the step's details.
 
+    ``short=True`` always yields a short form when there is any narrative at all.
+    Where the catalog authors one it is used verbatim; otherwise the opening
+    sentence of the technique's own long narrative is taken, which by the
+    catalog's convention is the sentence naming this step's principals and
+    target. Consumers rely on the short form to say "this route, these
+    principals" while the mechanism is explained once elsewhere, so a technique
+    without an authored one-liner must still compress — returning nothing there
+    is what made a report print a full technique essay and a pointer telling the
+    reader to go and read that same essay somewhere else.
+
     Args:
         step: Raw step dict with at least ``action``/``relation`` and optional
             ``details`` dict (from / to / display_to / template / etc.).
-        short: If True, prefer the short one-liner template.
+        short: If True, return the one-liner form.
 
     Returns:
         The rendered sentence, or an empty string when no template exists.
@@ -3856,18 +4048,81 @@ def render_step_narrative(
     entry = get_attack_step_entry(str(relation_raw))
     if entry is None:
         return ""
-    tmpl = entry.short_narrative_template if short else entry.narrative_template
+    derive_from_long = False
+    if short:
+        tmpl = entry.short_narrative_template
+        if not tmpl:
+            tmpl = entry.narrative_template
+            derive_from_long = True
+    else:
+        tmpl = entry.narrative_template
     if not tmpl:
         return ""
     placeholders = _extract_step_placeholders(step)
     try:
-        return tmpl.format(**placeholders)
+        rendered = tmpl.format(**placeholders)
     except (KeyError, IndexError):
         # Missing placeholder — return template with as many substitutions as possible.
-        out = tmpl
+        rendered = tmpl
         for k, v in placeholders.items():
-            out = out.replace("{" + k + "}", v)
-        return out
+            rendered = rendered.replace("{" + k + "}", v)
+    # Derive the one-liner only after substitution: a placeholder can itself
+    # contain a period (a hostname, an FQDN), so the sentence boundary is only
+    # knowable once the real names are in place.
+    return lead_sentence(rendered) if derive_from_long else rendered
+
+
+#: What a step out of an already-Tier-0-direct principal tells the client
+#: INSTEAD of "remove it". Rendered against the step's own source, so the
+#: sysadmin reads the name of the principal that legitimately holds the right
+#: and knows where the real fix belongs. Client-facing prose: it lands verbatim
+#: in the PDF deliverable and the web attack-path panel.
+_STRUCTURAL_HIERARCHY_REMEDIATION: str = (
+    "No change is required at this step: {source} is part of the domain's Tier 0 "
+    "control plane, so this relationship is how Active Directory is built rather "
+    "than a misconfiguration. When this step sits inside a longer chain, the "
+    "exposure belongs to the earlier step that lets a lower-privileged principal "
+    "take control of {source}. Remediate there."
+)
+
+
+def _step_source_is_tier0_direct(step: dict[str, Any]) -> bool:
+    """Return whether this step's SOURCE is already a Tier 0 direct principal.
+
+    Reads the ``source_privilege_tier`` the attack-path SSOT stamps into the
+    step's ``details`` (``attack_graph_service.path_to_display_record``), which
+    is the only place a graph NODE is available — a renderer downstream sees
+    labels, and no label can tell you that a machine account is a domain
+    controller.
+
+    When the stamp is absent (a step synthesized from labels alone, or an older
+    artifact) the source LABEL is graded through the same axis-1 taxonomy as a
+    best-effort fallback, which still recognises the named control-plane
+    principals (Domain Admins, Domain Controllers, BUILTIN\\Administrators,
+    Enterprise Admins, krbtgt). Fails OPEN — an unresolvable source is treated
+    as an ordinary principal, so a real finding never loses its remediation.
+    """
+    if not isinstance(step, dict):
+        return False
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    stamped = str(
+        (details.get("source_privilege_tier") if isinstance(details, dict) else None)
+        or step.get("source_privilege_tier")
+        or ""
+    ).strip()
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            PrivilegeTier,
+            is_structural_hierarchy_source,
+        )
+    except Exception:  # noqa: BLE001 — never break rendering over a taxonomy import
+        return False
+    if stamped:
+        return stamped == PrivilegeTier.TIER0_DIRECT.value
+    source_label = _extract_step_placeholders(step).get("source") or ""
+    if not source_label or source_label == "the source principal":
+        return False
+    return is_structural_hierarchy_source({"name": source_label})
 
 
 def render_step_remediation(step: dict[str, Any]) -> list[str]:
@@ -3880,6 +4135,32 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
     it falls back to the canonical static ``remediation`` from ``VULN_CATALOG``
     via the entry's ``vuln_key`` join, so NO vulnerability step in the report
     ever renders without remediation.
+
+    The per-edge templates are the ones that interpolate ``{source}`` and say
+    "remove it", so they are the ones a Tier-0-direct source must not receive.
+    Every right such a principal holds and every group it belongs to is built-in
+    AD hierarchy — Domain Controllers holds the replication extended rights
+    because that IS replication, Domain Admins sits inside
+    BUILTIN\\Administrators because Windows puts it there at the first DC
+    promotion, and a DC computer account belongs to Domain Controllers because
+    that is what makes it a DC. Rendering "Remove {source} from {target}" over
+    those told the client to break their own directory. For such a step the
+    per-edge templates are skipped in favour of a line that says the
+    relationship is by design and points at the earlier step where the exposure
+    actually lives, followed by the technique-level ``VULN_CATALOG``
+    remediation, which never names the source and stays correct (DCSync's, for
+    instance, is "restrict replication rights to Domain Controllers and
+    authorised sync accounts" — the right advice, and the opposite of what the
+    per-edge template said). A step that had no remediation to begin with gains
+    none. The step keeps its narrative and stays visible in the chain, because
+    that is how the chain works; only the advice changes. Same rule
+    ``severity.compute_edge_severity`` applies as Rule 1 and CLAUDE.md
+    § Nomenclature Standard states as hard rule 3.
+
+    This function is the single source of truth for step remediation on every
+    surface: the PDF deliverable calls it at render time, and the web reads the
+    ``knowledge`` blocks that ``build_step_knowledge`` — which calls it — bakes
+    into ``attack_paths_snapshot.json`` and ``attack_graph.json``.
     """
     if not isinstance(step, dict):
         return []
@@ -3887,6 +4168,45 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
     entry = get_attack_step_entry(str(relation_raw))
     if entry is None:
         return []
+
+    def _clean_bullet(value: Any) -> str:
+        # VULN_CATALOG remediation lines carry a literal "[bullet] " marker; the
+        # step renderer emits its own bullet, so strip the marker for parity
+        # with the edge-specific remediation_steps.
+        text = str(value).strip()
+        if text.lower().startswith("[bullet]"):
+            text = text[len("[bullet]"):].strip()
+        return text
+
+    def _technique_remediation() -> list[str]:
+        """Return the canonical static remediation from ``VULN_CATALOG``.
+
+        Technique-level advice, joined by the entry's ``vuln_key`` — it never
+        names the step's source, so it stays correct for a Tier-0-direct source
+        as well as for an ordinary one.
+        """
+        prose = resolve_technique_prose(getattr(entry, "vuln_key", None))
+        remediation = prose.get("remediation")
+        if isinstance(remediation, (list, tuple)):
+            return [cleaned for item in remediation if (cleaned := _clean_bullet(item))]
+        if isinstance(remediation, str) and _clean_bullet(remediation):
+            return [_clean_bullet(remediation)]
+        return []
+
+    if _step_source_is_tier0_direct(step):
+        technique = _technique_remediation()
+        if not entry.remediation_steps and not technique:
+            # Nothing was ever rendered for this step — do not invent an
+            # explanation for advice that never existed.
+            return []
+        placeholders = _extract_step_placeholders(step)
+        return [
+            _STRUCTURAL_HIERARCHY_REMEDIATION.format(
+                source=placeholders.get("source") or "this principal"
+            ),
+            *technique,
+        ]
+
     if entry.remediation_steps:
         placeholders = _extract_step_placeholders(step)
         rendered: list[str] = []
@@ -3901,23 +4221,7 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
         return rendered
     # Fallback: pull the canonical static remediation from VULN_CATALOG via the
     # vuln_key join (ADCS ESC* and any vuln-bearing edge without per-edge steps).
-    prose = resolve_technique_prose(getattr(entry, "vuln_key", None))
-    remediation = prose.get("remediation")
-
-    def _clean_bullet(value: Any) -> str:
-        # VULN_CATALOG remediation lines carry a literal "[bullet] " marker; the
-        # step renderer emits its own bullet, so strip the marker for parity
-        # with the edge-specific remediation_steps.
-        text = str(value).strip()
-        if text.lower().startswith("[bullet]"):
-            text = text[len("[bullet]"):].strip()
-        return text
-
-    if isinstance(remediation, (list, tuple)):
-        return [cleaned for item in remediation if (cleaned := _clean_bullet(item))]
-    if isinstance(remediation, str) and _clean_bullet(remediation):
-        return [_clean_bullet(remediation)]
-    return []
+    return _technique_remediation()
 
 
 def resolve_technique_prose(vuln_key: str | None) -> dict[str, Any]:

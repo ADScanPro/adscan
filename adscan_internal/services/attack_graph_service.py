@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Iterator, cast
+from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -26,7 +26,12 @@ from adscan_internal.rich_output import (
     print_attack_paths_summary_debug,
 )
 from adscan_core.rich_output import strip_sensitive_markers
-from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
+from adscan_internal.workspaces import (
+    domain_subpath,
+    read_json_file,
+    resolve_workspace_cwd,
+    write_json_file,
+)
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
 from adscan_internal.services import attack_graph_core, attack_paths_core
@@ -76,6 +81,8 @@ from adscan_internal.services.edge_kind import classify_edge_kind
 from adscan_internal.services.compromise_class import (
     PrivilegeTier,
     apply_path_based_classification,
+    is_structural_hierarchy_source,
+    privilege_tier_for_node,
     privilege_tier_for_principal,
 )
 from adscan_internal.services.tier_lattice import (
@@ -95,6 +102,7 @@ from adscan_internal.services.identity_risk_service import (
     load_or_build_identity_risk_snapshot,
 )
 from adscan_internal.services.choke_point_classifier import (
+    CHOKE_POINT_VERDICT_NOTE_KEYS,
     classify_attack_graph_edge_choke_point,
 )
 from adscan_internal.services.cache_metrics import (
@@ -422,11 +430,7 @@ def _maintenance_key(version: int) -> str:
 def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
     """Load enabled users list for a domain if available."""
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()  # type: ignore[attr-defined]
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
         enabled_path = domain_subpath(
             workspace_cwd, domains_dir, domain, "enabled_users.txt"
@@ -464,11 +468,7 @@ def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
 def _load_domain_users(shell: object, domain: str) -> list[str] | None:
     """Load the persisted domain user list for a workspace domain."""
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()  # type: ignore[attr-defined]
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
         users_path = domain_subpath(workspace_cwd, domains_dir, domain, "users.txt")
         if not os.path.exists(users_path):
@@ -546,11 +546,7 @@ def get_enabled_computers_for_domain(
 ) -> set[str] | None:
     """Return enabled computer sAMAccountNames for a domain using workspace data."""
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()  # type: ignore[attr-defined]
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
         computers = load_enabled_computer_samaccounts(
             workspace_cwd, domains_dir, domain
@@ -1974,6 +1970,298 @@ def _expand_group_ancestors(
     return cache.get(group_label, set())
 
 
+class _AttackPathMemoryBudgetExceeded(Exception):
+    """Signal that attack-path discovery would exceed the memory ceiling.
+
+    Raised by the post-DFS memory gate (:func:`_gate_attack_path_memory_post_dfs`)
+    when the projected peak crosses the safety threshold, so the compute aborts
+    BEFORE the memory-heavy decoration/ordering stages allocate — turning a fatal
+    ``SIGKILL`` into a clean, declared stop. Caught once at the public entry point
+    (:func:`get_attack_path_summaries`), which records the client-facing coverage
+    declaration and prints the operator remedy. Carries the raw route count so the
+    coverage boundary can state how many routes were examined before the bound.
+    """
+
+    def __init__(self, message: str, *, examined_routes: int) -> None:
+        super().__init__(message)
+        self.operator_message = message
+        self.examined_routes = int(examined_routes)
+
+
+def _read_memory_ceiling() -> tuple[int | None, int | None]:
+    """Return ``(limit_bytes, available_bytes)`` from the memory probe, best-effort.
+
+    Reuses :func:`adscan_core.memory_probe.read_memory_situation` — the cgroup-aware
+    reader (never ``/proc/meminfo`` host RAM when a container cap exists). Returns
+    ``(None, None)`` on any failure so the gate proceeds rather than aborting blind.
+    """
+    try:
+        from adscan_core import memory_probe
+
+        situation = memory_probe.read_memory_situation()
+        return situation.limit_bytes, situation.available_bytes
+    except Exception:  # noqa: BLE001 — a memory read must never break discovery.
+        return None, None
+
+
+def _gate_attack_path_memory_pre_dfs(nodes: int, edges: int) -> None:
+    """Stage A — project the graph term only, before the DFS runs.
+
+    The graph-resident memory is the only signal available before an hour of DFS.
+    A graph large enough to cross the ceiling on its own is surfaced HERE, at phase
+    entry, because the remedy (resize + re-run) is one the operator should learn
+    now rather than after the DFS burns time.
+
+    Interactive: WARN and proceed — ``raw_paths`` (often the dominant term) is not
+    yet known, so a viable compute is not aborted prematurely; the operator sees
+    the resize advice and can choose to stop.
+
+    Non-interactive (``adscan ci`` / the web worker): when the GRAPH TERM ALONE
+    already crosses the threshold the run is unconditionally doomed — adding the
+    path term can only make it worse — and there is nobody to react, so proceeding
+    would only burn the DFS and reach the same fatal allocation. In that case block
+    now (raise the declared abort) so the run stops cleanly with a coverage
+    declaration instead of being ``SIGKILL``ed. The abort is caught at the public
+    entry point.
+
+    Best-effort: any failure other than the declared abort leaves the compute
+    unchanged.
+    """
+    try:
+        from adscan_core.reporting import attack_path_memory_gate as gate
+
+        limit_bytes, available_bytes = _read_memory_ceiling()
+        projection = gate.evaluate_projection(
+            nodes=nodes,
+            edges=edges,
+            raw_paths=None,
+            limit_bytes=limit_bytes,
+            available_bytes=available_bytes,
+            stage="pre_dfs",
+        )
+        if not projection.exceeds:
+            return
+        message = gate.operator_message(projection)
+    except _AttackPathMemoryBudgetExceeded:
+        raise
+    except Exception:  # noqa: BLE001 — the pre-DFS gate must never break discovery.
+        return
+
+    non_interactive = False
+    try:
+        from adscan_internal.interaction import is_non_interactive
+
+        non_interactive = bool(is_non_interactive())
+    except Exception:  # noqa: BLE001 — default to the safe interactive behaviour.
+        non_interactive = False
+
+    if non_interactive:
+        # Doomed graph, unattended run — stop cleanly with a declaration rather
+        # than let the DFS reach a SIGKILL. examined_routes=0: the DFS never ran.
+        raise _AttackPathMemoryBudgetExceeded(message, examined_routes=0)
+    print_warning(message)
+
+
+def _estimate_affected_count_for_gate(shell: object, domain: str) -> int:
+    """Return a CONSERVATIVE upper bound on the per-path blast radius, best-effort.
+
+    The memory gate's affected-aware path term needs ``affected_count`` — how many
+    principals each surviving path stores in its ``meta.affected_users`` list — but
+    that value is resolved only later, INSIDE the post-processing stage this gate
+    protects (:func:`_apply_affected_user_metadata`), AFTER this seam fires. So the
+    gate must estimate it, and the estimate must be conservative in the SAFE
+    direction: OVER-estimate the blast radius, so the projection over-shoots and the
+    gate errs toward a clean early stop, never toward letting the run reach the OOM.
+
+    The estimator is the domain's ENABLED-PRINCIPAL count — a strict upper bound
+    (no path can affect more principals than exist in the directory) that is already
+    loaded cheaply for the very post-processing this gate guards, so it costs no
+    memory of its own. It is faithful precisely where it matters: a benign small
+    directory has few enabled principals, so the estimate stays small and does not
+    over-fire; a large corporate directory (the OOM the user reported) has thousands,
+    which is the true Domain-Users-convergence blast radius the affected slope
+    charges for. Returns ``0`` when the count cannot be read — the projection then
+    degrades to the base per-raw term, safe but no worse than the prior model.
+    """
+    try:
+        enabled = get_enabled_users_for_domain(shell, domain)
+        if enabled:
+            return len(enabled)
+        domain_users = get_domain_users_for_domain(shell, domain)
+        if domain_users:
+            return len(domain_users)
+    except Exception:  # noqa: BLE001 — an estimate must never break discovery.
+        return 0
+    return 0
+
+
+def _gate_attack_path_memory_post_dfs(
+    *, shell: object, domain: str, nodes: int, edges: int, raw_paths: int
+) -> None:
+    """Stage B — project the full peak now that ``raw_paths`` is known.
+
+    The DFS is done and its raw route count is the term that most often blows the
+    budget. There is a large safety window here: the DFS finishes with RSS flat,
+    then the decoration/ordering stages spike memory. So this is the moment to
+    project the FULL peak and, if it crosses the threshold, ABORT before those
+    stages run — saving both the wasted CPU and the fatal allocation. On a decision
+    to abort this raises :class:`_AttackPathMemoryBudgetExceeded`; on any internal
+    error it returns silently so the compute proceeds unchanged.
+
+    The peak model is affected-aware (each surviving path stores its blast-radius
+    list), but the true per-path blast radius is resolved only later, so this seam
+    passes a CONSERVATIVE upper bound (:func:`_estimate_affected_count_for_gate`)
+    that makes the projection over-shoot rather than miss. The graph-density regime
+    (keyed on ``nodes``/``edges``/``raw_paths``) is folded in by the gate itself.
+    """
+    try:
+        from adscan_core.reporting import attack_path_memory_gate as gate
+
+        limit_bytes, available_bytes = _read_memory_ceiling()
+        affected_count = _estimate_affected_count_for_gate(shell, domain)
+        projection = gate.evaluate_projection(
+            nodes=nodes,
+            edges=edges,
+            raw_paths=raw_paths,
+            limit_bytes=limit_bytes,
+            available_bytes=available_bytes,
+            stage="post_dfs",
+            affected_count=affected_count,
+        )
+        if not projection.exceeds:
+            return
+        message = gate.operator_message(projection)
+    except _AttackPathMemoryBudgetExceeded:
+        raise
+    except Exception:  # noqa: BLE001 — a gate failure must never break discovery.
+        return
+    # Raise OUTSIDE the try so the abort signal is not swallowed by the broad
+    # except above. The operator message reaches the terminal at the catch site.
+    raise _AttackPathMemoryBudgetExceeded(message, examined_routes=raw_paths)
+
+
+def _handle_attack_path_memory_abort(
+    shell: object, domain: str, exc: "_AttackPathMemoryBudgetExceeded"
+) -> None:
+    """Handle a memory-gate abort: operator terminal line + client coverage record.
+
+    Two audiences, two messages (CLAUDE.md § "A bounded computation is a data
+    gap"): the OPERATOR gets the real cause and remedy on the terminal (projected
+    memory, the ceiling, resize-or-free); the CLIENT deliverable gets only the
+    coverage boundary — how many routes were examined and that the set is not
+    exhaustive — never the internal reason and never a verdict about their
+    directory. Best-effort; never raises.
+    """
+    try:
+        print_warning(exc.operator_message)
+    except Exception:  # noqa: BLE001 — the operator line is best-effort.
+        pass
+    try:
+        from adscan_core.reporting.attack_path_memory_gate import (
+            build_attack_path_coverage,
+        )
+        from adscan_core.reporting.technical_report import (
+            record_attack_path_coverage,
+        )
+
+        coverage = build_attack_path_coverage(
+            bounded=True, examined_routes=exc.examined_routes
+        )
+        record_attack_path_coverage(shell, domain, coverage=coverage)
+    except Exception as record_exc:  # noqa: BLE001
+        telemetry.capture_exception(record_exc)
+        print_exception(exception=record_exc)
+
+
+def _emit_attack_path_discovery_started(
+    shell: object,
+    domain: str,
+    *,
+    scope: str,
+    target: str,
+    target_mode: str,
+) -> None:
+    """Emit a pre-discovery telemetry beacon BEFORE the DFS allocates memory.
+
+    Attack-path discovery can OOM-kill on a large domain, and an OOM is a
+    ``SIGKILL`` — no ``atexit``/signal handler runs, so the session's telemetry
+    is lost with the process and the crash cannot be sized from field data. This
+    beacon fires at the top of :func:`_compute_attack_path_summaries_inner`,
+    before any of the ``compute_display_paths_for_*`` DFS entry points run, so a
+    run that dies DURING discovery still leaves a record of the graph it was
+    about to walk and the memory situation at that moment.
+
+    It carries the base graph size (``nodes``/``edges`` — the predictor a future
+    memory gate needs), the query slice (``scope``/``target``/``target_mode``),
+    and the memory situation (cgroup limit / RSS / available, source-tagged) from
+    :mod:`adscan_core.memory_probe`. The event is FLUSHED synchronously
+    (:func:`telemetry.drain_telemetry_dispatch`) so it survives a ``SIGKILL`` that
+    lands during the subsequent allocation — the ``atexit`` disk-persist drain
+    never runs under ``SIGKILL``, so buffering it would lose it exactly as today.
+
+    Best-effort in every part: reading the graph, the memory figures, and the
+    flush are each wrapped so a beacon can never crash or slow the discovery it
+    is meant to instrument.
+
+    Args:
+        shell: The active shell (for the graph load + lab-event enrichment).
+        domain: The domain whose graph is about to be walked.
+        scope: The attack-path scope (``domain``/``owned``/``user``/``principals``).
+        target: The target selector (``highvalue``/``all``/…).
+        target_mode: The target mode (``object``/``domain``/``tier0``).
+    """
+    try:
+        from adscan_core import telemetry
+        from adscan_core import memory_probe
+
+        nodes_count = 0
+        edges_count = 0
+        try:
+            base_graph = load_attack_graph(shell, domain)
+            if isinstance(base_graph, dict):
+                base_nodes = base_graph.get("nodes")
+                base_edges = base_graph.get("edges")
+                if isinstance(base_nodes, (list, dict)):
+                    nodes_count = len(base_nodes)
+                if isinstance(base_edges, (list, dict)):
+                    edges_count = len(base_edges)
+        except Exception:  # noqa: BLE001 — a beacon must never block discovery.
+            pass
+
+        properties: dict[str, Any] = {
+            "domain": mark_sensitive(domain, "domain"),
+            "scope": scope,
+            "target": target,
+            "target_mode": target_mode,
+            "nodes": nodes_count,
+            "edges": edges_count,
+        }
+        try:
+            properties.update(memory_probe.memory_situation_fields())
+        except Exception:  # noqa: BLE001 — memory read is best-effort.
+            pass
+        try:
+            from adscan_internal.cli.common import build_lab_event_fields
+
+            properties.update(build_lab_event_fields(shell=shell, include_slug=False))
+        except Exception:  # noqa: BLE001 — lab fields are best-effort enrichment.
+            pass
+
+        telemetry.capture("attack_path_discovery_started", properties)
+        # Force the beacon onto the wire NOW. capture() enqueues onto the
+        # fire-and-forget dispatch daemon; a bounded drain blocks until that
+        # daemon has POSTed the queued job (or the bound elapses), so the event
+        # is sent before the DFS starts allocating and a SIGKILL during the walk
+        # cannot lose it. The SIGKILL disk-persist drain never runs, so this
+        # synchronous flush is the only thing that makes the beacon survive.
+        try:
+            telemetry.drain_telemetry_dispatch(total_timeout=2.5)
+        except Exception:  # noqa: BLE001 — flush is best-effort.
+            pass
+    except Exception:  # noqa: BLE001 — the beacon must never break discovery.
+        pass
+
+
 def _log_attack_path_compute_timing(
     *,
     domain: str,
@@ -2466,6 +2754,36 @@ def _load_or_build_prepared_runtime_graph(
     expand_terminal_memberships: bool,
     materialized_artifacts: MaterializedAttackPathArtifacts | None,
 ) -> dict[str, Any]:
+    """Load or build a reusable prepared runtime graph for local DFS scopes.
+
+    The prepared runtime graph is DISK-materialized and fingerprinted on the
+    graph FILE's mtime, so the in-memory foreign-DC enrichment (which depends on
+    live ``domains_data`` and never touches the file) would be bypassed by a
+    stale disk/memory cache. It is therefore re-applied to whatever graph this
+    returns — the graph the DFS actually consumes — on every call. Idempotent
+    and a no-op when no foreign DC matches the inventory.
+    """
+    prepared = _load_or_build_prepared_runtime_graph_raw(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+        expand_terminal_memberships=expand_terminal_memberships,
+        materialized_artifacts=materialized_artifacts,
+    )
+    _enrich_foreign_dc_nodes(shell, domain, prepared)
+    return prepared
+
+
+def _load_or_build_prepared_runtime_graph_raw(
+    shell: object,
+    *,
+    domain: str,
+    base_graph: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    expand_terminal_memberships: bool,
+    materialized_artifacts: MaterializedAttackPathArtifacts | None,
+) -> dict[str, Any]:
     """Load or build a reusable prepared runtime graph for local DFS scopes."""
     if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
         return _build_prepared_runtime_graph(
@@ -2713,6 +3031,136 @@ def _affected_users_tier_breakdown(
     return breakdown
 
 
+def _build_label_kind_and_sid_maps(
+    domain: str,
+    graph: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Index the graph (and snapshot) by canonical membership label.
+
+    Returns ``(label -> node kind, label -> SID)``. The SID half is what lets a
+    principal's Privilege Tier account for its own RID (500 Administrator, 502
+    krbtgt) rather than only its group closure; the snapshot's ``label_to_sid``
+    fills in any principal the graph did not carry an ``objectId`` for.
+    """
+    label_kind_map: dict[str, str] = {}
+    label_sid_map: dict[str, str] = {}
+    nodes_map = graph.get("nodes") if isinstance(graph, dict) else None
+    if isinstance(nodes_map, dict):
+        for node in nodes_map.values():
+            if not isinstance(node, dict):
+                continue
+            canonical = _canonical_membership_label(domain, _canonical_node_label(node))
+            if not canonical:
+                continue
+            label_kind_map[canonical] = _node_kind(node)
+            props = (
+                node.get("properties")
+                if isinstance(node.get("properties"), dict)
+                else {}
+            )
+            object_id = str(
+                node.get("objectId")
+                or props.get("objectid")
+                or props.get("objectId")
+                or ""
+            ).strip()
+            sid = attack_paths_core._extract_sid(object_id)  # noqa: SLF001
+            if sid:
+                label_sid_map[canonical] = sid
+    if isinstance(snapshot, dict):
+        snapshot_label_to_sid = snapshot.get("label_to_sid")
+        if isinstance(snapshot_label_to_sid, dict):
+            for label, sid in snapshot_label_to_sid.items():
+                canonical = _canonical_membership_label(domain, str(label or ""))
+                normalized_sid = normalize_sid(str(sid or ""))
+                if canonical and normalized_sid:
+                    label_sid_map.setdefault(canonical, normalized_sid)
+    return label_kind_map, label_sid_map
+
+
+def _classify_accounts_by_privilege_tier(
+    shell: object,
+    domain: str,
+    users: Iterable[str],
+    *,
+    label_sid_map: Mapping[str, str],
+    membership_closure: Mapping[str, tuple[str, ...]],
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Grade a set of accounts by the Privilege Tier each one IS GRANTED.
+
+    Returns ``(coarse {tier0,tier1,tier2} breakdown, account -> fine tier value)``.
+
+    The one classification behind every account-tier figure ADscan reports: the
+    Tier split of the accounts a path affects AND the Tier split of the account
+    POPULATION the exposure KPIs measure against. They have to come from the same
+    resolver, because the two are compared — an affected Tier-0 count larger than
+    the population's would be arithmetic nobody could defend.
+
+    Grading is the engine SSOT ``privilege_tier_for_principal`` over each
+    account's TRANSITIVE group closure, with its own RID read from the SID, and
+    the identity-risk Tier-0 flag as a floor for an account the snapshot did not
+    cover.
+    """
+    normalized_users = sorted(
+        {
+            normalize_samaccountname(str(user))
+            for user in users
+            if normalize_samaccountname(str(user))
+        },
+        key=str.lower,
+    )
+    if not normalized_users:
+        return {bucket: 0 for bucket in _AFFECTED_TIER_BUCKETS}, {}
+    risk_flags = classify_users_tier0_high_value(
+        shell,
+        domain=domain,
+        usernames=normalized_users,
+    )
+
+    def _resolver(samaccountname: str) -> PrivilegeTier:
+        canonical = _canonical_membership_label(domain, samaccountname)
+        groups = membership_closure.get(canonical, ()) if canonical else ()
+        sid = label_sid_map.get(canonical or "", "") if canonical else ""
+        tier = privilege_tier_for_principal(list(groups), sid=sid or None)
+        if not tier.is_tier0:
+            risk = risk_flags.get(normalize_samaccountname(str(samaccountname)))
+            if bool(getattr(risk, "is_tier0", False)):
+                return PrivilegeTier.TIER0_DIRECT
+        return tier
+
+    return _affected_users_tier_classification(normalized_users, _resolver)
+
+
+def classify_accounts_by_privilege_tier(
+    shell: object,
+    domain: str,
+    users: Iterable[str],
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Public front door over :func:`_classify_accounts_by_privilege_tier`.
+
+    Loads the attack graph and membership snapshot itself, for callers that hold
+    only a shell and a domain (the account-population tier split behind the
+    privilege-sprawl KPI). Callers already holding both should use the private
+    form and pass their loaded copies rather than re-reading the workspace.
+    """
+    graph = load_attack_graph(shell, domain)
+    snapshot = _load_membership_snapshot(shell, domain)
+    _kinds, label_sid_map = _build_label_kind_and_sid_maps(domain, graph, snapshot)
+    membership_closure = (
+        _build_recursive_membership_closure(domain, snapshot)
+        if isinstance(snapshot, dict)
+        else {}
+    )
+    return _classify_accounts_by_privilege_tier(
+        shell,
+        domain,
+        users,
+        label_sid_map=label_sid_map,
+        membership_closure=membership_closure,
+    )
+
+
 def _apply_affected_user_metadata(
     shell: object,
     domain: str,
@@ -2736,40 +3184,9 @@ def _apply_affected_user_metadata(
     if not annotated:
         return []
 
-    nodes_map = (
-        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
+    label_kind_map, label_sid_map = _build_label_kind_and_sid_maps(
+        domain, base_graph, snapshot
     )
-    label_kind_map: dict[str, str] = {}
-    label_sid_map: dict[str, str] = {}
-    if isinstance(nodes_map, dict):
-        for node in nodes_map.values():
-            if not isinstance(node, dict):
-                continue
-            canonical = _canonical_membership_label(domain, _canonical_node_label(node))
-            if canonical:
-                label_kind_map[canonical] = _node_kind(node)
-                props = (
-                    node.get("properties")
-                    if isinstance(node.get("properties"), dict)
-                    else {}
-                )
-                object_id = str(
-                    node.get("objectId")
-                    or props.get("objectid")
-                    or props.get("objectId")
-                    or ""
-                ).strip()
-                sid = attack_paths_core._extract_sid(object_id)  # noqa: SLF001
-                if sid:
-                    label_sid_map[canonical] = sid
-    if isinstance(snapshot, dict):
-        snapshot_label_to_sid = snapshot.get("label_to_sid")
-        if isinstance(snapshot_label_to_sid, dict):
-            for label, sid in snapshot_label_to_sid.items():
-                canonical = _canonical_membership_label(domain, str(label or ""))
-                normalized_sid = normalize_sid(str(sid or ""))
-                if canonical and normalized_sid:
-                    label_sid_map.setdefault(canonical, normalized_sid)
 
     group_members, _computer_group_members, has_users = (
         attack_paths_core.build_group_member_index(
@@ -2799,43 +3216,19 @@ def _apply_affected_user_metadata(
     ) -> tuple[dict[str, int], dict[str, str]]:
         """Tier 0/1/2 classification for a broad-group affected-account set.
 
-        Returns ``(breakdown, tier_map)`` — the coarse Tier 0/1/2 counts plus a
-        per-account map of (normalised sAMAccountName -> fine PrivilegeTier value)
-        so the drill-down can badge each row. Reuses the engine Privilege Tier
-        SSOT (``privilege_tier_for_principal`` over each account's transitive
-        group closure), with the identity-risk Tier-0 flag as a floor — catching
-        RID-500 Administrator and any account the graph already flagged Tier 0
-        even when its group closure is absent from the snapshot (the same SSOT the
-        previous low-priv strip trusted).
+        Delegates to the shared account grader
+        (:func:`_classify_accounts_by_privilege_tier`) with the graph/snapshot
+        indexes this call already built, so the affected set and the account
+        POPULATION behind the sprawl KPI are graded by one resolver and their
+        Tier-0 counts always reconcile.
         """
-        normalized_users = sorted(
-            {
-                normalize_samaccountname(str(user))
-                for user in users
-                if normalize_samaccountname(str(user))
-            },
-            key=str.lower,
-        )
-        if not normalized_users:
-            return {bucket: 0 for bucket in _AFFECTED_TIER_BUCKETS}, {}
-        risk_flags = classify_users_tier0_high_value(
+        return _classify_accounts_by_privilege_tier(
             shell,
-            domain=domain,
-            usernames=normalized_users,
+            domain,
+            users,
+            label_sid_map=label_sid_map,
+            membership_closure=_membership_closure,
         )
-
-        def _resolver(samaccountname: str) -> PrivilegeTier:
-            canonical = _canonical_membership_label(domain, samaccountname)
-            groups = _membership_closure.get(canonical, ()) if canonical else ()
-            sid = label_sid_map.get(canonical or "", "") if canonical else ""
-            tier = privilege_tier_for_principal(list(groups), sid=sid or None)
-            if not tier.is_tier0:
-                risk = risk_flags.get(normalize_samaccountname(str(samaccountname)))
-                if bool(getattr(risk, "is_tier0", False)):
-                    return PrivilegeTier.TIER0_DIRECT
-            return tier
-
-        return _affected_users_tier_classification(normalized_users, _resolver)
 
     fallback_domain_users_source = ""
     enabled_users = get_enabled_users_for_domain(shell, domain)
@@ -4283,11 +4676,7 @@ def _index_existing_user_object_control_relations(
 
 def _acl_object_control_coverage_path(shell: object, domain: str) -> str:
     """Return the compact ACL object-control coverage sidecar path."""
-    workspace_cwd = (
-        shell._get_workspace_cwd()  # type: ignore[attr-defined]
-        if hasattr(shell, "_get_workspace_cwd")
-        else getattr(shell, "current_workspace_dir", os.getcwd())
-    )
+    workspace_cwd = resolve_workspace_cwd(shell)
     domains_dir = getattr(shell, "domains_dir", "domains")
     return domain_subpath(
         workspace_cwd,
@@ -6433,11 +6822,7 @@ def _status_rank(status: str) -> int:
 
 
 def _graph_path(shell: object, domain: str) -> str:
-    workspace_cwd = (
-        shell._get_workspace_cwd()  # type: ignore[attr-defined]
-        if hasattr(shell, "_get_workspace_cwd")
-        else getattr(shell, "current_workspace_dir", os.getcwd())
-    )
+    workspace_cwd = resolve_workspace_cwd(shell)
     domains_dir = getattr(shell, "domains_dir", "domains")
     return domain_subpath(workspace_cwd, domains_dir, domain, "attack_graph.json")
 
@@ -6484,6 +6869,48 @@ def load_merged_attack_graph(shell: object, domains: list[str]) -> dict[str, Any
                 merged["edges"].append(edge)
 
     return merged
+
+
+def _enrich_foreign_dc_nodes(
+    shell: object, domain: str, graph: dict[str, Any]
+) -> None:
+    """Back-fill writable-DC markers on pivot-discovered DC nodes from inventory.
+
+    Thin shell-aware wrapper over
+    :func:`attack_graph_core.enrich_foreign_dc_nodes_from_inventory`: it reads the
+    live ``shell.domains_data`` (which holds every trusted domain's DC inventory
+    from trust enumeration) and enriches ``graph`` IN PLACE, in memory only. This
+    is what lets the F6 direct-DCSync overlay couple a cross-forest compromised DC
+    (e.g. ``dc02.darkzero.ext`` reached via an MSSQL linked-server pivot) to its
+    own trusted domain node. Best-effort — never raises into the load path.
+    """
+    try:
+        domains_data = getattr(shell, "domains_data", None)
+        if not isinstance(domains_data, dict) or not domains_data:
+            return
+        changed = attack_graph_core.enrich_foreign_dc_nodes_from_inventory(
+            graph, domains_data
+        )
+        if changed:
+            print_info_debug(
+                f"[attack_graph] back-filled foreign DC role markers in "
+                f"{mark_sensitive(domain, 'domain')} attack graph (in-memory)."
+            )
+        # Couple the cross-forest TGT-delegation escalation AFTER DC enrichment so
+        # any synthetic trusted-domain node it needs already exists. Adds a derived
+        # escalation edge (compromised trusted domain -> trusting domain) only when
+        # the trust actually carries CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION.
+        coupled = attack_graph_core.couple_cross_org_tgt_delegation_edges(
+            graph, domains_data
+        )
+        if coupled:
+            print_info_debug(
+                f"[attack_graph] coupled cross-forest TGT-delegation escalation edge "
+                f"in {mark_sensitive(domain, 'domain')} attack graph (in-memory)."
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
@@ -6577,6 +7004,14 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 except Exception:
                     pass
                 save_attack_graph(shell, domain, data)
+            # In-memory only, applied on EVERY load AFTER the persist decision so
+            # it never reaches disk: back-fill the writable-DC role marker on a
+            # foreign (pivot-discovered) DC node from the trust-enum inventory in
+            # domains_data, and synthesize the trusted domain's Domain node when
+            # absent. This lets the F6 DCSync overlay couple a cross-forest
+            # compromised DC to its own domain. Depends on live domains_data, so
+            # it cannot be a version-gated maintenance pass.
+            _enrich_foreign_dc_nodes(shell, domain, data)
             return data
         if schema_version in {"1.0"}:
             migrated = _migrate_attack_graph(data)
@@ -6598,6 +7033,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                     _ATTACK_GRAPH_MAINTENANCE_VERSION
                 )
                 save_attack_graph(shell, domain, migrated)
+                _enrich_foreign_dc_nodes(shell, domain, migrated)
                 return migrated
     return {
         "schema_version": ATTACK_GRAPH_SCHEMA_VERSION,
@@ -7540,14 +7976,19 @@ def _edge_matches_upsert_identity(
     return True
 
 
-# Per-relation cache of the baked technique-knowledge object. The prose is
-# pure (a function of the relation + the static VULN_CATALOG), so resolving it
-# once per relation per process avoids re-running the catalog join on every
+# Cache of the baked technique-knowledge object, keyed by
+# ``(relation, source_is_tier0_direct)``. The prose is pure (a function of the
+# relation, that one flag, and the static VULN_CATALOG), so resolving it once
+# per key per process avoids re-running the catalog join on every
 # ``upsert_edge`` call at 1-2k-host scale.
-_EDGE_KNOWLEDGE_CACHE: dict[str, dict[str, Any]] = {}
+_EDGE_KNOWLEDGE_CACHE: dict[tuple[str, bool], dict[str, Any]] = {}
 
 
-def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
+def _bake_edge_technique_knowledge(
+    relation_norm: str,
+    *,
+    source_is_tier0_direct: bool = False,
+) -> dict[str, Any] | None:
     """Resolve the rich technique-knowledge object for one edge relation.
 
     The persisted attack-graph artifact (``attack_graph.json``) is ingested by
@@ -7565,6 +8006,12 @@ def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
 
     Args:
         relation_norm: The already-normalized edge relation.
+        source_is_tier0_direct: True when the edge's SOURCE is already a Tier 0
+            direct principal, so the catalog renders the structural-hierarchy
+            line instead of removal advice (the web edge panel would otherwise
+            tell a client to strip replication rights off its own domain
+            controllers). Part of the cache key — at most two entries per
+            relation.
 
     Returns:
         The technique-knowledge dict (``description``, ``impact``,
@@ -7573,11 +8020,23 @@ def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
     """
     if not relation_norm:
         return None
-    cached = _EDGE_KNOWLEDGE_CACHE.get(relation_norm)
+    cache_key = (relation_norm, bool(source_is_tier0_direct))
+    cached = _EDGE_KNOWLEDGE_CACHE.get(cache_key)
     if cached is not None:
         return cached or None
     try:
-        knowledge = build_step_knowledge({"relation": relation_norm})
+        knowledge = build_step_knowledge(
+            {
+                "relation": relation_norm,
+                "details": {
+                    "source_privilege_tier": (
+                        PrivilegeTier.TIER0_DIRECT.value
+                        if source_is_tier0_direct
+                        else PrivilegeTier.TIER2.value
+                    )
+                },
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -7617,13 +8076,15 @@ def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
     # Cache the resolved value (even a no-technique resolution, stored as ``{}``)
     # so a relation without a technique mapping is not re-resolved on every
     # upsert at scale.
-    _EDGE_KNOWLEDGE_CACHE[relation_norm] = baked if isinstance(baked, dict) else {}
+    _EDGE_KNOWLEDGE_CACHE[cache_key] = baked if isinstance(baked, dict) else {}
     return baked
 
 
 def _personalize_edge_knowledge(
     relation_norm: str,
     edge_notes: dict[str, Any] | None,
+    *,
+    source_is_tier0_direct: bool = False,
 ) -> dict[str, Any] | None:
     """Weave THIS edge's concrete assets into its baked technique knowledge.
 
@@ -7639,7 +8100,9 @@ def _personalize_edge_knowledge(
     ``report_service.sync_attack_graph_findings`` via the SAME affected-assets
     SSOT, so the edge card and the finding card name identical assets.
     """
-    base = _bake_edge_technique_knowledge(relation_norm)
+    base = _bake_edge_technique_knowledge(
+        relation_norm, source_is_tier0_direct=source_is_tier0_direct
+    )
     if not isinstance(base, dict) or not base:
         return base
     if not isinstance(edge_notes, dict) or not edge_notes:
@@ -7735,6 +8198,13 @@ def upsert_edge(
                 "exec_support": support.kind,
                 "exec_support_version": version,
             }
+    # Is this edge built-in AD hierarchy (its SOURCE is already Tier 0 direct)?
+    # Resolved once and threaded into the baked technique knowledge, so the paid
+    # web edge panel never advises removing a right the domain needs to run.
+    _graph_nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    source_is_tier0_direct = is_structural_hierarchy_source(
+        _graph_nodes.get(from_id) if isinstance(_graph_nodes, dict) else None
+    )
     choke_point_notes = classify_attack_graph_edge_choke_point(
         graph,
         from_id=from_id,
@@ -7786,6 +8256,15 @@ def upsert_edge(
                 existing=merged_notes,
                 incoming=desired_notes,
             )
+            # Heal a choke-point stamp the current classifier no longer agrees
+            # with. Notes MERGE, so without this an edge stamped a choke point by
+            # an older build keeps that stamp — and its severity — for the life
+            # of the workspace, even after the classifier learned the transition
+            # was built-in AD hierarchy. Same heal-on-re-sync contract the baked
+            # ``knowledge`` block below follows.
+            if choke_point_notes is None:
+                for stale_key in CHOKE_POINT_VERDICT_NOTE_KEYS:
+                    merged_notes.pop(stale_key, None)
             if merged_notes:
                 edge["notes"] = merged_notes
             # Bake the technique-knowledge prose so the paid web edge panel can
@@ -7794,7 +8273,11 @@ def upsert_edge(
             # merged notes, so the web edge-detail names the exact assets. Healed
             # on re-sync: stamp when present, drop a stale block if the relation
             # no longer maps to a technique.
-            baked_knowledge = _personalize_edge_knowledge(relation_norm, merged_notes)
+            baked_knowledge = _personalize_edge_knowledge(
+                relation_norm,
+                merged_notes,
+                source_is_tier0_direct=source_is_tier0_direct,
+            )
             if baked_knowledge:
                 edge["knowledge"] = baked_knowledge
             elif "knowledge" in edge:
@@ -7828,7 +8311,9 @@ def upsert_edge(
     # technique edges (those with a resolvable catalog entry) carry it;
     # structural edges (MemberOf, Contains, ...) stay clean.
     baked_knowledge = _personalize_edge_knowledge(
-        relation_norm, entry.get("notes") if isinstance(entry.get("notes"), dict) else None
+        relation_norm,
+        entry.get("notes") if isinstance(entry.get("notes"), dict) else None,
+        source_is_tier0_direct=source_is_tier0_direct,
     )
     if baked_knowledge:
         entry["knowledge"] = baked_knowledge
@@ -9232,6 +9717,19 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         step_details = {
             "from": label(step.from_id),
             "to": label(step.to_id),
+            # The SOURCE's granted Privilege Tier (axis 1), resolved HERE
+            # because this is where the graph nodes are in hand — a downstream
+            # renderer only ever sees labels, and a label cannot tell you that
+            # MEEREEN$ is a domain controller. Consumed by
+            # ``attack_step_catalog.render_step_remediation`` to suppress
+            # "remove it" advice on a step out of a Tier-0-direct principal
+            # (built-in AD hierarchy, not a misconfiguration). Baked as DATA at
+            # this SSOT, mirroring how ``derive_step_display_status`` bakes the
+            # ``structural`` status, so the PDF and the web read one verdict
+            # instead of each re-deriving it.
+            "source_privilege_tier": privilege_tier_for_node(
+                nodes_map.get(step.from_id)
+            ).value,
             **(step.notes or {}),
         }
         if relation_key.startswith("adcs") or relation_key in {
@@ -9298,6 +9796,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 "details": {
                     "from": label(path.target_id),
                     "to": str(synthetic_followup["to"]),
+                    # Same axis-1 stamp as the real steps above, so every step a
+                    # renderer receives carries the source tier.
+                    "source_privilege_tier": privilege_tier_for_node(
+                        nodes_map.get(path.target_id)
+                    ).value,
                     "reason": str(synthetic_followup.get("reason") or ""),
                     "synthetic_followup": True,
                     "followup_source_group": label(path.target_id),
@@ -13457,6 +13960,7 @@ def _apply_local_postprocessing_pipeline(
     target_mode: str = "object",
     display_friendly: bool | None = None,
     keep_longest: bool = False,
+    runtime_graph: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply the shared post-processing pipeline to local DFS results.
 
@@ -13515,11 +14019,24 @@ def _apply_local_postprocessing_pipeline(
     # telemetry event both start from the true totals.
     _base_nodes = _base_graph.get("nodes") if isinstance(_base_graph, dict) else None
     _base_edges = _base_graph.get("edges") if isinstance(_base_graph, dict) else None
-    attack_path_progress.notify_graph_size(
-        len(_base_nodes) if isinstance(_base_nodes, (list, dict)) else 0,
-        len(_base_edges) if isinstance(_base_edges, (list, dict)) else 0,
-    )
+    _base_nodes_count = len(_base_nodes) if isinstance(_base_nodes, (list, dict)) else 0
+    _base_edges_count = len(_base_edges) if isinstance(_base_edges, (list, dict)) else 0
+    attack_path_progress.notify_graph_size(_base_nodes_count, _base_edges_count)
     attack_path_progress.notify_stage("raw", len(records))
+
+    # Stage B of the memory gate — now that the DFS is done and ``raw_paths`` is
+    # known (the term that most often blows the budget), project the FULL peak and
+    # ABORT before the memory-heavy decoration/ordering stages below run. The DFS
+    # left RSS flat; those stages are where it spikes. Aborting here saves both the
+    # remaining CPU and the fatal allocation. A declared abort propagates to
+    # get_attack_path_summaries, which records the coverage declaration.
+    _gate_attack_path_memory_post_dfs(
+        shell=shell,
+        domain=domain,
+        nodes=_base_nodes_count,
+        edges=_base_edges_count,
+        raw_paths=len(records),
+    )
 
     # Log scope / rule matrix (mirrors BH CE pipeline header).
     _apply_leading = display_friendly and (
@@ -13988,6 +14505,22 @@ def _apply_local_postprocessing_pipeline(
         f"[local-pipeline] final: {len(records)} attack path(s) after all post-processing"
     )
 
+    # Decorate seam — the ONE place the deferred per-step decoration is applied,
+    # after every minimisation/filter/dedup stage across both the core and the
+    # local-postprocessing pipeline. The DFS built LIGHT records (path_to_display_
+    # record(..., decorate=False)); only these survivors pay the expensive
+    # remediability + Privilege-Tier resolution. Idempotent, so it is a no-op on
+    # already-decorated records (e.g. a cache-hit path). Uses the SAME graph the
+    # DFS ran on (``runtime_graph``, which may carry injected group/membership
+    # nodes absent from the persisted base graph) so the output is byte-identical
+    # to eager decoration; falls back to the base graph only if a caller omits it.
+    _decorate_graph = (
+        runtime_graph
+        if isinstance(runtime_graph, dict) and runtime_graph.get("nodes")
+        else _base_graph
+    )
+    attack_graph_core.decorate_display_records(_decorate_graph, records)
+
     return records
 
 
@@ -14175,6 +14708,7 @@ def compute_display_paths_for_user(
         allow_owned_terminal_target=allow_owned_terminal_target,
         target_mode=target_mode,
         display_friendly=display_friendly,
+        runtime_graph=runtime_graph,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
@@ -14348,6 +14882,7 @@ def compute_display_paths_for_domain(
         target_mode=target_mode,
         display_friendly=display_friendly,
         keep_longest=keep_longest,
+        runtime_graph=runtime_graph,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
@@ -15126,6 +15661,13 @@ def get_attack_path_summaries(
                 display_friendly=display_friendly,
                 keep_longest=keep_longest,
             )
+    except _AttackPathMemoryBudgetExceeded as exc:
+        # The memory gate stopped discovery cleanly before it could be SIGKILLed.
+        # Give the operator the real cause + remedy on the terminal, and record the
+        # client-facing coverage declaration so the deliverable and the web CTEM
+        # both state the bound honestly (never rendering a bounded run as complete).
+        _handle_attack_path_memory_abort(shell, domain, exc)
+        return []
     finally:
         attack_graph_core._ATTACK_PATH_WORKERS = _prev_graph_workers  # noqa: SLF001
         attack_paths_core._PRINCIPAL_WORKERS = _prev_principal_workers  # noqa: SLF001
@@ -15368,6 +15910,46 @@ def _compute_attack_path_summaries_inner(
     keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     """Inner implementation of compute_attack_path_summaries, engine-dispatched."""
+    # Pre-discovery beacon: emit the base graph size + memory situation BEFORE
+    # any engine's DFS runs, so a run that OOM-kills DURING discovery (a SIGKILL,
+    # which skips the atexit telemetry drain) still leaves a diagnosable record.
+    # Best-effort and synchronously flushed inside the helper.
+    _emit_attack_path_discovery_started(
+        shell,
+        domain,
+        scope=scope_norm,
+        target=target,
+        target_mode=target_mode,
+    )
+
+    # Stage A of the memory gate — project the graph-resident term BEFORE any DFS
+    # runs. This is the only memory signal available pre-DFS; when the graph alone
+    # would cross the ceiling, warn (interactive) or block cleanly (non-interactive)
+    # now, so the resize-and-re-run remedy surfaces before an hour of DFS. The
+    # size read is best-effort; a declared abort propagates to the public entry.
+    _stage_a_nodes_count = 0
+    _stage_a_edges_count = 0
+    try:
+        _stage_a_graph = load_attack_graph(shell, domain)
+        _stage_a_nodes = (
+            _stage_a_graph.get("nodes") if isinstance(_stage_a_graph, dict) else None
+        )
+        _stage_a_edges = (
+            _stage_a_graph.get("edges") if isinstance(_stage_a_graph, dict) else None
+        )
+        _stage_a_nodes_count = (
+            len(_stage_a_nodes) if isinstance(_stage_a_nodes, (list, dict)) else 0
+        )
+        _stage_a_edges_count = (
+            len(_stage_a_edges) if isinstance(_stage_a_edges, (list, dict)) else 0
+        )
+    except Exception:  # noqa: BLE001 — the graph-size read is best-effort.
+        _stage_a_nodes_count = 0
+        _stage_a_edges_count = 0
+    # A declared abort from here propagates to get_attack_path_summaries, which
+    # records the coverage declaration — do NOT wrap this in a swallowing except.
+    _gate_attack_path_memory_pre_dfs(_stage_a_nodes_count, _stage_a_edges_count)
+
     allow_owned_terminal_target = bool(
         isinstance(summary_filters, AttackPathSummaryFilters)
         and summary_filters.target_labels
@@ -15758,6 +16340,7 @@ def compute_display_paths_for_principals(
         allow_owned_terminal_target=allow_owned_terminal_target,
         target_mode=target_mode,
         display_friendly=display_friendly,
+        runtime_graph=runtime_graph,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(

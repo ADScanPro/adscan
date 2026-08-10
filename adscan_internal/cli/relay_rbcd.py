@@ -1161,8 +1161,17 @@ def _select_reusable_delegate(
     ``_PlannedDelegate(created=False)`` when the operator picks one (so cleanup
     never deletes it), or ``None`` to fall through to minting a fresh account
     (operator chose "create new", there are no candidates, or non-interactive).
+
+    The create-vs-reuse decision is resolved through the shared
+    :func:`plan_privileged_account` SSOT (create-new is the safe non-interactive
+    default); RBCD-specific prompt wording is preserved so the operator UX is
+    unchanged. A cancel falls through to minting a fresh account, identical to
+    the pre-SSOT behaviour.
     """
-    from adscan_core.output import questionary_select_index  # noqa: PLC0415
+    from adscan_internal.services.privileged_account_provisioning import (  # noqa: PLC0415
+        ProvisioningAction,
+        decide_provisioning_action,
+    )
 
     try:
         creds = (
@@ -1182,19 +1191,19 @@ def _select_reusable_delegate(
     if not candidates:
         return None
 
-    options = ["Create a new machine account (adscan_<timestamp>$)"] + [
-        f"Reuse owned machine account: {c}" for c in candidates
-    ]
-    idx = questionary_select_index(
-        title="RBCD delegate account",
-        options=options,
-        default_idx=0,  # safe default: mint a fresh account (works in CI too)
-        shell=shell,
+    action, chosen = decide_provisioning_action(
+        shell,
+        reuse_candidates=candidates,
+        prompt_title="RBCD delegate account",
+        create_label="Create a new machine account (adscan_<timestamp>$)",
+        reuse_label_prefix="Reuse owned machine account: ",
+        allow_cancel=False,  # legacy menu had no Cancel row; back-out mints fresh
     )
-    if idx is None or idx == 0:
+    # Create-new / non-interactive both fall through to minting a fresh account —
+    # byte-identical to the previous ``idx is None or idx == 0`` guard.
+    if action is not ProvisioningAction.REUSE_EXISTING or not chosen:
         return None
 
-    chosen = candidates[idx - 1]
     chosen_secret = str(creds.get(chosen) or "").strip()
     sid = (
         _resolve_delegate_sid(

@@ -44,7 +44,16 @@
   --blue-bg:     #eff6ff;
   --blue-bd:     #93c5fd;
   --gray:        #64748b;
-  --green:       #15803d;
+  /* Deepened from #15803d, which had the SAME relative luminance as --amber
+     (0.1593 against 0.1591 — a contrast ratio of 1.001). Two inks that differ
+     only in hue are one ink to a reader who is not seeing the hue, and a page
+     of this document is routinely forwarded into a board pack in greyscale or
+     read by someone with a red-green deficiency. The failure mode is not a
+     cosmetic one: green marks an avenue the client's own configuration already
+     closes and amber marks a live foothold on a Tier 0 asset, so the two
+     collapsing inverts the order in which a reader would remediate. Deeper
+     green measures 1.81 against amber and 9.11 on white. */
+  --green:       #14532d;
   --purple:      #6d28d9;
 
   /* Fonts — refined editorial pairing */

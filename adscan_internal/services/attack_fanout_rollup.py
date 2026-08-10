@@ -49,8 +49,7 @@ from adscan_internal.services.compromise_class import (
     CompromiseClass,
     PrivilegeTier,
     derive_compromise_class_from_path,
-    privilege_tier_for_computer_node,
-    privilege_tier_for_principal_node,
+    privilege_tier_for_node,
     privilege_tier_label,
 )
 from adscan_internal.services.edge_kind import (
@@ -214,13 +213,12 @@ def resolve_fanout_target_tier(
 ) -> PrivilegeTier:
     """Return the granted :class:`PrivilegeTier` of a fan-out target node.
 
-    Pure node-dict → tier resolution for the fan-out bucketing axis, delegated
-    in both directions to the axis-1 SSOT in :mod:`compromise_class`:
-    :func:`privilege_tier_for_computer_node` for a Computer (DC / Tier-0-asset /
-    server / workstation grading) and
-    :func:`privilege_tier_for_principal_node` for a user, group or container
-    (direct domain breaker → Tier 0 direct, escalation group → Tier 0
-    escalation-capable, else Tier 2). Domain objects are Tier-0-direct.
+    Thin alias over the axis-1 SSOT :func:`compromise_class.privilege_tier_for_node`,
+    which dispatches by node kind: a Computer grades through the DC /
+    Tier-0-asset / server / workstation path, a user, group or container through
+    the direct-breaker / escalation-group path, and the Domain object is Tier 0
+    direct. Kept as a named entry point because the fan-out axis reads better at
+    its call sites; it adds no logic of its own.
 
     Because the tier is part of the rollup KEY and is rendered as the bucket's
     client label, a mis-graded target both mislabels the row and files it in the
@@ -239,15 +237,7 @@ def resolve_fanout_target_tier(
     Returns:
         The :class:`PrivilegeTier`; :attr:`PrivilegeTier.TIER2` for ``None``.
     """
-    if not isinstance(node, Mapping):
-        return PrivilegeTier.TIER2
-
-    kind = str(node.get("kind") or "").strip().lower()
-    if kind == "domain":
-        return PrivilegeTier.TIER0_DIRECT
-    if kind == "computer":
-        return privilege_tier_for_computer_node(node, is_tier0_asset=is_tier0_asset)
-    return privilege_tier_for_principal_node(node, is_tier0_asset=is_tier0_asset)
+    return privilege_tier_for_node(node, is_tier0_asset=is_tier0_asset)
 
 
 def _coerce_compromise_class(value: Any) -> CompromiseClass | None:

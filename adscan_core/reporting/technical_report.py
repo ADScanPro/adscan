@@ -97,9 +97,22 @@ _FINDING_CATALOG_PROVIDER: Optional[Callable[[], dict[str, dict[str, Any]]]] = N
 # PRO — the provider walks the whole ``VULN_CATALOG`` computing a CVSS base and
 # a knowledge block per key — and every recorder call plus every attack-graph
 # finding needs a lookup, so rebuilding it per lookup turned an O(1) read into
-# an O(catalog) rebuild. The snapshot is dropped whenever the provider changes,
-# which is the only thing that can change its contents.
+# an O(catalog) rebuild.
+#
+# The snapshot records WHICH provider produced it and is only reused while that
+# provider is still the installed one. Keying it this way is what makes the memo
+# correct by construction rather than by every writer remembering to invalidate:
+# a snapshot is a derived value, so tying its validity to the thing it derives
+# from is the invariant, and ``set_finding_catalog_provider`` dropping it eagerly
+# is then an optimisation (it frees the old catalog) rather than the only defence.
+# Before this, a caller that rebound ``_FINDING_CATALOG_PROVIDER`` directly left
+# a snapshot built under the OLD provider serving every later lookup in the
+# process — the LITE meta catalog carries no ``knowledge`` and no ``cvss_base``,
+# so findings recorded afterwards silently lost both.
 _FINDING_CATALOG_SNAPSHOT: Optional[dict[str, dict[str, Any]]] = None
+_FINDING_CATALOG_SNAPSHOT_PROVIDER: Optional[
+    Callable[[], dict[str, dict[str, Any]]]
+] = None
 
 
 def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, Any]]:
@@ -131,11 +144,15 @@ def set_finding_catalog_provider(
     to reset to the LITE default (used by tests).
 
     Installing a provider drops the memoized snapshot, so the next lookup
-    rebuilds from the new provider.
+    rebuilds from the new provider. The lookup also verifies the snapshot came
+    from the installed provider, so rebinding the module global some other way
+    is equally safe.
     """
     global _FINDING_CATALOG_PROVIDER, _FINDING_CATALOG_SNAPSHOT
+    global _FINDING_CATALOG_SNAPSHOT_PROVIDER
     _FINDING_CATALOG_PROVIDER = provider
     _FINDING_CATALOG_SNAPSHOT = None
+    _FINDING_CATALOG_SNAPSHOT_PROVIDER = None
 
 
 def finding_catalog() -> dict[str, dict[str, Any]]:
@@ -147,9 +164,15 @@ def finding_catalog() -> dict[str, dict[str, Any]]:
     derivation weaving per-instance specifics into ``knowledge``) must copy
     first; the specifics weaver already returns a new dict for exactly this
     reason.
+
+    The memo is keyed on the provider that produced it, so a provider swap is
+    always observed on the next lookup however the swap was made.
     """
-    global _FINDING_CATALOG_SNAPSHOT
-    if _FINDING_CATALOG_SNAPSHOT is not None:
+    global _FINDING_CATALOG_SNAPSHOT, _FINDING_CATALOG_SNAPSHOT_PROVIDER
+    if (
+        _FINDING_CATALOG_SNAPSHOT is not None
+        and _FINDING_CATALOG_SNAPSHOT_PROVIDER is _FINDING_CATALOG_PROVIDER
+    ):
         return _FINDING_CATALOG_SNAPSHOT
     catalog: dict[str, dict[str, Any]] | None = None
     if _FINDING_CATALOG_PROVIDER is not None:
@@ -162,6 +185,7 @@ def finding_catalog() -> dict[str, dict[str, Any]]:
     if not isinstance(catalog, dict):
         catalog = _build_technical_finding_catalog_from_meta()
     _FINDING_CATALOG_SNAPSHOT = catalog
+    _FINDING_CATALOG_SNAPSHOT_PROVIDER = _FINDING_CATALOG_PROVIDER
     return catalog
 
 
@@ -625,6 +649,101 @@ def record_collection_coverage(
     report = _load_technical_report(shell)
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["collection_coverage"] = coverage
+    _save_technical_report(shell, report)
+
+
+def record_cracking_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the password-cracking coverage statement for *domain*.
+
+    Write-side single source of truth for the honest answer to "why does the
+    cracking section look like that". A report whose recovered-credential
+    section is empty because the audit corpus was absent from the image is
+    indistinguishable, to a reader, from one where every password held. Under
+    the Exposure-Validation doctrine that is a DATA GAP — the same family as
+    ``unsupported`` — and it must never read as "no weak passwords found".
+
+    ``coverage`` carries ``complete`` (bool), ``missing_wordlists`` (list of
+    names), ``base_wordlist`` (the corpus actually used, when known) and a
+    rendered client-safe ``statement``. Mirrors
+    :func:`record_collection_coverage`: stamps the value onto
+    ``domains[<domain>]["cracking_coverage"]`` so the JSON export carries it and
+    the PDF report AND ``adscan_web`` render the SAME statement rather than each
+    recomputing one. Best-effort: ignores a missing/invalid payload and never
+    raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["cracking_coverage"] = coverage
+    _save_technical_report(shell, report)
+
+
+def record_attack_path_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the attack-path discovery coverage statement for *domain*.
+
+    Write-side single source of truth for the honest answer to "did discovery
+    evaluate every route". When discovery has to stop under a memory ceiling the
+    reported route set is not exhaustive, and a bounded run must never read as a
+    complete one — that is a DATA GAP in the family of ``unsupported`` (see
+    :mod:`adscan_core.reporting.attack_path_memory_gate`), the resource-limit
+    corollary of the cracking-coverage gap.
+
+    ``coverage`` carries ``complete`` (bool), ``examined_routes`` (int) and a
+    rendered client-safe ``statement``. Mirrors :func:`record_cracking_coverage`:
+    stamps the value onto ``domains[<domain>]["attack_path_coverage"]`` so the JSON
+    export carries it and the PDF report AND ``adscan_web`` render the SAME
+    statement rather than each recomputing one. Best-effort: ignores a
+    missing/invalid payload and never raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["attack_path_coverage"] = coverage
+    _save_technical_report(shell, report)
+
+
+def record_host_enrichment_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the SMB host-enrichment coverage statement for *domain*.
+
+    Write-side single source of truth for the honest answer to "were every
+    host's sessions, local admins and shares evaluated". The identity graph is
+    always 100%, but the SMB host-enrichment sweep may be bounded on a large
+    directory (a scale-gate cap, a skip, or an operator early stop). A capped
+    sweep must never read as an exhaustive one — that is a DATA GAP in the family
+    of ``unsupported`` (see
+    :mod:`adscan_core.reporting.host_enrichment_coverage`), the same family as
+    the cracking-coverage and attack-path-memory gaps.
+
+    ``coverage`` carries ``complete`` (bool), ``reason`` (str), ``hosts_swept`` /
+    ``hosts_total`` / ``hosts_remaining`` (int) and a rendered client-safe
+    ``statement``. Mirrors :func:`record_attack_path_coverage`: stamps the value
+    onto ``domains[<domain>]["host_enrichment_coverage"]`` so the JSON export
+    carries it and the PDF report, the LITE report AND ``adscan_web`` render the
+    SAME statement rather than each recomputing one. Best-effort: ignores a
+    missing/invalid payload and never raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["host_enrichment_coverage"] = coverage
     _save_technical_report(shell, report)
 
 

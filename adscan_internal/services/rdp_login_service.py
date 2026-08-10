@@ -372,10 +372,14 @@ async def _probe_one(
         # ── Pass 2: CredSSP+Kerberos (password only, not hash) ─────────────
         # Tried when NTLM fails — covers environments where NTLM is disabled
         # by GPO.  PtH has no Kerberos equivalent without the Kerberos key.
-        if not is_hash:
-            krb_url = _build_kerberos_url(domain, username, secret, host, dc_ip)
-            krb_factory = RDPConnectionFactory.from_url(krb_url, iosettings)
+        # Requires a KDC: without ``dc_ip`` the Kerberos credential cannot be
+        # built at all, so the attempt is skipped and Pass 3 still runs.  RDP is
+        # deliberately NOT wired for the sweep Kerberos pre-mint, so arriving
+        # here with ``dc_ip=None`` is a normal state, not an edge case.
+        if not is_hash and dc_ip:
             try:
+                krb_url = _build_kerberos_url(domain, username, secret, host, dc_ip)
+                krb_factory = RDPConnectionFactory.from_url(krb_url, iosettings)
                 async with asyncio.timeout(timeout_s):
                     ok = await _attempt_connection(
                         krb_factory, host, SUPP_PROTOCOLS.HYBRID_EX, timeout_s

@@ -243,7 +243,13 @@ _EVERY = _ALL_AUTH | _ALL_UNAUTH
 # form can never drift.
 # ---------------------------------------------------------------------------
 
-TRUST_POLICY_CHOICES: tuple[str, ...] = ("skip", "all", "selected", "interactive")
+TRUST_POLICY_CHOICES: tuple[str, ...] = (
+    "origin_only",
+    "skip",
+    "all",
+    "selected",
+    "interactive",
+)
 ATTACK_PATH_POLICY_CHOICES: tuple[str, ...] = (
     "none",
     "all",

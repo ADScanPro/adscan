@@ -49,7 +49,7 @@ from adscan_core.rich_output import print_exception
 # Allow-list of relations callers may insert. Anything outside this set is
 # rejected so a typo in a future technique never silently produces an
 # UNKNOWN edge in the canonical graph.
-_ALLOWED_DERIVED_RELATIONS: frozenset[str] = frozenset(
+ALLOWED_DERIVED_RELATIONS: frozenset[str] = frozenset(
     {
         "DumpedHashOf",
         "ForgedTicketFor",
@@ -78,6 +78,11 @@ _ALLOWED_DERIVED_RELATIONS: frozenset[str] = frozenset(
         "Ntlmv1Enabled",
     }
 )
+
+# Backwards-compatible private alias — this set is the canonical allow-list of
+# relations a derived edge may carry, and any catalog whose entry produces a
+# derived edge is validated against it at import time (see the CVE catalog).
+_ALLOWED_DERIVED_RELATIONS = ALLOWED_DERIVED_RELATIONS
 
 
 def _utc_now_iso() -> str:
@@ -230,4 +235,4 @@ def insert_derived_edge(
     return True
 
 
-__all__ = ["insert_derived_edge"]
+__all__ = ["insert_derived_edge", "ALLOWED_DERIVED_RELATIONS"]

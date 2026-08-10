@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +39,7 @@ from adscan_internal.services.pivot_capability_registry import (
 from adscan_internal.services.service_access_probe_history import (
     load_service_access_probe_history,
 )
-from adscan_internal.workspaces import domain_subpath
+from adscan_internal.workspaces import domain_subpath, resolve_workspace_cwd
 from adscan_internal.workspaces.computers import (
     load_target_entries,
     resolve_domain_service_target_file,
@@ -344,11 +343,7 @@ def ensure_host_bound_workflow_target_viable(
 def _workspace_dir(shell: Any) -> str:
     """Return the current workspace root."""
 
-    return (
-        shell._get_workspace_cwd()  # type: ignore[attr-defined]
-        if hasattr(shell, "_get_workspace_cwd")
-        else getattr(shell, "current_workspace_dir", os.getcwd())
-    )
+    return resolve_workspace_cwd(shell)
 
 
 def _domains_dir(shell: Any) -> str:

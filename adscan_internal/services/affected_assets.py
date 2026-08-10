@@ -39,6 +39,38 @@ from adscan_internal.services.affected_asset_rules import (
 )
 from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
 
+#: Reserved key under a finding's ``details`` carrying the engine's typed,
+#: correlation-ready affected-asset entities. Declared here — the base module —
+#: so the flat resolution and the structured one cannot disagree about where
+#: they live; :data:`affected_assets_struct.SERIALIZED_KEY` is its alias, and
+#: that is the name the platform contract is documented under.
+SERIALIZED_ENTITIES_KEY = "_affected_assets_struct"
+
+#: The flat, client-facing type name for each structured entity type. The typed
+#: vocabulary the platform correlates on says ``computer``; every flat surface
+#: (the appendix CSV column, the asset-type counts, the priority ladder) has
+#: always said ``host``, so the translation happens here rather than by
+#: renaming a column the client's GRC import already maps.
+_FLAT_TYPE_BY_ENTITY_TYPE: dict[str, str] = {
+    "computer": "host",
+    "user": "user",
+    "group": "group",
+    "domain": "domain",
+    "template": "template",
+    "ca": "ca",
+    "share": "share",
+    "artifact": "artifact",
+    "credential": "credential",
+}
+
+#: Entity types whose flat string carries a ``Template: ``-style prefix that
+#: :func:`classify_asset_type` already reads. Indexing their bare names would
+#: risk a collision — a template called ``Administrator`` would then re-type the
+#: account of the same name — so only principal entities go in the index.
+_PREFIXED_ENTITY_TYPES: frozenset[str] = frozenset(
+    {"template", "ca", "share", "artifact", "credential"}
+)
+
 _DIRECT_ASSET_KEYS: tuple[str, ...] = (
     "admin_users",
     "priv_users",
@@ -441,7 +473,19 @@ def _looks_like_artifact(value: str) -> bool:
 
 
 def classify_asset_type(value: str) -> str:
-    """Classify a normalized asset as host, user, or artifact."""
+    """Guess an asset's type from its display string alone.
+
+    The FALLBACK, for a finding the engine never stamped with typed entities.
+    Prefer :func:`resolve_asset_type`, which reads the type the engine resolved
+    against the directory.
+
+    A name on its own does not say what kind of object it is, and this function
+    is where that showed: ``khal.drogo`` has a dot so it read as a host,
+    ``BRAAVOS.ESSOS.LOCAL (192.168.180.23)`` has a space so it read as a user,
+    ``sql_svc`` starts with ``sql`` so it read as a host, and every group read
+    as a user. Those guesses are only ever right by coincidence; they are kept
+    for artifacts that predate the typed entities, where a guess beats nothing.
+    """
     text = str(value or "").strip()
     lower = text.lower()
     if not text:
@@ -467,6 +511,55 @@ def classify_asset_type(value: str) -> str:
     return "user"
 
 
+def build_asset_type_index(vuln_data: Any) -> dict[str, str]:
+    """Map a finding's flat asset strings to the type the engine RESOLVED.
+
+    Built from the typed entities the finalization pass stamped into the
+    finding's ``details``, keyed by the same display string the flat extractor
+    emits, so a renderer holding only a list of strings can still answer "what
+    kind of object is this" from the directory rather than from the name.
+
+    Returns ``{}`` for a finding with no stamped entities; callers then fall
+    back to :func:`classify_asset_type`.
+    """
+    view = _details_view(vuln_data) if isinstance(vuln_data, dict) else {}
+    raw = view.get(SERIALIZED_ENTITIES_KEY)
+    if not isinstance(raw, list):
+        return {}
+    index: dict[str, str] = {}
+    for entity in raw:
+        if not isinstance(entity, dict):
+            continue
+        entity_type = str(entity.get("type") or "").strip().lower()
+        if entity_type in _PREFIXED_ENTITY_TYPES:
+            continue
+        flat_type = _FLAT_TYPE_BY_ENTITY_TYPE.get(entity_type)
+        if not flat_type:
+            continue
+        for token in (entity.get("display"), entity.get("identifier")):
+            text = str(token or "").strip()
+            if text:
+                index.setdefault(text.casefold(), flat_type)
+    return index
+
+
+def resolve_asset_type(
+    asset: str, type_index: Mapping[str, str] | None = None
+) -> str:
+    """Return an asset's type, preferring what the engine resolved over a guess.
+
+    ``type_index`` comes from :func:`build_asset_type_index`. When the asset is
+    in it the answer is the directory's, which is the whole point: the CSV
+    appendix exists to be imported into a GRC tool and filtered by type, so a
+    column filled by string heuristics is worse than no column at all.
+    """
+    if type_index:
+        resolved = type_index.get(str(asset or "").strip().casefold())
+        if resolved:
+            return resolved
+    return classify_asset_type(asset)
+
+
 def _asset_priority(asset: str, asset_type: str) -> tuple[int, str]:
     """Return a priority tuple where smaller values are more critical."""
     lower = asset.lower()
@@ -485,12 +578,20 @@ def _asset_priority(asset: str, asset_type: str) -> tuple[int, str]:
         if any(token in lower for token in ("wkst", "ws", "laptop", "desktop", "pc")):
             return 5, lower
         return 4, lower
-    if asset_type == "user":
+    if asset_type in ("user", "group"):
+        # Groups keep the account ladder they were sorted by when every group
+        # was mis-typed as a user, so naming them correctly does not silently
+        # reorder which assets a capped inline list shows.
         if lower in {"administrator", "krbtgt"} or "domain admin" in lower:
             return 1, lower
         if any(token in lower for token in ("admin", "svc", "sql", "backup")):
             return 3, lower
         return 6, lower
+    if asset_type == "domain":
+        # The domain object is the whole directory. It only ever appears alone
+        # (a domain-wide finding names nothing else), so it keeps the mid-table
+        # slot the host heuristic used to give it.
+        return 4, lower
     if asset_type == "ca":
         return 1, lower
     if asset_type == "template":
@@ -1234,17 +1335,25 @@ def summarize_affected_assets(
         domain_name=domain_name,
         attack_paths=attack_paths,
     )
+    type_index = build_asset_type_index(vuln_data)
+    asset_types = {asset: resolve_asset_type(asset, type_index) for asset in assets}
     asset_type_counts = {
         "host": 0,
         "user": 0,
+        "group": 0,
+        "domain": 0,
         "template": 0,
         "ca": 0,
         "share": 0,
         "artifact": 0,
+        "credential": 0,
         "other": 0,
     }
-    for asset in assets:
-        asset_type_counts[classify_asset_type(asset)] += 1
+    for asset_type in asset_types.values():
+        if asset_type not in asset_type_counts:
+            asset_type_counts["other"] += 1
+            continue
+        asset_type_counts[asset_type] += 1
 
     domain_controller_count = 0
     non_dc_count = 0
@@ -1269,11 +1378,12 @@ def summarize_affected_assets(
 
     prioritized_assets = sorted(
         assets,
-        key=lambda asset: _asset_priority(asset, classify_asset_type(asset)),
+        key=lambda asset: _asset_priority(asset, asset_types[asset]),
     )
     return {
         "total_assets": len(assets),
         "assets": assets,
+        "asset_types": asset_types,
         "asset_type_counts": asset_type_counts,
         "domain_controller_count": domain_controller_count,
         "non_dc_count": non_dc_count,
@@ -1351,11 +1461,12 @@ def build_affected_asset_records(
         attack_paths=attack_paths,
     )
     prioritized_assets = list(summary["prioritized_assets"])
+    asset_types = summary.get("asset_types") or {}
     source_names = _source_principal_names(vuln_name, vuln_data)
 
     records: list[dict[str, str]] = []
     for asset in prioritized_assets:
-        asset_type = classify_asset_type(asset)
+        asset_type = asset_types.get(asset) or classify_asset_type(asset)
         # Source principals are the only axis the SSOT distinguishes
         # structurally; every other asset (the vulnerable resource, a posture
         # host, the domain object, a typed template/CA/share/artifact) is the

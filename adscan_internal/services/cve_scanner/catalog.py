@@ -42,7 +42,26 @@ class TargetScope(str, Enum):
 
 @dataclass(frozen=True)
 class CVEDefinition:
-    """Catalog entry for one CVE the native scanner knows how to check."""
+    """Catalog entry for one CVE the native scanner knows how to check.
+
+    ``required_ports`` declares the TCP port(s) the check's transport must
+    reach on the target for the check to run at all. The runner preflights
+    each ``(host, required_port)`` via the reachability SSOT before
+    dispatching, so an unreachable host is recorded as a data gap rather
+    than timing out on a full-check connect. A host is considered reachable
+    for the check when ANY of the declared ports answers (e.g. a DC's LDAP
+    check tries LDAPS 636 then LDAP 389 — either open satisfies the gate).
+
+    The port is derived from the check's actual binding, NOT the ``aka``:
+
+    - ``epm.hept_map`` → ``ncacn_ip_tcp`` (RPC endpoint mapper) → 135
+    - ``kerberos_transport.get_tgt`` (AS-REQ) → 88
+    - ``ncacn_np:...[\\PIPE\\...]`` / raw SMB / aiosmb / coercion pipes → 445
+    - ``ADscanLDAPConfig`` (LDAPS→LDAP fallback) → 636, 389
+
+    An empty tuple means "no reachability precondition" — the runner
+    dispatches the check unconditionally (used by synthetic/test entries).
+    """
 
     id: str
     aka: str
@@ -59,6 +78,7 @@ class CVEDefinition:
     graph_edge_kind: EdgeKind | None
     promotes_to_domain_breaker: bool
     technique: str | None = None
+    required_ports: tuple[int, ...] = ()
 
 
 _PETITPOTAM_REFS = (
@@ -88,6 +108,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
         technique="PetitPotam",
+        # MS-EFSR over the SMB named pipe \PIPE\lsarpc / \PIPE\efsrpc.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-COERCION-PRINTERBUG",
@@ -105,6 +127,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
         technique="PrinterBug",
+        # MS-RPRN over the SMB named pipe \PIPE\spoolss.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-COERCION-DFSCOERCE",
@@ -122,6 +146,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
         technique="DFSCoerce",
+        # MS-DFSNM over the SMB named pipe \PIPE\netdfs.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-COERCION-SHADOWCOERCE",
@@ -139,6 +165,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
         technique="ShadowCoerce",
+        # MS-FSRVP over the SMB named pipe \PIPE\FssagentRpc.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-COERCION-MSEVENCOERCE",
@@ -156,6 +184,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
         technique="MSEvenCoerce",
+        # MS-EVEN over the SMB named pipe \PIPE\eventlog.
+        required_ports=(445,),
     ),
     # ----- Slice 2: Pack DC ------------------------------------------------
     CVEDefinition(
@@ -176,6 +206,10 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="Zerologon",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=True,
+        # MS-NRPC via epm.hept_map → ncacn_ip_tcp: the RPC endpoint mapper
+        # (135) must be reachable; a closed 135 means the mapper — and the
+        # dynamic NRPC endpoint it hands out — is unreachable.
+        required_ports=(135,),
     ),
     CVEDefinition(
         id="CVE-2021-42278",
@@ -196,6 +230,9 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="NoPac",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=True,
+        # Primary probe is a Kerberos AS-REQ via kerberos_transport.get_tgt
+        # (port 88); a closed 88 means the KDC is unreachable.
+        required_ports=(88,),
     ),
     CVEDefinition(
         id="CVE-2021-34527",
@@ -215,6 +252,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="PrintNightmare",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=True,
+        # MS-RPRN over ncacn_np:...[\PIPE\spoolss] with set_dport(445).
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-BADSUCCESSOR-2025",
@@ -233,6 +272,9 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="BadSuccessor",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=True,
+        # LDAP via ADscanLDAPConfig (LDAPS 636 tried first, LDAP 389
+        # fallback) against the DC — either open satisfies the gate.
+        required_ports=(636, 389),
     ),
     # ----- Slice 3: host-level CVEs and NTLM enablers --------------------
     CVEDefinition(
@@ -253,6 +295,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="MS17-010",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
+        # Raw SMBv1 TCP connect to 445.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="CVE-2020-0796",
@@ -272,6 +316,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="SMBGhost",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
+        # aiosmb SMB 3.1.1 NEGOTIATE to 445.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-PRINTERBUG-SURFACE",
@@ -291,6 +337,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="PrinterBugSurface",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
+        # MS-RPRN over ncacn_np:...[\PIPE\spoolss] with set_dport(445).
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="ADSCAN-WEBDAV-ENABLED",
@@ -310,6 +358,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="WebDAVEnabled",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
+        # SMB via smb_machine_with_fallback (\PIPE\DAV RPC SERVICE probe).
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="CVE-2019-1166",
@@ -329,6 +379,8 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="DropTheMIC",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
+        # NTLM SMB session-setup (tampered MIC) via impacket SMBConnection.
+        required_ports=(445,),
     ),
     CVEDefinition(
         id="CVE-2019-1040",
@@ -348,8 +400,70 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
         graph_edge_relation="NTLMReflection",
         graph_edge_kind=EdgeKind.DERIVED,
         promotes_to_domain_breaker=False,
+        # NTLM SMB session-setup (tampered MIC) via impacket SMBConnection.
+        required_ports=(445,),
     ),
 )
+
+
+def _validate_catalog_graph_relations() -> None:
+    """Fail at import time if a catalog entry names a non-canonical edge.
+
+    Every ``graph_edge_relation`` a catalog entry declares is inserted into the
+    attack graph at scan time by ``insert_derived_edge``, which rejects any
+    relation outside the canonical derived-edge allow-list. Validating the whole
+    catalog against that same allow-list here turns a catalog misconfiguration
+    into an import-time (build) error, so it is caught before a scan — never as a
+    runtime ``ValueError`` in front of an operator, and never by dumping the
+    internal allow-list to a client-facing terminal.
+    """
+    from adscan_internal.services.attack_graph_derived import (  # noqa: PLC0415
+        ALLOWED_DERIVED_RELATIONS,
+    )
+
+    offenders = {
+        cve.id: cve.graph_edge_relation
+        for cve in CVE_CATALOG
+        if cve.graph_edge_relation is not None
+        and cve.graph_edge_relation not in ALLOWED_DERIVED_RELATIONS
+    }
+    if offenders:
+        detail = ", ".join(
+            f"{cid} -> {relation!r}" for cid, relation in sorted(offenders.items())
+        )
+        raise ValueError(
+            "CVE catalog declares graph_edge_relation values that are not "
+            f"canonical derived edges: {detail}. Add them to "
+            "ALLOWED_DERIVED_RELATIONS in attack_graph_derived.py (and to "
+            "edge_kind.py as EdgeKind.DERIVED) before shipping the catalog entry."
+        )
+
+
+def _validate_catalog_required_ports() -> None:
+    """Fail at import time if a catalog entry declares no reachability port.
+
+    Every shipped catalog entry authenticates against / connects to the
+    target over a concrete transport, so it MUST declare the port(s) the
+    runner preflights before dispatching (see ``CVEDefinition.required_ports``).
+    A missing declaration would silently fall back to "no reachability
+    precondition" and reintroduce the per-host timeout flood this gate
+    exists to prevent. Turning the omission into a build error keeps the
+    port map in lockstep with the catalog as new checks are added.
+    """
+
+    missing = [cve.id for cve in CVE_CATALOG if not cve.required_ports]
+    if missing:
+        raise ValueError(
+            "CVE catalog entries declare no required_ports (the runner cannot "
+            f"preflight their reachability): {', '.join(sorted(missing))}. Add "
+            "required_ports=(<port>,) matching the check's transport binding "
+            "(135 for epm/ncacn_ip_tcp, 88 for Kerberos, 445 for SMB/named "
+            "pipes, 636/389 for LDAP)."
+        )
+
+
+_validate_catalog_graph_relations()
+_validate_catalog_required_ports()
 
 
 def scope_applies_to_target(scope: TargetScope, *, is_dc: bool) -> bool:

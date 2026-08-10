@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_error, print_info_verbose
+from adscan_core.rich_output import print_error, print_info, print_info_debug, print_info_verbose
 from adscan_internal.core.events import Event, EventBus, EventType
 from adscan_internal.services.cve_scanner.catalog import (
     CVEDefinition,
@@ -25,7 +25,16 @@ from adscan_internal.services.cve_scanner.result import (
     CVEStatus,
     Severity,
 )
+from adscan_internal.services.network_probe_service import tcp_probe_hosts
 from adscan_core.rich_output import print_exception
+
+
+# Bounded concurrency for the reachability preflight (a raw TCP connect per
+# (host, port) is ~50× cheaper than an auth handshake, so a higher fan-out
+# than the auth concurrency is safe — mirrors the SMB sweep's gate). Kept in
+# one place so a corporate-scale bump is a one-line change.
+_PREFLIGHT_PROBE_CONCURRENCY = 64
+_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -140,6 +149,33 @@ class CVEScanRunner:
         results: list[CVEResult] = []
         results_lock = asyncio.Lock()
 
+        # Reachability preflight (SSOT gate). CVE checks do NOT all use one
+        # port — zerologon needs the RPC endpoint mapper (135), the Kerberos
+        # checks need 88, the SMB/RPRN/EFSR checks need 445, the LDAP checks
+        # 636/389. Probe each host's required ports ONCE up front (like the SMB
+        # sweep's 445 liveness gate), then dispatch a check only when its
+        # transport port is reachable. A host whose required port is
+        # unreachable is a DATA GAP (recorded SKIPPED), never a "not
+        # vulnerable" verdict and never a per-host TimeoutError.
+        reachable_ports = await self._preflight_required_ports(
+            targets_t, normal_cves, coercion_cves
+        )
+        # Count of (host, check) pairs skipped for unreachability, for the
+        # single end-of-sweep operator summary line.
+        unreachable_skips = 0
+
+        def _reachable_for(cve: CVEDefinition, target: ScanTarget) -> bool:
+            """Whether ANY of the check's required ports is open on the host.
+
+            Empty ``required_ports`` (synthetic/test entries) → always
+            dispatch (no reachability precondition).
+            """
+
+            if not cve.required_ports:
+                return True
+            open_ports = reachable_ports.get(target.host, frozenset())
+            return any(port in open_ports for port in cve.required_ports)
+
         # Build the standard work matrix for non-coercion checks.
         normal_work: list[tuple[ScanTarget, CVEDefinition]] = []
         for target in targets_t:
@@ -149,6 +185,13 @@ class CVEScanRunner:
                     results.append(skipped)
                     if on_result is not None:
                         on_result(skipped)
+                    continue
+                if not _reachable_for(cve, target):
+                    unreachable = _unreachable_result(cve, target)
+                    unreachable_skips += 1
+                    results.append(unreachable)
+                    if on_result is not None:
+                        on_result(unreachable)
                     continue
                 normal_work.append((target, cve))
 
@@ -172,6 +215,18 @@ class CVEScanRunner:
                     results.append(skipped)
                     if on_result is not None:
                         on_result(skipped)
+            # Reachability gate: the coercion sweep drives one SMB (445)
+            # connection per host. If 445 is unreachable, record every
+            # applicable technique as a data gap rather than letting the
+            # single adapter call time out.
+            if not _reachable_for(applicable[0], target):
+                for cve in applicable:
+                    unreachable = _unreachable_result(cve, target)
+                    unreachable_skips += 1
+                    results.append(unreachable)
+                    if on_result is not None:
+                        on_result(unreachable)
+                continue
             coercion_hosts.append(target)
 
         async def _run_normal(target: ScanTarget, cve: CVEDefinition) -> None:
@@ -188,10 +243,20 @@ class CVEScanRunner:
                         timeout=self._check_timeout,
                     )
                     cve_results = list(raw) if isinstance(raw, list) else [raw]
-                except asyncio.TimeoutError as exc:
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
-                    cve_results = [_error_result(cve, target, "check timed out")]
+                except asyncio.TimeoutError:
+                    # A host that passed the reachability preflight but then
+                    # timed out mid-check is unreachable-at-depth, not a tool
+                    # fault: render a concise unreachable line, NOT the generic
+                    # "contact support" template (do not route a routine
+                    # per-host connect timeout through print_exception).
+                    print_info_debug(
+                        f"[cve_scanner] {cve.id} timed out on {target.host} "
+                        "after passing the reachability preflight"
+                    )
+                    print_info(
+                        f"  ⚠ {target.host} unreachable (timeout) — {cve.aka} not evaluated"
+                    )
+                    cve_results = [_unreachable_result(cve, target)]
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
@@ -240,14 +305,24 @@ class CVEScanRunner:
                 check = CoercionCVECheck()
                 started = time.monotonic()
                 technique_results: list[CVEResult] = []
+                timed_out = False
                 try:
                     technique_results = await asyncio.wait_for(
                         check.run(target, creds, ctx),
                         timeout=self._check_timeout,
                     )
-                except asyncio.TimeoutError as exc:
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
+                except asyncio.TimeoutError:
+                    # Passed the 445 preflight but the sweep timed out
+                    # mid-flight → unreachable-at-depth, a data gap. Concise
+                    # line, not the generic support template.
+                    timed_out = True
+                    print_info_debug(
+                        f"[cve_scanner] coercion sweep timed out on {target.host} "
+                        "after passing the reachability preflight"
+                    )
+                    print_info(
+                        f"  ⚠ {target.host} unreachable (timeout) — coercion not evaluated"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
@@ -265,7 +340,11 @@ class CVEScanRunner:
                     for cve in applicable:
                         key = (cve.technique or cve.aka or "").strip()
                         adapter_result = by_technique.get(key)
-                        if adapter_result is None:
+                        if adapter_result is None and timed_out:
+                            # Sweep timed out after passing the preflight →
+                            # data gap, not an error (never a false verdict).
+                            final = _unreachable_result(cve, target)
+                        elif adapter_result is None:
                             # Adapter raised before producing per-technique
                             # rows — emit an error result for this entry so
                             # the dashboard cell does not stay blank.
@@ -306,12 +385,15 @@ class CVEScanRunner:
         print_info_verbose(
             f"[cve_scanner] scheduling {len(normal_work)} checks + "
             f"{len(coercion_hosts)} coercion sweep(s) across "
-            f"{len(targets_t)} target(s)"
+            f"{len(targets_t)} target(s); "
+            f"{unreachable_skips} check(s) skipped (required port unreachable)"
         )
         await asyncio.gather(
             *(_run_normal(target, cve) for target, cve in normal_work),
             *(_run_coercion_for_host(target) for target in coercion_hosts),
         )
+
+        _emit_unreachable_summary(unreachable_skips, results)
 
         return CVEScanReport(
             scan_id=scan_id,
@@ -321,6 +403,55 @@ class CVEScanRunner:
             cve_ids=tuple(c.id for c in cves_t),
             results=tuple(results),
         )
+
+    async def _preflight_required_ports(
+        self,
+        targets: tuple[ScanTarget, ...],
+        normal_cves: tuple[CVEDefinition, ...],
+        coercion_cves: tuple[CVEDefinition, ...],
+    ) -> dict[str, frozenset[int]]:
+        """Live-probe each target's required ports, once, up front.
+
+        Returns ``host -> frozenset(open_ports)``. Reuses the reachability
+        SSOT (``tcp_probe_hosts``) that backs the SMB/WinRM/RDP sweeps'
+        liveness gate, so a check is dispatched only against a host whose
+        transport port actually answers — the per-host TimeoutError flood
+        never happens. The probe is ALWAYS live (cheap TCP connect,
+        multi-homed aware, never raises) and respects a bounded fan-out.
+
+        Only the ports an APPLICABLE check needs on a given target are
+        probed: for each required port we probe the subset of hosts that
+        have at least one applicable check needing it, so a member host is
+        never probed on 88/135 for DC-only checks.
+        """
+
+        # Map each required port to the hosts for which an applicable check
+        # needs it. Applicability reuses the catalog scope gate (`_applies`),
+        # so a DC-only check's port is only probed on DCs.
+        port_to_hosts: dict[int, set[str]] = {}
+        for target in targets:
+            for cve in (*normal_cves, *coercion_cves):
+                if not _applies(cve, target):
+                    continue
+                for port in cve.required_ports:
+                    port_to_hosts.setdefault(port, set()).add(target.host)
+
+        if not port_to_hosts:
+            return {}
+
+        open_by_host: dict[str, set[int]] = {}
+        for port, hosts in port_to_hosts.items():
+            probe_map = await tcp_probe_hosts(
+                sorted(hosts),
+                port,
+                timeout=_PREFLIGHT_PROBE_TIMEOUT_SECONDS,
+                max_concurrency=_PREFLIGHT_PROBE_CONCURRENCY,
+            )
+            for host, probe in probe_map.items():
+                if probe.status == "open":
+                    open_by_host.setdefault(host, set()).add(port)
+
+        return {host: frozenset(ports) for host, ports in open_by_host.items()}
 
 
 def _applies(cve: CVEDefinition, target: ScanTarget) -> bool:
@@ -344,6 +475,56 @@ def _skipped_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
         cvss_v3=cve.cvss_v3,
         cvss_vector=cve.cvss_vector,
         technique=cve.technique,
+    )
+
+
+def _unreachable_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
+    """Record a check whose transport port was unreachable from this vantage.
+
+    This is a DATA GAP (``SKIPPED``), NOT a verdict: the check was never run,
+    so the host is neither "vulnerable" nor "not vulnerable" — it was simply
+    not evaluated. Using ``NOT_VULNERABLE`` here would falsely credit the host
+    with passing a check that never executed (Exposure-Validation doctrine).
+    """
+
+    ports = ", ".join(str(p) for p in cve.required_ports) or "required"
+    return CVEResult(
+        cve_id=cve.id,
+        aka=cve.aka,
+        host=target.host,
+        status=CVEStatus.SKIPPED,
+        severity=Severity.INFO,
+        cvss_v3=cve.cvss_v3,
+        cvss_vector=cve.cvss_vector,
+        technique=cve.technique,
+        error=f"not evaluated: port {ports}/tcp unreachable from this vantage",
+    )
+
+
+def _emit_unreachable_summary(
+    unreachable_skips: int, results: list[CVEResult]
+) -> None:
+    """Emit ONE concise operator line for hosts skipped for unreachability.
+
+    Declares the data gap without flooding the terminal with one red error
+    per unreachable (host, check). Stays silent when nothing was skipped so
+    clean runs are uncluttered. Per-(host, check) detail lives at debug
+    level (each ``_unreachable_result`` carries its own reason).
+    """
+
+    if unreachable_skips <= 0:
+        return
+    hosts = {
+        r.host
+        for r in results
+        if r.status is CVEStatus.SKIPPED
+        and (r.error or "").startswith("not evaluated: port")
+    }
+    host_count = len(hosts)
+    print_info(
+        f"  {host_count} host(s) skipped for {unreachable_skips} CVE check(s) "
+        "(required port unreachable from this vantage) — recorded as not "
+        "evaluated, not as not-vulnerable."
     )
 
 

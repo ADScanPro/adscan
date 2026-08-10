@@ -215,6 +215,7 @@ _TECHNIQUE_NAMES: dict[str, str] = {
     "privilegedgroupcontrol": "Control of a privileged group",
     "readgmsapassword": "gMSA password read",
     "readlapspassword": "LAPS password read",
+    "crossorgtgtdelegation": "Cross-forest Kerberos TGT delegation",
     "readshare": "Read access to an SMB share",
     "scheduledtask": "Scheduled task as a logged-on user",
     "shadowcredentials": "Shadow Credentials",

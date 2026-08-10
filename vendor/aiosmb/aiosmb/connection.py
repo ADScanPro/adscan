@@ -20,6 +20,7 @@ from aiosmb.protocol.smb2.commands.negotiate import SMB2ContextType, \
 	SMB2CompressionType, SMB2CompressionFlags,SMB2EncryptionCapabilities, \
 	SMB2CompressionCapabilities, SMB2SigningAlgorithm, SMB2SigningCapabilities
 from aiosmb.protocol.smb2.commands import *
+from aiosmb.protocol.smb2.commands.sessionsetup import SessionFlags
 from aiosmb.protocol.smb2.headers import *
 from aiosmb.protocol.smb2.command_codes import *
 from aiosmb.protocol.common import *
@@ -754,8 +755,51 @@ class SMBConnection:
 				if err is not None:
 					raise err
 
-				if self.gssapi.is_guest() is True:
+				# The SERVER's authoritative verdict for this session, from the
+				# SESSION_SETUP response SessionFlags. This is the ground truth for
+				# "guest" / "null" — it is set by the DC even when the CLIENT did
+				# NOT request a guest logon. A hardened DC with the Guest account
+				# enabled maps a normal empty-password NTLM authenticate for a
+				# non-existent account to Guest and returns
+				# SMB2_SESSION_FLAG_IS_GUEST — so ``gssapi.is_guest()`` (which only
+				# reflects OUR credential flag) is False while the session is really
+				# a guest session. Trust the server flag.
+				server_session_flags = getattr(rply.command, 'SessionFlags', None)
+				server_granted_guest = False
+				server_granted_null = False
+				if server_session_flags is not None:
+					try:
+						server_granted_guest = SessionFlags.SMB2_SESSION_FLAG_IS_GUEST in server_session_flags
+						server_granted_null = SessionFlags.SMB2_SESSION_FLAG_IS_NULL in server_session_flags
+					except TypeError:
+						server_granted_guest = bool(int(server_session_flags) & SessionFlags.SMB2_SESSION_FLAG_IS_GUEST.value)
+						server_granted_null = bool(int(server_session_flags) & SessionFlags.SMB2_SESSION_FLAG_IS_NULL.value)
+
+				# A guest / null / anonymous session — whether we asked for it
+				# (``gssapi.is_guest()``) or the server downgraded us to it
+				# (``server_granted_guest``/``server_granted_null``).
+				is_guest_or_null = (
+					self.gssapi.is_guest() is True
+					or server_granted_guest
+					or server_granted_null
+				)
+
+				if is_guest_or_null:
 					self.signing_required = False
+					# ADscan fix (root cause of guest CONNECTION_ABORTED on hardened
+					# DCs): a guest / null session MUST NOT encrypt its traffic. The
+					# server advertises the encryption capability during NEGOTIATE,
+					# which sets ``encryption_required=True`` — but a guest session
+					# carries no usable key material the server will accept for
+					# encryption, so if the SMB3 key-derivation below runs and the
+					# send-path then seals a request (e.g. the TREE_CONNECT) with the
+					# guest key, the DC ABORTS the connection (CONNECTION_ABORTED).
+					# impacket forces ``SupportsEncryption=False`` for guest/null for
+					# exactly this reason (smb3.py). Clearing it here makes ADscan's
+					# guest SMB share enumeration / SAMR work against Server 2022/2025
+					# signing-required DCs where it previously died right after a
+					# successful (guest-granted) session setup.
+					self.encryption_required = False
 
 				self.SessionKey = self.gssapi.get_session_key()[:16]
 
@@ -775,14 +819,13 @@ class SMBConnection:
 				# session unable to sign OR encrypt — so the server rejected the
 				# tree connect with ACCESS_DENIED. Derive keys whenever we have a
 				# real (authenticated, non-guest) session key on a SMB3 dialect.
-				# Guests are excluded: a guest session carries no usable key
-				# material, the server does not expect signed/encrypted traffic
-				# from it, and deriving from the null guest key would make the
-				# encryption send-path seal with a bogus key (server rejects with
-				# ACCESS_DENIED). This preserves the old behaviour for guests, which
-				# the previous ``signing_required``-gated derivation skipped because
-				# the guest branch above forces ``signing_required = False``.
-				if self.SessionKey and self.gssapi.is_guest() is False and self.selected_dialect in [NegotiateDialects.SMB300 , NegotiateDialects.SMB302 , NegotiateDialects.SMB311]:
+				#
+				# Guest / null sessions are EXCLUDED from ENCRYPTION-key derivation:
+				# the server does not expect encrypted traffic from them, and
+				# sealing with the guest key gets the connection ABORTED (the bug
+				# fixed above). They still keep ``encryption_required=False`` so the
+				# send-path never encrypts even if an ``EncryptionKey`` existed.
+				if self.SessionKey and is_guest_or_null is False and self.selected_dialect in [NegotiateDialects.SMB300 , NegotiateDialects.SMB302 , NegotiateDialects.SMB311]:
 					if self.selected_dialect == NegotiateDialects.SMB311:
 						#SMB311 is a special snowflake
 						self.SigningKey      = KDF_CounterMode(self.SessionKey, b"SMBSigningKey\x00", self.PreauthIntegrityHashValue, 128)
@@ -794,7 +837,7 @@ class SMBConnection:
 						self.ApplicationKey  = KDF_CounterMode(self.SessionKey, b"SMB2APP\x00", b"SmbRpc\x00", 128)
 						self.EncryptionKey   = KDF_CounterMode(self.SessionKey, b"SMB2AESCCM\x00", b"ServerIn \x00", 128)
 						self.DecryptionKey   = KDF_CounterMode(self.SessionKey, b"SMB2AESCCM\x00", b"ServerOut\x00", 128)
-				
+
 				self.status = SMBConnectionStatus.RUNNING
 			
 			#elif rply.header.Status != NTStatus.MORE_PROCESSING_REQUIRED:

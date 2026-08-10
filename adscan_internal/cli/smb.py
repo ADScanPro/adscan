@@ -10877,8 +10877,12 @@ def ask_for_smb_descriptions(shell: Any, *, domain: str) -> None:
     if shell.auto:
         run_smb_descriptions(shell, domain=domain)
     else:
+        from adscan_internal.cli.common import (
+            resolve_effective_username_for_domain,
+        )
+
         pdc = shell.domains_data.get(domain, {}).get("pdc", "N/A")
-        username = shell.domains_data.get(domain, {}).get("username", "N/A")
+        username = resolve_effective_username_for_domain(shell, domain)
 
         if confirm_operation(
             operation_name="SMB Description Password Search",

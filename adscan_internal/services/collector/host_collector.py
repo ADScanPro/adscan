@@ -15,10 +15,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import os
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+from rich.console import RenderableType
+from rich.text import Text
 
 from adscan_core import telemetry
 from adscan_core.rich_output import (
@@ -28,6 +32,7 @@ from adscan_core.rich_output import (
     print_warning,
 )
 from adscan_core.interaction import is_non_interactive
+from adscan_core.theme import COLOR_AMBER, COLOR_MUTED
 from adscan_core.tui.patience_notice import (
     PatienceNoticeConfig,
     maybe_show_patience_notice,
@@ -106,6 +111,20 @@ _HOST_TIMEOUT_DEFAULT = 20
 # 5s and an audit-tool completeness margin (we prefer not to skip a real-but-slow
 # host the way bloodhound's 1s would). Tune via ``ADSCAN_COLLECTOR_CONNECT_TIMEOUT``.
 _HOST_CONNECT_TIMEOUT_DEFAULT = 10
+
+# Hard wall-clock bound on the per-host SMB connection TEARDOWN
+# (``machine_cm.__aexit__``). Teardown runs INSIDE the worker's semaphore slot but
+# OUTSIDE the ``per_host_budget`` ``wait_for`` that wraps the collection body, and
+# rides only the vendor's internal ``wait_for(terminate, 5)`` / ``wait_for(disconnect,
+# 1)``. If a wedged host parks an ``await`` those inner bounds do not cover (a
+# half-open socket during ``__aexit__``, a re-parked cancel), the slot is held with
+# the budget already satisfied — so ``budget_timeouts`` never advances and the
+# semaphore starves the sweep. This is the exact field signature of the large-estate
+# freeze (drains ~250 hosts, then ``done`` freezes for HOURS with budget_timeouts=0).
+# Teardown of a healthy host is near-instant (the vendor already tries 5s+1s), so a
+# 10s outer bound never cuts a real teardown while it guarantees a wedged one frees
+# the slot fast. Tune via ``ADSCAN_COLLECTOR_TEARDOWN_TIMEOUT``.
+_HOST_TEARDOWN_TIMEOUT_DEFAULT = 10
 
 # Hard per-host wall-clock SAFETY NET for the full collection of one host
 # (negotiate + auth-connect + SAMR + shares). Every per-op step is already a hard
@@ -187,6 +206,30 @@ _MID_SWEEP_PERSIST_THRESHOLD = 200
 # cadence (``_COLLECTOR_PROGRESS_THROTTLE_SECS`` in intelligence.py) so a fast
 # fan-out surfaces calm ~1s motion instead of flooding the event sink.
 _HOST_EMIT_THROTTLE_SECS = 1.2
+
+# Stall watchdog (DIAGNOSTIC — see _stall_watchdog). The SMB collector has been
+# observed to deadlock on large directories (completes ~250 hosts, then ``done``
+# freezes for HOURS with budget_timeouts=0 and no further activity, until the
+# operator Ctrl+C's — the leading theory is a per-host connect coroutine that
+# ``asyncio.wait_for`` times out on but cannot CANCEL, so the worker slot is never
+# freed and the semaphore starves the sweep). When it stalls it prints nothing, so
+# the stuck ``await`` cannot be named from a recording. This watchdog makes the
+# stall LOUD and NAMED: it checks every ``_STALL_CHECK_INTERVAL_FACTOR ×
+# per_host_budget`` seconds whether ``done`` advanced while work is still
+# dispatched, and if not it logs a ``collector-timing STALL`` line plus the parked
+# state of every in-flight host. Two structural seams that produced this exact
+# signature (``budget_timeouts=0`` at the freeze) are now bounded: the connection
+# TEARDOWN (``_bounded_teardown`` — an unbudgeted ``__aexit__`` that held the slot)
+# and the mid-sweep CHECKPOINT (``asyncio.to_thread`` — a synchronous graph persist
+# that blocked the loop). The watchdog stays as the field oracle: if a freeze still
+# occurs it NAMES the stuck host+stage so the next culprit can be found.
+_STALL_CHECK_INTERVAL_FACTOR = 2.0
+# Never let the check interval collapse to a tight busy-loop if per_host_budget is
+# tiny (tests / a misconfigured budget); floor it so the watchdog stays cheap.
+_STALL_CHECK_INTERVAL_FLOOR_SECS = 5.0
+# Max per-stuck-host detail lines emitted per stall report. The whole in-flight
+# set is at most the semaphore concurrency (~20), so this is generous.
+_STALL_DETAIL_CAP = 32
 
 
 def _host_is_server(node: Any) -> bool:
@@ -542,6 +585,30 @@ class HostCollectorConfig:
     #    boundary for large estates: persists the partial graph FIRST, then
     #    flushes the done-set (ordering is load-bearing — see collection_progress).
     collection_checkpoint: "Callable[[], None] | None" = None
+    # Optional telemetry beacon for the running per-stage timing. Invoked on the
+    # ``_HOST_PROGRESS_TICK`` boundary and on the abort/interrupt drain with a
+    # snapshot of the LIVE :class:`HostPhaseTiming` plus done/total, so a run that
+    # never completes — a huge estate that runs for hours and is then Ctrl+C'd /
+    # OOM-killed — still leaves the timing decomposition in telemetry. The
+    # post-collection ``native_collection_performance`` event (intelligence.py)
+    # only fires when collection RETURNS, so it is lost on such a run. None
+    # (default) is a no-op. The CLI layer supplies one that captures + SYNCHRONOUSLY
+    # flushes the beacon (it owns ``shell`` and the event shape); this pure service
+    # never imports the CLI event sink — same clean layering as the callbacks above.
+    stage_timing_beacon: "Callable[[HostPhaseTiming, int, int], None] | None" = None
+    # Scale-aware host-enrichment gate (shell-free, opaque callable — same layering
+    # as the resume/progress callbacks). Invoked ONCE with the 445-reachable host
+    # count, after the gate and before the per-host sweep dispatches, only when a
+    # positive cap has not already been set. It returns the effective cap to apply
+    # (``0`` = full sweep) or signals a skip via the returned object, so a large
+    # directory turns hours of unbounded sweep into a 30-second informed choice.
+    # None (default) is a no-op: no gate, byte-for-byte the pre-gate behaviour. The
+    # CLI layer supplies one that renders the premium panel + prompt (interactive)
+    # or auto-resolves to the capped default (non-interactive) — this pure service
+    # never imports the CLI prompt sink. See ``services/collector/scale_gate.py``.
+    #   signature: (reachable_hosts: int) -> ScaleGateDecision-like with
+    #   ``.effective_host_cap: int``, ``.skip_enrichment: bool``, ``.reason: str``.
+    scale_gate_callback: "Callable[[int], Any] | None" = None
 
 
 @dataclass
@@ -612,6 +679,16 @@ class HostPhaseTiming:
     # fields so the coverage statement can report both reasons exactly.
     host_capped: bool = False
     capped_skipped: int = 0
+    # Proactive scale-gate coverage. Set by the scale gate (``scale_gate_callback``)
+    # when the operator (or the non-interactive capped default) bounded the sweep
+    # BEFORE it ran, as opposed to the reactive ``host_capped`` (env/scan-config cap
+    # applied inside ``_apply_host_cap``) or ``early_stopped`` (Ctrl+C mid-sweep).
+    # ``scale_gate_reason`` is the client-facing coverage-gap reason ('cap'/'skip');
+    # ``scale_gate_reachable`` is the reachable denominator at the gate. Carried up
+    # so the CLI records ONE host-enrichment coverage statement regardless of which
+    # bounding mechanism fired. Empty/zero when the gate was inert or ran full.
+    scale_gate_reason: str = ""
+    scale_gate_reachable: int = 0
 
     # Host-granular resume coverage (Slice 1). ``resumed_skipped`` is the number
     # of hosts skipped this run because a prior interrupted sweep already enriched
@@ -633,6 +710,104 @@ class HostPhaseTiming:
         failures never attempted a stage, so they are excluded by construction.
         """
         return int(sum((self.stage_outcomes.get("shares") or {}).values()))
+
+
+@dataclass
+class _InflightHost:
+    """Parked state of ONE in-flight per-host task, for the stall watchdog.
+
+    ``stage`` is the coroutine the host is currently parked in
+    (``dispatch``/``negotiate``/``connect``/``samr``/``shares``) — the exact
+    un-cancellable ``await`` the stall investigation could not name from a
+    recording. ``started`` is a monotonic timestamp (elapsed is derived, per the
+    clock-step doctrine — never wall-clock).
+    """
+
+    ip: str
+    stage: str = "dispatch"
+    started: float = 0.0
+
+
+class _InflightRegistry:
+    """Live map of in-flight per-host tasks → their parked stage.
+
+    A plain dict keyed by a monotonic token. Mutated only from the single
+    event-loop thread (the fan-out and the per-host coroutines), so no lock is
+    needed. The watchdog reads a snapshot. Registration/stage updates are pushed
+    through a per-host callback so ``collect_one_host`` stays decoupled from the
+    registry (it only calls an opaque ``stage_report(stage)``).
+    """
+
+    def __init__(self) -> None:
+        self._hosts: dict[int, _InflightHost] = {}
+        self._next = 0
+
+    def register(self, ip: str, *, now: float) -> int:
+        token = self._next
+        self._next += 1
+        self._hosts[token] = _InflightHost(ip=ip, stage="dispatch", started=now)
+        return token
+
+    def set_stage(self, token: int, stage: str) -> None:
+        host = self._hosts.get(token)
+        if host is not None:
+            host.stage = stage
+
+    def unregister(self, token: int) -> None:
+        self._hosts.pop(token, None)
+
+    def snapshot(self) -> list[_InflightHost]:
+        return list(self._hosts.values())
+
+
+def _format_stall_lines(
+    registry: "_InflightRegistry",
+    *,
+    done: int,
+    total: int,
+    frozen_for_s: float,
+    budget_timeouts: int,
+    inflight: int,
+    elapsed_s: float,
+    now: float,
+) -> list[str]:
+    """Build the ``collector-timing STALL`` diagnostic lines (bracket-free markers).
+
+    Turns a silent multi-hour freeze into a named report: WHERE the sweep is stuck
+    (``done``/``total``, how long ``done`` has been frozen), plus the parked state
+    of every in-flight host so the un-cancellable ``await`` is identified — per
+    stuck host ``host=<ip> stage=<negotiate|connect|samr|shares|dispatch>
+    elapsed=<s>``, plus a per-stage count and the oldest per-host elapsed. Pure
+    formatter (no I/O) so it is unit-testable; the watchdog does the emit.
+    """
+    lines: list[str] = [
+        "collector-timing STALL: done frozen at "
+        f"{done}/{total} for {frozen_for_s:.0f}s "
+        f"(inflight={inflight}, budget_timeouts={budget_timeouts}, "
+        f"phase-elapsed={elapsed_s:.0f}s)"
+    ]
+    hosts = registry.snapshot()
+    if not hosts:
+        return lines
+    stage_counts: dict[str, int] = {}
+    oldest = 0.0
+    for h in hosts:
+        stage_counts[h.stage] = stage_counts.get(h.stage, 0) + 1
+        oldest = max(oldest, now - h.started)
+    stage_hist = ", ".join(f"{k}={v}" for k, v in sorted(stage_counts.items()))
+    lines.append(
+        f"collector-timing STALL stages: {stage_hist} · "
+        f"oldest-inflight={oldest:.0f}s"
+    )
+    # Per-stuck-host detail, oldest first (the most likely culprit). Capped so a
+    # large stuck set (~20 slots) never floods, but that is the whole in-flight
+    # set at the semaphore's concurrency — well within one screen.
+    for h in sorted(hosts, key=lambda x: x.started)[:_STALL_DETAIL_CAP]:
+        lines.append(
+            f"collector-timing STALL parked: host={h.ip} stage={h.stage} "
+            f"elapsed={now - h.started:.0f}s"
+        )
+    return lines
 
 
 def _classify_host_outcome(errors: dict[str, str]) -> str:
@@ -711,6 +886,53 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[idx]
 
 
+def _format_stage_breakdown_lines(timing: HostPhaseTiming) -> list[str]:
+    """Build the per-stage time-decomposition lines from running-sum accumulators.
+
+    Pure formatter over the LIVE accumulators (``negotiate``/``samr``/``shares``
+    sums + ``stage_outcomes``), so it can surface a PARTIAL decomposition mid-sweep
+    (progress tick) or on an aborted/interrupted drain — not only on natural
+    completion. Returns the ``collector-timing stage time ...`` running-sum line
+    plus one ``collector-timing stage <stage>: ...`` line per stage with recorded
+    outcomes. ``connection-overhead`` needs the per-host wall-clock sum, so it is
+    included only when durations have been recorded (the completion path); on a
+    mid-sweep tick it is omitted (the sums are still meaningful as a ratio).
+    """
+    lines: list[str] = []
+    # WHERE the time goes, by stage (sums across hosts; concurrent so they
+    # overlap — read the RATIO, not the absolute). `connection-overhead` = total
+    # host-work minus the three RPC stages = authenticated connect + teardown +
+    # event-loop scheduling. If overhead dominates → the bottleneck is the
+    # connection layer (setup/teardown — where the abort/leak lived), NOT the RPC
+    # enumeration; if `shares` (or `samr`) dominates → that stage is the cost.
+    stage_sum = timing.negotiate + timing.samr + timing.shares
+    durations = timing.per_host_durations
+    if durations:
+        wall_sum = sum(durations)
+        overhead = max(0.0, wall_sum - stage_sum)
+        lines.append(
+            "collector-timing stage time (host-work sums): "
+            f"negotiate={timing.negotiate:.0f}s samr={timing.samr:.0f}s "
+            f"shares={timing.shares:.0f}s · connection-overhead≈{overhead:.0f}s "
+            f"· total host-work={wall_sum:.0f}s"
+        )
+    else:
+        lines.append(
+            "collector-timing stage time (host-work sums): "
+            f"negotiate={timing.negotiate:.0f}s samr={timing.samr:.0f}s "
+            f"shares={timing.shares:.0f}s · stage-sum={stage_sum:.0f}s"
+        )
+    # Per-stage outcomes (live-connection hosts only). `denied` = permission
+    # (normal, nothing to fix); `abort` = connection dropped (the recoverable
+    # case — decides whether a shares reconnect-retry is worth adding).
+    for _stage in ("sessions", "localadmins", "shares"):
+        _counts = timing.stage_outcomes.get(_stage) or {}
+        if _counts:
+            _line = ", ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+            lines.append(f"collector-timing stage {_stage}: {_line}")
+    return lines
+
+
 def _log_host_phase_stats(timing: HostPhaseTiming, total_hosts: int) -> None:
     """Emit the measured per-host duration distribution + outcome histogram.
 
@@ -735,29 +957,8 @@ def _log_host_phase_stats(timing: HostPhaseTiming, total_hosts: int) -> None:
             "collector-timing slowest per-host durations (s): "
             + ", ".join(f"{d:.0f}" for d in slowest)
         )
-    # WHERE the time goes, by stage (sums across hosts; concurrent so they
-    # overlap — read the RATIO, not the absolute). `connection-overhead` = total
-    # host-work minus the three RPC stages = authenticated connect + teardown +
-    # event-loop scheduling. If overhead dominates → the bottleneck is the
-    # connection layer (setup/teardown — where the abort/leak lived), NOT the RPC
-    # enumeration; if `shares` (or `samr`) dominates → that stage is the cost.
-    stage_sum = timing.negotiate + timing.samr + timing.shares
-    wall_sum = sum(durations)
-    overhead = max(0.0, wall_sum - stage_sum)
-    print_info_debug(
-        "collector-timing stage time (host-work sums): "
-        f"negotiate={timing.negotiate:.0f}s samr={timing.samr:.0f}s "
-        f"shares={timing.shares:.0f}s · connection-overhead≈{overhead:.0f}s "
-        f"· total host-work={wall_sum:.0f}s"
-    )
-    # Per-stage outcomes (live-connection hosts only). `denied` = permission
-    # (normal, nothing to fix); `abort` = connection dropped (the recoverable
-    # case — decides whether a shares reconnect-retry is worth adding).
-    for _stage in ("sessions", "localadmins", "shares"):
-        _counts = timing.stage_outcomes.get(_stage) or {}
-        if _counts:
-            _line = ", ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
-            print_info_debug(f"collector-timing stage {_stage}: {_line}")
+    for _line in _format_stage_breakdown_lines(timing):
+        print_info_debug(_line)
 
 
 async def _do_negotiate(
@@ -899,6 +1100,40 @@ async def _do_shares(
         timing.shares += time.monotonic() - t
 
 
+async def _bounded_teardown(machine_cm: Any, target_ip: str) -> None:
+    """Close an SMB connection context manager under a HARD wall-clock bound.
+
+    ``machine_cm.__aexit__`` runs inside the worker's semaphore slot but outside the
+    per-host budget ``wait_for``; a host that wedges the teardown ``await`` (a
+    half-open socket, a re-parked cancel that the vendor's inner ``wait_for(terminate,
+    5)`` / ``wait_for(disconnect, 1)`` do not cover) would otherwise hold the slot
+    forever with ``budget_timeouts`` never advancing — the exact large-estate freeze.
+    This wraps the teardown in ``asyncio.wait_for(_HOST_TEARDOWN_TIMEOUT_DEFAULT)`` so
+    the slot is guaranteed to free; a timed-out teardown is logged with a bracket-free,
+    countable ``collector-timing teardown-timeout`` marker and swallowed (best-effort
+    cleanup must never propagate). All other exceptions are swallowed too — teardown of
+    a dead host commonly errors, and the connection is being discarded regardless.
+    """
+    teardown_budget = _env_int(
+        "ADSCAN_COLLECTOR_TEARDOWN_TIMEOUT", _HOST_TEARDOWN_TIMEOUT_DEFAULT
+    )
+    try:
+        await asyncio.wait_for(
+            machine_cm.__aexit__(None, None, None),  # pylint: disable=no-member
+            timeout=teardown_budget,
+        )
+    except asyncio.TimeoutError:
+        # A wedged teardown — name it so it is countable in a recording, then move on.
+        # The slot MUST free; the connection is abandoned (the sweep is read-only work,
+        # so a leaked half-open socket is far cheaper than a held worker slot).
+        print_info_debug(
+            f"collector-timing teardown-timeout host={target_ip} "
+            f"budget={teardown_budget}s"
+        )
+    except Exception:  # noqa: BLE001 — best-effort cleanup; a dead host often errors on close
+        pass
+
+
 async def _do_shares_with_retry(
     machine: Any,
     smb_config: Any,
@@ -937,8 +1172,6 @@ async def _do_shares_with_retry(
         "fresh SMB connection (bounded, abort-only)."
     )
 
-    import contextlib
-
     from adscan_internal.services.smb_transport import smb_machine_with_fallback
 
     t = time.monotonic()
@@ -953,8 +1186,8 @@ async def _do_shares_with_retry(
                 fresh_machine, target_ip, share_cfg, per_host_timeout, out, timing
             )
         finally:
-            with contextlib.suppress(Exception):
-                await machine_cm.__aexit__(None, None, None)  # pylint: disable=no-member
+            # Hard-bound teardown so a wedged host cannot hold the worker slot.
+            await _bounded_teardown(machine_cm, target_ip)
     except Exception as exc:  # noqa: BLE001 — retry is best-effort; keep the abort recorded
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -969,6 +1202,7 @@ async def collect_one_host(
     config: HostCollectorConfig,
     timing: HostPhaseTiming,
     rtt_ms: float | None = None,
+    stage_report: "Callable[[str], None] | None" = None,
 ) -> HostCollectionResult:
     """Run negotiate + SAMR + SRVSVC against a single host on ONE SMB session.
 
@@ -977,6 +1211,12 @@ async def collect_one_host(
     proven-fast host that filters the IPC$ pipes stops burning the full
     ``per_host_timeout`` of dead-wait per SAMR stage; slow/unknown-RTT hosts keep
     the generous ``per_host_timeout`` unchanged.
+
+    ``stage_report`` (DIAGNOSTIC, optional) is the stall watchdog's per-host stage
+    hook: called with the coroutine this host is ABOUT to enter
+    (``negotiate``/``connect``/``samr``/``shares``) so the watchdog can name the
+    parked ``await`` if the sweep stalls. None (default) is a no-op — pure-service
+    / lab callers pay nothing.
     """
     from adscan_internal.services.smb_transport import (
         SMBAccessDeniedError,
@@ -986,8 +1226,13 @@ async def collect_one_host(
         smb_machine_with_fallback,
     )
 
+    def _stage(name: str) -> None:
+        if stage_report is not None:
+            stage_report(name)
+
     out = HostCollectionResult()
 
+    _stage("negotiate")
     await _do_negotiate(target_ip, config.smb, out, timing)
 
     smb_config = SMBConfig(
@@ -1008,8 +1253,6 @@ async def collect_one_host(
         posture_snapshot=config.smb.posture_snapshot,
     )
 
-    import contextlib
-
     try:
         # Hard-bound the authenticated connect. ``smb_machine_with_fallback``
         # enters via __aenter__ (Kerberos getST + negotiate + session-setup, plus
@@ -1025,12 +1268,16 @@ async def collect_one_host(
         machine_cm = smb_machine_with_fallback(smb_config)
         # smb_machine_with_fallback is an @asynccontextmanager; pylint can't infer
         # __aenter__/__aexit__ through the decorator (false-positive no-member).
+        # `connect` is the stage the stall investigation suspects is stuck (the
+        # wait_for that times out but may not cancel the native connect coroutine).
+        _stage("connect")
         machine = await asyncio.wait_for(
             machine_cm.__aenter__(),  # pylint: disable=no-member
             timeout=config.connect_timeout,
         )
         try:
             if config.collect_samr:
+                _stage("samr")
                 await _do_samr(
                     machine,
                     config.per_host_timeout,
@@ -1041,6 +1288,7 @@ async def collect_one_host(
                     enum_timeout=_adaptive_enum_timeout(rtt_ms, config.per_host_timeout),
                 )
             if config.collect_shares:
+                _stage("shares")
                 await _do_shares_with_retry(
                     machine,
                     smb_config,
@@ -1052,8 +1300,9 @@ async def collect_one_host(
                     timing,
                 )
         finally:
-            with contextlib.suppress(Exception):
-                await machine_cm.__aexit__(None, None, None)  # pylint: disable=no-member
+            # Hard-bound teardown so a wedged host cannot hold the worker slot with
+            # the per-host budget already satisfied (the ``budget_timeouts=0`` freeze).
+            await _bounded_teardown(machine_cm, target_ip)
     except SMBAuthError as exc:
         out.errors["auth"] = f"{type(exc).__name__}: {exc}"
         if "AP_REP" in str(exc) or "asn1_structs" in str(exc):
@@ -1512,6 +1761,66 @@ async def _gate_reachable_445(
         return nodes
 
 
+# Footer affordance shown at the foot of the live SMB-collection panel so the
+# operator KNOWS the sweep can be stopped cleanly mid-run. Calm and dim: an
+# affordance, not a warning. Only rendered on an interactive TTY (under
+# ``is_non_interactive`` Ctrl+C is a no-op — the platform stops via the
+# sentinel — so showing the hint would be misleading).
+_STOP_AFFORDANCE_LINE = (
+    "Ctrl+C  ·  stop enrichment here and continue the scan with the hosts "
+    "collected so far"
+)
+
+
+def _build_stop_footer_provider(
+    cancellation: Optional[Any],
+    inflight_count: Callable[[], int],
+) -> Callable[[], Optional[RenderableType]]:
+    """Build the per-frame footer provider for the SMB-collection dashboard.
+
+    Pulled once per rendered frame (see ``ProgressDashboard.set_footer_provider``)
+    so it reflects the CURRENT cooperative-cancellation state the instant it
+    changes. Two states, one line:
+
+    * Not yet requested — a calm, dim affordance telling the operator Ctrl+C
+      stops the enrichment here and continues the scan (Gap 1: make the
+      early-stop discoverable).
+    * Requested — an immediate, reassuring "stopping…" line naming how many
+      hosts are still draining, so the operator sees their first Ctrl+C took
+      effect and does NOT mash it into the double-tap hard abort (Gap 2). It
+      still states that a fresh Ctrl+C aborts the whole scan, so the escape
+      hatch stays discoverable.
+
+    The provider reads the thread-safe ``cancellation`` token (flipped on the
+    MAIN thread by the SIGINT handler) and the live in-flight count; it renders
+    on the worker thread inside ``render()``. It NEVER prompts or reads stdin.
+    """
+
+    def _provider() -> Optional[RenderableType]:
+        requested = bool(cancellation is not None and cancellation.is_requested())
+        if not requested:
+            return Text(_STOP_AFFORDANCE_LINE, style=COLOR_MUTED)
+        try:
+            n = max(0, int(inflight_count()))
+        except Exception:  # noqa: BLE001 — a count glitch must never break the render
+            n = 0
+        if n == 1:
+            in_flight = "finishing 1 host already in flight"
+        elif n > 1:
+            in_flight = f"finishing {n} hosts already in flight"
+        else:
+            in_flight = "finishing the hosts already in flight"
+        line = Text("Stopping:  ", style=f"bold {COLOR_AMBER}")
+        line.append(
+            f"{in_flight}, a few seconds more.  ",
+            style=COLOR_AMBER,
+        )
+        line.append("Ctrl+C again aborts the whole scan.", style=COLOR_MUTED)
+        return line
+
+    return _provider
+
+
 def _build_smb_progress_dashboard(timing: HostPhaseTiming) -> ProgressDashboard:
     """Construct the SMB-collection progress dashboard.
 
@@ -1569,6 +1878,48 @@ async def _collect_domain_hosts_async(
         count=timing.reachable_445_count or len(dispatch_nodes),
         non_interactive=is_non_interactive(),
     )
+
+    # Scale-aware host-enrichment gate. On a large directory the reachable count
+    # is now known and the sweep has NOT started — the one seam where the operator
+    # can make an informed choice before hours of enrichment. The callback renders
+    # the panel + prompt (interactive) or auto-resolves to the capped default
+    # (non-interactive). Runs off this event loop (a prompt reads stdin) and is
+    # inert below the threshold. Best-effort: any failure leaves the sweep to run
+    # as it would have (full), never worse.
+    reachable_now = timing.reachable_445_count or len(dispatch_nodes)
+    scale_gate_cb = getattr(config, "scale_gate_callback", None)
+    # Only engage the gate when a positive cap is not ALREADY in force (an
+    # explicit scan-config / env cap has already made the decision — e.g.
+    # `adscan ci` defaults host_cap to 150). The interactive `start` path arrives
+    # here with host_cap == 0 (unlimited), which is exactly the unbounded sweep
+    # the gate exists to turn into an informed choice.
+    _existing_cap = int(getattr(config, "host_cap", 0) or 0)
+    if scale_gate_cb is not None and _existing_cap <= 0:
+        try:
+            decision = await asyncio.to_thread(scale_gate_cb, int(reachable_now))
+        except Exception as exc:  # noqa: BLE001 — the gate must never break collection
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            decision = None
+        if decision is not None:
+            gate_reason = str(getattr(decision, "reason", "") or "")
+            if bool(getattr(decision, "skip_enrichment", False)):
+                # Operator declined SMB enrichment. Skip the whole per-host sweep;
+                # the identity graph is already complete. Record the coverage gap
+                # so the report/web declare it (no hosts swept of the reachable set).
+                timing.scale_gate_reason = gate_reason or "skip"
+                timing.scale_gate_reachable = int(reachable_now)
+                timing.total_dispatch = int(reachable_now)
+                return timing
+            gate_cap = int(getattr(decision, "effective_host_cap", 0) or 0)
+            if gate_cap > 0:
+                # Apply the chosen cap by overriding the config's host_cap for the
+                # _apply_host_cap step below (representative-first keeps the
+                # highest-value hosts). Record the gate reason for the coverage
+                # statement so a proactive cap reads distinctly from a full sweep.
+                config.host_cap = gate_cap
+                timing.scale_gate_reason = gate_reason or "cap"
+                timing.scale_gate_reachable = int(reachable_now)
 
     sid_to_node = _build_sid_to_node(result)
 
@@ -1647,6 +1998,21 @@ async def _collect_domain_hosts_async(
 
     sem = asyncio.Semaphore(config.concurrency)
 
+    # Serialises the mid-sweep checkpoint persist against the per-host graph merge.
+    # The checkpoint (``_checkpoint`` in the orchestrator) READS ``result`` — it
+    # iterates ``result.nodes`` / ``result.edges`` and serialises the partial graph
+    # to disk — while ``_merge_host_into_graph`` concurrently APPENDS edges and writes
+    # node properties into that SAME ``result``. To keep a slow disk write off the
+    # event loop it runs via ``asyncio.to_thread`` (below), so it can no longer rely
+    # on the "no-await window" that made the sync call atomic against the other
+    # in-flight tasks. This lock restores the invariant: the merge holds it for its
+    # (already synchronous, no-await) critical section, and the off-thread persist
+    # holds it for the read, so the two never touch ``result`` at once. Uncontended
+    # cost is a nanosecond-scale acquire/release on the hot path; the only time the
+    # loop thread blocks on it is a merge that lands mid-persist, which is far cheaper
+    # than today's whole-loop freeze for the whole persist.
+    result_lock = threading.Lock()
+
     totals = {"session": 0, "admin": 0, "share": 0}
     sd_source_counts: dict[str, int] = {}
 
@@ -1665,6 +2031,12 @@ async def _collect_domain_hosts_async(
         "skipped_capped": skipped_capped,
         "skipped_resumed": skipped_resumed,
     }
+    # Stall-watchdog state (DIAGNOSTIC). The registry tracks the parked stage of
+    # each in-flight host so a freeze can be NAMED, not just detected. The phase
+    # start is monotonic (elapsed only — never wall-clock, per the clock-step
+    # doctrine).
+    inflight_registry = _InflightRegistry()
+    phase_started = time.monotonic()
 
     def _safe_update(**kwargs: Any) -> None:
         # Fail-open: a dashboard render glitch must never abort collection.
@@ -1706,6 +2078,21 @@ async def _collect_domain_hosts_async(
 
     cancellation = getattr(config, "cancellation", None)
 
+    # Operator early-stop affordance in the live panel footer. Only on an
+    # interactive TTY: under ``is_non_interactive`` (``adscan ci``) Ctrl+C is a
+    # no-op (the platform stops via the sentinel), so the hint would mislead.
+    # The provider is pulled once per 10fps frame, so the calm affordance flips
+    # to the "stopping…" state on the NEXT frame the instant the SIGINT handler
+    # sets the cancellation flag on the main thread — no extra push, no stdin
+    # read on the render/worker path (Gaps 1 and 2).
+    if not is_non_interactive():
+        dashboard.set_footer_provider(
+            _build_stop_footer_provider(
+                cancellation,
+                inflight_count=lambda: progress["inflight"],
+            )
+        )
+
     async def _run(node: Any) -> None:
         had_error = False
         skipped = False
@@ -1718,6 +2105,7 @@ async def _collect_domain_hosts_async(
         _safe_update(in_flight=progress["inflight"])
         host_data = HostCollectionResult()
         host_t0 = 0.0
+        reg_token: int | None = None
         try:
             async with sem:
                 # Cooperative early-stop, checked at the true DISPATCH BOUNDARY:
@@ -1739,6 +2127,15 @@ async def _collect_domain_hosts_async(
                 # measured duration is the actual collection WORK, not the time
                 # spent queueing for a free worker.
                 host_t0 = time.monotonic()
+                # Register in the stall-watchdog registry so a freeze can name the
+                # exact host + stage stuck. Diagnostic-only, mutated from this loop
+                # thread; the per-host stage_report hook updates the parked stage.
+                reg_token = inflight_registry.register(target_ip, now=host_t0)
+                _token = reg_token
+
+                def _report_stage(stage: str, _t: int = _token) -> None:
+                    inflight_registry.set_stage(_t, stage)
+
                 try:
                     # SAFETY NET: hard wall-clock ceiling for the whole host. Every
                     # per-op step is already wait_for-bounded EXCEPT the authed
@@ -1753,6 +2150,7 @@ async def _collect_domain_hosts_async(
                             config,
                             timing,
                             rtt_ms=node.properties.get("_gate_rtt_ms"),
+                            stage_report=_report_stage,
                         ),
                         timeout=config.per_host_budget,
                     )
@@ -1762,9 +2160,16 @@ async def _collect_domain_hosts_async(
                         f"exceeded {config.per_host_budget}s total budget"
                     )
                     timing.host_budget_timeouts += 1
-            n_s, n_a, n_sh, src_counts = _merge_host_into_graph(
-                node, host_data, sid_to_node, samaccount_to_node, result, group_closure
-            )
+            # ``_merge_host_into_graph`` is the ONLY writer to ``result`` during the
+            # sweep (appends edges + writes node properties). Hold ``result_lock`` for
+            # it so the mid-sweep checkpoint's off-thread persist (which READS
+            # ``result``) can never observe a half-written graph. The section is
+            # already synchronous / no-await, so the lock is uncontended except during
+            # a concurrent checkpoint persist.
+            with result_lock:
+                n_s, n_a, n_sh, src_counts = _merge_host_into_graph(
+                    node, host_data, sid_to_node, samaccount_to_node, result, group_closure
+                )
             # Safe under asyncio: no await between the merge above and these updates,
             # so cooperative scheduling guarantees no preemption inside the read-modify-write.
             totals["session"] += n_s
@@ -1792,6 +2197,9 @@ async def _collect_domain_hosts_async(
                         print_exception(exception=exc)
         finally:
             progress["inflight"] -= 1
+            # Drop this host from the stall-watchdog registry (diagnostic-only).
+            if reg_token is not None:
+                inflight_registry.unregister(reg_token)
             # A host skipped by the early stop was never swept: release its slot
             # (done above), refresh the in-flight gauge, and record NOTHING else
             # (no duration, no outcome, no done/ok). The coverage statement reports
@@ -1866,19 +2274,54 @@ async def _collect_domain_hosts_async(
                 f"budget_timeouts={timing.host_budget_timeouts} · "
                 f"live_tasks={live_tasks}"
             )
+            # Surface the running per-stage decomposition every tick so a long or
+            # never-completing sweep (a 60k-host estate that runs for hours and is
+            # then Ctrl+C'd) still reveals WHERE the time went — the completion-only
+            # emit in _log_host_phase_stats never fires on such a run. The sums are
+            # already accumulated live; this is surfacing, not computing. Best-effort
+            # (never raise into the sweep). Cadence is the same 250-host tick — no
+            # per-host line, which would flood a large sweep.
+            try:
+                for _stage_line in _format_stage_breakdown_lines(timing):
+                    print_info_debug(_stage_line)
+            except Exception as exc:  # noqa: BLE001 — instrumentation must never break collection
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+            # Telemetry beacon of the running timing — so an aborted/OOM-killed run
+            # (which never reaches the post-collection native_collection_performance
+            # event) still leaves the timing decomposition in the field. Best-effort.
+            _beacon = getattr(config, "stage_timing_beacon", None)
+            if _beacon is not None:
+                try:
+                    _beacon(timing, progress["done"], len(dispatch_nodes))
+                except Exception as exc:  # noqa: BLE001 — beacon must never break collection
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
             # Host-granular resume: mid-sweep crash checkpoint for large estates.
             # The callback persists the partial graph FIRST, then flushes the
-            # done-set (ordering is load-bearing). Gated on the FULL swept-set
-            # size so small estates keep the single end-of-sweep persist. Runs in
-            # the same no-await window as the debug log above; the persist itself
-            # is synchronous so no other coroutine mutates ``result`` mid-write.
+            # done-set (ordering is load-bearing). Gated on the FULL swept-set size
+            # so small estates keep the single end-of-sweep persist.
+            #
+            # OFF-LOOP: the persist is a synchronous JSON dump of a large graph to
+            # disk. Run on the event-loop thread it BLOCKS the whole loop for the
+            # duration of the write — a latent stall by construction that freezes the
+            # sweep (flat ``live_tasks``, ``budget_timeouts=0``) on a slow disk at
+            # 60k-host scale. ``asyncio.to_thread`` moves it to a worker thread so the
+            # loop keeps servicing in-flight hosts. It reads ``result`` concurrently
+            # with the sweep, so it takes ``result_lock`` — the same lock the per-host
+            # merge holds — for a consistent view (see the lock's declaration).
             _checkpoint = getattr(config, "collection_checkpoint", None)
             if (
                 _checkpoint is not None
                 and hosts_total_for_resume >= _MID_SWEEP_PERSIST_THRESHOLD
             ):
+
+                def _locked_checkpoint(cb: Any = _checkpoint) -> None:
+                    with result_lock:
+                        cb()
+
                 try:
-                    _checkpoint()
+                    await asyncio.to_thread(_locked_checkpoint)
                 except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
@@ -1899,11 +2342,108 @@ async def _collect_domain_hosts_async(
         # Determinate "X / N hosts · ETA" to the web strip (throttled).
         _emit_host_progress()
 
+    # Stall watchdog (DIAGNOSTIC). Detects the multi-hour freeze where ``done``
+    # stops advancing with work still dispatched, and NAMES the stuck host+stage —
+    # the exact un-cancellable ``await`` a recording could not show. It is a
+    # lightweight polling coroutine that only reads state (never mutates the sweep),
+    # is cancelled on phase end, and is fully wrapped so it can neither hang nor
+    # block exit. Check interval = 2× per_host_budget (floored), so on the healthy
+    # path it wakes rarely and each wake is a cheap counter comparison.
+    _stall_state = {
+        "last_done": 0,
+        "last_change_at": phase_started,
+    }
+    _check_interval = max(
+        _STALL_CHECK_INTERVAL_FLOOR_SECS,
+        _STALL_CHECK_INTERVAL_FACTOR * float(getattr(config, "per_host_budget", 180)),
+    )
+
+    async def _stall_watchdog() -> None:
+        try:
+            while True:
+                await asyncio.sleep(_check_interval)
+                now = time.monotonic()
+                done = progress["done"]
+                inflight = progress["inflight"]
+                if done != _stall_state["last_done"]:
+                    _stall_state["last_done"] = done
+                    _stall_state["last_change_at"] = now
+                    continue
+                # ``done`` has not advanced since the last check. Only a STALL if
+                # work is still dispatched (inflight>0) and there are hosts left —
+                # a genuinely finished sweep is not a stall.
+                if inflight <= 0 or done >= total_hosts:
+                    continue
+                frozen_for = now - _stall_state["last_change_at"]
+                try:
+                    lines = _format_stall_lines(
+                        inflight_registry,
+                        done=done,
+                        total=total_hosts,
+                        frozen_for_s=frozen_for,
+                        budget_timeouts=timing.host_budget_timeouts,
+                        inflight=inflight,
+                        elapsed_s=now - phase_started,
+                        now=now,
+                    )
+                    for _line in lines:
+                        print_info_debug(_line)
+                except Exception as exc:  # noqa: BLE001 — watchdog must never break the sweep
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+        except asyncio.CancelledError:
+            # Normal shutdown on phase end — swallow so cancellation completes fast.
+            return
+
     results: list = []
     async with dashboard.async_live_session():
         tasks = [asyncio.create_task(_run(node)) for node in dispatch_nodes]
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        watchdog_task = asyncio.create_task(_stall_watchdog())
+        gather_completed = False
+        try:
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            gather_completed = True
+        finally:
+            # Stop the watchdog FIRST so it can never outlive the phase or block
+            # exit — cancel + await its completion (it swallows CancelledError, so
+            # this returns promptly and cannot hang the unwind).
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 — watchdog teardown is best-effort
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+            # Drain the partial per-stage decomposition when the gather did NOT
+            # complete normally — a hard Ctrl+C / KeyboardInterrupt / CancelledError
+            # propagating through the gather after hours on a huge estate (the case
+            # that motivated this). With return_exceptions=True a per-task failure is
+            # captured as a RESULT (gather still returns → gather_completed=True), so
+            # only a KeyboardInterrupt delivered to the loop, or cancellation of THIS
+            # coroutine, unwinds the await with gather_completed still False. On the
+            # normal path this is skipped because the completion-path
+            # _log_host_phase_stats below emits a superset. Best-effort: never raise
+            # into the unwind.
+            if not gather_completed:
+                try:
+                    for _drain_line in _format_stage_breakdown_lines(timing):
+                        print_info_debug(_drain_line)
+                except Exception as exc:  # noqa: BLE001 — drain must never break the unwind
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+                _drain_beacon = getattr(config, "stage_timing_beacon", None)
+                if _drain_beacon is not None:
+                    try:
+                        # flush=True: the terminal beacon on an aborted run must be
+                        # forced onto the wire before a following SIGKILL loses it.
+                        _drain_beacon(
+                            timing, progress["done"], len(dispatch_nodes), flush=True
+                        )
+                    except Exception as exc:  # noqa: BLE001 — beacon must never break the unwind
+                        telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
 
     # Operator early-stop coverage. If the cooperative token fired, some hosts
     # were never dispatched (they returned at the boundary above). Record the
