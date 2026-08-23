@@ -442,6 +442,16 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     shell.type = args.type
     shell.interface = args.interface
+    # Split-DC/DNS (issue #15): a separate AD-zone DNS server for segmented
+    # networks. Stash it session-wide so every resolver-update path picks it up
+    # (unauth discovers the domain FROM the DC, so the domain key may not exist
+    # yet), and persist it under the known domain for auth mode.
+    _ci_dns_server = str(getattr(args, "dns_server", "") or "").strip()
+    if _ci_dns_server:
+        shell._pending_dns_server = _ci_dns_server
+        _ci_dns_domain = str(getattr(args, "domain", "") or "").strip()
+        if _ci_dns_domain:
+            shell.domains_data.setdefault(_ci_dns_domain, {})["dns_server"] = _ci_dns_server
     try:
         from adscan_internal.services.myip_staleness import check_and_refresh_myip
 

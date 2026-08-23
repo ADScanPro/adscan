@@ -55,7 +55,7 @@ from adscan_internal.services.enumeration.smb_shares_native import (
     NativeSharesResult,
     enumerate_shares_native_sync,
 )
-from adscan_internal.models.domain import resolve_dc_ip
+from adscan_internal.models.domain import resolve_dc_ip, resolve_dns_server
 from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.kerberos_hostname_inventory import (
     load_workspace_ip_hostname_inventory,
@@ -711,6 +711,9 @@ def _build_smb_config_for_host(
     """
     domain_data = (shell.domains_data.get(domain) or {}) if hasattr(shell, "domains_data") else {}
     auth_state = str(domain_data.get("auth") or "unauth").strip().lower()
+    # Split-DC/DNS (issue #15): resolve the target host via the separate AD DNS
+    # server when one is configured; None -> the DC resolves (byte-identical).
+    dns_server = resolve_dns_server(domain_data)
 
     pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip() or None
     pdc_ip = str(domain_data.get("pdc") or "").strip()
@@ -825,6 +828,7 @@ def _build_smb_config_for_host(
             auth_domain=domain,
             kdc_ip=pdc_ip or None,
             use_kerberos=use_kerberos,
+            dns_server=dns_server,
             ip_hostname_inventory=inventory or None,
             timeout=timeout,
             posture_snapshot=posture_snapshot,
@@ -843,6 +847,7 @@ def _build_smb_config_for_host(
         password="",
         auth_domain=domain,
         use_kerberos=False,
+        dns_server=dns_server,
         timeout=timeout,
     )
 

@@ -377,6 +377,9 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
         domain=config.domain,
         username=config.username,
         password=config.effective_secret or "",
+        # Split-DC/DNS (issue #15): EscConfig already resolves the AD-zone DNS
+        # server from the shell; forward it for the SOA-serial query. Absent -> DC.
+        dns_server=config.dns_server,
     )
 
     krb_target = AdcsEsc8KrbRelayTarget(

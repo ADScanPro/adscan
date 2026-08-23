@@ -49,6 +49,12 @@ class EscConfig:
     ``__post_init__``. Required when ``use_kerberos=True`` because aiosmb
     derives the ``cifs/<host>`` SPN from the SMB target — passing an IP yields
     a ticket the server rejects (same SEC_E_LOGON_DENIED pattern as LDAP)."""
+    dns_server: Optional[str] = None
+    """Split-DC/DNS (issue #15): a SEPARATE AD-zone DNS server for segmented
+    networks. When unset it is auto-populated in ``__post_init__`` from
+    ``shell.domains_data[domain]['dns_server']``, and forwarded into the
+    ``CertRequestConfig`` / CA-backup resolution so the CA host resolves via the
+    DNS server, not the DC. ``None`` -> the DC resolves (byte-identical)."""
 
     def __post_init__(self) -> None:
         from adscan_internal.services._kerberos_spn import (
@@ -60,6 +66,23 @@ class EscConfig:
         # Promote short DC hostnames to FQDN. Mirrors the centralisation done
         # in ADscanLDAPConfig / SMBConfig — see services/_kerberos_spn.py.
         self.dc_fqdn = normalize_kerberos_target_hostname(self.dc_fqdn, self.domain)
+
+        # Split-DC/DNS (issue #15): auto-resolve the separate AD DNS server from
+        # the shell's domain data when the caller did not pass one explicitly, so
+        # every ESC build site inherits it without threading a new kwarg. Absent
+        # -> None, and the DC stays the resolver (byte-identical).
+        if not (self.dns_server or "").strip() and self.shell is not None:
+            try:
+                from adscan_internal.models.domain import resolve_dns_server
+
+                domains_data = getattr(self.shell, "domains_data", None) or {}
+                entry = domains_data.get(self.domain) or domains_data.get(
+                    self.auth_domain
+                )
+                if isinstance(entry, dict):
+                    self.dns_server = resolve_dns_server(entry)
+            except Exception:  # noqa: BLE001 — best-effort; absence keeps the DC.
+                self.dns_server = None
 
         # Enforce the ca_host / ca_fqdn consistency invariant: ca_fqdn must
         # either equal ca_host (when ca_host is an FQDN) or be a valid FQDN

@@ -67,6 +67,13 @@ class Domain:
     dc_ip: Optional[str] = None
     dcs: List[str] = field(default_factory=list)
 
+    # DNS resolver for the domain zone. In segmented AD networks the AD-zone DNS
+    # server is a DIFFERENT host from the DC one authenticates against. When set,
+    # this feeds ONLY the resolver (Unbound conditional forwarder / SRV
+    # discovery / A-record lookups); dc_ip stays the auth/enum target. When None,
+    # callers fall back to the DC (resolve_dc_ip) — byte-identical to legacy.
+    dns_server: Optional[str] = None
+
     # LDAP
     base_dn: Optional[str] = None
 
@@ -121,6 +128,7 @@ class Domain:
             "pdc_hostname": self.pdc_hostname,
             "dc_ip": self.dc_ip,
             "dcs": self.dcs,
+            "dns_server": self.dns_server,
             "base_dn": self.base_dn,
             "auth": self.auth_status.value,
             "username": self.username,
@@ -166,6 +174,7 @@ class Domain:
             pdc_hostname=data.get("pdc_hostname"),
             dc_ip=data.get("dc_ip"),
             dcs=data.get("dcs", []),
+            dns_server=data.get("dns_server"),
             base_dn=data.get("base_dn"),
             auth_status=auth_status,
             username=data.get("username"),
@@ -282,6 +291,29 @@ def resolve_dc_ip(domain_data: dict) -> str | None:
             if connectivity_pdc_ip:
                 return connectivity_pdc_ip
     return None
+
+
+def resolve_dns_server(domain_data: dict) -> str | None:
+    """Return the explicitly-configured DNS server for a domains_data entry.
+
+    In segmented AD networks the DNS server that serves the AD zone is a
+    DIFFERENT host from the DC one authenticates against. When the operator
+    passes ``--dns-server`` (or the interactive split-DNS prompt supplies one),
+    it is persisted under ``domains_data[domain]["dns_server"]`` and feeds ONLY
+    the resolver (Unbound conditional forwarder, SRV discovery, A-record
+    lookups). ``dc_ip``/``resolve_dc_ip`` stay the auth/enum target.
+
+    This reader deliberately does NOT fall back to the DC. It answers exactly
+    "is a separate DNS server configured?" — ``None`` means "no", and the caller
+    then falls back to :func:`resolve_dc_ip` explicitly::
+
+        resolver_ip = resolve_dns_server(domain_data) or resolve_dc_ip(domain_data)
+
+    Folding the fallback in here would make that question unanswerable and would
+    break the byte-identical-when-absent invariant.
+    """
+    dns_server = str(domain_data.get("dns_server") or "").strip()
+    return dns_server or None
 
 
 # --------------------------------------------------------------------------- #

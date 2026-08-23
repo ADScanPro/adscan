@@ -128,6 +128,9 @@ class DomainService(BaseService):
         dc_hostname: Optional[str] = None,
         resolve_dc_hostname: Optional[Callable[[str, str], Optional[str]]] = None,
         resolve_pdc_ip: Optional[Callable[[str, str], Optional[str]]] = None,
+        resolve_dns_server_for_domain: Optional[
+            Callable[[str], Optional[str]]
+        ] = None,
         check_domain_reachability: Optional[
             Callable[[str, str, str], Dict[str, Any]]
         ] = None,
@@ -160,6 +163,12 @@ class DomainService(BaseService):
             nt_hash: 32-hex NT hash (passed in lieu of password when set).
             aes_key: AES Kerberos key (32 or 64 hex chars).
             resolve_pdc_ip: Optional callback ``(partner, resolver_ip) -> ip``.
+            resolve_dns_server_for_domain: Optional callback ``(domain) -> dns_server``
+                (issue #15). When it returns a split-DC/DNS AD-zone DNS server for
+                the currently-walked (source) domain, that server — not the source
+                DC — is passed as the resolver for the partner-realm SRV/A/PTR
+                discovery. ``None`` / no callback -> the source DC doubles as the
+                resolver (legacy, byte-identical).
             check_domain_reachability: Optional reachability probe callback.
             scan_id: Optional scan id for progress events.
             timeout: Per-domain LDAP timeout (seconds). Reserved.
@@ -312,6 +321,21 @@ class DomainService(BaseService):
             per_domain_durations[current_domain] = duration_ms
             seen_domains.add(current_domain)
 
+            # Split-DC/DNS (issue #15): when the currently-walked (source) domain
+            # has a separate AD-zone DNS server, resolve the partner realms' SRV/A
+            # via that server, not the source DC. Absent -> current_pdc (the DC),
+            # byte-identical to legacy.
+            current_resolver = current_pdc
+            if resolve_dns_server_for_domain is not None:
+                try:
+                    source_dns_server = resolve_dns_server_for_domain(current_domain)
+                except Exception as dexc:  # noqa: BLE001 — best-effort resolver read
+                    telemetry.capture_exception(dexc)
+                    print_exception(exception=dexc)
+                    source_dns_server = None
+                if source_dns_server:
+                    current_resolver = source_dns_server
+
             for entry in entries:
                 partner = entry.partner
                 if not partner:
@@ -320,7 +344,7 @@ class DomainService(BaseService):
                 partner_pdc = domain_controllers.get(partner)
                 if not partner_pdc and resolve_pdc_ip is not None:
                     try:
-                        partner_pdc = resolve_pdc_ip(partner, current_pdc)
+                        partner_pdc = resolve_pdc_ip(partner, current_resolver)
                     except Exception as rexc:  # noqa: BLE001
                         telemetry.capture_exception(rexc)
                         print_exception(exception=rexc)
@@ -330,7 +354,7 @@ class DomainService(BaseService):
 
                 if partner not in domain_hostnames and resolve_dc_hostname is not None:
                     try:
-                        partner_host = resolve_dc_hostname(partner, current_pdc)
+                        partner_host = resolve_dc_hostname(partner, current_resolver)
                     except Exception as hexc:  # noqa: BLE001
                         telemetry.capture_exception(hexc)
                         print_exception(exception=hexc)

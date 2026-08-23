@@ -31,6 +31,7 @@ from adscan_internal.rich_output import (
     print_exception,
     print_success,
     print_warning,
+    prompt_ask,
     questionary_select_index,
 )
 from adscan_internal.services._kerberos_spn import is_ip_address
@@ -393,6 +394,10 @@ class PdcPreflightResult:
     authoritative_pdc_ip: str | None = None
     authoritative_pdc_hostname: str | None = None
     operator_overrode_pdc: bool = False
+    # Split-DC/DNS (issue #15): a separate AD-zone DNS server the operator
+    # supplied via the contextual prompt when the DC did not answer TCP/53.
+    # Feeds only the resolver; ``pdc_ip`` stays the DC/KDC. Absent -> DC is DNS.
+    dns_server: str | None = None
 
 
 def persist_pdc_preflight_result(shell: Any, result: PdcPreflightResult | None) -> None:
@@ -443,6 +448,12 @@ def persist_pdc_preflight_result(shell: Any, result: PdcPreflightResult | None) 
     hostname = _normalize_hostname_label(getattr(result, "pdc_hostname", None))
     if hostname:
         domain_info["pdc_hostname"] = hostname
+
+    # Split-DC/DNS (issue #15): persist a separate AD DNS server so the resolver
+    # update / finalize target it while pdc stays the DC.
+    dns_server = str(getattr(result, "dns_server", None) or "").strip()
+    if dns_server:
+        domain_info["dns_server"] = dns_server
 
 
 def is_domain_best_effort_mode(shell: Any, domain: str) -> bool:
@@ -624,6 +635,47 @@ def _host_looks_like_dns_candidate(
     return bool(port_evidence and 53 in port_evidence.open_tcp_ports)
 
 
+def _detect_separate_dns_server_candidates(
+    *,
+    selected_dc_ip: str | None,
+    candidate_open_ports: dict[str, set[int]] | None,
+) -> list[str]:
+    """Return candidate IPs that look like a separate AD-zone DNS server.
+
+    Segmented-network auto-detection (issue #15): the range-discovery nmap sweep
+    probes ``[88, 389, 53]``, so a pure DNS host (53 only) still surfaces as a
+    candidate IP. This classifier scans that candidate port map and returns every
+    IP that is DNS-like (:func:`_host_looks_like_dns_candidate`) but NOT DC-like
+    (:func:`_host_looks_like_dc_candidate`, which already gates on the scored
+    DC-confidence SSOT). The selected DC is always excluded — a host is never its
+    own separate DNS server.
+
+    The DC-identification heuristic is untouched: this ADDS DNS-server candidate
+    identification alongside it, reusing the same shared predicates. Returns a
+    sorted list so callers can enforce the "exactly one" rule for a safe
+    auto-adopt (0 or >1 is ambiguous).
+    """
+    if not candidate_open_ports:
+        return []
+    selected = (selected_dc_ip or "").strip()
+    found: list[str] = []
+    for candidate_ip, open_ports in candidate_open_ports.items():
+        ip_clean = (candidate_ip or "").strip()
+        if not ip_clean or ip_clean == selected:
+            continue
+        port_evidence = _candidate_dc_port_evidence_from_open_ports(
+            candidate_ip=ip_clean,
+            open_tcp_ports=open_ports,
+            source="nmap_range",
+        )
+        if _host_looks_like_dns_candidate(
+            fingerprint_evidence=None,
+            port_evidence=port_evidence,
+        ):
+            found.append(ip_clean)
+    return sorted(found)
+
+
 def _should_offer_fingerprint_retry(
     evidence: CandidateIpFingerprintEvidence | None,
 ) -> bool:
@@ -760,13 +812,20 @@ def _validate_domain_with_resolver_fallbacks(
     *,
     domain: str,
     resolver_ip: str,
+    dns_server: str | None = None,
 ) -> DomainValidationOutcome:
-    """Validate a domain against a resolver, optionally retrying the parent domain."""
+    """Validate a domain against a resolver, optionally retrying the parent domain.
+
+    Split-DC/DNS (issue #15): ``dns_server``, when set, is the SEPARATE AD-zone
+    DNS host the SRV/A queries target (the DC ``resolver_ip`` serves no DNS on a
+    segmented network). ``None`` keeps the DC as the resolver, byte-identical.
+    """
     attempts: list[DomainValidationAttempt] = []
     requested_domain = (domain or "").strip().rstrip(".").lower()
     candidates = _candidate_domains_for_dns_validation(requested_domain)
     marked_requested = mark_sensitive(requested_domain, "domain")
-    marked_resolver = mark_sensitive(resolver_ip, "ip")
+    effective_resolver = (dns_server or "").strip() or resolver_ip
+    marked_resolver = mark_sensitive(effective_resolver, "ip")
 
     print_info_debug(
         f"[pdc_preflight] DNS validation candidates for {marked_requested} via "
@@ -783,6 +842,7 @@ def _validate_domain_with_resolver_fallbacks(
             shell,
             domain=candidate_domain,
             resolver_ip=resolver_ip,
+            dns_server=dns_server,
         )
         attempts.append(
             DomainValidationAttempt(
@@ -1229,7 +1289,7 @@ class DcResolverCandidateAssessment:
     """Assessment for one DC/PDC candidate resolver."""
 
     ip: str
-    source: Literal["provided", "pdc_srv", "dc_srv"]
+    source: Literal["provided", "pdc_srv", "dc_srv", "dns_server"]
     reachable_route: bool
     tcp53_open: bool
     dns_ok: bool
@@ -1252,11 +1312,23 @@ def _discover_pdc_and_dcs_via_resolver(
     *,
     domain: str,
     resolver_ip: str,
+    dns_server: str | None = None,
 ) -> tuple[str | None, str | None, list[str]]:
-    """Best-effort DNS-only discovery for PDC (SRV) + DC list via a resolver IP."""
+    """Best-effort DNS-only discovery for PDC (SRV) + DC list.
+
+    Split-DC/DNS (issue #15): ``resolver_ip`` is the DC candidate (the auth/enum
+    target and the DC-identity selection reference). ``dns_server`` — when set —
+    is the host that actually answers DNS for the AD zone in a segmented network,
+    used ONLY as the DNS resolver for the SRV/A queries. When ``dns_server`` is
+    ``None`` the DC IP doubles as the resolver, byte-identical to legacy.
+    """
     normalized_domain = (domain or "").strip().rstrip(".")
     if not normalized_domain:
         return None, None, []
+
+    # The IP that answers DNS queries. In the common (non-split) case this is the
+    # DC itself; with a segmented network it is the separate AD DNS server.
+    dns_resolver_ip = dns_server or resolver_ip
 
     try:
         service = shell._get_dns_discovery_service()
@@ -1267,19 +1339,21 @@ def _discover_pdc_and_dcs_via_resolver(
         except Exception:
             domains_data_pdc = None
 
+        # preferred_ips / reference_ip stay anchored to the DC candidate — they
+        # bias DC-IDENTITY selection, and the DNS server is NOT a DC candidate.
         preferred_ips = [resolver_ip, domains_data_pdc, getattr(shell, "pdc", None)]
         preferred_ips = [ip for ip in preferred_ips if ip]
 
         pdc_ip, pdc_hostname = service.find_pdc_with_selection(
             domain=normalized_domain,
-            resolver_ip=resolver_ip,
+            resolver_ip=dns_resolver_ip,
             preferred_ips=preferred_ips if preferred_ips else None,
             reference_ip=resolver_ip,
         )
 
         dc_ips, _dc_hostnames, _dc_ip_to_hostname = service.discover_domain_controllers(
             domain=normalized_domain,
-            pdc_ip=resolver_ip,
+            pdc_ip=dns_resolver_ip,
             preferred_ips=preferred_ips if preferred_ips else None,
         )
 
@@ -1295,8 +1369,17 @@ def _validate_dns_with_resolver(
     *,
     domain: str,
     resolver_ip: str,
+    dns_server: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Validate DNS for a domain using an explicit resolver only (no fallback)."""
+    """Validate DNS for a domain using an explicit resolver only (no fallback).
+
+    Split-DC/DNS (issue #15): when ``dns_server`` is set the SRV/A validation
+    queries THAT host instead of ``resolver_ip`` (the DC candidate), so a
+    segmented network where the DC serves no DNS still validates. When
+    ``dns_server`` is ``None`` the DC candidate doubles as the resolver,
+    byte-identical to legacy.
+    """
+    resolver_ip = (dns_server or "").strip() or resolver_ip
     marked_domain = mark_sensitive(domain, "domain")
     marked_resolver = mark_sensitive(resolver_ip, "ip")
     try:
@@ -1327,24 +1410,41 @@ def _select_reachable_dc_resolver(
     *,
     domain: str,
     provided_ip: str,
+    dns_server: str | None = None,
 ) -> DcResolverSelection:
-    """Select the best reachable resolver from provided IP + discovered PDC/DC list."""
+    """Select the best reachable resolver from provided IP + discovered PDC/DC list.
+
+    Split-DC/DNS (issue #15): when ``dns_server`` is set the SRV discovery AND the
+    port-53/DNS gate target the SEPARATE DNS host — the resolver role. The DC
+    candidates (``provided_ip`` / SRV-discovered PDC / DC list) still supply the
+    persisted DC identity (``discovered_pdc_ip``) — the auth/enum target — and are
+    NOT probed for port 53. When ``dns_server`` is ``None`` the DC candidates
+    double as the resolver, byte-identical to legacy.
+    """
     discovered_pdc_ip, discovered_pdc_hostname, dc_ips = _discover_pdc_and_dcs_via_resolver(
         shell,
         domain=domain,
         resolver_ip=provided_ip,
+        dns_server=dns_server,
     )
 
-    source_by_ip: dict[str, Literal["provided", "pdc_srv", "dc_srv"]] = {}
-    if discovered_pdc_ip:
-        source_by_ip[discovered_pdc_ip] = "pdc_srv"
-    source_by_ip.setdefault(provided_ip, "provided")
-    for dc_ip in dc_ips:
-        source_by_ip.setdefault(dc_ip, "dc_srv")
+    source_by_ip: dict[str, Literal["provided", "pdc_srv", "dc_srv", "dns_server"]] = {}
 
-    ordered_candidates = normalize_ipv4_candidates(
-        [discovered_pdc_ip, provided_ip, *(dc_ips or [])]
-    )
+    if dns_server:
+        # The resolver and the DC are two distinct hosts: gate ONLY the DNS host
+        # for port 53 / DNS validation. The DC identity comes from SRV discovery.
+        source_by_ip[dns_server] = "dns_server"
+        ordered_candidates = normalize_ipv4_candidates([dns_server])
+    else:
+        if discovered_pdc_ip:
+            source_by_ip[discovered_pdc_ip] = "pdc_srv"
+        source_by_ip.setdefault(provided_ip, "provided")
+        for dc_ip in dc_ips:
+            source_by_ip.setdefault(dc_ip, "dc_srv")
+
+        ordered_candidates = normalize_ipv4_candidates(
+            [discovered_pdc_ip, provided_ip, *(dc_ips or [])]
+        )
     assessments: list[DcResolverCandidateAssessment] = []
     expected_interface = getattr(shell, "interface", None)
 
@@ -1420,7 +1520,12 @@ def _render_dc_resolver_failure_panel(
         "",
     ]
 
-    source_label = {"provided": "provided", "pdc_srv": "PDC SRV", "dc_srv": "DC SRV"}
+    source_label = {
+        "provided": "provided",
+        "pdc_srv": "PDC SRV",
+        "dc_srv": "DC SRV",
+        "dns_server": "DNS server",
+    }
     reason_label = {
         "no_route": "no route from local interfaces",
         "tcp53_unreachable": "TCP/53 not reachable",
@@ -1455,6 +1560,175 @@ def _render_dc_resolver_failure_panel(
     )
 
 
+def _selection_signals_separate_dns(selection: DcResolverSelection) -> bool:
+    """Return True when the DC was reached but did NOT answer DNS on TCP/53.
+
+    That exact combination — a routable candidate whose only failure reason is
+    ``tcp53_unreachable`` and no candidate that answered DNS — is the signal that
+    the AD-zone DNS server is a SEPARATE host from the DC (segmented network,
+    issue #15). A candidate that answered TCP/53 (``dns_ok``) means the DC also
+    serves DNS, so we must NOT offer the split-DNS prompt.
+    """
+    if selection.selected_ip is not None:
+        return False  # something already resolved DNS — not a split-DNS network
+    assessments = selection.assessments or []
+    if not assessments:
+        return False
+    reached_but_no_dns = any(
+        a.reachable_route and not a.tcp53_open and a.reason == "tcp53_unreachable"
+        for a in assessments
+    )
+    any_dns_ok = any(a.dns_ok for a in assessments)
+    return reached_but_no_dns and not any_dns_ok
+
+
+def _offer_split_dns_server_prompt(
+    shell: Any,
+    *,
+    domain: str,
+    candidate_ip: str,
+    selection: DcResolverSelection,
+    detected_dns_server: str | None = None,
+) -> str | None:
+    """Contextually ask for a separate AD-zone DNS server IP (issue #15).
+
+    Fires ONLY when :func:`_selection_signals_separate_dns` is true — i.e. the
+    DC was reached but does not answer DNS on port 53 — so this is never an
+    always-on question. Returns a validated DNS-server IP, or ``None`` to skip
+    (the DC is also the DNS server). Non-interactive runs (``adscan ci``) skip
+    silently so the prompt never blocks.
+
+    Auto-detection (issue #15): when the range-discovery sweep already surfaced a
+    DNS-only host (``detected_dns_server``), it is offered as the prompt DEFAULT so
+    the operator accepts it with Enter, while still being free to override or skip.
+    The confirmation is never bypassed.
+    """
+    if is_non_interactive(shell):
+        return None
+    if not _selection_signals_separate_dns(selection):
+        return None
+
+    detected = (detected_dns_server or "").strip()
+    detected = detected if is_ip_address(detected) else ""
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_candidate = mark_sensitive(candidate_ip, "ip")
+    if detected:
+        marked_detected = mark_sensitive(detected, "ip")
+        detection_line = (
+            f"\n\nADscan detected {marked_detected} on this network: it exposes "
+            "DNS on port 53 but not Kerberos or LDAP, so it looks like this "
+            "zone's DNS server. It is offered as the default below.\n"
+        )
+        prompt_default = detected
+    else:
+        detection_line = ""
+        prompt_default = ""
+    print_panel(
+        "[bold]The domain controller does not answer DNS on port 53.[/bold]\n\n"
+        "In segmented networks the AD DNS server is often a separate host from "
+        "the DC. If you know it, provide its IP — ADscan will use it only to "
+        "resolve the domain zone and keep "
+        f"{marked_candidate} as the DC/KDC target."
+        f"{detection_line}\n"
+        "[dim]Press Enter to skip if the DC is also the DNS server.[/dim]",
+        title="[bold]🧭 Separate AD DNS Server?[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+    answer = (
+        prompt_ask(
+            Text(
+                f"DNS server IP for {marked_domain} "
+                "[Enter to skip if the DC is also DNS]",
+                style="cyan",
+            ),
+            default=prompt_default,
+            shell=shell,
+        )
+        or ""
+    ).strip()
+    if not answer:
+        return None
+    if not is_ip_address(answer):
+        print_error(
+            f"Invalid DNS server IP: {mark_sensitive(answer, 'ip')}. "
+            "Continuing with the DC as the resolver."
+        )
+        return None
+    print_success(
+        f"Using {mark_sensitive(answer, 'ip')} as the DNS server for "
+        f"{marked_domain}; DC/KDC stays {marked_candidate}."
+    )
+    return answer
+
+
+def _maybe_auto_adopt_separate_dns_server(
+    shell: Any,
+    *,
+    domain: str,
+    candidate_ip: str,
+    all_candidate_open_ports: dict[str, set[int]] | None,
+) -> str | None:
+    """Auto-adopt a detected DNS-only host as the zone DNS server (non-interactive).
+
+    Segmented-network auto-detection (issue #15) for ``adscan ci`` and any other
+    non-interactive run: when the DC does not answer DNS on 53 and the SAME
+    range-discovery sweep surfaced a DNS-only host, adopt it as the zone resolver
+    WITHOUT prompting — but only when the full safety gate holds. Otherwise return
+    ``None`` and leave today's behavior untouched (DC == DNS, ``dns_server``
+    unset). Adopting a wrong DNS host degrades resolution for the whole scan, so
+    the conservative direction is to NOT adopt.
+
+    The gate (all three must hold):
+      (a) the DC (``candidate_ip``) was reached but failed DNS on 53 — the
+          :func:`_selection_signals_separate_dns` split-DNS signal;
+      (b) EXACTLY ONE DNS-only-not-DC candidate exists (0 or >1 is ambiguous); and
+      (c) that candidate ACTUALLY resolves the AD zone (a real SRV/A validation
+          against it succeeds), not merely "port 53 open".
+
+    ``candidate_ip`` always stays the DC/KDC auth/enum target — only the resolver
+    role moves to the detected host.
+    """
+    if not all_candidate_open_ports:
+        return None
+    detected = _detect_separate_dns_server_candidates(
+        selected_dc_ip=candidate_ip,
+        candidate_open_ports=all_candidate_open_ports,
+    )
+    if len(detected) != 1:  # (b) 0 or >1 candidates -> ambiguous, do NOT adopt
+        return None
+    dns_host = detected[0]
+
+    # (a) Confirm the DC was reached but is silent on TCP/53 (the split-DNS
+    # signal) before adopting anything.
+    signal_selection = _select_reachable_dc_resolver(
+        shell,
+        domain=domain,
+        provided_ip=candidate_ip,
+    )
+    if not _selection_signals_separate_dns(signal_selection):
+        return None
+
+    # (c) The detected host must ACTUALLY resolve the zone, not just have 53 open.
+    retry = _select_reachable_dc_resolver(
+        shell,
+        domain=domain,
+        provided_ip=candidate_ip,
+        dns_server=dns_host,
+    )
+    if retry.selected_ip is None:
+        return None
+
+    print_success(
+        f"Auto-detected {mark_sensitive(dns_host, 'ip')} as the DNS server for "
+        f"{mark_sensitive(domain, 'domain')}: it serves the domain zone but is "
+        "not the DC. Using it only as the resolver; DC/KDC stays "
+        f"{mark_sensitive(candidate_ip, 'ip')}."
+    )
+    return dns_host
+
+
 def preflight_domain_pdc_noninteractive(
     shell: Any,
     *,
@@ -1462,14 +1736,31 @@ def preflight_domain_pdc_noninteractive(
     candidate_ip: str,
     mode_label: str,
     candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
+    dns_server: str | None = None,
+    all_candidate_open_ports: dict[str, set[int]] | None = None,
 ) -> PdcPreflightResult:
-    """Best-effort DC/PDC preflight without prompting."""
+    """Best-effort DC/PDC preflight without prompting.
+
+    Split-DC/DNS (issue #15): when ``dns_server`` is set the DNS SRV/A validation
+    AND the reachable-resolver selection target that SEPARATE AD-zone DNS host,
+    while ``candidate_ip`` stays the DC/KDC auth/enum target. This is the
+    non-interactive equivalent of the interactive split-DNS retry, used by the
+    ``ci``/``doctor`` ``--dns-server`` paths. ``None`` keeps ``candidate_ip`` as
+    the resolver, byte-identical to legacy.
+
+    Auto-detection (issue #15): ``all_candidate_open_ports`` is the full nmap
+    range-discovery port map. When the DC fails DNS on 53 and it surfaces exactly
+    one DNS-only host that resolves the zone, that host is auto-adopted as the
+    resolver here (``adscan ci``), with no prompt. Absent / no match -> unchanged.
+    """
+    dns_server = (dns_server or "").strip() or None
     marked_domain = mark_sensitive(domain, "domain")
     marked_candidate = mark_sensitive(candidate_ip, "ip")
     validation = _validate_domain_with_resolver_fallbacks(
         shell,
         domain=domain,
         resolver_ip=candidate_ip,
+        dns_server=dns_server,
     )
     dns_ok = validation.ok
     dns_error = validation.error
@@ -1506,6 +1797,28 @@ def preflight_domain_pdc_noninteractive(
         )
         domain = effective_domain
         marked_domain = mark_sensitive(domain, "domain")
+
+    # Auto-detection (issue #15): the DC did not resolve the zone. Before falling
+    # back to "proceed against the DC", see whether the range-discovery sweep
+    # surfaced a separate DNS-only host that DOES serve the zone, and adopt it as
+    # the resolver. Only when no dns_server was explicitly supplied (the
+    # ci/doctor --dns-server path already knows the resolver).
+    if not dns_ok and dns_server is None and all_candidate_open_ports:
+        auto_dns_server = _maybe_auto_adopt_separate_dns_server(
+            shell,
+            domain=domain,
+            candidate_ip=candidate_ip,
+            all_candidate_open_ports=all_candidate_open_ports,
+        )
+        if auto_dns_server:
+            return preflight_domain_pdc_noninteractive(
+                shell,
+                domain=domain,
+                candidate_ip=candidate_ip,
+                mode_label=mode_label,
+                candidate_open_tcp_ports=candidate_open_tcp_ports,
+                dns_server=auto_dns_server,
+            )
 
     if dns_error == "validation_error":
         print_warning(
@@ -1563,13 +1876,22 @@ def preflight_domain_pdc_noninteractive(
         shell,
         domain=domain,
         provided_ip=candidate_ip,
+        dns_server=dns_server,
     )
     # §3.3 resolver-vs-DC consistency: _select_reachable_dc_resolver picks the
     # best DNS *resolver* (port 53), but find_pdc_with_selection /
     # discover_domain_controllers now choose the persisted *DC/KDC* IP via a
     # reachability-aware LDAP/Kerberos probe (389/88). Prefer that reachable DC
     # IP for the realm's pdc; the port-53 resolver pick only drives the resolver.
-    persisted_dc_ip = selection.discovered_pdc_ip or selection.selected_ip
+    # Split-DC/DNS (issue #15): with a separate DNS server, ``selected_ip`` IS
+    # that DNS host (the resolver, reachable on 53) and must never be adopted as
+    # the DC target — only an SRV-discovered PDC may switch it (mirrors the
+    # interactive retry's ``discovered_pdc_ip or candidate_ip``).
+    persisted_dc_ip = (
+        selection.discovered_pdc_ip
+        if dns_server
+        else (selection.discovered_pdc_ip or selection.selected_ip)
+    )
     if persisted_dc_ip and persisted_dc_ip != candidate_ip:
         telemetry.capture(
             "pdc_preflight_auto_switched",
@@ -1582,7 +1904,9 @@ def preflight_domain_pdc_noninteractive(
             f"[pdc_preflight_noninteractive] Switching DC target for {marked_domain}: "
             f"{marked_candidate} -> {mark_sensitive(persisted_dc_ip, 'ip')}"
         )
-        return PdcPreflightResult(action="use", domain=domain, pdc_ip=persisted_dc_ip)
+        return PdcPreflightResult(
+            action="use", domain=domain, pdc_ip=persisted_dc_ip, dns_server=dns_server
+        )
 
     if selection.selected_ip is None and selection.discovered_pdc_ip is None:
         print_warning(
@@ -1595,7 +1919,9 @@ def preflight_domain_pdc_noninteractive(
             selection=selection,
         )
 
-    return PdcPreflightResult(action="use", domain=domain, pdc_ip=candidate_ip)
+    return PdcPreflightResult(
+        action="use", domain=domain, pdc_ip=candidate_ip, dns_server=dns_server
+    )
 
 
 def preflight_domain_pdc_interactive(
@@ -1605,12 +1931,24 @@ def preflight_domain_pdc_interactive(
     candidate_ip: str,
     mode_label: str,
     candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
+    all_candidate_open_ports: dict[str, set[int]] | None = None,
 ) -> PdcPreflightResult:
-    """Validate (domain, candidate_ip) and ask user to confirm corrections."""
+    """Validate (domain, candidate_ip) and ask user to confirm corrections.
+
+    Auto-detection (issue #15): ``all_candidate_open_ports`` is the full nmap
+    range-discovery port map. On the split-DNS branch (DC reached, silent on 53)
+    a detected DNS-only host from that map pre-fills the split-DNS prompt as its
+    default, so the operator confirms with Enter but can still override or skip.
+    """
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
     if _is_non_interactive(shell):
         return preflight_domain_pdc_noninteractive(
-            shell, domain=domain, candidate_ip=candidate_ip, mode_label=mode_label
+            shell,
+            domain=domain,
+            candidate_ip=candidate_ip,
+            mode_label=mode_label,
+            candidate_open_tcp_ports=candidate_open_tcp_ports,
+            all_candidate_open_ports=all_candidate_open_ports,
         )
     marked_domain = mark_sensitive(domain, "domain")
     marked_candidate = mark_sensitive(candidate_ip, "ip")
@@ -1903,6 +2241,50 @@ def preflight_domain_pdc_interactive(
         return PdcPreflightResult(action="fallback", domain=domain)
 
     if selected_ip is None:
+        # Split-DC/DNS (issue #15): the DC was reached but did not answer TCP/53.
+        # Contextually offer a separate AD DNS server; retry the selection with
+        # it before falling through to the generic "no resolver" failure UX.
+        # Auto-detection: when the range-discovery sweep surfaced exactly one
+        # DNS-only host, pre-fill the prompt with it as the default.
+        detected_candidates = _detect_separate_dns_server_candidates(
+            selected_dc_ip=candidate_ip,
+            candidate_open_ports=all_candidate_open_ports,
+        )
+        detected_dns_server = (
+            detected_candidates[0] if len(detected_candidates) == 1 else None
+        )
+        dns_server = _offer_split_dns_server_prompt(
+            shell,
+            domain=domain,
+            candidate_ip=candidate_ip,
+            selection=selection,
+            detected_dns_server=detected_dns_server,
+        )
+        if dns_server:
+            retry = _select_reachable_dc_resolver(
+                shell,
+                domain=domain,
+                provided_ip=candidate_ip,
+                dns_server=dns_server,
+            )
+            if retry.selected_ip is not None:
+                # DNS now resolves via the separate host. The DC/KDC target is
+                # the SRV-discovered PDC (or the provided DC when SRV was empty).
+                use_ip = retry.discovered_pdc_ip or candidate_ip
+                return PdcPreflightResult(
+                    action="use",
+                    domain=domain,
+                    pdc_ip=use_ip,
+                    dns_server=dns_server,
+                    pdc_hostname=_normalize_hostname_label(
+                        retry.discovered_pdc_hostname
+                    ),
+                )
+            print_warning(
+                "The provided DNS server did not resolve the domain either. "
+                "Continuing without a separate DNS server."
+            )
+
         _render_dc_resolver_failure_panel(
             domain=domain,
             provided_ip=candidate_ip,
@@ -2137,8 +2519,13 @@ def preflight_domain_pdc(
     interactive: bool,
     mode_label: str,
     candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
+    all_candidate_open_ports: dict[str, set[int]] | None = None,
 ) -> PdcPreflightResult:
-    """Preflight wrapper that avoids interactive prompts when not desired."""
+    """Preflight wrapper that avoids interactive prompts when not desired.
+
+    ``all_candidate_open_ports`` is the full range-discovery port map, threaded
+    to both modes for the separate-DNS-server auto-detection (issue #15).
+    """
     if interactive:
         return preflight_domain_pdc_interactive(
             shell,
@@ -2146,6 +2533,7 @@ def preflight_domain_pdc(
             candidate_ip=candidate_ip,
             mode_label=mode_label,
             candidate_open_tcp_ports=candidate_open_tcp_ports,
+            all_candidate_open_ports=all_candidate_open_ports,
         )
     return preflight_domain_pdc_noninteractive(
         shell,
@@ -2153,6 +2541,7 @@ def preflight_domain_pdc(
         candidate_ip=candidate_ip,
         mode_label=mode_label,
         candidate_open_tcp_ports=candidate_open_tcp_ports,
+        all_candidate_open_ports=all_candidate_open_ports,
     )
 
 
@@ -2204,6 +2593,7 @@ def preflight_domain_pdc_from_candidates(
             interactive=interactive,
             mode_label=mode_label,
             candidate_open_tcp_ports=(candidate_open_ports or {}).get(ip),
+            all_candidate_open_ports=candidate_open_ports,
         )
         if decision.action == "use" and decision.pdc_ip:
             return decision
@@ -2523,7 +2913,10 @@ def seed_dc_context_after_dns_success(
         return None
 
     try:
-        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+        from adscan_internal.models.domain import (  # noqa: PLC0415
+            resolve_dc_ip,
+            resolve_dns_server,
+        )
 
         domain_info = shell.domains_data.setdefault(normalized_domain, {})
         if not isinstance(domain_info, dict):
@@ -2557,7 +2950,12 @@ def seed_dc_context_after_dns_success(
         domain_info["pdc"] = pdc_ip
         if not hostname:
             hostname = _normalize_hostname_label(
-                resolve_pdc_hostname(shell, domain=normalized_domain, pdc_ip=pdc_ip)
+                resolve_pdc_hostname(
+                    shell,
+                    domain=normalized_domain,
+                    pdc_ip=pdc_ip,
+                    dns_server=resolve_dns_server(domain_info),
+                )
             )
         if hostname:
             domain_info["pdc_hostname"] = hostname
@@ -2817,8 +3215,17 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
             return False
 
 
-def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
+def update_resolver_for_domain(
+    shell: DNSShell, domain: str, ip: str, dns_server: str | None = None
+) -> bool:
     """Update local DNS resolver configuration for a domain/DC pair.
+
+    Split-DC/DNS (issue #15): ``ip`` is the DC (auth/enum target). ``dns_server``,
+    when provided, is the SEPARATE host that serves DNS for the AD zone in a
+    segmented network — it becomes the Unbound conditional forwarder and the SRV
+    discovery resolver, while ``ip`` stays the persisted DC/KDC. When
+    ``dns_server`` is ``None`` the DC doubles as the resolver (legacy behaviour,
+    byte-identical).
 
     Idempotent per session: this is invoked from every ``finalize_domain_context``
     call site (workspace load, target set, posture, scan-confirm — roughly 4x per
@@ -2841,7 +3248,33 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
     marked_domain = mark_sensitive(domain, "domain")
     marked_ip = mark_sensitive(ip, "ip")
 
-    memo_key = ((domain or "").strip().rstrip(".").lower(), (ip or "").strip())
+    # Split-DC/DNS (issue #15): fall back to a dns_server persisted on
+    # domains_data[domain] when the caller does not pass one. This is the seam
+    # that lets EVERY resolver-update path (check_dns/update_resolv_conf,
+    # finalize_domain_context, the cross-forest auto-repoint) honour a segmented
+    # DNS config that the entry point (adscan ci/execute) persisted ONCE — no
+    # need to thread the flag through the args-string forms.
+    if not (dns_server or "").strip():
+        try:
+            domains_data = getattr(shell, "domains_data", None)
+            if isinstance(domains_data, dict):
+                entry = domains_data.get(domain)
+                if isinstance(entry, dict):
+                    dns_server = str(entry.get("dns_server") or "").strip() or None
+            # Unauth mode discovers the domain FROM the DC IP, so the domain key
+            # may not exist yet when the first resolver update runs. A session
+            # pending value (set by the ci/execute entry point) covers that.
+            if not (dns_server or "").strip():
+                pending = str(getattr(shell, "_pending_dns_server", "") or "").strip()
+                dns_server = pending or None
+        except Exception:  # noqa: BLE001 — best-effort read; absence -> legacy DC-as-resolver.
+            dns_server = None
+
+    memo_key = (
+        (domain or "").strip().rstrip(".").lower(),
+        (ip or "").strip(),
+        (dns_server or "").strip(),
+    )
     dns_configured = getattr(shell, "_dns_configured", None)
     if dns_configured is None:
         dns_configured = set()
@@ -2866,6 +3299,7 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
         shell,
         domain=domain,
         provided_ip=ip,
+        dns_server=dns_server,
     )
     # §3.3 resolver-vs-DC consistency: ``selection.selected_ip`` is the best
     # DNS *resolver* (port 53) winner, while ``selection.discovered_pdc_ip`` is
@@ -2892,14 +3326,21 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
             f"{marked_domain}."
         )
         return False
-    if pdc_ip and pdc_ip != ip:
+    if dns_server:
+        print_info(
+            f"Using separate DNS server {mark_sensitive(dns_server, 'ip')} for "
+            f"{marked_domain}; DC/KDC stays {marked_ip}."
+        )
+    elif pdc_ip and pdc_ip != ip:
         print_warning(
             "Provided DC/DNS IP was replaced by a reachable SRV-discovered resolver "
             f"for {marked_domain}: {mark_sensitive(pdc_ip, 'ip')}."
         )
     try:
         setattr(shell, "pdc", persisted_dc_ip)
-        hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=persisted_dc_ip)
+        hostname = resolve_pdc_hostname(
+            shell, domain=domain, pdc_ip=persisted_dc_ip, dns_server=dns_server
+        )
         if hostname:
             setattr(shell, "pdc_hostname", hostname)
         # Persist the DNS-discovered FQDN/short hostname to the per-domain
@@ -3031,18 +3472,28 @@ def resolve_pdc_hostname(
     *,
     domain: str,
     pdc_ip: str,
+    dns_server: str | None = None,
 ) -> str | None:
-    """Resolve the PDC hostname (short name) using DNS or reverse lookup."""
+    """Resolve the PDC hostname (short name) using DNS or reverse lookup.
+
+    Args:
+        dns_server: Split-DC/DNS AD-zone DNS server (issue #15). When set it is
+            the resolver that answers the SRV/PTR queries, while ``pdc_ip`` stays
+            the DC candidate / reference IP for selection and the PTR target.
+            ``None`` -> the DC (``pdc_ip``) doubles as the resolver (legacy,
+            byte-identical).
+    """
     normalized_domain = (domain or "").strip().rstrip(".")
     if not normalized_domain or not pdc_ip:
         return None
 
+    resolver_ip = str(dns_server or "").strip() or pdc_ip
     service = None
     try:
         service = shell._get_dns_discovery_service()
         selected_ip, hostname = service.find_pdc_with_selection(
             domain=normalized_domain,
-            resolver_ip=pdc_ip,
+            resolver_ip=resolver_ip,
             preferred_ips=[pdc_ip],
             reference_ip=pdc_ip,
         )
@@ -3057,7 +3508,7 @@ def resolve_pdc_hostname(
 
     if service is not None:
         try:
-            fqdn = service.reverse_resolve_fqdn_robust(pdc_ip, resolver=pdc_ip)
+            fqdn = service.reverse_resolve_fqdn_robust(pdc_ip, resolver=resolver_ip)
             fqdn = (fqdn or "").strip().rstrip(".")
             if fqdn and fqdn.lower().endswith(normalized_domain.lower()):
                 return fqdn.split(".")[0]
@@ -3077,6 +3528,7 @@ def resolve_pdc_hostname_best_effort(
     domain: str,
     pdc_ip: str,
     hostname_hint: str | None = None,
+    dns_server: str | None = None,
 ) -> str | None:
     """Resolve a short PDC hostname with best-effort fallbacks.
 
@@ -3085,12 +3537,20 @@ def resolve_pdc_hostname_best_effort(
     2. strict DNS-based hostname discovery
     3. LDAP/SMB fingerprinting for the candidate IP
     4. PTR reverse lookup
+
+    Args:
+        dns_server: Split-DC/DNS AD-zone DNS server (issue #15). When set it is
+            the resolver for the SRV/PTR lookups; ``pdc_ip`` stays the DC
+            candidate / PTR target. ``None`` -> the DC doubles as the resolver
+            (legacy, byte-identical).
     """
     normalized_hint = _normalize_hostname_label(hostname_hint)
     if normalized_hint:
         return normalized_hint
 
-    hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
+    hostname = resolve_pdc_hostname(
+        shell, domain=domain, pdc_ip=pdc_ip, dns_server=dns_server
+    )
     if hostname:
         return _normalize_hostname_label(hostname)
 
@@ -3098,9 +3558,10 @@ def resolve_pdc_hostname_best_effort(
     if evidence and evidence.hostname:
         return _normalize_hostname_label(evidence.hostname)
 
+    resolver_ip = str(dns_server or "").strip() or pdc_ip
     try:
         service = shell._get_dns_discovery_service()
-        fqdn = service.reverse_resolve_fqdn_robust(pdc_ip, resolver=pdc_ip)
+        fqdn = service.reverse_resolve_fqdn_robust(pdc_ip, resolver=resolver_ip)
         if fqdn:
             return _normalize_hostname_label(fqdn)
     except Exception as exc:  # noqa: BLE001
@@ -3122,6 +3583,7 @@ def finalize_domain_context(
     best_effort: bool | None = None,
     pdc_hostname_hint: str | None = None,
     make_active: bool = False,
+    dns_server: str | None = None,
 ) -> None:
     """Finalize DNS + /etc/hosts setup after confirming a domain and PDC/DC IP.
 
@@ -3204,8 +3666,17 @@ def finalize_domain_context(
                 f"[dns] Failed to set active domain context for {marked_domain}: {exc}"
             )
 
+    # Split-DC/DNS (issue #15): an explicit dns_server passed by an entry point
+    # wins and is persisted; a re-finalize with no dns_server falls back to a
+    # value persisted by an earlier call this session, so the segmented-DNS
+    # context survives the ~4 finalize calls per run without being re-supplied.
+    if not (dns_server or "").strip():
+        dns_server = str(domain_info.get("dns_server") or "").strip() or None
+
     try:
         domain_info["pdc"] = pdc_ip
+        if (dns_server or "").strip():
+            domain_info["dns_server"] = dns_server.strip()
         # Preserve a scope-aware operator DC override (2026-07-12): the operator
         # knowingly kept a non-PDC replica, so keep that marker + the persisted
         # lockout authority rather than downgrading it to "validated".
@@ -3250,7 +3721,7 @@ def finalize_domain_context(
         )
     elif all(hasattr(shell, name) for name in required_helpers):
         try:
-            if not update_resolver_for_domain(shell, domain, pdc_ip):
+            if not update_resolver_for_domain(shell, domain, pdc_ip, dns_server=dns_server):
                 print_warning(
                     "Failed to update the local DNS resolver configuration. "
                     "Some lookups may still rely on direct DC queries."
@@ -3278,9 +3749,12 @@ def finalize_domain_context(
                 domain=domain,
                 pdc_ip=pdc_ip,
                 hostname_hint=pdc_hostname_hint,
+                dns_server=dns_server,
             )
         else:
-            hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
+            hostname = resolve_pdc_hostname(
+                shell, domain=domain, pdc_ip=pdc_ip, dns_server=dns_server
+            )
 
     if not hostname and interactive:
         print_panel(

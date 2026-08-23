@@ -201,6 +201,7 @@ def resolve_kerberos_tcp_target(
     target_host: str,
     spn_host: str | None = None,
     resolver_ip: str | None = None,
+    dns_server: str | None = None,
     domain: str | None = None,
     ip_hostname_inventory: Mapping[str, Iterable[str] | str] | None = None,
     timeout_s: float = 2.0,
@@ -210,7 +211,14 @@ def resolve_kerberos_tcp_target(
     Args:
         target_host: Operator/discovery target, either IP or hostname.
         spn_host: Explicit SPN hostname when known from LDAP/workspace data.
-        resolver_ip: DC/KDC resolver to query directly when system DNS is not enough.
+        resolver_ip: DC/KDC IP. Used as the DNS resolver by default AND as the
+            multi-homed A-record preference (a co-located CA on a DC advertising
+            both an internal and a routable NIC prefers the reachable DC IP).
+        dns_server: Split-DC/DNS (issue #15) — a SEPARATE AD-zone DNS server for
+            segmented networks. When set it is the host that answers the A/PTR
+            queries, while ``resolver_ip`` (the DC) still drives the multi-homed
+            A-record preference. ``None`` -> the DC doubles as the resolver
+            (legacy, byte-identical).
         domain: Target DNS domain, used to promote short inventory hostnames.
         ip_hostname_inventory: Optional persisted IP → hostname candidates from
             MassDNS/reachability inventory. Checked before live PTR lookups.
@@ -225,6 +233,10 @@ def resolve_kerberos_tcp_target(
     target_clean = str(target_host or "").strip().rstrip(".")
     explicit_spn = str(spn_host or "").strip().rstrip(".")
     resolver_clean = str(resolver_ip or "").strip() or None
+    # The IP that ANSWERS DNS. In the common case this is the DC (resolver_clean);
+    # with a segmented network it is the separate AD DNS server. resolver_clean
+    # stays the DC for the multi-homed A-record preference below.
+    dns_query_ip = str(dns_server or "").strip() or resolver_clean
 
     if not target_clean:
         return KerberosTcpTarget(spn_host="", tcp_host="", server_ip=None)
@@ -242,7 +254,7 @@ def resolve_kerberos_tcp_target(
                 inventory=ip_hostname_inventory,
             )
         if not resolved_spn:
-            resolved_spn = _query_ptr_record(target_clean, resolver_clean, timeout_s)
+            resolved_spn = _query_ptr_record(target_clean, dns_query_ip, timeout_s)
         spn_value = resolved_spn or target_clean
         return KerberosTcpTarget(
             spn_host=spn_value,
@@ -250,7 +262,7 @@ def resolve_kerberos_tcp_target(
             server_ip=target_clean if spn_value != target_clean else None,
         )
 
-    resolved_ips = _query_a_records(target_clean, resolver_clean, timeout_s)
+    resolved_ips = _query_a_records(target_clean, dns_query_ip, timeout_s)
     # Prefer the resolver IP when the target resolves to it among several A
     # records. ``resolver_clean`` is the reachability-selected DC/KDC IP we are
     # already successfully talking to, so for a multi-homed host (e.g. an

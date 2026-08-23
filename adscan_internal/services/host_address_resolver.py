@@ -810,9 +810,10 @@ def _try_foreign_dc_discovery(
         return None
     try:
         domains_data = getattr(shell, "domains_data", {}) or {}
-        from adscan_internal.models.domain import resolve_dc_ip
+        from adscan_internal.models.domain import resolve_dc_ip, resolve_dns_server
 
         dc_ip: Optional[str] = None
+        realm_dns_server: Optional[str] = None
         for domain_name, entry in domains_data.items():
             if (
                 str(domain_name or "").strip().rstrip(".").lower()
@@ -820,6 +821,12 @@ def _try_foreign_dc_discovery(
                 and isinstance(entry, dict)
             ):
                 dc_ip = resolve_dc_ip(entry)
+                # Split-DC/DNS (issue #15): the foreign realm may itself have a
+                # separate AD-zone DNS server. This leaf re-derives the resolver
+                # from the foreign entry and so does NOT inherit the parent
+                # resolve_host_address override — read the foreign realm's own
+                # dns_server here so the A-lookup queries it, not the foreign DC.
+                realm_dns_server = resolve_dns_server(entry)
                 break
         if not dc_ip or not _is_ip(dc_ip):
             return None
@@ -829,8 +836,11 @@ def _try_foreign_dc_discovery(
             update_resolver_for_domain(shell, realm_clean, dc_ip)
         except Exception:  # noqa: BLE001 — re-point is best-effort
             pass
+        # Absent dns_server -> the foreign DC doubles as the resolver (legacy,
+        # byte-identical).
+        lookup_resolver = realm_dns_server or dc_ip
         return _lookup_dns(
-            host, dc_ip, probe_port, shell=shell, domain=domain, service=service
+            host, lookup_resolver, probe_port, shell=shell, domain=domain, service=service
         )
     except Exception:  # noqa: BLE001
         return None
@@ -980,6 +990,24 @@ def resolve_host_address(
     """
     host_clean = str(host or "").strip().rstrip(".")
     realm_clean = str(realm or domain or "").strip().rstrip(".")
+
+    # Split-DC/DNS (issue #15): when a SEPARATE AD-zone DNS server is configured
+    # for this domain (segmented network), it — not the DC — is the authority
+    # that answers A/SRV for the zone. Override the resolver here, at the single
+    # SSOT seam, so every DNS lookup below (_gather_candidate_ips, _lookup_dns)
+    # queries the right host. Absent -> resolver_ip stays as the caller passed it
+    # (the DC), byte-identical to legacy.
+    try:
+        from adscan_internal.models.domain import resolve_dns_server  # noqa: PLC0415
+
+        _entry = (getattr(shell, "domains_data", {}) or {}).get(
+            realm_clean or domain
+        ) or (getattr(shell, "domains_data", {}) or {}).get(domain)
+        _dns_server = resolve_dns_server(_entry) if isinstance(_entry, dict) else None
+        if _dns_server:
+            resolver_ip = _dns_server
+    except Exception:  # noqa: BLE001 — best-effort; absence keeps the DC as resolver.
+        pass
 
     # (a) already an IP.
     if _is_ip(host_clean):

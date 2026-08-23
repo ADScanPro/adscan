@@ -749,6 +749,7 @@ def _has_any_accepted_share_session(output: str) -> bool:
 
 def _smb_config_for_auth(shell: Any, domain: str):
     """Build an SMBConfig for the stored domain credentials, or None."""
+    from adscan_internal.models.domain import resolve_dns_server
     from adscan_internal.services.smb_transport import SMBConfig
 
     domain_data = shell.domains_data.get(domain, {}) or {}
@@ -767,6 +768,8 @@ def _smb_config_for_auth(shell: Any, domain: str):
     pdc_ip = str(domain_data.get("pdc") or "").strip()
     pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip() or None
 
+    # Split-DC/DNS (issue #15): resolve the target host via the separate AD DNS
+    # server when one is configured; None -> the DC resolves (byte-identical).
     return SMBConfig(
         target_ip=pdc_ip,
         target_hostname=pdc_hostname,
@@ -776,12 +779,14 @@ def _smb_config_for_auth(shell: Any, domain: str):
         nt_hash=nt_hash,
         auth_domain=domain,
         kdc_ip=pdc_ip,
+        dns_server=resolve_dns_server(domain_data),
         timeout=30,
     )
 
 
 def _smb_config_for_guest(shell: Any, domain: str):
     """Build an SMBConfig for a Guest:<empty> SMB session."""
+    from adscan_internal.models.domain import resolve_dns_server
     from adscan_internal.services.smb_transport import SMBConfig
 
     domain_data = shell.domains_data.get(domain, {}) or {}
@@ -791,6 +796,7 @@ def _smb_config_for_guest(shell: Any, domain: str):
     # Guest / null session: Kerberos requires a principal + ticket.
     # Force NTLM-anonymous so the posture plan's Kerberos-first policy
     # doesn't crash with empty credentials (NoneType.native).
+    # Split-DC/DNS (issue #15): resolve via the separate AD DNS server when set.
     return SMBConfig(
         target_ip=pdc_ip,
         target_hostname=pdc_hostname,
@@ -799,6 +805,7 @@ def _smb_config_for_guest(shell: Any, domain: str):
         password="",
         auth_domain=domain,
         use_kerberos=False,
+        dns_server=resolve_dns_server(domain_data),
         timeout=30,
     )
 

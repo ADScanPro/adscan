@@ -31985,6 +31985,15 @@ def add_ci_subparser(subparsers):
         "--dc-ip",
         help="PDC/DC IP (required for auth mode; optional for unauth to skip host discovery)",
     )
+    ci_parser.add_argument(
+        "--dns-server",
+        metavar="IP",
+        help=(
+            "Optional AD-zone DNS server IP for segmented networks where the DNS "
+            "server is a separate host from the DC. Feeds only the resolver; "
+            "--dc-ip stays the auth/enum target. Defaults to --dc-ip when omitted."
+        ),
+    )
     ci_parser.add_argument("--username", "-u", help="Username for auth mode")
     ci_parser.add_argument("--password", "-p", help="Password for auth mode")
     ci_parser.add_argument(
@@ -32730,6 +32739,7 @@ if __name__ == "__main__":
                 hosts=getattr(args, "hosts", None),
                 domain=getattr(args, "domain", None),
                 dc_ip=getattr(args, "dc_ip", None),
+                dns_server=getattr(args, "dns_server", None),
                 username=getattr(args, "username", None),
                 password=getattr(args, "password", None),
                 workspace=getattr(args, "workspace", None),

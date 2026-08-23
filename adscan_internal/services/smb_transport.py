@@ -188,6 +188,11 @@ class SMBConfig:
     explicit ``target_hostname`` is available. TCP still connects to
     ``target_ip`` via ``serverip=``.
     """
+    dns_server: str | None = None
+    """Split-DC/DNS (issue #15): a SEPARATE AD-zone DNS server for segmented
+    networks where DNS is a different host from the DC. Feeds only the SPN/PTR
+    DNS lookup in ``resolve_kerberos_tcp_target``; ``kdc_ip`` stays the DC. When
+    ``None`` the DC doubles as the resolver (legacy, byte-identical)."""
 
     def __post_init__(self) -> None:
         # Promote short Kerberos target hostnames to FQDN. Centralised so every
@@ -269,6 +274,7 @@ def _build_smb_url(config: SMBConfig) -> str:
             target_host=target_ip,
             spn_host=target_hostname or None,
             resolver_ip=config.kdc_ip or None,
+            dns_server=config.dns_server or None,
             domain=config.domain,
             ip_hostname_inventory=config.ip_hostname_inventory,
         )

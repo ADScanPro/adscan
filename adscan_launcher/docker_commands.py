@@ -3720,6 +3720,79 @@ def handle_start_docker(
         _release_runtime_acquisition(acq)
 
 
+def _build_ci_container_argv(
+    *,
+    mode: str,
+    workspace_type: str,
+    interface: str,
+    hosts: str | None,
+    domain: str | None,
+    dc_ip: str | None,
+    dns_server: str | None,
+    username: str | None,
+    password: str | None,
+    workspace: str | None,
+    verbose: bool,
+    debug: bool,
+    keep_workspace: bool,
+    generate_report: bool,
+    report_format: str,
+    report_engine: str = "",
+    report_renderer: str = "",
+    report_template: str = "",
+    report_theme: str = "",
+    report_only: str = "",
+) -> list[str]:
+    """Build the container ``adscan ci …`` argv forwarded across the docker seam.
+
+    Pure and side-effect-free so the forwarding is unit-testable (the docker
+    re-dispatch this feeds cannot be exercised without a running daemon). Split-
+    DC/DNS (issue #15): ``dns_server`` — when set — is forwarded as
+    ``--dns-server`` so the containerized ``ci`` run resolves against the separate
+    AD-zone DNS host while ``dc_ip`` stays the auth/enum target. ``None`` omits the
+    flag, byte-identical to before.
+    """
+    adscan_args: list[str] = ["ci", mode]
+    if debug:
+        adscan_args.append("--debug")
+    if verbose:
+        adscan_args.append("--verbose")
+    adscan_args.extend(["--type", workspace_type, "--interface", interface])
+
+    if hosts:
+        adscan_args.extend(["--hosts", hosts])
+    if domain:
+        adscan_args.extend(["--domain", domain])
+    if dc_ip:
+        adscan_args.extend(["--dc-ip", dc_ip])
+    # Split-DC/DNS (issue #15): optional separate AD-zone DNS server; feeds only
+    # the resolver, --dc-ip stays the auth/enum target. Absent -> omitted.
+    if dns_server:
+        adscan_args.extend(["--dns-server", dns_server])
+    if username:
+        adscan_args.extend(["--username", username])
+    if password:
+        adscan_args.extend(["--password", password])
+    if workspace:
+        adscan_args.extend(["--workspace", workspace])
+    if keep_workspace:
+        adscan_args.append("--keep-workspace")
+    if generate_report:
+        adscan_args.append("--generate-report")
+        adscan_args.extend(["--report-format", report_format])
+        if report_engine:
+            adscan_args.extend(["--report-engine", report_engine])
+        if report_renderer:
+            adscan_args.extend(["--report-renderer", report_renderer])
+        if report_template:
+            adscan_args.extend(["--report-template", report_template])
+        if report_theme:
+            adscan_args.extend(["--report-theme", report_theme])
+        if report_only:
+            adscan_args.extend(["--only", report_only])
+    return adscan_args
+
+
 def handle_ci_docker(
     *,
     mode: str,
@@ -3743,8 +3816,15 @@ def handle_ci_docker(
     report_only: str = "",
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
+    dns_server: str | None = None,
 ) -> int:
-    """Run `adscan ci` inside Docker and return the docker exit code."""
+    """Run `adscan ci` inside Docker and return the docker exit code.
+
+    Split-DC/DNS (issue #15): ``dns_server`` — when set — is forwarded as
+    ``--dns-server`` so the containerized ``ci`` run resolves against the separate
+    AD-zone DNS host while ``dc_ip`` stays the auth/enum target. ``None`` forwards
+    nothing, byte-identical to before.
+    """
     _emit_docker_runtime_context(command_name="ci")
     _emit_docker_host_resources_context(command_name="ci")
     if not _enforce_host_memory_gate(
@@ -3830,42 +3910,28 @@ def handle_ci_docker(
             run_host_dir=acq.session_dir,
         )
 
-        adscan_args: list[str] = []
-        adscan_args.append("ci")
-        adscan_args.append(mode)
-        if debug:
-            adscan_args.append("--debug")
-        if verbose:
-            adscan_args.append("--verbose")
-        adscan_args.extend(["--type", workspace_type, "--interface", interface])
-
-        if hosts:
-            adscan_args.extend(["--hosts", hosts])
-        if domain:
-            adscan_args.extend(["--domain", domain])
-        if dc_ip:
-            adscan_args.extend(["--dc-ip", dc_ip])
-        if username:
-            adscan_args.extend(["--username", username])
-        if password:
-            adscan_args.extend(["--password", password])
-        if workspace:
-            adscan_args.extend(["--workspace", workspace])
-        if keep_workspace:
-            adscan_args.append("--keep-workspace")
-        if generate_report:
-            adscan_args.append("--generate-report")
-            adscan_args.extend(["--report-format", report_format])
-            if report_engine:
-                adscan_args.extend(["--report-engine", report_engine])
-            if report_renderer:
-                adscan_args.extend(["--report-renderer", report_renderer])
-            if report_template:
-                adscan_args.extend(["--report-template", report_template])
-            if report_theme:
-                adscan_args.extend(["--report-theme", report_theme])
-            if report_only:
-                adscan_args.extend(["--only", report_only])
+        adscan_args = _build_ci_container_argv(
+            mode=mode,
+            workspace_type=workspace_type,
+            interface=interface,
+            hosts=hosts,
+            domain=domain,
+            dc_ip=dc_ip,
+            dns_server=dns_server,
+            username=username,
+            password=password,
+            workspace=workspace,
+            verbose=verbose,
+            debug=debug,
+            keep_workspace=keep_workspace,
+            generate_report=generate_report,
+            report_format=report_format,
+            report_engine=report_engine,
+            report_renderer=report_renderer,
+            report_template=report_template,
+            report_theme=report_theme,
+            report_only=report_only,
+        )
 
         probe_and_warn_reduced_runtime(cfg)
         cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)

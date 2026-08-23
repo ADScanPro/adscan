@@ -279,6 +279,31 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
         def _resolve_dc_hostname(trusted_domain: str, _resolver_ip: str) -> str | None:
             return partner_hostname_cache.get(trusted_domain.strip().lower())
 
+        def _resolve_dns_server_for_domain(source_domain: str) -> str | None:
+            # Split-DC/DNS (issue #15): the AD-zone DNS server configured for the
+            # source domain, used as the resolver for partner-realm SRV/A/PTR
+            # discovery instead of the source DC. ``None`` -> DC as resolver.
+            from adscan_internal.models.domain import (  # noqa: PLC0415
+                resolve_dns_server,
+            )
+
+            key = source_domain.strip().rstrip(".")
+            entry = shell.domains_data.get(key)
+            if not isinstance(entry, dict):
+                # Domains_data may key on a different case than the trust walk's
+                # normalized (lower-cased) domain name — match case-insensitively.
+                key_lower = key.lower()
+                entry = next(
+                    (
+                        v
+                        for k, v in shell.domains_data.items()
+                        if isinstance(v, dict)
+                        and str(k or "").strip().rstrip(".").lower() == key_lower
+                    ),
+                    None,
+                )
+            return resolve_dns_server(entry) if isinstance(entry, dict) else None
+
         def _check_trusted_domain_reachability(
             trusted_domain: str,
             trusted_pdc_ip: str,
@@ -324,6 +349,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
                 ),
                 resolve_pdc_ip=_resolve_pdc_ip,
                 resolve_dc_hostname=_resolve_dc_hostname,
+                resolve_dns_server_for_domain=_resolve_dns_server_for_domain,
                 check_domain_reachability=_check_trusted_domain_reachability,
                 progress_cb=live_view.on_event,
                 posture_sink=posture_sink,

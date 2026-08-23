@@ -37,17 +37,31 @@ from adscan_core.rich_output import print_exception
 
 @dataclass(frozen=True)
 class ADIDNSConfig:
-    """Connection config for AD-integrated DNS writes."""
+    """Connection config for AD-integrated DNS writes.
+
+    Attributes:
+        dns_server: Split-DC/DNS AD-zone DNS server (issue #15). When set it is
+            the resolver for the SOA-serial query, while ``dc_ip`` stays the LDAP
+            write target. ``None`` -> the DC doubles as the SOA resolver (legacy,
+            byte-identical). The A-record write itself is LDAP -> ``dc_ip`` and is
+            unaffected either way.
+    """
 
     dc_ip: str
     domain: str
     username: str
     password: str
     zone: str = ""  # defaults to domain if empty
+    dns_server: str | None = None
 
     @property
     def effective_zone(self) -> str:
         return self.zone or self.domain
+
+    @property
+    def soa_resolver_ip(self) -> str:
+        """Resolver for the SOA-serial query: the DNS server, else the DC."""
+        return str(self.dns_server or "").strip() or self.dc_ip
 
 
 @dataclass
@@ -126,7 +140,7 @@ def _add_a_record_sync(config: ADIDNSConfig, hostname: str, ip: str, ttl: int = 
     n_dn = _node_dn(hostname, zone, domain_dn)
     fqdn = f"{hostname}.{zone}"
 
-    serial = _get_soa_serial(zone, config.dc_ip)
+    serial = _get_soa_serial(zone, config.soa_resolver_ip)
     record_bytes = _build_dns_a_record(ip, serial=serial, ttl=ttl)
 
     with ADscanLDAPConnection(_ldap_cfg(config)) as conn:

@@ -185,6 +185,7 @@ class DoctorConfig:
 
     domain: Optional[str] = None
     dc_ip: Optional[str] = None
+    dns_server: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     workspace: Optional[str] = None
@@ -254,13 +255,16 @@ def _check_dns(report: DoctorReport, shell: Any, config: DoctorConfig) -> str:
         return ""
 
     entered_ip = (config.dc_ip or "").strip()
+    dns_server = (config.dns_server or "").strip() or None
     try:
         if entered_ip:
             effective_ip = _discover_pdc_from_entered_ip(
-                report, shell, domain=domain, entered_ip=entered_ip
+                report, shell, domain=domain, entered_ip=entered_ip, dns_server=dns_server
             )
         else:
-            effective_ip = _discover_pdc_without_ip(report, shell, domain=domain)
+            effective_ip = _discover_pdc_without_ip(
+                report, shell, domain=domain, dns_server=dns_server
+            )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -270,7 +274,12 @@ def _check_dns(report: DoctorReport, shell: Any, config: DoctorConfig) -> str:
 
 
 def _discover_pdc_from_entered_ip(
-    report: DoctorReport, shell: Any, *, domain: str, entered_ip: str
+    report: DoctorReport,
+    shell: Any,
+    *,
+    domain: str,
+    entered_ip: str,
+    dns_server: str | None = None,
 ) -> str:
     """Validate the entered DC IP and correct it to the real PDC if needed.
 
@@ -278,6 +287,11 @@ def _discover_pdc_from_entered_ip(
     preflight resolves the domain through the entered IP, probes its DC/KDC
     ports, and — when the entered IP is reachable but not the PDC — discovers
     the PDC and returns it. It never prompts.
+
+    Split-DC/DNS (issue #15): when ``dns_server`` is set the DNS SRV/A validation
+    targets that separate AD-zone DNS host instead of ``entered_ip`` (which stays
+    the DC/KDC connectivity target). ``None`` keeps the DC as the resolver,
+    byte-identical.
     """
     from adscan_internal.cli.dns import (  # noqa: PLC0415
         preflight_domain_pdc_noninteractive,
@@ -286,7 +300,11 @@ def _discover_pdc_from_entered_ip(
 
     marked_domain = mark_sensitive(domain, "domain")
     decision = preflight_domain_pdc_noninteractive(
-        shell, domain=domain, candidate_ip=entered_ip, mode_label="doctor"
+        shell,
+        domain=domain,
+        candidate_ip=entered_ip,
+        mode_label="doctor",
+        dns_server=dns_server,
     )
     pdc_ip = (getattr(decision, "pdc_ip", None) or "").strip()
     if decision.action != "use" or not pdc_ip:
@@ -324,26 +342,33 @@ def _discover_pdc_from_entered_ip(
     return pdc_ip
 
 
-def _discover_pdc_without_ip(report: DoctorReport, shell: Any, *, domain: str) -> str:
+def _discover_pdc_without_ip(
+    report: DoctorReport, shell: Any, *, domain: str, dns_server: str | None = None
+) -> str:
     """Locate the PDC for ``domain`` via the system resolver (no --dc-ip given).
 
     Reuses ``DNSDiscoveryService.find_pdc_with_selection`` against the first
     configured nameserver — the same service start_auth threads through. When no
     PDC SRV answer is obtained (DNS not configured for the realm) a ``fail`` row
     is recorded and downstream checks skip with a clear reason.
+
+    Split-DC/DNS (issue #15): when ``dns_server`` is set the PDC SRV lookup uses
+    that separate AD-zone DNS host as the resolver instead of the system
+    nameserver. ``None`` keeps the system resolver, byte-identical.
     """
     marked_domain = mark_sensitive(domain, "domain")
     service = shell._get_dns_discovery_service()  # noqa: SLF001
 
-    resolver_ip = ""
-    try:
-        nameservers = service._get_resolv_conf_nameservers(  # noqa: SLF001
-            include_loopback=True
-        )
-        resolver_ip = next((ns for ns in (nameservers or []) if ns), "")
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+    resolver_ip = (dns_server or "").strip()
+    if not resolver_ip:
+        try:
+            nameservers = service._get_resolv_conf_nameservers(  # noqa: SLF001
+                include_loopback=True
+            )
+            resolver_ip = next((ns for ns in (nameservers or []) if ns), "")
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     selected_ip = ""
     if resolver_ip:
@@ -438,10 +463,14 @@ def _ensure_dc_fqdn(shell: Any, domain: str, pdc_ip: str) -> None:
         from adscan_internal.cli.dns import (  # noqa: PLC0415
             resolve_pdc_hostname_best_effort,
         )
+        from adscan_internal.models.domain import resolve_dns_server  # noqa: PLC0415
         from adscan_internal.services._kerberos_spn import is_ip_address  # noqa: PLC0415
 
         hostname = resolve_pdc_hostname_best_effort(
-            shell, domain=domain, pdc_ip=pdc_ip
+            shell,
+            domain=domain,
+            pdc_ip=pdc_ip,
+            dns_server=resolve_dns_server(domain_data),
         )
         hostname = (hostname or "").strip().rstrip(".")
         # Never persist an IP as a hostname — that yields no real SPN FQDN.
@@ -915,6 +944,17 @@ def add_doctor_subparser(subparsers: Any) -> Any:
     )
     parser.add_argument("-d", "--domain", help="Target domain to validate.")
     parser.add_argument("--dc-ip", dest="dc_ip", help="PDC/DC IP for the target domain.")
+    parser.add_argument(
+        "--dns-server",
+        dest="dns_server",
+        metavar="IP",
+        help=(
+            "Optional AD-zone DNS server IP for segmented networks where DNS is "
+            "a separate host from the DC. The DNS validation queries this server; "
+            "--dc-ip stays the connectivity/auth target. Defaults to --dc-ip when "
+            "omitted."
+        ),
+    )
     parser.add_argument("-u", "--username", help="Auth username (enables the auth check).")
     parser.add_argument("-p", "--password", help="Auth password or hash.")
     parser.add_argument(
@@ -945,6 +985,7 @@ def config_from_args(args: Any) -> DoctorConfig:
     return DoctorConfig(
         domain=getattr(args, "domain", None),
         dc_ip=getattr(args, "dc_ip", None),
+        dns_server=getattr(args, "dns_server", None),
         username=getattr(args, "username", None),
         password=getattr(args, "password", None),
         workspace=getattr(args, "workspace", None),
@@ -986,6 +1027,20 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
         created = True
 
     telemetry.capture("doctor_start", properties={"has_domain": bool(config.domain)})
+
+    # Split-DC/DNS (issue #15): a separate AD-zone DNS server for segmented
+    # networks. Persist it session-wide and under the target domain (mirroring
+    # `ci`) so every resolver-update path — and the DNS validation below — points
+    # at the DNS host while --dc-ip stays the connectivity/auth target. When it is
+    # absent the DC resolves exactly as before (byte-identical).
+    _doctor_dns_server = (config.dns_server or "").strip()
+    if _doctor_dns_server:
+        shell._pending_dns_server = _doctor_dns_server  # noqa: SLF001
+        _doctor_dns_domain = (config.domain or "").strip()
+        if _doctor_dns_domain:
+            shell.domains_data.setdefault(_doctor_dns_domain, {})[
+                "dns_server"
+            ] = _doctor_dns_server
 
     report = DoctorReport()
     # Stream each check live to the web preflight ONLY on the --json path. The

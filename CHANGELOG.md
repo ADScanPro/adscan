@@ -6,6 +6,25 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+## [11.2.0] - 2026-08-21
+
+### Added
+
+- Optional `--dns-server` for segmented networks where the AD-zone DNS server is a separate host from the domain controller. It feeds name resolution only, and every resolution the scan needs follows it: domain and PDC-hostname discovery, host and CA names during SMB and ADCS enrollment, the Kerberos SPN lookup that keeps a scan on Kerberos instead of silently degrading to NTLM, cross-forest trust resolution, and the network-preflight DNS check. `--dc-ip` stays the authentication and enumeration target, and omitting `--dns-server` behaves exactly as before. Available on `adscan ci`, `adscan execute`, `adscan doctor`, the web connection check, and offered interactively when the DC does not answer DNS on port 53.
+- Range discovery now finds a separate DNS server on its own when a scan starts from a host range instead of a known domain. When the domain controller does not answer DNS on port 53 and the same sweep saw a host that serves DNS but is not itself a controller, `adscan start` offers that host as the pre-filled default for the DNS-server prompt, and an unattended scan adopts it automatically only when it is the single such host on the range and it actually resolves the domain zone. The controller stays the authentication and enumeration target; the detected host is used only to resolve names.
+
+### Fixed
+
+- A Force Change Password step against a user now runs unattended in a CTF scan as intended. A second, hidden confirmation still defaulted to skip, so an unattended CTF run reset nothing and reported the step as not executed. Consent is now a single confirmation, so a CTF scan resets the user and continues the path while an audit scan still requires an explicit operator opt-in. Resetting a computer or machine account password stays refused outright in every mode.
+
 ## [11.1.0] - 2026-08-10
 
 ### Added
@@ -445,7 +464,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v11.1.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v11.2.0...HEAD
+[11.2.0]: https://github.com/ADScanPro/adscan/compare/v11.1.0...v11.2.0
 [11.1.0]: https://github.com/ADScanPro/adscan/compare/v11.0.0...v11.1.0
 [11.0.0]: https://github.com/ADScanPro/adscan/compare/v10.1.0...v11.0.0
 [10.1.0]: https://github.com/ADScanPro/adscan/compare/v10.0.0...v10.1.0

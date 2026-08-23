@@ -138,6 +138,12 @@ CI_PASSTHROUGH = PassthroughCommand(
             "Domain controller IP. Required for auth mode; for unauth it skips host discovery.",
             metavar="IP",
         ),
+        PassthroughArg(
+            ("--dns-server",),
+            "AD-zone DNS server IP for segmented networks (separate from the DC). "
+            "Feeds only the resolver; defaults to --dc-ip when omitted.",
+            metavar="IP",
+        ),
         PassthroughArg(("--username", "-u"), "Username for auth mode.", metavar="USER"),
         PassthroughArg(("--password", "-p"), "Password or NT hash for auth mode.", metavar="SECRET"),
         PassthroughArg(("--workspace", "-w"), "Workspace name (random if omitted).", metavar="NAME"),
@@ -183,6 +189,8 @@ CI_PASSTHROUGH = PassthroughCommand(
         "adscan ci unauth --type audit --interface eth0 --dc-ip 10.0.0.1",
         "adscan ci auth --type audit --interface eth0 --domain corp.local "
         "--dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'",
+        "adscan ci auth --type audit --interface eth0 --domain corp.local "
+        "--dc-ip 10.0.0.1 --dns-server 10.0.0.53 -u alice -p 'S3cr3t!'",
     ),
 )
 
@@ -202,6 +210,12 @@ EXECUTE_PASSTHROUGH = PassthroughCommand(
         PassthroughArg(("--list",), "List the verbs available to `execute` and exit."),
         PassthroughArg(("--domain", "-d"), "Target domain.", metavar="DOMAIN"),
         PassthroughArg(("--dc-ip",), "Domain controller IP for the target domain.", metavar="IP"),
+        PassthroughArg(
+            ("--dns-server",),
+            "AD-zone DNS server IP for segmented networks (separate from the DC). "
+            "Feeds only the resolver; defaults to --dc-ip when omitted.",
+            metavar="IP",
+        ),
         PassthroughArg(("--username", "-u"), "Auth username (for verbs that authenticate).", metavar="USER"),
         PassthroughArg(("--password", "-p"), "Auth password or hash.", metavar="SECRET"),
         PassthroughArg(("--workspace", "-w"), "Named workspace to persist into (default: ephemeral).", metavar="NAME"),
@@ -212,6 +226,8 @@ EXECUTE_PASSTHROUGH = PassthroughCommand(
     examples=(
         "adscan execute --list",
         "adscan execute kerberoast -d corp.local --dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'",
+        "adscan execute kerberoast -d corp.local --dc-ip 10.0.0.1 --dns-server 10.0.0.53 "
+        "-u alice -p 'S3cr3t!'",
     ),
 )
 
@@ -224,6 +240,12 @@ DOCTOR_PASSTHROUGH = PassthroughCommand(
     args=(
         PassthroughArg(("--domain", "-d"), "Target domain to validate.", metavar="DOMAIN"),
         PassthroughArg(("--dc-ip",), "Domain controller IP for the target domain.", metavar="IP"),
+        PassthroughArg(
+            ("--dns-server",),
+            "AD-zone DNS server IP for segmented networks (separate from the DC). "
+            "The DNS check queries it; --dc-ip stays the connectivity target.",
+            metavar="IP",
+        ),
         PassthroughArg(("--username", "-u"), "Auth username (enables the auth check).", metavar="USER"),
         PassthroughArg(("--password", "-p"), "Auth password or hash.", metavar="SECRET"),
         PassthroughArg(("--workspace", "-w"), "Named workspace to use (default: ephemeral).", metavar="NAME"),
@@ -235,6 +257,7 @@ DOCTOR_PASSTHROUGH = PassthroughCommand(
     examples=(
         "adscan doctor -d corp.local --dc-ip 10.0.0.1",
         "adscan doctor -d corp.local --dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'",
+        "adscan doctor -d corp.local --dc-ip 10.0.0.1 --dns-server 10.0.0.53",
     ),
 )
 

@@ -20,7 +20,6 @@ from rich.text import Text
 from adscan_internal import print_info, print_warning, telemetry
 from adscan_internal.rich_output import (
     BRAND_COLORS,
-    confirm_ask,
     mark_sensitive,
     print_info_debug,
     print_panel,
@@ -1989,23 +1988,14 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 "Only continue if you are explicitly authorized to reset this credential during the engagement."
             ),
         )
-        # Consent default is mode-dependent (this point is reached only for a
-        # USER target — a computer/machine ForceChangePassword is hard-blocked
-        # above and never prompts). CTF: default ON, so an unattended ``adscan
-        # ci`` on a lab box resets the user and the path continues (a CTF target
-        # is disposable, and progressing the chain is the whole point). AUDIT:
-        # default OFF — resetting a real user's password is irreversible and
-        # disruptive, so it runs only on an explicit operator opt-in. The
-        # centralized helper auto-resolves to this default in non-interactive
-        # mode, so ``adscan ci`` / the web worker never hang: CTF auto-executes,
-        # audit auto-skips.
-        force_change_default = _is_ctf_mode(shell)
-        if not confirm_ask(
-            "Proceed with ForceChangePassword execution?",
-            default=force_change_default,
-        ):
-            print_warning("ForceChangePassword execution cancelled by operator.")
-            return False
+        # The consent gate lives in the ForceChangePassword choke point
+        # (``run_exploit_force_change_password`` in ``exploits.py``), which every
+        # entry point funnels through and which owns the mode-dependent default
+        # (CTF auto-executes, audit auto-skips) plus the computer hard-block. The
+        # panel above is the operator-facing context for that single gate; a
+        # second consent prompt here would be a redundant gate with its own drift
+        # risk (it once auto-skipped in CTF and cancelled a reset the choke point
+        # was about to auto-approve), so the decision is deferred to the SSOT.
         # Ledger-ordering fix: do NOT register a cleanup obligation before the
         # reset runs. A pre-registered "password_changed" entry left a FALSE
         # operator-required obligation when the reset later failed (the operator

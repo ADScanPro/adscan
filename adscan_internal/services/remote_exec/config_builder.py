@@ -28,6 +28,7 @@ def build_smb_config_from_credential(
     auth_domain: str | None = None,
     prefer_kerberos: bool = False,
     timeout: int = 30,
+    dns_server: str | None = None,
 ) -> SMBConfig:
     """Build an :class:`SMBConfig` from a single credential.
 
@@ -52,6 +53,10 @@ def build_smb_config_from_credential(
             or NT hash. AES keys and ccache paths always force Kerberos
             regardless of this flag.
         timeout: Connection timeout in seconds (default 30).
+        dns_server: Split-DC/DNS (issue #15) — a SEPARATE AD-zone DNS server
+            for segmented networks. When set, the target host A/PTR resolution
+            queries this server instead of the DC/KDC. ``None`` (default) keeps
+            the DC as the resolver, byte-identical to before.
 
     Returns:
         A fully-populated :class:`SMBConfig` ready to hand to
@@ -79,6 +84,7 @@ def build_smb_config_from_credential(
         auth_domain=(auth_domain or domain) or None,
         kdc_ip=kdc_ip or None,
         use_kerberos=use_kerberos,
+        dns_server=dns_server or None,
         timeout=int(timeout),
     )
 

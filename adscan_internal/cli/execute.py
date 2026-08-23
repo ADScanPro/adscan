@@ -203,6 +203,9 @@ class ExecuteConfig:
         passthrough: Remaining tokens forwarded verbatim to ``do_<verb>``.
         domain: Target domain (``-d/--domain``).
         dc_ip: DC / PDC IP (``--dc-ip``).
+        dns_server: Optional AD-zone DNS server IP (``--dns-server``) for
+            segmented networks where DNS is a separate host from the DC; feeds
+            only the resolver, ``dc_ip`` stays the auth/enum target.
         username: Auth username (``-u/--username``).
         password: Auth password / hash (``-p/--password``).
         workspace: Named workspace to persist into; ``None`` → ephemeral temp.
@@ -215,6 +218,7 @@ class ExecuteConfig:
     passthrough: tuple[str, ...] = ()
     domain: Optional[str] = None
     dc_ip: Optional[str] = None
+    dns_server: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     workspace: Optional[str] = None
@@ -536,6 +540,16 @@ def _establish_domain_context(shell: Any, config: ExecuteConfig) -> bool:
     if not domain:
         print_error("This verb needs a target domain. Pass -d/--domain.")
         return False
+
+    # Split-DC/DNS (issue #15): persist a separate AD-zone DNS server BEFORE
+    # do_check_dns so the resolver update targets it (dc_ip stays the DC).
+    dns_server = (config.dns_server or "").strip()
+    if dns_server:
+        shell._pending_dns_server = dns_server
+        try:
+            shell.domains_data.setdefault(domain, {})["dns_server"] = dns_server
+        except Exception:  # noqa: BLE001 — best-effort; the pending value still applies.
+            pass
 
     # DNS resolution + DC discovery. do_check_dns seeds domains_data[domain].
     if not shell.do_check_dns(domain, config.dc_ip):
@@ -922,6 +936,16 @@ def _add_execute_session_flags(parser: Any) -> None:
     )
     parser.add_argument("-d", "--domain", help="Target domain.")
     parser.add_argument("--dc-ip", dest="dc_ip", help="PDC/DC IP for the target domain.")
+    parser.add_argument(
+        "--dns-server",
+        dest="dns_server",
+        metavar="IP",
+        help=(
+            "Optional AD-zone DNS server IP for segmented networks where DNS is "
+            "a separate host from the DC. Feeds only the resolver; --dc-ip stays "
+            "the auth/enum target. Defaults to --dc-ip when omitted."
+        ),
+    )
     parser.add_argument("-u", "--username", help="Auth username (for verbs that authenticate).")
     parser.add_argument("-p", "--password", help="Auth password or hash.")
     parser.add_argument(
@@ -1012,6 +1036,7 @@ def config_from_args(args: Any) -> ExecuteConfig:
         passthrough=tuple(passthrough),
         domain=_pick("domain"),
         dc_ip=_pick("dc_ip"),
+        dns_server=_pick("dns_server"),
         username=_pick("username"),
         password=_pick("password"),
         workspace=_pick("workspace"),

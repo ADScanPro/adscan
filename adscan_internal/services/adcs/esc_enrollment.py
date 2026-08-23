@@ -57,6 +57,9 @@ def _request_cfg(
         target_domain=config.domain,
         auth_kdc_ip=config.auth_kdc,
         target_kdc_ip=config.dc_ip,
+        # Split-DC/DNS (issue #15): resolve the CA host via the separate AD DNS
+        # server when configured; None -> the DC resolves (byte-identical).
+        dns_server=config.dns_server,
         application_policies=application_policies,
         # Forward the workspace's fingerprinted lab provider so the cert
         # request failure panel can give lab-specific remediation hints

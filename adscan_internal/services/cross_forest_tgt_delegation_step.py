@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from adscan_core.rich_output import print_info, print_warning
-from adscan_internal.models.domain import resolve_dc_ip
+from adscan_internal.models.domain import resolve_dc_ip, resolve_dns_server
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.adidns import ADIDNSConfig
 from adscan_internal.services.credential_store_service import (
@@ -240,6 +240,11 @@ async def run_cross_org_tgt_delegation_step(
         domain=service_domain,
         username=writer_user,
         password=writer_secret,
+        # Split-DC/DNS (issue #15): the trusted forest may serve its AD zone from
+        # a separate DNS server; use it for the SOA-serial query. Absent -> DC.
+        dns_server=resolve_dns_server(
+            getattr(shell, "domains_data", {}).get(service_domain) or {}
+        ),
     )
     # The relay alias is prefixed with the trusted DC's short hostname so the
     # coerced trusting DC's Kerberos SPN canonicalization resolves it to the

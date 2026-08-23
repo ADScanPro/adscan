@@ -568,7 +568,7 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
     Without this the dump aborted with "Kerberos cannot use IP address as the
     service SPN host" against any lateral host reached only by IP.
     """
-    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.models.domain import resolve_dc_ip, resolve_dns_server
     from adscan_internal.services.domain_posture import get_posture
     from adscan_internal.services.kerberos_spn_resolution import (
         resolve_spn_or_decide_ntlm,
@@ -727,6 +727,10 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
         ccache_path=ccache_override,
         use_kerberos=use_kerberos,
         kdc_ip=kdc_ip,
+        # Split-DC/DNS (issue #15): resolve the target host FQDN/A-records via the
+        # separate AD DNS server when one is configured; None -> the DC resolves,
+        # byte-identical to before.
+        dns_server=resolve_dns_server(domains_data.get(domain) or {}),
         ip_hostname_inventory=inventory,
         posture_snapshot=posture_snapshot,
     )

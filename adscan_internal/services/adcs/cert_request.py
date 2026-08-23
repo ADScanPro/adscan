@@ -691,6 +691,11 @@ class CertRequestConfig:
     target_kdc_ip: Optional[str] = None
     application_policies: Optional[list[str]] = None
     ip_hostname_inventory: Optional[dict[str, list[str]]] = None
+    # Split-DC/DNS (issue #15): a SEPARATE AD-zone DNS server for segmented
+    # networks. When set, the CA-host A/PTR resolution queries this server
+    # instead of the DC/KDC (``resolver_ip``). ``None`` -> the DC resolves,
+    # byte-identical to before.
+    dns_server: Optional[str] = None
     # NTLM-to-IP direct connection (centralized host→IP resolver, layer g/b/c).
     # When ``connect_ip`` is set and ``force_ntlm`` is True the enrollment
     # connects straight to that IP over an authenticated NTLM session — no DNS,
@@ -889,6 +894,7 @@ def _build_smb_url(config: CertRequestConfig) -> str:
         target_host=config.ca_host,
         spn_host=_resolve_ca_hostname(config),
         resolver_ip=config.effective_target_kdc_ip or config.effective_auth_kdc_ip,
+        dns_server=config.dns_server or None,
         domain=config.effective_target_domain,
         ip_hostname_inventory=config.ip_hostname_inventory,
     )
@@ -1186,6 +1192,7 @@ async def _connect_icpr(config: CertRequestConfig):
             target_host=config.ca_host,
             spn_host=_resolve_ca_hostname(config),
             resolver_ip=config.effective_target_kdc_ip or config.effective_auth_kdc_ip,
+            dns_server=config.dns_server or None,
         )
         connect_host = endpoint.tcp_host or su.get_target().get_hostname_or_ip()
 

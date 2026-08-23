@@ -66,6 +66,7 @@ from adscan_internal.cli.dns import (
     preflight_domain_pdc,
     prompt_known_domain_and_pdc_interactive,
 )
+from adscan_internal.models.domain import resolve_dns_server
 from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.cli.host_file_picker import (
     is_full_container_runtime,
@@ -1617,6 +1618,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
             interactive=interactive_mode,
             target_ip=known_pdc_ip,
             require_dc_ports=True,
+            domain=known_domain or domain,
         ):
             return False
     else:
@@ -1626,6 +1628,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
             interface=getattr(shell, "interface", None),
             interactive=interactive_mode,
             hosts_expression=str(target),
+            domain=known_domain or domain,
         ):
             return False
 
@@ -2144,6 +2147,7 @@ def _maybe_offer_interface_switch_on_route_mismatch(
     hosts_expression: str | None,
     require_dc_ports: bool,
     interactive: bool,
+    domain: str | None = None,
 ) -> bool | None:
     """Offer to switch to the interface that actually routes to the target.
 
@@ -2276,6 +2280,7 @@ def _maybe_offer_interface_switch_on_route_mismatch(
         target_ip=target_ip,
         hosts_expression=hosts_expression,
         require_dc_ports=require_dc_ports,
+        domain=domain,
     )
 
 
@@ -2379,8 +2384,16 @@ def _run_start_network_preflight(
     target_ip: str | None = None,
     hosts_expression: str | None = None,
     require_dc_ports: bool = False,
+    domain: str | None = None,
 ) -> bool:
-    """Validate local interface/routing reachability before starting scans."""
+    """Validate local interface/routing reachability before starting scans.
+
+    Split-DC/DNS (issue #15): when ``domain`` is set and a separate ``dns_server``
+    is configured for it, the TCP/53 reachability check targets that DNS server
+    instead of the DC/PDC — in a segmented network the DC legitimately serves no
+    DNS, so probing 53 on it would raise a false warning. With no ``dns_server``
+    the DC is probed for 53 exactly as before (byte-identical).
+    """
     checks: list[_NetworkPreflightCheck] = []
     iface = (interface or "").strip()
 
@@ -2480,7 +2493,45 @@ def _run_start_network_preflight(
                     detail=f"Reachable ports on {marked_target}: {', '.join(str(p) for p in open_ports)}.",
                 )
             )
-            if 53 not in open_ports:
+            # Split-DC/DNS (issue #15): a separate DNS server serves the AD zone,
+            # so probe TCP/53 on the DNS server, not the DC (which serves no DNS
+            # and would otherwise raise a false warning). Absent -> the DC's own
+            # 53 result is used, byte-identical to before.
+            dns_server = (
+                resolve_dns_server(shell.domains_data.get(domain, {}))
+                if domain and getattr(shell, "domains_data", None)
+                else None
+            )
+            if dns_server:
+                dns_reachability = assess_target_reachability(
+                    shell,
+                    target_ip=dns_server,
+                    expected_interface=iface or None,
+                    tcp_ports=(53,),
+                    timeout_seconds=DC_REACHABILITY_TIMEOUT_SECONDS,
+                )
+                marked_dns = mark_sensitive(dns_server, "ip")
+                if 53 in dns_reachability.open_ports:
+                    checks.append(
+                        _NetworkPreflightCheck(
+                            name="DNS reachability",
+                            status="ok",
+                            detail=f"DNS reachability on {marked_dns}: TCP 53 is reachable.",
+                        )
+                    )
+                else:
+                    checks.append(
+                        _NetworkPreflightCheck(
+                            name="DNS reachability",
+                            status="warn",
+                            detail=(
+                                f"DNS reachability on {marked_dns}: TCP 53 is not reachable. "
+                                "DNS validation may fail."
+                            ),
+                            suggestion="Ensure the DNS server for this domain is reachable from this host.",
+                        )
+                    )
+            elif 53 not in open_ports:
                 checks.append(
                     _NetworkPreflightCheck(
                         name="DNS reachability",
@@ -2536,6 +2587,7 @@ def _run_start_network_preflight(
             hosts_expression=hosts_expression,
             require_dc_ports=require_dc_ports,
             interactive=interactive,
+            domain=domain,
         )
         if switched is not None:
             # Interface was switched and the route check re-ran with it.
@@ -4129,6 +4181,7 @@ def _start_auth_with_params(
         interactive=interactive_mode,
         target_ip=pdc_ip,
         require_dc_ports=True,
+        domain=domain,
     ):
         return False
 

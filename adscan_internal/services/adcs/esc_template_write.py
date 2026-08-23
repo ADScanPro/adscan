@@ -121,6 +121,7 @@ async def run_esc4(config: EscConfig) -> EscResult:
             password=config.effective_secret,
             upn=config.target_upn,
             ca_fqdn=config.ca_fqdn,
+            dns_server=config.dns_server,
             ledger_shell=config.shell,
             ledger_domain=config.domain,
             ledger_technique="ADCSESC4 — certificate enrollment on the mutated template",

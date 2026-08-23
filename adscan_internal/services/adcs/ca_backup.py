@@ -93,6 +93,11 @@ class CABackupConfig:
     temp_dir: str = _DEFAULT_TEMP_DIR
     timeout_s: int = 60
     ip_hostname_inventory: Optional[dict[str, list[str]]] = None
+    # Split-DC/DNS (issue #15): a SEPARATE AD-zone DNS server for segmented
+    # networks. When set, the CA-host A/PTR resolution queries this server
+    # instead of the DC/KDC (``kdc_ip``). ``None`` -> the DC resolves,
+    # byte-identical to before.
+    dns_server: Optional[str] = None
     # Path to a .ccache holding a ready-to-use TGS/TGT for the CA host. When set
     # it takes precedence over password/nt_hash and drives a
     # ``smb+kerberos-ccache`` bind. Populated automatically by the S4U2Self
@@ -182,6 +187,7 @@ def _build_smb_url(config: CABackupConfig) -> str:
         target_host=config.target_host,
         spn_host=_resolve_target_fqdn(config),
         resolver_ip=config.kdc_ip or None,
+        dns_server=config.dns_server or None,
         domain=config.domain,
         ip_hostname_inventory=config.ip_hostname_inventory,
     )

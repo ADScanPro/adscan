@@ -104,6 +104,7 @@ def resolve_spn_or_decide_ntlm(
     domains_data: dict | None = None,
     ip_hostname_inventory: dict | None = None,
     resolver_ip: str | None = None,
+    dns_server: str | None = None,
     posture_snapshot: Any | None = None,
     is_dc_target: bool = False,
 ) -> SpnResolution:
@@ -113,11 +114,20 @@ def resolve_spn_or_decide_ntlm(
         target_host: The IP or hostname the operation targets.
         domain: The target domain (used to promote short labels and pick the
             domain-suffixed hostname candidate).
-        domains_data: Full ``shell.domains_data`` (only consulted for a DC
-            target, to walk the ``resolve_dc_fqdn`` alias chain).
+        domains_data: Full ``shell.domains_data`` (consulted for a DC target, to
+            walk the ``resolve_dc_fqdn`` alias chain, AND — for any IP target — to
+            read the split-DC/DNS server via ``resolve_dns_server`` so the live
+            PTR that recovers the SPN FQDN queries the AD-zone DNS server, not the
+            DC, on a segmented network).
         ip_hostname_inventory: ``{ip: [hostname, …]}`` workspace map (massdns /
             reachability), loaded via ``load_workspace_ip_hostname_inventory``.
-        resolver_ip: KDC IP, passed to the TCP-target resolver for live PTR.
+        resolver_ip: KDC IP, passed to the TCP-target resolver for the multi-homed
+            A-record preference and as the DNS resolver when no ``dns_server`` is
+            configured.
+        dns_server: Explicit split-DC/DNS AD-zone DNS server (issue #15). When
+            ``None`` it is read from ``domains_data[domain]["dns_server"]`` via
+            :func:`resolve_dns_server`; still ``None`` -> the DC (``resolver_ip``)
+            doubles as the resolver (legacy, byte-identical).
         posture_snapshot: ``get_posture(domains_data, domain=domain)`` result.
         is_dc_target: ``True`` when the target is the domain's DC (enables the
             ``resolve_dc_fqdn`` alias chain in addition to the generic resolver).
@@ -128,6 +138,18 @@ def resolve_spn_or_decide_ntlm(
         ``ntlm_fallback_ok`` is ``True`` (and surface an error when not).
     """
     fallback_ok = not ntlm_disabled_high(posture_snapshot)
+
+    # Split-DC/DNS resolver (issue #15): an explicit argument wins; otherwise read
+    # the persisted AD-zone DNS server from domains_data. ``None`` when neither is
+    # present -> the DC doubles as the DNS resolver (byte-identical to legacy).
+    effective_dns_server = str(dns_server or "").strip() or None
+    if effective_dns_server is None and isinstance(domains_data, dict) and domain:
+        try:
+            from adscan_internal.models.domain import resolve_dns_server
+
+            effective_dns_server = resolve_dns_server(domains_data.get(domain) or {})
+        except Exception:  # noqa: BLE001 - resolver read is best-effort
+            effective_dns_server = None
     cleaned = str(target_host or "").strip().rstrip(".")
 
     if not cleaned:
@@ -186,6 +208,7 @@ def resolve_spn_or_decide_ntlm(
                 target_host=cleaned,
                 spn_host=None,
                 resolver_ip=resolver_ip or None,
+                dns_server=effective_dns_server,
                 domain=domain,
                 ip_hostname_inventory=ip_hostname_inventory,
             )
