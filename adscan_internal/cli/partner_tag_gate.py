@@ -209,13 +209,7 @@ def ensure_partner_tag_for_pro(license_mode: object) -> bool:
         # bind-mounted state dir, and ADSCAN_PARTNER_TAG is in the launcher's
         # env allow-list. Never instruct the operator to set a variable the
         # launcher does not forward (locked by a contract test).
-        print_error(
-            "ADscan PRO requires a partner tag. Re-run with --partner-tag and "
-            "the tag from your onboarding email, for example: "
-            "adscan ci --partner-tag acme-mssp. ADscan saves it on this "
-            "machine, so you only pass it once. Exporting ADSCAN_PARTNER_TAG "
-            "before the run works too."
-        )
+        print_error(telemetry.PARTNER_TAG_REQUIRED_MESSAGE)
         print_info_debug(
             "Partner-tag gate refused PRO start in non-interactive mode: "
             "no ADSCAN_PARTNER_TAG and no persisted partner.json."

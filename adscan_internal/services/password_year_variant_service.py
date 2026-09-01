@@ -210,6 +210,29 @@ def epoch_seconds_to_year(value: object) -> int | None:
         return None
 
 
+def epoch_seconds_to_year_month(value: object) -> tuple[int, int] | None:
+    """Convert a ``pwdlastset`` epoch-second value to a UTC ``(year, month)``.
+
+    Args:
+        value: Raw value from BloodHound / the user inventory.
+
+    Returns:
+        ``(year, month)`` with ``month`` in 1..12, or ``None`` when the value is
+        not usable.
+    """
+    try:
+        epoch_seconds = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if epoch_seconds <= 0:
+        return None
+    try:
+        moment = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+    return moment.year, moment.month
+
+
 def resolve_bloodhound_pwdlastset_year(
     shell: Any,
     *,

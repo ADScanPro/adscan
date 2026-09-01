@@ -229,6 +229,7 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "CrackNTLMv1",
         "PoisonCaptureNtlmv2Crack",
         "CrossOrgTgtDelegation",
+        "RaiseChild",
     }
 )
 

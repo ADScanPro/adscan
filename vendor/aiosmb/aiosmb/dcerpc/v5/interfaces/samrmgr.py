@@ -292,7 +292,46 @@ class SAMRRPC:
 					user_sid = '%s-%s' % (self.domain_handles[domain_handle], user['RelativeId'])
 					yield user['Name'], user_sid, None
 
-				enumerationContext = resp['EnumerationContext'] 
+				enumerationContext = resp['EnumerationContext']
+				status = NTStatus(resp['ErrorCode'])
+		except Exception as e:
+			yield None, None, e
+
+	async def list_domain_all_principals(self, domain_handle):
+		"""Enumerate ALL account types in the domain, not just normal user accounts.
+
+		``list_domain_users`` filters on ``USER_NORMAL_ACCOUNT`` (0x10) and so
+		EXCLUDES machine accounts (workstations, DCs) and trust accounts. That is
+		correct for user-enumeration surfaces, but WRONG for a DCSync full
+		replication walk, which must replicate machine-account and trust-account
+		keys too (a downstream step needing a machine-account key — S4U2Self,
+		RBCD, silver, shadow-creds, cross-org TGT delegation — otherwise has no
+		key to work with). This mirrors impacket's secretsdump DRSUAPI dump, which
+		enumerates with the combined mask NORMAL | WORKSTATION_TRUST |
+		SERVER_TRUST | INTERDOMAIN_TRUST.
+		"""
+		try:
+			user_type = (
+				samr.USER_NORMAL_ACCOUNT
+				| samr.USER_WORKSTATION_TRUST_ACCOUNT
+				| samr.USER_SERVER_TRUST_ACCOUNT
+				| samr.USER_INTERDOMAIN_TRUST_ACCOUNT
+			)
+			status = NTStatus.MORE_ENTRIES
+			enumerationContext = 0
+			while status == NTStatus.MORE_ENTRIES:
+				resp, err = await samr.hSamrEnumerateUsersInDomain(self.dce, domain_handle, user_type, enumerationContext=enumerationContext)
+				if err is not None:
+					if err.error_code != NTStatus.MORE_ENTRIES.value:
+						raise err
+						return
+					resp = err.get_packet()
+
+				for user in resp['Buffer']['Buffer']:
+					user_sid = '%s-%s' % (self.domain_handles[domain_handle], user['RelativeId'])
+					yield user['Name'], user_sid, None
+
+				enumerationContext = resp['EnumerationContext']
 				status = NTStatus(resp['ErrorCode'])
 		except Exception as e:
 			yield None, None, e

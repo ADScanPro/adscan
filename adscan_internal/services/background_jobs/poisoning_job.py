@@ -192,6 +192,29 @@ def _handle_capture_to_sink(runtime: "PoisoningJobRuntime", item: dict) -> None:
 
     runtime.captured += 1
 
+    # Telemetry: RESULT of the capture (responder/poisoning were bare command
+    # events with no yield). Cumulative counts + enums only; no secret leaves.
+    # NOTE: the capture arrives over the shared :445 SMB listener regardless of
+    # which broadcast spoofer (LLMNR / NBT-NS / mDNS) lured the victim — the lure
+    # protocol is not distinguished at this seam — so ``protocol`` reflects the
+    # capture channel (SMB). Emitted per capture with the running totals so the
+    # last event of a session carries the full yield.
+    try:
+        from adscan_internal.services.unauth_funnel_telemetry import (  # noqa: PLC0415
+            PROTOCOL_SMB,
+            emit_poisoning_capture,
+        )
+
+        emit_poisoning_capture(
+            shell,
+            hashes_captured=runtime.captured,
+            unique_accounts=len(runtime.processed_users),
+            protocol=PROTOCOL_SMB,
+            version=version,
+        )
+    except Exception as _poison_tel_exc:  # noqa: BLE001
+        telemetry.capture_exception(_poison_tel_exc)
+
     marked_user = mark_sensitive(user, "user")
     marked_domain = mark_sensitive(domain, "domain")
     summary = f"Poisoning captured a NetNTLM{version} response for {marked_user}@{marked_domain}"

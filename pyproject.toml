@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "11.2.0"
+version = "11.3.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -148,7 +148,7 @@ cli = [
 ]
 
 [project.urls]
-homepage = "https://github.com/ADscanPro/adscan"
+homepage = "https://adscanpro.com"
 documentation = "https://adscanpro.com/docs"
 repository = "https://github.com/ADscanPro/adscan"
 issues = "https://github.com/ADscanPro/adscan/issues"

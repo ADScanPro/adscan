@@ -25,14 +25,8 @@ from adscan_internal.rich_output import (
 from rich.text import Text
 
 
-# SECRET_MODE is a global flag that controls whether internal implementation
-# details are shown. It is set in adscan.py during initialization.
-# CLI modules should import this from here instead of adscan.py.
-# This will be initialized by adscan.py on startup.
 import os
 from adscan_core.rich_output import print_exception
-
-SECRET_MODE: bool = os.getenv("ADSCAN_SECRET_MODE") == "1"  # pylint: disable=invalid-name
 
 _WORKSPACE_ONBOARDING_KEY = "workspace_onboarding"
 _WORKSPACE_SCAN_STARTED_KEY = "start_scan_completed"
@@ -179,6 +173,43 @@ _COMMAND_INITIALIZER_RECOMMENDATIONS: dict[str, str] = {
 }
 
 
+def compute_workspace_id_hash(shell: Any) -> str | None:
+    """Return the stable per-(install, workspace) correlation id, or ``None``.
+
+    SSOT for the telemetry ``workspace_id_hash``: a truncated SHA-256 of
+    ``"{TELEMETRY_ID}:{current_workspace}"``. ``TELEMETRY_ID`` is the stable
+    per-install pseudonym, so the digest is stable for the life of one workspace
+    on one install and never reveals the workspace name. Returns ``None`` when no
+    workspace is bound to the shell yet (nothing to correlate on).
+    """
+    workspace = getattr(shell, "current_workspace", None)
+    if not workspace:
+        return None
+    workspace_unique_id = f"{TELEMETRY_ID}:{workspace}"
+    return hashlib.sha256(workspace_unique_id.encode()).hexdigest()[:12]
+
+
+def build_workspace_attribution_fields(shell: Any) -> dict[str, Any]:
+    """Return ``{workspace_type, workspace_id_hash}`` for cross-event attribution.
+
+    The single correlation key the unauth->credential funnel events share so a
+    credential can be attributed back to the unauth session that produced it, and
+    the funnel can be segmented by ``workspace_type`` (audit vs ctf/lab). Both
+    values are derived from the SSOT helpers (``build_workspace_telemetry_fields``
+    normalizes ``shell.type``; :func:`compute_workspace_id_hash` builds the id),
+    so they join cleanly with the ``workspace_id_hash`` already carried by
+    ``start_unauth``. Missing pieces are simply omitted — never guessed.
+    """
+    fields: dict[str, Any] = {}
+    fields.update(
+        build_workspace_telemetry_fields(workspace_type=getattr(shell, "type", None))
+    )
+    workspace_id_hash = compute_workspace_id_hash(shell)
+    if workspace_id_hash:
+        fields["workspace_id_hash"] = workspace_id_hash
+    return fields
+
+
 def build_telemetry_context(
     *,
     shell: Any,
@@ -201,15 +232,7 @@ def build_telemetry_context(
     """
     telemetry_context: dict[str, Any] = {}
 
-    if getattr(shell, "current_workspace", None):
-        workspace_unique_id = f"{TELEMETRY_ID}:{shell.current_workspace}"
-        telemetry_context["workspace_id_hash"] = hashlib.sha256(
-            workspace_unique_id.encode()
-        ).hexdigest()[:12]
-
-    telemetry_context.update(
-        build_workspace_telemetry_fields(workspace_type=getattr(shell, "type", None))
-    )
+    telemetry_context.update(build_workspace_attribution_fields(shell))
 
     telemetry_context.update(build_lab_event_fields(shell=shell, include_slug=False))
 

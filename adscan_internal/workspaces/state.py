@@ -8,6 +8,7 @@ from adscan_core.telemetry_preference import (
     load_global_preference,
     resolve_effective_telemetry,
 )
+from adscan_internal.models.domain import CaseInsensitiveDict
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +337,7 @@ def apply_workspace_variables_to_shell(
         "current_workspace_dir": None,
         "current_domain": None,
         "current_domain_dir": None,
-        "domains_data": {},
+        "domains_data": CaseInsensitiveDict(),
         "domain_connectivity": {},
         "auto": False,
         # Handled out of band by ``_apply_telemetry_preference_to_shell`` below;
@@ -357,7 +358,14 @@ def apply_workspace_variables_to_shell(
         if key == "telemetry":
             continue
         if key in variables:
-            setattr(shell, key, variables.get(key))
+            value = variables.get(key)
+            # ``domains_data`` is the case-insensitive SSOT, but ``json.load``
+            # returns a plain ``dict``. Re-wrap it here (the load seam) so the
+            # reloaded map resolves keys regardless of case — otherwise every
+            # workspace load silently reverts the shell to a plain ``dict``.
+            if key == "domains_data" and not isinstance(value, CaseInsensitiveDict):
+                value = CaseInsensitiveDict(value or {})
+            setattr(shell, key, value)
         elif reset_missing_to_defaults:
             setattr(shell, key, default)
 

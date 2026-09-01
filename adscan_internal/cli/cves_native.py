@@ -64,6 +64,7 @@ from adscan_internal.services.cve_scanner.ux.report import (
 )
 from adscan_internal.services.cve_scanner.ux.scan_log import ScanLogWriter
 from adscan_internal import get_console
+from adscan_internal.cli.common import set_active_domain
 from adscan_internal.models.domain import resolve_dc_fqdn, resolve_dc_ip
 from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.ldap_transport_service import (
@@ -105,6 +106,23 @@ _SUMMARY_SEVERITY_STYLE: dict[Severity, str] = {
 }
 
 
+def _resolve_known_domain(shell: Any, token: str) -> str | None:
+    """Return the loaded domain matching ``token`` (case-insensitive), else None.
+
+    Lets ``cves <domain>`` be recognized as a scan target rather than an unknown
+    subcommand — the token must match an ACTUAL loaded domain in ``domains_data``,
+    so a genuine typo still falls through to the usage message.
+    """
+    candidate = str(token or "").strip()
+    if not candidate:
+        return None
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    for known in domains_data:
+        if str(known).casefold() == candidate.casefold():
+            return str(known)
+    return None
+
+
 def dispatch(shell: Any, args: str) -> None:
     """Entry point called from the shell ``do_cves`` handler."""
 
@@ -112,8 +130,8 @@ def dispatch(shell: Any, args: str) -> None:
     if not tokens:
         print_info(_USAGE)
         return
-    sub, *rest = tokens
-    sub = sub.lower()
+    raw_sub, *rest = tokens
+    sub = raw_sub.lower()
     try:
         if sub == "scan":
             _run_scan(shell, rest)
@@ -121,8 +139,17 @@ def dispatch(shell: Any, args: str) -> None:
             _run_list()
         elif sub == "report":
             _run_report(shell)
+        elif _resolve_known_domain(shell, raw_sub) is not None:
+            # ``cves <domain>`` — the operator typed a loaded domain where a
+            # subcommand is expected (the muscle-memory shape every other
+            # exploration verb accepts: ``enum <domain>``, ``shares <domain>``).
+            # Treat it as ``cves scan`` scoped to that domain rather than
+            # rejecting it as an unknown subcommand.
+            domain = _resolve_known_domain(shell, raw_sub)
+            set_active_domain(shell, domain)
+            _run_scan(shell, rest)
         else:
-            print_warning(f"Unknown subcommand {sub!r}.")
+            print_warning(f"Unknown subcommand {raw_sub!r}.")
             print_info(_USAGE)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -283,6 +310,13 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
             "coercion checks will surface as errors. Pass --listener <ip>."
         )
 
+    # Workspace state the authenticated checks need to resolve a DC's FQDN
+    # through the canonical SSOTs (build_ldap_config_for_domain / resolve_dc_fqdn)
+    # instead of handing the transport a bare IP — which degrades the Kerberos
+    # SPN to ldap/<ip> or cifs/<ip> and draws SEC_E_LOGON_DENIED from the DC.
+    domains_data = dict(getattr(shell, "domains_data", {}) or {})
+    ip_hostname_inventory = _load_ip_hostname_inventory(shell, domain)
+
     ctx = ScanContext(
         workspace_dir=Path(workspace_dir),
         domain=domain,
@@ -290,6 +324,8 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
         smb_connection_factory=smb_factory,
         ldap_factory=ldap_factory,
         event_bus=event_bus,
+        domains_data=domains_data,
+        ip_hostname_inventory=ip_hostname_inventory,
         extras={"scan_id": scan_id, "dc_ip": dc_ip},
     )
 
@@ -647,8 +683,17 @@ def _load_targets(
         host = raw.strip()
         if not host or host.startswith("#"):
             continue
-        is_dc = force_dc or _target_is_dc(host, domain, dc_tokens)
-        out.append(ScanTarget(host=host, is_dc=is_dc))
+        # Resolve the domain the host actually belongs to (may differ from the
+        # scan's --domain in a multi-forest audit) so the cross-forest scope
+        # gate can skip a foreign DC the credential cannot cover.
+        if shell is not None:
+            target_domain, matched_foreign_dc = _resolve_target_domain(
+                shell, host, domain
+            )
+        else:
+            target_domain, matched_foreign_dc = domain, False
+        is_dc = force_dc or matched_foreign_dc or _target_is_dc(host, domain, dc_tokens)
+        out.append(ScanTarget(host=host, is_dc=is_dc, domain=target_domain))
     return tuple(out)
 
 
@@ -657,6 +702,65 @@ def _workspace_dir(shell: Any) -> Path | None:
     if not workspace:
         return None
     return Path(workspace)
+
+
+def _load_ip_hostname_inventory(shell: Any, domain: str | None) -> dict[str, list[str]]:
+    """Load the persisted IP → hostname inventory for ``domain``, once.
+
+    Best-effort (empty on any failure). Loaded at this seam — which has the
+    workspace paths — and passed down through ``ScanContext`` so the checks
+    never re-load it per host.
+    """
+    if not domain:
+        return {}
+    from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+        load_workspace_ip_hostname_inventory,
+    )
+
+    try:
+        workspace_dir = (
+            shell._get_workspace_cwd()  # noqa: SLF001
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", "")
+        ) or ""
+        domains_dir = getattr(shell, "domains_dir", "domains") or "domains"
+        return (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=str(workspace_dir),
+                domains_dir=str(domains_dir),
+                domain=domain,
+            )
+            or {}
+        )
+    except Exception as exc:  # noqa: BLE001 — inventory is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return {}
+
+
+def _resolve_target_domain(
+    shell: Any, host: str, default_domain: str | None
+) -> tuple[str | None, bool]:
+    """Resolve the AD domain a target host actually belongs to.
+
+    Walks ``domains_data`` and matches the host against each domain's known DC
+    identities (IP / FQDN / short label). When the host matches a DC of some
+    domain, that domain wins — this is how a foreign-forest DC gets its OWN
+    domain (not the scan's ``--domain``), which the cross-forest scope gate
+    needs to decide the credential cannot cover it.
+
+    Returns ``(domain, matched_a_dc)``. ``matched_a_dc`` is ``True`` when the
+    host is a known DC of some domain (used to flag foreign DCs as DCs too).
+    Falls back to ``default_domain`` (``matched_a_dc=False``) when the host is
+    not a known DC of any domain (member host, or a DC not yet enumerated),
+    keeping the gate conservative — an undetermined foreign domain still runs.
+    """
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    for candidate_domain in domains_data:
+        dc_tokens = _resolve_known_dc_identities(shell, candidate_domain)
+        if _target_is_dc(host, candidate_domain, dc_tokens):
+            return candidate_domain, True
+    return default_domain, False
 
 
 def _masked_creds(shell: Any, domain: str | None) -> str:

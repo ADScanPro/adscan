@@ -79,8 +79,74 @@ class DCERPCSessionError(DCERPCException):
         return 'CSRA SessionError: unknown error code: 0x%x' % self.error_code
 
 
+def _dcerpc_error_code(err) -> int | None:
+    """Best-effort recover the numeric fault / NT-status code from a DCE-RPC error.
+
+    The DCE-RPC / DCOM error objects (``DCERPCException`` and its subclasses,
+    including this module's ``DCERPCSessionError``) carry the fault code on
+    ``error_code`` and expose ``get_error_code()``. A plain transport exception
+    carries neither. Returns the code as an ``int`` when available, else ``None``.
+    """
+    if err is None:
+        return None
+    code = getattr(err, 'error_code', None)
+    if code is None:
+        getter = getattr(err, 'get_error_code', None)
+        if callable(getter):
+            try:
+                code = getter()
+            except Exception:
+                code = None
+    if isinstance(code, int):
+        return code
+    return None
+
+
+def _describe_dcerpc_error(err) -> str:
+    """Return a NON-EMPTY, human-usable description of a DCE-RPC / DCOM error.
+
+    The inner DCE-RPC error for some DCOM faults stringifies to an EMPTY string
+    (e.g. a session-error subclass built with ``error_code=None`` even raises in
+    its own ``__str__``), which produced the ``... failed for <CA>:`` bare-colon
+    message with no cause. This guarantees a cause token: the fault/NT-status
+    code when the error carries one (``0x...``), otherwise the string form, and
+    ``repr(err)`` as the final fallback — so the wrapper message is never empty
+    and always classifiable by code.
+    """
+    code = _dcerpc_error_code(err)
+    text = ''
+    try:
+        text = str(err)
+    except Exception:
+        # A malformed error object whose __str__ raises (e.g. error_code=None in
+        # a %x format). Fall back to repr / the recovered code below.
+        text = ''
+    text = (text or '').strip()
+    if code is not None:
+        code_token = f'0x{code & 0xffffffff:08x}'
+        if text and code_token.lower() not in text.lower():
+            return f'{text} ({code_token})'
+        if text:
+            return text
+        return code_token
+    if text:
+        return text
+    return repr(err)
+
+
 class CertAdminSecurityError(Exception):
-    """Raised when ICertAdminD2::GetCASecurity fails at the DCERPC layer."""
+    """Raised when an ICertAdminD2 / ICertAdminD call fails at the DCERPC layer.
+
+    Carries the underlying DCE-RPC / DCOM fault code on ``error_code`` (an
+    ``int`` HRESULT / NT-status such as ``0x80070005`` ACCESS_DENIED, or ``None``
+    when the inner error exposes no code) so a caller can classify the failure by
+    CODE — an EXPECTED not-CA-admin ACCESS_DENIED versus a real transport/RPC
+    fault — without substring-matching a message that may stringify empty.
+    """
+
+    def __init__(self, message: str, error_code: int | None = None):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 # =========================================================================
@@ -259,7 +325,10 @@ class ICertAdminD2(IRemUnknown):
         # not as the method target — do not conflate the two.)
         resp, err = await self._request(req, IID_ICertAdminD2, self.get_iPid())
         if err is not None:
-            raise CertAdminSecurityError(f'GetCASecurity failed for {ca_name}: {err}') from err
+            raise CertAdminSecurityError(
+                f'GetCASecurity failed for {ca_name}: {_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
 
         # pctbSD.pb is a PBYTE (pointer -> conformant byte array); aiosmb
         # auto-dereferences it to a Python list. Be robust to whether the NDR
@@ -305,7 +374,10 @@ class ICertAdminD2(IRemUnknown):
         # IPID (see get_ca_security for the 0x800706D1 rationale).
         resp, err = await self._request(req, IID_ICertAdminD2, self.get_iPid())
         if err is not None:
-            raise CertAdminSecurityError(f'SetCASecurity failed for {ca_name}: {err}') from err
+            raise CertAdminSecurityError(
+                f'SetCASecurity failed for {ca_name}: {_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
 
         error_code = resp['ErrorCode']
         logger.info(f'SetCASecurity for {ca_name} returned ErrorCode={error_code}')
@@ -386,7 +458,11 @@ class ICertAdminD(IRemUnknown):
         # against the interface's own IPID (get_iPid), same as ICertAdminD2.
         resp, err = await self._request(req, IID_ICertAdminD, self.get_iPid())
         if err is not None:
-            raise CertAdminSecurityError(f'ResubmitRequest failed for {ca_name} (id={request_id}): {err}') from err
+            raise CertAdminSecurityError(
+                f'ResubmitRequest failed for {ca_name} (id={request_id}): '
+                f'{_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
 
         disposition = resp['pdwDisposition']
         logger.info(f'ResubmitRequest for {ca_name} id={request_id} returned disposition={disposition}')

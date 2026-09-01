@@ -94,6 +94,14 @@ from adscan_internal.spraying import (
     write_temp_combo_file,
     write_temp_users_file,
 )
+from adscan_internal.services.unauth_funnel_telemetry import emit_spray_completed
+
+
+def _spray_monotonic() -> float:
+    """Monotonic clock for spray-duration telemetry (isolated for testability)."""
+    import time as _time  # noqa: PLC0415
+
+    return _time.monotonic()
 
 
 def _extract_typed_source_steps(source_steps: list[object] | None) -> list[object]:
@@ -552,6 +560,7 @@ _SPRAYING_OPTION_USER_AS_PASS_LOWER = "Username as password in lowercase"
 _SPRAYING_OPTION_USER_AS_PASS_UPPER = "Username as password in uppercase"
 _SPRAYING_OPTION_BLANK_PASSWORD = "Users with a blank password"
 _SPRAYING_OPTION_CUSTOM_PASSWORD = "Username with a specific password"
+_SPRAYING_OPTION_MONTH_SEASON = "Password by month/season + year (e.g. March2026, Verano2026)"
 _SPRAYING_OPTION_COMPUTER_PRE2K = "Computer accounts (pre2k: hostname as password)"
 _SPRAYING_OPTION_RETRY_PASSWORDS = "Retry saved password candidates"
 _SPRAYING_OPTION_RETRY_DOMAIN_REUSE = "Retry saved SAM -> domain reuse candidates"
@@ -4418,6 +4427,46 @@ def _enforce_lockout_guardrail(
     )
 
 
+def _print_spray_decision_lockout_context(shell: SprayShell, domain: str) -> None:
+    """Show a context panel at the spray decision, differentiated by session type.
+
+    Authenticated session (lockout policy is readable): explain that ADscan
+    actively protects the accounts — it reads the DC lockout policy and each
+    user's badPwdCount, excludes accounts near the threshold, reserves a margin,
+    and limits to one attempt per user per window. Turns the strongest built-in
+    safety into a visible reassurance the operator sees when deciding.
+
+    Unauthenticated session (policy unknown): surface the "wait between attempts"
+    caution here, at the decision point, instead of only deep in the flow.
+    """
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    if is_non_interactive(shell):
+        return
+    auth_state = str(shell.domains_data.get(domain, {}).get("auth", "")).strip().lower()
+    is_auth = auth_state in {"auth", "pwned"}
+    if is_auth:
+        print_panel(
+            "ADscan protects the accounts while spraying:\n"
+            "  - Reads the DC account-lockout policy and each user's badPwdCount\n"
+            "  - Excludes accounts already near the lockout threshold\n"
+            "  - Reserves a safety margin (never spends the last attempt)\n"
+            "  - Limits to one attempt per user per observation window",
+            title="[bold]Lockout-safe spraying[/bold]",
+            border_style=ADSCAN_PRIMARY,
+            expand=False,
+        )
+    else:
+        print_panel(
+            "This session is unauthenticated, so the account-lockout threshold "
+            "cannot be read yet.\nSpray conservatively (one attempt per user) and "
+            "wait at least 1 hour between attempts until the threshold is known.",
+            title="[bold]Caution — lockout threshold unknown[/bold]",
+            border_style="yellow",
+            expand=False,
+        )
+
+
 def ask_for_spraying(shell: SprayShell, domain: str) -> None:
     """Prompt user to perform password spraying on a domain."""
     from adscan_internal.services.scan_phases import phase_is_enabled
@@ -4442,6 +4491,7 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_auth_1 = mark_sensitive(shell.domains_data[domain]["auth"], "domain")
+    _print_spray_decision_lockout_context(shell, domain)
     wants_spraying = Confirm.ask(
         f"Do you want to perform password spraying on domain {marked_domain} using a {marked_auth_1} session?",
         default=True,
@@ -4540,6 +4590,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         return
 
     options: list[str] = []
+    audit_mode = str(getattr(shell, "type", "") or "").strip().lower() == "audit"
     if has_kerbrute:
         options.extend(
             [
@@ -4549,6 +4600,10 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
                 _SPRAYING_OPTION_CUSTOM_PASSWORD,
             ]
         )
+        # Month/season + year is an audit-engagement technique (predictable
+        # forced-rotation passwords); not offered in CTF workspaces.
+        if audit_mode:
+            options.append(_SPRAYING_OPTION_MONTH_SEASON)
     if has_netexec:
         options.append(_SPRAYING_OPTION_BLANK_PASSWORD)
     pending_candidates = _load_pending_spraying_password_candidates(
@@ -4639,9 +4694,13 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         spray_category = "blank_password"
         user_as_pass = False
     elif selected_option == _SPRAYING_OPTION_CUSTOM_PASSWORD:
+        _print_custom_password_guidance(shell)
         spray_password = Prompt.ask("Enter the password for spraying")
         spray_category = "password"
         user_as_pass = False
+    elif selected_option == _SPRAYING_OPTION_MONTH_SEASON:
+        spraying_with_month_season(shell, domain)
+        return
     elif selected_option == _SPRAYING_OPTION_COMPUTER_PRE2K:
         spray_category = "computer_pre2k"
         user_as_pass = False
@@ -4929,6 +4988,263 @@ def spraying_with_password(
     )
 
 
+def _print_custom_password_guidance(shell: SprayShell) -> None:
+    """Show a short cue of common spray password shapes before the custom prompt.
+
+    Guidance only — it does not change the free-text input. Helps an operator who
+    is unsure what to try; suppressed in non-interactive runs (no one reads it).
+    """
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    if is_non_interactive(shell):
+        return
+    from adscan_core.theme import COLOR_MUTED  # noqa: PLC0415
+    from rich.text import Text  # noqa: PLC0415
+
+    body = Text()
+    body.append("Common patterns to try:\n", style="dim")
+    body.append("  Company2026   Company2026!   Company2026@\n", style=COLOR_MUTED)
+    body.append("  March2026 / Marzo2026        (month + year)\n", style=COLOR_MUTED)
+    body.append("  Summer2026 / Verano2026      (season + year)\n", style=COLOR_MUTED)
+    body.append(
+        "\nTip: the month/season option sprays these per user automatically.",
+        style="dim",
+    )
+    print_panel(
+        body,
+        title="[bold]Password ideas[/bold]",
+        border_style=ADSCAN_PRIMARY,
+        expand=False,
+    )
+
+
+def _current_month_year() -> tuple[int, int]:
+    """Return the current ``(month, year)`` from the wall clock.
+
+    Absolute-calendar value (not a duration), so ``datetime.date.today`` is the
+    correct source per the time-constraints rule. Isolated in one helper so the
+    non-interactive default is deterministic and testable.
+    """
+    import datetime as _dt  # noqa: PLC0415
+
+    today = _dt.date.today()
+    return today.month, today.year
+
+
+def spraying_with_month_season(
+    shell: SprayShell,
+    domain: str,
+    *,
+    kind: str | None = None,
+    languages: tuple[str, ...] | None = None,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> None:
+    """Spray month/season + year passwords (``March2026``, ``Verano2026``).
+
+    Audit-only. Two modes, both keeping the one-combo-per-user anti-lockout
+    boundary:
+
+    * AUTHENTICATED — each eligible user's ``pwdLastSet`` month/year gives their
+      single strongest month/season guess (``resolve_adaptive_month_season_plan``,
+      one combo per user). Users without pwdLastSet data fall back to the current
+      period.
+    * UNAUTHENTICATED — no per-user dates, so the current month/season/year is
+      the default (operator-editable; the non-interactive default is used in CI).
+      Exactly one combo per user, so lockout headroom is unaffected.
+
+    Only ``Word+Year`` forms are sprayed here — symbols (``!@#``) are intentionally
+    excluded from the threshold flow (they belong to the separate lockout-free
+    expansion path, not this one-attempt-per-user pass).
+
+    Args:
+        kind: ``"month"``, ``"season"`` or ``"both"``. When ``None`` (the main
+            menu entry), an interactive sub-prompt asks (default Month); ``adscan
+            ci`` calls this with an explicit ``kind`` per coverage type
+            (``month_year`` / ``season_year``), so no sub-prompt runs there.
+        languages: Explicit language order for the generator. When ``None``, the
+            language is resolved from ADscan's environment inference plus a
+            show-once operator ask (see :func:`_resolve_month_season_languages`).
+    """
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir  # noqa: PLC0415
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+    from adscan_internal.services.password_month_season_generator import (  # noqa: PLC0415
+        month_season_passwords,
+    )
+    from adscan_internal.services.password_month_season_spray_plan_service import (  # noqa: PLC0415
+        resolve_adaptive_month_season_plan,
+    )
+
+    if str(getattr(shell, "type", "") or "").strip().lower() != "audit":
+        print_info(
+            "Month/season spraying is an audit-engagement technique and is not "
+            "offered in CTF workspaces."
+        )
+        return
+    if not getattr(shell, "kerbrute_path", None):
+        print_error(
+            "kerbrute is not installed. Please run 'adscan install' to install it."
+        )
+        return
+
+    interactive = not is_non_interactive(shell)
+
+    # Sub-prompt 1 (month/season kind) — only when the caller did not fix it
+    # (i.e. the operator picked the single main-menu entry). The ci coverage
+    # dispatch always passes an explicit kind, so this never prompts in ci.
+    if kind is None:
+        kind = _select_month_season_kind(shell) if interactive else "both"
+    kind = str(kind or "both").strip().lower()
+    if kind == "month":
+        kinds: tuple[str, ...] = ("month",)
+    elif kind == "season":
+        kinds = ("season",)
+    else:
+        kind = "both"
+        kinds = ("month", "season")
+
+    # Sub-prompt 2 (language) — resolve from inference + a show-once ask, unless
+    # the caller supplied an explicit language order.
+    langs = tuple(languages) if languages else _resolve_month_season_languages(shell, domain)
+
+    eligibility = _prepare_password_spraying_eligibility(
+        shell,
+        domain=domain,
+        spray_category="month_season",
+        spray_password=None,
+        guardrail_prompt="Continue with month/season + year spraying using the full user list?",
+        clock_sync_source="spraying_with_month_season",
+    )
+    if eligibility is None:
+        return
+    if not eligibility.eligible_users:
+        print_warning(
+            "No eligible users available for spraying with the current safety rules."
+        )
+        return
+
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    is_auth = auth_state in {"auth", "pwned"}
+    current_month, current_year = _current_month_year()
+
+    # Build one (user, password) combo per eligible user.
+    combos: list[tuple[str, str]] = []
+    plan_mode = "current_period"
+    if is_auth:
+        # Per-user adaptive: each user's pwdLastSet month/year -> one combo.
+        plan = resolve_adaptive_month_season_plan(
+            shell,
+            domain=domain,
+            users=list(eligibility.eligible_users),
+            languages=langs,
+            kinds=kinds,
+        )
+        adaptive_by_user: dict[str, str] = {}
+        if plan is not None:
+            adaptive_by_user = {
+                combo.username.casefold(): combo.password for combo in plan.combos
+            }
+            plan_mode = "adaptive_pwdlastset"
+        # Users without pwdLastSet data fall back to the current period.
+        fallback = month_season_passwords(
+            month=current_month, year=current_year,
+            languages=langs, include_symbols=False, kinds=kinds,
+        )
+        fallback_pw = fallback[0] if fallback else ""
+        for user in eligibility.eligible_users:
+            password = adaptive_by_user.get(user.casefold()) or fallback_pw
+            if password:
+                combos.append((user, password))
+    else:
+        # Unauthenticated: current month/season/year, one candidate per user.
+        month, year = current_month, current_year
+        if interactive:
+            try:
+                raw_year = Prompt.ask(
+                    "Year to append (leave blank for current)",
+                    default=str(current_year),
+                )
+                year = int(str(raw_year).strip() or current_year)
+                raw_month = Prompt.ask(
+                    "Month number 1-12 (leave blank for current)",
+                    default=str(current_month),
+                )
+                parsed_month = int(str(raw_month).strip() or current_month)
+                if 1 <= parsed_month <= 12:
+                    month = parsed_month
+            except (ValueError, TypeError):
+                month, year = current_month, current_year
+        candidates = month_season_passwords(
+            month=month, year=year,
+            languages=langs, include_symbols=False, kinds=kinds,
+        )
+        top_pw = candidates[0] if candidates else ""
+        if top_pw:
+            combos = [(user, top_pw) for user in eligibility.eligible_users]
+
+    combos = [(u, p) for (u, p) in combos if u and p]
+    if not combos:
+        print_warning("No month/season spray combos were generated.")
+        return
+
+    accepted = confirm_with_history_check(
+        shell,
+        domain=domain,
+        proposed_combos=combos,
+        mode_label="Month/season + year password",
+        multi_combo=False,
+    )
+    if accepted is None:
+        print_info("Password spraying cancelled by user.")
+        return
+
+    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
+    combo_lines = [f"{user}:{password}" for (user, password) in combos]
+    combos_path = write_temp_combo_file(combo_lines, directory=kerberos_output_dir)
+    try:
+        # Separate log per kind so the month_year and season_year passes never
+        # overwrite each other's kerbrute output.
+        _kind_slug = "month" if kinds == ("month",) else "season" if kinds == ("season",) else "month_season"
+        output_file = os.path.join(
+            "domains",
+            domain,
+            "kerberos",
+            f"{'auth' if is_auth else 'unauth'}_spray_{_kind_slug}.log",
+        )
+        kerbrute_cmd = build_kerbrute_bruteforce_command(
+            kerbrute_path=shell.kerbrute_path,
+            domain=domain,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            combos_file=combos_path,
+            output_file=output_file,
+        )
+        execute_spraying_command(
+            shell,
+            kerbrute_cmd,
+            domain,
+            spray_type="Month/Season Password",
+            source_context={
+                **(source_context or {}),
+                "origin": str((source_context or {}).get("origin") or "month_season_spray"),
+                "month_season_spray": True,
+                "month_season_kind": kind,
+                "spray_languages": list(langs),
+                "plan_mode": plan_mode,
+            },
+            source_steps=source_steps,
+            lockout_context=_build_lockout_context_from_eligibility(eligibility),
+        )
+    finally:
+        try:
+            os.remove(combos_path)
+        except OSError:
+            pass
+
+    register_user_spray_attempts(
+        shell, domain=domain, combos=combos, mode="month_season"
+    )
+
+
 def _execute_single_password_spraying(
     shell: SprayShell,
     *,
@@ -4999,6 +5315,7 @@ def _execute_single_password_spraying(
             run_validated_hits_followup=not has_year_candidate,
             render_hits_panel=not has_year_candidate,
             lockout_context=_spray_lockout_ctx,
+            eligibility=eligibility,
         )
         if not has_year_candidate:
             if offer_variation_spray and eligibility.no_lockout_enforced:
@@ -7388,9 +7705,18 @@ def execute_spraying_command(
     run_validated_hits_followup: bool = True,
     render_hits_panel: bool = True,
     lockout_context: dict[str, object] | None = None,
+    eligibility: "SprayEligibilityResult | None" = None,
 ) -> list[dict[str, str]]:
-    """Execute the spraying command and process results."""
-    from adscan_internal.cli.common import SECRET_MODE
+    """Execute the spraying command and process results.
+
+    ``eligibility`` is optional context (lockout threshold + excluded-near-lockout
+    count) carried by callers that computed it, used only to enrich the
+    ``spray_completed`` telemetry event; it never changes execution.
+    """
+    import time as _time  # noqa: PLC0415
+    from adscan_core.output._state import is_debug_mode
+
+    _spray_started_at = _time.monotonic()
 
     marked_domain = mark_sensitive(domain, "domain")
     # Best-effort eligible-user count for the spinner heartbeat (the kerbrute
@@ -7510,7 +7836,7 @@ def execute_spraying_command(
                     print_info_debug(f"[spray][stderr] {clean_line}")
         elif not found_credentials:
             print_warning("No valid credentials found.")
-            if output_lines and SECRET_MODE:
+            if output_lines and is_debug_mode():
                 print_info_verbose("Full command output:")
                 for line in output_lines:
                     print_info_verbose(f"  {line}")
@@ -7525,6 +7851,41 @@ def execute_spraying_command(
                     print_warning("Errors detected in output:")
                     for line in error_lines[:5]:  # Show first 5 genuine error lines
                         print_info(f"  {_rich_markup_escape(line)}")
+
+        # Telemetry: RESULT of this spray pass (gap #1). Best-effort, counts-only.
+        try:
+            _outcome_counts = _summarize_domain_spray_outcomes(
+                "\n".join([output, stderr_output])
+            )[1]
+            _accounts_locked = int(
+                _outcome_counts.get("STATUS_ACCOUNT_LOCKED_OUT", 0) or 0
+            )
+            _accounts_tried = _count_spray_attempt_total(command)
+            _excluded_near_lockout = None
+            _lockout_threshold = None
+            if eligibility is not None:
+                _excluded_near_lockout = sum(
+                    1
+                    for excluded in getattr(eligibility, "excluded_users", []) or []
+                    if "lockout" in str(getattr(excluded, "reason", "")).lower()
+                )
+                _lockout_threshold = getattr(eligibility, "lockout_threshold", None)
+                if _accounts_tried is None:
+                    _accounts_tried = len(
+                        getattr(eligibility, "eligible_users", []) or []
+                    )
+            emit_spray_completed(
+                shell,
+                spray_type=spray_type,
+                accounts_tried=_accounts_tried,
+                valid_creds_found=len(hits_by_user),
+                accounts_locked=_accounts_locked,
+                accounts_excluded_near_lockout=_excluded_near_lockout,
+                lockout_threshold=_lockout_threshold,
+                duration_s=_time.monotonic() - _spray_started_at,
+            )
+        except Exception as _spray_tel_exc:  # noqa: BLE001
+            telemetry.capture_exception(_spray_tel_exc)
     except Exception as e:
         telemetry.capture_exception(e)
         print_error("Error executing password spraying command.")
@@ -7637,6 +7998,7 @@ def execute_domain_spray_native(
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
     lockout_context: dict[str, object] | None = None,
+    eligibility: "SprayEligibilityResult | None" = None,
 ) -> None:
     """Run a native authentication sweep against the DC and process its hits.
 
@@ -7655,8 +8017,6 @@ def execute_domain_spray_native(
     structurally here: a single target host (the DC) and exactly one attempt per
     user.
     """
-    from adscan_internal.cli.common import SECRET_MODE
-
     marked_domain = mark_sensitive(domain, "domain")
 
     # De-duplicate the user list case-insensitively so a repeated entry can never
@@ -7708,6 +8068,7 @@ def execute_domain_spray_native(
             "[dim](native auth attempts, results render when complete)[/dim]",
             spinner="dots",
         ):
+            _native_started_at = _spray_monotonic()
             hit_usernames, outcome_counts = asyncio.run(
                 _run_native_domain_spray(
                     domain=domain,
@@ -7722,6 +8083,32 @@ def execute_domain_spray_native(
             {"username": username, "password": password}
             for username in hit_usernames
         ]
+
+        # Telemetry: RESULT of this native spray pass (gap #1). Counts-only.
+        try:
+            _excluded_near_lockout = None
+            _lockout_threshold = None
+            if eligibility is not None:
+                _excluded_near_lockout = sum(
+                    1
+                    for excluded in getattr(eligibility, "excluded_users", []) or []
+                    if "lockout" in str(getattr(excluded, "reason", "")).lower()
+                )
+                _lockout_threshold = getattr(eligibility, "lockout_threshold", None)
+            emit_spray_completed(
+                shell,
+                spray_type=spray_type,
+                accounts_tried=len(unique_users),
+                valid_creds_found=len(hit_usernames),
+                accounts_locked=int(
+                    (outcome_counts or {}).get("STATUS_ACCOUNT_LOCKED_OUT", 0) or 0
+                ),
+                accounts_excluded_near_lockout=_excluded_near_lockout,
+                lockout_threshold=_lockout_threshold,
+                duration_s=_spray_monotonic() - _native_started_at,
+            )
+        except Exception as _native_tel_exc:  # noqa: BLE001
+            telemetry.capture_exception(_native_tel_exc)
 
         if hits:
             _render_valid_spray_hits_panel(
@@ -7753,14 +8140,14 @@ def execute_domain_spray_native(
                 print_warning("No valid credentials found.")
     except Exception as e:  # noqa: BLE001
         telemetry.capture_exception(e)
-        if not SECRET_MODE:
-            print_error("Error executing password spraying.")
-            print_warning(
-                "No credentials were captured during spraying. Check the log above for signs of "
-                "must-change accounts, logon failures, or connectivity issues."
-            )
-        else:
-            print_exception(show_locals=False, exception=e)
+        print_error("Error executing password spraying.")
+        print_warning(
+            "No credentials were captured during spraying. Check the log above for signs of "
+            "must-change accounts, logon failures, or connectivity issues."
+        )
+        # print_exception writes the full traceback to the debug log + telemetry
+        # recording always, and only shows it on screen under --debug.
+        print_exception(show_locals=False, exception=e)
 
 
 def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
@@ -7892,19 +8279,47 @@ def should_proceed_with_repeated_spraying(
 #   Step 1 — pre2k computer-account spray, behind an educational panel + confirm
 #            (default yes; ci auto-yes). Computer accounts never lock, so it leads
 #            the phase, but the operator always sees what it is and why first.
-#   Step 2 — a coverage-aware spray SELECTOR loop over the three ci spray types
-#            (user-as-password -> owned-credential reuse -> blank), each showing
-#            live coverage %. Interactive: the operator picks from the selector,
-#            which re-appears after each spray (full control). ci: an auto-pick
-#            walks the priority order, SKIPPING fully-covered types and types with
-#            zero eligible users, and exits when none remain (deterministic; the
-#            iteration cap is a hard backstop against any loop). Two extra
-#            interactive-only entries (custom password, retry found/share passwords)
-#            never enter the ci auto-pick. Per-type eligibility + the 2-attempt
-#            lockout margin + per-combo de-dup are still owned by the executors.
-_SPRAY_CI_TYPES: tuple[str, ...] = ("useraspass", "reuse", "blank")
+#   Step 2 — a coverage-aware spray SELECTOR loop over the ci spray types
+#            (user-as-password -> month+year -> season+year -> owned-credential
+#            reuse -> blank), each showing live coverage %. Interactive: the
+#            operator picks from the selector, which re-appears after each spray
+#            (full control). ci: an auto-pick walks the priority order, SKIPPING
+#            fully-covered types and types with zero eligible users, and exits when
+#            none remain (deterministic; the iteration cap is a hard backstop
+#            against any loop). Two extra interactive-only entries (custom
+#            password, retry found/share passwords) never enter the ci auto-pick.
+#            Per-type eligibility + the 2-attempt lockout margin + per-combo de-dup
+#            are still owned by the executors.
+#
+# ── WHY _SPRAY_CI_TYPES and spray_coverage_plan._SEQUENCE DIFFER (do NOT unify) ─
+# _SPRAY_CI_TYPES covers ONLY user-account spray types, which share the lockout
+# budget and are chosen inside this coverage selector. `pre2k` (machine-account
+# spray) is DELIBERATELY absent: machine accounts never lock out, so pre2k is
+# asked/gated in its OWN step (Step 1 above), OUTSIDE this selector — putting it
+# here would double-offer it and mix it into the user-account lockout accounting.
+# spray_coverage_plan._SEQUENCE, by contrast, is the FULL priority order used to
+# sort a caller-supplied set that MAY include pre2k, so it keeps `pre2k` at the
+# front. Both lists share the same relative order for the user-account types;
+# they intentionally differ only by pre2k's presence. Keep them in lockstep on
+# the user-account types, but never "unify" them by adding pre2k here.
+#
+# month/season is TWO coverage types on purpose — month_year and season_year —
+# each with its own coverage row and its own one-combo-per-user pass, even though
+# the interactive MENU exposes them under a single "Password by month/season"
+# entry with a nested month/season sub-prompt. Splitting them in the coverage
+# logic is what lets ci actually spray BOTH (the old single `month_season` type
+# was marked covered after month alone, so season never ran in ci).
+_SPRAY_CI_TYPES: tuple[str, ...] = (
+    "useraspass",
+    "month_year",
+    "season_year",
+    "reuse",
+    "blank",
+)
 _SPRAY_TYPE_LABEL: dict[str, str] = {
     "useraspass": "user-as-password",
+    "month_year": "month + year",
+    "season_year": "season + year",
     "reuse": "owned-credential reuse",
     "blank": "blank password",
 }
@@ -8080,6 +8495,45 @@ def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
                 )
             )
 
+        # month+year and season+year — audit-engagement technique only, split into
+        # TWO independent coverage types so ci sprays BOTH (see _SPRAY_CI_TYPES).
+        # Each is measured against its own current-period candidate (a cheap,
+        # deterministic denominator); the executor sprays the richer per-user
+        # adaptive combo of that kind, and the ci one-shot guard runs each type
+        # once regardless of the display percentage. Symbols are off (Word+Year).
+        audit_mode = str(getattr(shell, "type", "") or "").strip().lower() == "audit"
+        if audit_mode:
+            from adscan_internal.services.password_month_season_generator import (
+                month_season_passwords,
+            )
+            import datetime as _dt
+
+            _today = _dt.date.today()
+            for _ms_type, _ms_kinds in (
+                ("month_year", ("month",)),
+                ("season_year", ("season",)),
+            ):
+                _ms_candidates = month_season_passwords(
+                    month=_today.month, year=_today.year,
+                    include_symbols=False, kinds=_ms_kinds,
+                )
+                _ms_pw = _ms_candidates[0] if _ms_candidates else ""
+                if not _ms_pw:
+                    continue
+                _ms_combos = [(u, _ms_pw) for u in all_users]
+                _ms_hist = find_already_attempted_combos(
+                    shell, domain=domain, combos=_ms_combos
+                )
+                _ms_covered = {ku.casefold() for (ku, _p) in _ms_hist}
+                rows.append(
+                    _coverage_row(
+                        _ms_type,
+                        planned=len(all_users),
+                        covered=len(_ms_covered),
+                        eligible=_eligible_remaining_count(eligible_users, _ms_covered),
+                    )
+                )
+
         # blank password
         blank_covered = blank_already_attempted(shell, domain=domain, users=all_users)
         rows.append(
@@ -8196,6 +8650,89 @@ def _select_useraspass_transform(shell: "SprayShell", *, interactive: bool) -> "
     return {0: None, 1: "lower", 2: "capitalize"}.get(idx, "lower")
 
 
+def _select_month_season_kind(shell: "SprayShell") -> str:
+    """Sub-selector for the month/season spray kind. Default = Month.
+
+    Mirrors the useraspass sub-prompt pattern: the MAIN spraying menu keeps ONE
+    entry ("Password by month/season + year") and selecting it opens this nested
+    prompt. Returns ``"month"`` / ``"season"`` / ``"both"``. Auto-resolves to the
+    default (Month) under ``adscan ci`` via the centralized helper.
+    """
+    options = ["Month + year (e.g. March2026)", "Season + year (e.g. Verano2026)", "Both"]
+    idx = shell._questionary_select(
+        "Month/season pattern:", options, default_idx=0
+    )
+    if idx is None:
+        return "month"
+    return {0: "month", 1: "season", 2: "both"}.get(idx, "month")
+
+
+def _resolve_month_season_languages(shell: "SprayShell", domain: str) -> tuple[str, ...]:
+    """Resolve the spray languages for the month/season flow, with a show-once ask.
+
+    Language is ENVIRONMENT CONFIG, not a safeguard, so it is asked at most once
+    per domain and then reused — exactly the "onboarding is seen once" rule. The
+    persistence lives in ``domains_data`` (via the environment-language module),
+    NOT ``first_run_notices``: that module already stores an operator override
+    per domain, so an override's presence IS the "don't re-ask" signal. Using it
+    keeps ONE source of truth for the resolved language instead of splitting the
+    decision (in ``domains_data``) from the "already asked" flag (in a notices
+    file) — the cleaner option the task called for.
+
+    Flow:
+      * If the operator already chose a language for this domain (an override is
+        persisted), reuse it silently — no re-prompt.
+      * Otherwise, show ADscan's inferred language and let the operator accept it
+        or change it (EN / ES / Both), persisting the choice as an override so the
+        next spray does not re-ask.
+      * Non-interactive (``adscan ci``): never prompts; uses the inferred default
+        from :func:`spray_languages_for`.
+    """
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+    from adscan_internal.services.environment_language_inference_service import (  # noqa: PLC0415
+        get_environment_language,
+        set_environment_language,
+        spray_languages_for,
+    )
+
+    if is_non_interactive(shell):
+        return spray_languages_for(shell, domain)
+
+    # An operator override already recorded for this domain = decision made once.
+    existing = get_environment_language(shell, domain)
+    if getattr(existing, "source", "") == "operator_override":
+        return spray_languages_for(shell, domain)
+
+    _LANG_LABELS = {"en": "English", "es": "Spanish", "unknown": "undetermined"}
+    inferred = existing.language if existing.language in ("en", "es") else "unknown"
+    inferred_label = _LANG_LABELS.get(inferred, "undetermined")
+    if inferred in ("en", "es"):
+        title = (
+            f"ADscan inferred this environment is {inferred_label}. "
+            "Generate month/season patterns in which language?"
+        )
+        default_idx = 0 if inferred == "en" else 1
+    else:
+        title = (
+            "ADscan could not determine this environment's language. "
+            "Generate month/season patterns in which language?"
+        )
+        default_idx = 2  # Both — never silently drop a language when unsure.
+
+    options = ["English (en)", "Spanish (es)", "Both (en + es)"]
+    idx = shell._questionary_select(title, options, default_idx=default_idx)
+    choice = {0: "en", 1: "es", 2: "both"}.get(
+        idx if idx is not None else default_idx, "both"
+    )
+    if choice == "both":
+        # Record the explicit "both" decision as an override so we do not re-ask,
+        # but return both languages to the generator.
+        set_environment_language(shell, domain, "unknown")
+        return ("en", "es")
+    set_environment_language(shell, domain, choice)
+    return (choice,)
+
+
 def _select_owned_passwords(
     shell: "SprayShell", owned: list[tuple[str, str]], *, interactive: bool
 ) -> list[str]:
@@ -8296,11 +8833,22 @@ def _dispatch_spray_choice(
     """
     from adscan_internal.services.scan_phases import subphase_is_enabled
 
-    if choice in {"blank", "useraspass", "reuse"} and not subphase_is_enabled(
-        shell, "password_spraying", choice
-    ):
+    # month_year / season_year are two coverage types but share the SINGLE
+    # client-facing "month_season" subphase toggle (see scan_phases.py) — map both
+    # to it for the enable check.
+    _subphase_for_choice = (
+        "month_season" if choice in {"month_year", "season_year"} else choice
+    )
+    if choice in {
+        "blank", "useraspass", "reuse", "month_year", "season_year"
+    } and not subphase_is_enabled(shell, "password_spraying", _subphase_for_choice):
         print_info(
             f"Spray strategy '{choice}' skipped (disabled in scan configuration)."
+        )
+        return
+    if choice in {"month_year", "season_year"}:
+        spraying_with_month_season(
+            shell, domain, kind="month" if choice == "month_year" else "season"
         )
         return
     if choice == "useraspass":

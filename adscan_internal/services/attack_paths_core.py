@@ -1241,12 +1241,17 @@ def _strip_leading_relations(
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
     statuses: list[str] = []
+    # Collect the non-context actions in the SAME pass that reads the statuses so
+    # each step's ``action`` is normalized once, not twice (this function is a
+    # per-path hot spot at domain scale — ~30k calls on Forest/L15k domain/all).
+    non_context_actions: list[str] = []
     for step in steps:
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
         if action in _CONTEXT_RELATIONS_LOWER:
             continue
+        non_context_actions.append(action)
         value = step.get("status")
         if isinstance(value, str) and value:
             statuses.append(value.strip().lower())
@@ -1259,13 +1264,16 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         classify_relation_support,
     )
 
-    non_context_actions = [
-        str(step.get("action") or "").strip().lower()
-        for step in steps
-        if isinstance(step, dict)
-        and str(step.get("action") or "").strip().lower()
-        not in _CONTEXT_RELATIONS_LOWER
-    ]
+    # Classify each DISTINCT non-context action's support kind exactly once. The
+    # three fallback passes below each scan ``non_context_actions``; on a path with
+    # repeated relations the naive form re-classified the same action up to three
+    # times. ``classify_relation_support`` is a pure function of its string arg, so
+    # sharing the per-action ``.kind`` is byte-identical and collapses the calls to
+    # O(distinct actions).
+    support_kind_by_action = {
+        action: classify_relation_support(action).kind
+        for action in set(non_context_actions)
+    }
 
     # PARTIAL — a chain with >=1 VALIDATED (success) step that did NOT execute
     # end-to-end. The proven segment must never be flattened into
@@ -1284,7 +1292,7 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         "closed_by_configuration",
     }
     has_doctrine_status = any(s in _doctrine_critical for s in statuses) or any(
-        classify_relation_support(action).kind in {"policy_blocked", "unsupported"}
+        support_kind_by_action[action] in {"policy_blocked", "unsupported"}
         for action in non_context_actions
     )
     if any(status == "success" for status in statuses) and not has_doctrine_status:
@@ -1299,7 +1307,7 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
     if any(status == "unsupported" for status in statuses):
         return "unsupported"
     if any(
-        classify_relation_support(action).kind == "policy_blocked"
+        support_kind_by_action[action] == "policy_blocked"
         for action in non_context_actions
     ):
         return "blocked"
@@ -1307,7 +1315,7 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         # Live support classification is the single source of truth — surface an
         # ``unsupported`` relation even when the persisted step status still
         # carries the pre-flip default (see CrackNTLMv1).
-        classify_relation_support(action).kind == "unsupported"
+        support_kind_by_action[action] == "unsupported"
         for action in non_context_actions
     ):
         return "unsupported"
@@ -1484,6 +1492,192 @@ def _sibling_pivot_status_strength(status: Any) -> int:
     if token == "theoretical":
         return 1
     return 0
+
+
+#: The step-details / notes key the generation-time collapse stamps on the
+#: representative pivot's incoming step (see attack_graph_core). Kept in sync
+#: with ``attack_graph_core._GENTIME_COLLAPSE_MEMBERS_KEY``.
+_GENTIME_COLLAPSE_MEMBERS_KEY = "gentime_collapsed_pivot_members"
+
+
+def _strip_gentime_collapse_markers(record: dict[str, Any]) -> None:
+    """Remove the private gen-time collapse marker from a record's steps (in place).
+
+    The marker only existed to carry the suppressed sibling ids across the DFS →
+    minimisation boundary; the FINAL records must be byte-identical to a run with
+    the collapse OFF, so it is stripped once the re-expansion has consumed it.
+    """
+    steps = record.get("steps")
+    if not isinstance(steps, list):
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        details = step.get("details")
+        if isinstance(details, dict) and _GENTIME_COLLAPSE_MEMBERS_KEY in details:
+            details.pop(_GENTIME_COLLAPSE_MEMBERS_KEY, None)
+
+
+def _find_gentime_pivot_step(
+    record: dict[str, Any],
+) -> tuple[int, list[str]] | None:
+    """Return ``(step_index, member_ids)`` for a gen-time-collapsed pivot, else None.
+
+    The step that PRODUCED the representative pivot carries the suppressed
+    siblings' node ids in ``details[_GENTIME_COLLAPSE_MEMBERS_KEY]``. The pivot
+    NODE sits at ``step_index + 1`` in ``record['nodes']`` (steps are 0-based over
+    the node sequence: step ``i`` goes node ``i`` -> node ``i+1``).
+    """
+    steps = record.get("steps")
+    if not isinstance(steps, list):
+        return None
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        details = step.get("details")
+        if not isinstance(details, dict):
+            continue
+        members = details.get(_GENTIME_COLLAPSE_MEMBERS_KEY)
+        if isinstance(members, list) and len(members) > 1:
+            return i, [str(m) for m in members]
+    return None
+
+
+def reexpand_gentime_collapsed_pivots(
+    records: list[dict[str, Any]],
+    *,
+    node_id_to_label: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Rebuild the sibling rows a gen-time pivot suppression collapsed away.
+
+    The generation-time collapse (attack_graph_core) walked ONLY the
+    representative pivot of each interchangeable set, stamping the representative's
+    incoming step with the suppressed sibling node ids. Here — AFTER the DFS and
+    the O(N^2) minimisation have run on the small collapsed set — the sibling rows
+    are reconstructed (shallow: one row per suppressed sibling per representative
+    record) so the untouched, PROVEN :func:`collapse_sibling_pivot_paths`
+    downstream produces the byte-identical ``via_accounts`` metadata it always
+    has. The siblings are structurally interchangeable (same incoming relation,
+    kind, and outgoing signature — enforced at suppression time), so a sibling row
+    is the representative row with the pivot node label swapped in the ``nodes``
+    sequence and the two adjacent steps' ``from``/``to`` endpoints.
+
+    This is O(distinct-records x pivots), NOT O(pivots x subtree): the K x subtree
+    blow-up the DFS avoided is never re-materialised — only the shallow per-record
+    sibling set is, transiently, for the collapse to re-merge.
+
+    A record with no gen-time marker passes through unchanged and in order.
+    """
+    if not records:
+        return records
+    result: list[dict[str, Any]] = []
+    for record in records:
+        found = _find_gentime_pivot_step(record)
+        if found is None:
+            result.append(record)
+            continue
+        step_index, member_ids = found
+        nodes = record.get("nodes")
+        if not isinstance(nodes, list) or step_index + 1 >= len(nodes):
+            # Marker present but the shape is unexpected — keep the record as-is
+            # (stripped) rather than dropping coverage.
+            _strip_gentime_collapse_markers(record)
+            result.append(record)
+            continue
+        pivot_node_index = step_index + 1
+        rep_pivot_label = str(nodes[pivot_node_index])
+        # Representative row first (matches the DFS emit order: representative id
+        # sorts lowest, and ``collapse_sibling_pivot_paths`` orders by status then
+        # record index — so the representative-first order is preserved).
+        is_terminal_pivot = pivot_node_index == len(nodes) - 1
+        for member_id in member_ids:
+            member_label = node_id_to_label.get(member_id, member_id)
+            sibling = copy.deepcopy(record)
+            sib_nodes = list(sibling.get("nodes") or [])
+            sib_nodes[pivot_node_index] = member_label
+            sibling["nodes"] = sib_nodes
+            # When the interchangeable pivot IS the terminal node, every label
+            # that identifies the terminal must swap with it (a terminal dead-end
+            # leaf: e.g. ``AO --GenericAll--> HealthMailbox`` where each leaf is
+            # its own finding target). ``source`` never swaps — the pivot is never
+            # node 0.
+            if is_terminal_pivot:
+                for term_key in ("target", "terminal_target_label"):
+                    if str(sibling.get(term_key) or "") == rep_pivot_label:
+                        sibling[term_key] = member_label
+            # Swap the pivot label in the two adjacent steps' endpoints so the
+            # per-step details stay consistent with the swapped node sequence.
+            sib_steps = sibling.get("steps")
+            if isinstance(sib_steps, list):
+                for si in (step_index, step_index + 1):
+                    if 0 <= si < len(sib_steps) and isinstance(sib_steps[si], dict):
+                        details = sib_steps[si].get("details")
+                        if isinstance(details, dict):
+                            if str(details.get("from") or "") == rep_pivot_label:
+                                details["from"] = member_label
+                            if str(details.get("to") or "") == rep_pivot_label:
+                                details["to"] = member_label
+                        # Keep the private decorate ids consistent for the swapped
+                        # endpoint so a later decorate re-walk resolves the sibling.
+                        if si == step_index and "_decorate_to_id" in sib_steps[si]:
+                            sib_steps[si]["_decorate_to_id"] = member_id
+                        if si == step_index + 1 and "_decorate_from_id" in sib_steps[si]:
+                            sib_steps[si]["_decorate_from_id"] = member_id
+            # Rebuild the exact signature from the SWAPPED nodes so containment /
+            # dedup treat the sibling as its own path (the pivot node differs).
+            # Set it explicitly (rather than popping to force a lazy rebuild) so a
+            # downstream consumer that reads it — e.g. the sibling-path stash in
+            # collapse_sibling_pivot_paths — sees the correct value, not None.
+            sib_rels = sibling.get("relations")
+            if isinstance(sib_nodes, list) and isinstance(sib_rels, list):
+                sibling["_exact_signature"] = (
+                    tuple(str(n) for n in sib_nodes),
+                    tuple(str(r) for r in sib_rels),
+                )
+            else:
+                sibling.pop("_exact_signature", None)
+            _strip_gentime_collapse_markers(sibling)
+            result.append(sibling)
+    return result
+
+
+def _gentime_collapse_enabled() -> bool:
+    """Whether the generation-time interchangeable-pivot collapse is active."""
+    return str(
+        os.getenv("ADSCAN_ATTACK_PATH_GENTIME_COLLAPSE", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_node_id_to_label(graph: dict[str, Any] | None) -> dict[str, str]:
+    """Return ``{node_id: label}`` for the re-expansion pivot label lookup."""
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, dict):
+        return {}
+    out: dict[str, str] = {}
+    for nid, node in nodes.items():
+        if isinstance(node, dict):
+            out[str(nid)] = str(node.get("label") or nid)
+    return out
+
+
+def maybe_reexpand_gentime_collapsed_pivots(
+    records: list[dict[str, Any]],
+    *,
+    graph: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Re-expand gen-time-collapsed pivots (no-op when the collapse is disabled).
+
+    Called right before ``collapse_sibling_pivot_paths`` in every pipeline so the
+    proven post-materialization merge produces byte-identical ``via_accounts``
+    metadata regardless of whether the interchangeable-pivot collapse happened at
+    generation time or not.
+    """
+    if not _gentime_collapse_enabled():
+        return records
+    node_id_to_label = _build_node_id_to_label(graph)
+    return reexpand_gentime_collapsed_pivots(
+        records, node_id_to_label=node_id_to_label
+    )
 
 
 def collapse_sibling_pivot_paths(
@@ -1823,6 +2017,32 @@ def apply_affected_user_metadata(
     if not has_principals:
         return records
 
+    # Sorting a group's member set is by far the hottest work in this stage:
+    # thousands of records converge on the same broad groups (Domain Users,
+    # Account Operators, nested Exchange clusters), so a naive per-record sort
+    # re-sorts the SAME large set thousands of times (measured: ~87% of stage
+    # time on L15k) and each record materialises its own copy of the resulting
+    # list (the stage's RAM peak).  Sort each group ONCE and share the resulting
+    # (read-only) list across every record whose source is that group — the
+    # affected lists are never mutated in place downstream, only read or
+    # wholesale-replaced.  This collapses O(records) sorts to O(distinct groups)
+    # and O(records) list copies to O(distinct groups) shared references.
+    group_affected_cache: dict[str, tuple[list[str], list[str]]] = {}
+
+    def _affected_for_group(group_label: str) -> tuple[list[str], list[str]]:
+        cached = group_affected_cache.get(group_label)
+        if cached is not None:
+            return cached
+        sorted_users = sorted(
+            user_group_members.get(group_label, ()), key=str.lower
+        )
+        sorted_computers = sorted(
+            computer_group_members.get(group_label, ()), key=str.lower
+        )
+        result = (sorted_users, sorted_computers)
+        group_affected_cache[group_label] = result
+        return result
+
     annotated: list[dict[str, Any]] = []
     for record in records:
         current = record
@@ -1845,11 +2065,8 @@ def apply_affected_user_metadata(
             affected_users: list[str] = []
             affected_computers: list[str] = []
             if kind == "Group":
-                affected_users = sorted(
-                    user_group_members.get(canonical_source, set()), key=str.lower
-                )
-                affected_computers = sorted(
-                    computer_group_members.get(canonical_source, set()), key=str.lower
+                affected_users, affected_computers = _affected_for_group(
+                    canonical_source
                 )
             elif source_label:
                 # Individual principal (User or Computer) — single affected entry.
@@ -3065,6 +3282,14 @@ def compute_display_paths_for_domain(
         started_at=unfiltered_started_at,
         records=unfiltered,
     )
+    # Re-expand gen-time-collapsed pivots at the RAW record boundary — before any
+    # collapse/minimise — so every downstream stage sees the identical full set it
+    # would in an OFF run. The RAM/OOM win is the SMALLER list the DFS held (see
+    # _build_interchangeable_pivot_suppression); byte-identity is preserved because
+    # the collapsed set is re-expanded here, ahead of minimisation.
+    unfiltered = maybe_reexpand_gentime_collapsed_pivots(
+        unfiltered, graph=runtime_graph
+    )
     collapsed_started_at = time.monotonic()
     collapsed = collapse_memberof_prefixes(
         unfiltered,
@@ -3275,7 +3500,11 @@ def compute_display_paths_for_start_node(
         records=records,
     )
 
+    # Raw checkpoint reflects the SMALLER DFS output (the OOM-relevant peak); the
+    # re-expansion restores the full set immediately after, before minimisation,
+    # so every downstream stage is byte-identical to an OFF run.
     _debug_paths_checkpoint(f"raw paths start_node_id={start_node_id}", records)
+    records = maybe_reexpand_gentime_collapsed_pivots(records, graph=runtime_graph)
     minimized_started_at = time.monotonic()
     minimized_records = minimize_display_paths(
         records, domain=domain, snapshot=snapshot
@@ -3508,6 +3737,10 @@ def compute_display_paths_for_principals(
         started_at=minimized_started_at,
         records=minimized,
     )
+    # NOTE: gen-time-collapse re-expansion already ran INSIDE each per-principal
+    # compute_display_paths_for_user (the start_node pipeline) before this
+    # aggregation, so records here carry no markers — the collapse below is a
+    # plain no-op wrt gen-time collapse.
     pivot_collapsed_started_at = time.monotonic()
     minimized = collapse_sibling_pivot_paths(minimized)
     _log_phase_timing(

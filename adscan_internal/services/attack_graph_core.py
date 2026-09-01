@@ -22,6 +22,10 @@ from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from adscan_core.reporting.attack_path_memory_gate import (
+    DfsMemoryBudget,
+    _AttackPathMemoryBudgetExceeded,
+)
 from adscan_internal.services import attack_path_progress
 from adscan_internal.services.domain_controller_classifier import (
     RID_DOMAIN_CONTROLLERS,
@@ -1082,6 +1086,96 @@ def get_owned_node_ids(
     return resolved
 
 
+def _build_light_display_records(
+    graph: dict[str, Any],
+    computed: list[AttackPath],
+    *,
+    target: str,
+    mode: str,
+    key_fn: Callable[[dict[str, Any]], Any],
+) -> list[dict[str, Any]]:
+    """Shape raw DFS paths into light display records (shared by both entry points).
+
+    The DFS emits thousands of candidates (42k+ on Forest owned/all); this loop
+    turns each into a light record and stamps its target-criticality classes.
+    ``_node_target_priority_class`` / ``_node_target_priority_rank`` /
+    ``_node_target_terminal_class`` are PURE functions of the target node and
+    internally re-call the costly ``_node_is_tier0`` 8+ times each, yet those
+    thousands of paths resolve to only a few hundred distinct target nodes — so
+    the triple is memoised per ``target_id`` (byte-identical, computed once per
+    node instead of once per path). ``key_fn`` is the caller's own dedup key.
+    """
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        apply_path_based_classification as _apply_pbc,
+    )
+
+    target_class_cache: dict[str, tuple[str, int, str]] = {}
+
+    def _classify_target(target_id: str) -> tuple[str, int, str]:
+        cached = target_class_cache.get(target_id)
+        if cached is not None:
+            return cached
+        node = nodes_map.get(target_id) if isinstance(nodes_map, dict) else None
+        if isinstance(node, dict):
+            verdict = (
+                _node_target_priority_class(node),
+                _node_target_priority_rank(node),
+                _node_target_terminal_class(node),
+            )
+        else:
+            verdict = ("pivot", 100, "pivot")
+        target_class_cache[target_id] = verdict
+        return verdict
+
+    results: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+
+    for path in computed:
+        candidate = path
+        if target == "highvalue":
+            target_is_hv = _path_target_is_high_value(graph, path.target_id, mode=mode)
+            if not target_is_hv:
+                promoted = _try_promote_target_via_membership_edges(
+                    graph, path, required_rank=1 if mode == "impact" else 3, mode=mode
+                )
+                if promoted:
+                    candidate = promoted
+                    target_is_hv = True
+            if not target_is_hv:
+                continue
+        elif target == "lowpriv":
+            if _path_target_is_high_value(graph, path.target_id, mode=mode):
+                continue
+
+        # Build the LIGHT record here — the DFS emits thousands of candidates and
+        # minimisation keeps ~2%; the expensive per-step decoration is deferred to
+        # the survivors via ``decorate_display_records`` at the end of the
+        # post-processing pipeline. See ``path_to_display_record``.
+        record = path_to_display_record(graph, candidate, decorate=False)
+        target_id = str(candidate.target_id or "")
+        target_node = nodes_map.get(target_id) if isinstance(nodes_map, dict) else None
+        priority_class, priority_rank, terminal_class = _classify_target(target_id)
+        record["target_priority_class"] = priority_class
+        record["target_priority_rank"] = priority_rank
+        record["target_terminal_class"] = terminal_class
+        record["is_tier_zero"] = priority_class == "tierzero"
+        record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
+        # Phase 3 — path-based compromise-class classifier (overrides terminal_class).
+        _apply_pbc(record, target_node if isinstance(target_node, dict) else None)
+        nodes = record.get("nodes")
+        rels = record.get("relations")
+        if not isinstance(nodes, list) or not isinstance(rels, list):
+            continue
+        key = key_fn(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(record)
+
+    return results
+
+
 def compute_display_paths_for_domain_unfiltered(
     graph: dict[str, Any],
     *,
@@ -1131,72 +1225,13 @@ def compute_display_paths_for_domain_unfiltered(
         chokepoint_group_ids=chokepoint_group_ids,
     )
 
-    results: list[dict[str, Any]] = []
-    seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
-
-    for path in computed:
-        candidate = path
-        if target == "highvalue":
-            target_is_hv = _path_target_is_high_value(graph, path.target_id, mode=mode)
-            if not target_is_hv:
-                promoted = _try_promote_target_via_membership_edges(
-                    graph, path, required_rank=1 if mode == "impact" else 3, mode=mode
-                )
-                if promoted:
-                    candidate = promoted
-                    target_is_hv = True
-            if not target_is_hv:
-                continue
-        elif target == "lowpriv":
-            if _path_target_is_high_value(graph, path.target_id, mode=mode):
-                continue
-
-        # Build the LIGHT record here — the DFS emits thousands of candidates and
-        # minimisation keeps ~2%; the expensive per-step decoration is deferred to
-        # the survivors via ``decorate_display_records`` at the end of the
-        # post-processing pipeline. See ``path_to_display_record``.
-        record = path_to_display_record(graph, candidate, decorate=False)
-        nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-        target_node = (
-            nodes_map.get(str(candidate.target_id or ""))
-            if isinstance(nodes_map, dict)
-            else None
-        )
-        priority_class = (
-            _node_target_priority_class(target_node)
-            if isinstance(target_node, dict)
-            else "pivot"
-        )
-        record["target_priority_class"] = priority_class
-        record["target_priority_rank"] = (
-            _node_target_priority_rank(target_node)
-            if isinstance(target_node, dict)
-            else 100
-        )
-        record["target_terminal_class"] = (
-            _node_target_terminal_class(target_node)
-            if isinstance(target_node, dict)
-            else "pivot"
-        )
-        record["is_tier_zero"] = priority_class == "tierzero"
-        record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
-        # Phase 3 — path-based compromise-class classifier (overrides terminal_class).
-        from adscan_internal.services.compromise_class import (
-            apply_path_based_classification as _apply_pbc,
-        )
-
-        _apply_pbc(record, target_node if isinstance(target_node, dict) else None)
-        nodes = record.get("nodes")
-        rels = record.get("relations")
-        if not isinstance(nodes, list) or not isinstance(rels, list):
-            continue
-        key = display_record_signature(record)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(record)
-
-    return results
+    return _build_light_display_records(
+        graph,
+        computed,
+        target=target,
+        mode=mode,
+        key_fn=display_record_signature,
+    )
 
 
 def _record_affected_principal_count(record: dict[str, Any]) -> int:
@@ -1883,72 +1918,20 @@ def compute_display_paths_for_start_node(
         reachable_node_ids=high_value_reachable_node_ids,
     )
 
-    results: list[dict[str, Any]] = []
-    seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    def _start_node_dedup_key(
+        record: dict[str, Any],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        nodes = record.get("nodes") or []
+        rels = record.get("relations") or []
+        return (tuple(str(n) for n in nodes), tuple(str(r) for r in rels))
 
-    for path in computed:
-        candidate = path
-        if target == "highvalue":
-            target_is_hv = _path_target_is_high_value(graph, path.target_id, mode=mode)
-            if not target_is_hv:
-                promoted = _try_promote_target_via_membership_edges(
-                    graph, path, required_rank=1 if mode == "impact" else 3, mode=mode
-                )
-                if promoted:
-                    candidate = promoted
-                    target_is_hv = True
-            if not target_is_hv:
-                continue
-        elif target == "lowpriv":
-            if _path_target_is_high_value(graph, path.target_id, mode=mode):
-                continue
-
-        # Build the LIGHT record here — the DFS emits thousands of candidates and
-        # minimisation keeps ~2%; the expensive per-step decoration is deferred to
-        # the survivors via ``decorate_display_records`` at the end of the
-        # post-processing pipeline. See ``path_to_display_record``.
-        record = path_to_display_record(graph, candidate, decorate=False)
-        nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-        target_node = (
-            nodes_map.get(str(candidate.target_id or ""))
-            if isinstance(nodes_map, dict)
-            else None
-        )
-        priority_class = (
-            _node_target_priority_class(target_node)
-            if isinstance(target_node, dict)
-            else "pivot"
-        )
-        record["target_priority_class"] = priority_class
-        record["target_priority_rank"] = (
-            _node_target_priority_rank(target_node)
-            if isinstance(target_node, dict)
-            else 100
-        )
-        record["target_terminal_class"] = (
-            _node_target_terminal_class(target_node)
-            if isinstance(target_node, dict)
-            else "pivot"
-        )
-        record["is_tier_zero"] = priority_class == "tierzero"
-        record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
-        # Phase 3 — path-based compromise-class classifier (overrides terminal_class).
-        from adscan_internal.services.compromise_class import (
-            apply_path_based_classification as _apply_pbc,
-        )
-
-        _apply_pbc(record, target_node if isinstance(target_node, dict) else None)
-        nodes = record.get("nodes")
-        rels = record.get("relations")
-        if not isinstance(nodes, list) or not isinstance(rels, list):
-            continue
-        key = (tuple(str(n) for n in nodes), tuple(str(r) for r in rels))
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(record)
-
-    return results
+    return _build_light_display_records(
+        graph,
+        computed,
+        target=target,
+        mode=mode,
+        key_fn=_start_node_dedup_key,
+    )
 
 
 def _build_local_reuse_virtual_state(
@@ -2280,18 +2263,26 @@ def enrich_foreign_dc_nodes_from_inventory(
 #: ``attack_step_catalog.py`` (``crossorgtgtdelegation``).
 _CROSS_ORG_TGT_DELEGATION_RELATION = "CrossOrgTgtDelegation"
 
+#: Relation for the child->parent forest-root escalation (RaiseChild): from a
+#: compromised child Domain object to its parent/forest-root Domain object, via the
+#: trust key + krbtgt SID-history forgery. Classified ``EdgeKind.ESCALATION``.
+_RAISE_CHILD_RELATION = "RaiseChild"
+
 #: Relations that escalate FROM one compromised Domain object INTO another domain
 #: (the cross-domain / cross-forest escalation category). A Domain node is normally
 #: a hard DFS terminal (``is_terminal`` in object mode), but when it carries one of
 #: these OUTBOUND edges the kill chain genuinely continues across the trust boundary
-#: — e.g. ``… → DCSync → DARKZERO.EXT → CrossOrgTgtDelegation → DARKZERO.HTB``. Only
-#: these modeled escalation relations lift the terminal stop; every other outbound
-#: edge from a Domain node (structural TrustedBy, etc.) leaves it terminal, so the
-#: existing single-domain paths are unaffected. Extend this set as new cross-domain
-#: escalation steps land (SID-history abuse, unconstrained-delegation-across-trust,
-#: foreign-group-membership).
+#: — e.g. ``… → DCSync → DARKZERO.EXT → CrossOrgTgtDelegation → DARKZERO.HTB`` or a
+#: child domain -> RaiseChild -> forest root. Only these modeled escalation relations
+#: lift the terminal stop; every other outbound edge from a Domain node (structural
+#: TrustedBy, etc.) leaves it terminal, so the existing single-domain paths are
+#: unaffected. Extend this set as new cross-domain escalation steps land (SID-history
+#: abuse, unconstrained-delegation-across-trust, foreign-group-membership).
 _CROSS_DOMAIN_ESCALATION_RELATIONS: frozenset[str] = frozenset(
-    {_CROSS_ORG_TGT_DELEGATION_RELATION.lower()}
+    {
+        _CROSS_ORG_TGT_DELEGATION_RELATION.lower(),
+        _RAISE_CHILD_RELATION.lower(),
+    }
 )
 
 
@@ -2354,7 +2345,7 @@ def _find_domain_node_id(
 
 
 def _iter_cross_org_tgt_delegation_trusts(
-    graph: dict[str, Any],
+    graph: dict[str, Any] | None,
     domains_data: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     """Collect trusts carrying CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION.
@@ -2444,7 +2435,13 @@ def _iter_cross_org_tgt_delegation_trusts(
                 )
 
     # Source 2 — TrustedBy edges persisted in the graph itself.
-    nodes_map = graph.get("nodes")
+    # ``graph`` is optional: a caller resolving trusts purely from
+    # ``domains_data`` (e.g. the cross-domain-escalation drain in
+    # ``cross_domain_escalation._cross_org_applies``) passes ``None``. Treat a
+    # missing/non-dict graph as "no graph-persisted trust edges" so Source 1
+    # (domains_data) still works and this function never raises on ``None``.
+    graph_map = graph if isinstance(graph, dict) else {}
+    nodes_map = graph_map.get("nodes")
     nodes_map = nodes_map if isinstance(nodes_map, dict) else {}
 
     def _node_label(node_id: str) -> str:
@@ -2453,7 +2450,7 @@ def _iter_cross_org_tgt_delegation_trusts(
             return str(node.get("label") or node.get("name") or "").strip()
         return ""
 
-    for edge in graph.get("edges") or []:
+    for edge in graph_map.get("edges") or []:
         if not isinstance(edge, dict):
             continue
         if str(edge.get("relation") or "").strip().lower() != "trustedby":
@@ -2509,8 +2506,12 @@ def couple_cross_org_tgt_delegation_edges(
     * The edge is marked ``theoretical`` — ADscan models the exposure from the
       trust attribute but does not (yet) execute the cross-forest ticket capture.
 
-    In-memory only — never persisted to disk. Idempotent (re-adding an existing
-    edge is a no-op). Returns True when it changed the graph.
+    Idempotent (re-adding an existing edge is a no-op). Returns True when it
+    changed the graph. This mints the edge into the passed graph dict; when the
+    dict is the ORIGIN domain's persisted graph (see
+    :func:`attack_graph_service.persist_cross_domain_trust_edges`) the edge
+    survives reloads so an executed escalation keeps its ``success`` status. The
+    query-time merge re-runs this as a no-op once the edge is already present.
     """
     nodes_map = graph.get("nodes")
     if not isinstance(nodes_map, dict) or not nodes_map:
@@ -2564,11 +2565,138 @@ def couple_cross_org_tgt_delegation_edges(
                 "kind": "escalation",
                 "status": "discovered",
                 "notes": {
-                    "virtual": True,
                     "theoretical": True,
                     "synthesized_from": "cross_org_tgt_delegation_trust",
                     "trusting_domain": trust["source_domain"],
                     "compromised_domain": trust["target_domain"],
+                },
+            }
+        )
+        changed = True
+
+    return changed
+
+
+def _iter_within_forest_child_parent(
+    domains_data: Mapping[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Collect (child, parent) pairs for same-forest child->parent escalation.
+
+    A domain ``a.b.c`` is a CHILD of ``b.c`` when a ``WITHIN_FOREST`` trust to the
+    parent exists AND the parent (``b.c``) is a known domain in ``domains_data``
+    (so RaiseChild has a real forest root to escalate into). The parent is the DNS
+    suffix — matching ``run_raise_child``'s own child/parent identification
+    (``privileges.py`` ``domain.split(".", 1)[1]``). Only the FIRST DNS label is
+    stripped, so ``child.parent.forest`` -> ``parent.forest`` (one hop up); deeper
+    chains escalate one level per compromise, which is correct.
+
+    Returns records ``{"child": <lower>, "parent": <lower>}``; de-duplicated.
+    """
+    if not isinstance(domains_data, Mapping):
+        return []
+    known = {str(name).strip().lower() for name in domains_data.keys()}
+    results: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for name, entry in domains_data.items():
+        child = str(name or "").strip().lower()
+        parts = child.split(".", 1)
+        if len(parts) < 2:
+            continue
+        parent = parts[1]
+        if parent not in known or parent == child:
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        # Require a WITHIN_FOREST trust from the child to the parent to avoid
+        # coupling a RaiseChild edge on a mere DNS-suffix coincidence between two
+        # unrelated domains that happen to share a suffix.
+        has_within_forest = False
+        for trust in entry.get("trusts") or ():
+            if not isinstance(trust, Mapping):
+                continue
+            tgt = str(trust.get("target_domain") or "").strip().lower()
+            flags = {
+                str(f).strip().upper()
+                for f in (trust.get("attribute_flags") or ())
+            }
+            if tgt == parent and "WITHIN_FOREST" in flags:
+                has_within_forest = True
+                break
+        if not has_within_forest:
+            continue
+        key = (child, parent)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({"child": child, "parent": parent})
+    return results
+
+
+def couple_raise_child_edges(
+    graph: dict[str, Any],
+    domains_data: Mapping[str, Any] | None,
+) -> bool:
+    """Couple a child->parent RaiseChild escalation edge onto the graph.
+
+    For every same-forest child domain whose parent/forest root is a known domain
+    (see :func:`_iter_within_forest_child_parent`), add a derived escalation edge
+    ``child Domain -> parent Domain`` when BOTH domain objects exist as nodes. This
+    is the intra-forest analogue of :func:`couple_cross_org_tgt_delegation_edges`:
+    a compromise of the child forest-lets the kill chain continue up to the forest
+    root via the trust key + krbtgt SID-history forgery (``raise_child_native``).
+
+    Conservative + idempotent, mirrors the cross-org coupling. Persisted into the
+    origin (child) domain's graph via
+    :func:`attack_graph_service.persist_cross_domain_trust_edges` so its status
+    survives reloads. Returns True when it changed the graph.
+    """
+    nodes_map = graph.get("nodes")
+    if not isinstance(nodes_map, dict) or not nodes_map:
+        return False
+    pairs = _iter_within_forest_child_parent(domains_data)
+    if not pairs:
+        return False
+
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        edges = []
+        graph["edges"] = edges
+
+    existing_pairs: set[tuple[str, str]] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "") != _RAISE_CHILD_RELATION:
+            continue
+        frm = str(edge.get("from") or edge.get("source") or "").strip()
+        to = str(edge.get("to") or edge.get("target") or "").strip()
+        if frm and to:
+            existing_pairs.add((frm, to))
+
+    changed = False
+    for pair_rec in pairs:
+        child_node_id = _find_domain_node_id(nodes_map, label=pair_rec["child"])
+        parent_node_id = _find_domain_node_id(nodes_map, label=pair_rec["parent"])
+        if not child_node_id or not parent_node_id:
+            continue
+        if child_node_id == parent_node_id:
+            continue
+        pair = (child_node_id, parent_node_id)
+        if pair in existing_pairs:
+            continue
+        existing_pairs.add(pair)
+        edges.append(
+            {
+                "from": child_node_id,
+                "to": parent_node_id,
+                "relation": _RAISE_CHILD_RELATION,
+                "kind": "escalation",
+                "status": "discovered",
+                "notes": {
+                    "theoretical": True,
+                    "synthesized_from": "within_forest_child_parent_trust",
+                    "child_domain": pair_rec["child"],
+                    "parent_domain": pair_rec["parent"],
                 },
             }
         )
@@ -3371,16 +3499,30 @@ def _dfs_sources_batch_worker(
     are already loaded into the worker process via the pool initializer;
     only the cheap per-task arguments are serialized on each dispatch.
     """
-    adjacency = _W_ADJACENCY
-    local_reuse_by_node = _W_LOCAL_REUSE_BY_NODE
-    local_reuse_existing_pairs = _W_LOCAL_REUSE_EXISTING_PAIRS
-    local_reuse_useful_nodes = _W_LOCAL_REUSE_USEFUL_NODES
     terminal_set = _W_TERMINAL_SET
-    implicit_edge_overlay = _W_IMPLICIT_EDGE_OVERLAY
     reachable_node_ids = _W_REACHABLE_NODE_IDS
+    # Rebuild the shared expansion view (concern 1) from the per-worker globals
+    # the pool initializer populated. The worker path carries no gentime-collapse
+    # state (it is not passed to workers), so those fields are empty — byte-
+    # identical to the previous inline behaviour. Degree maps are unused here.
+    view = AttackPathExpansionView(
+        adjacency=_W_ADJACENCY,
+        incoming={},
+        outgoing={},
+        local_reuse_by_node=_W_LOCAL_REUSE_BY_NODE,
+        local_reuse_existing_pairs=_W_LOCAL_REUSE_EXISTING_PAIRS,
+        local_reuse_useful_nodes=_W_LOCAL_REUSE_USEFUL_NODES,
+        implicit_edge_overlay=_W_IMPLICIT_EDGE_OVERLAY,
+        gentime_suppressed=set(),
+        gentime_representatives={},
+    )
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
+    # In-DFS runaway bound (shared with the sequential DFS entrypoints): converts a
+    # mid-recursion OOM into the SAME declared coverage-bounded stop the outer gate
+    # raises, instead of a kernel SIGKILL. Never fires on a graph that fits in RAM.
+    _budget = DfsMemoryBudget()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -3404,6 +3546,7 @@ def _dfs_sources_batch_worker(
         )
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
+        _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
         actionable_depth = _count_actionable_edges(acc_steps)
@@ -3415,75 +3558,33 @@ def _dfs_sources_batch_worker(
         ):
             emit(acc_steps)
             return
-        next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
-            current,
-            adjacency=adjacency,
-            acc_steps=acc_steps,
-            local_reuse_by_node=local_reuse_by_node,
-            local_reuse_existing_pairs=local_reuse_existing_pairs,
-            local_reuse_useful_nodes=local_reuse_useful_nodes,
-            implicit_edge_overlay=implicit_edge_overlay,
-        )
+        next_edges = iter_view_frontier(view, current, acc_steps)
         if not next_edges:
             emit(acc_steps)
             return
         extended = False
         _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
-            last_step = acc_steps[-1] if acc_steps else None
-            if _is_same_local_reuse_cluster_chain(last_step, edge):
+            verdict, is_self_loop, step_notes = admit_frontier_edge(
+                edge,
+                current=current,
+                acc_steps=acc_steps,
+                path_rels=_path_rels,
+                visited=visited,
+                view=view,
+                reachable_node_ids=reachable_node_ids,
+                terminal_set=terminal_set,
+                chokepoint_root_set=set(),
+            )
+            if verdict != "admit":
                 continue
-
-            # ── Credential-context guard ────────────────────────────────────
-            # Pruning incompatible chains at the DFS level (rather than at
-            # render time) avoids generating paths like
-            # AdminTo → AllowedToDelegate that look valid syntactically but
-            # require an unstated post-exploitation step.
-            _cand_rel = str(edge.get("relation") or "").strip().lower()
-            if not _edges_chain_ok(_path_rels, _cand_rel, candidate_edge=edge):
-                continue
-            # ── End guard ────────────────────────────────────────────────────
-
             to_id = str(edge.get("to") or "")
-            if not to_id:
-                continue
-            # Self-loop edges (to_id == current) are context-upgrading derived
-            # steps (e.g. DumpLSASS on the same node).  They don't advance the
-            # DFS to a new node, so the visited-set check does not apply —
-            # current is already in visited as expected.  Append the step and
-            # recurse from the same node without re-adding to visited.
-            is_self_loop = to_id == current
-            if not is_self_loop and to_id in visited:
-                continue
-            # A self-loop technique is a one-time capability gain on this host;
-            # do not re-traverse the same self-loop relation (prevents same-node
-            # cycles like XpCmdshell ↔ MssqlTokenTheftEscalation oscillating).
-            if is_self_loop and _self_loop_relation_already_used(
-                acc_steps, current, _cand_rel
-            ):
-                continue
-            # ── Reverse-reachability expansion guard ─────────────────────────
-            # Mirror of the sequential DFS guard in compute_maximal_attack_paths:
-            # never expand into a node that can neither reach a high-value/Tier-0
-            # sink nor is itself a terminal sink. reachable_node_ids is empty
-            # unless the caller requested reachability pruning (highvalue target
-            # only), so this is a no-op for target=all/lowpriv — no coverage loss.
-            # A skipped node cannot be an intermediate of any Tier-0-terminating
-            # path (emit() already discards non-terminal endpoints), so the
-            # emitted highvalue path set is provably unchanged.
-            if (
-                reachable_node_ids
-                and to_id not in reachable_node_ids
-                and to_id not in terminal_set
-            ):
-                continue
-            # ── End guard ────────────────────────────────────────────────────
             step = AttackPathStep(
                 from_id=current,
                 relation=str(edge.get("relation") or ""),
                 to_id=to_id,
                 status=str(edge.get("status") or "discovered"),
-                notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
+                notes=step_notes,
             )
             if not is_self_loop:
                 visited.add(to_id)
@@ -3597,6 +3698,12 @@ def _run_parallel_domain_dfs(
                             for f in futures:
                                 f.cancel()
                             return all_paths
+    except _AttackPathMemoryBudgetExceeded:
+        # A worker hit the in-DFS runaway bound. This is a DELIBERATE clean stop,
+        # not a worker crash — re-raise so it reaches the declared coverage-bounded
+        # handler at the public entry point instead of being swallowed into a
+        # silent full sequential re-run (which would only OOM the same way).
+        raise
     except Exception:  # noqa: BLE001
         # Any failure (spawn unavailable, worker crash, etc.) → fall back to
         # sequential; the caller will redo the DFS serially.
@@ -3739,6 +3846,493 @@ def _build_priority_memberof_suppression(
     return suppressed
 
 
+# ---------------------------------------------------------------------------
+# Generation-time interchangeable-pivot collapse (PROTOTYPE)
+# ---------------------------------------------------------------------------
+# ADscan's DFS enumerates then RETAINS every maximal simple path; on a mass-ACL
+# / mass-membership fan-out over INTERCHANGEABLE pivots (e.g. Account Operators
+# --GenericAll--> {4000 accounts} --AdminTo--> {sinks}) the raw path count and
+# peak RAM explode combinatorially. The existing post-materialization merge
+# ``collapse_sibling_pivot_paths`` (attack_paths_core) already flattens exactly
+# these sibling paths — but only AFTER the DFS built every branch and memory
+# peaked, and AFTER the O(N^2) minimisation walked them all.
+#
+# This moves that PROVEN-SAFE merge earlier: a pre-DFS pass detects each set of
+# interchangeable pivots reachable from one source, and the DFS walks ONLY the
+# representative pivot's subtree. Because the siblings are structurally
+# identical (same incoming relation, same node kind, byte-identical outgoing
+# signature, none Tier-0/high-value), the representative's subtree is exactly
+# what every sibling would have produced — so no downstream path shape is lost.
+#
+# The collapse is coverage-preserving by CONSTRUCTION, not by re-implementing
+# the display merge: the suppressed siblings are re-expanded (shallow, one row
+# per representative record, not per subtree) right before the untouched
+# ``collapse_sibling_pivot_paths`` runs, so that proven function produces the
+# byte-identical ``via_accounts``/``via_accounts_count`` metadata it always has.
+# The DFS + minimisation — where the K x subtree blow-up and the O(N^2) cost
+# live — operate on the collapsed set. The suppression MIRRORS the established
+# ``_build_priority_memberof_suppression`` pattern: pre-compute a set, honour it
+# at the traversal seam.
+#
+# Toggle: ADSCAN_ATTACK_PATH_GENTIME_COLLAPSE=1 enables it (default OFF while it
+# is a prototype under review). The debug script's --gentime-collapse flag sets
+# this env var.
+
+#: Note key stamped on a representative pivot's INCOMING step so the shallow
+#: re-expansion can recover the suppressed sibling node ids.
+_GENTIME_COLLAPSE_MEMBERS_KEY = "gentime_collapsed_pivot_members"
+
+
+def _read_gentime_collapse_enabled() -> bool:
+    return str(os.getenv("ADSCAN_ATTACK_PATH_GENTIME_COLLAPSE", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _node_outgoing_signature(
+    node_id: str,
+    adjacency: dict[str, list[dict[str, Any]]],
+) -> tuple[tuple[str, str], ...]:
+    """Return a node's canonical outgoing signature: sorted ``(relation, to_id)``.
+
+    Two pivots with the SAME signature have byte-identical downstream reach — the
+    DFS subtree they generate is identical (same edges to the same nodes) — so
+    keeping one representative loses no path. A self-loop (``to_id == node_id``)
+    is normalised out: it is a per-node capability, identical for every sibling.
+    """
+    sig: list[tuple[str, str]] = []
+    for edge in adjacency.get(node_id) or []:
+        if not isinstance(edge, dict):
+            continue
+        rel = str(edge.get("relation") or "").strip().lower()
+        to_id = str(edge.get("to") or "").strip()
+        if not rel or not to_id:
+            continue
+        if to_id == node_id:
+            # Self-loop capability — identical across siblings, drop from the key.
+            continue
+        sig.append((rel, to_id))
+    sig.sort()
+    return tuple(sig)
+
+
+def _read_gentime_collapse_interior() -> bool:
+    """Whether to ALSO collapse interior (non-dead-end) interchangeable pivots.
+
+    Default ON. The SINGLE-PARENT guard (a pivot collapsed only when it is reached
+    from exactly the grouping source) is what makes the collapse byte-safe: it
+    removes the DFS ``visited``-set interaction that would otherwise let two
+    same-outgoing pivots reach different terminals under different prefixes. Under
+    that guard, an interior single-parent pivot's subtree is identical across
+    siblings and self-contained, so collapsing it is byte-identical (validated on
+    Forest / Blackfield / the synthetic AO fan-out). Set the env var to ``0`` to
+    restrict to dead-end leaves only (measurement / extra caution).
+    """
+    return str(
+        os.getenv("ADSCAN_ATTACK_PATH_GENTIME_COLLAPSE_INTERIOR", "1")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_interchangeable_pivot_suppression(
+    adjacency: dict[str, list[dict[str, Any]]],
+    nodes_map: dict[str, Any],
+    *,
+    floor: int = 2,
+    interior: bool | None = None,
+) -> tuple[set[tuple[str, str]], dict[tuple[str, str], list[str]]]:
+    """Return the interchangeable-pivot suppression set + representative map.
+
+    For every source ``S`` and incoming relation ``rel``, group ``S``'s outgoing
+    targets that are structurally interchangeable pivots and pick ONE
+    representative per group. The other edges are suppressed at the DFS seam.
+
+    Interchangeability test (all must hold; a leaf failing ANY is excluded):
+
+    * **Same source and same incoming relation** — grouped by ``(S, rel)``.
+    * **Same node kind** — a User pivot and a Computer pivot are not
+      interchangeable even with the same downstream.
+    * **Byte-identical outgoing signature** — the sorted ``(relation, to_id)``
+      multiset (:func:`_node_outgoing_signature`) is identical.
+    * **Dead-end by default** — only pivots with an EMPTY outgoing signature are
+      collapsed unless ``interior`` is set. A dead-end leaf has no subtree, so
+      the collapse is context-free and provably byte-identical. An interior
+      pivot's subtree depends on the DFS ``visited`` set (a cyclic group mesh can
+      route two same-outgoing pivots to different terminals), so collapsing it is
+      NOT guaranteed lossless — gated behind ``interior`` for measurement only.
+    * **Not Tier-0 / high-value** — a pivot that is itself a domain-takeover
+      target is an independent finding and is NEVER collapsed.
+    * **Group size >= floor** (default 2).
+
+    Returns:
+        ``(suppressed, representatives)`` where ``suppressed`` is a set of
+        ``(from_id, to_id)`` edges to skip in the DFS, and ``representatives``
+        maps ``(from_id, rep_to_id) -> [all_member_ids...]`` (representative
+        first) so the shallow re-expansion can rebuild the sibling rows.
+    """
+    if not isinstance(nodes_map, dict) or not adjacency:
+        return set(), {}
+    allow_interior = _read_gentime_collapse_interior() if interior is None else interior
+
+    # In-degree over the TRAVERSABLE adjacency. A pivot reached from more than one
+    # parent can be visited via a DIFFERENT in-path, and the DFS ``visited`` set
+    # then makes its presence context-dependent — collapsing it is NOT byte-safe
+    # (a shared WELLKNOWN sink such as ``Authenticated Users`` reached from dozens
+    # of sources). Only SINGLE-PARENT pivots (reached exclusively from the grouping
+    # source) are collapsed, so the representative is reached exactly as often as
+    # the full sibling set would be.
+    in_parents: dict[str, set[str]] = {}
+    for src, edges in adjacency.items():
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            to_id = str(edge.get("to") or "").strip()
+            if to_id and to_id != src:
+                in_parents.setdefault(to_id, set()).add(src)
+
+    suppressed: set[tuple[str, str]] = set()
+    representatives: dict[tuple[str, str], list[str]] = {}
+
+    for src, edges in adjacency.items():
+        if not isinstance(edges, list) or len(edges) < floor:
+            continue
+        # (relation, kind, outgoing_signature) -> [to_id...] preserving edge order.
+        groups: dict[tuple[str, str, tuple[tuple[str, str], ...]], list[str]] = {}
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            to_id = str(edge.get("to") or "").strip()
+            if not to_id or to_id == src:
+                continue
+            rel = str(edge.get("relation") or "").strip().lower()
+            if not rel:
+                continue
+            node = nodes_map.get(to_id)
+            if not isinstance(node, dict):
+                continue
+            # Never collapse a pivot that is itself a takeover target — it is an
+            # independent, high-value finding.
+            if _node_is_effectively_high_value(node):
+                continue
+            # SINGLE-PARENT ONLY: a pivot reachable from >1 parent is unsafe (the
+            # visited-set makes it context-dependent). Its own parent set is
+            # exactly {src} here.
+            parents = in_parents.get(to_id)
+            if parents is not None and len(parents) > 1:
+                continue
+            out_sig = _node_outgoing_signature(to_id, adjacency)
+            # DEAD-END-ONLY by default: an interior pivot (non-empty out_sig) is
+            # only collapsed when interior mode is explicitly enabled.
+            if out_sig and not allow_interior:
+                continue
+            kind = str(node.get("kind") or "").strip().lower()
+            key = (rel, kind, out_sig)
+            groups.setdefault(key, []).append(to_id)
+
+        for members in groups.values():
+            # Dedupe while preserving order (an edge could be listed twice).
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for mid in members:
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                ordered.append(mid)
+            if len(ordered) < floor:
+                continue
+            # Deterministic representative: lowest node id (stable across runs).
+            ordered.sort()
+            rep = ordered[0]
+            representatives[(src, rep)] = ordered
+            for mid in ordered[1:]:
+                suppressed.add((src, mid))
+
+    return suppressed, representatives
+
+
+# ===========================================================================
+# Attack-path engine — the shared rule layer (architecture C, Phase 1)
+# ===========================================================================
+# The DFS in this module entangled three concerns that a pluggable enumeration
+# engine (Python DFS today, rustworkx later) must be able to share WITHOUT
+# re-implementing. The July rustworkx engine drifted precisely because it
+# hand-copied these rules and missed several of them (see the audit at
+# ``docs/superpowers/specs/2026-08-23-attack-path-engine-rustworkx-gentime-collapse/03-rustworkx-engine-audit.md``).
+# Phase 1 formalises the separation seam so ANY enumerator consumes ONE rule
+# layer. The three concerns:
+#
+#   1. GRAPH-SHAPE guards (this section, ``AttackPathExpansionView`` /
+#      ``build_expansion_view``) — they INVENT edges/roots that do not exist in
+#      ``graph["edges"]`` (virtual local-reuse edges, the five implicit overlays,
+#      the memberof-priority suppression, the gen-time interchangeable-pivot
+#      collapse). Any enumerator that only reads base out-edges is structurally
+#      blind to them, so they are PRE-MATERIALISED into an expansion view before
+#      enumeration — never applied as a post-filter over "raw paths" (that is the
+#      exact bug the audit found; a post-filter silently drops the injected-edge
+#      families).
+#   2. PREFIX-PREDICATE guards (``admit_frontier_edge``) — pure functions of the
+#      accumulated path prefix (credential-context ``_edges_chain_ok``, the
+#      same-cluster local-reuse chain, self-loop one-time gating, the
+#      gen-time-suppressed sibling skip, the visited/self-loop rule, the
+#      reverse-reachability gate). The enumeration loop CALLS them per frontier;
+#      a different engine calls the IDENTICAL callback.
+#   3. ENUMERATION — the thin "all maximal simple paths under the callbacks over
+#      the expansion view" loop. The Python DFS below is the FIRST consumer.
+#
+# This is a pure refactor: the behaviour (and therefore the finding set) is
+# byte-identical, frozen by
+# ``tests/unit/services/test_attack_path_engine_snapshot.py``.
+
+
+@dataclass
+class AttackPathExpansionView:
+    """Pre-materialised graph-shape layer that any enumerator walks (concern 1).
+
+    Built once by :func:`build_expansion_view` from a base attack graph, this
+    value object carries the traversable adjacency plus every SYNTHETIC piece
+    the DFS injects that is not a plain out-edge of ``graph["edges"]``:
+
+    * ``adjacency`` — real edges with non-traversable edges removed and the
+      memberof-priority suppression applied.
+    * ``incoming`` / ``outgoing`` — per-node edge degrees (source selection, the
+      choke-point rooting gates) — populated only for the domain builder.
+    * ``local_reuse_by_node`` / ``local_reuse_existing_pairs`` /
+      ``local_reuse_useful_nodes`` — the star-topology local-reuse virtual-edge
+      state consumed by :func:`_iter_outgoing_edges_with_virtual_local_reuse`.
+    * ``implicit_edge_overlay`` — the five implicit overlay families (DumpLSA +
+      DC-DCSync/session-followup/xpcmdshell/openrowset self-loops).
+    * ``gentime_suppressed`` / ``gentime_representatives`` — the generation-time
+      interchangeable-pivot collapse suppression set + representative map.
+
+    The synthetic local-reuse + overlay edges are surfaced per-visit through
+    :func:`iter_view_frontier` (a thin wrapper over the existing
+    ``_iter_outgoing_edges_with_virtual_local_reuse``), so an enumerator never
+    reaches into these fields directly — it asks the view for the frontier.
+    """
+
+    adjacency: dict[str, list[dict[str, Any]]]
+    incoming: dict[str, int]
+    outgoing: dict[str, int]
+    local_reuse_by_node: dict[str, list[dict[str, Any]]]
+    local_reuse_existing_pairs: set[tuple[str, str]]
+    local_reuse_useful_nodes: set[str]
+    implicit_edge_overlay: dict[str, list[dict[str, Any]]]
+    gentime_suppressed: set[tuple[str, str]]
+    gentime_representatives: dict[tuple[str, str], list[str]]
+
+
+def build_expansion_view(
+    graph: dict[str, Any],
+    *,
+    nodes_map: dict[str, Any],
+    edges: list[dict[str, Any]],
+    track_degrees: bool,
+    gentime_collapse_on: bool,
+) -> AttackPathExpansionView:
+    """Pre-materialise the graph-shape layer both engines consume (concern 1).
+
+    Constructs the traversable adjacency (non-traversable edges removed,
+    memberof-priority suppression applied) plus every synthetic-edge index the
+    DFS injects. This is the SSOT for concern (1) of the separation seam — the
+    exact construction the three DFS entry points previously inlined
+    identically, so extracting it here is byte-identical by construction.
+
+    Args:
+        graph: The base attack graph (used for the implicit-overlay builder,
+            which reads nodes + edges from it).
+        nodes_map: ``graph["nodes"]`` (already validated as a dict by the caller).
+        edges: ``graph["edges"]`` (already validated as a list by the caller).
+        track_degrees: When ``True`` also compute the per-node ``incoming`` /
+            ``outgoing`` degree maps (the domain builder needs them for source
+            selection + choke-point rooting; the per-start builder does not).
+        gentime_collapse_on: When ``True`` compute the interchangeable-pivot
+            collapse suppression set + representative map (OFF by default).
+
+    Returns:
+        A populated :class:`AttackPathExpansionView`.
+    """
+    suppressed_memberof = _build_priority_memberof_suppression(edges, nodes_map)
+
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    incoming: dict[str, int] = {}
+    outgoing: dict[str, int] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if _is_nontraversable_attack_edge(edge, nodes_map):
+            continue
+        from_id = str(edge.get("from") or "")
+        to_id = str(edge.get("to") or "")
+        rel = str(edge.get("relation") or "")
+        if not from_id or not to_id or not rel:
+            continue
+        if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
+            continue
+        adjacency.setdefault(from_id, []).append(edge)
+        if track_degrees:
+            outgoing[from_id] = outgoing.get(from_id, 0) + 1
+            # MemberOf edges (persisted or runtime) should not change which nodes
+            # are considered "sources" in domain-wide path listing.
+            if rel != "MemberOf":
+                incoming[to_id] = incoming.get(to_id, 0) + 1
+            incoming.setdefault(from_id, incoming.get(from_id, 0))
+            outgoing.setdefault(to_id, outgoing.get(to_id, 0))
+
+    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
+        nodes_map, edges
+    )
+    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    implicit_edge_overlay = _build_implicit_path_overlays(graph)
+
+    gentime_suppressed: set[tuple[str, str]] = set()
+    gentime_representatives: dict[tuple[str, str], list[str]] = {}
+    if gentime_collapse_on:
+        gentime_suppressed, gentime_representatives = (
+            _build_interchangeable_pivot_suppression(adjacency, nodes_map)
+        )
+
+    return AttackPathExpansionView(
+        adjacency=adjacency,
+        incoming=incoming,
+        outgoing=outgoing,
+        local_reuse_by_node=local_reuse_by_node,
+        local_reuse_existing_pairs=local_reuse_existing_pairs,
+        local_reuse_useful_nodes=local_reuse_useful_nodes,
+        implicit_edge_overlay=implicit_edge_overlay,
+        gentime_suppressed=gentime_suppressed,
+        gentime_representatives=gentime_representatives,
+    )
+
+
+def iter_view_frontier(
+    view: AttackPathExpansionView,
+    current: str,
+    acc_steps: list[AttackPathStep],
+) -> list[dict[str, Any]]:
+    """Return the outgoing frontier (real + synthetic edges) for ``current``.
+
+    Thin wrapper over :func:`_iter_outgoing_edges_with_virtual_local_reuse` so
+    an enumerator asks the expansion view for the frontier instead of reaching
+    into its synthetic-edge fields. Byte-identical to the previous inline call.
+    """
+    return _iter_outgoing_edges_with_virtual_local_reuse(
+        current,
+        adjacency=view.adjacency,
+        acc_steps=acc_steps,
+        local_reuse_by_node=view.local_reuse_by_node,
+        local_reuse_existing_pairs=view.local_reuse_existing_pairs,
+        local_reuse_useful_nodes=view.local_reuse_useful_nodes,
+        implicit_edge_overlay=view.implicit_edge_overlay,
+    )
+
+
+def admit_frontier_edge(
+    edge: dict[str, Any],
+    *,
+    current: str,
+    acc_steps: list[AttackPathStep],
+    path_rels: list[str],
+    visited: set[str],
+    view: AttackPathExpansionView,
+    reachable_node_ids: set[str],
+    terminal_set: set[str] | None,
+    chokepoint_root_set: set[str],
+) -> tuple[str, bool, dict[str, Any]]:
+    """Apply the shared per-frontier prefix predicates to one candidate edge (concern 2).
+
+    Pure function of the accumulated prefix + the expansion view. Both the
+    Python DFS and any future engine call this IDENTICAL callback per frontier,
+    so the prune rules cannot diverge between engines (the root cause of the
+    rotted July rustworkx impl). It runs the exact in-loop admission sequence
+    the three DFS bodies shared, in order:
+
+    1. same-cluster local-reuse chain suppression (``_is_same_local_reuse_cluster_chain``);
+    2. credential-context edge-chain guard (``_edges_chain_ok`` WITH the
+       candidate edge — the arity the July engine got wrong);
+    3. empty ``to_id`` skip;
+    4. leading (depth-0) MemberOf-into-choke-point suppression (Layer 3);
+    5. gen-time interchangeable-pivot sibling suppression;
+    6. self-loop vs visited rule + self-loop one-time gating;
+    7. reverse-reachability expansion gate.
+
+    Args:
+        reachable_node_ids: The reverse-reachable set; empty disables the gate.
+        terminal_set: When provided (the worker path, which pre-computes the
+            terminal set), the reachability gate also admits a node that IS a
+            terminal sink — mirrors the worker's ``... or to_id in terminal_set``.
+            When ``None`` (the sequential paths), the gate is the plain
+            ``to_id in reachable_node_ids`` form.
+        chokepoint_root_set: The rooted choke-point group ids; empty disables the
+            leading-hop suppression (only the domain sequential path uses it).
+
+    Returns:
+        ``(verdict, is_self_loop, step_notes)`` where ``verdict`` is one of
+        ``"skip"`` (reject this edge) or ``"admit"`` (append + recurse). The
+        caller owns the recursion, visited mutation, and emit — only the
+        admission predicates live here.
+    """
+    empty_notes: dict[str, Any] = {}
+
+    last_step = acc_steps[-1] if acc_steps else None
+    if _is_same_local_reuse_cluster_chain(last_step, edge):
+        return "skip", False, empty_notes
+
+    cand_rel = str(edge.get("relation") or "").strip().lower()
+    if not _edges_chain_ok(path_rels, cand_rel, candidate_edge=edge):
+        return "skip", False, empty_notes
+
+    to_id = str(edge.get("to") or "")
+    if not to_id:
+        return "skip", False, empty_notes
+
+    # Layer 3: suppress the redundant LEADING (depth-0) MemberOf hop from a real
+    # source into a rooted choke point (walked once from the choke-point root).
+    if (
+        not acc_steps
+        and chokepoint_root_set
+        and cand_rel == "memberof"
+        and to_id in chokepoint_root_set
+        and current not in chokepoint_root_set
+    ):
+        return "skip", False, empty_notes
+
+    # Gen-time collapse: skip a suppressed interchangeable-pivot sibling edge —
+    # only the representative pivot's subtree is walked.
+    if view.gentime_suppressed and (current, to_id) in view.gentime_suppressed:
+        return "skip", False, empty_notes
+
+    # Self-loop edges (to_id == current) are context-upgrading derived steps
+    # (e.g. DumpLSASS on the same node). They don't advance the DFS to a new
+    # node, so the visited-set check does not apply.
+    is_self_loop = to_id == current
+    if not is_self_loop and to_id in visited:
+        return "skip", False, empty_notes
+    # A self-loop technique is a one-time capability gain on this host; do not
+    # re-traverse the same self-loop relation.
+    if is_self_loop and _self_loop_relation_already_used(acc_steps, current, cand_rel):
+        return "skip", is_self_loop, empty_notes
+
+    # Reverse-reachability expansion gate. Empty reachable set is a no-op
+    # (target=all/lowpriv), so no coverage loss. The worker path (terminal_set
+    # provided) also admits a node that is itself a terminal sink.
+    if reachable_node_ids and to_id not in reachable_node_ids:
+        if terminal_set is None or to_id not in terminal_set:
+            return "skip", is_self_loop, empty_notes
+
+    step_notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+    # Stamp the representative pivot's INCOMING step with its suppressed sibling
+    # ids so the shallow re-expansion can rebuild the K sibling rows.
+    if view.gentime_representatives:
+        members = view.gentime_representatives.get((current, to_id))
+        if members and len(members) > 1:
+            step_notes = dict(step_notes)
+            step_notes[_GENTIME_COLLAPSE_MEMBERS_KEY] = list(members)
+
+    return "admit", is_self_loop, step_notes
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
@@ -3781,36 +4375,21 @@ def compute_maximal_attack_paths(
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return []
 
-    suppressed_memberof = _build_priority_memberof_suppression(edges, nodes_map)
-
-    adjacency: dict[str, list[dict[str, Any]]] = {}
-    incoming: dict[str, int] = {}
-    outgoing: dict[str, int] = {}
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        if _is_nontraversable_attack_edge(edge, nodes_map):
-            continue
-        from_id = str(edge.get("from") or "")
-        to_id = str(edge.get("to") or "")
-        rel = str(edge.get("relation") or "")
-        if not from_id or not to_id or not rel:
-            continue
-        if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
-            continue
-        adjacency.setdefault(from_id, []).append(edge)
-        outgoing[from_id] = outgoing.get(from_id, 0) + 1
-        # MemberOf edges (persisted or runtime) should not change which nodes
-        # are considered "sources" in domain-wide path listing.
-        if rel != "MemberOf":
-            incoming[to_id] = incoming.get(to_id, 0) + 1
-        incoming.setdefault(from_id, incoming.get(from_id, 0))
-        outgoing.setdefault(to_id, outgoing.get(to_id, 0))
-    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
-        nodes_map, edges
+    # Concern 1 — pre-materialise the graph-shape layer (adjacency + degrees +
+    # local-reuse + implicit overlays + the gen-time collapse). OFF-by-default
+    # gentime collapse walks only ONE representative pivot per interchangeable
+    # set and stamps its incoming step so the post-materialization
+    # ``collapse_sibling_pivot_paths`` merge rebuilds the byte-identical rows.
+    gentime_collapse_on = _read_gentime_collapse_enabled()
+    view = build_expansion_view(
+        graph,
+        nodes_map=nodes_map,
+        edges=edges,
+        track_degrees=True,
+        gentime_collapse_on=gentime_collapse_on,
     )
-    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
-    implicit_edge_overlay = _build_implicit_path_overlays(graph)
+    adjacency = view.adjacency
+    outgoing = view.outgoing
 
     mode = normalize_target_mode(terminal_mode)
 
@@ -3912,16 +4491,16 @@ def compute_maximal_attack_paths(
         }
         parallel_paths = _run_parallel_domain_dfs(
             sources,
-            adjacency,
-            local_reuse_by_node,
-            local_reuse_existing_pairs,
-            local_reuse_useful_nodes,
+            view.adjacency,
+            view.local_reuse_by_node,
+            view.local_reuse_existing_pairs,
+            view.local_reuse_useful_nodes,
             terminal_set,
             target,
             max_depth,
             max_paths_cap,
             n_workers,
-            implicit_edge_overlay,
+            view.implicit_edge_overlay,
             allowed_reachable_ids,
         )
         if parallel_paths or not sources:
@@ -3947,6 +4526,10 @@ def compute_maximal_attack_paths(
     #     there and emit the shorter path; the shared root walk continues past
     #     ``m``, so it must ALSO emit the truncated path to stay byte-identical.
     active_guard_members: set[str] | None = None
+    # In-DFS runaway bound: converts a mid-recursion OOM into the SAME declared
+    # coverage-bounded stop the outer gate raises, instead of a kernel SIGKILL.
+    # Never fires on a graph that fits in RAM (byte-identical coverage there).
+    _budget = DfsMemoryBudget()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -3981,6 +4564,7 @@ def compute_maximal_attack_paths(
         )
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
+        _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
         actionable_depth = _count_actionable_edges(acc_steps)
@@ -4002,15 +4586,7 @@ def compute_maximal_attack_paths(
             emit(acc_steps)
             return
 
-        next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
-            current,
-            adjacency=adjacency,
-            acc_steps=acc_steps,
-            local_reuse_by_node=local_reuse_by_node,
-            local_reuse_existing_pairs=local_reuse_existing_pairs,
-            local_reuse_useful_nodes=local_reuse_useful_nodes,
-            implicit_edge_overlay=implicit_edge_overlay,
-        )
+        next_edges = iter_view_frontier(view, current, acc_steps)
         if not next_edges:
             emit(acc_steps)
             return
@@ -4020,61 +4596,29 @@ def compute_maximal_attack_paths(
         self_loop_extended = False
         _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
-            last_step = acc_steps[-1] if acc_steps else None
-            if _is_same_local_reuse_cluster_chain(last_step, edge):
+            # Shared per-frontier prefix predicates (concern 2). The domain DFS
+            # uses the plain reachability form (terminal_set=None) and passes the
+            # rooted choke-point set for the Layer-3 leading-hop suppression.
+            verdict, is_self_loop, step_notes = admit_frontier_edge(
+                edge,
+                current=current,
+                acc_steps=acc_steps,
+                path_rels=_path_rels,
+                visited=visited,
+                view=view,
+                reachable_node_ids=allowed_reachable_ids,
+                terminal_set=None,
+                chokepoint_root_set=chokepoint_root_set,
+            )
+            if verdict != "admit":
                 continue
-
-            # ── Credential-context guard ────────────────────────────────────
-            # Pruning incompatible chains at the DFS level (rather than at
-            # render time) avoids generating paths like
-            # AdminTo → AllowedToDelegate that look valid syntactically but
-            # require an unstated post-exploitation step.
-            _cand_rel = str(edge.get("relation") or "").strip().lower()
-            if not _edges_chain_ok(_path_rels, _cand_rel, candidate_edge=edge):
-                continue
-            # ── End guard ────────────────────────────────────────────────────
-
             to_id = str(edge.get("to") or "")
-            if not to_id:
-                continue
-            # Layer 3: suppress the redundant LEADING (depth-0) ``MemberOf`` hop
-            # from a REAL SOURCE into a rooted choke point.  That subtree is
-            # walked ONCE from the choke-point root below (``current`` is a
-            # choke-point root when it is already in the rooted set, and those
-            # walk their MemberOf hops normally so deeper frontiers still root).
-            # The post-hoc collapse strips exactly this leading prefix, so
-            # dropping it here is byte-identical, not lossy.
-            if (
-                not acc_steps
-                and chokepoint_root_set
-                and _cand_rel == "memberof"
-                and to_id in chokepoint_root_set
-                and current not in chokepoint_root_set
-            ):
-                continue
-            # Self-loop edges (to_id == current) are context-upgrading derived
-            # steps (e.g. DumpLSASS on the same node).  They don't advance the
-            # DFS to a new node, so the visited-set check does not apply —
-            # current is already in visited as expected.  Append the step and
-            # recurse from the same node without re-adding to visited.
-            is_self_loop = to_id == current
-            if not is_self_loop and to_id in visited:
-                continue
-            # A self-loop technique is a one-time capability gain on this host;
-            # do not re-traverse the same self-loop relation (prevents same-node
-            # cycles like XpCmdshell ↔ MssqlTokenTheftEscalation oscillating).
-            if is_self_loop and _self_loop_relation_already_used(
-                acc_steps, current, _cand_rel
-            ):
-                continue
-            if allowed_reachable_ids and to_id not in allowed_reachable_ids:
-                continue
             step = AttackPathStep(
                 from_id=current,
                 relation=str(edge.get("relation") or ""),
                 to_id=to_id,
                 status=str(edge.get("status") or "discovered"),
-                notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
+                notes=step_notes,
             )
             if not is_self_loop:
                 visited.add(to_id)
@@ -4171,27 +4715,6 @@ def compute_maximal_attack_paths_from_start(
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return []
 
-    suppressed_memberof = _build_priority_memberof_suppression(edges, nodes_map)
-
-    adjacency: dict[str, list[dict[str, Any]]] = {}
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        if _is_nontraversable_attack_edge(edge, nodes_map):
-            continue
-        from_id = str(edge.get("from") or "")
-        to_id = str(edge.get("to") or "")
-        rel = str(edge.get("relation") or "")
-        if not from_id or not to_id or not rel:
-            continue
-        if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
-            continue
-        adjacency.setdefault(from_id, []).append(edge)
-    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
-        nodes_map, edges
-    )
-    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
-    implicit_edge_overlay = _build_implicit_path_overlays(graph)
     allowed_reachable_ids: set[str] = (
         {str(node_id) for node_id in reachable_node_ids if str(node_id).strip()}
         if reachable_node_ids
@@ -4199,6 +4722,22 @@ def compute_maximal_attack_paths_from_start(
     )
     if allowed_reachable_ids and start_node_id not in allowed_reachable_ids:
         return []
+
+    # Concern 1 — pre-materialise the graph-shape layer (adjacency + local-reuse
+    # + implicit overlays + gen-time collapse). This is the owned/user/principals
+    # per-start DFS, where the interchangeable-pivot fan-out (Account Operators
+    # --GenericAll--> thousands of accounts) explodes per principal; the OFF-by-
+    # default gen-time collapse walks one representative and rebuilds the sibling
+    # rows before the proven post-materialization merge. No degree maps needed.
+    gentime_collapse_on = _read_gentime_collapse_enabled()
+    view = build_expansion_view(
+        graph,
+        nodes_map=nodes_map,
+        edges=edges,
+        track_degrees=False,
+        gentime_collapse_on=gentime_collapse_on,
+    )
+    adjacency = view.adjacency
 
     mode = normalize_target_mode(terminal_mode)
 
@@ -4214,6 +4753,10 @@ def compute_maximal_attack_paths_from_start(
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
+    # In-DFS runaway bound: converts a mid-recursion OOM into the SAME declared
+    # coverage-bounded stop the outer gate raises, instead of a kernel SIGKILL.
+    # Never fires on a graph that fits in RAM (byte-identical coverage there).
+    _budget = DfsMemoryBudget()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -4237,6 +4780,7 @@ def compute_maximal_attack_paths_from_start(
         )
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
+        _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
         actionable_depth = _count_actionable_edges(acc_steps)
@@ -4258,15 +4802,7 @@ def compute_maximal_attack_paths_from_start(
             emit(acc_steps)
             return
 
-        next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
-            current,
-            adjacency=adjacency,
-            acc_steps=acc_steps,
-            local_reuse_by_node=local_reuse_by_node,
-            local_reuse_existing_pairs=local_reuse_existing_pairs,
-            local_reuse_useful_nodes=local_reuse_useful_nodes,
-            implicit_edge_overlay=implicit_edge_overlay,
-        )
+        next_edges = iter_view_frontier(view, current, acc_steps)
         if not next_edges:
             emit(acc_steps)
             return
@@ -4274,46 +4810,29 @@ def compute_maximal_attack_paths_from_start(
         extended = False
         _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
-            last_step = acc_steps[-1] if acc_steps else None
-            if _is_same_local_reuse_cluster_chain(last_step, edge):
+            # Shared per-frontier prefix predicates (concern 2). The per-start DFS
+            # uses the plain reachability form (terminal_set=None) and has no
+            # choke-point rooting (empty root set).
+            verdict, is_self_loop, step_notes = admit_frontier_edge(
+                edge,
+                current=current,
+                acc_steps=acc_steps,
+                path_rels=_path_rels,
+                visited=visited,
+                view=view,
+                reachable_node_ids=allowed_reachable_ids,
+                terminal_set=None,
+                chokepoint_root_set=set(),
+            )
+            if verdict != "admit":
                 continue
-
-            # ── Credential-context guard ────────────────────────────────────
-            # Pruning incompatible chains at the DFS level (rather than at
-            # render time) avoids generating paths like
-            # AdminTo → AllowedToDelegate that look valid syntactically but
-            # require an unstated post-exploitation step.
-            _cand_rel = str(edge.get("relation") or "").strip().lower()
-            if not _edges_chain_ok(_path_rels, _cand_rel, candidate_edge=edge):
-                continue
-            # ── End guard ────────────────────────────────────────────────────
-
             to_id = str(edge.get("to") or "")
-            if not to_id:
-                continue
-            # Self-loop edges (to_id == current) are context-upgrading derived
-            # steps (e.g. DumpLSASS on the same node).  They don't advance the
-            # DFS to a new node, so the visited-set check does not apply —
-            # current is already in visited as expected.  Append the step and
-            # recurse from the same node without re-adding to visited.
-            is_self_loop = to_id == current
-            if not is_self_loop and to_id in visited:
-                continue
-            # A self-loop technique is a one-time capability gain on this host;
-            # do not re-traverse the same self-loop relation (prevents same-node
-            # cycles like XpCmdshell ↔ MssqlTokenTheftEscalation oscillating).
-            if is_self_loop and _self_loop_relation_already_used(
-                acc_steps, current, _cand_rel
-            ):
-                continue
-            if allowed_reachable_ids and to_id not in allowed_reachable_ids:
-                continue
             step = AttackPathStep(
                 from_id=current,
                 relation=str(edge.get("relation") or ""),
                 to_id=to_id,
                 status=str(edge.get("status") or "discovered"),
-                notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
+                notes=step_notes,
             )
             if not is_self_loop:
                 visited.add(to_id)
@@ -4701,7 +5220,10 @@ def path_to_display_record(
 
 
 def decorate_display_record(
-    graph: dict[str, Any], record: dict[str, Any]
+    graph: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    _caches: "_DecorationCaches | None" = None,
 ) -> dict[str, Any]:
     """Fill in the deferred per-step decoration on a light display record.
 
@@ -4717,41 +5239,31 @@ def decorate_display_record(
     externally-built step) is left untouched. Only the ~2% of raw records that
     survive minimisation reach here, which is the whole point — the ~98%
     collapsed away never pay the decoration cost.
+
+    ``_caches`` (internal) shares the per-node fact/tier resolution across every
+    record of one batch — see :func:`decorate_display_records`. On a large domain
+    thousands of surviving paths terminate at the same handful of Tier-0 nodes, so
+    resolving the same node id once per batch instead of once per record collapses
+    the repeated ``principal_facts_from_node``/``privilege_tier_for_node`` work.
+    Byte-identical: both resolvers are pure functions of the node dict, which is
+    stable across the batch (same ``graph``). Omitting ``_caches`` builds a
+    per-call cache, preserving the standalone-call behaviour.
     """
-    from adscan_internal.services.compromise_class import privilege_tier_for_node
-    from adscan_internal.services.remediability import (
-        classify_edge_remediability,
-        principal_facts_from_node,
-    )
-
-    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    _facts_cache: dict[str, Any] = {}
-
-    def _facts(node_id: str) -> Any:
-        if node_id not in _facts_cache:
-            _facts_cache[node_id] = principal_facts_from_node(nodes_map.get(node_id))
-        return _facts_cache[node_id]
-
-    def remediability_of(relation: str, from_id: str, to_id: str) -> dict[str, str]:
-        try:
-            return classify_edge_remediability(
-                relation, source=_facts(from_id), target=_facts(to_id)
-            ).as_dict()
-        except Exception:  # pragma: no cover - a verdict is never fatal
-            return {}
+    caches = _caches if _caches is not None else _DecorationCaches(graph)
 
     # The sibling-pivot collapse (``collapse_sibling_pivot_paths``) stashes each
     # sampled sibling's full path SHAPE — including its own ``steps`` — under
     # ``meta.via_account_paths[<label>]`` so a later re-target executes the ACTUAL
     # sibling. Those nested steps are light too, so decorate them here (they never
-    # reach the top-level ``steps`` seam otherwise). Same graph, same idempotency.
+    # reach the top-level ``steps`` seam otherwise). Same graph, same idempotency,
+    # same shared caches.
     meta = record.get("meta")
     if isinstance(meta, dict):
         via_paths = meta.get("via_account_paths")
         if isinstance(via_paths, dict):
             for shape in via_paths.values():
                 if isinstance(shape, dict) and isinstance(shape.get("steps"), list):
-                    decorate_display_record(graph, shape)
+                    decorate_display_record(graph, shape, _caches=caches)
 
     steps = record.get("steps")
     if not isinstance(steps, list):
@@ -4776,9 +5288,7 @@ def decorate_display_record(
             "from": old_details.get("from", ""),
             "to": old_details.get("to", ""),
         }
-        new_details["source_privilege_tier"] = privilege_tier_for_node(
-            nodes_map.get(from_id)
-        ).value
+        new_details["source_privilege_tier"] = caches.tier(from_id)
         for key, value in old_details.items():
             if key in ("from", "to"):
                 continue
@@ -4791,7 +5301,7 @@ def decorate_display_record(
             "step": step.get("step"),
             "action": step.get("action"),
             "status": step.get("status"),
-            "remediability": remediability_of(
+            "remediability": caches.remediability(
                 str(step.get("action") or ""), from_id, to_id
             ),
             "details": new_details,
@@ -4802,16 +5312,74 @@ def decorate_display_record(
     return record
 
 
+class _DecorationCaches:
+    """Per-batch shared resolution cache for :func:`decorate_display_record`.
+
+    Memoizes the two pure per-node resolvers (``principal_facts_from_node`` and
+    ``privilege_tier_for_node``) by node id across every record decorated in one
+    batch, so a Tier-0 terminal shared by thousands of paths resolves once.
+    """
+
+    def __init__(self, graph: dict[str, Any]) -> None:
+        from adscan_internal.services.compromise_class import privilege_tier_for_node
+        from adscan_internal.services.remediability import (
+            classify_edge_remediability,
+            principal_facts_from_node,
+        )
+
+        nodes = graph.get("nodes")
+        self._nodes_map = nodes if isinstance(nodes, dict) else {}
+        self._privilege_tier_for_node = privilege_tier_for_node
+        self._classify_edge_remediability = classify_edge_remediability
+        self._principal_facts_from_node = principal_facts_from_node
+        self._facts_cache: dict[str, Any] = {}
+        self._tier_cache: dict[str, Any] = {}
+
+    def _facts(self, node_id: str) -> Any:
+        cached = self._facts_cache.get(node_id, _MISSING)
+        if cached is _MISSING:
+            cached = self._principal_facts_from_node(self._nodes_map.get(node_id))
+            self._facts_cache[node_id] = cached
+        return cached
+
+    def tier(self, node_id: str) -> Any:
+        cached = self._tier_cache.get(node_id, _MISSING)
+        if cached is _MISSING:
+            cached = self._privilege_tier_for_node(self._nodes_map.get(node_id)).value
+            self._tier_cache[node_id] = cached
+        return cached
+
+    def remediability(
+        self, relation: str, from_id: str, to_id: str
+    ) -> dict[str, str]:
+        try:
+            return self._classify_edge_remediability(
+                relation, source=self._facts(from_id), target=self._facts(to_id)
+            ).as_dict()
+        except Exception:  # pragma: no cover - a verdict is never fatal
+            return {}
+
+
+#: Sentinel distinguishing "not yet cached" from a legitimately cached ``None``.
+_MISSING: Any = object()
+
+
 def decorate_display_records(
     graph: dict[str, Any], records: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Decorate a batch of light display records in place (see
-    :func:`decorate_display_record`)."""
+    :func:`decorate_display_record`).
+
+    Builds ONE shared per-node resolution cache for the whole batch so a node id
+    that appears across many records (a shared Tier-0 terminal) is resolved once,
+    not once per record — byte-identical output, far fewer resolver calls.
+    """
     if not isinstance(records, list):
         return records
+    caches = _DecorationCaches(graph)
     for record in records:
         if isinstance(record, dict):
-            decorate_display_record(graph, record)
+            decorate_display_record(graph, record, _caches=caches)
     return records
 
 

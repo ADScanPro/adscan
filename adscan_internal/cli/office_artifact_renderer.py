@@ -119,8 +119,9 @@ def render_office_vault_unlocked(
 ) -> None:
     """Render a green success panel when the Office vault password is recovered.
 
-    Surfaces the cracked secret with standard ``mark_sensitive`` masking so it
-    is hidden under SECRET_MODE while still visible to the operator.
+    Surfaces the cracked secret cleartext to the operator while wrapping it with
+    ``mark_sensitive`` so the export-time telemetry sanitizer scrubs it from the
+    session recording.
 
     Args:
         result: The completed :class:`OfficeArtifactCrackResult`.

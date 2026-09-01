@@ -37,7 +37,6 @@ from adscan_internal import (
     print_info_table,
     print_info_list,
     print_info_verbose,
-    print_operation_header,
     print_success,
     print_success_verbose,
     print_warning,
@@ -1486,12 +1485,19 @@ def run_attack_paths(
     *,
     max_depth: int = 6,  # requested actionable-edge budget; bounded by _effective_max_depth (user+all caps at 6)
     build_only: bool = False,
+    seen_path_keys: set[tuple[Any, ...]] | None = None,
 ) -> None:
     """Enumerate theoretical attack steps from low-priv users.
 
     Today, this phase focuses on ACL/ACE-style effective relationships derived
     from group membership + rights edges in BloodHound CE. The resulting graph
     is then used to compute maximal attack paths for CLI display.
+
+    ``seen_path_keys`` is a cross-call de-duplication ledger threaded straight to
+    ``run_show_attack_paths``. The multi-domain scan phase passes ONE shared set
+    across its per-domain display sweep so a cross-domain path discoverable from
+    several trust-connected domains is shown once. ``None`` (every other caller)
+    means no de-duplication.
     """
     if target_domain not in shell.domains:
         marked_domain = mark_sensitive(target_domain, "domain")
@@ -1514,102 +1520,9 @@ def run_attack_paths(
         target_mode="object",
         display_friendly=True,
         allow_execution=not build_only,
+        seen_path_keys=seen_path_keys,
     )
     return
-
-
-def run_cross_domain_attack_paths(
-    shell: "BloodHoundShell",
-    domains: list[str],
-    *,
-    max_depth: int = 6,  # requested actionable-edge budget; bounded by _effective_max_depth caps
-) -> None:
-    """Run cross-domain attack path discovery using a merged multi-domain graph.
-
-    Called after all per-domain Phase 2 builds are complete so every
-    attack_graph.json is fully populated. Merges all graphs so multi-hop
-    paths like USER@A → pivot → USER@B → escalate → DA@A are discoverable.
-
-    Args:
-        shell: Shell context with domains_data, credential store, and workspace.
-        domains: In-scope domains ordered with the trust source domain first.
-        max_depth: Maximum edge depth for path computation.
-    """
-    from adscan_internal.services.attack_graph_service import (
-        get_attack_path_owned_principal_labels,
-        get_attack_path_summaries,
-        ATTACK_PATHS_MAX_DEPTH_USER,
-    )
-    from adscan_internal.cli.attack_path_execution import (
-        offer_attack_paths_with_non_high_value_fallback,
-        persist_attack_path_snapshot,
-    )
-
-    reachable = [d for d in domains if d]
-    if not reachable:
-        return
-
-    # Header — inform user this is a merged cross-domain pass
-    print_operation_header(
-        "Cross-Domain Attack Paths",
-        details={
-            "Domains": ", ".join(mark_sensitive(d, "domain") for d in reachable),
-            "Mode": "merged graph",
-            "Depth": str(max(ATTACK_PATHS_MAX_DEPTH_USER, max_depth)),
-        },
-        icon="🌐",
-    )
-
-    # Collect owned principals from ALL in-scope domains.
-    all_owned: list[str] = []
-    for domain in reachable:
-        owned = get_attack_path_owned_principal_labels(
-            shell,
-            domain,
-            include_trusted_domains=True,
-        )
-        all_owned.extend(owned)
-    all_owned = sorted(set(all_owned))
-
-    primary = reachable[0]
-    marked_primary = mark_sensitive(primary, "domain")
-
-    if not all_owned:
-        print_info_verbose(
-            f"[cross-domain] no owned principals found across {len(reachable)} domain(s); "
-            f"falling back to domain-wide summaries for {marked_primary}"
-        )
-        summaries = get_attack_path_summaries(shell, primary)  # pylint: disable=missing-kwoa
-        if summaries:
-            try:
-                persist_attack_path_snapshot(shell, primary, summaries)  # pylint: disable=too-many-function-args,missing-kwoa
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-        return
-
-    marked_count = len(all_owned)
-    marked_domain_count = len(reachable)
-    print_info(
-        f"Searching cross-domain attack paths from {marked_count} owned principal(s) "
-        f"across {marked_domain_count} domain(s)"
-    )
-
-    try:
-        offer_attack_paths_with_non_high_value_fallback(
-            shell,
-            primary,
-            start="owned",
-            max_depth=max(ATTACK_PATHS_MAX_DEPTH_USER, max_depth),
-            max_display=20,
-            target="all",
-            target_mode="object",
-            display_friendly=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_error(f"Cross-domain attack path calculation failed: {exc}")
 
 
 def persist_bloodhound_membership_snapshot(
@@ -1997,12 +1910,22 @@ def run_show_attack_paths(
     max_path_steps: int | None = None,
     no_cache: bool = False,
     keep_longest: bool = False,
+    seen_path_keys: set[tuple[Any, ...]] | None = None,
 ) -> None:
     """Show attack paths and optionally a detailed path.
 
     ``keep_longest`` only affects the ``domain`` scope (no explicit start user /
     ``owned``): when False (default) the listing shows the most direct route to
     domain compromise; when True it shows the holistic longest kill chain.
+
+    ``seen_path_keys`` is a cross-call de-duplication ledger keyed by
+    ``(source, target, relations, status)``. When provided, any computed path
+    whose key is already present is dropped BEFORE display/execution, and the
+    surviving keys are added to the set. The multi-domain scan phase threads ONE
+    shared set through its per-domain display sweep so a cross-domain path that a
+    trust-connected domain's owned start set also discovers is shown exactly once
+    (under the first domain that lists it), with full coverage preserved. Every
+    other caller passes ``None`` (no de-duplication, byte-identical behaviour).
     """
     from adscan_internal.services.attack_graph_service import (
         get_attack_paths_cache_stats,
@@ -2586,6 +2509,32 @@ def run_show_attack_paths(
     # "SMB Share Exposure" (see ``share_exposure_phase.run_smb_share_exposure_phase``)
     # rather than mixed into the attack-paths UX. The attack-paths flow
     # now stays focused on path execution only.
+
+    # Cross-call de-duplication for the multi-domain phase display sweep. Each
+    # per-domain owned view is computed over the trust-union owned set (full
+    # coverage), so a cross-domain path is discoverable from more than one
+    # domain's view. The shared ``seen_path_keys`` ledger keeps each unique path
+    # (keyed by source/target/relations/status) in exactly the FIRST domain that
+    # lists it, dropping the duplicate from later domains before display AND
+    # execution. When ``seen_path_keys`` is None (every non-phase caller) this is
+    # a no-op.
+    if seen_path_keys is not None and path_refs:
+        def _path_dedup_key(path: dict[str, Any]) -> tuple[Any, ...]:
+            return (
+                path.get("source"),
+                path.get("target"),
+                tuple(path.get("relations") or []),
+                path.get("status"),
+            )
+
+        deduped: list[dict[str, Any]] = []
+        for _path in path_refs:
+            _k = _path_dedup_key(_path)
+            if _k in seen_path_keys:
+                continue
+            seen_path_keys.add(_k)
+            deduped.append(_path)
+        path_refs = deduped
 
     if not path_refs:
         print_warning("No attack paths recorded for this domain.")

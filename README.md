@@ -14,7 +14,7 @@
 
 **Free active directory pentesting tool for Linux. Replace your AD pentest toolchain with one CLI.**
 
-ADscan is a free Linux CLI for pentesters, red teamers, and security consultants. It covers 104 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. No Windows required.
+ADscan is a free Linux CLI for pentesters, red teamers, and security consultants. It covers 105 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. No Windows required.
 
 **[Docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_cta)** | [Discord](https://discord.com/invite/fXBR3P8H74) | [Website](https://adscanpro.com)
 
@@ -35,6 +35,7 @@ ADscan is a free Linux CLI for pentesters, red teamers, and security consultants
 - [FAQ](#faq)
 - [Developer Setup](#developer-setup)
 - [Contributing](#contributing)
+- [Author](#author)
 - [License](#license)
 
 ---
@@ -108,7 +109,7 @@ ADscan is not a replacement for every tool in every scenario. It is the fastest 
 
 ## Kerberoasting, ADCS and AD Attack Coverage
 
-ADscan covers 104 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
+ADscan covers 105 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
 
 <table>
 <tr>
@@ -117,7 +118,7 @@ ADscan covers 104 Active Directory attack techniques across the kill chain — s
 ### LITE (Free, Source Available)
 
 **Everything a pentester could do manually, without the toolchain:**
-- Three operation modes (automatic/semi-auto/manual)
+- Two operation modes: automatic (runs the flow end-to-end) and semi-automatic (pauses for operator approval at decision points)
 - DNS, LDAP, SMB, Kerberos enumeration
 - AS-REP Roasting and Kerberoasting
 - Password spraying
@@ -254,6 +255,12 @@ uv run pytest -m unit
 Bug reports, lab reproductions, command-output samples, and focused pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the PR workflow and required checks.
 
 Enterprise support: [hello@adscanpro.com](mailto:hello@adscanpro.com)
+
+---
+
+## Author
+
+Built by Yeray Martin Dominguez, a working AD pentester. I share a new Active Directory attack technique most weeks — follow along on [LinkedIn](https://linkedin.com/in/yeray-martín-domínguez-324a64223) or [X](https://x.com/yeraymd44).
 
 ---
 

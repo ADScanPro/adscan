@@ -935,13 +935,23 @@ class CredentialService(BaseService):
         Uses an anonymous LDAP bind (no credentials needed for this attribute in
         most AD configs) to avoid triggering another bad-password count.
         Falls back to ACCOUNT_LOCKED when the attribute is unreadable.
-        """
-        try:
-            from adscan_internal.services.ldap_transport_service import (
-                ADscanLDAPConfig,
-                ADscanLDAPConnection,
-            )
 
+        This runs INSIDE the already-running event loop of the Kerberos
+        verification chain (``_verify_via_kerberos`` under ``asyncio.run``), so
+        it MUST use the async LDAP entry point directly. The sync
+        ``ADscanLDAPConnection`` opens its own ``asyncio.new_event_loop()`` +
+        ``run_until_complete`` in ``__enter__``, which raises ``RuntimeError:
+        this event loop is already running`` before the search ever runs — the
+        old code then swallowed it and fell through to the ACCOUNT_LOCKED safe
+        default, mislabelling EVERY revoked account (locked OR disabled) as
+        locked.
+        """
+        from adscan_internal.services.ldap_transport_service import (
+            ADscanLDAPConfig,
+            async_connect_with_ldap_fallback,
+        )
+
+        try:
             cfg = ADscanLDAPConfig(
                 domain=domain,
                 dc_ip=kdc_ip,
@@ -950,24 +960,49 @@ class CredentialService(BaseService):
                 username="",
                 password="",
             )
-            with ADscanLDAPConnection(cfg) as conn:
-                conn.search(
-                    search_base=conn.domain_dn,
-                    search_filter=f"(sAMAccountName={username})",
-                    attributes=["userAccountControl"],
+            result = await async_connect_with_ldap_fallback(cfg)
+            conn = result.client
+            try:
+                # Derive the domain naming context from the bound client's
+                # rootDSE, falling back to the domain name split into DCs.
+                server_info = getattr(conn, "_serverinfo", None) or {}
+                domain_nc = server_info.get("defaultNamingContext") or ",".join(
+                    f"DC={part}" for part in domain.split(".") if part
                 )
-                if conn.entries:
-                    uac_vals = (
-                        conn.entries[0].entry_attributes_as_dict.get("userAccountControl") or []
-                    )
-                    uac = int(uac_vals[0]) if uac_vals else 0
+                async for entry, err in conn.pagedsearch(
+                    query=f"(sAMAccountName={username})",
+                    attributes=["userAccountControl"],
+                    tree=domain_nc,
+                ):
+                    if err is not None:
+                        continue
+                    attrs = dict(entry.get("attributes", {}) or {})
+                    uac_raw = None
+                    for attr_name, attr_value in attrs.items():
+                        if str(attr_name).lower() == "useraccountcontrol":
+                            uac_raw = attr_value
+                            break
+                    if isinstance(uac_raw, (list, tuple)):
+                        uac_raw = uac_raw[0] if uac_raw else None
+                    if uac_raw is None:
+                        continue
+                    uac = int(uac_raw)
                     # Bit 4 (0x10) = LOCKOUT, bit 1 (0x2) = ACCOUNTDISABLE
                     if uac & 0x10:
                         return CredentialStatus.ACCOUNT_LOCKED
                     if uac & 0x2:
                         return CredentialStatus.ACCOUNT_DISABLED
-        except Exception:  # noqa: BLE001
-            pass
+            finally:
+                try:
+                    if conn is not None and hasattr(conn, "disconnect"):
+                        await conn.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            # Reading UAC is best-effort — the account IS revoked either way; we
+            # only lose the locked-vs-disabled distinction. Log the traceback so
+            # a future failure here is debuggable (swallow-needs-print_exception).
+            print_exception(exception=e)
         return CredentialStatus.ACCOUNT_LOCKED  # safe default
 
     def _verify_via_kerberos_sync(

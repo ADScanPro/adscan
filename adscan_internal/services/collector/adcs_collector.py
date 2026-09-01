@@ -70,10 +70,61 @@ from adscan_core.rich_output import print_exception
 # for any ordinary domain account — not a failure.
 _CA_ACCESS_DENIED_MARKERS = ("0x80070005", "access_denied", "access denied")
 
+# The HRESULT / NT-status codes that mean "the account lacks the CA-admin rights
+# needed to read the security descriptor" — the EXPECTED low-priv audit outcome.
+# ``CertAdminSecurityError`` now carries the fault code on ``error_code`` (vendor
+# ``certadmin.py``), so we classify by CODE first: the inner DCE-RPC error can
+# stringify EMPTY, which left the substring test blind and escalated a benign
+# denial to a red operator error + a PostHog exception.
+_CA_ACCESS_DENIED_CODES = (
+    0x80070005,  # E_ACCESSDENIED / ERROR_ACCESS_DENIED
+    0x00000005,  # ERROR_ACCESS_DENIED (bare Win32 form)
+)
+
 
 def _is_expected_ca_security_denial(exc: BaseException) -> bool:
-    """Return whether a GetCASecurity error is the normal not-CA-admin denial."""
+    """Return whether a GetCASecurity error is the normal not-CA-admin denial.
+
+    Classifies by the fault CODE the exception carries first (robust even when
+    the underlying DCE-RPC error stringifies to an empty message), then falls
+    back to a substring match on the message for any error object that exposes no
+    code.
+    """
+    code = getattr(exc, "error_code", None)
+    if isinstance(code, int) and (code & 0xFFFFFFFF) in _CA_ACCESS_DENIED_CODES:
+        return True
     return any(marker in str(exc).lower() for marker in _CA_ACCESS_DENIED_MARKERS)
+
+
+# A CA whose FQDN cannot be resolved from the current vantage (the DC-DNS gap on
+# a member CA) surfaces as ``socket.gaierror`` (``[Errno -2] Name or service not
+# known``), usually wrapped in an ``SMBConnectionError`` from the DCOM connect.
+# This is a DATA GAP (the CA-security read is skipped), not a failure — mirror
+# the ESC8 ``could_not_verify`` handling: never a red operator error.
+_CA_HOST_UNRESOLVABLE_MARKERS = (
+    "name or service not known",
+    "[errno -2]",
+    "temporary failure in name resolution",
+    "[errno -3]",
+    "nodename nor servname provided",
+    "[errno -5]",
+    "getaddrinfo",
+)
+
+
+def _is_ca_host_unresolvable(exc: BaseException) -> bool:
+    """Return whether a GetCASecurity failure is an unresolvable-CA-host data gap."""
+    import socket
+
+    cause: BaseException | None = exc
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, socket.gaierror):
+            return True
+        cause = cause.__cause__ or cause.__context__
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in _CA_HOST_UNRESOLVABLE_MARKERS)
 
 
 # LDAP ``noSuchObject`` (result code 32) / its Windows twin
@@ -734,10 +785,34 @@ class ADCSCollector:
             domain_binding if domain_binding is not None else (0, False)
         )
 
+        # Publication gate (mirrors Certipy's ``is_enabled`` flag): a template is
+        # issuable only when its enrollment name (its ``cn``) appears in some
+        # Enterprise CA's ``certificateTemplates`` list. An unpublished template
+        # object cannot be requested from any CA (the CA rejects it with
+        # CERTSRV_E_UNSUPPORTED_CERT_TYPE), so its issuance ESC findings would be
+        # false-positive executable paths. Collected across ALL CAs, casefolded,
+        # matched on ``cn`` (the enrollment name) — NOT ``displayName``, which
+        # ``template.name`` derives from and which may differ from the CN.
+        published_labels: set[str] = set()
+        for ca in cas:
+            ca_templates = ca.properties.get("certificate_templates") or []
+            if not isinstance(ca_templates, (list, tuple)):
+                ca_templates = [ca_templates]
+            for entry in ca_templates:
+                label = str(entry).strip().casefold()
+                if label:
+                    published_labels.add(label)
+
+        def _template_is_published(template_node: CollectorNode) -> bool:
+            cn = str(template_node.properties.get("cn") or "").strip().casefold()
+            return bool(cn) and cn in published_labels
+
         # Build a "is template published by any CA whose ESC6 probe says
         # SAN2 is enabled?" flag per template. ESC6 takes a single bool;
         # if any CA publishing the template has the flag set, surface the
-        # finding.
+        # finding. Match on ``cn`` (enrollment name), same as the publication
+        # gate — the old ``template.name`` (displayName) match was a latent
+        # false-negative when displayName != CN.
         template_to_san2: dict[str, bool] = {}
         for ca in cas:
             probe = ca_probes.get(ca.object_id)
@@ -745,13 +820,12 @@ class ADCSCollector:
                 continue
             if not probe.registry.editf_attributesubjectaltname2_enabled:
                 continue
-            published = ca.properties.get("certificate_templates") or []
-            if not isinstance(published, (list, tuple)):
-                published = [published]
-            published_norm = {str(t).strip().casefold() for t in published if t}
+            ca_published = ca.properties.get("certificate_templates") or []
+            if not isinstance(ca_published, (list, tuple)):
+                ca_published = [ca_published]
+            published_norm = {str(t).strip().casefold() for t in ca_published if t}
             for template in templates:
-                # Match on cn / display name / objectguid label fragment.
-                cn_label = template.name.split("@", 1)[0].casefold()
+                cn_label = str(template.properties.get("cn") or "").strip().casefold()
                 if cn_label and cn_label in published_norm:
                     template_to_san2[template.object_id] = True
 
@@ -771,6 +845,7 @@ class ADCSCollector:
                     strong_cert_binding_enforced=strong_cert_binding_enforced,
                     oid_to_group_dn=oid_to_group_dn,
                     oid_links_resolved=oid_links_resolved,
+                    published=_template_is_published(template),
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
@@ -813,23 +888,11 @@ class ADCSCollector:
                 result.add_edge(edge)
                 pki_added += 1
 
-        # Resolve Domain Users SID — needed by ESC8 / ESC11 detectors so the
-        # edges resolve to a real principal rather than a synthetic placeholder.
-        # The ADCS collector creates its own result so we cannot rely on a
-        # Domain node from LDAP.  Instead we extract the domain SID prefix from
-        # any S-1-5-21-X-Y-Z-RID source already present in the ACL edges
-        # (Domain Admins / Domain Users / Authenticated Users etc. are common
-        # ACE principals on templates) and append the well-known RID 513.
-        import re as _re
-
-        domain_users_sid: str | None = None
-        _domain_sid_pattern = _re.compile(r"^S-1-5-21(?:-\d+){3}")
-        for edge in result.edges:
-            source = str(edge.source_object_id or "").upper()
-            match = _domain_sid_pattern.match(source)
-            if match:
-                domain_users_sid = f"{match.group(0)}-513"
-                break
+        # ESC8 / ESC11 anchor at the well-known Authenticated Users SID
+        # (S-1-5-11) — resolved by the detectors themselves — so no domain-SID
+        # derivation is needed here. That node is injected into the graph before
+        # persistence, so the edge always resolves and (unlike a domain-local
+        # Domain Users anchor) surfaces the cross-forest NTLM-relay surface.
 
         # Per-CA detection (ESC7 + probe-driven ESC8 / ESC11).
         ca_added = 0
@@ -878,7 +941,6 @@ class ADCSCollector:
                     domain=self._domain,
                     web_enrollment_enabled=web_enabled,
                     enforce_encrypt_icertrequest=enforce_encrypt,
-                    domain_users_sid=domain_users_sid,
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
@@ -1254,6 +1316,18 @@ class ADCSCollector:
                     "adcs GetCASecurity not permitted for "
                     f"{mark_sensitive(ca_name, 'hostname')} (CA-admin rights "
                     f"required): {detail}"
+                )
+                return []
+            if _is_ca_host_unresolvable(exc):
+                # The CA host FQDN could not be resolved / reached from this
+                # vantage (the DC-DNS gap on a member CA). This is a DATA GAP —
+                # the CA-security read is skipped, ESC7-delegated holders are
+                # UNKNOWN — not a failure. Mirror the ESC8 could_not_verify path
+                # rather than a red operator error.
+                print_info_debug(
+                    "adcs GetCASecurity skipped for "
+                    f"{mark_sensitive(ca_name, 'hostname')}: CA host could not be "
+                    f"resolved or reached (data gap): {detail}"
                 )
                 return []
             telemetry.capture_exception(exc)

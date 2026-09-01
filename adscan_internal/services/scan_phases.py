@@ -523,6 +523,12 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
                 subtitle="Replay already-recovered passwords across the user base.",
                 optional=True,
             ),
+            Subphase(
+                subphase_id="month_season",
+                title="Month/Season + Year",
+                subtitle="Spray predictable seasonal passwords (March2026, Verano2026).",
+                optional=True,
+            ),
         ),
     ),
     ScanPhase(

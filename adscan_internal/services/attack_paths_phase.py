@@ -16,11 +16,53 @@ This module extracts the contract into ONE function,
 :func:`run_attack_paths_discovery_phase`, that owns compute + checkpoint as an
 atomic unit (and optionally the announce). Both the single-domain Phase-2 seam and
 the trust/cross-domain pivot route their lifecycle through it, so the checkpoint
-obligation can never be forgotten again — the merged-vs-per-domain difference is a
-PARAMETER (``len(domains)``), not a caller fork.
+obligation can never be forgotten again — the single-vs-multi-domain difference is
+a PARAMETER (``len(domains)``), not a caller fork.
+
+The compute is UNIFIED: one flow for one or N domains, per-domain display+execute,
+and there is NO silent build-only pre-pass. A single-domain workspace runs one
+``run_attack_path_discovery`` (display + execute). A multi-domain workspace runs ONE
+per-domain display+execute sweep over the auto-merged graph — the earlier silent
+``build_only=True`` sweep was removed as redundant. The cross-domain merge and the
+RaiseChild / CrossOrg trust coupling are pure READ-TIME properties of the compute:
+the merge (``_load_attack_graph_for_paths`` → ``load_merged_attack_graph``) reads
+every per-domain ``attack_graph.json`` and re-applies the coupling in-memory on each
+load (``_enrich_foreign_dc_nodes``), and the trust edges are already persisted during
+COLLECTION (``collector/orchestrator.py`` → ``persist_cross_domain_trust_edges``).
+By the time this phase runs, every selected domain's graph is on disk, so the FIRST
+display compute already sees the full merged, trust-coupled graph — the build sweep
+built nothing the display sweep did not, it only computed every path once and threw
+it away (rendering nothing, offering no execution) before recomputing. Each domain's
+owned view is computed over its full trust-union owned set (the compute *context*,
+not just the owned set, governs discoverability, so restricting the owned set would
+silently drop real paths), and ONE shared de-duplication ledger keyed by
+``(source, target, relations, status)`` keeps each unique path in the FIRST domain
+that lists it. The operator therefore sees the SAME per-domain, directly-executable
+view in single- and multi-domain scans, with every unique path shown exactly once.
+
+The multi-domain scan INTERLEAVES per domain. The trust/cross-domain pivot in
+``cli/domains.py`` no longer runs ``[attack-paths for ALL domains] → [phases-3+ for
+each domain]``; after collection populates every domain's graph, it runs ONE loop
+``for domain in selected:`` that computes THAT domain's attack paths and then runs
+THAT domain's remaining phases (quick wins, spraying, SMB, unauth, CVE …) before
+moving to the next domain. So the pivot calls this seam once per domain (each with a
+single-element ``domains`` list) and threads ONE shared ``seen_path_keys`` ledger
+through every call, keeping the "each unique path shown once" guarantee across the
+interleaved runs. A consequence the founder accepted intentionally: an earlier domain
+is EXPLOITED (its phases-3+ run) before a later domain computes its attack paths, so
+the later domain sees the graph/credentials already mutated by the earlier domain's
+exploitation — realistic cross-domain chaining, not a regression. The merged-graph
+correctness is unaffected because the merge is read-time and every domain's graph is
+already on disk before the loop starts.
+
+The separate "Cross-Domain Attack Paths" pass was REMOVED: the per-domain graph
+merge is transparent (``_load_attack_graph_for_paths`` merges every per-domain
+``attack_graph.json``, so each per-domain DFS already crosses trust boundaries), so
+that pass was redundant AND lossy — it computed only ``reachable[0]``, a 34-110/129
+coverage regression on GOAD.
 
 The module is dependency-light: it never imports the engine or the native stack.
-The compute wrappers and announce helpers are imported lazily inside the function
+The compute wrapper and announce helpers are imported lazily inside the function
 body so unit tests that monkeypatch them at their canonical module path keep
 working.
 """
@@ -48,6 +90,7 @@ def run_attack_paths_discovery_phase(
     announce: bool = True,
     run_step: Callable[[str, Callable[[], None]], Any] | None = None,
     max_depth: int = 6,
+    seen_path_keys: set[tuple[Any, ...]] | None = None,
 ) -> bool:
     """Run the ``attack_paths_discovery`` phase lifecycle for one or more domains.
 
@@ -60,12 +103,20 @@ def run_attack_paths_discovery_phase(
        (which integrates with the run-level span tracker, the between-phase crack
        surfacing, and ``mark_scan_running``), so it passes ``announce=False`` to
        avoid a double announce.
-    2. **Compute** via the existing wrappers, selecting per-domain vs merged
+    2. **Compute** via ``run_attack_path_discovery``, selecting single-domain vs
        multi-domain by ``len(domains)``:
-       * ``len(domains) == 1`` — ``run_attack_path_discovery`` (build + display).
-       * ``len(domains) > 1`` — a silent ``build_only=True`` build for every
-         domain (so every ``attack_graph.json`` is populated) followed by
-         ``run_cross_domain_attack_path_discovery`` to display the merged view.
+       * ``len(domains) == 1`` — one ``run_attack_path_discovery`` (display +
+         execute; no build-only pre-pass).
+       * ``len(domains) > 1`` — ONE per-domain display+execute sweep over the
+         auto-merged graph (no silent ``build_only=True`` pre-pass — it was
+         redundant, see the module docstring). Each domain's owned view is computed
+         over its full trust-union owned set (full coverage), and a shared
+         de-duplication ledger keyed by ``(source, target, relations, status)``
+         shows each unique path once — under the FIRST domain that lists it — so no
+         duplicate rows appear across trust-connected views. The graph merge is
+         transparent (see ``_load_attack_graph_for_paths``); the earlier separate
+         cross-domain pass computed only ``reachable[0]`` (a 34-110/129 coverage
+         regression on GOAD) and was removed.
     3. **Checkpoint**: mark ``attack_paths_discovery`` complete for every domain in
        ``checkpoint_domains`` — but ONLY on a clean, non-early-stop return. A
        CTF-pwned early stop (surfaced by ``run_step`` returning True) MUST NOT mark
@@ -93,6 +144,17 @@ def run_attack_paths_discovery_phase(
             an objective-met stop is the runner's own responsibility — this seam
             only honours the stop. When omitted the compute runs directly.
         max_depth: Actionable-edge depth budget for the single-domain build.
+        seen_path_keys: Optional shared de-duplication ledger keyed by
+            ``(source, target, relations, status)``. The trust/cross-domain pivot
+            INTERLEAVES attack-paths per domain with that domain's phases-3+, so it
+            can no longer hand this seam the whole domain list in one call. Instead
+            it calls the seam once per domain (each with a single-element
+            ``domains``) and threads ONE ledger through every call via this
+            parameter, preserving the "each unique cross-domain path shown once,
+            under the first domain that lists it" guarantee across the interleaved
+            runs. When ``None`` (every single-call caller — the per-domain Phase 2
+            in ``run_enumeration`` and the audit block) there is no cross-call
+            de-dup, which is correct because those callers cover one domain in total.
 
     Returns:
         ``True`` when the caller should early-stop the surrounding pipeline (only
@@ -128,21 +190,66 @@ def run_attack_paths_discovery_phase(
             _ap_phase_cm = None
 
     def _compute() -> None:
-        # Lazy import at call time so tests that monkeypatch these at
-        # ``adscan_internal.cli.intelligence.*`` see the patched callables.
-        from adscan_internal.cli.intelligence import (
-            run_attack_path_discovery,
-            run_cross_domain_attack_path_discovery,
-        )
+        # Lazy import at call time so tests that monkeypatch this at
+        # ``adscan_internal.cli.intelligence.*`` see the patched callable.
+        from adscan_internal.cli.intelligence import run_attack_path_discovery
 
         if len(domains) > 1:
-            # Build every per-domain graph silently first so multi-hop
-            # cross-domain edges are present, then display the merged view once.
+            # Multi-domain: ONE per-domain display+execute sweep over the SAME
+            # auto-merged graph (``_load_attack_graph_for_paths`` merges every
+            # per-domain ``attack_graph.json`` transparently, so each per-domain DFS
+            # already crosses trust boundaries).
+            #
+            # There is NO separate silent ``build_only=True`` sweep anymore. It was
+            # redundant: the cross-domain merge + the RaiseChild / CrossOrg trust
+            # coupling are pure READ-TIME properties of the compute — the merge
+            # reads each domain's on-disk ``attack_graph.json`` and re-applies the
+            # coupling in-memory on every load (``_enrich_foreign_dc_nodes`` →
+            # ``couple_raise_child_edges`` / ``couple_cross_org_tgt_delegation_edges``),
+            # and the trust edges are already persisted during COLLECTION
+            # (``collector/orchestrator.py`` → ``persist_cross_domain_trust_edges``,
+            # when >1 domain is collected). By the time this phase runs, every
+            # selected domain's graph is already on disk, so the FIRST display
+            # compute already sees the full merged, trust-coupled graph. The old
+            # build sweep just computed every path once, discarded it (rendering
+            # nothing, offering no execution), then recomputed on the display pass —
+            # a wasted, invisible second traversal that gated execution off.
+            #
+            # Each domain's owned view is computed over its full trust-union owned
+            # set (so no cross-domain path is lost — the compute context matters,
+            # not just the owned set), and ONE shared de-duplication ledger keeps
+            # each unique path in the FIRST domain that lists it, so a cross-domain
+            # path shared across trust-connected views is displayed and offered for
+            # execution exactly once. Coverage is preserved; duplicate rows are not.
+            #
+            # ``seen_path_keys`` MAY be supplied by the caller (the trust pivot
+            # threads ONE ledger across its INTERLEAVED per-domain calls — each of
+            # which enters this function with a single-domain ``domains`` list — so
+            # the same-once guarantee spans the whole multi-domain scan even though
+            # each domain's attack-paths run is now interleaved with that domain's
+            # phases-3+). When the caller passes nothing we own a fresh ledger for
+            # this call's sweep.
+            _ledger: set[tuple[Any, ...]] = (
+                seen_path_keys if seen_path_keys is not None else set()
+            )
             for one_domain in domains:
-                run_attack_path_discovery(shell, one_domain, build_only=True)
-            run_cross_domain_attack_path_discovery(shell, list(domains))
+                run_attack_path_discovery(
+                    shell,
+                    one_domain,
+                    max_depth=max_depth,
+                    seen_path_keys=_ledger,
+                )
         else:
-            run_attack_path_discovery(shell, domains[0], max_depth=max_depth)
+            # A caller-supplied ledger (the trust pivot's interleaved per-domain
+            # sweep) makes each single-domain call de-dup against the paths already
+            # shown under earlier domains — the cross-scan same-once guarantee. Every
+            # other single-domain caller passes ``None`` (no de-dup, legacy behaviour).
+            run_attack_path_discovery(
+                shell,
+                domains[0],
+                max_depth=max_depth,
+                seen_path_keys=seen_path_keys,
+            )
 
     try:
         if run_step is not None:

@@ -10,15 +10,21 @@ defeated), so no ESC8 edge is emitted — the hardened, recommended CA state has
 no residual weakness to report. HTTP web enrollment is EPA-agnostic and keeps
 ``web_enrollment_enabled=True``.
 
-The edge source is the Domain Users group SID (``{domain_sid}-513``) passed by
-the collector, so the edge resolves to a real graph node and surfaces correctly
-in tactical findings.  Callers must pass ``domain_users_sid`` whenever the
-domain SID is known; if absent we skip emission rather than using a synthetic
-placeholder that cannot be resolved by the graph display layer.
+The edge source is the well-known Authenticated Users SID (``S-1-5-11``): the
+NTLM relay only requires the coerced/authenticating principal to hold ANY valid
+domain credential, which is cross-forest capable (a trusted-forest authenticated
+user is also a member of Authenticated Users of the target realm). Sourcing the
+edge from the domain-local Domain Users group would silently drop that
+cross-forest relay surface. The Authenticated Users node is guaranteed present
+in the graph — the collector injects every well-known SID node before
+persistence — so the edge always resolves and renders in tactical findings.
 """
 
 from __future__ import annotations
 
+from adscan_internal.services.collector.adcs_detectors._well_known import (
+    AUTHENTICATED_USERS_SID,
+)
 from adscan_internal.services.collector.models import CollectorEdge, CollectorNode
 
 
@@ -27,22 +33,15 @@ def detect_esc8(
     ca_node: CollectorNode,
     domain: str,
     web_enrollment_enabled: bool = False,
-    domain_users_sid: str | None = None,
 ) -> list[CollectorEdge]:
     if not web_enrollment_enabled:
         return []
     if ca_node.kind != "EnterpriseCA":
         return []
 
-    # Resolve source to the real Domain Users SID so the edge is navigable in
-    # the attack graph and renders correctly in tactical findings.
-    source_oid = domain_users_sid
-    if not source_oid:
-        return []
-
     return [
         CollectorEdge(
-            source_object_id=source_oid,
+            source_object_id=AUTHENTICATED_USERS_SID,
             target_object_id=ca_node.object_id,
             relation="ADCSESC8",
             source="adcs_detector",

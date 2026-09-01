@@ -1443,6 +1443,19 @@ _PARTNER_TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 #: Human-readable description of the format, for prompts and error messages.
 PARTNER_TAG_FORMAT_HINT = "lowercase letters, digits and hyphens, 2-41 characters"
 
+#: The refusal message shown when ADscan PRO is started without a resolvable
+#: partner tag. It lives HERE (adscan_core) so the host launcher's fast
+#: pre-container gate and the in-container start gate print the SAME wording —
+#: the recovery it names (``--partner-tag`` and ``ADSCAN_PARTNER_TAG``) must
+#: only ever be a route that actually works from the host.
+PARTNER_TAG_REQUIRED_MESSAGE = (
+    "ADscan PRO requires a partner tag. Re-run with --partner-tag and "
+    "the tag from your onboarding email, for example: "
+    "adscan ci --partner-tag acme-mssp. ADscan saves it on this "
+    "machine, so you only pass it once. Exporting ADSCAN_PARTNER_TAG "
+    "before the run works too."
+)
+
 
 def validate_partner_tag(tag: object) -> bool:
     """Return True when ``tag`` matches the partner-tag format contract.
@@ -2610,6 +2623,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "post_ex_execute_invoked",
         "post_ex_menu_viewed",
         "post_ex_technique_selected",
+        "poisoning_capture",
         "post_scan_report_moment",
         "rdp_scan_started",
         "reinstall",
@@ -2638,8 +2652,10 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "session_start_override_declined",
         "session_start_override_prompt_shown",
         "smb_scan_started",
+        "social_cta_shown",
         "smb_sensitive_auth_normalized",
         "smb_sensitive_data_analysis",
+        "spray_completed",
         "spray_replica_gate",
         "spraying_aborted_clock_sync_failed",
         "spraying_pre2k_selected",
@@ -2655,6 +2671,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "timeroast_started",
         "uninstalled",
         "user_discovery_followups",
+        "username_pattern_inferred",
         "victory_hint_shown",
         "users_enumerated",
         "winrm_scan_started",
@@ -3078,6 +3095,52 @@ def _get_sanitization_key() -> bytes:
     return key
 
 
+# Data types whose pseudonym SEED is canonicalized so casing / a trailing FQDN
+# root dot / surrounding whitespace can never fork one real token into several
+# different masks within a recording. See ``_canonical_domain_for_pseudonym``.
+_CANONICAL_SEED_DATA_TYPES = frozenset({"domain", "hostname"})
+
+
+def _canonical_domain_for_pseudonym(value: str) -> str:
+    """Canonical seed form for a domain/hostname pseudonym lookup.
+
+    The pseudonym is a deterministic keyed-HMAC keyed on ``(data_type, value)``.
+    Two spellings of the SAME real domain (``corp.local`` vs ``CORP.LOCAL``, a
+    trailing FQDN root dot, or surrounding whitespace) are the same token to a
+    reviewer, but as distinct seed strings they produced distinct pseudonyms --
+    a reviewability defect (the same domain masked several ways in one
+    recording). This folds those trivial spelling differences together so one
+    real token maps to one pseudonym.
+
+    This is the ONE place a domain/hostname seed is canonicalized. It drives
+    ONLY the keyed byte stream; the visible pseudonym still walks the ORIGINAL
+    characters positionally, so the masked token keeps the original length and
+    per-character case. Note that inputs of different LENGTH (``corp.local`` vs
+    ``dc.corp.local``) legitimately stay distinct -- the goal is to collapse
+    case/dot/whitespace forks, not to merge different tokens.
+
+    Args:
+        value: Raw domain or hostname token.
+
+    Returns:
+        The lowercased value with surrounding whitespace and a single trailing
+        dot removed.
+    """
+    return value.strip().rstrip(".").lower()
+
+
+def _seed_value_for_data_type(data_type: str, value: str) -> str:
+    """Return the seed string used to key the HMAC byte stream for a value.
+
+    For domain/hostname tokens the seed is canonicalized (see
+    :func:`_canonical_domain_for_pseudonym`) so casing / trailing dots never
+    fork a pseudonym; every other data type seeds on the raw value unchanged.
+    """
+    if data_type.lower() in _CANONICAL_SEED_DATA_TYPES:
+        return _canonical_domain_for_pseudonym(value)
+    return value
+
+
 def _iter_pseudorandom_bytes(data_type: str, value: str) -> Iterator[int]:
     """Yield deterministic pseudorandom bytes for a value and data type.
 
@@ -3288,7 +3351,12 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
     hex_digits = "0123456789abcdef"
     opaque_pool = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-    stream = _iter_pseudorandom_bytes(data_type, value)
+    # Seed the keyed byte stream on the CANONICAL form for domain/hostname
+    # tokens (so ``corp.local`` and ``CORP.LOCAL`` share one pseudonym), while
+    # the char walk below still consumes the ORIGINAL characters positionally so
+    # the masked token keeps its original length and separator shape.
+    canonical_case = data_type in _CANONICAL_SEED_DATA_TYPES
+    stream = _iter_pseudorandom_bytes(data_type, _seed_value_for_data_type(data_type, value))
     result: list[str] = []
 
     for char in value:
@@ -3337,7 +3405,15 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
             else:
                 pool = letters
             replacement = pool[byte % len(pool)]
-            result.append(replacement.upper() if char.isupper() else replacement)
+            # For canonical-seed types (domain/hostname) the output case is also
+            # canonical (lowercase) so a case-only variant of one real token
+            # (corp.local vs CORP.LOCAL) collapses to the IDENTICAL masked
+            # string, not just the same letters in a different case. Other types
+            # keep the original per-character case for shape fidelity.
+            if canonical_case:
+                result.append(replacement)
+            else:
+                result.append(replacement.upper() if char.isupper() else replacement)
             continue
 
         if data_type in opaque_types:

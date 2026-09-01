@@ -43,7 +43,7 @@ from adscan_internal import (
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.core import AuthMode
 from adscan_internal.interaction import is_non_interactive
-from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.ntlm_hash_finding_flow import (
     render_ntlm_hash_findings_flow,
 )
@@ -1689,6 +1689,23 @@ def _validate_ldap_anonymous_username_candidates(
         _infer_username_pattern_from_known_users(known_users or [])
     )
 
+    if inferred_pattern:
+        # Telemetry: the central playbook step (username format inference) that was
+        # previously invisible. Best-effort; only when a pattern was concluded.
+        try:
+            from adscan_internal.services.unauth_funnel_telemetry import (  # noqa: PLC0415
+                emit_username_pattern_inferred,
+            )
+
+            emit_username_pattern_inferred(
+                shell,
+                fmt=inferred_pattern,
+                score=pattern_score,
+                sample_size=known_users_analyzed,
+            )
+        except Exception:  # noqa: BLE001 — telemetry never breaks inference
+            pass
+
     cn_to_candidate: dict[str, str] = {}
     candidate_set: set[str] = set()
     for cn_name in candidates:
@@ -3323,8 +3340,6 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
     persistence of the aggregated user list under ``domains/<domain>/users.txt``.
     """
 
-    from adscan_internal import print_operation_header
-
     if domain not in shell.domains_data:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Unknown domain: {marked_domain}")
@@ -3355,7 +3370,38 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
     )
     if not should_continue:
         return
-    output_file = Path(os.path.join(kerberos_dir, "enum_users.log"))
+    users = _run_kerberos_username_wordlist(
+        shell, domain, wordlist=wordlist, kerberos_dir=Path(kerberos_dir)
+    )
+    if users is None:
+        return
+    _finalize_kerberos_enum_users(
+        shell,
+        domain,
+        users,
+        kerberos_dir=Path(kerberos_dir),
+        wordlist_path=Path(wordlist),
+        source="kerberos_wordlist",
+    )
+
+
+def _run_kerberos_username_wordlist(
+    shell: LdapShell,
+    domain: str,
+    *,
+    wordlist: str,
+    kerberos_dir: Path,
+) -> "list[str] | None":
+    """Run one Kerberos username wordlist through kerbrute and return the hits.
+
+    Shared kerbrute-run body for both the strategy-driven path and the
+    post-enum "widen the list with the known format" jump. Returns the confirmed
+    usernames, or ``None`` when kerbrute is unavailable (the caller aborts).
+    Honours the same cooperative early-stop contract as the rest of the scan.
+    """
+    from adscan_internal import print_operation_header  # noqa: PLC0415
+
+    output_file = kerberos_dir / "enum_users.log"
 
     wordlist_name = os.path.basename(wordlist) if os.path.exists(wordlist) else wordlist
     print_operation_header(
@@ -3375,7 +3421,7 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
             f"kerbrute binary not found or not executable at {kerbrute_path}. "
             "Please ensure tools are installed via 'adscan install'."
         )
-        return
+        return None
 
     enum_service = EnumerationService()
     executor = shell._get_service_executor()
@@ -3411,7 +3457,7 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
             "with the usernames found so far."
         ),
     ):
-        users = enum_service.kerberos.enumerate_users_kerberos(
+        return enum_service.kerberos.enumerate_users_kerberos(
             domain=domain,
             pdc=shell.domains_data[domain]["pdc"],
             wordlist=wordlist,
@@ -3423,13 +3469,143 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
             timeout=300,
             cancellation=user_enum_cancellation,
         )
-    _finalize_kerberos_enum_users(
-        shell,
-        domain,
-        users,
-        kerberos_dir=Path(kerberos_dir),
-        wordlist_path=Path(wordlist),
+
+
+def _persist_kerberos_username_format(
+    shell: LdapShell, domain: str, pattern_key: str
+) -> None:
+    """Persist the inferred username format on the domain record.
+
+    Stored so later Kerberos steps never re-ask the operator for a naming
+    convention ADscan already learned this run: the post-enum "widen the list"
+    jump reads it to preselect the format and skip straight to source selection.
+    ``domains_data`` is JSON-persisted, so a plain string key is safe here.
+    """
+    domain_record = shell.domains_data.get(domain)
+    if isinstance(domain_record, dict) and pattern_key:
+        domain_record["kerberos_username_format"] = pattern_key
+
+
+def _persisted_kerberos_username_format(shell: LdapShell, domain: str) -> str | None:
+    """Return the username format inferred for ``domain`` earlier this run, if any.
+
+    Read from the domain record (written by :func:`_persist_kerberos_username_format`
+    after a prior enum). ``None`` when no convention has been learned yet.
+    """
+    domain_record = shell.domains_data.get(domain)
+    if isinstance(domain_record, dict):
+        value = domain_record.get("kerberos_username_format")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _offer_post_kerberos_enum_next_step(
+    shell: LdapShell,
+    domain: str,
+    *,
+    confirmed_users: list[str],
+    source: str,
+    inferred_pattern: str | None,
+    kerberos_dir: Path,
+) -> bool:
+    """Offer the operator one clear next step after a successful user enum.
+
+    Replaces the old blind ``ask_for_kerberos_user_enum(relaunch=True)`` — which,
+    after the auto-detect broad sweep, re-ran the same ~1M-candidate multi-hour
+    sweep from scratch. The choice is now explicit and value-ordered:
+
+    1. Proceed to exploitation (AS-REP roast / spraying) with the confirmed users
+       — the default, and the actual next step of value.
+    2. Widen the list using the ALREADY-KNOWN format — jumps straight to source
+       selection (statistically-likely / LinkedIn / custom) with the inferred
+       naming pattern preselected, so the operator never re-answers "detect the
+       format or not", and the terminal broad sweep is never re-run.
+    3. Stop here.
+
+    Returns ``True`` when the caller should run the post-user-discovery followups
+    now (options 1 and 3), ``False`` when option 2 already routed into a fresh
+    enum whose own finalize will run them.
+    """
+    marked_domain = mark_sensitive(domain, "domain")
+
+    # The "widen with the known format" option only makes sense when we actually
+    # inferred a format AND a matching focused list can be built. Read the
+    # persisted format as the source of truth (the sweep wrote it), falling back
+    # to the value threaded in from this run.
+    domain_record = shell.domains_data.get(domain)
+    known_format = inferred_pattern
+    if isinstance(domain_record, dict):
+        known_format = domain_record.get("kerberos_username_format") or inferred_pattern
+
+    proceed_label = "Proceed to exploitation (AS-REP roasting / password spraying)"
+    stop_label = "Stop here — keep the confirmed users only"
+    options = [proceed_label]
+    handlers: list[str] = ["proceed"]
+
+    if known_format:
+        format_label = USERNAME_PATTERN_LABELS.get(known_format, known_format)
+        options.append(
+            f"Widen the user list using the detected '{format_label}' format"
+        )
+        handlers.append("widen")
+
+    options.append(stop_label)
+    handlers.append("stop")
+
+    print_panel(
+        (
+            f"Confirmed {len(confirmed_users)} user"
+            f"{'s' if len(confirmed_users) != 1 else ''} for {marked_domain}"
+            + (
+                f"\nDetected username format: {USERNAME_PATTERN_LABELS.get(known_format, known_format)}"
+                if known_format
+                else ""
+            )
+            + "\nChoose how to continue — the broad sweep has already covered the "
+            "name-space, so it will not be re-run."
+        ),
+        title="👤 User Enumeration · Next Step",
+        border_style=BRAND_COLORS["info"],
     )
+
+    choice_idx = shell._questionary_select(
+        f"What next for {marked_domain}?",
+        options,
+        default_idx=0,
+    )
+    if choice_idx is None or not 0 <= choice_idx < len(handlers):
+        choice_idx = 0
+    handler = handlers[choice_idx]
+
+    if handler == "widen" and known_format:
+        # Jump straight to source selection with the format preselected — no
+        # strategy menu, no format question, and never the terminal broad sweep.
+        widened_wordlist = _build_focused_kerberos_wordlist_for_pattern(
+            shell, domain, pattern_key=known_format
+        )
+        if widened_wordlist:
+            widened_users = _run_kerberos_username_wordlist(
+                shell, domain, wordlist=widened_wordlist, kerberos_dir=kerberos_dir
+            )
+            if widened_users is not None:
+                _finalize_kerberos_enum_users(
+                    shell,
+                    domain,
+                    widened_users,
+                    kerberos_dir=kerberos_dir,
+                    wordlist_path=Path(widened_wordlist),
+                    source="kerberos_wordlist",
+                    inferred_pattern=known_format,
+                )
+                # The recursive finalize already ran (or offered) the followups.
+                return False
+        # Build/run produced nothing: fall through to the exploitation followups
+        # with the users we already have rather than dead-ending.
+
+    # "proceed" and "stop" both keep the confirmed users; only "proceed" wants the
+    # exploitation followups. "stop" ends the phase cleanly with the users saved.
+    return handler != "stop"
 
 
 def _finalize_kerberos_enum_users(
@@ -3439,6 +3615,8 @@ def _finalize_kerberos_enum_users(
     *,
     kerberos_dir: Path,
     wordlist_path: Path,
+    source: str = "kerberos_wordlist",
+    inferred_pattern: str | None = None,
 ) -> None:
     """Record the attempt, persist discovered users to ``users.txt`` and follow up.
 
@@ -3446,9 +3624,10 @@ def _finalize_kerberos_enum_users(
     the standard wordlist-driven run AND the auto-detect broad sweep (which
     persists its confirmed users straight through here without re-running
     kerbrute). It records the attempt for exact-match warnings, writes the
-    aggregated ``users.txt`` (merging with any existing list), triggers the
-    post-user-discovery followups (roast/spray candidate generation), offers a
-    relaunch, and prints the shortcut hint.
+    aggregated ``users.txt`` (merging with any existing list), then offers the
+    operator a single clear next-step choice (proceed to exploitation / widen
+    the list with the already-known format / stop) and triggers the
+    post-user-discovery followups (roast/spray candidate generation).
 
     Args:
         shell: Active LDAP shell.
@@ -3456,6 +3635,16 @@ def _finalize_kerberos_enum_users(
         users: Usernames discovered this run (deduplicated/sorted internally).
         kerberos_dir: Per-domain Kerberos workspace directory.
         wordlist_path: Wordlist the run consumed, recorded in the attempt history.
+        source: Which strategy produced this run. ``kerberos_auto_detect_broad_sweep``
+            is TERMINAL for its phase — the sweep already covered the whole
+            name-space and auto-stopped, so it must NOT re-offer itself (the old
+            blind ``relaunch=True`` re-ran the same ~1M-candidate, multi-hour
+            sweep). Any other source ran a small focused/custom list, where
+            trying a different source is a legitimate next move.
+        inferred_pattern: The dominant username format inferred from the confirmed
+            users (persisted to ``domains_data``), so the "widen the list" next
+            step jumps straight to source selection with the format preselected —
+            never re-asking the operator for something ADscan already learned.
     """
     _record_kerberos_wordlist_attempt(
         domain=domain,
@@ -3467,7 +3656,12 @@ def _finalize_kerberos_enum_users(
     if not users:
         print_warning("No Kerberos users were discovered.")
         _show_kerberos_enum_shortcut_hint(shell, domain, had_results=False)
-        shell.ask_for_kerberos_user_enum(domain, relaunch=True)
+        # A broad sweep that found nothing already marked itself exhausted for the
+        # session; re-offering enumeration here would loop straight back into a
+        # doomed run. Only the focused/custom path (a small list that missed) is
+        # worth re-offering with a different source.
+        if source != "kerberos_auto_detect_broad_sweep":
+            shell.ask_for_kerberos_user_enum(domain, relaunch=True)
         return
 
     unique_users = sorted(set(users))
@@ -3485,12 +3679,20 @@ def _finalize_kerberos_enum_users(
         source="kerberos_user_enum",
     )
 
-    shell.ask_for_kerberos_user_enum(domain, relaunch=True)
-    run_post_user_discovery_followups(
+    proceed_to_followups = _offer_post_kerberos_enum_next_step(
         shell,
         domain,
-        source="kerberos_user_enum",
+        confirmed_users=unique_users,
+        source=source,
+        inferred_pattern=inferred_pattern,
+        kerberos_dir=kerberos_dir,
     )
+    if proceed_to_followups:
+        run_post_user_discovery_followups(
+            shell,
+            domain,
+            source="kerberos_user_enum",
+        )
     _show_kerberos_enum_shortcut_hint(shell, domain, had_results=True)
 
 
@@ -3720,9 +3922,8 @@ def _select_kerberos_wordlist_strategy(
     (default No) before re-running. (Revises dd6d23ab9, which dropped the
     option entirely.)
     """
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    is_audit = workspace_type == "audit"
     autodetect_exhausted = _kerberos_autodetect_exhausted(shell, domain)
+    persisted_format = _persisted_kerberos_username_format(shell, domain)
 
     # ── Context panel ────────────────────────────────────────────────────────
     # The three real strategies always describe themselves the same way; only
@@ -3781,11 +3982,24 @@ def _select_kerberos_wordlist_strategy(
     # guarantee: ``_questionary_select`` auto-resolves to ``default_idx`` in
     # non-interactive / ``adscan ci`` mode, so once auto-detect is exhausted the
     # default MUST point at Skip -- never at a manual-input branch (known /
-    # custom) that would block on stdin or loop the run. Fresh runs default to
-    # auto-detect, or to the known-format branch in an audit workspace.
+    # custom) that would block on stdin or loop the run.
+    #
+    # The default is a pure-effectiveness, 3-level ladder and is INDEPENDENT of
+    # the workspace type (ctf vs audit): how to DISCOVER users is only an
+    # effectiveness question -- workspace type governs OPSEC/deliverable
+    # concerns, never the discovery strategy.
+    #   1. know the format (persisted this session/workspace) -> use it.
+    #   2. don't know it                                      -> auto-detect it.
+    #   3. auto-detect already failed                         -> skip.
+    # Note: this changes the INTERACTIVE recommendation on an audit workspace
+    # from "I know the format" (which fed a generic 8k-name list and found
+    # nobody on a directory whose usernames don't match generic patterns) to
+    # auto-detect (or the already-known format) -- a strict improvement. The
+    # interactive operator still freely picks any strategy; only the pre-selected
+    # / "(Recommended)" row changes.
     if autodetect_exhausted:
         recommended_handler = "skip"
-    elif is_audit:
+    elif persisted_format:
         recommended_handler = "known"
     else:
         recommended_handler = "auto"
@@ -3836,7 +4050,15 @@ def _select_kerberos_wordlist_strategy(
                     continue
             return _kerberos_auto_detect_then_build(shell, domain)
         if handler == "known":
-            return _kerberos_known_format_build(shell, domain)
+            # When ADscan already inferred the naming convention this
+            # session/workspace, use it directly. In non-interactive mode this
+            # is essential: without a preselected pattern the format prompt
+            # auto-resolves to the FIRST format (default_idx=0), not the one we
+            # actually learned. Passing it skips the prompt and builds the
+            # focused list for the stored pattern.
+            return _kerberos_known_format_build(
+                shell, domain, preselected_pattern=persisted_format
+            )
         if handler == "custom":
             return _prompt_custom_kerberos_username_wordlist(shell, domain)
 
@@ -4018,6 +4240,26 @@ def _kerberos_auto_detect_then_build(
     # confirmed users, offer to widen the net with the matching focused list.
     # The confirmed users themselves are the win either way.
     ranked = wordlist_service.rank_inferred_patterns_from_candidates(unique_users)
+    dominant_pattern = ranked[0][0] if ranked else None
+    if dominant_pattern:
+        # Persist the inferred username format so later steps (the post-enum
+        # "widen with this format" jump, and any subsequent Kerberos enum in this
+        # session) never re-ask the operator for something ADscan already knows.
+        _persist_kerberos_username_format(shell, domain, dominant_pattern)
+        # Telemetry: username format inferred from confirmed users. Best-effort.
+        try:
+            from adscan_internal.services.unauth_funnel_telemetry import (  # noqa: PLC0415
+                emit_username_pattern_inferred,
+            )
+
+            emit_username_pattern_inferred(
+                shell,
+                fmt=dominant_pattern,
+                score=ranked[0][1] if ranked and len(ranked[0]) > 1 else None,
+                sample_size=len(unique_users),
+            )
+        except Exception:  # noqa: BLE001 — telemetry never breaks inference
+            pass
     if ranked:
         dominant = ranked[0][0]
         pattern_label = format_supported_pattern_label(
@@ -4073,6 +4315,8 @@ def _kerberos_auto_detect_then_build(
         unique_users,
         kerberos_dir=kerberos_dir,
         wordlist_path=large_wordlist,
+        source="kerberos_auto_detect_broad_sweep",
+        inferred_pattern=dominant_pattern,
     )
     return KERBEROS_ENUM_HANDLED
 
@@ -4135,9 +4379,18 @@ def _render_auto_detect_stop_summary(
     )
 
 
-def _kerberos_known_format_build(shell: LdapShell, domain: str) -> str | None:
-    """Build a focused wordlist when the operator already knows the naming convention."""
-    pattern_key = _prompt_kerberos_username_pattern(shell, domain)
+def _kerberos_known_format_build(
+    shell: LdapShell, domain: str, *, preselected_pattern: str | None = None
+) -> str | None:
+    """Build a focused wordlist when the naming convention is known.
+
+    When ``preselected_pattern`` is supplied (a convention ADscan already
+    inferred this session/workspace), the format prompt is skipped and the
+    focused list is built for that pattern directly. This is required in
+    non-interactive mode, where the prompt would otherwise auto-resolve to the
+    first format rather than the one actually learned.
+    """
+    pattern_key = preselected_pattern or _prompt_kerberos_username_pattern(shell, domain)
     if not pattern_key:
         return None
     return _build_focused_kerberos_wordlist_for_pattern(
@@ -5392,8 +5645,7 @@ def _find_and_move_userdesc_log(shell: LdapShell, domain: str) -> Optional[str]:
         )
 
         # Move the file (not copy)
-        if SECRET_MODE:
-            print_info_verbose(f"Moving {source_file} to {dest_file}")
+        print_info_debug(f"Moving {source_file} to {dest_file}")
         shutil.move(source_file, dest_file)
 
         print_success(f"Moved UserDesc log to {dest_file_rel}")
@@ -5448,8 +5700,7 @@ def _parse_userdesc_log_file(log_file: str) -> dict[str, str]:
                     user_descriptions[username] = description
             elif len(parts) == 1 and parts[0].strip():
                 # Sometimes description might be empty, skip
-                if SECRET_MODE:
-                    print_info_debug(f"Skipping line with only username: {parts[0]}")
+                print_info_debug(f"Skipping line with only username: {parts[0]}")
 
     except Exception as e:
         telemetry.capture_exception(e)
@@ -6465,7 +6716,13 @@ def _build_user_description_source_steps(
         CredentialSourceStep(
             relation="UserDescription",
             edge_type="user_description",
-            entry_label="Domain Users",
+            # Reading an LDAP description/info attribute only needs an
+            # authenticated bind, which is cross-forest capable — a foreign-forest
+            # authenticated user (NOT a member of the target's Domain Users, but IS
+            # Authenticated Users) can read it. Anchor the provenance edge on
+            # Authenticated Users (S-1-5-11) so the cross-forest case surfaces,
+            # mirroring the Kerberoasting/AS-REP-Roasting actor scope.
+            entry_label="Authenticated Users",
             notes={
                 "source": "ldap_descriptions",
                 "source_username": username_clean,

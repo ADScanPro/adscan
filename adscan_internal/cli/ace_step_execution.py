@@ -901,12 +901,27 @@ def resolve_execution_candidates(
             f"member ({len(candidate_users)} candidate(s))."
         )
 
+    # NEVER blind-pick for a post-ex step that authenticates to its SOURCE host
+    # (the dump family + HasSession). Its actor is the session a PRIOR access step
+    # in the chain established on that host, resolved by the executor via
+    # carry_forward_foothold_actor (the same predicate the ownership gate uses).
+    # Falling back to "any stored credential" here would run the dump as an
+    # arbitrary principal that never obtained the foothold — the latent false
+    # positive that only ever "worked" because exactly one credential was stored.
+    # Left unresolved, exactly like the strict path, so the gate and the executor
+    # stay in agreement. Other carry_forward relations (XpCmdshell, coercion,
+    # ScheduledTask) keep their existing resolution — they are NOT in this set.
+    from adscan_internal.services.execution_credential_scope import (  # noqa: PLC0415
+        relation_authenticates_to_source_host,
+    )
+
     if (
         not candidate_users
         and not strict_source
         and isinstance(creds, dict)
         and creds
         and node_kind_lower != "group"
+        and not relation_authenticates_to_source_host(relation)
     ):
         print_info_debug(
             "[exec-user] No source-faithful actor; falling back to all stored credentials "
@@ -1234,6 +1249,12 @@ class AceStepContext:
     target_kind: str
     target_enabled: bool | None
     target_sam_or_label: str
+    # ``"true"`` only when the resolved actor is an account local to a host's SAM
+    # (a local Administrator recovered on a member server); ``"false"`` for a
+    # domain principal or a scoped-ticket ccache. Never inferred from the account
+    # name — carried verbatim from the step-execution actor SSOT so a host-read
+    # step (DCSync/DumpLSA) logs on with the correct authority.
+    islocal: str = "false"
     # RBCD chain coordination: when an AddMember/write-to-group step feeds a
     # downstream AllowedToAct whose trustee is this group, the member to add must
     # be an owned SPN-bearing account (the one the AllowedToAct will mint as) —
@@ -1391,64 +1412,66 @@ def build_ace_step_context(
     context_password: str | None,
     member_to_add: str | None = None,
     strict_source: bool = False,
+    steps: list[dict[str, Any]] | None = None,
+    step_index: int | None = None,
 ) -> AceStepContext | None:
     """Build an ACE execution context for a given step (best-effort).
 
     ``member_to_add`` (RBCD coordination) overrides the group-membership default
     when a downstream AllowedToAct needs a specific owned SPN-bearing member.
     ``strict_source=True`` (the ownership-gate predicate) forbids resolving the
-    actor from the "any stored credential" fallback, so the context is built
-    ONLY when the step's real SOURCE principal is controlled.
+    actor from the "any stored credential" fallback, so the context is built ONLY
+    when the step's real SOURCE principal is controlled.
+
+    The acting principal + secret are resolved through the ONE step-execution
+    actor SSOT (:func:`resolve_step_execution_actor`), so a host-execution-read
+    step (DCSync / DumpLSA / …) no longer aborts on a missing source-owned member
+    when a scoped ticket, an owned machine account, or a carried foothold serves
+    it. ``steps`` + ``step_index`` (1-based) supply the chain context that lets a
+    carry-forward step inherit a proven prior foothold; absent, the host-read
+    ladder still resolves the ticket / machine-account / source-owned rungs.
     """
     from_node = get_node_by_label(shell, domain, label=from_label)
     to_node = get_node_by_label(shell, domain, label=to_label)
-    exec_username, exec_user_source = _resolve_execution_user_with_source(
+
+    # Lazy import to avoid a module-load cycle: attack_path_execution imports this
+    # module at module scope, so the SSOT it owns is resolved at call time.
+    from adscan_internal.cli.attack_path_execution import (  # noqa: PLC0415
+        resolve_step_execution_actor,
+    )
+
+    actor = resolve_step_execution_actor(
         shell,
         domain=domain,
-        context_username=context_username,
-        summary=summary,
-        from_label=from_label,
-        from_node_kind=_node_kind(from_node),
-        strict_source=strict_source,
         relation=relation,
+        from_label=from_label,
+        to_label=to_label,
+        summary=summary,
+        context_username=context_username,
+        context_password=context_password,
+        steps=steps,
+        step_index=step_index,
+        strict_source=strict_source,
+        interactive=True,
     )
-    if not exec_username:
+    if actor is None or not actor.username or not actor.secret:
         marked_domain = mark_sensitive(domain, "domain")
         marked_from = mark_sensitive(from_label, "node")
         marked_to = mark_sensitive(to_label, "node")
         print_info_debug(
-            "[ace-context] Missing exec username: "
+            "[ace-context] No usable execution actor: "
             f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
             f"from={marked_from} to={marked_to} "
             f"context_username={'set' if context_username else 'unset'} "
             f"applies_to_users={summary.get('applies_to_users')!r} "
             f"from_node_kind={mark_sensitive(_node_kind(from_node), 'detail')} "
-            f"resolution_source={mark_sensitive(exec_user_source, 'detail')}"
+            f"actor_source={mark_sensitive(actor.source if actor else 'none', 'detail')}"
         )
         return None
 
-    stored_password = _resolve_domain_password(shell, domain, exec_username)
-    password = resolve_exec_password(
-        shell,
-        domain=domain,
-        username=exec_username,
-        context_username=context_username,
-        context_password=context_password,
-    )
-    if not password:
-        marked_domain = mark_sensitive(domain, "domain")
-        marked_from = mark_sensitive(from_label, "node")
-        marked_to = mark_sensitive(to_label, "node")
-        marked_user = mark_sensitive(exec_username, "user")
-        print_info_debug(
-            "[ace-context] Missing exec credential: "
-            f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
-            f"from={marked_from} to={marked_to} exec_user={marked_user} "
-            f"context_password={'set' if context_password else 'unset'} "
-            f"stored_domain_credential={'present' if stored_password else 'absent'} "
-            f"resolution_source={mark_sensitive(exec_user_source, 'detail')}"
-        )
-        return None
+    exec_username = actor.username
+    password = actor.secret
+    exec_islocal = actor.islocal
 
     target_domain = _node_domain(to_node) or domain
     target_kind = _node_kind(to_node)
@@ -1475,15 +1498,12 @@ def build_ace_step_context(
     marked_from = mark_sensitive(from_label, "node")
     marked_to = mark_sensitive(to_label, "node")
     marked_user = mark_sensitive(exec_username, "user")
-    credential_source = (
-        "context_password" if context_password else "stored_domain_credential"
-    )
     print_info_debug(
         "[ace-context] Built execution context: "
         f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
         f"from={marked_from} to={marked_to} exec_user={marked_user} "
-        f"credential_source={mark_sensitive(credential_source, 'detail')} "
-        f"user_source={mark_sensitive(exec_user_source, 'detail')} "
+        f"actor_source={mark_sensitive(actor.source, 'detail')} "
+        f"islocal={mark_sensitive(exec_islocal, 'detail')} "
         f"target_kind={mark_sensitive(target_kind, 'detail')} "
         f"target_domain={mark_sensitive(target_domain, 'domain')} "
         f"target_enabled={mark_sensitive(str(target_enabled), 'detail')} "
@@ -1501,6 +1521,7 @@ def build_ace_step_context(
         target_kind=target_kind,
         target_enabled=target_enabled,
         target_sam_or_label=target_sam_or_label,
+        islocal=exec_islocal,
         member_to_add=member_to_add,
         target_tombstoned=target_tombstoned,
         target_deleted_dn=target_deleted_dn,
@@ -1807,50 +1828,17 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         relation = effective_relation
 
     if relation == "dcsync":
-        # GAP 3 — scoped-ticket-first: if a prior step (SPNJack, relay-RBCD)
-        # minted an LDAP-service ticket scoped to the DC host (impersonating a
-        # privileged user), DRSUAPI replication should run via that ccache rather
-        # than the generic, under-privileged execution credential. Mirrors the
-        # DumpLSA cifs-scoped-ticket path. Alias-aware host match guarantees a
-        # ticket for a different host is never used here.
-        dcsync_username = context.exec_username
-        dcsync_password = context.exec_password
-        try:
-            from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
-            from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
-                resolve_execution_credential,
-            )
-
-            _domain_data = getattr(shell, "domains_data", {}).get(context.domain, {})
-            # Resolve the DC via the FQDN SSOT (CLAUDE.md "Kerberos SPNs — always
-            # FQDN"). The old ``dc_fqdn -> pdc_hostname_fqdn -> resolve_dc_ip``
-            # chain skipped the short ``pdc_hostname`` rung and returned a raw IP
-            # in best-effort mode, which cannot serve a ``cifs`` service ticket
-            # (SEC_E_LOGON_DENIED). ``resolve_dc_fqdn`` promotes a short hostname
-            # to ``<host>.<domain>`` and adds the workspace inventory fallback, so
-            # the scoped-ticket lookup below keys on a real FQDN, never an IP.
-            _dc_host = resolve_dc_fqdn(_domain_data, target_domain=context.domain) or ""
-            if _dc_host:
-                # relation="dcsync" -> cifs (DRSUAPI replicates over an aiosmb SMB
-                # connection, NOT ldap). The central map owns the service class so
-                # the right ticket is selected by construction; preferent matching
-                # falls back to any ticket for the DC (a TGT-bearing ccache serves
-                # cifs regardless of its own SPN class).
-                _scoped = resolve_execution_credential(
-                    shell, domain=context.domain, host=_dc_host, relation="dcsync"
-                )
-                if _scoped is not None:
-                    dcsync_username, dcsync_password = _scoped
-                    print_info_debug(
-                        "ace dcsync: reusing host-scoped service ticket for "
-                        f"{mark_sensitive(str(_dc_host), 'hostname')} as "
-                        f"{mark_sensitive(dcsync_username, 'user')}"
-                    )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
-        result = shell.dcsync(context.domain, dcsync_username, dcsync_password)
+        # The acting principal + secret arrive PRE-RESOLVED from the step-execution
+        # actor SSOT (build_ace_step_context). DCSync is a host-execution READ
+        # (Set B), so that SSOT already tried, in proof-specificity order, a scoped
+        # cifs/<dc> ServiceTicket (SPNJack / relay-RBCD, impersonating a privileged
+        # user), an owned <dc>$ machine account, and the source-owned principal —
+        # each alias-aware to the DC host. Re-running that lookup here is redundant
+        # (it was dead code: this branch is unreachable when the context builder
+        # aborts, and now the builder never aborts a ticketed DCSync).
+        result = shell.dcsync(
+            context.domain, context.exec_username, context.exec_password
+        )
         # Edge semantics: DCSync → Domain means "compromise the domain by
         # replicating its secrets". Success requires either the krbtgt
         # secret (full domain compromise via Golden Ticket material) or at

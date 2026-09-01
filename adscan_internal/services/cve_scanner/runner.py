@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +16,8 @@ from adscan_core.rich_output import print_error, print_info, print_info_debug, p
 from adscan_internal.core.events import Event, EventBus, EventType
 from adscan_internal.services.cve_scanner.catalog import (
     CVEDefinition,
+    TargetScope,
+    credential_covers_domain,
     scope_applies_to_target,
 )
 from adscan_internal.services.cve_scanner.checks.coercion import CoercionCVECheck
@@ -39,17 +41,37 @@ _PREFLIGHT_PROBE_TIMEOUT_SECONDS = 3.0
 
 @dataclass(frozen=True)
 class ScanTarget:
-    """One host to scan."""
+    """One host to scan.
+
+    ``domain`` names the AD domain the host actually belongs to (resolved
+    from the workspace ``domains_data`` at load time). In a single-domain
+    audit it equals the scan's ``--domain``; in a multi-forest audit it can
+    be a DIFFERENT domain than the credential's, which is exactly how the
+    foreign-DC scope gate (``scope_applies_to_target``) decides a check must
+    be skipped rather than attempted with a credential that cannot cover it.
+    ``None`` means "could not be determined" — the gate then stays
+    conservative and still lets the check run.
+    """
 
     host: str
     is_dc: bool = False
     display_name: str | None = None
+    domain: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class ScanContext:
-    """Runtime context passed into every check."""
+    """Runtime context passed into every check.
+
+    ``domains_data`` and ``ip_hostname_inventory`` are threaded so the
+    authenticated LDAP/SMB checks (BadSuccessor, WebDAV) can resolve a DC's
+    FQDN through the canonical SSOT (``build_ldap_config_for_domain`` /
+    ``resolve_dc_fqdn``) instead of handing the transport a bare IP, which
+    would degrade the Kerberos SPN to ``ldap/<ip>`` and be rejected by the
+    DC with ``SEC_E_LOGON_DENIED``. Both default empty so test contexts and
+    non-workspace callers keep working unchanged.
+    """
 
     workspace_dir: Path
     domain: str | None = None
@@ -58,6 +80,8 @@ class ScanContext:
     smb_connection_factory: Any | None = None
     ldap_factory: Any | None = None
     kerb_factory: Any | None = None
+    domains_data: Mapping[str, Any] = field(default_factory=dict)
+    ip_hostname_inventory: dict[str, list[str]] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -130,6 +154,7 @@ class CVEScanRunner:
         scan_id = scan_id or _new_scan_id()
         targets_t = tuple(targets)
         cves_t = tuple(cves)
+        cred_auth_domains = _credential_auth_domains(creds)
         started_at = datetime.now(timezone.utc)
         global_sem = asyncio.Semaphore(self._concurrency)
         per_host_sems: dict[str, asyncio.Semaphore] = {}
@@ -158,7 +183,7 @@ class CVEScanRunner:
         # unreachable is a DATA GAP (recorded SKIPPED), never a "not
         # vulnerable" verdict and never a per-host TimeoutError.
         reachable_ports = await self._preflight_required_ports(
-            targets_t, normal_cves, coercion_cves
+            targets_t, normal_cves, coercion_cves, cred_auth_domains
         )
         # Count of (host, check) pairs skipped for unreachability, for the
         # single end-of-sweep operator summary line.
@@ -180,8 +205,8 @@ class CVEScanRunner:
         normal_work: list[tuple[ScanTarget, CVEDefinition]] = []
         for target in targets_t:
             for cve in normal_cves:
-                if not _applies(cve, target):
-                    skipped = _skipped_result(cve, target)
+                if not _applies(cve, target, cred_auth_domains):
+                    skipped = _skipped_result(cve, target, cred_auth_domains)
                     results.append(skipped)
                     if on_result is not None:
                         on_result(skipped)
@@ -200,10 +225,12 @@ class CVEScanRunner:
         # scope) still emit a result so the dashboard fills the cell.
         coercion_hosts: list[ScanTarget] = []
         for target in targets_t:
-            applicable = [c for c in coercion_cves if _applies(c, target)]
+            applicable = [
+                c for c in coercion_cves if _applies(c, target, cred_auth_domains)
+            ]
             if not applicable:
                 for cve in coercion_cves:
-                    skipped = _skipped_result(cve, target)
+                    skipped = _skipped_result(cve, target, cred_auth_domains)
                     results.append(skipped)
                     if on_result is not None:
                         on_result(skipped)
@@ -211,7 +238,7 @@ class CVEScanRunner:
             # Skipped entries (some scopes excluded) still need recording.
             for cve in coercion_cves:
                 if cve not in applicable:
-                    skipped = _skipped_result(cve, target)
+                    skipped = _skipped_result(cve, target, cred_auth_domains)
                     results.append(skipped)
                     if on_result is not None:
                         on_result(skipped)
@@ -282,7 +309,9 @@ class CVEScanRunner:
             host_sem = per_host_sems.setdefault(
                 target.host, asyncio.Semaphore(self._per_host_concurrency)
             )
-            applicable = [c for c in coercion_cves if _applies(c, target)]
+            applicable = [
+                c for c in coercion_cves if _applies(c, target, cred_auth_domains)
+            ]
             if not applicable:
                 return
 
@@ -394,6 +423,7 @@ class CVEScanRunner:
         )
 
         _emit_unreachable_summary(unreachable_skips, results)
+        _emit_foreign_dc_summary(results)
 
         return CVEScanReport(
             scan_id=scan_id,
@@ -409,6 +439,7 @@ class CVEScanRunner:
         targets: tuple[ScanTarget, ...],
         normal_cves: tuple[CVEDefinition, ...],
         coercion_cves: tuple[CVEDefinition, ...],
+        cred_auth_domains: frozenset[str] | None = None,
     ) -> dict[str, frozenset[int]]:
         """Live-probe each target's required ports, once, up front.
 
@@ -431,7 +462,7 @@ class CVEScanRunner:
         port_to_hosts: dict[int, set[str]] = {}
         for target in targets:
             for cve in (*normal_cves, *coercion_cves):
-                if not _applies(cve, target):
+                if not _applies(cve, target, cred_auth_domains):
                     continue
                 for port in cve.required_ports:
                     port_to_hosts.setdefault(port, set()).add(target.host)
@@ -454,18 +485,75 @@ class CVEScanRunner:
         return {host: frozenset(ports) for host, ports in open_by_host.items()}
 
 
-def _applies(cve: CVEDefinition, target: ScanTarget) -> bool:
+def _applies(
+    cve: CVEDefinition,
+    target: ScanTarget,
+    cred_auth_domains: frozenset[str] | None = None,
+) -> bool:
     """Return whether ``cve`` runs against ``target``.
 
     Delegates to :func:`scope_applies_to_target` (the catalog's canonical
     scope→target gate) so the scheduler and any pre-scan display derived
     from the catalog can never disagree about which checks execute.
+
+    ``cred_auth_domains`` (the domains the scan credential can authenticate
+    to) drives the cross-forest foreign-DC skip: a DC-only check against a
+    controller in a domain the credential does not cover is skipped rather
+    than attempted with a bind that would fail ``SEC_E_LOGON_DENIED``.
     """
 
-    return scope_applies_to_target(cve.target_scope, is_dc=target.is_dc)
+    return scope_applies_to_target(
+        cve.target_scope,
+        is_dc=target.is_dc,
+        target_domain=target.domain,
+        cred_auth_domains=cred_auth_domains,
+    )
 
 
-def _skipped_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
+def _credential_auth_domains(creds: Any | None) -> frozenset[str]:
+    """Collect the domain(s) a scan credential can authenticate to.
+
+    Conservative: only the credential's own ``auth_domain`` / ``domain``
+    (ADscan does not model trust reachability here). Empty when unknown, which
+    makes the foreign-DC gate a no-op (every DC still runs).
+    """
+
+    if creds is None:
+        return frozenset()
+    domains: set[str] = set()
+    for attr in ("auth_domain", "domain"):
+        value = getattr(creds, attr, None)
+        if value:
+            domains.add(str(value))
+    return frozenset(domains)
+
+
+# Prefix that marks a skip caused by the cross-forest foreign-DC gate, so the
+# end-of-scan summary can de-duplicate it into ONE operator line instead of
+# repeating a raw transport error per (host, check).
+_FOREIGN_DC_SKIP_PREFIX = "cross-domain:"
+
+
+def _skipped_result(
+    cve: CVEDefinition,
+    target: ScanTarget,
+    cred_auth_domains: frozenset[str] | None = None,
+) -> CVEResult:
+    # Distinguish a plain scope skip (member host, DC-only check) from a
+    # foreign-DC skip (the credential cannot cover this DC's domain) so the
+    # operator gets a clear cross-domain note rather than the raw
+    # SEC_E_LOGON_DENIED a bind attempt would have produced.
+    error: str | None = None
+    if (
+        target.is_dc
+        and cve.target_scope in (TargetScope.DCS_ONLY, TargetScope.DOMAIN_LDAP)
+        and not credential_covers_domain(target.domain, cred_auth_domains)
+        and target.domain
+    ):
+        error = (
+            f"{_FOREIGN_DC_SKIP_PREFIX} no credential for domain "
+            f"{target.domain} — LDAP check skipped"
+        )
     return CVEResult(
         cve_id=cve.id,
         aka=cve.aka,
@@ -475,6 +563,7 @@ def _skipped_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
         cvss_v3=cve.cvss_v3,
         cvss_vector=cve.cvss_vector,
         technique=cve.technique,
+        error=error,
     )
 
 
@@ -526,6 +615,36 @@ def _emit_unreachable_summary(
         "(required port unreachable from this vantage) — recorded as not "
         "evaluated, not as not-vulnerable."
     )
+
+
+def _emit_foreign_dc_summary(results: list[CVEResult]) -> None:
+    """Emit ONE concise note per foreign domain whose DC checks were skipped.
+
+    A cross-forest audit points the scan at DCs in domains the scan credential
+    cannot authenticate to. The gate skips those DC-only checks up front, so the
+    operator would otherwise see nothing (previously: repeated raw
+    ``SEC_E_LOGON_DENIED`` errors). One informative line per foreign domain
+    replaces both the silence and the error spam. Stays quiet when nothing was
+    skipped for this reason.
+    """
+
+    domains: set[str] = set()
+    for result in results:
+        error = result.error or ""
+        if error.startswith(_FOREIGN_DC_SKIP_PREFIX):
+            # "cross-domain: no credential for domain <X> — LDAP check skipped"
+            marker = "domain "
+            start = error.find(marker)
+            if start != -1:
+                rest = error[start + len(marker):]
+                domain = rest.split(" —", 1)[0].split(" -", 1)[0].strip()
+                if domain:
+                    domains.add(domain)
+    for domain in sorted(domains):
+        print_info(
+            f"  ℹ cross-domain: no credential for domain {domain} — "
+            "DC checks skipped (not evaluated, not a finding)"
+        )
 
 
 def _error_result(cve: CVEDefinition, target: ScanTarget, message: str) -> CVEResult:

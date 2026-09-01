@@ -24,7 +24,7 @@ import re
 from typing import Any, MutableMapping, Optional
 
 from adscan_internal.services.base_service import BaseService
-from adscan_internal.models.domain import Domain
+from adscan_internal.models.domain import Domain, resolve_ci
 from adscan_core.rich_output import print_exception
 from adscan_core.sensitive import strip_sensitive_markers
 
@@ -602,7 +602,22 @@ class CredentialStoreService(BaseService):
 
         domain_data = self.ensure_domain_entry(domains_data, domain)
         kerberos_keys = domain_data.setdefault("kerberos_keys", {})
-        current = kerberos_keys.get(normalized_username)
+        # Reuse an existing entry for the same principal regardless of case
+        # (AD sAMAccountName is case-insensitive), so a later store under a
+        # different casing (e.g. ``dc02$`` after DCSync wrote ``DC02$``) MERGES
+        # into the existing record instead of forking a second one that the
+        # reader would then have to disambiguate.
+        store_key = normalized_username
+        current = kerberos_keys.get(store_key)
+        if not isinstance(current, dict):
+            for candidate in kerberos_keys:
+                if (
+                    str(candidate or "").strip().casefold()
+                    == normalized_username.casefold()
+                ):
+                    store_key = candidate
+                    current = kerberos_keys.get(candidate)
+                    break
         current_data = current if isinstance(current, dict) else {}
 
         material = {
@@ -615,7 +630,7 @@ class CredentialStoreService(BaseService):
             ).strip(),
             "rid": str(rid or current_data.get("rid") or "").strip(),
         }
-        kerberos_keys[normalized_username] = {
+        kerberos_keys[store_key] = {
             key: value for key, value in material.items() if value
         }
 
@@ -636,12 +651,32 @@ class CredentialStoreService(BaseService):
         domain: str,
         username: str,
     ) -> KerberosKeyMaterial | None:
-        """Return stored Kerberos key material for ``username`` if present."""
-        domain_data = domains_data.get(domain, {})
+        """Return stored Kerberos key material for ``username`` if present.
+
+        Both the domain key and the username key are matched
+        CASE-INSENSITIVELY. AD ``sAMAccountName`` (including machine accounts
+        like ``DC02$``) is case-insensitive, and the two producers store with
+        different casing: DCSync persists the SAMR display name verbatim
+        (``DC02$``, uppercase), while a consumer derived from
+        ``pdc_hostname_fqdn`` (``dc02.darkzero.ext``) queries ``dc02$``
+        (lowercase). A raw ``kerberos_keys.get(username)`` misses that record,
+        so the material reads as absent even though it is on disk — the
+        cross-org TGT-delegation ``no Kerberos key material held for dc02$``
+        abort on a workspace that DOES hold ``DC02$``. Matching by casefold on
+        both keys resolves the real record regardless of either producer's
+        casing.
+        """
+        # Resolve the domain and the username keys case-insensitively via the
+        # shared SSOT (resolve_ci) — the same principle as the top-level
+        # CaseInsensitiveDict, applied at READ time for the nested map so the
+        # stored casing (DC02$) is preserved for display.
+        domain_data = resolve_ci(domains_data, domain)
+        if not isinstance(domain_data, dict):
+            return None
         kerberos_keys = domain_data.get("kerberos_keys", {})
         if not isinstance(kerberos_keys, dict):
             return None
-        data = kerberos_keys.get(username)
+        data = resolve_ci(kerberos_keys, username)
         if not isinstance(data, dict):
             return None
         return KerberosKeyMaterial(

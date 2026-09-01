@@ -1129,8 +1129,18 @@ def print_attack_paths_summary(
             nodes_to_render = nodes[: max_path_steps + 1]
             step_details_to_render = step_details_to_render[:max_path_steps]
 
+        first_label = str(nodes_to_render[0])
+        first_partner = (
+            str(nodes_to_render[1]) if len(nodes_to_render) > 1 else ""
+        )
         chain.append(
-            _mark_path_node(format_node_label(str(nodes_to_render[0]), domain))
+            _mark_path_node(
+                format_node_label(
+                    first_label,
+                    domain,
+                    _wellknown_context_domain(first_label, first_partner),
+                )
+            )
         )
         for idx, rel in enumerate(rels_to_render):
             if idx + 1 >= len(nodes_to_render):
@@ -1164,11 +1174,35 @@ def print_attack_paths_summary(
             chain.append(" → ", style="dim")
             chain.append(rel_label, style=BRAND_COLORS["warning"])
             chain.append(" → ", style="dim")
-            chain.append(_mark_path_node(format_node_label(next_label, domain)))
+            # A well-known target node takes its context domain from the edge
+            # SOURCE (the previous node), which is its edge partner here.
+            next_partner = str(nodes_to_render[idx])
+            chain.append(
+                _mark_path_node(
+                    format_node_label(
+                        next_label,
+                        domain,
+                        _wellknown_context_domain(next_label, next_partner),
+                    )
+                )
+            )
         if not truncated and len(nodes) > len(rels) + 1:
-            for node in nodes[len(rels) + 1 :]:
+            for offset, node in enumerate(nodes[len(rels) + 1 :]):
+                node_label = str(node)
+                partner_idx = len(rels) + offset  # the preceding node
+                trailing_partner = (
+                    str(nodes[partner_idx]) if 0 <= partner_idx < len(nodes) else ""
+                )
                 chain.append(" → ", style="dim")
-                chain.append(_mark_path_node(format_node_label(str(node), domain)))
+                chain.append(
+                    _mark_path_node(
+                        format_node_label(
+                            node_label,
+                            domain,
+                            _wellknown_context_domain(node_label, trailing_partner),
+                        )
+                    )
+                )
         if truncated:
             remaining = max(0, len(rels) - len(rels_to_render))
             chain.append(" → ", style="dim")
@@ -1377,8 +1411,41 @@ def print_attack_paths_summary(
 _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED = False
 
 
-def _fallback_format_attack_path_node_label(label: str, domain: str) -> str:
-    """Best-effort node label formatter when reporting narratives are unavailable."""
+def _wellknown_context_domain(node_label: str, partner_label: str) -> str | None:
+    """Return the partner node's ``@domain`` when ``node_label`` is a well-known sentinel.
+
+    A well-known principal renders its internal ``@WELLKNOWN`` sentinel unless
+    the formatter is handed the adjacent node's domain as context. The partner
+    is the well-known node's edge neighbour in the path (the next node when it
+    is the edge source, the previous node when it is the edge target). Returns
+    ``None`` for a regular node so the formatter behaves exactly as before.
+    """
+    node_value = str(node_label or "").strip()
+    if "@" not in node_value:
+        return None
+    _, _, node_domain = node_value.partition("@")
+    if node_domain.strip().lower() != "wellknown":
+        return None
+    partner_value = str(partner_label or "").strip()
+    if "@" not in partner_value:
+        return None
+    _, _, partner_domain = partner_value.partition("@")
+    partner_domain = partner_domain.strip()
+    return partner_domain or None
+
+
+def _fallback_format_attack_path_node_label(
+    label: str, domain: str, context_domain: str | None = None
+) -> str:
+    """Best-effort node label formatter when reporting narratives are unavailable.
+
+    Kept in lockstep with the PRO SSOT ``format_node_label``: a well-known
+    principal (label ends ``@WELLKNOWN``) has its effective domain rebound to
+    the adjacent node's ``context_domain`` so the same-domain strip below
+    produces a bare ``Authenticated Users`` intra-domain or
+    ``Authenticated Users@<partner-domain>`` cross-domain. Display-only — the
+    graph node identity is never touched.
+    """
     value = str(label or "").strip()
     if not value:
         return "N/A"
@@ -1389,8 +1456,17 @@ def _fallback_format_attack_path_node_label(label: str, domain: str) -> str:
 
     if "@" in value:
         left, _, right = value.partition("@")
+        if right.strip().lower() == "wellknown" and left.strip():
+            partner_domain = str(context_domain or "").strip()
+            if partner_domain:
+                right = partner_domain
+                value = f"{left}@{partner_domain}"
         if right and right.strip().lower() == domain_value:
             return left.strip() or value
+        # A UPN carrying a cross-domain '@domain' keeps its full NAME@DOMAIN —
+        # matching the PRO SSOT's `return node_value`. Never fall through to the
+        # host-suffix strip below (which would truncate a cross-forest UPN).
+        return value
     if domain_value and value.lower().endswith(f".{domain_value}"):
         host = value[: -(len(domain_value) + 1)].split(".", 1)[0].strip()
         return host or value
@@ -1601,7 +1677,7 @@ def _fallback_format_attack_path_source_context(
 
 
 def _get_attack_path_narrative_formatters() -> tuple[
-    Callable[[str, str], str],
+    Callable[..., str],
     Callable[[str], str],
     Callable[..., str],
     Callable[..., str],

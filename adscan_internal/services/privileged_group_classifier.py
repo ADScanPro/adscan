@@ -11,6 +11,7 @@ Rationale:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import zip_longest
 from typing import Any, Iterable, Mapping
 
@@ -158,12 +159,19 @@ _TIER_ZERO_TARGET_RIDS: frozenset[int] = frozenset(
 )
 
 
+@lru_cache(maxsize=None)
 def normalize_sid(value: str) -> str | None:
     """Return a normalized SID string or None when it can't be extracted.
 
     BloodHound CE sometimes prefixes SIDs with domain strings (e.g.:
     ``HTB.LOCAL-S-1-5-32-548``). Some tools may also embed the SID inside
     additional text. We extract the first ``S-1-`` substring and keep it.
+
+    Pure string transform of a single hashable ``str`` argument (no shell or
+    mutable global state), so it is safe to memoize across domains/runs — the
+    result depends only on ``value``. Called ~4M times over a bounded, tiny set
+    of distinct inputs (group SIDs in a domain), so an unbounded cache is
+    memory-safe and eliminates the repeated parse.
     """
     raw = (value or "").strip()
     if not raw:
@@ -290,8 +298,15 @@ class PrivilegedGroupMembership:
         }
 
 
+@lru_cache(maxsize=None)
 def normalize_group_name(value: str) -> str:
-    """Return one normalized group name without the optional @DOMAIN suffix."""
+    """Return one normalized group name without the optional @DOMAIN suffix.
+
+    Pure, context-free transform of a single hashable ``str`` (no shell/global
+    state), so its output depends only on ``value`` and it is safe to memoize
+    across domains. Called ~4M times over a bounded set of distinct group names,
+    so an unbounded cache is memory-safe.
+    """
     raw = str(value or "").strip().lower()
     if "@" in raw:
         raw = raw.rsplit("@", 1)[0].strip()

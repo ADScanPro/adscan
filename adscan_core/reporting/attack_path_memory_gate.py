@@ -27,15 +27,30 @@ independent regimes, and the gate takes the larger:
 **Regime 1 — the affected-aware path term.** The path term is two-dimensional:
 each surviving path stores its blast-radius (``meta.affected_users``) list, so
 the marginal cost per raw path grows with how many principals that path affects.
-The measured slope is ``0.35 KB per (raw_path * affected_principal)`` — tight
-(0.343–0.361 across five high-corner fixtures spanning raw 1,427→15,000 and
-affected 51→3,001), predicting 5 of 6 within 2%. The old scalar
-``155 KB/raw_path`` silently assumed ``affected ≈ 430``; on a corporate directory
-where each path affects ~2,000 principals the true rate is ~880 KB/raw, so the
-scalar gate fired ~5x too late there — it let the corporate run (the OOM the user
-reported) get far closer to the kill than it should. At affected≈2,000 on a
-20k-element graph, 2 GB is now crossed at ~2,600 raw_paths, not the ~13,500 the
-scalar model implied.
+That list is a copy of REFERENCES into the shared group-member index — an
+8-byte-pointer-per-element cost, not a full re-materialisation — so the true
+marginal is a small pointer-sized slope, NOT the full ``raw × affected`` cartesian
+residency an earlier fit assumed. Re-derived 2026-08 against the peak RSS of THREE
+graphs actually run to completion with the gate disabled under a 7 GB cap
+(``/proc/self/statm`` sampler, the annotate stage isolated):
+
+    | graph    | nodes+edges | raw_paths | affected_est | real peak | slope needed |
+    |----------|------------:|----------:|-------------:|----------:|-------------:|
+    | AffC     |      20,772 |     8,000 |        2,001 |    667 MB |    23.8 B    |
+    | AffHeavy |      33,912 |    12,000 |        3,001 |  1,599 MB |    33.5 B    |
+    | L15k     |      36,112 |    15,000 |        2,501 |  1,156 MB |    18.9 B    |
+
+The real slope needed to COVER these peaks is 19–34 B per (raw·affected); the gate
+uses ``0.0625 KB = 64 B`` — roughly 2x the worst observed slope, conservative in
+the safe (over-projecting) direction without the ~11x blow-up the old
+``0.35 KB (358 B)`` slope caused. That old slope assumed all ~2,516 affected
+principals of every one of 15,000 paths were resident at peak simultaneously
+(→12.9 GB), whereas the annotate stage's real growth on L15k is only +479 MB. The
+concrete customer consequence of the old coefficient: L15k domain/all projected
+13,289 MB and needed a container ≥ ~15.6 GB just to NOT abort to zero paths — a
+silent false negative ("no attack paths") on a directory that HAS them and fits in
+1.16 GB. At 64 B the same run projects ~2.77 GB, so any container ≥ ~4 GB completes
+it and returns its ~15,000 real paths.
 
 **The affected_count is NOT known when Stage B projects** (see below), so the
 gate ESTIMATES it with a conservative upper bound and over-projects rather than
@@ -77,6 +92,7 @@ the LITE runtime, the PRO report renderer and the web backend alike.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -100,17 +116,27 @@ GRAPH_BYTES_PER_ELEMENT = 10 * 1024
 
 #: Base marginal peak memory per RAW DFS path, independent of blast radius — the
 #: fixed cost of holding one path's node/edge list resident. Measured ~4 KB
-#: (2026-08, the intercept of the per-raw curve at affected→0). Final.
+#: (2026-08, the intercept of the per-raw curve at affected→0). This is the ONE
+#: coefficient a future engine-aware selector will swap (rustworkx retains ~8x less
+#: per path than the Python DFS), so it is kept as a single clean scalar,
+#: deliberately NOT entangled with the affected-slope term above — a later
+#: selector can pass an engine-specific base without re-deriving the blast-radius
+#: slope. Final for the Python engine.
 PATH_BASE_BYTES_PER_RAWPATH = 4 * 1024
 
 #: Marginal peak memory per (RAW DFS path × affected principal) — the cost of each
-#: surviving path storing its blast-radius ``meta.affected_users`` list. Measured
-#: 0.35 KB/(raw_path·affected), tight (2026-08: 0.343–0.361 across the AffA/AffB/
-#: AffC/DomX-15k/L15k high-corner sweep, which fixes raw and varies affected from
-#: 51 to 3,001). This slope is what the old scalar 155 KB/raw missed: it assumed a
-#: fixed affected≈430, and a corporate directory affecting ~2,000 principals per
-#: path costs ~880 KB/raw, so the scalar gate fired ~5x too late there.
-PATH_BYTES_PER_RAWPATH_AFFECTED = int(0.35 * 1024)
+#: surviving path storing its blast-radius ``meta.affected_users`` list, which is a
+#: list of REFERENCES into the shared group-member index (an 8-byte pointer per
+#: element, not a full copy). Re-derived 2026-08 against the REAL peak RSS of three
+#: graphs run to completion with the gate disabled (AffC 667 MB, AffHeavy 1,599 MB,
+#: L15k 1,156 MB — see the module docstring table): the true slope needed to cover
+#: those peaks is 19–34 B/(raw·affected). This uses 64 B (``0.0625 KB``), ~2x the
+#: worst observed slope, conservative without the ~11x over-projection the earlier
+#: 358 B (``0.35 KB``) slope caused. That earlier slope assumed the FULL
+#: ``raw × affected`` blast radius was resident at peak simultaneously (12.9 GB for
+#: L15k), which aborted L15k domain/all to zero paths in any container under
+#: ~15.6 GB — a silent false negative on a directory whose real peak is 1.16 GB.
+PATH_BYTES_PER_RAWPATH_AFFECTED = int(0.0625 * 1024)
 
 #: Second-regime density coefficient: marginal peak per (raw_path × branching),
 #: where branching = ``edges / nodes``. The DFS transiently holds every
@@ -139,6 +165,232 @@ SAFETY_FRACTION = 0.85
 #: and in the renderer's ``report_data``. One name so the writer, the PDF and the
 #: web platform cannot drift on where the record lives.
 ATTACK_PATH_COVERAGE_KEY = "attack_path_coverage"
+
+# --- In-DFS runaway bound (Option C) ------------------------------------------
+#
+# The two-stage gate above runs OUTSIDE the DFS — Stage A before it and Stage B
+# after the raw path list exists. Neither runs INSIDE the recursion, so on a wide,
+# densely-connected directory the DFS intermediate-state fan-out can exhaust memory
+# MID-recursion, before ``max_paths`` (which caps COMPLETED output paths, not states
+# explored) and before Stage B — and the kernel ``SIGKILL``s the process with no
+# report. The in-DFS bound below closes that hole by converting the runaway into the
+# SAME declared ``_AttackPathMemoryBudgetExceeded`` the outer gate raises, so the
+# coverage-bounded declaration fires unchanged.
+#
+# Two mechanisms, both ON by default, both raising the same exception:
+#
+#   1. PRIMARY — RSS vs the real available ceiling. Every ``_RSS_SAMPLE_STRIDE``
+#      DFS invocations (cheap: the sample is amortised ~1/4096), sample the process
+#      RSS and the available memory from the SAME cgroup-aware reader the outer gate
+#      uses (:func:`adscan_core.memory_probe.read_memory_situation`). When RSS
+#      crosses ``_RSS_STOP_FRACTION`` of that ceiling — the point where the kernel is
+#      about to kill — stop cleanly. A domain that FITS in RAM never crosses the
+#      fraction, so the bound never fires and coverage is byte-identical: only the
+#      pathological case that OOMs today is touched. This is the zero-coverage-loss
+#      guarantee.
+#
+#   2. SECONDARY — an absolute DFS-state cap, a safety net for environments where
+#      RSS sampling is unavailable/unreliable (no ``/proc``, no cgroup, a platform
+#      whose RSS reader returns ``None``). Set high enough that no NORMAL domain
+#      reaches it: a real enterprise reporter proved a ~100k-state ceiling stops the
+#      runaway they hit on 24 GB, and the largest healthy real/synthetic baseline
+#      (Forest ``domain/all`` ≈ 96k pre-minimisation transient states) sits just
+#      under that, so the default is set with headroom above the worst healthy case
+#      rather than at it. Configurable via ``ADSCAN_ATTACK_PATHS_MAX_DFS_STATES``.
+
+#: How many ``dfs()`` invocations between RSS samples. A sample reads ``/proc`` and
+#: a cgroup file; at one every few thousand recursive calls the cost is negligible
+#: while still catching a runaway long before the kill boundary. A power of two so
+#: the modulo is a cheap mask.
+_RSS_SAMPLE_STRIDE = 4096
+
+#: Fraction of the AVAILABLE memory ceiling the live process RSS may reach inside
+#: the DFS before the bound stops it. Matches :data:`SAFETY_FRACTION` — the kill is
+#: unrecoverable, so the bound leaves the same headroom the projection gate does.
+_RSS_STOP_FRACTION = SAFETY_FRACTION
+
+#: Default absolute DFS-state ceiling (the secondary net). Above the worst HEALTHY
+#: baseline (Forest ``domain/all`` ≈ 96k transient states) with headroom, so a
+#: normal domain never reaches it and the RSS check remains the primary bound.
+#: Operators can RAISE it (or effectively disable it with a very high value) via
+#: ``ADSCAN_ATTACK_PATHS_MAX_DFS_STATES``; the default protects every run.
+_DEFAULT_MAX_DFS_STATES = 2_000_000
+
+#: Env var name that overrides the absolute DFS-state ceiling. Forwarded to the
+#: container by the launcher's ``ADSCAN_*`` wildcard (11.3.0), so no launcher change
+#: is needed to expose it.
+_MAX_DFS_STATES_ENV = "ADSCAN_ATTACK_PATHS_MAX_DFS_STATES"
+
+
+def _read_max_dfs_states() -> int:
+    """Return the absolute DFS-state ceiling from the env override, best-effort.
+
+    Falls back to :data:`_DEFAULT_MAX_DFS_STATES` on an unset/invalid value. A
+    non-positive override is treated as "disable the absolute net" by returning a
+    very large sentinel, so the RSS check remains the only active bound (an operator
+    who sets ``0`` wants no state cap, not an instant abort).
+    """
+    raw = os.getenv(_MAX_DFS_STATES_ENV)
+    if raw is None:
+        return _DEFAULT_MAX_DFS_STATES
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_DFS_STATES
+    if value <= 0:
+        return 1 << 62  # effectively "no absolute cap"; RSS check still guards.
+    return value
+
+
+class _AttackPathMemoryBudgetExceeded(Exception):
+    """Signal that attack-path discovery would exceed the memory ceiling.
+
+    Raised by BOTH the outer projection gate (pre/post-DFS in
+    ``attack_graph_service``) AND the in-DFS runaway bound (:class:`DfsMemoryBudget`
+    below) so a mid-recursion OOM and a pre-decoration projection abort flow through
+    the SAME clean, declared stop: the whole "declare coverage bounded, state how
+    many routes/states examined" path (``build_attack_path_coverage(bounded=True,
+    examined_routes=...)``) fires unchanged, turning a fatal ``SIGKILL`` into a
+    reviewable coverage boundary. Caught once at the public entry point
+    (``get_attack_path_summaries``). Carries the count of routes/states examined so
+    the coverage boundary can state how far discovery got before the bound.
+
+    Lives in this pure-logic module (not ``attack_graph_service``) so both the
+    service layer that catches it and ``attack_graph_core`` — which imports from
+    ``adscan_core`` but never from ``attack_graph_service`` — raise the SAME class.
+    ``attack_graph_service`` re-exports it for its existing callers.
+    """
+
+    def __init__(self, message: str, *, examined_routes: int) -> None:
+        super().__init__(message)
+        self.operator_message = message
+        self.examined_routes = int(examined_routes)
+
+
+class DfsMemoryBudget:
+    """Stateful in-DFS runaway bound shared by every ``dfs()`` closure.
+
+    ONE instance is created per compute and its :meth:`tick` is called on entry to
+    every recursive ``dfs()`` invocation across all three DFS entrypoints in
+    ``attack_graph_core``, so the three sites cannot drift on the bound logic.
+    ``tick`` increments a state counter and, every :data:`_RSS_SAMPLE_STRIDE`
+    invocations, samples live RSS vs available memory; it raises
+    :class:`_AttackPathMemoryBudgetExceeded` when either the RSS fraction or the
+    absolute state cap is crossed. Both checks are ON by default.
+
+    Best-effort by construction: the RSS sample is wrapped so a sampling failure
+    (no ``/proc``, no cgroup, an RSS/available read that returns ``None``) silently
+    falls back to the absolute state-cap-only path — a broken memory reader must
+    never break discovery, and the state cap is the safety net for exactly that
+    environment.
+
+    The message is DEFERRED to raise-time and worded for the operator; the client
+    coverage declaration is built from :attr:`examined_states` by the catch site,
+    so this object stays pure (no console, no report writes).
+    """
+
+    def __init__(
+        self,
+        *,
+        rss_stop_fraction: float = _RSS_STOP_FRACTION,
+        sample_stride: int = _RSS_SAMPLE_STRIDE,
+        max_states: int | None = None,
+    ) -> None:
+        self.examined_states = 0
+        self._rss_stop_fraction = float(rss_stop_fraction)
+        self._sample_stride = max(1, int(sample_stride))
+        self._max_states = (
+            int(max_states) if max_states is not None else _read_max_dfs_states()
+        )
+
+    def tick(self) -> None:
+        """Account one ``dfs()`` invocation; raise the budget exception if bound.
+
+        Called at the top of every recursive ``dfs()``. Increments the state
+        counter, checks the absolute cap unconditionally (cheap), and samples RSS
+        once every ``sample_stride`` calls (the expensive read, amortised to ~zero).
+        """
+        self.examined_states += 1
+
+        # Secondary net — absolute DFS-state ceiling. Cheap, checked every call.
+        if self.examined_states >= self._max_states:
+            raise _AttackPathMemoryBudgetExceeded(
+                _dfs_bound_operator_message(
+                    reason="state_cap",
+                    examined_states=self.examined_states,
+                    projected_bytes=None,
+                    available_bytes=None,
+                ),
+                examined_routes=self.examined_states,
+            )
+
+        # Primary — RSS vs the real available ceiling, sampled on a stride.
+        if self.examined_states % self._sample_stride != 0:
+            return
+        crossed, rss_bytes, available_bytes = self._rss_crossed_ceiling()
+        if crossed:
+            raise _AttackPathMemoryBudgetExceeded(
+                _dfs_bound_operator_message(
+                    reason="rss",
+                    examined_states=self.examined_states,
+                    projected_bytes=rss_bytes,
+                    available_bytes=available_bytes,
+                ),
+                examined_routes=self.examined_states,
+            )
+
+    def _rss_crossed_ceiling(self) -> tuple[bool, int | None, int | None]:
+        """Return ``(crossed, rss_bytes, available_bytes)``, best-effort.
+
+        ``crossed`` is True only when BOTH live RSS and available memory are
+        readable AND ``rss >= available * fraction``. Any failure (no reader, a
+        ``None`` value) returns ``(False, ...)`` so the DFS proceeds under the
+        absolute state cap alone — never abort on a blind read.
+        """
+        try:
+            from adscan_core import memory_probe
+
+            situation = memory_probe.read_memory_situation()
+            rss = situation.rss_bytes
+            available = situation.available_bytes
+        except Exception:  # noqa: BLE001 — a memory read must never break discovery.
+            return False, None, None
+        if not isinstance(rss, int) or not isinstance(available, int):
+            return False, None, None
+        if available <= 0:
+            return False, rss, available
+        threshold = int(available * self._rss_stop_fraction)
+        return rss >= threshold, rss, available
+
+
+def _dfs_bound_operator_message(
+    *,
+    reason: str,
+    examined_states: int,
+    projected_bytes: int | None,
+    available_bytes: int | None,
+) -> str:
+    """Compose the operator terminal line for an in-DFS runaway abort.
+
+    Operator-facing (the real cause + remedy); the CLIENT coverage sentence is a
+    separate, reason-free statement built by :func:`build_attack_path_coverage` at
+    the catch site. Never names an internal module or a verdict about the directory.
+    """
+    if reason == "rss" and projected_bytes and available_bytes:
+        rss = _mb(projected_bytes)
+        avail = _mb(available_bytes)
+        return (
+            f"Attack-path discovery reached about {rss} of memory with only {avail} "
+            "free, and was stopped before this environment would run out. Raise the "
+            "available memory (or close other running workloads) and re-run to "
+            "compute the full set of routes."
+        )
+    return (
+        f"Attack-path discovery examined {examined_states:,} intermediate states and "
+        "was stopped at the configured limit before it could exhaust memory. Raise "
+        "the analysis host's memory (or the state limit) and re-run to compute the "
+        "full set of routes."
+    )
 
 # Operator-scenario discriminator. When the projected need exceeds the TOTAL
 # ceiling, freeing RAM cannot help — the ceiling is fixed and too small. When the
@@ -539,6 +791,8 @@ __all__ = [
     "SCENARIO_RESIZE",
     "SCENARIO_UNKNOWN",
     "MemoryProjection",
+    "DfsMemoryBudget",
+    "_AttackPathMemoryBudgetExceeded",
     "project_graph_term_bytes",
     "project_peak_bytes",
     "evaluate_projection",

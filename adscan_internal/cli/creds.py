@@ -975,9 +975,33 @@ def _ensure_verified_domain_credential_ticket(
         CredentialStoreService,
     )
 
+    from adscan_internal.services.credential_disclosure_detection import (
+        is_non_loginable_principal,
+    )
+
     store_service = CredentialStoreService()
     is_explicit_blank_password = credential == ""
     try:
+        # Non-loginable principals (krbtgt / per-RODC krbtgt_<digits> / machine
+        # accounts) can never pass an AS-REQ — the KDC answers KDC_ERR_CLIENT_REVOKED
+        # by design — so this purely opportunistic TGT caching would only mint a
+        # doomed AS-REQ (an extra DC 4768 failure + an ugly traceback in the
+        # client-facing output). Their secret is valid by construction from
+        # replication/SAM and is retained for offline ticket forging.
+        if is_non_loginable_principal(user):
+            marked_user = mark_sensitive(user, "user")
+            marked_domain = mark_sensitive(domain, "domain")
+            print_info(
+                f"Skipping Kerberos ticket generation for '{marked_user}' — "
+                "non-loginable account (krbtgt/machine); its hash is retained for "
+                "offline use (golden/silver ticket forging)."
+            )
+            print_info_debug(
+                "[kerberos] Skipped opportunistic TGT auto-generation for "
+                f"{marked_user}@{marked_domain} (non-loginable principal)."
+            )
+            return
+
         existing_ticket = store_service.get_kerberos_ticket(
             domains_data=shell.domains_data,
             domain=domain,
@@ -1166,6 +1190,53 @@ def _render_unreachable_domain_authenticated_pipeline_skip(
         f"[creds] handle_auth_and_optional_privs: skipping authenticated "
         f"pipeline for {marked_domain} -- resolve_dc_reachability() == False"
     )
+
+
+def _attack_context_promotes_new_terminal_principal(
+    *,
+    is_execution_active: bool,
+    is_terminal_step: bool,
+    normalized_user: str,
+    active_step_user: str | None,
+) -> bool:
+    """Decide whether an attack-context credential should run the full user search.
+
+    A credential added during active attack-path execution should trigger the
+    broad ``ask_for_user_privs`` per-principal search when BOTH hold:
+
+    1. The active step is TERMINAL (the last executable step of the chain). A
+       non-terminal step already has downstream steps queued, so re-searching
+       from an interim principal would duplicate work the chain will do anyway.
+    2. The added principal is NEW — it is not the step's own executor. A step
+       whose executor simply re-authenticates has nothing new to search from;
+       the interesting case is a step that *produces* a fresh principal (for
+       example an MSSQL TokenTheft/SeImpersonate step that mints a Domain Admin,
+       possibly in a foreign forest) which must be searched from to discover the
+       paths it unlocks.
+
+    ``active_step_user`` is best-effort. When it cannot be resolved (``None`` or
+    empty), we cannot prove the added principal is the executor, so a terminal
+    step still promotes the new principal — the conservative direction is to run
+    the search rather than silently drop a real escalation source.
+
+    Args:
+        is_execution_active: Whether attack-path execution is currently active.
+        is_terminal_step: Whether the active step is the last executable step.
+        normalized_user: The added credential's ``sAMAccountName`` (normalized).
+        active_step_user: The active step's execution/FROM principal, if known.
+
+    Returns:
+        True when the full ``ask_for_user_privs`` search should run.
+    """
+    if not is_execution_active:
+        return False
+    if not is_terminal_step:
+        return False
+    if not normalized_user:
+        return False
+    if active_step_user and normalized_user == active_step_user:
+        return False
+    return True
 
 
 def handle_auth_and_optional_privs(
@@ -1373,7 +1444,6 @@ def handle_auth_and_optional_privs(
     try:
         from adscan_internal.services.attack_graph_runtime_service import (
             ActiveAttackGraphStep,
-            get_attack_path_followup_context,
             get_attack_path_step_context,
             is_attack_path_execution_active,
         )
@@ -1381,9 +1451,6 @@ def handle_auth_and_optional_privs(
         ActiveAttackGraphStep = object  # type: ignore[misc,assignment]
 
         def get_attack_path_step_context(_shell: Any) -> dict[str, object]:
-            return {}
-
-        def get_attack_path_followup_context(_shell: Any) -> dict[str, object]:
             return {}
 
         def is_attack_path_execution_active(_shell: Any) -> bool:
@@ -1569,10 +1636,17 @@ def handle_auth_and_optional_privs(
             if isinstance(value, str) and value.strip():
                 candidates.append(value.strip())
 
-        # Fallbacks when steps did not include notes.
-        for label in (active.to_label, active.from_label):
-            if isinstance(label, str) and label.strip():
-                candidates.append(label.strip())
+        # Fallback when steps did not include notes: the step's FROM/executor
+        # identity ONLY. NEVER include ``active.to_label`` here — the executor is
+        # the principal that RAN the step, never the step's target. For a
+        # ``User4 --GenericAll--> User5`` step the target (User5) is frequently
+        # the NEW principal being added; folding it into the executor candidates
+        # would make the "new principal" comparison see User5==User5 and wrongly
+        # cut a legitimate promotion (a compromised target masquerading as the
+        # executor).
+        from_label = active.from_label
+        if isinstance(from_label, str) and from_label.strip():
+            candidates.append(from_label.strip())
 
         for raw in candidates:
             normalized = normalize_samaccountname(raw)
@@ -1727,11 +1801,20 @@ def handle_auth_and_optional_privs(
     def _should_force_full_user_privs_from_attack_context(user: str) -> bool:
         """Return True when attack-path context should promote a full user pivot.
 
-        Credentials discovered from an active attack-path follow-up (for example,
-        passwords recovered while enumerating SMB shares or services) represent a
-        *new* pivot source that was not part of the original terminal step. In
-        that scenario we intentionally prefer the broader ``ask_for_user_privs``
-        flow over the lightweight terminal-pivot UX.
+        A credential added during active attack-path execution represents a
+        *new* pivot source when it belongs to a principal that is not the active
+        step's own executor and the active step is TERMINAL (the last executable
+        step). In that scenario we intentionally prefer the broader
+        ``ask_for_user_privs`` flow over the lightweight terminal-pivot UX, so the
+        paths that new principal unlocks are discovered and executed.
+
+        The decisive criteria are NEW-principal + TERMINAL-step. This agrees with
+        every credential-producing step (share/ACL/ADCS/gMSA/LAPS/kerberoast/RODC/
+        MSSQL TokenTheft) and additionally covers producers — such as the MSSQL
+        SeImpersonate/TokenTheft step that mints a foreign-forest Domain Admin —
+        that bypass the nested follow-up context entirely (they call
+        ``add_credential`` directly). The decision itself lives in the module-level
+        SSOT ``_attack_context_promotes_new_terminal_principal``.
         """
         if not is_attack_path_execution_active(shell):
             print_info_debug(
@@ -1739,14 +1822,10 @@ def handle_auth_and_optional_privs(
                 "(attack path execution inactive)"
             )
             return False
-        followup_context = get_attack_path_followup_context(shell)
-        compromise_semantics, compromise_effort = (
-            _resolve_active_step_compromise_metadata()
-        )
-        if not followup_context and compromise_semantics != "access_capability_only":
+        if not _is_active_attack_path_step_terminal():
             print_info_debug(
                 "[creds] attack-context credential flow: disabled "
-                "(no nested follow-up context and active step semantics are not access_capability_only)"
+                "(active step is not terminal)"
             )
             return False
 
@@ -1759,7 +1838,12 @@ def handle_auth_and_optional_privs(
             return False
 
         active_step_user = _resolve_active_step_execution_user()
-        if active_step_user and normalized_user == active_step_user:
+        if not _attack_context_promotes_new_terminal_principal(
+            is_execution_active=True,
+            is_terminal_step=True,
+            normalized_user=normalized_user,
+            active_step_user=active_step_user,
+        ):
             print_info_debug(
                 "[creds] attack-context credential flow: disabled "
                 "(credential belongs to active step execution user)"
@@ -1768,12 +1852,9 @@ def handle_auth_and_optional_privs(
 
         print_info_debug(
             "[creds] attack-context credential flow: enabling full "
-            "ask_for_user_privs for newly discovered principal "
+            "ask_for_user_privs for newly discovered terminal principal "
             f"user={mark_sensitive(normalized_user, 'user')} "
-            f"active_step_user={mark_sensitive(active_step_user or 'N/A', 'user')} "
-            f"compromise_semantics={mark_sensitive(compromise_semantics, 'detail')} "
-            f"compromise_effort={mark_sensitive(compromise_effort, 'detail')} "
-            f"context={mark_sensitive(str(followup_context), 'detail')}"
+            f"active_step_user={mark_sensitive(active_step_user or 'N/A', 'user')}"
         )
         return True
 
@@ -2997,6 +3078,25 @@ def add_credential(
                         if host and service:
                             cred_source_hint = f"local_{service}"
 
+                        # Derive the acquisition METHOD (the technique that produced
+                        # this credential) from the recorded ``credential_origin``
+                        # via the shared SSOT — this answers "which technique got
+                        # the FIRST credential", which the legacy ``source_hint``
+                        # (a domain/local store-location tag) never could.
+                        cred_method: str | None = None
+                        cred_method_label: str | None = None
+                        try:
+                            origin_for_method = str(credential_origin or "").strip()
+                            if origin_for_method:
+                                _routes = build_method_set(origin_for_method, None)
+                                if _routes:
+                                    cred_method = str(_routes[0].get("method") or "") or None
+                                    cred_method_label = (
+                                        str(_routes[0].get("method_label") or "") or None
+                                    )
+                        except Exception:  # noqa: BLE001 — method is best-effort enrichment
+                            cred_method = None
+
                         properties = {
                             "scan_mode": shell.scan_mode,
                             "duration_minutes": round((duration / 60.0), 2)
@@ -3006,6 +3106,8 @@ def add_credential(
                             "auto": getattr(shell, "auto", False),
                             "is_hash": is_hash,
                             "source_hint": cred_source_hint,
+                            "method": cred_method,
+                            "method_label": cred_method_label,
                             "auth_type": shell.domains_data.get(domain, {}).get(
                                 "auth", "unknown"
                             ),
@@ -3013,6 +3115,18 @@ def add_credential(
                         properties.update(
                             build_lab_event_fields(shell=shell, include_slug=True)
                         )
+                        # Shared attribution key so this credential joins back to
+                        # the unauth session (start_unauth) that produced it.
+                        try:
+                            from adscan_internal.cli.common import (  # noqa: PLC0415
+                                build_workspace_attribution_fields,
+                            )
+
+                            properties.update(
+                                build_workspace_attribution_fields(shell)
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                         telemetry.capture("first_cred_found", properties)
                         # Track victory for session summary (Hormozi: Give:Ask ratio)
                         if hasattr(shell, "_session_victories"):

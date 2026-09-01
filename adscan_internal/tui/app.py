@@ -418,7 +418,6 @@ class ADscanApp(App):
             bridge_console,
             verbose_mode=bool(getattr(self._shell, "verbose_mode", False)),
             debug_mode=bool(getattr(self._shell, "debug_mode", False)),
-            secret_mode=bool(getattr(self._shell, "SECRET_MODE", False)),
         )
 
     # ── Message handlers ───────────────────────────────────────────────────────

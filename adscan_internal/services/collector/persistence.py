@@ -16,6 +16,7 @@ from adscan_internal.services.collector.inventory_persistence import (
 from adscan_internal.services.collector.models import (
     CollectionResult,
     CollectorEdge,
+    ForeignNodeRef,
     HttpSpnFinding,
 )
 from adscan_internal.services.credential_store_service import hosts_match
@@ -98,6 +99,12 @@ _REPLICATION_RIGHT_RELATIONS: frozenset[str] = frozenset(
 
 _DOMAIN_ADMINS_RID = 512
 _DOMAIN_CONTROLLERS_RID = 516
+
+# Well-known Authenticated Users SID — the broadest actor for Kerberoasting /
+# AS-REP Roasting (only *being authenticated* is required, which is cross-forest
+# capable). Sourcing those derived edges here (not from the domain-local Domain
+# Users group) is what surfaces the cross-forest roasting paths.
+_AUTHENTICATED_USERS_SID = "S-1-5-11"
 
 # Canonical display names for synthesized well-known groups (used only when the
 # real node is absent from the collection result). Keyed by domain-relative RID.
@@ -330,6 +337,55 @@ def _register_collected_hostnames_for_telemetry(result: CollectionResult) -> Non
         print_exception(exception=exc)
 
 
+def _ensure_foreign_endpoint_node(
+    graph: dict[str, Any],
+    target_sid: str,
+    foreign_sid_to_label: dict[str, ForeignNodeRef],
+) -> str | None:
+    """Resolve a foreign target SID to a graph id, creating a light endpoint node.
+
+    When an edge's target SID belongs to another collected domain, the current
+    graph has no node for it, so the edge would be dropped. If the cross-domain
+    registry knows the SID, we create (idempotently) a light node in THIS graph
+    keyed by the foreign node's canonical graph id — the SAME id the foreign
+    domain's own graph uses — so the query-time merge collapses the two onto one
+    node and the DFS crosses the domain boundary.
+
+    Args:
+        graph: The origin domain's attack graph being persisted.
+        target_sid: The edge's (foreign) target object SID.
+        foreign_sid_to_label: SID -> :class:`ForeignNodeRef` registry.
+
+    Returns:
+        The foreign node's graph id, or ``None`` when the SID is genuinely
+        unresolvable (out of scope, no registry entry) — the edge stays dropped.
+    """
+    ref = foreign_sid_to_label.get(str(target_sid or "").upper())
+    if ref is None or not ref.node_id:
+        return None
+    nodes = graph.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        nodes = {}
+        graph["nodes"] = nodes
+    if ref.node_id not in nodes:
+        # Light placeholder — the real foreign node (same graph id) overwrites it
+        # when the graphs merge. ``cross_domain_endpoint`` marks it as a stand-in.
+        nodes[ref.node_id] = {
+            "kind": ref.kind,
+            "label": ref.label,
+            "name": ref.label,
+            "objectId": str(target_sid or "").upper(),
+            "highvalue": ref.is_tier0,
+            "isTierZero": ref.is_tier0,
+            "properties": {
+                "name": ref.label,
+                "objectid": str(target_sid or "").upper(),
+                "cross_domain_endpoint": True,
+            },
+        }
+    return ref.node_id
+
+
 class CollectorPersistence:
     """Persist collector output into attack_graph.json and memberships.json."""
 
@@ -339,8 +395,19 @@ class CollectorPersistence:
         *,
         domain: str,
         result: CollectionResult,
+        foreign_sid_to_label: dict[str, "ForeignNodeRef"] | None = None,
     ) -> dict[str, int]:
-        """Persist one CollectionResult and return artifact counters."""
+        """Persist one CollectionResult and return artifact counters.
+
+        Args:
+            foreign_sid_to_label: SID -> :class:`ForeignNodeRef` for principals in
+                OTHER collected domains, so an edge whose target SID belongs to a
+                foreign domain is persisted as a real cross-domain edge (pointing
+                at the foreign node's canonical graph id) instead of being dropped.
+                ``None``/empty preserves the legacy single-domain behaviour.
+        """
+
+        foreign_sid_to_label = foreign_sid_to_label or {}
 
         _register_collected_hostnames_for_telemetry(result)
 
@@ -373,9 +440,20 @@ class CollectorPersistence:
             if _should_skip_attack_graph_edge(edge, result, has_enterprise_ca=_has_enterprise_ca):
                 continue
             from_id = sid_to_graph_id.get(edge.source_object_id.upper())
-            to_id = sid_to_graph_id.get(edge.target_object_id.upper())
-            if not from_id or not to_id:
+            if not from_id:
                 continue
+            to_id = sid_to_graph_id.get(edge.target_object_id.upper())
+            cross_domain = False
+            if not to_id:
+                to_id = _ensure_foreign_endpoint_node(
+                    graph, edge.target_object_id, foreign_sid_to_label
+                )
+                if not to_id:
+                    continue  # genuinely unresolvable (out-of-scope, no ref)
+                cross_domain = True
+            notes: dict[str, Any] = {"collector_method": edge.method, **edge.notes}
+            if cross_domain:
+                notes["cross_domain"] = True
             persisted = attack_graph_service.upsert_edge(
                 graph,
                 from_id=from_id,
@@ -383,7 +461,7 @@ class CollectorPersistence:
                 relation=edge.relation,
                 edge_type=f"native_{edge.source}",
                 status="discovered",
-                notes={"collector_method": edge.method, **edge.notes},
+                notes=notes,
                 log_creation=False,
             )
             if persisted:
@@ -405,7 +483,12 @@ class CollectorPersistence:
 
         attack_graph_service.save_attack_graph(shell, domain, graph)
         membership_edges = self._write_memberships(
-            shell, domain, result, sid_to_graph_id, node_payloads
+            shell,
+            domain,
+            result,
+            sid_to_graph_id,
+            node_payloads,
+            foreign_sid_to_label,
         )
         inventory_counters = CollectorInventoryPersistence().persist(
             shell,
@@ -428,7 +511,9 @@ class CollectorPersistence:
         result: CollectionResult,
         sid_to_graph_id: dict[str, str],
         node_payloads: list[dict[str, Any]],
+        foreign_sid_to_label: dict[str, "ForeignNodeRef"] | None = None,
     ) -> int:
+        foreign_sid_to_label = foreign_sid_to_label or {}
         graph: dict[str, Any] = {
             "domain": domain,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -448,9 +533,18 @@ class CollectorPersistence:
             if edge.relation != "MemberOf":
                 continue
             from_id = sid_to_graph_id.get(edge.source_object_id.upper())
-            to_id = sid_to_graph_id.get(edge.target_object_id.upper())
-            if not from_id or not to_id:
+            if not from_id:
                 continue
+            to_id = sid_to_graph_id.get(edge.target_object_id.upper())
+            if not to_id:
+                # Foreign group membership: the user "belongs" to a group in
+                # another collected domain. Point at that group's canonical id
+                # so the merge collapses it onto the real foreign group node.
+                to_id = _ensure_foreign_endpoint_node(
+                    graph, edge.target_object_id, foreign_sid_to_label
+                )
+                if not to_id:
+                    continue
             key = (from_id, edge.relation, to_id)
             if key in seen:
                 continue
@@ -624,7 +718,17 @@ def _persist_derived_attack_steps(
     sid_to_graph_id: dict[str, str],
 ) -> int:
     """Persist attack steps derived from collected account properties."""
-    domain_users_id = _find_domain_users_graph_id(result, sid_to_graph_id)
+    # Kerberoasting and AS-REP Roasting only require the requester to be
+    # *authenticated* against the target realm — NOT to be a member of the
+    # target domain's local Domain Users group. The correct broadest actor is
+    # therefore Authenticated Users (well-known SID S-1-5-11), which a
+    # foreign-forest authenticated principal is also a member of (a trusted-forest
+    # user CAN kerberoast/AS-REP-roast the target domain). Sourcing these edges
+    # from Domain Users (513) — which contains only the domain's own users —
+    # silently drops every cross-forest roasting path. The Authenticated Users
+    # node is guaranteed present: the orchestrator injects it and wires every
+    # enabled principal's MemberOf into it before persistence runs.
+    authenticated_users_id = _find_authenticated_users_graph_id(sid_to_graph_id)
     # ADCS Enterprise CA web-enrollment hosts carry an ``HTTP/<ca>`` SPN, but the
     # ADCS collector already owns that host's Kerberos-relay story (ESC8 detection
     # plus the active EPA probe in ``adcs_web_enrollment_probe``). Collect those
@@ -690,13 +794,13 @@ def _persist_derived_attack_steps(
         if (
             node.kind == "User"
             and account_type != "gmsa"
-            and domain_users_id
+            and authenticated_users_id
             and _node_is_enabled(node)
         ):
             if _node_bool_property(node, "hasspn"):
                 created += _upsert_derived_edge(
                     graph,
-                    from_id=domain_users_id,
+                    from_id=authenticated_users_id,
                     to_id=graph_id,
                     relation="Kerberoasting",
                     notes={
@@ -710,7 +814,7 @@ def _persist_derived_attack_steps(
             if _node_bool_property(node, "dontreqpreauth"):
                 created += _upsert_derived_edge(
                     graph,
-                    from_id=domain_users_id,
+                    from_id=authenticated_users_id,
                     to_id=graph_id,
                     relation="ASREPRoasting",
                     notes={
@@ -1732,18 +1836,19 @@ def _upsert_derived_edge(
     return 1 if edge else 0
 
 
-def _find_domain_users_graph_id(
-    result: CollectionResult,
+def _find_authenticated_users_graph_id(
     sid_to_graph_id: dict[str, str],
 ) -> str:
-    for object_id, node in result.nodes.items():
-        if node.kind != "Group":
-            continue
-        sam = str(node.samaccountname or "").strip().casefold()
-        name = str(node.name or "").split("@", 1)[0].strip().casefold()
-        if sam == "domain users" or name == "domain users":
-            return sid_to_graph_id.get(object_id.upper(), "")
-    return ""
+    """Return the graph id of the Authenticated Users well-known node (S-1-5-11).
+
+    Resolved by its fixed well-known SID rather than by group name — the node is
+    synthetic (``Authenticated Users@WELLKNOWN``), guaranteed injected by
+    ``well_known_sids.inject_all_well_known_sid_nodes`` before persistence, and
+    keyed under its SID in ``sid_to_graph_id`` like every other collected node.
+    Returns ``""`` when the node is absent so the caller can skip emission rather
+    than sourcing an edge from an unresolvable placeholder.
+    """
+    return sid_to_graph_id.get(_AUTHENTICATED_USERS_SID, "")
 
 
 def _resolve_delegation_target_graph_id(

@@ -944,10 +944,7 @@ def disable_auto_mode():
     install_prompt_logging_wrappers()
 
 
-# Secret mode runtime flag (internal traceback/detail visibility control).
-# Import from common module to avoid circular dependencies.
-from adscan_internal.cli.common import (  # pylint: disable=invalid-name  # noqa: E402
-    SECRET_MODE,
+from adscan_internal.cli.common import (  # noqa: E402
     build_lab_event_fields,
 )
 
@@ -3374,14 +3371,13 @@ logger = init_logging(
     console,
     VERBOSE_MODE,
     DEBUG_MODE,
-    SECRET_MODE,
     log_dir=Path(ADSCAN_BASE_DIR) / "logs",
     telemetry_console=TELEMETRY_CONSOLE,
 )
 
 # Initialize rich output module (pass logger for integration) and configure
 # telemetry console so high-level helpers mirror output to it.
-init_rich_output(console, VERBOSE_MODE, DEBUG_MODE, SECRET_MODE, logger=logger)
+init_rich_output(console, VERBOSE_MODE, DEBUG_MODE, logger=logger)
 set_telemetry_console(TELEMETRY_CONSOLE)
 
 # Tame third-party native-stack stdlib loggers (aiosmb, msldap, kerbad, ...)
@@ -4373,6 +4369,34 @@ def _maybe_show_report_cta(shell) -> None:
     if workspace_type != "audit":
         return
     shell.console.print()
+
+    # Branch the CTA by the operator's own role. A buyer testing their OWN estate
+    # (internal security / sysadmin-blue-team / CISO) is pointed at the Enterprise
+    # demo — continuous validation + a board/auditor report — not the /pro CLI they
+    # would run themselves. A consultant / unknown role stays on /pro (the light,
+    # safe default; the Enterprise lane is only offered on a positive buyer signal).
+    from adscan_internal.services.operator_role_cta import is_enterprise_lane
+
+    if is_enterprise_lane():
+        _demo_url = mark_passthrough(cta_display_url("session_summary_enterprise_demo"))
+        if "domain_compromise" in victories:
+            print_info(
+                f"Domain Admin proven in your own AD. ADscan Enterprise validates this "
+                f"continuously and gives you the board/auditor-ready report → {_demo_url}"
+            )
+        elif attack_paths > 0:
+            print_info(
+                f"[bold]{attack_paths} attack path(s) found in your own AD[/bold] — ADscan "
+                f"Enterprise re-checks them continuously and reports for your board/auditor "
+                f"→ {_demo_url}"
+            )
+        else:
+            print_info(
+                f"Credentials exposed in your own AD this session. ADscan Enterprise "
+                f"validates your exposure continuously → book a demo {_demo_url}"
+            )
+        return
+
     _pro_url = mark_passthrough(cta_display_url("session_summary"))
     if "domain_compromise" in victories:
         print_info(
@@ -9003,54 +9027,14 @@ def _is_positive_report_metric(value) -> bool:
     return bool(value)
 
 
-class CaseInsensitiveDict(dict):
-    """A dictionary that uses case-insensitive keys."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._convert_keys()
-
-    def _convert_keys(self):
-        """Convert all existing keys to lowercase."""
-        for k in list(self.keys()):
-            v = super().pop(k)
-            self.__setitem__(k, v)
-
-    def __getitem__(self, key):
-        return super().__getitem__(key.lower() if isinstance(key, str) else key)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key.lower() if isinstance(key, str) else key, value)
-
-    def __delitem__(self, key):
-        super().__delitem__(key.lower() if isinstance(key, str) else key)
-
-    def __contains__(self, key):
-        return super().__contains__(key.lower() if isinstance(key, str) else key)
-
-    def get(self, key, default=None):
-        return super().get(key.lower() if isinstance(key, str) else key, default)
-
-    def pop(self, key, *args, **kwargs):
-        return super().pop(
-            key.lower() if isinstance(key, str) else key, *args, **kwargs
-        )
-
-    def update(self, other=None, **kwargs):
-        if other is not None:
-            if isinstance(other, CaseInsensitiveDict):
-                super().update(other)
-            else:
-                super().update(
-                    {
-                        k.lower() if isinstance(k, str) else k: v
-                        for k, v in other.items()
-                    }
-                )
-        if kwargs:
-            super().update(
-                {k.lower() if isinstance(k, str) else k: v for k, v in kwargs.items()}
-            )
+# ``CaseInsensitiveDict`` is the SSOT wrapper for ``shell.domains_data``. It
+# lives in the import-light ``adscan_internal.models.domain`` module so the
+# workspace-load seam (``state.py``) and the report_service can import it
+# without a circular dependency on this 30k-line module. Re-exported here so
+# existing ``from adscan import CaseInsensitiveDict`` imports keep working.
+from adscan_internal.models.domain import (  # noqa: E402
+    CaseInsensitiveDict,
+)
 
 
 # CLI<->web contract: the only workspace_type values the telemetry streamer
@@ -9584,6 +9568,21 @@ class PentestShell:
         from adscan_internal.cli.post_da import queue_audit_post_compromise
 
         queue_audit_post_compromise(self, domain, username, credential)
+
+    def _execute_cross_domain_escalation_actions(self, domain: str) -> None:
+        """Drain queued cross-domain escalation for a domain at a safe checkpoint.
+
+        Mode-agnostic (ctf AND audit): fires the applicable escalation techniques
+        (CrossOrgTgtDelegation, RaiseChild, ...) from the just-compromised domain
+        into another domain, then recurses via promote_to_pwned on success. Defers
+        while attack-path execution is active. No-op when nothing is queued. Runs
+        BEFORE the mode-specific post-compromise so escalation opens surface first.
+        """
+        from adscan_internal.services.cross_domain_escalation import (
+            execute_cross_domain_escalation,
+        )
+
+        execute_cross_domain_escalation(self, domain)
 
     def _execute_audit_post_compromise_actions(
         self,
@@ -10716,7 +10715,11 @@ class PentestShell:
     current_domain = None
     current_domain_dir = None
     domain_path = None
-    domains_data = CaseInsensitiveDict()  # Initialize as CaseInsensitiveDict
+    # Class-level default is ``None`` (NOT a shared mutable ``CaseInsensitiveDict``
+    # class attribute, which every instance would share). ``__init__`` always
+    # instantiates a fresh per-instance ``CaseInsensitiveDict`` (see the guard
+    # below), so no code path uses a shared class-attr map.
+    domains_data = None
     report_file = "technical_report.json"
     report = {}
     technical_report_file = "technical_report.json"
@@ -11440,6 +11443,10 @@ class PentestShell:
                     f"Error loading technical report cache: {self.technical_report_file}"
                 )
         self.type = None  # Initialize pentest type (ctf or audit)
+        # Didactic mode override: None = derive from workspace type (ctf/lab →
+        # deep, audit → basic); "off"|"basic"|"deep" = explicit operator choice
+        # set via `set explain_level …` / `--learn` / `--quiet`.
+        self.explain_level = None
         self.lab_provider = (
             None  # Lab provider for CTF workspaces (HTB, TryHackMe, etc.)
         )
@@ -14656,32 +14663,14 @@ class PentestShell:
                     except Exception as e:
                         telemetry.capture_exception(e)
                         print_error(f"Error executing command '{command_name}'.")
-                        # Single sanitized render in the default (non-secret)
-                        # mode: a second print_exception there only duplicates
-                        # the same one-line sanitized message (locals are
-                        # ignored by the sanitized branch). In secret mode the
-                        # second call adds the locals-annotated frame, so keep it
-                        # there. This removes the "printed twice" duplicate.
-                        from adscan_core.output._state import is_debug_mode, is_secret_mode
+                        # print_exception shows a sanitized one-liner by default
+                        # and the FULL traceback under --debug (the visible-branch
+                        # gate). Under --debug also surface the locals-annotated
+                        # frame so the exact failing state is visible without an
+                        # operator re-run.
+                        from adscan_core.output._state import is_debug_mode
 
-                        print_exception(show_locals=False, exception=e)
-                        if is_secret_mode():
-                            print_exception(show_locals=True, exception=e)
-
-                        # Debuggability: under --debug, surface the FULL Python
-                        # traceback so the exact failing frame is visible without
-                        # an operator re-run. Routed through print_info_debug
-                        # (markup-safe), so a bracketed path / MarkupError text in
-                        # the trace can never re-trigger the same crash here.
-                        if is_debug_mode() and not is_secret_mode():
-                            import traceback as _tb
-                            from rich.markup import escape as _rich_escape
-
-                            tb_text = _tb.format_exc()
-                            print_info_debug(
-                                "command-dispatch traceback (debug):\n"
-                                + _rich_escape(tb_text)
-                            )
+                        print_exception(show_locals=is_debug_mode(), exception=e)
                 else:
                     # Escape the (uncontrolled) user token before it reaches a
                     # Rich-rendered sink: a bracketed input like `[/x]` would
@@ -14803,11 +14792,13 @@ class PentestShell:
         raw_gh = ADSCAN_LINKS["github"]
         raw_dc = ADSCAN_LINKS["discord"]
         raw_li = ADSCAN_LINKS["linkedin"]
+        raw_x = ADSCAN_LINKS["x"]
         self.console.print(
             f"  [dim][link={raw_docs}]📚 Docs[/link]"
             f"  ·  [link={raw_gh}]🔗 GitHub[/link]"
             f"  ·  [link={raw_dc}]💬 Discord[/link]"
-            f"  ·  [link={raw_li}]💼 LinkedIn[/link][/dim]"
+            f"  ·  [link={raw_li}]💼 LinkedIn[/link]"
+            f"  ·  [link={raw_x}]𝕏[/link][/dim]"
             f"  [dim]·  © 2026 Yeray Martín[/dim]"
         )
         # ── Tier-aware intro — branched dispatch (LITE vs PRO).
@@ -14901,6 +14892,31 @@ class PentestShell:
                         )
                 else:
                     print_error("Invalid type. Please use 'ctf' or 'audit'.")
+            elif variable in ("explain_level", "explain", "learn"):
+                from adscan_internal.services.didactic_service import (
+                    ExplainLevel,
+                    default_level_for_type,
+                )
+
+                level = ExplainLevel.coerce(value)
+                if level is None:
+                    print_error(
+                        "Invalid explain_level. Use 'off', 'basic', or 'deep' "
+                        "(aliases: quiet, learn)."
+                    )
+                else:
+                    self.explain_level = level.value
+                    default = default_level_for_type(self.type)
+                    print_info(
+                        f"Didactic mode set to '{level.value}'. "
+                        f"(Workspace default for type={self.type or 'unset'} is "
+                        f"'{default.value}'.)"
+                    )
+                    if level == ExplainLevel.DEEP:
+                        print_info(
+                            "Each technique now shows a full teaching card "
+                            "(what/why, manual command, MITRE, detection) before it runs."
+                        )
             elif variable == "telemetry":
                 from adscan_internal.services.telemetry_preference_service import (
                     USAGE as TELEMETRY_SET_USAGE,
@@ -15953,6 +15969,45 @@ class PentestShell:
         # credential is unusable.
         self._last_domain_credential_verification_skipped = False
 
+        # Non-loginable principals (krbtgt / krbtgt_<RODC> / machine accounts)
+        # can never pass a TGT-logon check: they are disabled for logon by
+        # design and always answer an AS-REQ with KDC_ERR_CLIENT_REVOKED.
+        # Their secret is valid by CONSTRUCTION when it lands here (recovered
+        # via a successful DRSUAPI replication or the SAM), so verification is
+        # pointless — and running it produced a FALSE "Account locked out" for
+        # krbtgt. Trust the credential and mark it verified so nothing
+        # downstream re-verifies or deletes it (e.g. golden-ticket material).
+        from adscan_internal.services.credential_disclosure_detection import (
+            is_non_loginable_principal as _is_non_loginable_principal,
+        )
+
+        if _is_non_loginable_principal(user):
+            self._last_verified_domain_name = domain_name
+            self._last_verified_domain_username = user
+            self._last_verified_domain_credential = cred_value
+            marked_user = mark_sensitive(user, "user")
+            marked_domain_name = mark_sensitive(domain_name, "domain")
+            is_machine_account = str(user or "").strip().endswith("$")
+            if is_machine_account:
+                trust_message = (
+                    f"'{marked_user}' is a machine account (non-loginable by "
+                    f"design); its secret for domain '{marked_domain_name}' is "
+                    "trusted by construction from the replication/SAM — no TGT "
+                    "logon check is possible."
+                )
+            else:
+                trust_message = (
+                    f"'{marked_user}' is a KDC service account (non-loginable "
+                    f"by design) for domain '{marked_domain_name}'; its hash is "
+                    "valid by construction from the replication — golden-ticket "
+                    "material retained."
+                )
+            if ui_silent:
+                print_info_verbose(trust_message)
+            else:
+                print_info(trust_message)
+            return True
+
         # Resolve the DC/KDC IP via the SSOT fallback chain
         # (pdc → dc_ip → dcs[0] → connectivity.summary.pdc_ip). Reading
         # domain_data["pdc"] directly drops a cross-domain-discovered
@@ -16492,7 +16547,9 @@ class PentestShell:
                 f"[ui_silent] Credential verification failed for user {marked_user} on domain {marked_domain_name}{error_suffix}"
             )
 
-        if result.raw_output and SECRET_MODE:
+        from adscan_core.output._state import is_debug_mode  # noqa: PLC0415
+
+        if result.raw_output and is_debug_mode():
             self.console.print(
                 Panel(
                     result.raw_output.strip(),
@@ -16837,7 +16894,21 @@ class PentestShell:
         # ``_finalize_scan_on_objective_met``). No ``scan_complete`` telemetry:
         # this invocation ran no phases, so the event belongs to the invocation
         # that actually reached the objective.
-        if self._is_ctf_domain_pwned(domain):
+        # Cross-domain escalation FIRST (mode-agnostic): a trusted-forest / child
+        # compromise may still escalate into the origin/parent forest, so drain it
+        # before deciding the objective is met — otherwise a `.ext` win would end a
+        # CTF scan before the `.htb` hop. The drain recurses via promote_to_pwned,
+        # so after a successful escalation the origin domain is itself pwned.
+        self._execute_cross_domain_escalation_actions(domain)
+
+        # Do not finalize while an escalation into another domain is still pending.
+        from adscan_internal.services.cross_domain_escalation import (
+            has_pending_cross_domain_escalation,
+        )
+
+        if self._is_ctf_domain_pwned(domain) and not has_pending_cross_domain_escalation(
+            self
+        ):
             self._ctf_execute_post_compromise_actions(domain)
             self._finalize_scan_on_objective_met(domain, ran_scan_work=False)
             return
@@ -17033,7 +17104,15 @@ class PentestShell:
             """
             # If we were compromised asynchronously (e.g. by another pipeline), stop
             # without printing additional "Running/Completed" noise in CTF mode.
-            if self._is_ctf_domain_pwned(domain):
+            # Cross-domain escalation first, and do not stop while one is pending.
+            self._execute_cross_domain_escalation_actions(domain)
+            from adscan_internal.services.cross_domain_escalation import (
+                has_pending_cross_domain_escalation,
+            )
+
+            if self._is_ctf_domain_pwned(
+                domain
+            ) and not has_pending_cross_domain_escalation(self):
                 self._ctf_execute_post_compromise_actions(domain)
                 if _manage_progress:
                     self._finalize_scan_on_objective_met(domain, ran_scan_work=True)
@@ -17066,16 +17145,32 @@ class PentestShell:
                 )
                 from adscan_internal.rich_output import print_exception
 
-                # User-visible error is sanitized unless SECRET_MODE=True.
+                # User-visible error is sanitized unless --debug is set.
                 print_exception(exception=e, show_locals=False)
             finally:
                 self._exit_enumeration_context()
 
+            # Cross-domain escalation FIRST (mode-agnostic): a step that compromised
+            # a trusted/child domain (e.g. DCSync as the terminal step of an attack
+            # path) may still escalate into the origin/parent forest. The step has
+            # returned and attack-path execution has unwound, so the drain (which
+            # runs DCSync + re-discovery) is no longer re-entrant. It recurses via
+            # promote_to_pwned, so after a successful escalation the origin domain
+            # is itself pwned.
+            self._execute_cross_domain_escalation_actions(domain)
+
             # If the domain was compromised during this step, execute the minimal
             # post-compromise actions and stop the remaining pipeline. This is the
             # engagement's success criterion, so the scan is recorded COMPLETE —
-            # the remaining phases are skipped by design, not by interruption.
-            if self._is_ctf_domain_pwned(domain):
+            # the remaining phases are skipped by design, not by interruption. But
+            # do NOT stop while an escalation into another domain is still pending.
+            from adscan_internal.services.cross_domain_escalation import (
+                has_pending_cross_domain_escalation,
+            )
+
+            if self._is_ctf_domain_pwned(
+                domain
+            ) and not has_pending_cross_domain_escalation(self):
                 self._ctf_execute_post_compromise_actions(domain)
                 if _manage_progress:
                     self._finalize_scan_on_objective_met(domain, ran_scan_work=True)
@@ -17628,6 +17723,53 @@ class PentestShell:
                     f"in 90 seconds → {_pro_url}"
                 )
                 mark_victory_hint_shown("scan_complete_report")
+            # A soft give:ask at the peak-value moment: ADscan just walked the
+            # domain to compromise, so this is where an operator is most open to
+            # following the person behind it. Shown ONCE per operator (not once
+            # per victory) and never in a non-interactive run — an unattended
+            # ci/PoV worker has nobody to read it and the extra line only dirties
+            # the log. The two social links live in ADSCAN_LINKS (the SSOT) so
+            # they stay in lockstep with the banner and install note.
+            try:
+                from adscan_internal.interaction import (  # noqa: PLC0415
+                    is_non_interactive as _is_non_interactive,
+                )
+
+                if not _is_non_interactive(self):
+                    from adscan_core import first_run_notices  # noqa: PLC0415
+
+                    if first_run_notices.should_show_once(
+                        first_run_notices.NOTICE_SOCIAL_CTA_VICTORY
+                    ):
+                        from adscan_core.branding import ADSCAN_LINKS  # noqa: PLC0415
+
+                        _li = ADSCAN_LINKS["linkedin"]
+                        _x = ADSCAN_LINKS["x"]
+                        self.console.print()
+                        print_info(
+                            "ADscan just walked your domain to compromise. "
+                            "I break down a new AD attack technique every week — "
+                            f"[link={_li}]LinkedIn[/link] · [link={_x}]X[/link]"
+                        )
+                        first_run_notices.mark_shown(
+                            first_run_notices.NOTICE_SOCIAL_CTA_VICTORY
+                        )
+                        # Impression only: a terminal URL gives no click signal,
+                        # so there is no honest ``social_cta_clicked`` to emit
+                        # here — we record that the ask was SHOWN.
+                        try:
+                            telemetry.capture(
+                                "social_cta_shown",
+                                {
+                                    "location": "victory",
+                                    "platform": "linkedin_x",
+                                    "attack_paths": int(_ap_verdict.total),
+                                },
+                            )
+                        except Exception:  # noqa: BLE001 - analytics never breaks a scan
+                            pass
+            except Exception as exc:  # noqa: BLE001 - a CTA never breaks a scan
+                telemetry.capture_exception(exc)
         elif _ap_verdict.kind == "identified_unvalidated":
             # Paths exist but none were proven end-to-end. Honest wording that
             # mirrors the exit summary — NEVER "hardened" (theoretical/blocked/
@@ -18275,8 +18417,11 @@ class PentestShell:
             print_exception(exception=_exc)
 
         # Professional authenticated enumeration header
+        from adscan_internal.cli.common import (
+            resolve_effective_username_for_domain,
+        )
 
-        username = self.domains_data.get(domain, {}).get("username", "N/A")
+        username = resolve_effective_username_for_domain(self, domain)
         pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
         print_operation_header(
             "Authenticated Enumeration",
@@ -18453,9 +18598,14 @@ class PentestShell:
         else:
             from adscan_internal.rich_output import confirm_operation
             from adscan_internal.cli.ldap import run_ldap_descriptions
+            from adscan_internal.cli.common import (
+                resolve_effective_username_for_domain,
+            )
 
             pdc = self.domains_data.get(target_domain, {}).get("pdc", "N/A")
-            username = self.domains_data.get(target_domain, {}).get("username", "N/A")
+            # SSOT: a trusted domain reached over a cross-realm referral is
+            # enumerated with the auth domain's credential — show that, not "N/A".
+            username = resolve_effective_username_for_domain(self, target_domain)
 
             if confirm_operation(
                 operation_name="LDAP Description Password Search",
@@ -20140,6 +20290,7 @@ class PentestShell:
         """
         from adscan_internal.cli.kerberos import run_kerberoast
 
+        self._explain_technique_before_run("kerberoasting")
         target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_kerberoast(self, target_domain, auto_crack=auto_crack)
 
@@ -20195,6 +20346,7 @@ class PentestShell:
         """
         from adscan_internal.cli.kerberos import do_dcsync
 
+        self._explain_technique_before_run("dcsync")
         do_dcsync(self, args)
 
     def dcsync_zerologon(self, domain):
@@ -20629,6 +20781,7 @@ class PentestShell:
         """
         from adscan_internal.cli.kerberos import run_asreproast
 
+        self._explain_technique_before_run("asreproasting")
         target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         return run_asreproast(self, target_domain, auto_crack=auto_crack)
 
@@ -21225,6 +21378,17 @@ class PentestShell:
                 "auth_type": self.domains_data[domain].get("auth", "unknown"),
             }
             properties.update(build_lab_event_fields(shell=self, include_slug=True))
+            # Attribution key shared across the unauth->credential funnel so this
+            # enumeration step can be segmented by workspace_type and joined to the
+            # session's other events. SSOT helper.
+            try:
+                from adscan_internal.cli.common import (
+                    build_workspace_attribution_fields,
+                )
+
+                properties.update(build_workspace_attribution_fields(self))
+            except Exception:  # noqa: BLE001
+                pass
             telemetry.capture("users_enumerated", properties)
         except Exception as e:
             telemetry.capture_exception(e)
@@ -23727,25 +23891,28 @@ class PentestShell:
                 telemetry.capture_exception(_exc)
                 print_exception(exception=_exc)
 
-            from adscan_internal.services.domain_compromise_promotion import (
-                CompromiseEvidence,
-                promote_to_pwned,
-            )
-
-            promote_to_pwned(
-                self,
-                domain=domain,
-                evidence=CompromiseEvidence.DOMAIN_ADMIN_MEMBERSHIP,
-                username=username,
-                credential=password,
-                ctf_actions={"flags", "dcsync"},
-            )
+            # Do NOT promote to ``pwned`` HERE, at bare privileged-group
+            # enumeration follow-up: the DA credential is recorded above, and the
+            # promotion is deferred to the DCSync attack-STEP so the attack-path
+            # search can run first. A domain is ``pwned`` once ADscan has PROVEN
+            # control over a Domain Admin — which is confirmed at the terminal
+            # DCSync step off the verified-DA actor (or on the executed dump
+            # replicating Tier-0 secrets), the SSOT that also fires the
+            # CTF/cross-domain/audit post-compromise pipeline. That flow is driven
+            # by the attack-path search via ``_offer_attack_paths`` — the single
+            # source of truth — instead of a hardcoded dispatch here. The attack
+            # graph auto-chains the DCSync and any cross-trust / cross-forest steps
+            # that the membership unlocks.
+            #
+            # The SYSVOL cleanup below is NOT escalation: it is the rollback of a
+            # prior Backup Operators escalation (world-readable SAM/SYSTEM/SECURITY
+            # hives ADscan itself dropped into SYSVOL). It is self-guarded by the
+            # ``backup_ops_*`` flags (a no-op unless a backup-ops attempt ran) and
+            # has no other trigger site, so it stays here.
             try:
-                from adscan_internal.cli.backup_operators_escalation import (
-                    handle_backup_ops_sysvol_cleanup,
-                )
+                from adscan_internal.cli import backup_operators_escalation
 
-                handle_backup_ops_sysvol_cleanup(
+                backup_operators_escalation.handle_backup_ops_sysvol_cleanup(
                     self,
                     domain=domain,
                     username=username,
@@ -23756,57 +23923,24 @@ class PentestShell:
                 print_exception(exception=exc)
                 print_info_debug(f"[backup-ops] cleanup helper failed: {exc}")
 
-            if self.type == "ctf":
-                return privileged_groups
-            self.ask_for_dcsync(domain, username, password)
-            if self.type == "audit":
-                # Single source of truth: route the audit post-compromise
-                # pipeline (graph re-collection AS the DA + host dump campaign)
-                # through the shared orchestrator. Idempotent — if the DCSync
-                # attack-path already dispatched it for this domain, this is a
-                # no-op; otherwise it runs here with the membership credential.
-                self._execute_audit_post_compromise_actions(
-                    domain, username, password
-                )
-            self.ask_for_raise_child(domain, username, password)
             return privileged_groups
 
         if selected_key == "Administrators":
             print_warning(
                 f"The user {marked_username} is a member of the Administrators group"
             )
-            # In CTF mode: run DCSync first so we get the Domain Admin / Administrator
-            # NT hash, then rely on the credential-add pipeline to trigger flag
-            # collection with reliable credentials.  Asking for flags here fires
-            # before DCSync and uses the current (possibly contaminated) Kerberos
-            # session, causing ACCESS_DENIED on SMB C$ probes.
-            self.ask_for_dcsync(domain, username, password)
+            # Administrators is a ``direct`` privileged type: the DCSync / domain
+            # compromise it enables is now driven by the attack-path search
+            # (``_offer_attack_paths``), not a hardcoded DCSync dispatch here.
 
         if selected_key == "backup_operators":
             print_warning(
                 f"The user {marked_username} is a member of the Backup Operators group"
             )
-            try:
-                from adscan_internal.cli.backup_operators_escalation import (
-                    record_backup_ops_discovered,
-                    offer_backup_operators_escalation,
-                )
-
-                record_backup_ops_discovered(
-                    self,
-                    domain=domain,
-                    username=username,
-                )
-                offer_backup_operators_escalation(
-                    self,
-                    domain=domain,
-                    username=username,
-                    password=password,
-                )
-            except Exception as exc:  # pragma: no cover - best effort
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                print_info_debug(f"[backup-ops] escalation helper failed: {exc}")
+            # Backup Operators is a ``direct`` privileged type: the
+            # SeBackupPrivilege → NTDS.dit escalation is now driven by the
+            # attack-path search (``_offer_attack_paths``), not a hardcoded
+            # ``offer_backup_operators_escalation`` dispatch here.
 
         if selected_key == "read_only_domain_controllers":
             print_warning(
@@ -24387,52 +24521,23 @@ class PentestShell:
             except Exception:  # noqa: BLE001 — the marker is a best-effort hint
                 pass
             if has_admin_privs:
-                # Check privileged groups and execute corresponding actions
-                privileged_groups = self.check_privileged_groups(
-                    domain, username, password
-                )
-                has_adcs = domain_has_adcs_for_attack_steps(self, domain)
-                followup_decision = resolve_privileged_followup_decision(
-                    privileged_groups,
-                    adcs_available=has_adcs,
-                )
-
-                # If the user is already privileged, direct follow-up beats
-                # showing noisy attack paths from that same user.
-                if followup_decision.skip_attack_path_search:
-                    if self._domain_flow_completed_by_pwn(domain):
-                        print_info_verbose(
-                            f"Skipping user privilege enumeration for {marked_username}: domain is already pwned."
-                        )
-                        return
-
-                    print_info_verbose(
-                        f"Skipping attack path search for {marked_username}: "
-                        f"user is already privileged via {followup_decision.primary_key}."
-                    )
-
-                    if auto_mode:
-                        marked_username = mark_sensitive(username, "user")
-                        print_success(
-                            f"Automatically enumerating post-auth service access for user {marked_username}"
-                        )
-                        self.user_postauth_access(domain, username, password)
-                    else:
-                        marked_username = mark_sensitive(username, "user")
-                        if Confirm.ask(
-                            f"Do you want to enumerate post-auth service access for user {marked_username}?",
-                            default=True,
-                        ):
-                            self.user_postauth_access(
-                                domain, username, password
-                            )
-                        else:
-                            marked_username = mark_sensitive(username, "user")
-                            print_info_verbose(
-                                f"Post-auth service enumeration for user {marked_username} has been cancelled."
-                            )
-                else:
-                    _offer_attack_paths()
+                # Run the membership-driven follow-ups (persist, RODC escalation,
+                # enrichment) for their side effects; the return value is unused
+                # because escalation now routes through the attack-path search.
+                self.check_privileged_groups(domain, username, password)
+                # ``check_privileged_groups`` above already ran the
+                # membership-driven follow-ups (RODC escalation, enrichment,
+                # runtime-membership persist) via
+                # ``_handle_privileged_group_membership``. Every privileged
+                # principal — including the five ``direct`` types (Domain Admins,
+                # Administrators, Backup Operators, Domain Controllers, Enterprise
+                # Domain Controllers) — now routes its escalation through the
+                # attack-path search (the single source of truth), which
+                # auto-chains DCSync and any cross-trust / cross-forest steps. The
+                # old hardcoded "skip the search and dispatch directly" branch was
+                # removed; RODC keeps its dedicated dispatch inside
+                # ``_handle_privileged_group_membership`` (no attack-path edge).
+                _offer_attack_paths()
             else:
                 live_membership = self.check_privileged_groups(
                     domain,
@@ -24446,7 +24551,19 @@ class PentestShell:
                     live_membership or {},
                     adcs_available=has_adcs,
                 )
-                if live_followup_decision.skip_attack_path_search:
+                # Live LDAP can reveal privileged membership the adminCount/cache
+                # check missed. Run the membership-driven follow-ups (persist,
+                # RODC escalation, enrichment) for their side effects, then fall
+                # through to the attack-path search — the ``direct`` privileged
+                # types (Domain Admins, Administrators, Backup Operators, Domain
+                # Controllers, Enterprise Domain Controllers) no longer skip the
+                # search: their escalation is driven by the attack graph (the
+                # single source of truth), not a hardcoded dispatch. RODC keeps its
+                # dedicated dispatch inside ``_handle_privileged_group_membership``.
+                if (
+                    live_followup_decision.skip_attack_path_search
+                    or live_followup_decision.should_run_enrichment_followup
+                ):
                     print_info_debug(
                         "[user-privs] Live LDAP membership indicates privileged access "
                         f"for {marked_username}@{marked_domain} despite adminCount/cache check."
@@ -24457,19 +24574,6 @@ class PentestShell:
                         password,
                         live_membership,
                         "ldap-live-admincount-bypass",
-                    )
-                    return
-                if live_followup_decision.should_run_enrichment_followup:
-                    print_info_debug(
-                        "[user-privs] Running non-blocking privileged enrichment "
-                        f"for {marked_username}@{marked_domain}."
-                    )
-                    self._handle_privileged_group_membership(
-                        domain,
-                        username,
-                        password,
-                        live_membership,
-                        "ldap-live-enrichment",
                     )
 
                 # If the user does not have adminCount=1, ask if privilege enumeration should be executed
@@ -27317,6 +27421,72 @@ class PentestShell:
             max_display=max_display,
             relation_filter=relation_filter,
         )
+
+    def do_explain(self, args):
+        """Explain an Active Directory attack technique (didactic mode).
+
+        Prints a teaching card for the technique: what it is and why it works,
+        the equivalent manual command with the standard tool (nxc / certipy /
+        impacket / bloodyAD), its MITRE ATT&CK id/name, and how it is detected
+        (Windows Event IDs). Runs NOTHING — it only teaches.
+
+        This is the on-demand form of ADscan's didactic mode. During a scan the
+        same cards appear automatically before each technique runs, at the level
+        set by the workspace type (ctf/lab → full cards, audit → one-liners) or
+        by `set explain_level off|basic|deep`.
+
+        Usage:
+            explain <technique>      Show the full card for one technique
+            explain                  List every technique that can be explained
+
+        Examples:
+            explain kerberoasting
+            explain dcsync
+            explain "ADCS ESC1"
+            explain genericall
+        """
+        from adscan_internal.services.didactic_service import (
+            explain_technique_by_name,
+            list_explainable_techniques,
+        )
+
+        query = (args or "").strip().strip('"').strip("'")
+        if not query:
+            rows = list_explainable_techniques()
+            print_info(
+                f"{len(rows)} techniques can be explained. Run "
+                "'explain <technique>' for the full card."
+            )
+            from rich.table import Table
+
+            table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+            table.add_column("Technique", style="bold")
+            table.add_column("What ADscan calls it", style="dim")
+            for relation, title in rows:
+                table.add_row(relation, title)
+            get_console().print(table)
+            return
+
+        if not explain_technique_by_name(query):
+            print_error(
+                f"No technique matched '{query}'. Run 'explain' with no argument "
+                "to list the techniques ADscan can explain."
+            )
+
+    def _explain_technique_before_run(self, relation: str) -> None:
+        """Show the didactic card for a technique before a manual command runs.
+
+        Best-effort, at the session's resolved level (off/basic/deep). Called by
+        the standalone technique commands (kerberoast / dcsync / asreproast / …)
+        so running one by hand teaches it just like the attack-path flow does.
+        Never raises into the command.
+        """
+        try:
+            from adscan_internal.services.didactic_service import explain_step
+
+            explain_step(self, relation)
+        except Exception as exc:  # noqa: BLE001 — teaching must not break the command
+            telemetry.capture_exception(exc)
 
     def do_reset_attack_path_statuses(self, args):
         """Reset persisted attack-path statuses for local testing.
@@ -30552,7 +30722,7 @@ class PentestShell:
 
         self.domain = None
         self.domains.clear()
-        self.domains_data = {}
+        self.domains_data = CaseInsensitiveDict()
         if failed_items:
             reason = "permission denied" if permission_denied else "unremovable"
             hint = (
@@ -32031,6 +32201,13 @@ def add_ci_subparser(subparsers):
         ),
     )
     ci_parser.add_argument(
+        "--read-only",
+        "--no-attack-paths",
+        action="store_true",
+        dest="read_only",
+        help="Map and report attack paths without executing them (read-only).",
+    )
+    ci_parser.add_argument(
         "--generate-report",
         action="store_true",
         help="Generate report after successful scan with flags captured (requires Report License)",
@@ -32533,7 +32710,7 @@ if __name__ == "__main__":
     # Propagate --show-structural as ADSCAN_SHOW_STRUCTURAL so the
     # Tactical Findings renderer in adscan_core can read it without
     # threading the flag through every subcommand layer. Mirrors the
-    # existing pattern used by SECRET_MODE / DEBUG_MODE toggles.
+    # existing pattern used by the DEBUG_MODE toggle.
     if getattr(args, "show_structural", False):
         os.environ["ADSCAN_SHOW_STRUCTURAL"] = "1"
     _SESSION_CAPTURE_FINALIZED = not _is_session_capture_allowed(SESSION_COMMAND_TYPE)
@@ -32581,7 +32758,8 @@ if __name__ == "__main__":
 
         update_logging_console_level(verbose_mode=True, debug_mode=DEBUG_MODE)
 
-    # Debug mode (public in OSS launcher/runtime; does not enable SECRET_MODE).
+    # Debug mode (public in OSS launcher/runtime; controls on-screen traceback
+    # and raw internal-detail visibility).
     if (
         hasattr(args, "command")
         and args.command in ("start", "ci", "execute", "doctor", "install", "check", "deliver", "mitre-navigator")
@@ -32593,7 +32771,6 @@ if __name__ == "__main__":
         update_modes(
             verbose_mode=VERBOSE_MODE,
             debug_mode=True,
-            secret_mode=SECRET_MODE,
         )
         # Update logging console level
         from adscan_internal.logging_config import update_logging_console_level

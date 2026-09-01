@@ -92,6 +92,9 @@ from rich.table import Table
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from adscan_internal.interaction import is_non_interactive
+from adscan_internal.services.unauth_funnel_telemetry import (
+    normalize_hash_type_for_telemetry,
+)
 
 # Lazily bound to avoid an import cycle: the ``background_jobs`` package
 # __init__ imports poisoning_job -> cli.creds -> cli.cracking. A module-level
@@ -2496,7 +2499,7 @@ def run_cracking(
 
     try:
         properties = {
-            "hash_type": hash_type,
+            "hash_type": normalize_hash_type_for_telemetry(hash_type),
             "scan_mode": getattr(shell, "scan_mode", None),
             "retry": failed,
             "workspace_type": getattr(shell, "type", None),
@@ -2835,7 +2838,7 @@ def run_password_spraying(
         domain: Domain name for spraying operation.
         command: Full kerbrute command string to execute.
     """
-    from adscan_internal.cli.common import SECRET_MODE
+    from adscan_core.output._state import is_debug_mode
 
     # Upfront patience notice -- threshold-gated on the candidate count. Silent
     # for small lists; a single line under non-interactive runs. Never blocks.
@@ -2913,7 +2916,7 @@ def run_password_spraying(
                 print_info_debug(f"[spray][stderr] {clean_line}")
     elif not result["found_credentials"]:
         print_warning("No valid credentials found.")
-        if result["stdout"] and SECRET_MODE:
+        if result["stdout"] and is_debug_mode():
             print_info_verbose("Full command output:")
             for line in result["stdout"].splitlines():
                 print_info_verbose(f"  {line}")
@@ -3940,7 +3943,7 @@ def execute_cracking(
                 # Telemetry: track successful hash cracking
                 try:
                     properties = {
-                        "hash_type": hash_type,
+                        "hash_type": normalize_hash_type_for_telemetry(hash_type),
                         "credentials_cracked": len(creds),
                         "scan_mode": getattr(shell, "scan_mode", None),
                         "workspace_type": shell.type,
@@ -3960,7 +3963,7 @@ def execute_cracking(
                 try:
                     if str(getattr(shell, "type", "") or "").strip().lower() == "audit":
                         audit_properties = {
-                            "hash_type": hash_type,
+                            "hash_type": normalize_hash_type_for_telemetry(hash_type),
                             "wordlist": _wordlist_telemetry_label(wordlist_name),
                             "hashes_cracked": len(creds),
                             "scan_mode": getattr(shell, "scan_mode", None),
@@ -4105,7 +4108,7 @@ def execute_cracking(
             # Telemetry: track failed hash cracking
             try:
                 properties = {
-                    "hash_type": hash_type,
+                    "hash_type": normalize_hash_type_for_telemetry(hash_type),
                     "scan_mode": getattr(shell, "scan_mode", None),
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,

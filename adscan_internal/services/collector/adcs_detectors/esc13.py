@@ -29,6 +29,7 @@ from adscan_core.rich_output import print_info_debug
 from adscan_internal.services.collector.adcs_detectors._common import (
     get_enroll_principal_sids,
     template_certificate_policies,
+    template_has_authentication_eku,
     template_int_property,
 )
 from adscan_internal.services.collector.adcs_detectors.constants import (
@@ -49,6 +50,13 @@ def detect_esc13(
         return []
     policies = template_certificate_policies(template_node)
     if not policies:
+        return []
+    # ESC13 abuse works by PKINIT-authenticating with the enrolled certificate,
+    # so the template must grant client authentication (or carry no EKU, which
+    # means any purpose). Without a client-auth EKU the injected group SID never
+    # reaches a logon, so a group-linked policy alone is a false positive.
+    # Certipy applies the same guard (``client_authentication`` required).
+    if not template_has_authentication_eku(template_node):
         return []
     if (
         template_int_property(

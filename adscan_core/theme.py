@@ -172,6 +172,16 @@ PADDING_NORMAL = (1, 2)
 PADDING_LARGE = (2, 3)
 
 # ============================================================================
+# Authorship / expert-voice signature
+# ============================================================================
+# A short expert-voice signature the didactic ("deep") teaching card can append
+# so a deep explanation reads as coming from a named AD practitioner rather than
+# an anonymous tool. Kept here (an already-imported, import-safe module) so the
+# didactic service can consume it without a new dependency. Close, expert,
+# never salesy — user-facing, English only.
+DIDACTIC_AUTHOR_SIGNATURE = "— Yeray, creator of ADscan, senior AD pentester"
+
+# ============================================================================
 # Style Presets
 # ============================================================================
 

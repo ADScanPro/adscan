@@ -67,6 +67,24 @@ _TEMPLATE_DETECTOR_NAMES = (
     "detect_esc15",
 )
 
+# Issuance-bound detectors that require the template to be PUBLISHED on an
+# Enterprise CA (its CN present in some CA's ``certificateTemplates``) to be a
+# real, issuable weakness. Mirrors Certipy's single ``is_enabled`` gate wrapping
+# ESC1/2/3/9/13/15 (find.py:1910). ESC6/10/14 are template-issuance conditions
+# too, so an unpublished template cannot be issued through any of them either.
+# An unpublished-but-vulnerable template object is NOT an executable path to
+# compromise (the CA rejects the request with CERTSRV_E_UNSUPPORTED_CERT_TYPE),
+# so emitting one of these edges is a false positive under the
+# Exposure-Validation doctrine.
+#
+# ``detect_esc4`` is intentionally EXCLUDED: it is a template write-ACL
+# configuration weakness (a principal can modify the template into ESC1),
+# independent of whether the CA currently publishes it. Certipy likewise does
+# not gate ESC4 on ``is_enabled``.
+_PUBLICATION_GATED_DETECTOR_NAMES = frozenset(
+    _TEMPLATE_DETECTOR_NAMES
+) - {"detect_esc4"}
+
 
 def _safe_run(detector, **kwargs) -> list[CollectorEdge]:
     try:
@@ -91,6 +109,7 @@ def detect_all_for_template(
     strong_cert_binding_enforced: bool = False,
     oid_to_group_dn: dict[str, str] | None = None,
     oid_links_resolved: bool = False,
+    published: bool = True,
 ) -> list[CollectorEdge]:
     """Run every template-bound ADCS detector for one CertTemplate.
 
@@ -107,6 +126,17 @@ def detect_all_for_template(
     ``oid_links_resolved`` distinguishes "query succeeded, no link exists"
     (ESC13 absent) from "query failed" (data gap); both suppress the edge, so a
     domain without ``msDS-OIDToGroupLink`` never yields a false ESC13 finding.
+
+    ``published`` is the publication gate (mirrors Certipy's ``is_enabled``): a
+    template is issuable only when its CN appears in some Enterprise CA's
+    ``certificateTemplates`` list. When ``published`` is ``False`` the
+    issuance-bound detectors (ESC1/2/3/6/9/10/13/14/15) are SKIPPED — an
+    unpublished template cannot be requested from any CA, so any issuance ESC
+    edge would be a false-positive executable path (the CA rejects the request
+    with ``CERTSRV_E_UNSUPPORTED_CERT_TYPE``). ESC4 (template write-ACL) still
+    runs unconditionally, because modifying an unpublished template's ACL and
+    later publishing it is a real, publication-independent weakness. ``True``
+    (default) preserves the pre-gate behaviour for all callers.
     """
     if template_node.kind != "CertTemplate":
         return []
@@ -132,6 +162,8 @@ def detect_all_for_template(
         },
     }
     for name in _TEMPLATE_DETECTOR_NAMES:
+        if not published and name in _PUBLICATION_GATED_DETECTOR_NAMES:
+            continue
         detector = getattr(module, name)
         kwargs = dict(common)
         kwargs.update(extra_per_detector.get(name, {}))
@@ -146,7 +178,6 @@ def detect_all_for_ca(
     domain: str,
     web_enrollment_enabled: bool = False,
     enforce_encrypt_icertrequest: bool = False,
-    domain_users_sid: str | None = None,
 ) -> list[CollectorEdge]:
     """Run every CA-bound ADCS detector for one EnterpriseCA.
 
@@ -173,7 +204,6 @@ def detect_all_for_ca(
             ca_node=ca_node,
             domain=domain,
             web_enrollment_enabled=web_enrollment_enabled,
-            domain_users_sid=domain_users_sid,
         )
     )
     edges.extend(
@@ -182,7 +212,6 @@ def detect_all_for_ca(
             ca_node=ca_node,
             domain=domain,
             enforce_encrypt_icertrequest=enforce_encrypt_icertrequest,
-            domain_users_sid=domain_users_sid,
         )
     )
     return edges

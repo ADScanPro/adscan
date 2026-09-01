@@ -262,6 +262,12 @@ class BadSuccessorCheck:
             return [_error(target.host, "BadSuccessor requires authenticated LDAP")]
         try:
             findings = await asyncio.to_thread(self._collect_sync, target, creds, ctx)
+        except BadSuccessorSkip as exc:
+            # Not a failure — the check cannot run against this target without a
+            # resolvable DC FQDN. Record it as not-evaluated with a clear reason
+            # instead of the raw SEC_E_LOGON_DENIED a bind would have produced.
+            print_info_verbose(f"[badsuccessor] skipped on {target.host}: {exc}")
+            return [_not_applicable(target.host, str(exc))]
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -274,7 +280,8 @@ class BadSuccessorCheck:
     ) -> BadSuccessorFindings:
         connector = self._ldap_connector or _default_ldap_connector
         domain = (
-            getattr(creds, "target_domain", None)
+            target.domain
+            or getattr(creds, "target_domain", None)
             or ctx.domain
             or getattr(creds, "domain", None)
         )
@@ -286,7 +293,13 @@ class BadSuccessorCheck:
             f"[badsuccessor] reading dMSA posture via LDAP on "
             f"{mark_sensitive(target.host, 'host')}"
         )
-        with connector(domain=domain, dc_ip=target.host, creds=creds) as conn:
+        with connector(
+            domain=domain,
+            dc_ip=target.host,
+            creds=creds,
+            domains_data=getattr(ctx, "domains_data", None),
+            ip_hostname_inventory=getattr(ctx, "ip_hostname_inventory", None),
+        ) as conn:
             functional_level = _read_domain_functional_level(conn)
             principal_sids = _read_principal_sids(conn, creds)
             ou_sds = _read_ou_security_descriptors(conn)
@@ -409,25 +422,103 @@ def _read_dmsa_security_descriptors(conn: Any) -> list[tuple[str, bytes]]:
     return out
 
 
-def _default_ldap_connector(*, domain: str, dc_ip: str, creds: Any) -> Any:
+class BadSuccessorSkip(RuntimeError):
+    """Raised by the connector when the check cannot run safely.
+
+    The concrete case: Kerberos is required but no DC FQDN could be resolved
+    from the workspace ``domains_data`` (all six fallback steps returned
+    ``None``) while only an IP is available — using ``ldap/<ip>`` as the SPN
+    would be rejected with ``SEC_E_LOGON_DENIED``. ``run`` catches this and
+    emits an informative NOT_APPLICABLE result instead of a raw bind error.
+    """
+
+
+def _default_ldap_connector(
+    *,
+    domain: str,
+    dc_ip: str,
+    creds: Any,
+    domains_data: Any | None = None,
+    ip_hostname_inventory: Any | None = None,
+) -> Any:
+    """Build a DC LDAP connection, resolving the DC's FQDN via the SSOT.
+
+    Routes through ``build_ldap_config_for_domain`` so ``kerberos_target_hostname``
+    is resolved from the canonical FQDN fallback chain (``resolve_dc_fqdn``,
+    including IP → FQDN via ``ip_hostname_inventory``) rather than left ``None``
+    while ``dc_ip`` is a bare IP — the exact bug that degraded the SASL-seal
+    Kerberos bind to ``ldap/<ip>`` and drew ``SEC_E_LOGON_DENIED``. Falls back to
+    a directly-built config only when ``domains_data`` is not threaded (e.g. an
+    older caller); skips when Kerberos is required but no FQDN is recoverable.
+    """
     from adscan_internal.services.ldap_transport_service import (
         ADscanLDAPConfig,
         ADscanLDAPConnection,
+        build_ldap_config_for_domain,
     )
 
+    use_kerberos = bool(getattr(creds, "use_kerberos", True))
+    username = getattr(creds, "username", None)
+    # ADscanLDAPConfig has no nt_hash field — when only an NT hash is available,
+    # pass it as password: _build_ldap_connection_url detects 32-hex strings and
+    # selects the ntlm-nt / kerberos-rc4 auth scheme (see _is_nt_hash).
+    password = getattr(creds, "password", None) or getattr(creds, "nt_hash", None)
+
+    if domains_data and domain in domains_data:
+        try:
+            config = build_ldap_config_for_domain(
+                domains_data,
+                domain,
+                username=username or "",
+                password=getattr(creds, "password", None),
+                nt_hash=getattr(creds, "nt_hash", None),
+                auth_domain=getattr(creds, "auth_domain", None),
+                auth_kdc=getattr(creds, "auth_kdc_ip", None)
+                or getattr(creds, "kdc_ip", None),
+                use_ldaps=True,
+                use_kerberos=use_kerberos,
+                ip_hostname_inventory=ip_hostname_inventory,
+            )
+        except (KeyError, ValueError):
+            config = None
+        if config is not None:
+            _guard_kerberos_fqdn(config, domain, use_kerberos=use_kerberos)
+            return ADscanLDAPConnection(config)
+
+    # No workspace domains_data threaded — build directly, then apply the same
+    # last-resort Kerberos-without-FQDN guard so a bare IP never reaches a
+    # Kerberos SASL bind.
     config = ADscanLDAPConfig(
         domain=domain,
         dc_ip=dc_ip,
         use_ldaps=True,
-        use_kerberos=getattr(creds, "use_kerberos", True),
-        username=getattr(creds, "username", None),
-        # ADscanLDAPConfig has no nt_hash field — when only an NT hash is
-        # available, pass it as password: _build_ldap_connection_url
-        # detects 32-hex strings and selects the ntlm-nt / kerberos-rc4
-        # auth scheme automatically (see ldap_transport_service._is_nt_hash).
-        password=getattr(creds, "password", None) or getattr(creds, "nt_hash", None),
+        use_kerberos=use_kerberos,
+        username=username,
+        password=password,
     )
+    _guard_kerberos_fqdn(config, domain, use_kerberos=use_kerberos)
     return ADscanLDAPConnection(config)
+
+
+def _guard_kerberos_fqdn(config: Any, domain: str, *, use_kerberos: bool) -> None:
+    """Skip the check when Kerberos is required but only an IP is available.
+
+    ``ADscanLDAPConfig.__post_init__`` normalizes ``kerberos_target_hostname``:
+    it stays an IP when no FQDN was resolvable. Binding Kerberos to ``ldap/<ip>``
+    is rejected with ``SEC_E_LOGON_DENIED``, so we abstain with a clear reason
+    rather than attempt it (last resort — the SSOT resolves the FQDN in the
+    common case).
+    """
+    if not use_kerberos:
+        return
+    from adscan_internal.services._kerberos_spn import is_ip_address  # noqa: PLC0415
+
+    spn_host = getattr(config, "kerberos_target_hostname", None)
+    if not spn_host or is_ip_address(str(spn_host)):
+        raise BadSuccessorSkip(
+            f"no DC FQDN resolved for domain {domain}; Kerberos LDAP bind to an "
+            "IP would be rejected — check skipped"
+        )
 
 
 def _result_from_findings(host: str, findings: BadSuccessorFindings) -> CVEResult:

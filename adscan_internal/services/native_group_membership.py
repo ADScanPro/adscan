@@ -187,8 +187,21 @@ def is_principal_member_of_rid_native(
     rid: int,
     *,
     operation_name: str | None = None,
+    auth_username: str | None = None,
+    auth_password: str | None = None,
 ) -> bool | None:
-    """Return whether a user/computer is recursively member of a domain group RID."""
+    """Return whether a user/computer is recursively member of a domain group RID.
+
+    ``auth_username``/``auth_password`` override the credential the LDAP bind
+    authenticates with. Pass them when the ``domain`` being verified has no
+    usable stored credential yet — the cross-forest linked-server case (HTB
+    DarkZero): the trusted forest (darkzero.ext) holds no LDAP credential (we
+    only proved SYSTEM on its DC over the SQL channel), so verifying a
+    freshly-minted account there must bind AS THAT account, not with a
+    (non-existent) stored one. Without them, the query falls back to the stored
+    credential for ``domain`` and returns ``None`` for lack of one — an
+    inconclusive verify indistinguishable from a real transport failure.
+    """
     rid_value = int(rid)
     escaped_principal = escape_ldap_filter_value(str(principal or "").strip())
     if not escaped_principal:
@@ -202,6 +215,8 @@ def is_principal_member_of_rid_native(
                 f"(&{_object_filter('principal')}(sAMAccountName={escaped_principal}))"
             ),
             attribute="distinguishedName",
+            auth_username=auth_username,
+            auth_password=auth_password,
             prefer_kerberos=True,
             allow_ntlm_fallback=True,
             operation_name=operation_name or f"principal RID {rid_value} DN lookup",
@@ -213,12 +228,26 @@ def is_principal_member_of_rid_native(
                 f"(&{_object_filter('principal')}(sAMAccountName={escaped_principal}))"
             ),
             attribute="primaryGroupID",
+            auth_username=auth_username,
+            auth_password=auth_password,
             prefer_kerberos=True,
             allow_ntlm_fallback=True,
             operation_name=operation_name
             or f"principal RID {rid_value} primary group lookup",
         )
         if dns is None or primary_group_ids is None:
+            # DIAG: an inconclusive LDAP probe (None) — NOT an exception, so which
+            # of the two queries came back None matters (a pivoted DC often times
+            # out or the transport returns None without raising). Log it so a
+            # "RID-512 verification inconclusive" upstream is diagnosable.
+            print_info_debug(
+                f"[ldap-group-rid] RID {rid_value} membership INCONCLUSIVE for "
+                f"{mark_sensitive(principal, 'user')}@{mark_sensitive(domain, 'domain')}: "
+                f"dn_query={'None' if dns is None else f'{len(dns)} row(s)'}, "
+                f"primaryGroupID_query={'None' if primary_group_ids is None else f'{len(primary_group_ids)} row(s)'} "
+                "(a None query = transport returned nothing without raising — "
+                "likely a pivot timeout / bind failure to the target DC)"
+            )
             return None
         if any(str(value).strip() == str(rid_value) for value in primary_group_ids):
             return True
@@ -234,6 +263,8 @@ def is_principal_member_of_rid_native(
                 f"(member:{_LDAP_MATCHING_RULE_IN_CHAIN}:={escaped_dn}))"
             ),
             attribute="objectSid",
+            auth_username=auth_username,
+            auth_password=auth_password,
             prefer_kerberos=True,
             allow_ntlm_fallback=True,
             operation_name=operation_name or f"principal RID {rid_value} group lookup",

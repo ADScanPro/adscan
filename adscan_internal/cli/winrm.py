@@ -1989,10 +1989,9 @@ def check_powershell_transcripts(
         print_success(
             f"Found {len(transcript_paths)} PowerShell transcript file(s) on host {marked_host}."
         )
-        if getattr(shell, "SECRET_MODE", False):
-            print_info_debug(
-                f"[PSTranscripts] Remote transcript paths: {transcript_paths}"
-            )
+        print_info_debug(
+            f"PSTranscripts remote transcript paths: {transcript_paths}"
+        )
 
         transcripts_download_dir = os.path.join(
             shell.domains_dir, domain, "winrm", host, "pstranscripts"

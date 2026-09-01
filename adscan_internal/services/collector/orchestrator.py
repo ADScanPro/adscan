@@ -32,8 +32,12 @@ from adscan_internal.services.collector.dns_resolver import resolve_computer_nod
 from adscan_internal.services.collector.group_inference_analyzer import (
     analyze_group_inferences,
 )
+from adscan_internal.services import attack_graph_service
 from adscan_internal.services.collector.ldap_collector import ADscanLDAPCollector
-from adscan_internal.services.collector.models import CollectionResult
+from adscan_internal.services.collector.models import (
+    CollectionResult,
+    ForeignNodeRef,
+)
 from adscan_internal.services.collector.persistence import CollectorPersistence
 from adscan_internal.services.collector.smb_collector import SMBCollectorConfig
 from adscan_internal.services.collector.share_collector import ShareCollectorConfig
@@ -119,6 +123,40 @@ class _Credential(Protocol):
     use_kerberos: bool
     ccache_path: str | None
     aes_key: str | None
+
+
+def build_cross_domain_label_registry(
+    results: "dict[str, CollectionResult]",
+) -> dict[str, ForeignNodeRef]:
+    """Build a SID -> :class:`ForeignNodeRef` registry over all collected domains.
+
+    Walks every node of every collected domain and records, per SID, the exact
+    graph identity (``name:<canonical>``) and ``NAME@DOMAIN`` label that domain's
+    own ``attack_graph.json`` uses. Per-domain persistence consumes this map so a
+    cross-domain edge whose target SID belongs to another domain points at the
+    real foreign node (same graph id → the query-time merge collapses them), which
+    is what lets a single attack path span the domain boundary.
+
+    Args:
+        results: SID-keyed collection results, one per collected domain.
+
+    Returns:
+        SID (uppercased) -> :class:`ForeignNodeRef`. Later domains win on a SID
+        collision (impossible in practice — SIDs are globally unique).
+    """
+    registry: dict[str, ForeignNodeRef] = {}
+    for result in results.values():
+        for sid, node in result.nodes.items():
+            payload = node.to_graph_payload()
+            registry[sid.upper()] = ForeignNodeRef(
+                node_id=attack_graph_service._node_id(payload),  # noqa: SLF001
+                label=str(payload.get("label") or node.name or sid),
+                kind=str(payload.get("kind") or "Base"),
+                is_tier0=bool(
+                    payload.get("isTierZero") or payload.get("highvalue")
+                ),
+            )
+    return registry
 
 
 class CollectionOrchestrator:
@@ -764,7 +802,70 @@ class CollectionOrchestrator:
             # ``running`` with the full done-set so a reload resumes the remainder.
             self._finalize_collection_progress(shell, scope.domain, timing)
         self._resolve_cross_domain_references(results)
+        self._persist_cross_domain_edges(shell, results, counters)
         return counters, results, timings
+
+    def _persist_cross_domain_edges(
+        self,
+        shell: Any,
+        results: dict[str, "CollectionResult"],
+        counters: dict[str, dict[str, int]],
+    ) -> None:
+        """Re-persist every domain with the cross-domain SID registry.
+
+        The per-scope persist ran with an empty registry (a later-collected
+        domain's nodes were not yet available), so a foreign-target edge was
+        dropped. Once ALL domains are collected we build the registry once and
+        re-persist each domain: ``persist`` is load-then-merge / upsert-based, so
+        this only ADDS the now-resolvable cross-domain edges — no duplicates and
+        no change to single-domain runs (skipped when only one domain collected).
+        """
+        if len(results) < 2:
+            return
+        registry = build_cross_domain_label_registry(results)
+        # Partner Domain nodes (graph id -> light Domain payload) so a trust
+        # coupling can point at a domain whose own node lives in another graph.
+        foreign_domain_nodes: dict[str, dict[str, Any]] = {}
+        for sid, ref in registry.items():
+            if str(ref.kind or "").strip().lower() == "domain":
+                foreign_domain_nodes[ref.node_id] = {
+                    "kind": "Domain",
+                    "label": ref.label,
+                    "name": ref.label,
+                    "objectId": sid,
+                    "highvalue": True,
+                    "isTierZero": True,
+                    "properties": {
+                        "name": ref.label,
+                        "objectid": sid,
+                        "cross_domain_endpoint": True,
+                    },
+                }
+        domains_data = getattr(shell, "domains_data", None)
+        for domain, result in results.items():
+            try:
+                counters[domain] = self._persistence.persist(
+                    shell,
+                    domain=domain,
+                    result=result,
+                    foreign_sid_to_label=registry,
+                )
+                # Persist the CrossOrgTgtDelegation / RaiseChild trust escalation
+                # edges into the ORIGIN graph so their execution status survives
+                # reloads (they were previously in-memory-only virtual edges).
+                attack_graph_service.persist_cross_domain_trust_edges(
+                    shell,
+                    domain=domain,
+                    domains_data=domains_data,
+                    foreign_domain_nodes=foreign_domain_nodes,
+                )
+            except Exception as exc:  # noqa: BLE001 — a re-persist failure must not abort collection
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_info_debug(
+                    f"[orchestrator] cross-domain edge re-persist failed for "
+                    f"{mark_sensitive(domain, 'domain')}"
+                )
 
     @staticmethod
     def _domain_output_dir(shell: Any, domain: str) -> str | None:

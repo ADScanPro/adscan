@@ -2189,7 +2189,7 @@ def check_runtime_python_dependencies(
                     f"Runtime Python dependency '{display_name}' is not importable ({usage})."
                 )
                 deps.print_instruction("Rebuild or update the ADscan runtime image.")
-                deps.print_info_verbose(f"{display_name} import stderr: {exc}")
+                deps.print_info_debug(f"{display_name} import stderr: {exc}")
                 all_ok = False
                 continue
 
@@ -2269,9 +2269,9 @@ def check_runtime_python_dependencies(
             stderr = (import_result.stderr or "").strip()
             stdout = (import_result.stdout or "").strip()
             if stderr:
-                deps.print_info_verbose(f"{display_name} import stderr: {stderr}")
+                deps.print_info_debug(f"{display_name} import stderr: {stderr}")
             elif stdout:
-                deps.print_info_verbose(f"{display_name} import stdout: {stdout}")
+                deps.print_info_debug(f"{display_name} import stdout: {stdout}")
             all_ok = False
             continue
 

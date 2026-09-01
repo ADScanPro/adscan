@@ -141,6 +141,23 @@ def query_shell_ldap_attribute_values(
     username = str(auth_username or domain_data.get("username") or "").strip()
     password = str(auth_password or domain_data.get("password") or "").strip()
     if not username or not password:
+        # DIAG: this early-return (BEFORE any bind) is a distinct failure from a
+        # transport/bind error — it means NO stored credential is available for
+        # `domain`. In the cross-forest linked-server case (HTB DarkZero) the
+        # trusted forest (darkzero.ext) has no usable user credential yet
+        # (username=N/A) because we only hold SYSTEM on its DC over the SQL
+        # channel, not an LDAP credential — so a RID-512 verify against it
+        # returns None here for lack of an auth credential, NOT because the
+        # target DC is unreachable. Callers that pass auth_username/auth_password
+        # explicitly avoid this path.
+        print_info_debug(
+            f"[ldap-query] {operation_name}: NO stored credential for "
+            f"{mark_sensitive(domain, 'domain')} "
+            f"(username={'set' if username else 'MISSING'}, "
+            f"password={'set' if password else 'MISSING'}, "
+            f"auth_username_passed={'yes' if auth_username else 'no'}) "
+            "-> returning None WITHOUT attempting a bind"
+        )
         return None
 
     auth_domain = str(getattr(shell, "domain", None) or domain)

@@ -36,6 +36,15 @@ from adscan_internal.workspaces.computers import load_enabled_computer_samaccoun
 
 from adscan_internal.services import attack_graph_core, attack_paths_core
 from adscan_internal.services import attack_path_progress
+
+# The budget-exceeded signal now lives in the pure-logic gate module so BOTH this
+# service layer (which catches it) and ``attack_graph_core`` (the in-DFS bound,
+# which imports from ``adscan_core`` but never from this module) raise the SAME
+# class. Re-exported here under its original name so this module's existing callers
+# (and any consumer catching it via this module) are unchanged.
+from adscan_core.reporting.attack_path_memory_gate import (
+    _AttackPathMemoryBudgetExceeded,
+)
 from adscan_internal.services.attack_graph_findings import sync_attack_graph_findings
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
@@ -1970,24 +1979,6 @@ def _expand_group_ancestors(
     return cache.get(group_label, set())
 
 
-class _AttackPathMemoryBudgetExceeded(Exception):
-    """Signal that attack-path discovery would exceed the memory ceiling.
-
-    Raised by the post-DFS memory gate (:func:`_gate_attack_path_memory_post_dfs`)
-    when the projected peak crosses the safety threshold, so the compute aborts
-    BEFORE the memory-heavy decoration/ordering stages allocate — turning a fatal
-    ``SIGKILL`` into a clean, declared stop. Caught once at the public entry point
-    (:func:`get_attack_path_summaries`), which records the client-facing coverage
-    declaration and prints the operator remedy. Carries the raw route count so the
-    coverage boundary can state how many routes were examined before the bound.
-    """
-
-    def __init__(self, message: str, *, examined_routes: int) -> None:
-        super().__init__(message)
-        self.operator_message = message
-        self.examined_routes = int(examined_routes)
-
-
 def _read_memory_ceiling() -> tuple[int | None, int | None]:
     """Return ``(limit_bytes, available_bytes)`` from the memory probe, best-effort.
 
@@ -2605,6 +2596,23 @@ def _load_or_build_materialized_attack_path_artifacts(
     if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED or not snapshot:
         return None
 
+    # A MERGED multi-domain graph must NOT read/write the per-domain disk cache:
+    # that cache fingerprints on the single-domain graph FILE, so caching merged
+    # content under the primary domain's key would poison the single-domain path.
+    # Build the artifacts fresh, in memory, from the merged graph instead.
+    if bool(base_graph.get("_merged_domains")):
+        return MaterializedAttackPathArtifacts(
+            fingerprint="merged",
+            node_id_by_label=attack_paths_core._build_node_id_index_by_canonical_label(  # noqa: SLF001
+                base_graph,
+                domain=domain,
+            ),
+            recursive_groups_by_principal=_build_recursive_membership_closure(
+                domain, snapshot
+            ),
+            storage_format="memory",
+        )
+
     graph_path = _graph_path(shell, domain)
     snapshot_path = _membership_snapshot_path(shell, domain)
     fingerprint = build_attack_path_artifact_fingerprint(
@@ -2785,7 +2793,12 @@ def _load_or_build_prepared_runtime_graph_raw(
     materialized_artifacts: MaterializedAttackPathArtifacts | None,
 ) -> dict[str, Any]:
     """Load or build a reusable prepared runtime graph for local DFS scopes."""
-    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
+    # A MERGED multi-domain graph must build fresh in-memory and NEVER touch the
+    # per-domain disk cache (fingerprinted on the single-domain graph file), or it
+    # would poison the single-domain prepared graph with cross-domain content.
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED or bool(
+        base_graph.get("_merged_domains")
+    ):
         return _build_prepared_runtime_graph(
             base_graph=base_graph,
             domain=domain,
@@ -3161,6 +3174,46 @@ def classify_accounts_by_privilege_tier(
     )
 
 
+def _affected_metadata_group_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    """Return the key that fully captures the per-path annotation inputs.
+
+    ``_apply_affected_user_metadata``'s per-path body is a pure function of
+    exactly these three things — the source principal (``nodes[0]``), the first
+    relation (which drives ``_derive_execution_scope_metadata``), and the
+    incoming affected-user meta signature. Two records with the same key produce
+    an identical annotation delta, so the annotation can be computed once per key
+    and broadcast, byte-identically, across the whole group.
+    """
+    nodes = record.get("nodes")
+    source_label = (
+        str(nodes[0] or "").strip() if isinstance(nodes, list) and nodes else ""
+    )
+    relations = record.get("relations")
+    first_relation = (
+        str(relations[0] or "").strip()
+        if isinstance(relations, list) and relations
+        else ""
+    )
+    relation_key = _normalize_relation_key(first_relation)
+    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    affected_users = meta.get("affected_users") or []
+    users_sig = "|".join(
+        sorted(
+            str(user).lower()
+            for user in affected_users
+            if isinstance(user, str) and str(user).strip()
+        )
+    )
+    meta_sig = (
+        f"{users_sig}"
+        f"#uc={meta.get('affected_user_count')!r}"
+        f"#pc={meta.get('affected_principal_count')!r}"
+        f"#cc={meta.get('affected_computer_count')!r}"
+        f"#src={meta.get('affected_users_source')!r}"
+    )
+    return (source_label, relation_key, meta_sig)
+
+
 def _apply_affected_user_metadata(
     shell: object,
     domain: str,
@@ -3173,7 +3226,7 @@ def _apply_affected_user_metadata(
         return []
 
     snapshot = _load_membership_snapshot(shell, domain)
-    base_graph = load_attack_graph(shell, domain)
+    base_graph = _load_attack_graph_for_paths(shell, domain)
     annotated = attack_paths_core.apply_affected_user_metadata(
         records,
         graph=base_graph,
@@ -3258,8 +3311,16 @@ def _apply_affected_user_metadata(
             if snapshot_domain_users:
                 fallback_domain_users_source = "snapshot"
 
-    enriched: list[dict[str, Any]] = []
-    for record in annotated:
+    def _annotate_one(record: dict[str, Any]) -> dict[str, Any]:
+        """Compute the enriched record for ONE path.
+
+        This is the original per-path loop body, extracted verbatim so the
+        group-by-scope broadcast below can run it on ONE representative per
+        distinct scope key and reuse the result across every path that shares
+        the key. The shared per-scope caches (``broad_group_resolution_cache``,
+        ``broad_group_tier_classification_cache``) remain live across
+        representatives, so cross-key work is still memoized once.
+        """
         current = dict(record)
         meta = current.get("meta")
         if not isinstance(meta, dict):
@@ -3268,16 +3329,14 @@ def _apply_affected_user_metadata(
 
         nodes = current.get("nodes")
         if not isinstance(nodes, list) or not nodes:
-            enriched.append(current)
-            continue
+            return current
         source_label = str(nodes[0] or "").strip()
         execution_scope = _derive_execution_scope_metadata(current, source_label)
         if execution_scope:
             meta.update(execution_scope)
         scope_label = _canonical_membership_label(domain, source_label)
         if not scope_label:
-            enriched.append(current)
-            continue
+            return current
 
         scope_name = _membership_label_to_name(scope_label).upper()
         source_name = scope_name
@@ -3316,8 +3375,7 @@ def _apply_affected_user_metadata(
             or int(meta.get("affected_user_count", 0)) <= 0
         )
         if not should_override and not is_broad_group_scope:
-            enriched.append(current)
-            continue
+            return current
 
         affected_users: list[str] = []
         affected_count = 0
@@ -3477,9 +3535,84 @@ def _apply_affected_user_metadata(
             meta["affected_users_tier_breakdown"] = dict(tier_breakdown)
             meta["affected_users_tier_map"] = dict(tier_map)
 
-        enriched.append(current)
+        return current
 
-    return enriched
+    # Group-by-scope + broadcast. The per-path body above is a PURE function of
+    # (source_label, first-relation key, incoming-meta signature): every field
+    # it reads comes from ``record["nodes"][0]``, ``record["relations"][0]`` (via
+    # ``_derive_execution_scope_metadata``) and the incoming ``meta`` fields the
+    # signature captures. On a domain-wide graph, all N paths typically share ONE
+    # scope with ONE identical incoming-meta signature, so the original loop
+    # recomputed the identical annotation N times. Instead we compute it ONCE per
+    # distinct key on a representative record and broadcast the resulting meta
+    # delta to every path in the group. This drops L15k domain/all from ~27s to
+    # ~10s and roughly halves peak RSS, byte-identically.
+    groups: dict[tuple[str, str, str], list[int]] = {}
+    key_order: list[tuple[str, str, str]] = []
+    for idx, record in enumerate(annotated):
+        key = _affected_metadata_group_key(record)
+        bucket = groups.get(key)
+        if bucket is None:
+            groups[key] = bucket = []
+            key_order.append(key)
+        bucket.append(idx)
+
+    enriched: list[dict[str, Any]] = [None] * len(annotated)  # type: ignore[list-item]
+    for key in key_order:
+        indices = groups[key]
+        rep_idx = indices[0]
+        rep_record = annotated[rep_idx]
+        # Snapshot the representative's INCOMING meta values BEFORE annotating.
+        # ``_annotate_one`` mutates ``record["meta"]`` in place (it aliases the
+        # shallow-copied ``current["meta"]``), so ``rep_record["meta"]`` is the
+        # SAME dict as the output — a post-hoc comparison against it would miss
+        # every overwritten key. This frozen copy is what the delta is measured
+        # against.
+        rep_meta_in = rep_record.get("meta")
+        rep_meta_before = (
+            dict(rep_meta_in) if isinstance(rep_meta_in, dict) else {}
+        )
+        rep_current = _annotate_one(rep_record)
+        enriched[rep_idx] = rep_current
+        if len(indices) == 1:
+            continue
+        rep_meta_out = rep_current.get("meta")
+        if not isinstance(rep_meta_out, dict):
+            # Defensive: nothing to broadcast — annotate each member directly.
+            for member_idx in indices[1:]:
+                enriched[member_idx] = _annotate_one(annotated[member_idx])
+            continue
+        # The delta is exactly the keys the representative's body added or
+        # modified relative to its incoming meta. The signature guarantees each
+        # member's incoming meta matches the representative on those fields, so
+        # applying the same delta is byte-identical to running the body per
+        # member. We SHARE the large ``affected_users``/``affected_computers``
+        # list references (read-only / wholesale-replaced downstream — same
+        # precedent as commit 0c7038e19), and re-copy the small tier dicts so no
+        # two records alias one dict.
+        _MISSING = object()
+        delta_keys = [
+            mk
+            for mk in rep_meta_out
+            if rep_meta_out[mk] is not rep_meta_before.get(mk, _MISSING)
+        ]
+        for member_idx in indices[1:]:
+            member_record = annotated[member_idx]
+            member_current = dict(member_record)
+            member_meta_in = member_current.get("meta")
+            member_meta = (
+                dict(member_meta_in) if isinstance(member_meta_in, dict) else {}
+            )
+            for mk in delta_keys:
+                mv = rep_meta_out[mk]
+                if mk in ("affected_users_tier_breakdown", "affected_users_tier_map"):
+                    member_meta[mk] = dict(mv) if isinstance(mv, dict) else mv
+                else:
+                    member_meta[mk] = mv
+            member_current["meta"] = member_meta
+            enriched[member_idx] = member_current
+
+    return [record for record in enriched if record is not None]
 
 
 def _classify_broad_group_scope(
@@ -6840,8 +6973,11 @@ def load_merged_attack_graph(shell: object, domains: list[str]) -> dict[str, Any
 
     Returns:
         Unified attack graph dict with keys ``schema_version``, ``nodes``,
-        ``edges``, and ``_merged_domains``. Edges are deduplicated by
-        ``(source_label, target_label, kind)`` tuple.
+        ``edges``, and ``_merged_domains``. Edges are deduplicated by the SAME
+        identity ``upsert_edge`` uses — ``(from, relation, to, share_identity)`` —
+        so a cross-domain edge persisted in one domain and its foreign-endpoint
+        twin in another collapse to one, without flattening distinct edges that
+        merely share a ``kind``.
     """
     merged: dict[str, Any] = {
         "schema_version": ATTACK_GRAPH_SCHEMA_VERSION,
@@ -6849,26 +6985,277 @@ def load_merged_attack_graph(shell: object, domains: list[str]) -> dict[str, Any
         "edges": [],
         "_merged_domains": list(domains),
     }
-    seen_edge_keys: set[tuple[str, str, str]] = set()
+    seen_edge_keys: set[tuple[str, str, str, str]] = set()
 
+    # Re-key every node to a GLOBALLY-unique id (the canonical ``NAME@DOMAIN``
+    # label; see ``_merged_node_global_id``). Two resolution maps are built so
+    # edges remap correctly EVEN when a cross-domain edge in domain A references a
+    # foreign node by an id/SID that only exists in domain B's file:
+    #   * ``local_to_global[domain]`` — that domain's own ``local_id -> global_id``.
+    #   * ``sid_to_global`` — a GLOBAL ``objectId/SID -> global_id`` index, so a
+    #     foreign edge that references a node by its ``name:<SID>`` local id or a
+    #     bare SID resolves to the foreign node's label-based global id even though
+    #     the label-based re-key made the two ids differ.
+    per_domain_local_to_global: dict[str, dict[str, str]] = {}
+    sid_to_global: dict[str, str] = {}
+    per_domain_graphs: dict[str, dict[str, Any]] = {}
+
+    # Pass 1 — nodes.
     for domain in domains:
         graph = load_attack_graph(shell, domain)
-        # Merge nodes — later domains overwrite earlier ones for the same label,
-        # which is safe because labels are globally unique (NAME@DOMAIN).
-        for node_id, node_data in graph.get("nodes", {}).items():
-            merged["nodes"][node_id] = node_data
-        # Merge edges — deduplicate by (source_label, target_label, kind).
+        per_domain_graphs[domain] = graph
+        raw_nodes = graph.get("nodes")
+        raw_nodes = raw_nodes if isinstance(raw_nodes, dict) else {}
+        local_to_global: dict[str, str] = {}
+        per_domain_local_to_global[domain] = local_to_global
+        for local_id, node_data in raw_nodes.items():
+            global_id = _merged_node_global_id(node_data, domain=domain, local_id=local_id)
+            local_to_global[local_id] = global_id
+            object_id = _merged_node_object_id(node_data)
+            if object_id and object_id not in sid_to_global:
+                # First (primary-domain-first) real node keyed by this SID wins the
+                # global index; a per-domain BUILTIN SID (label-keyed, distinct
+                # global ids) never lands here because two ADMINISTRATORS@<dom>
+                # share the SID — only the first is indexed, and edges referencing
+                # that SID from ANOTHER domain resolve via the local map first (see
+                # the remap order below), so BUILTIN edges never cross domains.
+                sid_to_global[object_id] = global_id
+            # Primary domain is ordered first, so its node wins on any real
+            # (same-label) collision; a stand-in endpoint is overwritten by the
+            # real foreign node it merges onto.
+            merged["nodes"].setdefault(global_id, node_data)
+            if not isinstance(merged["nodes"].get(global_id), dict) or bool(
+                (merged["nodes"][global_id].get("properties") or {}).get(
+                    "cross_domain_endpoint"
+                )
+            ):
+                # A previously-inserted stand-in must yield to a real node.
+                merged["nodes"][global_id] = node_data
+
+    # Pass 2 — edges. Remap endpoints to the global ids and deduplicate by the
+    # upsert identity so we neither drop a distinct edge nor duplicate a
+    # cross-domain edge and its foreign twin. A reference is resolved LOCAL-first
+    # (the edge's own domain), then via the global SID index (a cross-domain
+    # reference to a foreign node whose id lives only in the other domain's file).
+    for domain in domains:
+        graph = per_domain_graphs[domain]
+        local_to_global = per_domain_local_to_global[domain]
         for edge in graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            from_local = str(edge.get("from") or edge.get("source") or "")
+            to_local = str(edge.get("to") or edge.get("target") or "")
+            from_global = _resolve_merged_endpoint(from_local, local_to_global, sid_to_global)
+            to_global = _resolve_merged_endpoint(to_local, local_to_global, sid_to_global)
+            relation = _normalize_relation(str(edge.get("relation") or ""))
             key = (
-                str(edge.get("source_label") or edge.get("source") or ""),
-                str(edge.get("target_label") or edge.get("target") or ""),
-                str(edge.get("kind") or ""),
+                from_global,
+                relation,
+                to_global,
+                _edge_share_identity(relation, edge.get("notes")),
             )
-            if key not in seen_edge_keys:
-                seen_edge_keys.add(key)
-                merged["edges"].append(edge)
+            if key in seen_edge_keys:
+                continue
+            seen_edge_keys.add(key)
+            remapped = dict(edge)
+            remapped["from"] = from_global
+            remapped["to"] = to_global
+            merged["edges"].append(remapped)
 
     return merged
+
+
+def _merged_node_object_id(node: dict[str, Any]) -> str:
+    """Return a node's objectId/SID (top-level or under ``properties``), upper-cased."""
+    object_id = str(node.get("objectId") or node.get("objectid") or "").strip()
+    if not object_id:
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        object_id = str(props.get("objectid") or "").strip()
+    return object_id.upper()
+
+
+def _resolve_merged_endpoint(
+    reference: str,
+    local_to_global: dict[str, str],
+    sid_to_global: dict[str, str],
+) -> str:
+    """Resolve an edge endpoint reference to its merged-graph global id.
+
+    LOCAL-first (the edge's own domain map — so a per-domain BUILTIN SID edge stays
+    within its domain), then the global SID index (a cross-domain edge that
+    references a foreign node by its ``name:<SID>`` local id or a bare SID, when
+    that node's node-entry lives only in the other domain's file), then the raw
+    reference unchanged.
+    """
+    if reference in local_to_global:
+        return local_to_global[reference]
+    ref_upper = reference.upper()
+    # A ``name:<SID>`` local-id reference to a foreign node → index by the SID.
+    sid = ref_upper[len("NAME:"):] if ref_upper.startswith("NAME:") else ref_upper
+    if sid in sid_to_global:
+        return sid_to_global[sid]
+    return reference
+
+
+def _merged_node_global_id(
+    node: dict[str, Any], *, domain: str, local_id: str
+) -> str:
+    """Return a globally-unique merged-graph node id.
+
+    Identity is the canonical ``NAME@DOMAIN`` label, NOT the bare objectId/SID.
+    This is decisive for two node classes the bare-SID key got wrong:
+
+    * **Per-domain BUILTIN groups.** ``BUILTIN\\Administrators`` is
+      ``S-1-5-32-544`` in EVERY domain; keying by that shared SID FUSED
+      ``ADMINISTRATORS@ESSOS`` / ``@NORTH`` / ``@SEVENKINGDOMS`` into one node and
+      hung all three domains' ``DCSync`` edges off it — inventing false
+      cross-domain compromise paths (a DA of forest A "DCSyncing" forest B). The
+      ``@DOMAIN`` suffix in the label keeps them SEPARATE.
+    * **Foreign-endpoint stand-ins.** A collector stand-in and the real
+      SID-keyed node for the same account carry the SAME ``NAME@DOMAIN`` label,
+      so keying by label correctly MERGES them into one.
+
+    Genuinely-global well-known principals (``Everyone@WELLKNOWN`` = ``S-1-1-0``,
+    ``Authenticated Users@WELLKNOWN`` = ``S-1-5-11``) carry a domain-agnostic
+    ``@WELLKNOWN`` label that is identical across domains, so keying by label
+    correctly FUSES them into one shared node.
+
+    Resolution order:
+        1. A canonical ``NAME@DOMAIN`` / ``@WELLKNOWN`` label (has ``@``) — the
+           domain-qualified label distinguishes per-domain objects and unifies
+           genuinely-global and real/stand-in pairs.
+        2. Otherwise the globally-unique objectId/SID — used for container-class
+           objects (Container/GPO/OU/Domain) whose canonical label is a bare name
+           or a GUID that repeats across domains (e.g. the Default Domain Policy
+           GUID); their objectId is a domain-unique GUID/domain-SID, never a
+           shared well-known SID (those always carry an ``@``-qualified label and
+           take slot 1), so this never re-introduces the cross-domain fusion.
+        3. Otherwise a non-``@`` label, domain-namespaced so an ambiguous shared
+           label cannot fuse across domains.
+        4. Otherwise the domain-prefixed local id.
+    """
+    label = _canonical_node_label(node)
+    if label and label not in {"N/A", ""} and "@" in label:
+        return f"label:{label.upper()}"
+    object_id = _merged_node_object_id(node)
+    if object_id:
+        return f"name:{object_id}"
+    if label and label not in {"N/A", ""}:
+        return f"{str(domain or '').strip().upper()}::label:{label.upper()}"
+    return f"{str(domain or '').strip().upper()}::{local_id}"
+
+
+def list_domains_with_attack_graph(shell: object) -> list[str]:
+    """List every workspace domain that has a persisted ``attack_graph.json``.
+
+    Scans ``<workspace>/<domains_dir>/*/attack_graph.json`` so path computation
+    can decide whether to merge (more than one domain graph) or run single-domain.
+
+    Returns:
+        Sorted domain names (directory names) that carry an attack graph.
+    """
+    workspace_cwd = resolve_workspace_cwd(shell)
+    if not workspace_cwd:
+        return []
+    domains_dir = getattr(shell, "domains_dir", "domains")
+    root = os.path.join(workspace_cwd, domains_dir)
+    if not os.path.isdir(root):
+        return []
+    found: list[str] = []
+    try:
+        for entry in os.listdir(root):
+            graph_file = os.path.join(root, entry, "attack_graph.json")
+            if os.path.isfile(graph_file):
+                found.append(entry)
+    except OSError:
+        return []
+    return sorted(found)
+
+
+def _order_domains(domains: list[str], *, primary: str) -> list[str]:
+    """Return ``domains`` with ``primary`` first, so the merged graph's primary
+    domain wins on any node-label collision during the merge."""
+    primary_norm = str(primary or "").strip().lower()
+    ordered = [d for d in domains if str(d).strip().lower() == primary_norm]
+    ordered += [d for d in domains if str(d).strip().lower() != primary_norm]
+    return ordered
+
+
+def _load_attack_graph_for_paths(shell: object, domain: str) -> dict[str, Any]:
+    """Load the graph the DFS should run over for ``domain``.
+
+    When the workspace has MORE THAN ONE domain graph, return the MERGED graph of
+    all of them (primary ``domain`` first) so a persisted cross-domain edge lets
+    the DFS cross the boundary — this is the single, always-on compute path (no
+    caller-selected merge mode). When there is exactly one domain graph, return
+    it unchanged, so single-domain runs stay byte-identical.
+    """
+    domains_with_graph = list_domains_with_attack_graph(shell)
+    if len(domains_with_graph) > 1:
+        return load_merged_attack_graph(
+            shell, _order_domains(domains_with_graph, primary=domain)
+        )
+    return load_attack_graph(shell, domain)
+
+
+def persist_cross_domain_trust_edges(
+    shell: object,
+    *,
+    domain: str,
+    domains_data: "Mapping[str, Any] | None",
+    foreign_domain_nodes: "Mapping[str, dict[str, Any]] | None" = None,
+) -> bool:
+    """Persist CrossOrgTgtDelegation + RaiseChild trust escalation edges to disk.
+
+    These edges were previously minted in-memory only (``virtual``) at query time,
+    so a status write (``update_edge_status_by_labels``) had no persisted edge to
+    land on and a reload re-derived them as ``theoretical``. This runs the same
+    couplings against the ORIGIN domain's on-disk graph and saves it, so the edge
+    (and its execution status) survives reloads. The query-time merge re-runs the
+    couplings as a no-op once the persisted edge exists.
+
+    A coupling needs BOTH domain nodes present. When the trust partner's Domain
+    node is not in this domain's own graph, ``foreign_domain_nodes`` (partner FQDN
+    upper -> a light Domain node payload, built from the cross-domain registry)
+    supplies it, keyed by the partner node's graph id so it merges cleanly.
+
+    Best-effort and idempotent. Returns True when it changed (and re-saved) the
+    graph.
+    """
+    graph = load_attack_graph(shell, domain)
+    nodes = graph.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        nodes = {}
+        graph["nodes"] = nodes
+    if foreign_domain_nodes:
+        for node_id, node_payload in foreign_domain_nodes.items():
+            if node_id and node_id not in nodes and isinstance(node_payload, dict):
+                nodes[node_id] = node_payload
+
+    # NOTE: ``load_attack_graph`` already runs these couplings IN MEMORY on every
+    # load (via ``_enrich_foreign_dc_nodes``), so the edge is usually present in
+    # ``graph`` before we call the couplings again — their idempotent return would
+    # then be False even though nothing is on DISK yet. So we do not gate the save
+    # on the coupling return: we save whenever a synthesized trust edge is present
+    # in the graph, materializing the previously in-memory-only edge to disk so its
+    # execution status survives reloads. Idempotent — a second call re-saves the
+    # same content (no duplicate, upsert identity).
+    attack_graph_core.couple_cross_org_tgt_delegation_edges(graph, domains_data)
+    attack_graph_core.couple_raise_child_edges(graph, domains_data)
+    synthesized = [
+        edge
+        for edge in graph.get("edges", [])
+        if isinstance(edge, dict)
+        and str(edge.get("relation") or "")
+        in {"CrossOrgTgtDelegation", "RaiseChild"}
+        and str((edge.get("notes") or {}).get("synthesized_from") or "").startswith(
+            ("cross_org_tgt_delegation", "within_forest_child_parent")
+        )
+    ]
+    if not synthesized:
+        return False
+    save_attack_graph(shell, domain, graph)
+    return True
 
 
 def _enrich_foreign_dc_nodes(
@@ -6906,6 +7293,15 @@ def _enrich_foreign_dc_nodes(
         if coupled:
             print_info_debug(
                 f"[attack_graph] coupled cross-forest TGT-delegation escalation edge "
+                f"in {mark_sensitive(domain, 'domain')} attack graph (in-memory)."
+            )
+        # Same-forest child->parent RaiseChild escalation edge (intra-forest
+        # analogue of the cross-org coupling); only when a WITHIN_FOREST trust to a
+        # known parent exists and both domain nodes are present.
+        coupled_rc = attack_graph_core.couple_raise_child_edges(graph, domains_data)
+        if coupled_rc:
+            print_info_debug(
+                f"[attack_graph] coupled child->parent RaiseChild escalation edge "
                 f"in {mark_sensitive(domain, 'domain')} attack graph (in-memory)."
             )
     except Exception as exc:  # noqa: BLE001
@@ -7421,6 +7817,74 @@ def classify_graph_edges(graph: dict[str, Any]) -> int:
     return changed
 
 
+def _refresh_edge_verify_commands(graph: dict[str, Any]) -> int:
+    """Re-render the ``knowledge`` verify commands on technique edges.
+
+    An edge's ``knowledge`` block is baked in :func:`upsert_edge`, which runs
+    during collection — before ``save_attack_graph`` stamps ``graph["dc_ip"]``
+    (and, for some writers, ``graph["domain"]``) — so its ``verify_windows`` /
+    ``verify_linux`` still carry the literal ``<dc_ip>`` / ``<domain>`` tokens.
+    Once the writer knows the coordinates it re-renders them against each edge's
+    own source/target so the web CTEM shows a copy-paste command with the real
+    DC IP and domain, matching what the report re-renders at PDF-build time.
+
+    Only technique edges (those carrying a ``knowledge`` block with a verify
+    command) are touched; ``<user>`` / ``<pass>`` are never substituted. Idempotent
+    and best-effort — a no-op when the graph has no coordinates or no such edges.
+    """
+    dc_ip = str(graph.get("dc_ip") or "").strip()
+    domain = str(graph.get("domain") or "").strip()
+    if not dc_ip and not domain:
+        return 0
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return 0
+    try:
+        from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
+            render_step_verify,
+        )
+    except Exception:  # noqa: BLE001 — never break the write over an enrichment
+        return 0
+    refreshed = 0
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        knowledge = edge.get("knowledge")
+        if not isinstance(knowledge, dict):
+            continue
+        if not (knowledge.get("verify_windows") or knowledge.get("verify_linux")):
+            continue
+        relation = str(edge.get("relation") or "").strip()
+        if not relation:
+            continue
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        verify_step = {
+            "relation": relation,
+            "details": {
+                "from": str(notes.get("source_label") or edge.get("from") or ""),
+                "to": str(notes.get("target_label") or edge.get("to") or ""),
+                **({"dc_ip": dc_ip} if dc_ip else {}),
+                **({"domain": domain} if domain else {}),
+            },
+        }
+        try:
+            rendered = render_step_verify(verify_step)
+        except Exception:  # noqa: BLE001
+            continue
+        changed = False
+        if rendered.get("windows") and knowledge.get("verify_windows"):
+            if knowledge["verify_windows"] != rendered["windows"]:
+                knowledge["verify_windows"] = rendered["windows"]
+                changed = True
+        if rendered.get("linux") and knowledge.get("verify_linux"):
+            if knowledge["verify_linux"] != rendered["linux"]:
+                knowledge["verify_linux"] = rendered["linux"]
+                changed = True
+        if changed:
+            refreshed += 1
+    return refreshed
+
+
 def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None:
     """Persist the attack graph to disk with stable formatting.
 
@@ -7434,6 +7898,31 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
     graph["schema_version"] = ATTACK_GRAPH_SCHEMA_VERSION
     graph["domain"] = domain
     graph["generated_at"] = _utc_now_iso()
+    # Stamp the DC/KDC IP onto the graph so downstream renderers (report,
+    # attack-path snapshot, edge-knowledge bake) can substitute a real IP into
+    # the independent-verification commands instead of a literal <dc_ip> token.
+    # Resolved once here through the ``resolve_dc_ip`` SSOT (never a hand-rolled
+    # .get("dc_ip") walk). Best-effort: absent domains_data / no resolvable DC
+    # leaves the field unset and the catalog degrades to the literal token.
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        domains_data = getattr(shell, "domains_data", None)
+        domain_entry = (
+            domains_data.get(domain) if isinstance(domains_data, dict) else None
+        )
+        if isinstance(domain_entry, dict):
+            resolved_dc_ip = resolve_dc_ip(domain_entry)
+            if resolved_dc_ip:
+                graph["dc_ip"] = resolved_dc_ip
+    except Exception:  # noqa: BLE001 — never break the graph write over an enrichment
+        pass
+    # Edges are baked during collection, BEFORE the dc_ip/domain stamps above
+    # exist on the graph, so their knowledge verify blocks still carry the
+    # literal <dc_ip>/<domain> tokens. Refresh them here — at the ONE writer,
+    # after the coordinates are known — so the web CTEM edge panel gets the real
+    # DC IP + domain in its copy-paste verify commands (parity with the report).
+    _refresh_edge_verify_commands(graph)
     classify_graph_edges(graph)
     _prune_tier0_source_attack_edges(graph)
     _flush_tier0_source_attack_edge_skip_summary(graph)
@@ -8085,6 +8574,8 @@ def _personalize_edge_knowledge(
     edge_notes: dict[str, Any] | None,
     *,
     source_is_tier0_direct: bool = False,
+    dc_ip: str = "",
+    domain: str = "",
 ) -> dict[str, Any] | None:
     """Weave THIS edge's concrete assets into its baked technique knowledge.
 
@@ -8096,6 +8587,17 @@ def _personalize_edge_knowledge(
     affected template". Never mutates the cached base. Returns ``None`` when the
     relation maps to no technique (so the caller stamps nothing).
 
+    The cached base bakes the independent-verification commands from a synthetic,
+    context-free step, so its ``verify_windows``/``verify_linux`` carry the
+    literal ``<dc_ip>``/``<domain>`` tokens. When the caller passes this edge's
+    environment coordinates (``dc_ip`` from the graph's ``resolve_dc_ip`` stamp,
+    ``domain`` from the graph), the verify block is re-rendered against a step
+    carrying them plus this edge's source/target, so the web CTEM shows a
+    copy-paste command with the real DC IP and domain — parity with the report,
+    which re-renders the same block at PDF-build time. ``<user>``/``<pass>`` are
+    NEVER substituted (the credential must never land in the CTEM). Absent
+    coordinates leave the literal tokens in place.
+
     Mirrors the finding-side weave in
     ``report_service.sync_attack_graph_findings`` via the SAME affected-assets
     SSOT, so the edge card and the finding card name identical assets.
@@ -8106,16 +8608,63 @@ def _personalize_edge_knowledge(
     if not isinstance(base, dict) or not base:
         return base
     if not isinstance(edge_notes, dict) or not edge_notes:
+        edge_notes = {}
+    # Re-render the verification commands against this edge's real coordinates so
+    # the web CTEM's copy-paste verify block carries the DC IP + domain, matching
+    # the report. Only when the graph supplied at least one coordinate and the
+    # base actually carries a verify block. Best-effort: any failure keeps the
+    # generic (literal-token) verify already on the base.
+    verify_override: dict[str, str] = {}
+    if (dc_ip or domain) and (
+        base.get("verify_windows") or base.get("verify_linux")
+    ):
+        try:
+            from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
+                render_step_verify,
+            )
+
+            verify_step = {
+                "relation": relation_norm,
+                "details": {
+                    "from": str(edge_notes.get("source_label") or ""),
+                    "to": str(edge_notes.get("target_label") or ""),
+                    **({"dc_ip": dc_ip} if dc_ip else {}),
+                    **({"domain": domain} if domain else {}),
+                },
+            }
+            rendered = render_step_verify(verify_step)
+            if rendered.get("windows") and base.get("verify_windows"):
+                verify_override["verify_windows"] = rendered["windows"]
+            if rendered.get("linux") and base.get("verify_linux"):
+                verify_override["verify_linux"] = rendered["linux"]
+        except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
+            telemetry.capture_exception(exc)
+    def _with_verify(result: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Overlay the re-rendered verify commands onto a knowledge dict.
+
+        Copies before mutating so the cached base is never touched. A no-op when
+        there is no override (no coordinates, or the base had no verify block).
+        """
+        if not verify_override or not isinstance(result, dict):
+            return result
+        merged = dict(result)
+        merged.update(verify_override)
+        return merged
+
+    if not edge_notes and not verify_override:
         return base
     try:
         from adscan_internal.pro.reporting.finding_specifics import (
             weave_specifics_into_knowledge,
         )
     except Exception:  # noqa: BLE001 — LITE/runtime without the PRO catalog
-        return base
+        return _with_verify(base)
     vuln_key = str(base.get("vuln_key") or "").strip()
     if not vuln_key:
-        return base
+        return _with_verify(base)
+    if not edge_notes:
+        # Coordinates but no per-edge assets to weave — just overlay verify.
+        return _with_verify(base)
     # Synthesise the minimal ``details`` shape the specifics SSOT expects: one
     # attack-graph edge whose source/target/notes carry the concrete assets.
     synthetic_details = {
@@ -8129,11 +8678,13 @@ def _personalize_edge_knowledge(
         ]
     }
     try:
-        return weave_specifics_into_knowledge(vuln_key, base, synthetic_details)
+        return _with_verify(
+            weave_specifics_into_knowledge(vuln_key, base, synthetic_details)
+        )
     except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
-        return base
+        return _with_verify(base)
 
 
 def upsert_edge(
@@ -8277,6 +8828,8 @@ def upsert_edge(
                 relation_norm,
                 merged_notes,
                 source_is_tier0_direct=source_is_tier0_direct,
+                dc_ip=str(graph.get("dc_ip") or "").strip(),
+                domain=str(graph.get("domain") or "").strip(),
             )
             if baked_knowledge:
                 edge["knowledge"] = baked_knowledge
@@ -8314,6 +8867,8 @@ def upsert_edge(
         relation_norm,
         entry.get("notes") if isinstance(entry.get("notes"), dict) else None,
         source_is_tier0_direct=source_is_tier0_direct,
+        dc_ip=str(graph.get("dc_ip") or "").strip(),
+        domain=str(graph.get("domain") or "").strip(),
     )
     if baked_knowledge:
         entry["knowledge"] = baked_knowledge
@@ -9184,6 +9739,137 @@ def _select_edge_endpoints(
     return best_from, best_to
 
 
+def _resolve_edge_endpoints_in_graph(
+    graph: dict[str, Any],
+    *,
+    from_label: str,
+    relation: str,
+    to_label: str,
+) -> tuple[str, str]:
+    """Resolve ``(from_id, to_id)`` for an edge inside ONE graph (best-effort).
+
+    Returns ``("", "")`` when either endpoint is unresolvable in this graph.
+    Endpoint resolution is alias-aware and lives in one place
+    (``attack_graph_node_identity``).  Three properties matter here:
+
+    * Security principals (Group, User, Computer, Domain) win over structural
+      AD objects (OU, Container, CertTemplate, EnterpriseCA) when several nodes
+      share the same normalised display label.
+    * A host-shaped endpoint may be named by IP, short name, FQDN or ``HOST$``
+      while the node is labelled with one of the other three.
+    * A display label is NOT unique, so when an endpoint is ambiguous prefer the
+      candidate pair that ALREADY carries an edge with this relation.
+    """
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict) or not nodes_map:
+        return "", ""
+    from_candidates = resolve_graph_node_candidates(nodes_map, from_label)
+    to_candidates = resolve_graph_node_candidates(nodes_map, to_label)
+    from_id, to_id = _select_edge_endpoints(
+        graph,
+        relation=relation,
+        from_candidates=from_candidates,
+        to_candidates=to_candidates,
+    )
+    return (from_id or ""), (to_id or "")
+
+
+def _write_edge_status_in_graph(
+    shell: object,
+    domain: str,
+    graph: dict[str, Any],
+    *,
+    from_id: str,
+    to_id: str,
+    relation: str,
+    status: str,
+    from_label: str,
+    to_label: str,
+    notes: dict[str, Any] | None,
+) -> None:
+    """Upsert the edge status into ``graph`` and persist ``domain``'s graph."""
+    upsert_edge(
+        graph,
+        from_id=from_id,
+        to_id=to_id,
+        relation=relation,
+        edge_type="runtime",
+        status=status,
+        notes=notes,
+    )
+    save_attack_graph(shell, domain, graph)
+    print_info_debug(
+        "[attack-graph] Edge status updated: "
+        f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
+        f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')}"
+    )
+
+
+def _is_cross_domain_relation(relation: str) -> bool:
+    """True when ``relation`` is a modeled cross-domain / cross-forest escalation.
+
+    Reuses the SSOT set from ``attack_graph_core`` so a new cross-domain edge
+    (RaiseChild, a future bidirectional inter-forest edge) inherits the
+    owning-graph write-back routing with no per-technique change here.
+    """
+    return _normalize_relation_key(relation) in (
+        attack_graph_core._CROSS_DOMAIN_ESCALATION_RELATIONS  # noqa: SLF001
+    )
+
+
+def _route_cross_domain_status_to_owning_graph(
+    shell: object,
+    path_domain: str,
+    *,
+    from_label: str,
+    relation: str,
+    to_label: str,
+    status: str,
+    notes: dict[str, Any] | None,
+) -> bool:
+    """Write a cross-domain edge's status into whichever domain graph OWNS it.
+
+    A cross-domain edge (CrossOrgTgtDelegation, RaiseChild, …) spans two domains,
+    so it is persisted in ONE of them (the trusting / child side), which is often
+    NOT the path's own domain.  When the endpoints do not resolve in the
+    path-domain graph, walk every OTHER persisted domain graph and write the
+    status into the one whose graph resolves BOTH endpoints — "an edge whose
+    endpoints span two domains gets its status written to whichever domain graph
+    persists it".
+
+    Returns True when it found the owning graph and wrote the status.
+    """
+    for other_domain in list_domains_with_attack_graph(shell):
+        if str(other_domain).strip().lower() == str(path_domain).strip().lower():
+            continue
+        other_graph = load_attack_graph(shell, other_domain)
+        from_id, to_id = _resolve_edge_endpoints_in_graph(
+            other_graph, from_label=from_label, relation=relation, to_label=to_label
+        )
+        if not from_id or not to_id:
+            continue
+        _write_edge_status_in_graph(
+            shell,
+            other_domain,
+            other_graph,
+            from_id=from_id,
+            to_id=to_id,
+            relation=relation,
+            status=status,
+            from_label=from_label,
+            to_label=to_label,
+            notes=notes,
+        )
+        print_info_debug(
+            "[attack-graph] Cross-domain edge status routed to owning graph: "
+            f"path_domain={mark_sensitive(path_domain, 'domain')} "
+            f"owning_domain={mark_sensitive(other_domain, 'domain')} "
+            f"relation={relation} status={status}"
+        )
+        return True
+    return False
+
+
 def update_edge_status_by_labels(
     shell: object,
     domain: str,
@@ -9221,35 +9907,28 @@ def update_edge_status_by_labels(
         )
         return False
 
-    # Endpoint resolution is alias-aware and lives in one place
-    # (``attack_graph_node_identity``).  Three properties matter here:
-    #
-    # * Security principals (Group, User, Computer, Domain) win over structural
-    #   AD objects (OU, Container, CertTemplate, EnterpriseCA) when several
-    #   nodes share the same normalised display label.  Without that preference
-    #   an OU named "Domain Controllers" is returned before the Domain
-    #   Controllers security group (SID-516), producing a runtime edge that
-    #   targets the OU GUID instead of the group — the attack-path DFS then
-    #   finds the native_derived edge (still at "discovered") and the path stays
-    #   "theoretical".
-    # * A host-shaped endpoint may be named by IP, short name, FQDN or ``HOST$``
-    #   while the node is labelled with one of the other three.  An ADCS ESC8
-    #   step naming its Enterprise CA by IP used to resolve to nothing, so a
-    #   PROVEN domain-compromising step was dropped from the graph and the whole
-    #   path rendered as theoretical in the client deliverable.
-    # * A display label is NOT unique.  One AD CS deployment renders three nodes
-    #   as ``<CA>@<REALM>`` — the EnterpriseCA, its AIACA and its RootCA — and
-    #   the ADCS ESC edges hang off the EnterpriseCA.  Picking a candidate by
-    #   dict order writes the proven status onto a sibling node, creating an
-    #   orphan runtime edge while the real edge keeps its stale status.  So when
-    #   an endpoint is ambiguous, prefer the candidate pair that ALREADY carries
-    #   an edge with this relation.
-    from_candidates = resolve_graph_node_candidates(nodes_map, from_label)
-    to_candidates = resolve_graph_node_candidates(nodes_map, to_label)
-    from_id, to_id = _select_edge_endpoints(
-        graph, relation=relation, from_candidates=from_candidates, to_candidates=to_candidates
+    from_id, to_id = _resolve_edge_endpoints_in_graph(
+        graph, from_label=from_label, relation=relation, to_label=to_label
     )
     if not from_id or not to_id:
+        # A cross-domain edge (CrossOrgTgtDelegation, RaiseChild, future
+        # bidirectional inter-forest edges) spans two domains, so it is persisted
+        # in the OTHER domain's graph (the trusting / child side) — not the path's
+        # own domain. When the terminal node is not in THIS graph but the relation
+        # is cross-domain, route the write to the graph that actually holds the
+        # edge, rather than dropping the status. Generalized via the SSOT relation
+        # set — no per-technique special-casing.
+        if _is_cross_domain_relation(relation) and _route_cross_domain_status_to_owning_graph(
+            shell,
+            domain,
+            from_label=from_label,
+            relation=relation,
+            to_label=to_label,
+            status=status,
+            notes=notes,
+        ):
+            return True
+
         # Only the sampled node LABELS are marked: the counts and the kind
         # census carry no identity and must stay readable in a recording — they
         # are what tells "no node of this kind exists" apart from "it exists
@@ -9282,20 +9961,17 @@ def update_edge_status_by_labels(
             )
         return False
 
-    upsert_edge(
+    _write_edge_status_in_graph(
+        shell,
+        domain,
         graph,
         from_id=from_id,
         to_id=to_id,
         relation=relation,
-        edge_type="runtime",
         status=status,
+        from_label=from_label,
+        to_label=to_label,
         notes=notes,
-    )
-    save_attack_graph(shell, domain, graph)
-    print_info_debug(
-        "[attack-graph] Edge status updated: "
-        f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
-        f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')}"
     )
     return True
 
@@ -9554,7 +10230,12 @@ def get_node_by_label(
 
     Args:
         shell: Shell instance used to load the attack graph.
-        domain: Domain for which the graph is loaded.
+        domain: Primary domain for which the graph is loaded. When the workspace
+            holds more than one domain graph, the MERGED multi-domain graph is
+            searched (primary ``domain`` first), so a node that lives in a trusted
+            in-scope domain — the target/source of a cross-domain attack-path step
+            — resolves here. In the single-domain case this is byte-identical to
+            loading ``domain``'s own graph.
         label: UI label of the node (e.g. ``WINTERFELL$``).
 
     Returns:
@@ -9563,7 +10244,7 @@ def get_node_by_label(
     label_clean = str(label or "").strip()
     if not label_clean:
         return None
-    graph = load_attack_graph(shell, domain)
+    graph = _load_attack_graph_for_paths(shell, domain)
     node_id = _find_node_id_by_label(graph, label_clean)
     if not node_id:
         return None
@@ -9582,6 +10263,27 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     """
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     context_relations = _CONTEXT_RELATIONS_LOWER
+
+    # Environment coordinates for the per-step independent-verification commands
+    # (the catalog renders {dc_ip}/{domain} into the copy-paste verify block).
+    # Both are graph-level facts stamped by ``save_attack_graph`` — the domain
+    # name always, and the DC/KDC IP resolved once there via the ``resolve_dc_ip``
+    # SSOT. Stamping them into every step's ``details`` here means both the report
+    # (which re-renders verify at PDF-build time) and the attack-path snapshot
+    # (which bakes the ``knowledge`` block the web CTEM consumes) inherit real
+    # values for free — no seam re-resolves them. Absent (an older graph written
+    # before the stamp, or a domain with no resolvable DC) → left unset, and the
+    # catalog degrades to the literal ``<dc_ip>``/``<domain>`` token.
+    _graph_dc_ip = str(graph.get("dc_ip") or "").strip()
+    _graph_domain = str(graph.get("domain") or "").strip()
+
+    def _stamp_env(details: dict[str, Any]) -> dict[str, Any]:
+        """Attach dc_ip/domain to a step's details when the graph carries them."""
+        if _graph_dc_ip:
+            details.setdefault("dc_ip", _graph_dc_ip)
+        if _graph_domain:
+            details.setdefault("domain", _graph_domain)
+        return details
 
     def label(node_id: str) -> str:
         node = nodes_map.get(node_id)
@@ -9759,7 +10461,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 "step": idx,
                 "action": step.relation,
                 "status": step_status,
-                "details": {
+                "details": _stamp_env({
                     **step_details,
                     # A hard-blocked safety abstention is stamped
                     # ``dangerous_destructive`` (routed via the single classifier)
@@ -9779,7 +10481,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                             else {}
                         )
                     ),
-                },
+                }),
             }
         )
     if synthetic_followup is not None:
@@ -9793,7 +10495,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 "step": len(steps_for_ui) + 1,
                 "action": str(synthetic_followup["relation"]),
                 "status": synthetic_status,
-                "details": {
+                "details": _stamp_env({
                     "from": label(path.target_id),
                     "to": str(synthetic_followup["to"]),
                     # Same axis-1 stamp as the real steps above, so every step a
@@ -9819,7 +10521,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                         if synthetic_status.strip().lower() == "blocked"
                         else {}
                     ),
-                },
+                }),
             }
         )
 
@@ -10140,14 +10842,62 @@ def resolve_entry_label_for_auth(auth_username: str | None) -> str:
     return normalized
 
 
+# Genuinely-global well-known principals carry a domain-AGNOSTIC @WELLKNOWN label
+# (identical across domains) and a fixed SID, so they must resolve to ONE shared,
+# cross-domain-traversable node — never a per-domain synthetic fork. Authenticated
+# Users (S-1-5-11) is the actor scope for any attack that needs only an
+# authenticated bind (Kerberoasting, AS-REP Roasting, UserDescription), which is
+# cross-forest capable. This is the SAME node the collector injects via
+# well_known_sids.inject_all_well_known_sid_nodes, so keying by its fixed SID
+# merges the entry-node with the injected node.
+_GLOBAL_WELL_KNOWN_ENTRY_SIDS: dict[str, tuple[str, str]] = {
+    "authenticated users": ("S-1-5-11", "Authenticated Users"),
+    "everyone": ("S-1-1-0", "Everyone"),
+}
+
+
+def _resolve_global_well_known_entry(
+    graph: dict[str, Any],
+    label_lower: str,
+) -> str | None:
+    """Resolve a genuinely-global well-known principal to its shared @WELLKNOWN node.
+
+    Returns the graph node id (``name:<SID>``) or ``None`` when the label is not a
+    globally-well-known principal. The node shape mirrors
+    ``well_known_sids._make_well_known_node`` so it fuses with the collector-injected
+    node and stays cross-domain traversable.
+    """
+    entry = _GLOBAL_WELL_KNOWN_ENTRY_SIDS.get(label_lower)
+    if entry is None:
+        return None
+    sid, display_name = entry
+    node_record = {
+        "name": f"{display_name}@WELLKNOWN",
+        "kind": ["Group"],
+        "objectId": sid,
+        "properties": {
+            "name": f"{display_name}@WELLKNOWN",
+            "objectid": sid,
+            "domain": "WELLKNOWN",
+            "well_known_sid": True,
+            "display_name": display_name,
+        },
+    }
+    upsert_nodes(graph, [node_record])
+    return _node_id(node_record)
+
+
 def _resolve_special_principal_entry(
     shell: object,
     domain: str,
     graph: dict[str, Any],
     label: str,
 ) -> str | None:
-    """Resolve well-known non-auth principals (anonymous/guest) via BH SIDs."""
+    """Resolve well-known principals (authenticated-users/everyone/anonymous/guest)."""
     label_lower = str(label or "").strip().lower()
+    global_entry = _resolve_global_well_known_entry(graph, label_lower)
+    if global_entry:
+        return global_entry
     sid_suffix_map = {
         "anonymous logon": "S-1-5-7",
         "guests": "S-1-5-32-546",
@@ -10446,7 +11196,11 @@ def resolve_netexec_target_for_node_label(
         return None
     domain_clean = str(domain or "").strip().lower()
 
-    graph = load_attack_graph(shell, domain)
+    # Search the MERGED multi-domain graph when the workspace holds more than one
+    # domain, so a cross-domain attack-path step's TARGET host (living in a
+    # trusted in-scope domain) resolves to its real properties.name/FQDN rather
+    # than the best-effort samAccountName fallback. Single-domain: byte-identical.
+    graph = _load_attack_graph_for_paths(shell, domain)
     node_id = _find_node_id_by_label(graph, label_clean)
     if not node_id:
         return _normalize_netexec_target_candidate(
@@ -14006,7 +14760,7 @@ def _apply_local_postprocessing_pipeline(
     # Build label-to-node index once — reused by stage 2 (terminal MemberOf) and stage 7 (HV tag).
     # Must include attack graph nodes (domains, computers, CAs) because the membership snapshot
     # only carries user/group data; domain terminals like ESSOS.LOCAL are only in the attack graph.
-    _base_graph = load_attack_graph(shell, domain)
+    _base_graph = _load_attack_graph_for_paths(shell, domain)
     _label_to_node = _build_snapshot_label_to_node(snapshot, base_graph=_base_graph)
     _recursive_groups_by_principal = (
         _build_recursive_membership_closure(domain, snapshot) if snapshot else None
@@ -14589,7 +15343,7 @@ def compute_display_paths_for_user(
         )
         return cached
 
-    base_graph = load_attack_graph(shell, domain)
+    base_graph = _load_attack_graph_for_paths(shell, domain)
     snapshot = _load_membership_snapshot(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
@@ -14792,7 +15546,7 @@ def compute_display_paths_for_domain(
         )
         return cached
 
-    base_graph = load_attack_graph(shell, domain)
+    base_graph = _load_attack_graph_for_paths(shell, domain)
     snapshot = _load_membership_snapshot(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
@@ -16218,7 +16972,7 @@ def compute_display_paths_for_principals(
         covered_by_snapshot / len(unique_principals) if unique_principals else 0.0
     )
 
-    base_graph = load_attack_graph(shell, domain)
+    base_graph = _load_attack_graph_for_paths(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
         domain=domain,

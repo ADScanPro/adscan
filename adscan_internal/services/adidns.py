@@ -50,9 +50,17 @@ class ADIDNSConfig:
     dc_ip: str
     domain: str
     username: str
-    password: str
+    password: str | None = None
     zone: str = ""  # defaults to domain if empty
     dns_server: str | None = None
+    # Pass-the-hash / ccache / forced-Kerberos auth (mirrors ADSPNConfig). A real
+    # engagement often holds only the DA NT hash (not a cleartext password), so the
+    # ADIDNS write must accept a hash/ccache too — otherwise the whole cross-forest
+    # step needs cleartext DA, a lab luxury. Password-only callers are unaffected
+    # (these default to None/False and the secret resolution falls back to password).
+    nt_hash: str | None = None
+    ccache_path: str | None = None
+    use_kerberos: bool = False
 
     @property
     def effective_zone(self) -> str:
@@ -110,13 +118,24 @@ def _node_dn(hostname: str, zone: str, domain_dn: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _ldap_cfg(config: ADIDNSConfig) -> ADscanLDAPConfig:
+    # Single secret resolution: ccache > nt_hash (PtH) > cleartext password
+    # (same precedence as ADSPNConfig._ldap_cfg). PtH threads the NT hash into
+    # the transport password slot, which ADscanLDAPConfig.__post_init__ detects.
+    if config.ccache_path:
+        secret: str | None = None
+    elif config.nt_hash:
+        secret = config.nt_hash
+    else:
+        secret = config.password
+
     return ADscanLDAPConfig(
         domain=config.domain,
         dc_ip=config.dc_ip,
         use_ldaps=True,
-        use_kerberos=False,
+        use_kerberos=bool(config.use_kerberos or config.ccache_path),
         username=config.username,
-        password=config.password,
+        password=secret,
+        ccache_path=config.ccache_path,
     )
 
 

@@ -114,7 +114,18 @@ def build_spray_coverage_plan(
     )
 
 
-_SEQUENCE = ("pre2k", "useraspass", "reuse", "blank")
+# Full spray-type priority order for sorting a caller-supplied set that MAY
+# include pre2k. This differs from spraying._SPRAY_CI_TYPES BY DESIGN — do NOT
+# unify them:
+#   * `pre2k` (machine-account spray) is kept HERE at the front because callers
+#     of ordered_spray_types() may pass it in and it must sort first; but it is
+#     absent from _SPRAY_CI_TYPES because machine accounts never lock out and are
+#     handled in their own step, OUTSIDE the user-account coverage selector.
+#   * month/season is TWO types (month_year, season_year) — one per coverage
+#     pass — not the old single `month_season`, so ci sprays both.
+# The relative order of the user-account types matches _SPRAY_CI_TYPES; keep them
+# in lockstep on those, differing only by pre2k's presence.
+_SEQUENCE = ("pre2k", "useraspass", "month_year", "season_year", "reuse", "blank")
 
 
 def ordered_spray_types(selected: Iterable[str]) -> list[str]:

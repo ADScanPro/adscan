@@ -21,6 +21,36 @@ NodeKind = Literal[
 
 
 @dataclass(frozen=True)
+class ForeignNodeRef:
+    """A reference to a node that lives in ANOTHER collected domain's graph.
+
+    Built by the orchestrator's cross-domain registry so per-domain persistence
+    can resolve a foreign trustee/target SID (an ACE trustee, a MemberOf target,
+    a delegation principal) to the exact graph identity the foreign domain's own
+    ``attack_graph.json`` uses. Persisting a cross-domain edge to ``node_id``
+    makes the light foreign-endpoint node created in the origin graph MERGE onto
+    the real foreign node at query time (``load_merged_attack_graph`` dedups
+    nodes by graph id), so a single end-to-end attack path spans the boundary.
+
+    Attributes:
+        node_id: The foreign node's canonical graph id (``name:<canonical>``),
+            identical to the id the foreign domain's graph uses — this is what
+            makes the merge collision-free for objectId-keyed targets.
+        label: The foreign node's human-readable ``NAME@DOMAIN`` label, carried
+            onto the light endpoint node for display until the merge overwrites
+            it with the real foreign node.
+        kind: The foreign node's object kind (``Group``/``User``/``Domain``/...).
+        is_tier0: Whether the foreign node is a Tier-0 asset, so the endpoint
+            keeps its high-value marker even before the merge.
+    """
+
+    node_id: str
+    label: str
+    kind: str = "Base"
+    is_tier0: bool = False
+
+
+@dataclass(frozen=True)
 class CollectorNode:
     """A normalized AD object ready for graph persistence."""
 

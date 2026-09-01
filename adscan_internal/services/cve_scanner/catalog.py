@@ -466,7 +466,47 @@ _validate_catalog_graph_relations()
 _validate_catalog_required_ports()
 
 
-def scope_applies_to_target(scope: TargetScope, *, is_dc: bool) -> bool:
+def _norm_domain(value: str | None) -> str:
+    """Lowercase + strip a domain token for comparison."""
+
+    return str(value or "").strip().rstrip(".").lower()
+
+
+def credential_covers_domain(
+    target_domain: str | None,
+    cred_auth_domains: frozenset[str] | set[str] | tuple[str, ...] | None,
+) -> bool:
+    """Return whether the scan credential can authenticate to ``target_domain``.
+
+    Conservative by design (Exposure-Validation doctrine): only returns
+    ``False`` when we can POSITIVELY determine the target's domain is one the
+    credential does not cover — i.e. both the target domain and the credential's
+    covered-domain set are known AND the target is not among them. An unknown
+    target domain, an unknown/empty credential set, or a match all return
+    ``True`` so a legitimate target is never silently dropped.
+
+    ADscan does not enumerate trust-based reachability here, so "covered" means
+    the credential's own auth domain(s). A DC in a foreign forest the credential
+    has no path to is the case this skips — the very ``SEC_E_LOGON_DENIED``
+    class this gate exists to avoid.
+    """
+
+    tgt = _norm_domain(target_domain)
+    if not tgt:
+        return True
+    covered = {_norm_domain(d) for d in (cred_auth_domains or ()) if _norm_domain(d)}
+    if not covered:
+        return True
+    return tgt in covered
+
+
+def scope_applies_to_target(
+    scope: TargetScope,
+    *,
+    is_dc: bool,
+    target_domain: str | None = None,
+    cred_auth_domains: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+) -> bool:
     """Return whether a catalog ``scope`` runs against a target.
 
     This is the **single source of truth** for the scope→target gate.
@@ -478,10 +518,18 @@ def scope_applies_to_target(scope: TargetScope, *, is_dc: bool) -> bool:
 
     - ``ALL_HOSTS`` runs against every target (DC or member host).
     - ``DCS_ONLY`` / ``DOMAIN_LDAP`` run only against domain controllers.
+    - A domain controller whose domain the scan credential does not cover is
+      skipped (cross-forest foreign DC) — see :func:`credential_covers_domain`.
+      This is CONSERVATIVE: it only fires when the foreign domain is positively
+      known; an indeterminate case still runs.
 
     Args:
         scope: The catalog entry's :class:`TargetScope`.
         is_dc: Whether the target is a domain controller.
+        target_domain: The domain the target host belongs to (``None`` when
+            undetermined). Used only for the cross-domain foreign-DC gate.
+        cred_auth_domains: The domain(s) the scan credential can authenticate
+            to (``None``/empty when unknown). Used only for the gate.
 
     Returns:
         ``True`` when a check with ``scope`` would run against the target.
@@ -490,7 +538,12 @@ def scope_applies_to_target(scope: TargetScope, *, is_dc: bool) -> bool:
     if scope is TargetScope.ALL_HOSTS:
         return True
     if scope in (TargetScope.DCS_ONLY, TargetScope.DOMAIN_LDAP):
-        return is_dc
+        if not is_dc:
+            return False
+        # DC-only checks bind to the target domain's DC. A DC in a domain the
+        # credential cannot cover is a foreign forest — skip rather than attempt
+        # a bind that returns SEC_E_LOGON_DENIED (cross-domain audit finding).
+        return credential_covers_domain(target_domain, cred_auth_domains)
     return False
 
 

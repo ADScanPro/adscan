@@ -163,6 +163,30 @@ def _build_runtime_license_env(image: str) -> tuple[tuple[str, str], ...]:
     return ((ADSCAN_RUNTIME_LICENSE_MODE_ENV, inferred_license_mode),)
 
 
+def resolve_runtime_license_mode() -> str | None:
+    """Resolve the runtime license mode BEFORE any Docker pull, cheaply.
+
+    Uses the SAME preference order the container run applies
+    (:func:`_build_runtime_license_env`): the explicit host override
+    ``ADSCAN_RUNTIME_LICENSE_MODE`` first, then image-name inference. The image
+    is selected with :func:`_select_existing_or_preferred_image`, a local-only
+    check (an existing compatible image, else the preferred candidate) that
+    never touches the network — so this can gate a doomed PRO run at the CLI
+    seam before the launcher spends a ``docker run`` (image start + entrypoint).
+
+    Returns:
+        ``"PRO"`` or ``"LITE"`` when resolvable, otherwise ``None`` (the runtime
+        would fall back to its own default; treat as not-PRO so the launcher-side
+        gate fails safe toward "let it start and let the container decide").
+    """
+    explicit_license_mode = (
+        str(os.getenv(ADSCAN_RUNTIME_LICENSE_MODE_ENV, "")).strip().upper()
+    )
+    if explicit_license_mode in {"LITE", "PRO"}:
+        return explicit_license_mode
+    return _infer_runtime_license_mode_from_image(_select_existing_or_preferred_image())
+
+
 def _extract_workspace_from_passthrough_args(adscan_args: list[str]) -> str | None:
     """Best-effort extraction of `--workspace/-w` from passthrough args."""
     args = list(adscan_args or [])
@@ -3302,6 +3326,43 @@ def _print_docker_install_summary() -> None:
     # Auto-mirrored to telemetry by the `_TeeConsole` — no manual mirror.
     console.print(next_panel)
 
+    # A short, personal note from the founder. Close and human, not a pitch —
+    # a thank-you plus an open invitation to follow the work. English only.
+    try:
+        from adscan_core.branding import ADSCAN_LINKS
+
+        linkedin = ADSCAN_LINKS.get("linkedin", "")
+        x_link = ADSCAN_LINKS.get("x", "")
+    except Exception:  # pragma: no cover - branding is import-safe, guard anyway
+        linkedin = ""
+        x_link = ""
+    note = Text()
+    note.append(
+        "Thanks for installing ADscan — it means a lot.\n", style="bold"
+    )
+    note.append(
+        "I build it as a working AD pentester, and I'd love to hear how it goes "
+        "for you.\n",
+        style="dim",
+    )
+    if linkedin:
+        note.append("Follow along / say hi: ", style="dim")
+        note.append(linkedin, style=BRAND_COLORS["info"])
+        note.append("\n", style="dim")
+    if x_link:
+        note.append("On X: ", style="dim")
+        note.append(x_link, style=BRAND_COLORS["info"])
+        note.append("\n", style="dim")
+    note.append("— Yeray, creator of ADscan", style="dim")
+    note_panel = Panel(
+        note,
+        title="[bold]A note from the founder[/bold]",
+        border_style=BRAND_COLORS.get("primary", BRAND_COLORS["info"]),
+        padding=(1, 2),
+    )
+    console.print()
+    console.print(note_panel)
+
 
 def handle_install_docker(
     *,
@@ -3447,6 +3508,23 @@ def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
     )
 
     _print_docker_install_summary()
+
+    # SHOW-ONCE onboarding: the thank-you-for-installing / welcome note goes here,
+    # gated on `should_show_once(NOTICE_WELCOME_INSTALL)` so a re-install / repeated
+    # `adscan install` does not re-print it. The flag persists in the mounted state
+    # dir (`~/.adscan/state/shown_notices.json`), so the container runtime sees it
+    # too. See adscan_core.first_run_notices.
+    #
+    # TODO(onboarding-note): another agent is authoring the actual "gracias por
+    # instalar" note. When it lands, wrap its render exactly like this and drop
+    # this scaffold:
+    #
+    #     from adscan_core.first_run_notices import (
+    #         NOTICE_WELCOME_INSTALL, mark_shown, should_show_once,
+    #     )
+    #     if should_show_once(NOTICE_WELCOME_INSTALL):
+    #         render_install_welcome_note()   # <- the not-yet-written note
+    #         mark_shown(NOTICE_WELCOME_INSTALL)
 
     return True
 

@@ -857,6 +857,79 @@ def _select_dcsync_ccache(
     return explicit_ccache or workspace_ccache
 
 
+def _persist_machine_account_kerberos_keys(
+    shell: Any, *, domain: str, secret: Any
+) -> Any:
+    """Persist a machine account's DCSync KEY MATERIAL into ``kerberos_keys``.
+
+    A machine account replicated by the DRSUAPI full walk (DC02$, member
+    computers) is dropped from the user-credential store — its password is
+    120/240 random bytes, so cracking it is pointless and it must never reach the
+    interactive credential picker. But its NT/AES keys ARE reusable capability:
+    the cross-org TGT-delegation step needs the trusted DC machine account's AES
+    keys to decrypt the coerced AP-REQ, and S4U2Self / RBCD / silver-ticket /
+    shadow-creds steps all key off a computer's machine-account key too.
+
+    So we route the KEY MATERIAL (not a credential) through the SSOT
+    ``store_kerberos_principal_material`` — which writes
+    ``domains_data[domain]["kerberos_keys"][<acct>]`` (the store
+    ``credential_store_service.get_kerberos_key_material`` reads) WITHOUT adding a
+    ``credentials`` entry and WITHOUT feeding the batch NTLM cracker. This keeps
+    "persist machine keys, never crack them" true by construction: the cracker
+    only ever sees the user-credential store / ``raw_credentials``, which this
+    path never touches.
+
+    Args:
+        shell: Active ``PentestShell`` (source of ``domains_data``).
+        domain: Domain that owns the machine account.
+        secret: The streamed ``DcsyncSecret`` for the machine account.
+
+    Returns:
+        The stored :class:`KerberosKeyMaterial`, or ``None`` when the secret
+        carried no reusable NT/AES key.
+    """
+    from adscan_internal.cli.creds import store_kerberos_principal_material
+
+    acct = str(getattr(secret, "username", "") or "").strip()
+    if not acct:
+        return None
+
+    nt_hash = str(getattr(secret, "nt_hash", "") or "") or None
+    aes256 = str(getattr(secret, "aes256_key", "") or "") or None
+    aes128 = str(getattr(secret, "aes128_key", "") or "") or None
+    if not nt_hash and not aes256 and not aes128:
+        return None
+
+    sid_value = getattr(secret, "sid", None)
+    rid = ""
+    if sid_value:
+        try:
+            rid = str(int(str(sid_value).rsplit("-", 1)[1]))
+        except (ValueError, IndexError):
+            rid = ""
+
+    # Best-effort resolution of the machine's own host (for target_host context);
+    # the machine account $ name maps to its short hostname.
+    target_host = acct[:-1] if acct.endswith("$") else ""
+
+    try:
+        return store_kerberos_principal_material(
+            shell,
+            domain=domain,
+            username=acct,
+            nt_hash=nt_hash,
+            aes256=aes256,
+            aes128=aes128,
+            source="dcsync",
+            target_host=target_host,
+            rid=rid,
+        )
+    except Exception as exc:  # noqa: BLE001 — a persist failure must not abort DCSync
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
 def execute_dcsync_native(
     shell: Any,
     domain: str,
@@ -1054,8 +1127,14 @@ def execute_dcsync_native(
                 password=password,
                 ccache_path=_tgt_ccache,
             )
-            import asyncio as _asyncio
-            _asyncio.get_event_loop().run_until_complete(get_tgt(_kr_cfg))
+            # Use the async-bridge SSOT: asyncio.get_event_loop() raises
+            # "There is no current event loop" on Python 3.12 when no loop is
+            # bound to this thread (the MainThread here), which silently degraded
+            # the DCSync to NTLM plaintext. run_async_sync handles both the
+            # loop-present and loop-absent cases robustly.
+            from adscan_internal.services.async_bridge import run_async_sync
+
+            run_async_sync(get_tgt(_kr_cfg))
             if os.path.exists(_tgt_ccache):
                 _workspace_ccache = _tgt_ccache
                 print_info_debug(
@@ -1121,6 +1200,7 @@ def execute_dcsync_native(
     ] = {}  # acct (lowercased) → is_enabled (UAC bit 0x0002 inverted)
     privileged_accounts: set[str] = set()
     krbtgt_found: bool = False
+    machine_accounts_shown: int = 0  # computer accounts whose key material was extracted + streamed
     builtin_admin_account: str | None = None  # populated when RID==500 row arrives
     errors_seen: int = 0
     _stream_error_types: list[str] = []  # track error class names to distinguish timeout vs access denied
@@ -1150,7 +1230,7 @@ def execute_dcsync_native(
         )
 
     async def _collect() -> None:
-        nonlocal errors_seen, krbtgt_found, builtin_admin_account
+        nonlocal errors_seen, krbtgt_found, builtin_admin_account, machine_accounts_shown
         svc = NativeDumpService()
         print_info_debug(
             f"dcsync-native: config: target={smb_config.target_ip} "
@@ -1179,8 +1259,34 @@ def execute_dcsync_native(
             acct = str(secret.username or "")
             nt = str(secret.nt_hash or "")
 
-            # Filter: skip machine accounts and common noise accounts
+            # Machine accounts: persist the KEY MATERIAL (reusable for cross-org
+            # TGT delegation / S4U2Self / RBCD / silver / shadow-creds against a
+            # computer) into ``kerberos_keys``, then skip the rest of the loop —
+            # so they never enter the user-credential store OR the batch NTLM
+            # cracker (their passwords are 120/240 random bytes). ALL machine
+            # accounts, not just DCs: the DRSUAPI walk returns them at no cost and
+            # any of them can key an S4U/RBCD/shadow-creds step.
             if is_machine_account(acct):
+                _persist_machine_account_kerberos_keys(
+                    shell, domain=domain, secret=secret
+                )
+                # Show it in the live NTDS table in its own demoted [MACHINE]
+                # tier so the operator SEES that ADscan extracted the computer
+                # accounts (DC02$, member computers) — their key material is
+                # reusable for silver-ticket / S4U2Self / RBCD / shadow-creds.
+                # It is deliberately NOT appended to raw_credentials, so it never
+                # enters the user-credential store, the login total, or the batch
+                # NTLM cracker (its password is 120/240 random bytes).
+                machine_accounts_shown += 1
+                _machine_nt = str(secret.nt_hash or "")
+                _machine_aes = str(secret.aes256_key or "")
+                if _machine_nt or _machine_aes:
+                    display.stream_dcsync_credential(
+                        account=acct,
+                        nt_hash=_machine_nt,
+                        aes256=_machine_aes or None,
+                        is_machine_account=True,
+                    )
                 continue
             if (
                 acct.startswith("MSOL_")
@@ -1286,6 +1392,7 @@ def execute_dcsync_native(
         host=pdc_hostname or pdc_ip,
         elapsed=elapsed,
         dcsync_failure=_dcsync_failure,
+        machine_account_count=machine_accounts_shown,
     )
 
     if errors_seen > 0:
@@ -1606,64 +1713,57 @@ def execute_dcsync_native(
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
 
-        # Centralised domain compromise promotion. Idempotent: a no-op
-        # when the domain was already promoted via a different vector
-        # (Domain Admin membership, NTDS dump, etc.).
+    # Domain compromise promotion (pwned SSOT: DA control proven, NOT krbtgt-gated).
+    # A successful DRSUAPI replication is only possible for a principal that holds
+    # DS-Replication-Get-Changes[-All] — i.e. Domain-Admin-level control of the
+    # domain — and returning any Tier-0 secret (krbtgt, the built-in Administrator
+    # RID 500, or Domain/Enterprise/Schema Admins RID 512/518/519) confirms full
+    # domain compromise. So the EXECUTED dump promotes on proven Tier-0 control,
+    # NOT specifically on krbtgt: krbtgt stays valuable (forgeable persistence) and
+    # is extracted whenever the dump runs, but it is no longer the CONDITION.
+    # (When the operator SKIPS the dump entirely, promotion happens instead at the
+    # DCSync attack-STEP terminal off the verified-DA actor — see
+    # attack_path_execution._promote_pwned_on_verified_da_dcsync_actor.)
+    # Idempotent: a no-op when a different vector (the step-terminal DA check,
+    # DA-group membership, NTDS dump) already promoted the domain.
+    _dcsync_tier0_rids = {500, 512, 518, 519}
+    _dcsync_tier0_extracted = krbtgt_found or any(
+        rid_by_account.get(acct.lower()) in _dcsync_tier0_rids
+        for acct, _ in raw_credentials
+    )
+    if _dcsync_tier0_extracted:
         try:
             from adscan_internal.services.domain_compromise_promotion import (
                 CompromiseEvidence,
                 promote_to_pwned,
             )
 
-            krbtgt_nt_value = ""
+            # Name the promotion after the strongest secret replicated: krbtgt
+            # when present (Golden-Ticket material), else the built-in
+            # Administrator, else the first Tier-0 account extracted.
+            promote_username = ""
+            promote_credential: str | None = None
             for _a, _n in raw_credentials:
                 if _a.lower() == "krbtgt":
-                    krbtgt_nt_value = _n
+                    promote_username, promote_credential = "krbtgt", _n or None
                     break
-            promote_to_pwned(
-                shell,
-                domain=domain,
-                evidence=CompromiseEvidence.KRBTGT_HASH_EXTRACTED,
-                username="krbtgt",
-                credential=krbtgt_nt_value or None,
-                evidence_ref="native_dcsync",
-            )
-        except Exception as _exc:  # noqa: BLE001
-            telemetry.capture_exception(_exc)
-            print_exception(exception=_exc)
-
-    # Built-in Administrator hash extracted: Tier 0 evidence even if
-    # krbtgt was filtered out. Detection is RID-based (RID 500) so it
-    # works in renamed-admin and non-English directories ("Administrador",
-    # "Administrateur"). Falls back to a name match only when no SID was
-    # available on any row (older parser paths).
-    admin_acct_value: str | None = builtin_admin_account
-    if admin_acct_value is None and not rid_by_account:
-        for _a, _ in raw_credentials:
-            if _a.lower() == "administrator":
-                admin_acct_value = _a
-                break
-
-    admin_nt_value = ""
-    if admin_acct_value:
-        for _a, _n in raw_credentials:
-            if _a == admin_acct_value:
-                admin_nt_value = _n
-                break
-
-    if admin_acct_value and admin_nt_value:
-        try:
-            from adscan_internal.services.domain_compromise_promotion import (
-                CompromiseEvidence,
-                promote_to_pwned,
-            )
+            if not promote_username:
+                for _a, _n in raw_credentials:
+                    if rid_by_account.get(_a.lower()) == 500:
+                        promote_username, promote_credential = _a, _n or None
+                        break
+            if not promote_username:
+                for _a, _n in raw_credentials:
+                    if rid_by_account.get(_a.lower()) in _dcsync_tier0_rids:
+                        promote_username, promote_credential = _a, _n or None
+                        break
 
             promote_to_pwned(
                 shell,
                 domain=domain,
-                evidence=CompromiseEvidence.TIER0_HASH_EXTRACTED,
-                username=admin_acct_value,
-                credential=admin_nt_value,
+                evidence=CompromiseEvidence.DOMAIN_ADMIN_MEMBERSHIP,
+                username=promote_username or "krbtgt",
+                credential=promote_credential,
                 evidence_ref="native_dcsync",
             )
         except Exception as _exc:  # noqa: BLE001

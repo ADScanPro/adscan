@@ -272,6 +272,24 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     _ci_started_at = time.monotonic()
 
     deps.enable_auto_mode()
+
+    # PRO partner-tag gate — FAIL FAST, before the heavy preflight.
+    #
+    # `adscan check` (deps.handle_check, run below) verifies every tool + launches
+    # Chromium — tens of seconds. A PRO run with no partner tag is refused anyway,
+    # so refusing it AFTER that preflight made a paying customer wait through the
+    # whole check only to be told a one-line tag is missing. The gate needs only
+    # the resolved license mode (not the shell), and `adscan ci` is always
+    # non-interactive (ADSCAN_NONINTERACTIVE is set at entry), so we can resolve
+    # the license mode early and gate here. The full gate is a no-op for LITE and
+    # for PRO once the tag is resolved, so an already-configured PRO run is
+    # unaffected. (`start` keeps its own gate at its interactive seam.)
+    license_mode = deps.resolve_license_mode(config.requested_pro)
+    from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
+
+    if not ensure_partner_tag_for_pro(license_mode):
+        return 1
+
     preflight_result = run_session_preflight(
         config=SessionPreflightConfig(
             command_name="ci",
@@ -288,7 +306,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         ),
     )
 
-    license_mode = deps.resolve_license_mode(config.requested_pro)
+    # ``license_mode`` was resolved above for the early partner-tag gate.
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
 
@@ -352,14 +370,27 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         # downstream getattr(shell, "scan_config", ...) always finds it.
         shell.scan_config = DEFAULT_SCAN_CONFIG
 
-    # PRO partner-tag gate (non-interactive path): the env var ADSCAN_PARTNER_TAG
-    # must satisfy it; otherwise refuse to start PRO rather than hang on stdin.
-    # LITE is never gated. Placed after session_command_type="ci" so the
-    # non-interactive predicate resolves correctly.
-    from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
+    # --read-only / --no-attack-paths: force the attack-path policy to 'none' so
+    # paths are still computed and reported but never executed. The CLI flag maps
+    # onto the same knob as ``attack_paths.policy: none`` in --scan-config, and
+    # takes precedence over whatever the YAML/env config resolved to.
+    if getattr(args, "read_only", False):
+        import dataclasses
 
-    if not ensure_partner_tag_for_pro(getattr(shell, "license_mode", None)):
-        return 1
+        from adscan_internal.services.scan_config import ATTACK_PATH_POLICY_NONE
+
+        shell.scan_config = dataclasses.replace(
+            shell.scan_config,
+            attack_paths=dataclasses.replace(
+                shell.scan_config.attack_paths,
+                policy=ATTACK_PATH_POLICY_NONE,
+                selected=(),
+            ),
+        )
+        print_info("Read-only mode: attack paths will be mapped and reported, not executed.")
+
+    # (The PRO partner-tag gate already ran as a fail-fast before the preflight,
+    # above — a missing tag never reaches this far, so no second check is needed.)
 
     shell.preflight_check_passed = bool(preflight_result.passed)
     shell.preflight_check_fix_attempted = bool(preflight_result.fix_attempted)

@@ -31,6 +31,7 @@ ADSCAN_LINKS = {
     "github": "https://github.com/ADscanPro/adscan",
     "discord": "https://discord.gg/fXBR3P8H74",
     "linkedin": "https://linkedin.com/in/yeray-martín-domínguez-324a64223",
+    "x": "https://x.com/yeraymd44",
 }
 
 # ── ASCII logo ────────────────────────────────────────────────────────────────
@@ -108,7 +109,8 @@ def build_intro_lines(version_tag: str) -> list[tuple[str, str]]:
             f"[link={ADSCAN_LINKS['docs']}]📚 Docs[/link]"
             f"  ·  [link={ADSCAN_LINKS['discord']}]💬 Discord[/link]"
             f"  ·  [link={ADSCAN_LINKS['github']}]🔗 GitHub[/link]"
-            f"  ·  [link={ADSCAN_LINKS['linkedin']}]💼 LinkedIn[/link]",
+            f"  ·  [link={ADSCAN_LINKS['linkedin']}]💼 LinkedIn[/link]"
+            f"  ·  [link={ADSCAN_LINKS['x']}]𝕏[/link]",
             "dim",
         ),
         (

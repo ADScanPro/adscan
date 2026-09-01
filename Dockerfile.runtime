@@ -187,22 +187,50 @@ FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS kerbrute_builder
 ARG TARGETARCH
 ARG KERBRUTE_VERSION=v1.0.3
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
-# HTTP/1.1 + low-speed abort hardens the clone against GitHub's HTTP/2 stream
-# CANCEL / CDN throttle (same class the John builder guards against). The bare
-# `.` build target is used deliberately: the Makefile's per-arch targets omit
-# arm64, but `go build .` from the repo root works for every GOARCH.
+# Source fetch is hardened against GitHub's HTTP/2 stream CANCEL / CDN throttle
+# exactly like the John builder above: a bare `git clone` negotiates git-pack and
+# under throttling dies mid-listing ("fatal: expected flush after ref listing"),
+# which git then reports as "could not read Username" (it retries with auth and
+# there is no TTY) — a misleading failure that is really a network abort. So the
+# PRIMARY path is the source tarball over a plain HTTP GET (codeload): no git-pack
+# negotiation, so it does not corrupt under throttling, and `gzip -t` rejects a
+# truncated download so a retry only accepts a COMPLETE archive. git clone
+# (HTTP/1.1, low-speed abort) stays as the fallback for the rare case codeload is
+# unavailable but the git endpoint works.
+# The bare `.` build target is used deliberately: the Makefile's per-arch targets
+# omit arm64, but `go build .` from the repo root works for every GOARCH.
 RUN set -eux; \
   git config --global http.version HTTP/1.1; \
   git config --global http.lowSpeedLimit 1000; \
   git config --global http.lowSpeedTime 60; \
-  for attempt in 1 2 3; do \
-    if git clone --depth 1 --branch "${KERBRUTE_VERSION}" https://github.com/ropnop/kerbrute.git /src; then \
-      break; \
+  mkdir -p /src; \
+  fetched=0; \
+  for attempt in 1 2 3 4 5; do \
+    if curl --http1.1 -fSL --retry 3 --retry-all-errors --retry-delay 5 \
+         "https://github.com/ropnop/kerbrute/archive/refs/tags/${KERBRUTE_VERSION}.tar.gz" \
+         -o /tmp/kerbrute-src.tar.gz \
+       && gzip -t /tmp/kerbrute-src.tar.gz; then \
+      rm -rf /src; mkdir -p /src; \
+      tar -xzf /tmp/kerbrute-src.tar.gz -C /src --strip-components=1; \
+      rm -f /tmp/kerbrute-src.tar.gz; \
+      fetched=1; break; \
     fi; \
-    echo "[kerbrute_builder] clone attempt ${attempt} failed, retrying in $((attempt * 5))s..." >&2; \
-    rm -rf /src; \
+    echo "[kerbrute_builder] tarball attempt ${attempt} failed (incomplete/throttled), retrying in $((attempt * 5))s..." >&2; \
+    rm -f /tmp/kerbrute-src.tar.gz; \
     sleep "$((attempt * 5))"; \
   done; \
+  if [ "${fetched}" != "1" ]; then \
+    echo "[kerbrute_builder] tarball exhausted; falling back to git clone" >&2; \
+    for attempt in 1 2 3; do \
+      rm -rf /src; \
+      if git clone --depth 1 --branch "${KERBRUTE_VERSION}" https://github.com/ropnop/kerbrute.git /src; then \
+        fetched=1; break; \
+      fi; \
+      echo "[kerbrute_builder] clone attempt ${attempt} failed, retrying in $((attempt * 5))s..." >&2; \
+      sleep "$((attempt * 5))"; \
+    done; \
+  fi; \
+  [ "${fetched}" = "1" ] || { echo "[kerbrute_builder] giving up: both tarball and git clone failed" >&2; exit 1; }; \
   test -d /src; \
   mkdir -p /out; \
   cd /src; \

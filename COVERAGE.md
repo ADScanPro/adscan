@@ -19,7 +19,7 @@ catalog and regenerate.
 
 <!-- BEGIN GENERATED: technique-inventory -->
 
-**103 techniques** across 14 categories · 70 executed end to end · AD CS ESC1–ESC17 · 79 reported finding types.
+**104 techniques** across 15 categories · 71 executed end to end · AD CS ESC1–ESC17 · 79 reported finding types.
 
 ### ACL / ACE Abuse (18)
 
@@ -180,5 +180,10 @@ catalog and regenerate.
 | Privileged Session Abuse | High-value user session observed on a non-Tier-0 computer that can be abused for scheduled-task impersonation | Executed | [T1053.005](https://attack.mitre.org/techniques/T1053/005/) |
 | RODC Credential Caching | Prepare RODC credential caching by modifying the RODC password-replication policy | Executed | [T1098](https://attack.mitre.org/techniques/T1098/) |
 | Scheduled Task Execution | Impersonate a logged-on user by registering a scheduled task whose principal is that user's interactive logon session | Executed | [T1053.005](https://attack.mitre.org/techniques/T1053/005/) |
+### Trust Abuse (1)
+
+| Technique | What ADscan does | Status | MITRE ATT&CK |
+|---|---|---|---|
+| Cross-Forest TGT Delegation | Escalate across a forest trust into the trusting forest by abusing cross-organization Kerberos TGT delegation: a forwardable ticket-granting ticket from the trusting forest is delegated across the trust boundary and can be captured from a compromised trusted forest | Executed | [T1558](https://attack.mitre.org/techniques/T1558/) |
 
 <!-- END GENERATED: technique-inventory -->

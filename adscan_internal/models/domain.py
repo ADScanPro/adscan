@@ -14,6 +14,122 @@ from enum import Enum
 from adscan_core.time_utils import utc_now
 
 
+class CaseInsensitiveDict(dict):
+    """A dictionary with case-insensitive string keys.
+
+    This is the SSOT wrapper for ``shell.domains_data``, which is keyed by
+    domain FQDN. Attack-path edge labels are UPPERCASE (``DARKZERO.HTB``) while
+    collected keys are lowercase (``darkzero.htb``), so every access site must
+    resolve regardless of key case. Keys are normalized with ``str.casefold()``
+    (correct for non-ASCII, and consistent with ``_resolve_domain_key`` in
+    ``adscan.py``). Non-string keys pass through unchanged.
+
+    Lives here (an import-light module: ``re`` + stdlib + ``adscan_core``) so
+    both the CLI (``adscan.py``) and the workspace-load seam
+    (``adscan_internal.workspaces.state``) can import it without the
+    circular-import risk of pulling from the 30k-line ``adscan`` module.
+    """
+
+    @staticmethod
+    def _norm(key):
+        return key.casefold() if isinstance(key, str) else key
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._convert_keys()
+
+    def _convert_keys(self):
+        """Casefold every key already present after construction."""
+        for k in list(self.keys()):
+            v = super().pop(k)
+            self.__setitem__(k, v)
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._norm(key))
+
+    def __setitem__(self, key, value):
+        super().__setitem__(self._norm(key), value)
+
+    def __delitem__(self, key):
+        super().__delitem__(self._norm(key))
+
+    def __contains__(self, key):
+        return super().__contains__(self._norm(key))
+
+    def get(self, key, default=None):
+        return super().get(self._norm(key), default)
+
+    def pop(self, key, *args, **kwargs):
+        return super().pop(self._norm(key), *args, **kwargs)
+
+    def setdefault(self, key, default=None):
+        # ``dict.setdefault`` bypasses ``__setitem__`` and would store the raw
+        # (possibly UPPERCASE) key, re-creating the case-mismatch bug the class
+        # exists to prevent. 53 ``domains_data.setdefault(domain, {})`` call
+        # sites depend on this casefolding the stored key.
+        return super().setdefault(self._norm(key), default)
+
+    def update(self, other=None, **kwargs):
+        if other is not None:
+            if isinstance(other, CaseInsensitiveDict):
+                super().update(other)
+            elif hasattr(other, "items"):
+                super().update({self._norm(k): v for k, v in other.items()})
+            else:
+                super().update({self._norm(k): v for k, v in other})
+        if kwargs:
+            super().update({self._norm(k): v for k, v in kwargs.items()})
+
+    def copy(self):
+        # ``dict.copy`` returns a plain ``dict`` and would revert
+        # case-insensitivity; keep the wrapper.
+        return CaseInsensitiveDict(self)
+
+
+def resolve_ci(mapping: Any, key: str) -> Any:
+    """Return ``mapping[key]`` matched case-insensitively, else ``None``.
+
+    The SSOT for reading a **nested** ``domains_data`` sub-map that is keyed by
+    an AD principal or domain name — ``kerberos_keys[username]``,
+    ``domains_data[domain]`` when the top-level wrapper is not live, and any
+    future principal-keyed store. AD ``sAMAccountName`` (including machine
+    accounts like ``DC02$``) and domain names are case-insensitive, but plain
+    ``dict`` keys are not, and different producers write different casing
+    (DCSync persists ``DC02$`` from SAMR; a consumer derived from
+    ``pdc_hostname_fqdn`` queries ``dc02$``). A raw ``mapping.get(key)`` then
+    misses a record that IS on disk.
+
+    Complements :class:`CaseInsensitiveDict`, which is the structural fix for
+    the **top-level** ``domains_data`` map (where casefolding the STORED key is
+    fine because domain FQDNs are already lowercase and not display-sensitive).
+    Nested principal-keyed maps keep their ORIGINAL casing on disk (``DC02$``
+    reads better than ``dc02$`` in the NTDS panel) and are not re-wrapped on
+    workspace load, so they resolve case at READ time via this helper instead
+    of mutating the stored key. Use this — never a raw ``.get()`` — for any
+    nested map keyed by an AD principal or domain name.
+
+    A direct hit is preferred (fast path, and exact case wins on the rare
+    collision); only a miss triggers the casefold scan, so an
+    already-normalized key stays zero-cost.
+    """
+    if not hasattr(mapping, "get"):
+        return None
+    direct = mapping.get(key)
+    if direct is not None:
+        return direct
+    target = str(key or "").strip().casefold()
+    if not target:
+        return None
+    try:
+        items = mapping.items()
+    except AttributeError:
+        return None
+    for candidate, value in items:
+        if str(candidate or "").strip().casefold() == target:
+            return value
+    return None
+
+
 class AuthStatus(str, Enum):
     """Authentication status for a domain."""
 

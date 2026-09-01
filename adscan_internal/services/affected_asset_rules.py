@@ -421,6 +421,13 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.HOST_SCOPED,
         record_qualifier="http_spns",
     ),
+    # --- Intra-forest child->forest-root escalation (RaiseChild) -------------
+    # Materialized from a derived escalation edge (``couple_raise_child_edges``):
+    # ``from`` = the compromised child domain node, ``to`` = the parent /
+    # forest-root domain it escalates INTO. The forest root is the asset taken
+    # over (target), the child-domain principals are who abuse it (source) — the
+    # standard attack-step edge shape, both endpoints carried on the edge.
+    "raise_child_forest_root": _attack_step_rule(),
     # --- Trust posture: the partner domain on the far side of the trust ------
     # The locator is the counterpart domain, qualified by the trust type, so the
     # reader knows which trust relationship to go reconfigure.

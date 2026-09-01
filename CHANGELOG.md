@@ -14,6 +14,79 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+## [11.3.0] - 2026-09-01
+
+### Added
+
+- A DCSync can now replicate just the krbtgt account. When an operator already
+  controls a Domain Admin, "krbtgt only" proves full domain compromise and
+  captures the golden-ticket key without pulling every account out of the
+  directory — the minimal-footprint way to mark a domain owned.
+- Didactic mode: ADscan now explains each attack technique as it runs, so a scan on a lab or an HTB box teaches Active Directory pentesting instead of just doing it. Before a technique executes, a teaching card shows what the attack is and why it works, the equivalent command to run it by hand with the standard tool, its MITRE ATT&CK id, and the Windows Event IDs that detect it. Three levels: a full card (default on CTF/lab workspaces), a one-line summary (default on audits), or off, set with `set explain_level off|basic|deep`. The new `explain <technique>` command shows the full card for any technique on demand without running anything (e.g. `explain kerberoasting`, `explain "ADCS ESC1"`).
+- Password spraying by month/season and year for audit engagements: a new spray option tries the predictable seasonal passwords forced rotation produces (March2026, Verano2026). Picking it lets you choose the pattern (month, season, or both) and the language: ADscan infers whether the environment is English or Spanish from language-independent account signals, shows its guess, and lets you keep or change it, remembering the choice per domain so later sprays do not ask again. With domain credentials it reads each user's last password-change month and sprays their most likely seasonal password; without credentials it uses the current month and season (editable at the prompt). Only Word+Year forms are tried, no trailing symbols, one attempt per account, inside the same lockout safety rules as every other spray. In an unattended `adscan ci` run the month and the season passes now both run. Configurable and skippable via the `month_season` spray strategy in the scan config.
+- Reports and the web platform now include a "Verify this finding independently" block on each attack step, so the client can confirm a finding by hand and rule out a false positive. Each block gives a native Windows/PowerShell check (Get-ADUser, Get-Acl, dsacls, certutil) and a Linux/pentester equivalent, starting with the highest-volume techniques (Kerberoasting, AS-REP Roasting, DCSync, ADCS ESC1, and the GenericAll/GenericWrite/WriteDACL/WriteOwner ACL family). The Linux commands carry the environment's real domain controller IP and domain name instead of placeholders, so they are paste-and-run; credentials are never filled in for you. In the web platform each command has a one-click copy button.
+- Attack paths now cross domain and forest boundaries. A workspace with more than one domain is analysed as one unified graph, so a low-privilege principal in one domain that can act on an object in another (through a foreign ACL, a group membership across a trust, a child-to-parent relationship, or a cross-organization TGT-delegation trust) yields a single end-to-end route that terminates in the domain it actually reaches. Same-named accounts across domains (administrator, guest, krbtgt) stay distinct, and single-domain workspaces are unchanged.
+- After compromising one domain, ADscan now escalates into another on its own when a trust allows it. Two routes ship: from a compromised trusted forest into the trusting forest across a cross-organization TGT-delegation trust, and from a compromised child domain up to its forest root (RaiseChild). Each fires only when its trust condition holds. A successful escalation compromises the reached domain and runs its own post-compromise, so a foothold in one forest can carry through to full compromise of a forest that trusts it. Both routes are drawn on the attack graph and reported with native remediation.
+- Cross-forest Kerberoasting and AS-REP Roasting routes now appear in multi-domain analysis: an authenticated principal in one forest can roast a service or no-preauth account in another domain across a trust, and that end-to-end route surfaces. The ADCS web-enrollment relay routes (ESC8/ESC11) surface across a trust for the same reason.
+- Plaintext credentials left in an account's directory description or info attribute are now a validated attack step in the deliverable, not just a side finding: ADscan reads the attribute over LDAP, recovers the credential, and verifies a working login. The route also crosses forest boundaries.
+
+### Changed
+
+- A domain is reported as compromised once ADscan proves control of a Domain
+  Admin, not only after the full krbtgt hash dump, so a validated Domain Admin
+  takeover no longer shows as "not compromised" when the operator declines the
+  full credential extraction.
+- A DCSync now defaults to replicating the whole directory, so an unattended run
+  performs the full domain password audit the cracking pipeline is built for;
+  "krbtgt only" or a specific account narrows it.
+- Child-to-forest-root escalation (RaiseChild) now lets you choose what to
+  replicate from the forest root — the full directory, krbtgt only, or a specific
+  administrator — instead of always pulling just krbtgt and Administrator, and
+  marks the forest root compromised on proven Domain Admin control.
+- The long "Choose Scan Type" explainer at the start of an unauthenticated scan now shows once and then steps aside on later scans; the quick "Do you have domain credentials?" question still appears every time. Non-interactive runs skip the explainer entirely.
+- Password spraying now shows how ADscan keeps accounts safe: before an authenticated spray it states that it reads the domain lockout policy and each account's failed-password count, skips accounts near the threshold, holds back a safety margin, and limits itself to one attempt per account; before an unauthenticated spray, where the threshold can't be read, it surfaces the wait-between-attempts caution at the decision point. The custom-password prompt now shows a few example patterns to try.
+- Attack-path computation is much faster on large directories. Work shared across routes with identical inputs (the path-status roll-up, per-step remediation, and blast-radius annotation) cuts a domain-wide run on a directory with tens of thousands of accounts and fifteen thousand routes from about a minute to about ten seconds, with identical results.
+- The credential-replication panel now shows recovered computer accounts in their own row type, badged and counted separately (`5 users · 2 machine accounts`), so machine-account key material is visible without inflating the login count or reading as accounts to spray. They stay out of the deliverable's per-account detail and out of password cracking.
+- Exception tracebacks now reach the sanitized session diagnostics recording, so a failure that shows the operator only a generic message can still be diagnosed afterward. The terminal is unchanged: full tracebacks stay on screen only under `--debug`.
+
+### Fixed
+
+- A targeted Kerberoasting attack-path step now roasts only the account it
+  targets. Previously a step aimed at one service account requested service
+  tickets for every account with a service principal name in the domain, so a
+  step to roast one user pulled hashes for unrelated accounts and generated far
+  more directory-service alerts than the step called for.
+
+- The krbtgt (KDC service) account is now recognized as non-loginable by design:
+  ADscan no longer tries to log-on-verify it or generate a ticket for it after
+  extracting its hash — operations that always fail for that account — so a run
+  no longer prints a spurious "locked out" verdict or ticket-generation error.
+  Its hash is retained for offline ticket forging, and genuinely locked-versus-
+  disabled accounts are now classified correctly instead of everything revoked
+  being labelled "locked".
+
+- In a multi-domain workspace, selecting a cross-domain attack path from a single domain's view now lets you execute it when the starting principal is one you own in another in-scope domain, instead of refusing with an "unsupported" message. Execution is now offered consistently whether the path is opened from a per-domain list or the combined cross-domain view; the set of discovered paths is unchanged.
+- Attack paths in a multi-domain scan are now shown once per domain and can be executed directly from that view. Previously each per-domain list was display-only and execution was deferred to a separate cross-domain pass that computed just one domain and missed most routes; the unified per-domain flow keeps every route, shows each unique path once, and lets you run it where you see it.
+- Attack-path discovery on a very large or densely connected directory now stops with a stated coverage boundary if it would exhaust memory mid-computation, instead of being killed by the operating system with no result. A directory that fits in memory is unaffected and its coverage is unchanged.
+
+- A proven foothold on a host now carries into the next step of the same attack path. When an earlier step confirmed local admin on a server, the follow-up credential dump on that server runs to completion instead of stopping with a contradictory "this host is not yet compromised" message. A database-only session, or an access step that was never confirmed, still does not carry a foothold forward.
+- An attack path from a compromised child domain to the forest root now runs to completion. ADscan forges the inter-realm ticket, reuses the child krbtgt key it already extracted rather than replicating it a second time, follows the cross-realm trust to the forest root, and replicates it — so a chain from a child-domain foothold to full forest compromise completes end to end instead of stopping partway with a directory-replication error.
+- A credential-replication step (DCSync) and the credential-dump steps now run whenever ADscan already holds material that reaches the host, instead of stopping with a "not yet compromised" message. A delegation ticket minted earlier in the path, an owned domain controller's own machine account, or a proven foothold on the host each let the step proceed, so a chain like AllowedToDelegate then DCSync now replicates the domain to the end. A step that would modify the directory still runs only as a principal you actually control.
+- Credential-template escalation findings (ESC1, ESC2, ESC3, ESC6, ESC9, ESC13, ESC14, ESC15) are now reported only for templates an enterprise CA actually publishes, so a vulnerable-by-configuration template that no CA issues no longer appears as an executable path to domain compromise that fails at request time. A policy-linked ESC13 finding on a template that grants no client authentication is also dropped.
+- Attack-path discovery no longer returns zero routes on a large directory that fits in memory. A pre-emptive memory check was over-estimating a run's needs by roughly eleven times and aborting before any route was computed; the estimate is recalibrated, so these runs complete and report their real routes, while a genuinely oversized run is still stopped cleanly with a stated coverage boundary.
+- Multi-domain analysis no longer invents impossible cross-domain routes. Built-in groups identical by identifier in every domain (such as `Administrators`) were collapsed into one node, making one domain's replication rights appear to reach another. Each domain's built-in groups are now distinct; genuinely global principals (Everyone, Authenticated Users) and real cross-domain techniques are unchanged.
+- Credential replication now keeps the Kerberos keys of computer accounts, so the escalation steps that need a machine's own key (cross-forest TGT-delegation, resource-based constrained delegation, silver tickets, shadow credentials) run instead of dead-ending. The keys are used only as Kerberos key material; computer accounts never enter the credential list or the cracking queue.
+- The CVE scanner targets a domain controller by its resolved hostname instead of its IP for Kerberos, so an authenticated scan across a forest trust no longer prints repeated "logon denied" errors for a controller in another domain. A controller the scan credential cannot authenticate to is skipped with a clear cross-domain note.
+- Reading a certificate authority's security settings without CA-admin rights is now handled quietly. An ordinary account lacking those rights triggered an alarming red error with no cause after the colon on an otherwise-successful scan; that expected answer is now recorded as a routine skip.
+- Unattended scans of a hardened directory with no anonymous access now try to detect the real username convention, or reuse one already found this run, before falling back to a generic name list, instead of blind-guessing common names and confirming nobody. The strategy is chosen on effectiveness and no longer depends on the workspace type.
+- Kerberos username enumeration no longer loops back to the start after it finishes. Once the automatic sweep confirms users, ADscan remembers the detected format and offers one clear next step (exploit with the confirmed users, widen the list using that format, or stop) instead of a prompt that could silently restart the same multi-hour sweep.
+- Environment configuration set on the host now reaches the containerized scan. Any `ADSCAN_*` variable an operator exports (attack-path tuning, cache sizes, depth limits, diagnostic toggles) is forwarded in, where before only a fixed subset was, so a documented setting could appear to have no effect.
+- Session recordings now show a single, consistent masked name for each domain instead of several different masks for the same one, so a recording can be reviewed without ambiguity. The masking is unchanged: deterministic, per-install, non-reversible, with no additional data recorded.
+- Typing `cves <domain>` in the shell now scans that domain instead of returning "unknown subcommand", the same way the other exploration commands accept a domain name.
+- A PRO scan started without a partner tag is now refused on the host before the scan container starts, and the in-container check fails fast before the startup preflight rather than after it, so the operator no longer waits through the full tool-and-browser check to be told a one-line tag is missing. Passing `--partner-tag`, or having set it once, is unaffected.
+
+### Removed
+
 ## [11.2.0] - 2026-08-21
 
 ### Added
@@ -464,7 +537,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v11.2.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v11.3.0...HEAD
+[11.3.0]: https://github.com/ADScanPro/adscan/compare/v11.2.0...v11.3.0
 [11.2.0]: https://github.com/ADScanPro/adscan/compare/v11.1.0...v11.2.0
 [11.1.0]: https://github.com/ADScanPro/adscan/compare/v11.0.0...v11.1.0
 [11.0.0]: https://github.com/ADScanPro/adscan/compare/v10.1.0...v11.0.0

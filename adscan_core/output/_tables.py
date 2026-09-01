@@ -328,16 +328,6 @@ def print_command(
     console.print(panel)
 
 
-def _get_secret_mode() -> bool:
-    """Get SECRET_MODE from globals safely."""
-    try:
-        import builtins
-
-        return getattr(builtins, "SECRET_MODE", False)
-    except Exception:
-        return False
-
-
 def print_error_context(
     error_message: str,
     context: Optional[Dict[str, Any]] = None,
@@ -381,9 +371,7 @@ def print_error_context(
             content_parts.append(suggestion_line)
 
     if show_exception and exception:
-        secret_mode = _get_secret_mode()
-
-        if secret_mode:
+        if _state.is_debug_mode():
             content_parts.append(Text(""))
             exception_header = Text("Exception Details:", style="bold red")
             content_parts.append(exception_header)
@@ -395,7 +383,7 @@ def print_error_context(
         else:
             logger = logging.getLogger(__name__)
             logger.debug(
-                "Exception details hidden (SECRET_MODE=False)",
+                "Exception details hidden (run with --debug to show)",
                 extra={"exception_type": type(exception).__name__},
             )
 

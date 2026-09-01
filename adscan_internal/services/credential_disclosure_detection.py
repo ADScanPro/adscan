@@ -98,6 +98,7 @@ __all__ = [
     "PASSWORD_ATTRIBUTES",
     "detect_credential_disclosure",
     "is_builtin_principal",
+    "is_non_loginable_principal",
     "rid_from_sid",
     "scan_attribute_values",
 ]
@@ -267,6 +268,49 @@ def is_builtin_principal(
     if effective_rid is not None:
         return effective_rid < _BUILTIN_RID_CEILING
     return str(samaccountname or "").strip().lower() in _BUILTIN_NAMES
+
+
+#: sAMAccountName of the primary KDC service account (RID 502) and the per-RODC
+#: KDC accounts (``krbtgt_<numeric-tag>``), matched case-insensitively. These
+#: exist ONLY so the KDC can encrypt/decrypt tickets; they are disabled for
+#: interactive/network logon by design and always answer an AS-REQ with
+#: ``KDC_ERR_CLIENT_REVOKED``, so a TGT-logon verification can never pass for
+#: them even when the secret is valid by construction (e.g. recovered via a
+#: successful DRSUAPI replication).
+_RODC_KRBTGT_RE = re.compile(r"\Akrbtgt(?:_\d+)?\Z", re.IGNORECASE)
+
+
+def is_non_loginable_principal(samaccountname: str | None) -> bool:
+    """Return ``True`` when the principal can never pass a TGT-logon check.
+
+    Covers the accounts whose secret is legitimate but for which an AS-REQ is
+    guaranteed to be refused, so credential VERIFICATION must be skipped and the
+    secret trusted by construction:
+
+    - ``krbtgt`` — the KDC service account (RID 502), disabled for logon.
+    - ``krbtgt_<digits>`` — the per-RODC KDC accounts, likewise non-loginable.
+    - Machine accounts (``<host>$``) — computer accounts do not perform an
+      interactive/network AS-REQ the way a user does; ADscan already skips hash
+      CRACKING for them, and their secret is trusted by construction when it is
+      recovered from replication or the SAM.
+
+    Note this is NARROWER than :func:`is_builtin_principal`: the built-in
+    ``Administrator`` (RID 500) and ``Guest`` (RID 501) ARE loginable and must
+    still be verified — do not use the built-in predicate to gate verification.
+
+    Args:
+        samaccountname: The account's sAMAccountName (with or without a trailing
+            ``$`` for machine accounts); ``None``/empty returns ``False``.
+
+    Returns:
+        ``True`` when a TGT-logon verification is pointless and must be skipped.
+    """
+    name = str(samaccountname or "").strip()
+    if not name:
+        return False
+    if name.endswith("$"):
+        return True
+    return bool(_RODC_KRBTGT_RE.match(name))
 
 
 def _character_classes(token: str) -> int:

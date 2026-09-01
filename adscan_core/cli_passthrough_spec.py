@@ -150,6 +150,10 @@ CI_PASSTHROUGH = PassthroughCommand(
         PassthroughArg(("--keep-workspace",), "Keep the auto-created workspace after the scan."),
         PassthroughArg(("--show-structural",), "Show the structural band in the Tactical Findings panel."),
         PassthroughArg(
+            ("--read-only", "--no-attack-paths"),
+            "Map and report attack paths without executing them (read-only).",
+        ),
+        PassthroughArg(
             ("--generate-report",),
             "Generate the PDF report after a successful scan (requires a report license).",
         ),

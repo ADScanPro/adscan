@@ -35,6 +35,17 @@ class CompromiseEvidence(StrEnum):
 
     The string value is recorded in telemetry, so do not rename
     casually — downstream dashboards filter on these.
+
+    ``pwned`` doctrine (2026-08-28): a domain is ``pwned`` once ADscan has
+    PROVEN control over a Domain Admin — ``DOMAIN_ADMIN_MEMBERSHIP`` is the
+    canonical condition, promoted at the DCSync attack-STEP off the verified-DA
+    actor (fires even when the operator skips the full credential dump).
+    ``KRBTGT_HASH_EXTRACTED`` still promotes (extracting krbtgt is trivially
+    full domain compromise) but it is no longer the *required* condition —
+    krbtgt is decoupled from the ``pwned`` decision and stays valuable only as
+    forgeable persistence material. See ``adscan-obsidian/business/
+    12_nomenclature_standard.md`` § "pwned = control probado sobre un Domain
+    Admin".
     """
 
     DOMAIN_ADMIN_MEMBERSHIP = "domain_admin_membership"
@@ -43,6 +54,9 @@ class CompromiseEvidence(StrEnum):
     TIER0_PASSWORD_OBTAINED = "tier0_password_obtained"
     DCSYNC_RIGHTS_GRANTED = "dcsync_rights_granted"
     NTDS_DUMP = "ntds_dump"
+    # A cross-domain escalation (RaiseChild child->parent, CrossOrgTgtDelegation
+    # trusted->trusting forest) compromised this domain from an already-owned one.
+    CROSS_DOMAIN_ESCALATION = "cross_domain_escalation"
 
 
 def is_full_ntds_replicated(shell, domain: str) -> bool:
@@ -188,6 +202,18 @@ def promote_to_pwned(
                 workspace_type=getattr(shell, "type", None)
             )
         )
+        # ``workspace_id_hash`` closes the funnel: it joins this compromise back to
+        # the same session's ``start_unauth`` / ``first_cred_found`` rows.
+        try:
+            from adscan_internal.cli.common import (  # noqa: PLC0415
+                compute_workspace_id_hash,
+            )
+
+            _workspace_id_hash = compute_workspace_id_hash(shell)
+            if _workspace_id_hash:
+                properties["workspace_id_hash"] = _workspace_id_hash
+        except Exception:  # noqa: BLE001
+            pass
         try:
             properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         except Exception as exc:  # noqa: BLE001
@@ -272,10 +298,27 @@ def promote_to_pwned(
                 and callable(show_explicit)
                 and should_show("da_compromise", "explicit")
             ):
-                show_explicit(
-                    victory_type="da_compromise",
-                    title="🎯 Major Win: Domain Admin Compromised!",
-                    message=(
+                # Branch the CTA by the operator's role. A buyer testing their OWN
+                # estate (internal security / sysadmin-blue-team / CISO) sees the
+                # Enterprise demo lane; a consultant / unknown role sees /pro (the
+                # safe default). See ``operator_role_cta``.
+                from adscan_internal.services.operator_role_cta import (  # noqa: PLC0415
+                    is_enterprise_lane,
+                )
+
+                if is_enterprise_lane():
+                    victory_message = (
+                        "[bold green]You've just proven full domain compromise "
+                        "in your own AD.[/bold green]\n\n"
+                        "Domain Admin access confirmed. This is exactly the exposure "
+                        "ADscan Enterprise validates continuously.\n\n"
+                        "[bold]Next step:[/bold] ADscan Enterprise re-checks this "
+                        "path over time and gives you the board/auditor-ready report.\n"
+                        "Book a demo → "
+                        f"{cta_markup('victory_enterprise_demo')}"
+                    )
+                else:
+                    victory_message = (
                         "[bold green]You've just proven full domain compromise."
                         "[/bold green]\n\n"
                         "Domain Admin access confirmed. This is the finding your "
@@ -284,7 +327,11 @@ def promote_to_pwned(
                         "window closes.\n"
                         "Generate a board-ready report → "
                         f"{cta_markup('victory_da_compromise')}"
-                    ),
+                    )
+                show_explicit(
+                    victory_type="da_compromise",
+                    title="🎯 Major Win: Domain Admin Compromised!",
+                    message=victory_message,
                 )
             # The session-exit rating -> star funnel owns the single star ask at
             # peak goodwill for value-moment sessions (Hormozi give:ask — one
@@ -312,10 +359,29 @@ def promote_to_pwned(
     # evidence, evidence_ref)`` — and call it from here. For now the
     # graph is updated by the existing path-state machinery downstream.
 
-    # 5. Post-compromise hook. The caller's action set drives BOTH the CTF and
-    # the audit branch: "dcsync" requests a full DCSync ("all") of the domain
-    # credential database. It is set by paths that have NOT already dumped the
-    # NTDS (DA-group membership) and omitted by the secretsdump-driven paths
+    # 5a. Shared cross-domain escalation (mode-agnostic — ctf AND audit). Queue
+    # ONLY: an escalation fires an attack step (coerce/DCSync) and re-materializes
+    # the graph, so it MUST NOT run inline here (promote_to_pwned frequently fires
+    # mid-DCSync). It is drained at a safe checkpoint (execute_cross_domain_escalation),
+    # BEFORE the mode-specific followups, so reaching another domain opens surface
+    # they then cover. Fires each applicable technique (CrossOrgTgtDelegation,
+    # RaiseChild, ...) only when its trust condition holds.
+    try:
+        from adscan_internal.services.cross_domain_escalation import (
+            queue_cross_domain_escalation,
+        )
+
+        queue_cross_domain_escalation(
+            shell, domain=domain, username=username, credential=credential or ""
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    # 5b. Mode-specific post-compromise hook. The caller's action set drives BOTH
+    # the CTF and the audit branch: "dcsync" requests a full DCSync ("all") of the
+    # domain credential database. It is set by paths that have NOT already dumped
+    # the NTDS (DA-group membership) and omitted by the secretsdump-driven paths
     # (krbtgt / Tier-0 hash already extracted) so neither mode replicates twice.
     post_compromise_actions = set(ctf_actions) if ctf_actions else {"flags"}
     if getattr(shell, "type", None) == "ctf":

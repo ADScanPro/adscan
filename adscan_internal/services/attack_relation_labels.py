@@ -219,6 +219,7 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "crackntlmv1": "Offline NTLMv1 Credential Recovery",
     # Trust abuse ──────────────────────────────────────────────────────────
     "crossorgtgtdelegation": "Cross-Forest Kerberos Ticket Delegation",
+    "raisechild": "Child-to-Forest-Root Escalation",
 }
 
 

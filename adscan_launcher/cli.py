@@ -44,6 +44,7 @@ from adscan_launcher.docker_commands import (
     handle_check_docker,
     handle_install_docker,
     handle_start_docker,
+    resolve_runtime_license_mode,
     run_adscan_passthrough_docker,
     normalize_pull_timeout_seconds,
 )
@@ -1095,6 +1096,89 @@ def _apply_partner_tag_flag(
     except Exception:  # noqa: BLE001 — attribution is never worth failing a run
         pass
     return cleaned
+
+
+def _image_ref_is_dev_edge(image_ref: str) -> bool:
+    """True when the resolved image is the internal dev/CI ``:edge`` build.
+
+    Mirrors :func:`adscan_internal.cli.partner_tag_gate._is_dev_edge_runtime`:
+    partners always receive ``:latest`` / a pinned ``:vX.Y.Z`` tag, so an
+    ``:edge`` tag is the founder's own ``--dev`` run or the CI regression
+    workflow. The partner-tag gate is attribution, not access control, so those
+    internal runs are never gated. Tolerant of a ``host:port`` registry prefix by
+    reading only the final path segment's tag.
+    """
+    last_segment = str(image_ref or "").strip().lower().rsplit("/", 1)[-1]
+    if ":" not in last_segment:
+        return False
+    return last_segment.rsplit(":", 1)[-1] == "edge"
+
+
+def _should_block_pro_without_tag(
+    license_mode: str | None, resolved_tag: str, image_ref: str = ""
+) -> bool:
+    """Return True when a PRO run has no resolvable partner tag.
+
+    Pure decision function so the gate can be unit-tested in isolation.
+
+    Args:
+        license_mode: The runtime license mode the launcher resolved before any
+            Docker pull (``"PRO"`` / ``"LITE"`` / ``None`` when undeterminable).
+        resolved_tag: The partner tag resolved via
+            :func:`adscan_core.telemetry.resolve_partner_tag` (env → persisted
+            volume file), ``""`` when none is resolvable by any route.
+        image_ref: The resolved runtime image reference. When it is the internal
+            dev/CI ``:edge`` build, the run is NEVER gated — mirroring the
+            in-container ``_is_dev_edge_runtime`` skip, so `--dev`/CI PRO runs are
+            not blocked (the regression this argument fixes).
+
+    Returns:
+        True only when the run is PRO, is not the dev/CI ``:edge`` image, and no
+        partner tag is resolvable — the one case the in-container gate would
+        refuse. Anything else (LITE, an undeterminable mode, the dev/CI image, or
+        a resolvable tag) returns False so the run proceeds and the in-container
+        gate stays the backstop.
+    """
+    if str(license_mode or "").strip().upper() != "PRO":
+        return False
+    if _image_ref_is_dev_edge(image_ref):
+        return False
+    return not resolved_tag
+
+
+def _enforce_partner_tag_before_container() -> None:
+    """Abort a doomed PRO-without-tag run BEFORE the launcher spends a docker run.
+
+    The in-container start gate (:mod:`adscan_internal.cli.partner_tag_gate`)
+    already refuses PRO without a partner tag, but only after the image starts
+    and the entrypoint runs. This is the fastest layer: it resolves the license
+    mode locally (no network) and the partner tag through the SAME SSOT resolver
+    the container uses (:func:`adscan_core.telemetry.resolve_partner_tag`, which
+    reads ``ADSCAN_PARTNER_TAG`` and the bind-mounted ``partner.json``), so host
+    and container agree by construction. Call it AFTER
+    :func:`_apply_partner_tag_flag` — a run WITH ``--partner-tag`` has already
+    exported the tag, so the resolver sees it and this no-ops.
+
+    LITE runs, and PRO runs with a resolvable tag, are never gated. The
+    in-container gate remains the backstop for a direct ``docker run`` that
+    bypasses the launcher.
+
+    Raises:
+        SystemExit: with code 1 when a PRO run has no resolvable partner tag.
+    """
+    from adscan_core import telemetry as _telemetry
+    from adscan_launcher.docker_commands import _select_existing_or_preferred_image
+
+    # Resolve the image ONCE so the license inference and the dev/CI :edge skip
+    # both key off the exact same reference the run will use.
+    image_ref = _select_existing_or_preferred_image()
+    if not _should_block_pro_without_tag(
+        resolve_runtime_license_mode(), _telemetry.resolve_partner_tag(), image_ref
+    ):
+        return
+
+    print_error(_telemetry.PARTNER_TAG_REQUIRED_MESSAGE)
+    raise SystemExit(1)
 
 
 # Container path the scan-config file is bind-mounted at. Fixed (not under the
@@ -2181,6 +2265,10 @@ def main(argv: list[str] | None = None) -> None:
         # PRO activation: persist + export the partner tag before the container
         # starts, so the in-container start gate finds it.
         _apply_partner_tag_flag(ns, [])
+        # Fast pre-container gate: abort a PRO run with no resolvable partner tag
+        # here, before spending a docker run. Runs AFTER activation so a run WITH
+        # --partner-tag passes cleanly. No-op for LITE / when a tag is resolvable.
+        _enforce_partner_tag_before_container()
         raise SystemExit(
             _run_host_command_with_session_capture(
                 command_type="start",
@@ -2289,6 +2377,10 @@ def main(argv: list[str] | None = None) -> None:
         # Consumed at the seam and stripped from the passthrough, like the
         # toggles above.
         passthrough = _apply_partner_tag_flag(ns, passthrough)
+        # Fast pre-container gate: abort a PRO run with no resolvable partner tag
+        # here, before spending a docker run. Runs AFTER activation so a run WITH
+        # --partner-tag passes cleanly. No-op for LITE / when a tag is resolvable.
+        _enforce_partner_tag_before_container()
         # Translate --scan-config <host-path> into a read-only container mount +
         # ADSCAN_SCAN_CONFIG env var. Consumed at the seam and stripped from the
         # passthrough (mirrors the posture-toggle pattern). Absent = no-op.

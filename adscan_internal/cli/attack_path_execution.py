@@ -68,14 +68,23 @@ from adscan_internal.services.attack_graph_service import (
 from adscan_internal.services.credential_store_service import (
     get_capability_bearing_ccache,
     get_stored_domain_credential_for_user,
+    hosts_match,
     resolve_execution_credential,
     resolve_local_credential_for_host,
 )
 from adscan_internal.services.execution_credential_scope import (
+    ACTOR_SOURCE_CARRY_FORWARD,
+    ACTOR_SOURCE_GENERIC_HOST,
+    ACTOR_SOURCE_MACHINE_ACCOUNT,
+    ACTOR_SOURCE_SCOPED_TICKET,
+    ACTOR_SOURCE_SOURCE_OWNED,
     CarriedCredential,
+    StepExecutionActor,
     derive_carried_credential,
     islocal_flag_for,
     local_service_for_relation,
+    relation_authenticates_to_source_host,
+    relation_is_host_execution_read,
     scope_carried_credential_to_step,
 )
 from adscan_internal.services.attack_graph_runtime_service import (
@@ -101,6 +110,7 @@ from adscan_internal.cli.ace_step_execution import (
     resolve_execution_candidates,
     resolve_execution_user as _shared_resolve_execution_user,
     resolve_source_node_kind,
+    source_ownership_bucket,
 )
 from adscan_internal.cli.control_escalation import (
     ensure_control_to_wield_next_edge,
@@ -128,10 +138,13 @@ from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
 )
 from adscan_internal.services.attack_step_catalog import (
+    access_grant_satisfies_requirement,
+    access_session_grant_for_relation,
     build_step_knowledge,
     is_probabilistic_step,
     relation_counts_for_execution_readiness,
     relation_requires_execution_context,
+    required_context_for_relation,
 )
 from adscan_internal.services.attack_paths_core import (
     collapsed_pivot_fanout_relation,
@@ -1764,6 +1777,61 @@ def _resolve_step_victim_ip(shell: Any, domain: str, computer_label: str) -> str
     return ""
 
 
+def _didactic_steps_for_path(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pick the steps worth teaching before a path runs.
+
+    A path narrative can be long (MemberOf / context hops between the real
+    techniques). For the didactic card we want the steps that ACTUALLY get
+    executed — the ones that count for execution readiness — so the learner sees
+    the attack(s) about to run, not the graph plumbing. Falls back to every step
+    with a known relation if none are execution-readiness steps (so a
+    fully-structural path still gets explained).
+    """
+    steps = summary.get("steps")
+    if not isinstance(steps, list):
+        return []
+    executable: list[dict[str, Any]] = []
+    named: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or step.get("relation") or "").strip().lower()
+        if not action:
+            continue
+        named.append(step)
+        if relation_counts_for_execution_readiness(action):
+            executable.append(step)
+    return executable or named
+
+
+def render_didactic_for_path(shell: Any, summary: dict[str, Any]) -> None:
+    """Render the teaching card(s) for a path before its execute prompt.
+
+    Best-effort, at the session's resolved level (off/basic/deep). Dedupes by
+    relation so a path that Kerberoasts three accounts explains Kerberoasting
+    once. Never raises into the offer flow.
+    """
+    try:
+        from adscan_internal.services.didactic_service import (  # noqa: PLC0415
+            ExplainLevel,
+            explain_step,
+            resolve_explain_level,
+        )
+
+        level = resolve_explain_level(shell)
+        if level == ExplainLevel.OFF:
+            return
+        seen: set[str] = set()
+        for step in _didactic_steps_for_path(summary):
+            relation = str(step.get("action") or step.get("relation") or "").strip().lower()
+            if relation in seen:
+                continue
+            seen.add(relation)
+            explain_step(shell, step, level=level)
+    except Exception as exc:  # noqa: BLE001 — teaching must never break the flow
+        telemetry.capture_exception(exc)
+
+
 def offer_attack_path_execution(
     shell: Any,
     *,
@@ -1879,6 +1947,12 @@ def offer_attack_path_execution(
                 if _pivot_evaluated:
                     return True
         return False
+    # Didactic mode: explain the technique(s) about to run BEFORE the prompt, at
+    # the session's level (off/basic/deep — default deep in ctf/lab, basic in
+    # audit). This is what makes ADscan a learning tool: the operator sees what
+    # runs and why. It never blocks the operator who goes fast (basic is one line,
+    # off is silent).
+    render_didactic_for_path(shell, annotated)
     if not Confirm.ask("Execute this attack path now?", default=True):
         return False
     execute_selected_attack_path(
@@ -2349,6 +2423,8 @@ def attack_path_step_source_is_actionable(
     step: dict[str, Any],
     context_username: str | None = None,
     context_password: str | None = None,
+    steps: list[dict[str, Any]] | None = None,
+    step_index: int | None = None,
 ) -> tuple[bool, str]:
     """Return ``(actionable, client_safe_reason)`` for one attack-path step.
 
@@ -2358,6 +2434,14 @@ def attack_path_step_source_is_actionable(
     offered — and ADscan never attempts — a step whose source principal is not
     controlled (which otherwise runs the write as the wrong, carried-over
     principal and fails with a confusing ``insufficientAccessRights``).
+
+    ``steps`` + ``step_index`` (1-based) supply the chain context so a
+    ``carry_forward`` post-exploitation step (DumpLSA/DumpSAM/…) sourced at a HOST
+    can be unlocked by a PROVEN prior access edge to that host — the fix for the
+    executor blocking a dump whose foothold it just established. When absent, only
+    the carried-context / stored-credential / scoped-ticket routes apply (the
+    pre-existing behaviour), so read-only consumers without a chain in scope keep
+    working.
 
     Consults the credential-store SSOT in order:
 
@@ -2373,6 +2457,93 @@ def attack_path_step_source_is_actionable(
 
     Branches (c) and (d) are the capability/scoped-ticket axis: they MUST keep a
     step actionable even though the source principal holds no password.
+
+    Cross-domain source resolution — when the attack graph is a MERGED
+    multi-domain graph (a workspace with more than one domain), a path's SOURCE
+    principal may be owned in ANOTHER in-scope domain, not in ``domain``. The
+    per-domain credential/membership/ticket lookups this predicate consults are
+    all scoped to a single domain, so resolving only against ``domain`` would
+    return "not controlled" for a source ADscan genuinely owns in a trusted
+    in-scope domain — the exact divergence that made the per-domain listing view
+    refuse execution while the separate cross-domain pass offered it. This
+    predicate therefore resolves against ``domain`` FIRST and, on a miss, against
+    every OTHER legitimate source domain reported by the source-domain SSOT
+    (``get_attack_path_source_domains``). The FIRST domain whose credential store
+    controls the source wins; the last per-domain reason is returned when none
+    do, so single-domain behaviour is byte-identical.
+    """
+    actionable, reason = _attack_path_step_source_is_actionable_in_domain(
+        shell,
+        domain=domain,
+        step=step,
+        context_username=context_username,
+        context_password=context_password,
+        steps=steps,
+        step_index=step_index,
+    )
+    if actionable:
+        return True, reason
+
+    # Cross-domain fallback: the source may be owned in another in-scope domain.
+    # Only fires for a merged multi-domain graph — the source-domain SSOT returns
+    # just ``domain`` in the single-domain case, so this is a no-op there.
+    for alternate_domain in _alternate_source_domains(shell, domain):
+        alt_actionable, alt_reason = _attack_path_step_source_is_actionable_in_domain(
+            shell,
+            domain=alternate_domain,
+            step=step,
+            context_username=context_username,
+            context_password=context_password,
+            steps=steps,
+            step_index=step_index,
+        )
+        if alt_actionable:
+            return True, alt_reason
+    return actionable, reason
+
+
+def _alternate_source_domains(shell: Any, domain: str) -> list[str]:
+    """Return the OTHER in-scope domains that may source a step for ``domain``.
+
+    Reuses the source-domain SSOT ``get_attack_path_source_domains`` — the same
+    set ``get_attack_path_owned_principal_labels(..., include_trusted_domains=True)``
+    accumulates over — so the owned/credential union used for cross-domain source
+    resolution is defined in exactly one place. Returns an empty list in the
+    single-domain case (the SSOT reports only ``domain`` itself), which keeps the
+    cross-domain fallback a no-op there.
+    """
+    domain_clean = str(domain or "").strip().lower()
+    if not domain_clean:
+        return []
+    try:
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            get_attack_path_source_domains,
+        )
+
+        source_domains = get_attack_path_source_domains(shell, domain_clean)
+    except Exception as exc:  # noqa: BLE001 — best-effort; a miss must not break the gate
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
+    return [d for d in source_domains if str(d or "").strip().lower() != domain_clean]
+
+
+def _attack_path_step_source_is_actionable_in_domain(
+    shell: Any,
+    *,
+    domain: str,
+    step: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
+    steps: list[dict[str, Any]] | None = None,
+    step_index: int | None = None,
+) -> tuple[bool, str]:
+    """Per-domain core of :func:`attack_path_step_source_is_actionable`.
+
+    Resolves the step's SOURCE ownership against the credential store, membership
+    snapshot and scoped tickets of a SINGLE ``domain``. The public predicate wraps
+    this with the cross-domain fallback (see its docstring); this core stays
+    single-domain so its behaviour — and every existing test — is unchanged.
     """
     if not isinstance(step, dict):
         return False, "invalid step payload"
@@ -2426,26 +2597,38 @@ def attack_path_step_source_is_actionable(
     if key not in ACL_ACE_RELATIONS and not relation_requires_execution_context(key):
         return True, ""
 
-    # (d) host-scoped ServiceTicket opening exactly this step's TARGET — checked
-    # FIRST so the scoped-ticket axis is never hidden by a "no password for the
-    # source" verdict.
-    if to_label:
-        try:
-            target_host = (
-                resolve_netexec_target_for_node_label(
-                    shell, domain, node_label=to_label
-                )
-                or to_label
+    # (d) HOST-EXECUTION-READ material — a scoped ServiceTicket opening this
+    # step's host, an owned machine account of the host, or (for a host-read) a
+    # carried foothold. Resolved via the ONE step-execution actor SSOT so the
+    # selector and the executor can never disagree on whether a step is runnable.
+    # ``interactive=False`` keeps this read-only path from ever prompting;
+    # ``strict_source=True`` forbids the non-strict generic-host fallback, so a
+    # non-None result is source-faithful material the (a)/(b)/(c) branches below
+    # cannot see (a purpose-minted ticket or an owned machine account). This is
+    # checked FIRST so the scoped-ticket / machine-account axis is never hidden by
+    # a "no password for the source" verdict.
+    try:
+        if (
+            resolve_step_execution_actor(
+                shell,
+                domain=domain,
+                relation=key,
+                from_label=from_label,
+                to_label=to_label,
+                summary={"steps": steps} if steps else {},
+                context_username=context_username,
+                context_password=context_password,
+                steps=steps,
+                step_index=step_index,
+                strict_source=True,
+                interactive=False,
             )
-            if (
-                resolve_execution_credential(
-                    shell, domain=domain, host=target_host, relation=key
-                )
-                is not None
-            ):
-                return True, ""
-        except Exception as exc:  # noqa: BLE001 — scoped-ticket lookup is best-effort
-            telemetry.capture_exception(exc)
+            is not None
+        ):
+            return True, ""
+    except Exception as exc:  # noqa: BLE001 — actor resolution is best-effort here
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     # Well-known "all principals" source (Everyone / Authenticated Users /
     # BUILTIN Users): non-enumerable SIDs — every authenticated principal is a
@@ -2475,7 +2658,30 @@ def attack_path_step_source_is_actionable(
         context_username=context_username,
         context_password=context_password,
     )
-    return (not reason), reason
+    if not reason:
+        return True, ""
+
+    # Chained-foothold fallback for a carry_forward post-ex step (DumpLSA/DumpSAM/
+    # …) sourced at a HOST: strict source resolution cannot see the chain, so a
+    # dump whose foothold a PRIOR successful access step in this same path already
+    # established would be blocked ("<host> not yet compromised") even though the
+    # executor holds the session. Consult the shared carry-forward predicate — it
+    # unlocks the step ONLY when a proven prior access edge to this host granted a
+    # session that satisfies this step's requirement (so SQLAccess → DumpLSA stays
+    # blocked). The gate and the executor share this SSOT, so they cannot diverge.
+    carried_actor = carry_forward_foothold_actor(
+        shell,
+        domain=domain,
+        relation=key,
+        from_label=from_label,
+        steps=steps,
+        step_index=step_index,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if carried_actor:
+        return True, ""
+    return False, reason
 
 
 def _attack_path_step_readiness_reason(
@@ -2525,6 +2731,8 @@ def _attack_path_step_readiness_reason(
         step=step_item,
         context_username=context_username,
         context_password=context_password,
+        steps=steps,
+        step_index=step_index,
     )
     if not source_actionable:
         return source_reason
@@ -2915,6 +3123,8 @@ def _attack_path_actionable_start_indices(
             step=step_item,
             context_username=context_username,
             context_password=context_password,
+            steps=steps,
+            step_index=idx,
         )
         if actionable:
             out.append(idx)
@@ -3732,6 +3942,43 @@ def _resolve_owned_spn_member_for_rbcd(
         telemetry.capture_exception(exc)
 
     return owned_machines[0]
+
+
+def resolve_owned_machine_account_for_host(
+    shell: Any, *, domain: str, host: str | None
+) -> str | None:
+    """Resolve an owned MACHINE ACCOUNT whose name is an alias of ``host``.
+
+    A host-execution-read step (Set B) can authenticate as the target host's own
+    computer account when ADscan owns it: a domain controller replicating from
+    itself (``DC01$`` for a DCSync against ``dc01.corp.local``), or a member
+    server dumping its own SAM. This mirrors
+    :func:`_resolve_owned_spn_member_for_rbcd` but keys on the host identity
+    rather than group membership.
+
+    The match is ALIAS-AWARE (IP ↔ short ↔ FQDN ↔ ``HOST$``) via
+    :func:`hosts_match`, never string equality — an owned ``DC01$@CORP.LOCAL``
+    credential must satisfy a step whose resolved host is ``dc01.corp.local`` or
+    an IP. Returns the stored credential key (the sAMAccountName / label the
+    credential store filed it under), or ``None`` when no owned machine account
+    aliases ``host``.
+    """
+    resolved_host = str(host or "").strip()
+    if not resolved_host:
+        return None
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+    creds = domain_data.get("credentials", {}) or {}
+    for cred_key in creds.keys():
+        key = str(cred_key or "").strip()
+        # A machine account key ends in ``$`` (optionally before an ``@realm``
+        # suffix). hosts_match folds ``HOST$``/``HOST$@REALM`` into the host it
+        # denotes, so this compares the machine account to the resolved host.
+        sam = key.split("@", 1)[0].strip()
+        if not sam.endswith("$") or len(sam) <= 1:
+            continue
+        if hosts_match(key, resolved_host):
+            return key
+    return None
 
 
 def _print_allowedtoact_blocked_panel(
@@ -5793,6 +6040,21 @@ def _resolve_users_from_principal_label(
     return sorted(set(valid_members), key=str.lower)
 
 
+# Priority among the session-granting access relations when several prior steps
+# reached the same host — a stronger session wins the head of the candidate list.
+# Ordering only; the SET of access relations is the catalog SSOT
+# (:func:`access_session_grant_for_relation`), never re-declared here.
+_ACCESS_RELATION_PRIORITY: dict[str, int] = {
+    "adminto": 0,
+    "hassession": 0,
+    "sqladmin": 1,
+    "sqlaccess": 1,
+    "canpsremote": 2,
+    "canrdp": 3,
+    "executedcom": 3,
+}
+
+
 def _collect_previous_host_access_candidates(
     shell: Any,
     *,
@@ -5802,8 +6064,31 @@ def _collect_previous_host_access_candidates(
     target_host: str,
     context_username: str | None,
     context_password: str | None,
+    required_context: str | None = None,
+    require_success: bool = False,
 ) -> list[tuple[str, str]]:
     """Collect candidate executor users from prior host-access relations.
+
+    Walks the steps BEFORE ``current_step_index`` for a PROVEN access edge whose
+    resolved TARGET is ``target_host`` and returns the executor principals with a
+    usable credential. The set of "access edge" relations is the catalog SSOT
+    (:func:`access_session_grant_for_relation`), NOT a hardcoded list — a relation
+    is an access edge iff it declares a host-session grant.
+
+    ``required_context`` gates by the CONSUMER's ``source_context_requirement``:
+    an access edge carries a foothold into the next step only when the session it
+    granted SATISFIES that requirement. So a prior ``AdminTo`` (local-admin
+    session) carries into ``DumpLSA`` (needs ``local_admin_session``), but a prior
+    ``SQLAccess`` (a DB session) does NOT — the SQL session does not satisfy the
+    dump's local-admin requirement. ``None`` disables the gate (any granting access
+    edge qualifies), which is the pre-existing behaviour for the HasSession
+    resolver that already restricts by target host on its own.
+
+    ``require_success`` restricts the walk to prior steps whose ``status`` is
+    ``success`` — only a PROVEN access step carries a foothold forward. The
+    pre-execution ownership gate sets this (a theoretical/attempted prior access
+    is not evidence we hold the session); the HasSession resolver leaves it off,
+    keeping its any-status fallback.
 
     Returns:
         List of ``(username, reason)`` sorted by confidence/priority.
@@ -5811,13 +6096,6 @@ def _collect_previous_host_access_candidates(
     target_host_clean = str(target_host or "").strip().lower()
     if not target_host_clean:
         return []
-    relation_priority = {
-        "adminto": 0,
-        "sqlaccess": 1,
-        "sqladmin": 1,
-        "canpsremote": 2,
-        "canrdp": 3,
-    }
     best: dict[str, tuple[tuple[int, int, int], str]] = {}
 
     for index in range(current_step_index - 1, -1, -1):
@@ -5825,7 +6103,16 @@ def _collect_previous_host_access_candidates(
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
-        if action not in relation_priority:
+        grant = access_session_grant_for_relation(action)
+        if grant is None:
+            continue
+        # The access level this edge granted must cover what the consumer needs.
+        if required_context is not None and not access_grant_satisfies_requirement(
+            grant, required_context
+        ):
+            continue
+        step_status = str(step.get("status") or "discovered").strip().lower()
+        if require_success and step_status != "success":
             continue
         details = step.get("details") if isinstance(step.get("details"), dict) else {}
         from_label = str(details.get("from") or "").strip()
@@ -5847,10 +6134,9 @@ def _collect_previous_host_access_candidates(
         )
         if not users:
             continue
-        step_status = str(step.get("status") or "discovered").strip().lower()
         status_rank = 0 if step_status == "success" else 1
         distance = current_step_index - index
-        relation_rank = relation_priority[action]
+        relation_rank = _ACCESS_RELATION_PRIORITY.get(action, 9)
         reason = f"{action}:{step_status}"
         for user in users:
             password = _resolve_exec_password_for_user(
@@ -5869,6 +6155,370 @@ def _collect_previous_host_access_candidates(
 
     ordered = sorted(best.items(), key=lambda item: (item[1][0], item[0]))
     return [(username, metadata[1]) for username, metadata in ordered]
+
+
+def carry_forward_foothold_actor(
+    shell: Any,
+    *,
+    domain: str,
+    relation: str,
+    from_label: str,
+    steps: list[dict[str, Any]] | None,
+    step_index: int | None,
+    context_username: str | None,
+    context_password: str | None,
+) -> str | None:
+    """Return an owned actor for a ``carry_forward`` post-ex step, or ``None``.
+
+    The ONE predicate the pre-execution ownership gate AND the executor consult so
+    they can never disagree on whether a proven foothold carries into the next
+    post-exploitation step. It applies ONLY to ``carry_forward`` (``EdgeKind.
+    DERIVED``) relations sourced at a HOST — the acting credential is the session
+    carried forward from a prior access step, never ownership of the source host.
+
+    Answers: did a PRIOR step in THIS chain execute a successful ACCESS edge whose
+    TARGET is this step's source host, granting a session that SATISFIES this
+    step's ``source_context_requirement``? So ``AdminTo(success) → DumpLSA`` returns
+    the AdminTo actor; ``SQLAccess(success) → DumpLSA`` returns ``None`` (a DB
+    session does not satisfy the dump's local-admin requirement); a prior access
+    step that did NOT succeed grants nothing. Returns the executor username with a
+    usable credential, or ``None`` when no such foothold exists.
+    """
+    if source_ownership_bucket(relation) != "carry_forward":
+        return None
+    if not steps or not step_index or step_index < 1:
+        return None
+    source_host = resolve_netexec_target_for_node_label(
+        shell, domain, node_label=from_label
+    )
+    if not isinstance(source_host, str) or not source_host.strip():
+        return None
+    candidates = _collect_previous_host_access_candidates(
+        shell,
+        domain=domain,
+        steps=steps,
+        current_step_index=step_index,
+        target_host=source_host.strip(),
+        context_username=context_username,
+        context_password=context_password,
+        required_context=required_context_for_relation(relation),
+        require_success=True,
+    )
+    if not candidates:
+        return None
+    return candidates[0][0]
+
+
+def _resolve_step_execution_host(
+    shell: Any, *, domain: str, relation: str, from_label: str, to_label: str
+) -> str | None:
+    """Return the host a host-execution-read step actually authenticates to.
+
+    The endpoint differs by relation family:
+
+    * SOURCE-side reads (the dump family + HasSession) authenticate to the SOURCE
+      host — the machine the edge starts at.
+    * TARGET-side access reads authenticate to the TARGET host.
+    * DCSync is a special case: its ``to_label`` is the DOMAIN object, not a host,
+      yet the native DRSUAPI replication runs over an SMB connection to the domain
+      controller. It is resolved via the FQDN SSOT (``resolve_dc_fqdn``) so the
+      scoped-ticket / machine-account lookups key on a real DC FQDN, never the
+      bare domain name or an IP (which cannot serve a ``cifs`` service ticket).
+
+    Returns the resolved host (FQDN/short/IP), or ``None`` when it cannot be
+    resolved — in which case the host-specific ladder rungs (scoped ticket,
+    machine account) are skipped and the step falls back to the generic route.
+    """
+    key = str(relation or "").strip().lower()
+
+    if key == "dcsync":
+        # DCSync's ``to_label`` is usually the DOMAIN object, so the DRSUAPI target
+        # is the domain controller, resolved via the FQDN SSOT so the scoped-ticket
+        # lookup keys on a real DC FQDN (an IP cannot serve a ``cifs`` ticket).
+        try:
+            from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+
+            domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+            dc_host = resolve_dc_fqdn(domain_data, target_domain=domain)
+            if isinstance(dc_host, str) and dc_host.strip():
+                return dc_host.strip()
+        except Exception as exc:  # noqa: BLE001 — best-effort DC resolution
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        # Fallback: when the FQDN SSOT cannot resolve a DC (sparse domains_data),
+        # a ``to_label`` that already names the DC host is the next-best key — this
+        # is the pre-existing branch-(d) behaviour (it used ``to_label`` directly).
+        to_host = str(to_label or "").strip()
+        if to_host:
+            resolved_to = resolve_netexec_target_for_node_label(
+                shell, domain, node_label=to_host
+            )
+            return (
+                resolved_to.strip()
+                if isinstance(resolved_to, str) and resolved_to.strip()
+                else to_host
+            )
+        return None
+
+    node_label = (
+        str(from_label or "").strip()
+        if relation_authenticates_to_source_host(key)
+        else str(to_label or "").strip()
+    )
+    if not node_label:
+        return None
+    resolved = resolve_netexec_target_for_node_label(
+        shell, domain, node_label=node_label
+    )
+    return resolved.strip() if isinstance(resolved, str) and resolved.strip() else None
+
+
+def _resolve_actor_secret(
+    shell: Any,
+    *,
+    domain: str,
+    relation: str,
+    username: str,
+    resolved_host: str | None,
+    context_username: str | None,
+    context_password: str | None,
+) -> tuple[str, str]:
+    """Resolve ``(secret, islocal)`` for a resolved actor with the context guard.
+
+    A context-supplied secret is used ONLY when the resolved actor IS the context
+    principal (``resolve_exec_password`` semantics) — never for a different
+    principal, which is what let a stale carried context drive a write as the
+    wrong actor. Otherwise the host-aware store resolver runs with no context
+    secret (stored domain credential → host-local account), so ``islocal`` is
+    derived from the credential and never guessed from the name.
+    """
+    normalized_user = _normalize_account(username)
+    normalized_context = _normalize_account(context_username or "")
+    if context_password and normalized_user and normalized_user == normalized_context:
+        return _resolve_host_step_credential(
+            shell,
+            domain=domain,
+            relation=relation,
+            username=username,
+            target_host=resolved_host,
+            carried=None,
+            context_password=context_password,
+        )
+    return _resolve_host_step_credential(
+        shell,
+        domain=domain,
+        relation=relation,
+        username=username,
+        target_host=resolved_host,
+        carried=None,
+        context_password=None,
+    )
+
+
+def resolve_step_execution_actor(
+    shell: Any,
+    *,
+    domain: str,
+    relation: str,
+    from_label: str,
+    to_label: str,
+    summary: dict[str, Any],
+    context_username: str | None,
+    context_password: str | None,
+    steps: list[dict[str, Any]] | None = None,
+    step_index: int | None = None,
+    strict_source: bool = False,
+    interactive: bool = True,
+) -> StepExecutionActor | None:
+    """The ONE resolver for "what actor + secret runs this step?".
+
+    Composes every material source into one result the start-step selector, the
+    per-step context builder, and the dump executor all consume, so they can
+    never disagree on whether a step is runnable or as whom. It does NOT replace
+    :func:`resolve_execution_candidates` — that stays as the source-ownership
+    sub-resolver (step 4).
+
+    The ladder is ranked by SPECIFICITY OF PROOF, not by credential type — a
+    purpose-minted scoped ticket outranks a generic machine account, so a fixed
+    machine→user→ticket order would get it backwards:
+
+    1. (Set B only) a scoped ``ServiceTicket`` opening exactly this (relation ×
+       host) — the most specific proof, used AS-IS and never re-minted.
+    2. (carry-forward relations) a proven prior-access foothold on this host.
+    3. (Set B only) an OWNED MACHINE ACCOUNT aliasing the host — a DC replicating
+       from itself, or a host dumping its own SAM.
+    4. the SOURCE-OWNED principal (``resolve_execution_candidates`` /
+       ``_resolve_execution_user``). For a Set-A control/modification step this is
+       the ONLY route (steps 1-3 and 5 skipped) — the strict anti-wrong-principal
+       gate stays.
+    5. (non-strict Set B) a generic host-aware credential — the DumpLSA
+       ``khal.drogo``-from-AdminTo fallback that already works.
+
+    ``strict_source=True`` (the start-step selector / gate) forbids the non-strict
+    generic-host fallback (step 5). ``interactive`` selects how the source-owned
+    branch resolves: ``True`` (the executor) may prompt once (memoized) among
+    several owned candidates; ``False`` (the read-only gate) takes the ranked head
+    without ever prompting.
+
+    Returns a :class:`StepExecutionActor`, or ``None`` when no material exists.
+    """
+    key = str(relation or "").strip().lower()
+    is_host_read = relation_is_host_execution_read(key)
+    resolved_host = _resolve_step_execution_host(
+        shell, domain=domain, relation=key, from_label=from_label, to_label=to_label
+    )
+
+    # --- Step 1: scoped ServiceTicket opening (relation × host) [Set B only] ---
+    if is_host_read and resolved_host:
+        scoped = resolve_execution_credential(
+            shell, domain=domain, host=resolved_host, relation=key
+        )
+        if scoped is not None:
+            ticket_user, ccache_path = scoped
+            print_info_debug(
+                f"attack_paths {key}: reusing host-scoped service ticket for "
+                f"{mark_sensitive(resolved_host, 'hostname')} as "
+                f"{mark_sensitive(ticket_user, 'user')} "
+                f"(ccache={mark_sensitive(ccache_path, 'path')})"
+            )
+            return StepExecutionActor(
+                username=ticket_user,
+                secret=ccache_path,
+                islocal="false",
+                source=ACTOR_SOURCE_SCOPED_TICKET,
+            )
+
+    # --- Step 2: carried foothold (carry_forward relations only) ---
+    carried_actor = carry_forward_foothold_actor(
+        shell,
+        domain=domain,
+        relation=key,
+        from_label=from_label,
+        steps=steps,
+        step_index=step_index,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if carried_actor:
+        secret, islocal = _resolve_actor_secret(
+            shell,
+            domain=domain,
+            relation=key,
+            username=carried_actor,
+            resolved_host=resolved_host,
+            context_username=context_username,
+            context_password=context_password,
+        )
+        if secret:
+            return StepExecutionActor(
+                username=carried_actor,
+                secret=secret,
+                islocal=islocal,
+                source=ACTOR_SOURCE_CARRY_FORWARD,
+            )
+
+    # --- Step 3: owned MACHINE ACCOUNT of the host [Set B only] ---
+    if is_host_read and resolved_host:
+        machine_account = resolve_owned_machine_account_for_host(
+            shell, domain=domain, host=resolved_host
+        )
+        if machine_account:
+            secret, islocal = _resolve_actor_secret(
+                shell,
+                domain=domain,
+                relation=key,
+                username=machine_account,
+                resolved_host=resolved_host,
+                context_username=context_username,
+                context_password=context_password,
+            )
+            if secret:
+                print_info_debug(
+                    f"attack_paths {key}: using owned machine account "
+                    f"{mark_sensitive(machine_account, 'user')} for "
+                    f"{mark_sensitive(resolved_host, 'hostname')}"
+                )
+                return StepExecutionActor(
+                    username=machine_account,
+                    secret=secret,
+                    islocal=islocal,
+                    source=ACTOR_SOURCE_MACHINE_ACCOUNT,
+                )
+
+    # --- Step 4: source-owned principal (the ONLY route for Set A) ---
+    from_node_kind = _resolve_from_node_kind(shell, domain, from_label) or None
+    if interactive:
+        source_owned_user = _resolve_execution_user(
+            shell,
+            domain=domain,
+            context_username=context_username,
+            summary=summary,
+            from_label=from_label,
+            from_node_kind=from_node_kind,
+            host=resolved_host,
+            strict_source=strict_source,
+            relation=key,
+        )
+    else:
+        candidates, _tag = resolve_execution_candidates(
+            shell,
+            domain=domain,
+            context_username=context_username,
+            summary=summary,
+            from_label=from_label,
+            from_node_kind=from_node_kind,
+            host=resolved_host,
+            strict_source=strict_source,
+            relation=key,
+        )
+        source_owned_user = candidates[0] if candidates else None
+    if source_owned_user:
+        secret, islocal = _resolve_actor_secret(
+            shell,
+            domain=domain,
+            relation=key,
+            username=source_owned_user,
+            resolved_host=resolved_host,
+            context_username=context_username,
+            context_password=context_password,
+        )
+        if secret:
+            return StepExecutionActor(
+                username=source_owned_user,
+                secret=secret,
+                islocal=islocal,
+                source=ACTOR_SOURCE_SOURCE_OWNED,
+            )
+
+    # --- Step 5: generic host-aware credential (non-strict Set B only) ---
+    if is_host_read and not strict_source:
+        generic_user = _resolve_execution_user(
+            shell,
+            domain=domain,
+            context_username=context_username,
+            summary=summary,
+            from_label=from_label,
+            host=resolved_host,
+        )
+        if generic_user:
+            secret, islocal = _resolve_host_step_credential(
+                shell,
+                domain=domain,
+                relation=key,
+                username=generic_user,
+                target_host=resolved_host,
+                carried=None,
+                context_password=context_password,
+            )
+            if secret:
+                return StepExecutionActor(
+                    username=generic_user,
+                    secret=secret,
+                    islocal=islocal,
+                    source=ACTOR_SOURCE_GENERIC_HOST,
+                )
+
+    return None
 
 
 def _select_candidate_executor_user(
@@ -6715,6 +7365,98 @@ def _is_user_domain_admin_via_sid(
             f"{marked_user}@{marked_domain}: {exc}"
         )
         return None
+
+
+def _promote_pwned_on_verified_da_dcsync_actor(
+    shell: Any,
+    *,
+    domain: str,
+    actor_username: str,
+    actor_secret: str,
+    actor_islocal: bool,
+) -> None:
+    """Promote ``domain`` to ``pwned`` when a DCSync step's actor is a controlled DA.
+
+    This is the SSOT for the ``pwned`` decision at the DCSync attack-STEP terminal.
+    A domain is ``pwned`` once ADscan has PROVEN control over a Domain Admin — not
+    only after krbtgt extraction. Reaching a DCSync step with a controlled principal
+    that is verified (recursive SID resolution) to be a Domain Admin proves that
+    control, so promotion fires HERE, at the step, **even when the operator skips
+    the actual credential dump** (declined the full replication, or ran a scoped
+    dump that never touched krbtgt). krbtgt is still extracted whenever the dump
+    RUNS — it stays valuable persistence material — but it is no longer the
+    condition for ``pwned``.
+
+    Exposure-Validation discipline: promotion requires VERIFIED DA control, never
+    "the DCSync step was reached". The actor already comes from
+    ``resolve_step_execution_actor`` (a principal we control); confirming via
+    ``_is_user_domain_admin_via_sid`` that it is a Domain Admin closes the honest
+    condition. An unverifiable membership (LDAP unreachable → ``None``) does NOT
+    promote — a false "domain compromised" in the client report is forbidden.
+
+    Best-effort: never raises (a promotion failure must not abort step execution).
+    ``promote_to_pwned`` is idempotent, so a later krbtgt-driven dump that also
+    promotes is a harmless no-op.
+    """
+    actor = (actor_username or "").strip()
+    if not actor or not (actor_secret or "").strip():
+        return
+    # A local (host-SAM) account is never a domain principal, so it can never be a
+    # Domain Admin — skip the LDAP round-trip and never promote off it.
+    if actor_islocal:
+        return
+    # Fast path: an executed dump that replicated Tier-0 secrets already promoted
+    # via secretsdump (evidence DOMAIN_ADMIN_MEMBERSHIP). Skip the DA-verification
+    # LDAP round-trip when the domain is already pwned — promote_to_pwned would be
+    # a no-op anyway. The verification is only needed for the SKIPPED-dump case.
+    try:
+        domains_data = getattr(shell, "domains_data", None)
+        entry = domains_data.get(domain) if isinstance(domains_data, dict) else None
+        if isinstance(entry, dict) and entry.get("auth") == "pwned":
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        is_da = _is_user_domain_admin_via_sid(
+            shell,
+            domain=domain,
+            target_user=actor,
+            auth_username=actor,
+            auth_password=actor_secret,
+        )
+        if not is_da:
+            # False (not a DA) or None (could not verify) → do NOT promote. Only
+            # a positive, verified DA membership proves domain control.
+            marked_actor = mark_sensitive(actor, "user")
+            print_info_debug(
+                "dcsync-pwned: not promoting — DCSync actor "
+                f"{marked_actor} is not a verified Domain Admin "
+                f"(is_da={is_da})."
+            )
+            return
+
+        from adscan_internal.services.domain_compromise_promotion import (
+            CompromiseEvidence,
+            promote_to_pwned,
+        )
+
+        promoted = promote_to_pwned(
+            shell,
+            domain=domain,
+            evidence=CompromiseEvidence.DOMAIN_ADMIN_MEMBERSHIP,
+            username=actor,
+            credential=actor_secret or None,
+            evidence_ref="dcsync_step_verified_da",
+        )
+        if promoted:
+            marked_actor = mark_sensitive(actor, "user")
+            print_info_debug(
+                "dcsync-pwned: promoted domain to pwned — DCSync step actor "
+                f"{marked_actor} verified as a controlled Domain Admin."
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _find_next_step_by_action(
@@ -8720,6 +9462,8 @@ def execute_selected_attack_path(
                 step=step,
                 context_username=context_username,
                 context_password=context_password,
+                steps=steps,
+                step_index=idx,
             )
             if not _source_actionable:
                 _record_attack_path_execution_event(
@@ -10082,6 +10826,8 @@ def execute_selected_attack_path(
                     context_username=context_username,
                     context_password=context_password,
                     member_to_add=rbcd_member_to_add,
+                    steps=steps,
+                    step_index=idx,
                 )
                 if not exec_context:
                     marked_from = mark_sensitive(from_label, "node")
@@ -10329,6 +11075,25 @@ def execute_selected_attack_path(
                             relation=action,
                             to_label=to_label,
                         )
+                        # pwned SSOT (DA-controlled): a DCSync attack-step whose
+                        # resolved actor is a verified controlled Domain Admin
+                        # proves domain compromise — promote HERE, at the step,
+                        # regardless of ``ace_result``. This fires even when the
+                        # operator skipped the full dump (a scoped run that never
+                        # extracted krbtgt, or a declined replication) — reaching
+                        # this step with a controlled DA is the honest evidence.
+                        # ``exec_context.exec_username`` came from the step-actor
+                        # SSOT (a principal we control); the helper verifies DA
+                        # membership via recursive SID resolution before promoting
+                        # (Exposure-Validation: never on "step reached" alone).
+                        if key == "dcsync":
+                            _promote_pwned_on_verified_da_dcsync_actor(
+                                shell,
+                                domain=domain,
+                                actor_username=exec_context.exec_username,
+                                actor_secret=exec_context.exec_password,
+                                actor_islocal=exec_context.islocal == "true",
+                            )
                         offer_followups = (
                             idx == last_executable_idx and ace_result is True
                         )
@@ -14377,59 +15142,44 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                # Scoped-ticket-first: if a prior step (RBCD/S4U, constrained
-                # delegation) minted a service ticket for THIS host, reuse it -
-                # the dump executor accepts a .ccache path as the credential and
-                # runs as the ticket's impersonated principal. The alias-aware
-                # host match guarantees a cifs/<other-host> ticket is never used
-                # here. relation=action (dumplsa/dumpdpapi) -> cifs via the
-                # central map; preferent matching keeps a TGT-bearing ccache
-                # usable even if its own SPN class differs. Fall back to the
-                # generic resolver on no match.
-                scoped = resolve_execution_credential(
-                    shell, domain=domain, host=source_host, relation=action
+                # One resolution path: the step-execution actor SSOT tries, in
+                # proof-specificity order, a scoped cifs/<host> ServiceTicket
+                # (RBCD/S4U/constrained delegation — used as-is, never re-minted),
+                # a proven carry-forward foothold from a prior access step in this
+                # same chain, an owned machine account of the host, the source-
+                # owned principal, and finally the generic host-aware credential
+                # (the khal.drogo-from-AdminTo fallback). The alias-aware host
+                # match guarantees a cifs/<other-host> ticket is never used here.
+                # ``islocal`` is derived from the credential, never the name.
+                dump_actor = resolve_step_execution_actor(
+                    shell,
+                    domain=domain,
+                    relation=key,
+                    from_label=from_label,
+                    to_label=to_label,
+                    summary=summary,
+                    context_username=context_username,
+                    context_password=context_password,
+                    steps=steps,
+                    step_index=idx,
+                    strict_source=False,
+                    interactive=True,
                 )
-                dump_islocal = "false"
-                if scoped is not None:
-                    exec_username, password = scoped
+                if dump_actor is not None:
+                    exec_username = dump_actor.username
+                    password = dump_actor.secret
+                    dump_islocal = dump_actor.islocal
                     print_info_debug(
-                        f"attack_paths {action}: reusing host-scoped service ticket "
-                        f"for {mark_sensitive(source_host, 'hostname')} as "
-                        f"{mark_sensitive(exec_username, 'user')} "
-                        f"(ccache={mark_sensitive(password, 'path')})"
-                    )
-                else:
-                    # host=source_host: DumpLSA/DumpDPAPI authenticate via a
-                    # NETWORK logon (SMB session_setup) to source_host, so prefer
-                    # a principal that host has not already denied.
-                    exec_username = _resolve_execution_user(
-                        shell,
-                        domain=domain,
-                        context_username=context_username,
-                        summary=summary,
-                        from_label=from_label,
-                        host=source_host,
-                    )
-                    # Host-aware resolution: a credential carried from the
-                    # previous step keeps its authority, and an account that
-                    # exists only in this host's SAM is usable here. ``islocal``
-                    # decides whether the logon names the host or the domain,
-                    # so it is derived from the credential, never from the name.
-                    password, dump_islocal = _resolve_host_step_credential(
-                        shell,
-                        domain=domain,
-                        relation=key,
-                        username=exec_username or "",
-                        target_host=source_host,
-                        carried=step_carried,
-                        context_password=context_password,
-                    )
-                    print_info_debug(
-                        f"attack_paths {action}: credential resolved for "
+                        f"attack_paths {action}: actor resolved for "
                         f"{mark_sensitive(exec_username or '?', 'user')} on "
                         f"{mark_sensitive(source_host, 'hostname')} "
+                        f"source={mark_sensitive(dump_actor.source, 'detail')} "
                         f"scope={'local' if dump_islocal == 'true' else 'domain'}"
                     )
+                else:
+                    exec_username = ""
+                    password = ""
+                    dump_islocal = "false"
                 if not exec_username or not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
                     print_warning(
@@ -14616,6 +15366,116 @@ def execute_selected_attack_path(
                     break
                 continue
 
+            if key == "raisechild":
+                # Same-forest child -> forest-root escalation. The child domain
+                # has just been compromised by the preceding DCSync step (its
+                # krbtgt is in the store and the domain is pwned), which is
+                # exactly the material raise_child needs: it DCSyncs the child
+                # krbtgt over DRSUAPI, forges the inter-realm referral TGT with
+                # the forest-root privileged SID history, and replicates the
+                # parent (forest root). ``domain`` here is the CHILD domain the
+                # path is computed for; run_raise_child derives the parent
+                # itself from the DNS suffix. The from_label is the child-domain
+                # node, so the actor is the child-domain admin the path just
+                # obtained.
+                rc_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                rc_password = context_password or (
+                    _resolve_domain_password(shell, domain, rc_username)
+                    if rc_username
+                    else None
+                )
+                if not rc_username or not rc_password:
+                    print_warning(
+                        "Cannot execute RaiseChild without a child-domain admin "
+                        f"credential for {from_label or domain}."
+                    )
+                    return execution_started
+                _update_attack_path_step_status_at_index(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    step_index=idx - 1,
+                    status="attempted",
+                    notes={"user": rc_username},
+                )
+                from adscan_internal.cli.privileges import run_raise_child
+
+                # SINGLE-EXECUTOR SSOT: mark RaiseChild dispatched BEFORE firing
+                # it inline. The preceding child DCSync promoted the child to
+                # pwned, which queued a post-compromise cross-domain escalation
+                # (RaiseChild) drained in this function's finally block. Without
+                # this mark BOTH the inline dispatch here AND that drain would run
+                # run_raise_child for the same child->forest-root pair — a
+                # competing double-fire whose second (drain) run rebuilt a
+                # degraded credential (NT hash / RC4-only) and got
+                # KDC_ERR_CLIENT_REVOKED in RC4-restricted forests. Recording the
+                # fire in the shared dispatched set makes the drain skip it: one
+                # execution, from the actor the path resolved, with the real
+                # (AES-capable) credential. The parent domain is the DNS suffix,
+                # matching run_raise_child's own child/parent identification.
+                rc_parent_domain = domain.split(".", 1)[1] if "." in domain else ""
+                if rc_parent_domain:
+                    from adscan_internal.services.cross_domain_escalation import (
+                        mark_technique_dispatched,
+                    )
+
+                    mark_technique_dispatched(
+                        shell,
+                        compromised_domain=domain,
+                        target_domain=rc_parent_domain,
+                        technique_key="raise_child",
+                    )
+
+                # run_raise_child performs the full escalation (child krbtgt
+                # DCSync, inter-realm TGT forge, parent DCSync) and stores every
+                # recovered forest-root credential (parent krbtgt/Administrator)
+                # in the credential store. It returns the typed outcome so we get
+                # a reliable success signal without duplicating any of that
+                # logic. Parent-domain promotion is NOT done here: the preceding
+                # child DCSync already promoted the child to pwned; the drain
+                # layer owns the parent promotion (promote_to_pwned is idempotent).
+                rc_outcome = run_raise_child(
+                    shell,
+                    domain=domain,
+                    username=rc_username,
+                    password=rc_password,
+                )
+                if rc_outcome is not None and getattr(rc_outcome, "success", False):
+                    _update_attack_path_step_status_at_index(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        step_index=idx - 1,
+                        status="success",
+                        notes={"user": rc_username},
+                    )
+                    execution_started = True
+                else:
+                    _update_attack_path_step_status_at_index(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        step_index=idx - 1,
+                        status="failed",
+                        notes={"user": rc_username},
+                    )
+                    _halt_path_after_failed_step(
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_index=idx,
+                        executable_step_position=executable_step_position,
+                        actor=rc_username,
+                    )
+                    break
+                continue
+
             # Unknown supported key shouldn't happen due to pre-check, but keep safe.
             _record_attack_path_execution_event(
                 shell,
@@ -14657,6 +15517,24 @@ def execute_selected_attack_path(
             if cleanup_scope_owner and local_cleanup_scope_id:
                 discard_cleanup_scope(shell, scope_id=local_cleanup_scope_id)
             clear_attack_path_execution(shell)
+            # Drain any cross-domain escalation queued during this run. A
+            # terminal DCSync that recovered krbtgt promotes the domain to pwned,
+            # which queues its outbound trust escalation (e.g. .ext -> .htb
+            # CrossOrgTgtDelegation) via promote_to_pwned. That queue self-defers
+            # while attack-path execution is active, so it MUST be drained now,
+            # once the execution flag has been cleared above; otherwise the
+            # queued escalation is silently left pending. Best-effort — the
+            # per-domain drain is re-entrancy-safe (pops its domain up front,
+            # gates re-fires via the dispatched set) and never raises here.
+            try:
+                from adscan_internal.services.cross_domain_escalation import (
+                    drain_pending_cross_domain_escalations,
+                )
+
+                drain_pending_cross_domain_escalations(shell)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
 
 def offer_attack_paths_for_execution(

@@ -23,7 +23,7 @@ import time
 from selectors import DefaultSelector, EVENT_READ
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 from adscan_core.version_context import RUNTIME_CONTRACT_VERSION
 from adscan_launcher.docker_pull_diagnostics import (
@@ -1005,45 +1005,21 @@ def probe_and_warn_reduced_runtime(cfg: DockerRunConfig) -> None:
             pass
 
 
-#: Host environment variables forwarded verbatim into the scan container.
+#: Non-``ADSCAN_``-prefixed host environment variables forwarded verbatim into
+#: the scan container.
 #:
-#: Opt-in by design: a key is only forwarded when it is set (and non-empty) on
-#: the host, so the default runtime behaviour is unchanged. This tuple is the
-#: contract between the host and the container — anything the runtime asks an
-#: operator to "set in the environment" must be listed here, or the instruction
-#: is impossible to follow. It is module-level (not a local inside
-#: ``build_adscan_run_command``) precisely so tests can assert against it.
+#: ADscan's OWN configuration namespace (``ADSCAN_*``) is wildcard-forwarded — see
+#: ``LAUNCHER_ONLY_ENV_KEYS`` and ``_iter_forwardable_adscan_env`` below. This tuple
+#: only holds the handful of vars OUTSIDE that namespace the container still needs:
+#: the CI markers (so in-container CI/non-interactive detection matches the host),
+#: the terminal colour hints, and the two shared proxy/helper tokens. They can never
+#: be covered by the ``ADSCAN_`` prefix, so they stay an explicit keep-list.
+#:
+#: Opt-in by design: a key is only forwarded when it is set (and non-empty) on the
+#: host, so the default runtime behaviour is unchanged. It is module-level (not a
+#: local inside ``build_adscan_run_command``) precisely so tests can assert against
+#: it.
 PASSTHROUGH_ENV_KEYS: tuple[str, ...] = (
-    "ADSCAN_SESSION_ENV",
-    "ADSCAN_ENV",
-    "ADSCAN_TELEMETRY",
-    "ADSCAN_ALLOW_PUBLIC_DNS",
-    # Offline / no-external kill switch (PoV appliance). Without forwarding
-    # these, an ``ADSCAN_OFFLINE=1`` set on the host (e.g. by the appliance
-    # cloud-init / Celery unit) never reaches the scan container, so the
-    # weakpass egress guard and telemetry opt-out inside the runtime stay
-    # off — the "zero bytes leave the appliance" promise would rest solely
-    # on nftables. ``ADSCAN_NO_EXTERNAL`` is the documented alias
-    # (see weakpass_service._OFFLINE_ENV_VARS).
-    "ADSCAN_OFFLINE",
-    "ADSCAN_NO_EXTERNAL",
-    # PRO entitlement/attribution tag. The in-container PRO start gate refuses
-    # to run without it and tells the operator to supply one; without this
-    # entry the host value never arrived and the instruction could not be
-    # followed. The launcher's ``--partner-tag`` flag also lands here (it sets
-    # the variable on the launcher process before this forwarding runs).
-    "ADSCAN_PARTNER_TAG",
-    # CI event pipeline: forward the structured-event sink config so the container
-    # emits JSON events to stderr (read by the Celery worker via PIPE).
-    "ADSCAN_EVENT_SINK",
-    "ADSCAN_SCAN_ID",
-    "ADSCAN_NONINTERACTIVE",
-    # Remote interaction bridge: forward the sink type so the container can delegate
-    # interactive prompts (e.g. attack path selection) back to the web UI via Redis.
-    # The Redis URL is NOT forwarded as-is because localhost/127.0.0.1 is unreachable
-    # from inside Docker; instead we compute a host-gateway-based URL below.
-    "ADSCAN_INTERACTIVE_SINK",
-    "ADSCAN_INTERACTIVE_TIMEOUT_SECONDS",
     "CI",
     "GITHUB_ACTIONS",
     "GITLAB_CI",
@@ -1060,11 +1036,111 @@ PASSTHROUGH_ENV_KEYS: tuple[str, ...] = (
     "CLI_SHARED_TOKEN",
     # Used by the host privileged helper (Docker clock sync).
     "CONTAINER_SHARED_TOKEN",
-    # Distinguish host launcher version from in-container runtime version.
-    "ADSCAN_LAUNCHER_VERSION",
-    # Correlate launcher preflight + runtime sessions as one logical run.
-    "ADSCAN_SESSION_TRACE_ID",
 )
+
+
+#: ``ADSCAN_*`` variables the LAUNCHER consumes itself and that must NOT be
+#: forwarded into the scan container.
+#:
+#: The forwarding model is INVERTED: every ``ADSCAN_*`` variable set on the host
+#: is forwarded to the container by default (that namespace is ADscan's own
+#: product config, not third-party secrets), EXCEPT the ones listed here. The old
+#: key-by-key allow-list was the root cause of a recurring bug class — the runtime
+#: reads ~196 distinct ``ADSCAN_*`` vars but the launcher only forwarded ~35, so a
+#: config var an operator set on the host (e.g. ``ADSCAN_ATTACK_PATHS_COMPUTE_MAX``,
+#: their attack-path memory workaround) was silently dropped at the container
+#: boundary and never took effect. Inverting to "forward-by-default, exclude
+#: explicitly" makes a newly-added runtime var work with zero launcher changes.
+#:
+#: Every entry here is read by the launcher to drive ``docker run`` mechanics or to
+#: carry host identity — forwarding it is at best useless noise inside the container
+#: and at worst would override a value the launcher computes and injects itself.
+#: Vars the launcher forwards with a COMPUTED value (e.g. ``ADSCAN_UID``/``ADSCAN_GID``,
+#: ``ADSCAN_LOCAL_RESOLVER_IP``, ``ADSCAN_RUNTIME_LICENSE_MODE``, ``ADSCAN_HOME``,
+#: ``ADSCAN_CONTAINER_RUNTIME``, ``ADSCAN_TELEMETRY_ID``, ``ADSCAN_HOST_DISTRO_*``)
+#: do NOT need an entry here: the wildcard skips any key already emitted into the
+#: ``docker run`` argv, so the launcher's injected value always wins.
+LAUNCHER_ONLY_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        # --- docker-run mechanics: which image / runtime / channel to launch ---
+        "ADSCAN_DOCKER_IMAGE",       # image override (launcher image selection)
+        "ADSCAN_DOCKER_CHANNEL",     # stable/dev channel selection
+        "ADSCAN_DOCKER_GPU",         # GPU passthrough mode (launcher wires --gpus/--device)
+        "ADSCAN_DOCKER_GUI",         # X11 GUI passthrough toggle (launcher-side)
+        "ADSCAN_X11_SOCKET_DIR",     # host X11 socket dir the launcher mounts
+        "ADSCAN_CONTAINER_RUNTIME",  # marks "inside container"; launcher sets =1 itself
+        # --- host preflight / capability escape hatches (launcher-only gates) ---
+        "ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK",
+        "ADSCAN_ALLOW_LOW_MEMORY",
+        "ADSCAN_ALLOW_PODMAN_DOCKER_API",
+        "ADSCAN_ALLOW_UNSUPPORTED_ARCH",
+        "ADSCAN_ALLOW_UNSUPPORTED_PLATFORM",
+        "ADSCAN_ALLOW_UNSUPPORTED_WSL",
+        # --- host-shell integration (launcher install/alias mechanics) ---
+        "ADSCAN_CLI_PATH",           # host launcher invocation prefix
+        "ADSCAN_SUDO_ALIAS_MARKER",  # marker line for the auto-sudo shell alias
+    }
+)
+
+
+def is_env_var_forwarded_to_container(key: str) -> bool:
+    """Return whether a host env var named ``key`` reaches the scan container.
+
+    The single source of truth for "will an operator's ``export KEY=...`` take
+    effect inside the scan". A start gate that tells the operator to set an env
+    var must name one this returns ``True`` for, or the recovery instruction is a
+    dead end (the exact PRO partner-tag regression).
+
+    True when either:
+
+    * ``key`` is in the explicit NON-``ADSCAN_`` keep-list (``PASSTHROUGH_ENV_KEYS`` —
+      CI markers, colour hints, shared tokens); or
+    * ``key`` has the ``ADSCAN_`` prefix and is NOT a launcher-only var
+      (``LAUNCHER_ONLY_ENV_KEYS``), i.e. it is covered by the wildcard forward.
+
+    Args:
+        key: The environment variable name.
+
+    Returns:
+        ``True`` if a host value for ``key`` is forwarded into the container.
+    """
+    if key in PASSTHROUGH_ENV_KEYS:
+        return True
+    return key.startswith("ADSCAN_") and key not in LAUNCHER_ONLY_ENV_KEYS
+
+
+def _iter_forwardable_adscan_env(
+    already_emitted: frozenset[str],
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(key, value)`` for every host ``ADSCAN_*`` var to forward.
+
+    Wildcard-forward ADscan's own configuration namespace into the container,
+    with three guards:
+
+    * only keys with the ``ADSCAN_`` prefix (never the whole environment, so no
+      third-party host secrets — ``AWS_*``, tokens, ``HOME`` — leak in);
+    * never a ``LAUNCHER_ONLY_ENV_KEYS`` var (docker-run mechanics / host identity);
+    * never a key already emitted into the ``docker run`` argv (so a value the
+      launcher computes and injects itself — UID/GID, resolver IP, license mode,
+      ``ADSCAN_HOME``, the attack-path defaults — always wins, never double-set).
+
+    Args:
+        already_emitted: ``ADSCAN_*`` keys already present as ``-e KEY=...`` in the
+            command being built.
+
+    Yields:
+        ``(key, value)`` pairs to append as ``-e KEY=value``.
+    """
+    for key, value in os.environ.items():
+        if not key.startswith("ADSCAN_"):
+            continue
+        if key in LAUNCHER_ONLY_ENV_KEYS:
+            continue
+        if key in already_emitted:
+            continue
+        if not str(value).strip():
+            continue
+        yield key, value
 
 
 def build_adscan_run_command(
@@ -1231,22 +1307,10 @@ def build_adscan_run_command(
         ]
     )
 
-    # Forward debug / instrumentation env vars from host to container when
-    # the operator has set them. Without this, an ``ADSCAN_NO_LIVE=1`` on
-    # the host shell never reaches the runtime that actually owns the
-    # Rich Live surfaces, so the toggle is silently a no-op. Each var is
-    # opt-in (only forwarded when explicitly set) so the default runtime
-    # behaviour is unchanged.
-    _OPT_FORWARD_ENV_VARS = (
-        "ADSCAN_NO_LIVE",            # disable LiveSession (probe / dashboards)
-        "ADSCAN_TELEMETRY_TRACE",    # extra telemetry diagnostics (chunks, etc.)
-        "ADSCAN_NO_POSTURE_PROBE",   # skip proactive posture probe phase
-        "ADSCAN_DIAG_RICH",          # rich_output diagnostic stderr trace
-    )
-    for _name in _OPT_FORWARD_ENV_VARS:
-        _value = os.environ.get(_name)
-        if _value is not None and _value != "":
-            cmd.extend(["-e", f"{_name}={_value}"])
+    # (Debug / instrumentation ``ADSCAN_*`` toggles — ``ADSCAN_NO_LIVE``,
+    # ``ADSCAN_TELEMETRY_TRACE``, ``ADSCAN_NO_POSTURE_PROBE``, ``ADSCAN_DIAG_RICH``,
+    # and every other runtime config var — are now forwarded by the wildcard
+    # ``ADSCAN_*`` pass below, so no per-var allow-list is needed.)
 
     # Optional GUI passthrough (X11) for interactive desktop features (e.g., xfreerdp).
     #
@@ -1310,8 +1374,10 @@ def build_adscan_run_command(
         value = str(os.environ.get(key, default_value)).strip()
         cmd.extend(["-e", f"{key}={value}"])
 
-    # Allow-list lives at module scope (PASSTHROUGH_ENV_KEYS) so it can be
-    # asserted against — see tests/unit/launcher/.
+    # Forward the small explicit keep-list of NON-``ADSCAN_`` host vars the
+    # container still needs (CI markers, colour hints, shared tokens). These can
+    # never match the ``ADSCAN_`` prefix, so they stay a named allow-list —
+    # see PASSTHROUGH_ENV_KEYS and tests/unit/launcher/.
     for key in PASSTHROUGH_ENV_KEYS:
         if key in os.environ and str(os.environ.get(key, "")).strip():
             cmd.extend(["-e", f"{key}={os.environ[key]}"])
@@ -1361,6 +1427,24 @@ def build_adscan_run_command(
         host_id = _compute_host_telemetry_id()
         if host_id:
             cmd.extend(["-e", f"{_HOST_TELEMETRY_ID_ENV}={host_id}"])
+
+    # Wildcard-forward ADscan's own configuration namespace (``ADSCAN_*``) LAST,
+    # so ``already_emitted`` captures EVERY ``ADSCAN_*`` key the launcher injects
+    # with a computed value above (UID/GID, resolver IP, license mode, ADSCAN_HOME,
+    # the attack-path defaults, the rewritten Redis URL, host-distro, telemetry id).
+    # This inverts the old key-by-key allow-list: any runtime config var an operator
+    # sets on the host now actually reaches the scan (attack-path tuning, cache
+    # sizes, depth limits, …) instead of being silently dropped at the container
+    # boundary. Launcher-only vars (LAUNCHER_ONLY_ENV_KEYS — docker-run mechanics,
+    # host identity) and already-emitted keys are skipped, so nothing is double-set
+    # and no host value overrides a launcher-computed one.
+    _emitted_adscan_keys = frozenset(
+        arg.split("=", 1)[0]
+        for i, arg in enumerate(cmd)
+        if i > 0 and cmd[i - 1] == "-e" and arg.startswith("ADSCAN_") and "=" in arg
+    )
+    for key, value in _iter_forwardable_adscan_env(_emitted_adscan_keys):
+        cmd.extend(["-e", f"{key}={value}"])
 
     cmd.append(cfg.image)
     cmd.extend(adscan_args)

@@ -605,7 +605,13 @@ class SMBMachine:
 						domain_handle, err = await samrpc.open_domain(domain_sid)
 						if err is not None:
 							raise err
-						async for username, user_sid, err in samrpc.list_domain_users(domain_handle):
+						# Full-replication walk MUST include machine accounts (workstations,
+						# DCs) and trust accounts, not just normal user accounts — a downstream
+						# step needing a machine-account key (S4U2Self, RBCD, silver,
+						# shadow-creds, cross-org TGT delegation) otherwise has no key to
+						# replicate. list_domain_all_principals enumerates with the combined
+						# account-type mask, mirroring impacket's secretsdump DRSUAPI dump.
+						async for username, user_sid, err in samrpc.list_domain_all_principals(domain_handle):
 							if err is not None:
 								yield None, err
 								return

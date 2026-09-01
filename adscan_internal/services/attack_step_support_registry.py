@@ -197,8 +197,15 @@ def internal_support_reasons() -> frozenset[str]:
     return frozenset(reasons)
 
 
+@lru_cache(maxsize=None)
 def classify_relation_support(relation: str) -> RelationSupport:
     """Classify a relation by execution support.
+
+    Pure function of a single hashable ``str`` returning an immutable
+    (``frozen=True, slots=True``) ``RelationSupport``: it reads only the
+    module-level catalog (built at import, never mutated), so the result depends
+    solely on ``relation`` and is safe to memoize across domains. The distinct
+    relation set is small and bounded, so an unbounded cache is memory-safe.
 
     Returns:
         RelationSupport(kind=...) where kind is one of:

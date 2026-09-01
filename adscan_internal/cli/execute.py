@@ -1156,9 +1156,9 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
         telemetry.capture_exception(exc)
         # Always write the full traceback to adscan.debug.log (DEBUG-on-disk,
         # unconditional) so an `execute` failure is diagnosable from the log;
-        # the console stays generic unless --debug/SECRET_MODE is on. Without
-        # this the traceback reached ONLY PostHog and every `execute` error was
-        # an opaque one-liner in the debug log.
+        # the console stays generic unless --debug is on. Without this the
+        # traceback reached ONLY PostHog and every `execute` error was an
+        # opaque one-liner in the debug log.
         print_exception(exception=exc)
         print_error(f"Error executing '{verb}'.")
         exit_code = 1

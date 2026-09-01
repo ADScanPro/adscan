@@ -65,11 +65,20 @@ async def _probe_webdav(
     auth_domain: str | None,
     nt_hash: str | None,
     kdc_ip: str | None,
+    target_hostname: str | None = None,
     timeout: int = 30,
 ) -> WebDAVProbeResult:
-    """Real probe — authenticated aiosmb session, list pipes on IPC$."""
+    """Real probe — authenticated aiosmb session, list pipes on IPC$.
+
+    ``target_hostname`` is the resolved FQDN of the target. It is passed to
+    ``SMBConfig`` so that when Kerberos is used the SMB SPN is
+    ``cifs/<FQDN>`` rather than ``cifs/<ip>`` (which the DC rejects with
+    ``SEC_E_LOGON_DENIED``). ``SMBConfig.__post_init__`` promotes it via the
+    Kerberos-SPN SSOT; a bare IP is preserved as-is (NTLM path unaffected).
+    """
     config = SMBConfig(
         target_ip=host,
+        target_hostname=target_hostname,
         domain=domain,
         username=username,
         password=password,
@@ -106,6 +115,53 @@ async def _probe_webdav(
     )
 
 
+def _resolve_target_fqdn(
+    *, target: "ScanTarget", ctx: "ScanContext", domain: str | None
+) -> str | None:
+    """Best-effort resolve the target host's FQDN for the Kerberos SMB SPN.
+
+    Routes through the same SSOTs the rest of the codebase uses so a bare IP
+    never becomes ``cifs/<ip>`` when Kerberos is engaged:
+
+    - A DC of ``domain`` → ``resolve_dc_fqdn`` (canonical DC FQDN chain).
+    - Any other host → its own hostname from the workspace IP → hostname
+      inventory (massdns/reachability), selected for ``domain`` when possible.
+
+    Returns ``None`` when nothing is recoverable; the SMB path then keeps the
+    IP (correct for the NTLM branch WebDAV uses today). WebDAV does not flip
+    ``use_kerberos``; this only makes the SPN correct if it ever does.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address  # noqa: PLC0415
+
+    domains_data = getattr(ctx, "domains_data", None) or {}
+    inventory = getattr(ctx, "ip_hostname_inventory", None) or {}
+    domain_clean = str(domain or "").strip().rstrip(".") or None
+
+    if target.is_dc and domain_clean and domain_clean in domains_data:
+        from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+
+        fqdn = resolve_dc_fqdn(
+            domains_data.get(domain_clean) or {},
+            target_domain=domain_clean,
+            ip_hostname_inventory=inventory or None,
+        )
+        if fqdn and not is_ip_address(str(fqdn)):
+            return fqdn
+
+    host = str(target.host or "").strip()
+    if inventory and host and is_ip_address(host):
+        from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+            choose_hostname_for_kerberos_spn,
+        )
+
+        chosen = choose_hostname_for_kerberos_spn(
+            ip=host, domain=domain_clean, inventory=inventory
+        )
+        if chosen and not is_ip_address(str(chosen)):
+            return chosen
+    return None
+
+
 def classify(probe: WebDAVProbeResult) -> tuple[CVEStatus, str]:
     """Pure-logic classifier."""
     if probe.error and not probe.pipes_seen:
@@ -133,16 +189,20 @@ class WebDAVCheck:
         creds: Any | None,
         ctx: "ScanContext",
     ) -> list[CVEResult]:
-        del ctx
         if creds is None:
             return [_error(target.host, "WebDAV probe requires authentication")]
 
         username = getattr(creds, "username", None)
         password = getattr(creds, "password", None)
-        domain = getattr(creds, "target_domain", None) or getattr(creds, "domain", None)
+        domain = (
+            target.domain
+            or getattr(creds, "target_domain", None)
+            or getattr(creds, "domain", None)
+        )
         auth_domain = getattr(creds, "auth_domain", None) or domain
         nt_hash = getattr(creds, "nt_hash", None)
         kdc_ip = getattr(creds, "kdc_ip", None)
+        target_hostname = _resolve_target_fqdn(target=target, ctx=ctx, domain=domain)
 
         print_info_verbose(f"[webdav] probing {mark_sensitive(target.host, 'host')}")
         try:
@@ -154,6 +214,7 @@ class WebDAVCheck:
                 auth_domain=auth_domain,
                 nt_hash=nt_hash,
                 kdc_ip=kdc_ip,
+                target_hostname=target_hostname,
                 timeout=self._timeout,
             )
         except Exception as exc:  # noqa: BLE001

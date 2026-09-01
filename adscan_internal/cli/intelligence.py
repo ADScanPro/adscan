@@ -2321,15 +2321,19 @@ def run_attack_path_discovery(
     *,
     max_depth: int = 6,  # requested actionable-edge budget; bounded by _effective_max_depth (user+all caps at 6)
     build_only: bool = False,
+    seen_path_keys: set[tuple[Any, ...]] | None = None,
 ) -> None:
     """Build and display attack paths from ADscan's local attack graph.
 
     ``build_only`` is honoured strictly: when False the table renders and
     execution is enabled; when True the table is suppressed and only the
-    graph artefacts are persisted (the explicit cross-domain merge in
-    ``cli/domains.py`` uses this to build every per-domain graph silently
-    before ``run_cross_domain_attack_path_discovery`` shows the merged
-    view).
+    graph artefacts are persisted. There is no silent ``build_only=True``
+    pre-pass anymore: collection persists every domain's ``attack_graph.json``
+    before the attack-paths phase runs, so the FIRST display compute already
+    sees the full merged, trust-coupled graph (the merge is read-time). The
+    trust pivot now INTERLEAVES per domain — it calls the phase seam once per
+    domain (each ``build_only=False``) threading one shared ``seen_path_keys``
+    ledger, and runs that domain's phases-3+ before the next domain.
 
     Earlier this helper auto-flipped ``effective_build_only = True`` when
     the workspace had multiple configured domains, on the assumption that
@@ -2339,13 +2343,21 @@ def run_attack_path_discovery(
     this helper one domain at a time and does NOT invoke the merge, so
     the auto-flip silently gated execution forever in multi-domain
     workspaces.  Trust the caller's explicit ``build_only``.
+
+    ``seen_path_keys`` is a cross-call de-duplication ledger for the multi-
+    domain scan: the trust pivot threads ONE shared set through every per-domain
+    call (now interleaved with each domain's phases-3+) so a cross-domain path
+    discoverable from several trust-connected domains is shown once (under the
+    first domain that lists it), while each domain's view is still computed over
+    its full trust-union owned set so no path is lost. ``None`` (every other
+    caller) means no de-dup.
     """
     from adscan_internal.services.scan_phases import phase_is_enabled
 
     # ``phases.disabled`` may turn off the discovery phase entirely. Only the
     # interactive discovery/execution pass (``build_only=False``) is skipped;
-    # silent ``build_only=True`` graph builds still run because other phases and
-    # the cross-domain merge depend on those artefacts.
+    # silent ``build_only=True`` graph builds still run because other phases
+    # depend on those artefacts.
     if not build_only and not phase_is_enabled(shell, "attack_paths_discovery"):
         from adscan_core.rich_output import print_info
 
@@ -2359,14 +2371,5 @@ def run_attack_path_discovery(
         target_domain,
         max_depth=max_depth,
         build_only=build_only,
+        seen_path_keys=seen_path_keys,
     )
-
-
-def run_cross_domain_attack_path_discovery(
-    shell: Any,
-    domains: list[str],
-) -> None:
-    """Display merged cross-domain attack paths from local graph artifacts."""
-    from adscan_internal.cli.attack_graph_reports import run_cross_domain_attack_paths
-
-    run_cross_domain_attack_paths(shell, domains)

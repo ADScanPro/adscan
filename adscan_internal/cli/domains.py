@@ -1497,47 +1497,98 @@ def _handle_trust_enumeration_result(
             ]
             phase2_all = selected_domains  # every selected domain needs graph rebuilt
 
-            # Phase 1: native collection only for domains that haven't been collected yet.
+            # Collection FIRST for every domain that still needs it. This MUST
+            # finish for ALL selected domains before any attack-paths compute runs,
+            # because the merged multi-domain graph is read-time: each per-domain
+            # attack-path DFS reads every domain's on-disk ``attack_graph.json`` and
+            # only sees a complete, trust-coupled forest once every graph exists.
+            # (An already-enumerated selected peer + the source domain already have
+            # theirs from an earlier run, so only ``phase1_needed`` collect here.)
             for main_domain in phase1_needed:
                 shell.do_enum_domain_auth_phase1(main_domain)
 
-            # Attack Paths Discovery for the trust/cross-domain pivot. This runs
-            # OUTSIDE ``run_enumeration`` because the merged multi-domain graph can
-            # only be built after every selected domain's Phase-1 chunk above has
-            # populated its ``attack_graph.json``. The lifecycle (announce +
-            # compute + checkpoint) is owned by the single seam
-            # ``run_attack_paths_discovery_phase`` — the SAME seam the per-domain
-            # Phase 2 in ``run_enumeration`` routes through — so this pivot can
-            # never again announce the phase without also marking it complete (the
-            # resume-checkpoint HOLE that ``74cb0c72`` half-fixed). ``announce=True``
-            # here (the seam emits the chapter ONCE, covering both the merged
-            # cross-domain pass and the single selected-domain pass, and keeps the
-            # worker's ``current_phase`` advancing past ``domain_analysis``). The
-            # merged-vs-single choice is a parameter (``len(domains)``), not a fork.
+            # ---- INTERLEAVED per-domain enumeration --------------------------
+            # After collection, run ONE loop over the selected domains that, for
+            # EACH domain in turn, computes THAT domain's attack paths and then runs
+            # THAT domain's remaining phases (quick wins, spraying, SMB, unauth, CVE
+            # …) before moving to the next domain — instead of the old two-loop shape
+            # ``[attack-paths for ALL domains] → [phases-3+ for EACH domain]``.
             #
-            # Checkpoint the phase for the source domain plus every domain that
-            # still needs its phases-3+ chunk (``phase1_needed``) — those are the
-            # domains whose ``scan_progress`` record this pivot drives and where the
-            # hole would otherwise be permanent. Already-complete peers keep their
-            # own (complete) checkpoint; the mark is idempotent.
+            # Consequence, ACCEPTED intentionally: an earlier domain is EXPLOITED
+            # (its phases-3+ run) before a later domain computes its attack paths, so
+            # the later domain sees the graph/credentials already mutated by the
+            # earlier domain's exploitation — realistic cross-domain chaining. Merged-
+            # graph correctness is unaffected: the merge is read-time and every
+            # domain's graph is already on disk before this loop starts (above).
+            #
+            # State that MUST persist across iterations — and does, because the loop
+            # shares ONE ``shell``:
+            #   * the credential pool / ``domains_data`` the shell accumulates as
+            #     each domain is exploited (so what an earlier domain cracks is
+            #     available to a later domain's compute + execution);
+            #   * ONE ``seen_path_keys`` de-duplication ledger threaded through every
+            #     per-domain attack-paths call, so a cross-domain path reachable from
+            #     several trust-connected domains is shown once (under the first
+            #     domain that lists it) even though each domain's attack-paths run is
+            #     now interleaved with its own phases-3+;
+            #   * the per-domain ``scan_progress`` checkpoint (each domain's phase
+            #     lifecycle marks ``attack_paths_discovery`` complete for itself).
+            #
+            # The attack-paths lifecycle (announce + compute + checkpoint) is owned
+            # by the single seam ``run_attack_paths_discovery_phase`` — the SAME seam
+            # the per-domain Phase 2 in ``run_enumeration`` routes through — so this
+            # pivot can never announce the phase without also marking it complete (the
+            # resume-checkpoint HOLE that ``74cb0c72`` half-fixed). ``announce=True``
+            # per domain: each domain's attack-paths gets its own chapter right before
+            # its phases-3+, matching the interleaved narrative and the per-domain
+            # chapters ``run_enumeration`` already emits for phases 3+.
+            #
+            # Checkpoint set is preserved EXACTLY: the source domain plus every
+            # ``phase1_needed`` domain get ``attack_paths_discovery`` marked (those are
+            # the domains whose ``scan_progress`` record this pivot drives, where the
+            # hole would otherwise be permanent). Already-complete selected peers keep
+            # their own (complete) checkpoint — not re-marked here, matching the prior
+            # ``[domain, *phase1_needed]`` set rather than all of ``phase2_all``.
             from adscan_internal.services.attack_paths_phase import (
                 run_attack_paths_discovery_phase,
             )
 
-            checkpoint_domains = list(dict.fromkeys([domain, *phase1_needed]))
-            run_attack_paths_discovery_phase(
-                shell,
-                domains=phase2_all,
-                checkpoint_domains=checkpoint_domains,
-                span_domain=domain,
-                scan_type=getattr(shell, "type", "default"),
-                announce=True,
-            )
+            checkpoint_set = {domain, *phase1_needed}
+            phase1_needed_set = set(phase1_needed)
+            seen_path_keys: set[tuple[Any, ...]] = set()
+            for main_domain in phase2_all:
+                run_attack_paths_discovery_phase(
+                    shell,
+                    domains=[main_domain],
+                    checkpoint_domains=(
+                        [main_domain] if main_domain in checkpoint_set else []
+                    ),
+                    span_domain=main_domain,
+                    scan_type=getattr(shell, "type", "default"),
+                    announce=True,
+                    seen_path_keys=seen_path_keys,
+                )
+                # Phase 3+ only for domains that needed Phase 1 here (new domains).
+                # An already-enumerated selected peer completed phases 3+ in its own
+                # earlier full run, and the source domain completed them before this
+                # pivot; re-running would repeat spraying (lockout-critical) and SMB
+                # touches. This mirrors the old ``for main_domain in phase1_needed``
+                # loop exactly — only now each domain's phases-3+ run immediately
+                # after its own attack paths, not after every domain's.
+                if main_domain in phase1_needed_set:
+                    shell.run_enumeration(main_domain, start_from_phase=3)
 
-            # Phase 3+: only for new domains (credential spraying, share scan, etc.)
-            # Already-enumerated domains completed these phases before the pivot.
-            for main_domain in phase1_needed:
-                shell.run_enumeration(main_domain, start_from_phase=3)
+            # Defensive: if the operator deselected the source domain from scope so
+            # it never appeared in ``phase2_all`` above, its ``attack_paths_discovery``
+            # checkpoint would be missed. The old code checkpointed the source domain
+            # unconditionally (``[domain, *phase1_needed]``); preserve that so a
+            # crash-resume never reports a false hole for the origin.
+            if domain not in phase2_all:
+                from adscan_internal.services import scan_progress as _scan_progress
+
+                _scan_progress.mark_phase_complete(
+                    shell, domain, "attack_paths_discovery"
+                )
         else:
             print_info("No trust relationships found.")
             shell.domains_data[domain]["auth"] = "auth"

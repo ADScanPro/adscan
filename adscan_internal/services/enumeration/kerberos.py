@@ -1643,7 +1643,12 @@ class KerberosEnumerationMixin:
             password: Plaintext password (mutually optional with ``hashes``).
             hashes: NTLM hashes (LM:NT or NT) for pass-the-hash auth.
             auth_domain: Domain the credential belongs to.  Defaults to ``domain``.
-            usersfile: Optional list narrowing the SPN target set.
+            usersfile: Optional file narrowing the roast to a specific target
+                set (an attack-path step targeting one principal). Its entries
+                are intersected with the LDAP SPN enumeration, so only enabled,
+                SPN-bearing accounts present in both are roasted. When ``None``
+                or empty, every enumerated SPN user is roasted (the standalone
+                domain-wide command).
             workspace_dir: Workspace root directory for environment preparation.
             domains_data: Per-domain configuration mapping.
             sync_clock: Optional hook to sync clock with the PDC.
@@ -1703,6 +1708,7 @@ class KerberosEnumerationMixin:
             password=password,
             hashes=hashes,
             auth_domain=normalized_auth_domain,
+            usersfile=usersfile,
             output_file=output_file,
             workspace_dir=workspace_dir,
             domains_data=domains_data,
@@ -1745,6 +1751,7 @@ class KerberosEnumerationMixin:
         password: Optional[str],
         hashes: Optional[str],
         auth_domain: str,
+        usersfile: Optional[Path] = None,
         output_file: Optional[Path],
         workspace_dir: str = "",
         domains_data: dict | None = None,
@@ -1901,6 +1908,45 @@ class KerberosEnumerationMixin:
         if not target_usernames:
             print_warning("No usable SPN-bearing usernames after filtering.")
             return []
+
+        # Narrow to the requested target set when a usersfile is supplied
+        # (an attack-path step targeting ONE principal). The LDAP enum stays
+        # authoritative — it applies the disabled-account filter and proves the
+        # account actually bears an SPN — so we INTERSECT the requested set with
+        # the enum rather than roasting the file blindly. When no usersfile is
+        # given (the standalone domain-wide command), roast every enumerated SPN
+        # user unchanged.
+        requested = self._read_target_lines(usersfile) if usersfile else []
+        if requested:
+            enum_count = len(target_usernames)
+            requested_keys = {
+                key for entry in requested if (key := self._normalize_sam_key(entry))
+            }
+            narrowed = [
+                sam
+                for sam in target_usernames
+                if self._normalize_sam_key(sam) in requested_keys
+            ]
+            print_info_debug(
+                "kerberoast target-narrowing: "
+                f"enum={enum_count} requested={len(requested_keys)} "
+                f"narrowed={len(narrowed)} "
+                f"targets={[mark_sensitive(sam, 'user') for sam in narrowed]}"
+            )
+            if not narrowed:
+                # The requested principal is not in the SPN enumeration (no
+                # kerberoastable SPN, or disabled). Do NOT fall back to
+                # roast-all and never roast a different principal — honour the
+                # target and return empty so the step fails honestly.
+                requested_display = ", ".join(
+                    mark_sensitive(entry, "user") for entry in requested
+                )
+                print_warning(
+                    f"Kerberoast target(s) {requested_display} have no kerberoastable "
+                    "SPN in the directory (not enumerable / disabled); nothing to roast."
+                )
+                return []
+            target_usernames = narrowed
 
         print_info_verbose(
             f"Requesting service tickets for {len(target_usernames)} user(s)..."
@@ -2068,6 +2114,25 @@ class KerberosEnumerationMixin:
         """Return the first value for one attribute from an ldap3 mapping."""
         values = cls._attribute_values(mapping, attribute)
         return values[0] if values else None
+
+    @staticmethod
+    def _normalize_sam_key(value: str) -> str:
+        """Reduce a roast-target entry to a bare, case-folded sAMAccountName.
+
+        AD sAMAccountNames are case-insensitive, and a usersfile entry may be a
+        bare name (``jon.snow``), a UPN (``jon.snow@north.local``), or a
+        down-level logon name (``NORTH\\jon.snow``). All three must match the
+        same directory account, so strip any realm/UPN suffix or domain prefix
+        and case-fold what remains before comparing.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if "@" in text:
+            text = text.split("@", 1)[0]
+        if "\\" in text:
+            text = text.rsplit("\\", 1)[-1]
+        return text.strip().casefold()
 
     def asreproast(
         self,

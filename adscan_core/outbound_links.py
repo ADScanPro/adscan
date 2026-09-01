@@ -134,6 +134,13 @@ _PLACEMENTS: dict[str, _Placement] = {
     "victory_da_compromise": _Placement("/pro"),
     # `adscan demo` closing panels.
     "demo_closing": _Placement("/pro"),
+    # ── Enterprise demo (/get-a-demo) ───────────────────────────────────────
+    # The buyer's lane. When the operator identified as running their OWN estate
+    # (internal security / sysadmin-blue-team / security-manager-CISO), the
+    # peak-value CTA points at the Enterprise demo, not the /pro CLI — this is the
+    # person who books a demo and buys, not the pentester who runs the tool.
+    "victory_enterprise_demo": _Placement("/get-a-demo"),
+    "session_summary_enterprise_demo": _Placement("/get-a-demo"),
     # The "Get beta access" line shown when a PRO-only import is absent.
     # (``beta_access_graph_validation`` was retired when attack-graph finding
     # validation moved into the tier-shared derivation and stopped being a

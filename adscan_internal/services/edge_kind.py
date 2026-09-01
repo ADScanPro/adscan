@@ -354,6 +354,11 @@ _ESCALATION_EDGES: Final[frozenset[str]] = frozenset(
         # trusting forest (Domain -> Domain). Modeled from the trust attribute;
         # execution is a separate follow-up.
         "CrossOrgTgtDelegation",
+        # Same-forest child->parent escalation (RaiseChild): a compromised child
+        # domain forges an inter-realm TGT with the parent's SID history to become
+        # Enterprise Admin at the forest root (Domain -> Domain). ADscan native
+        # (raise_child_native); modeled from the WITHIN_FOREST child/parent trust.
+        "RaiseChild",
     }
 )
 

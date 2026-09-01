@@ -1210,6 +1210,31 @@ def _prompt_dc_discovery_recovery(
     return _DcDiscoveryRecoveryDecision(action="retry_scope", hosts=new_hosts)
 
 
+def _maybe_ask_operator_role_at_startup(shell) -> None:
+    """Ask the once-ever operator-role question at the first interactive scan.
+
+    Runs at the start of ``start_auth`` / ``start_unauth`` (both converge here
+    after the type/interface prompts). It is once-ever, tied to the didactic mode
+    (the answer is persisted and steers what the didactic card emphasises and
+    which commercial CTA the operator sees). In non-interactive / CI / offline /
+    telemetry-off runs it renders nothing and never blocks — the survey's own
+    ``survey_suppressed`` gate plus the centralized prompt helper handle that.
+    Best-effort: a failure here never aborts the scan.
+    """
+    try:
+        from adscan_internal.services.operator_survey import (  # noqa: PLC0415
+            ask_operator_role_at_startup,
+        )
+
+        ask_operator_role_at_startup(shell)
+    except Exception as exc:  # noqa: BLE001
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def _run_start_unauth_impl(shell, args: str | None) -> bool:
     """Start unauthenticated scan using the legacy PentestShell implementation.
 
@@ -1234,6 +1259,11 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
     if not shell._prompt_auto_if_missing():
         return False
 
+    # Once-ever operator-role question, at the first interactive scan (before the
+    # heavy work). Feeds the didactic emphasis + the commercial CTA lane; silent
+    # and non-blocking in CI / offline / telemetry-off.
+    _maybe_ask_operator_role_at_startup(shell)
+
     # Ask if user wants to clean workspace before starting scan (only if needed)
     _prompt_workspace_cleanup(shell)
 
@@ -1242,25 +1272,42 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
     # the time the scan reaches the crack step. No-op when already cached-fresh.
     warm_benchmark_async(shell)
 
-    # Always show scan-type guidance (even in args mode) to steer credentialed users
-    # towards start_auth. Only prompt when interactive so automation doesn't block.
-    print_panel(
-        "[bold]Pick the scan mode that matches what you already hold.[/bold]\n\n"
-        "[bold cyan]›[/bold cyan]  [bold cyan]Authenticated[/bold cyan]   "
-        "[dim](recommended if you have valid domain credentials)[/dim]\n"
-        "    covers every unauthenticated check, plus full authenticated enumeration\n"
-        "    deeper attack-path graph, ACL analysis, ADCS, kerberoasting, lateral moves\n"
-        "    [dim]requires:[/dim] domain, DC/PDC IP, username, and password or NTLM hash\n\n"
-        "[bold yellow]›[/bold yellow]  [bold yellow]Unauthenticated[/bold yellow]  "
-        "[dim](black-box, no credentials yet)[/dim]\n"
-        "    domain discovery, anonymous and guest enumeration, AS-REP roasting\n"
-        "    initial-access primitives and credential-recovery vectors\n"
-        "    [dim]requires:[/dim] a target IP range or a known DC IP",
-        title="[bold]» Choose Scan Type[/bold]",
-        border_style="cyan",
-        padding=(1, 2),
+    # Scan-type guidance steers credentialed users towards start_auth. The long
+    # explainer PANEL is show-once onboarding (key `scan_type_explainer`): once an
+    # operator has read it, we don't repeat the wall of text on every later scan —
+    # the cheap yes/no prompt below stays every time. In non-interactive/CI mode
+    # the panel is skipped as noise and the flag is NOT consumed, so the first real
+    # interactive user still sees it. (See adscan_core.first_run_notices.)
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+    from adscan_core.first_run_notices import (  # noqa: PLC0415
+        NOTICE_SCAN_TYPE_EXPLAINER,
+        mark_shown,
+        should_show_once,
     )
 
+    if not is_non_interactive(shell) and should_show_once(NOTICE_SCAN_TYPE_EXPLAINER):
+        print_panel(
+            "[bold]Pick the scan mode that matches what you already hold.[/bold]\n\n"
+            "[bold cyan]›[/bold cyan]  [bold cyan]Authenticated[/bold cyan]   "
+            "[dim](recommended if you have valid domain credentials)[/dim]\n"
+            "    covers every unauthenticated check, plus full authenticated enumeration\n"
+            "    deeper attack-path graph, ACL analysis, ADCS, kerberoasting, lateral moves\n"
+            "    [dim]requires:[/dim] domain, DC/PDC IP, username, and password or NTLM hash\n\n"
+            "[bold yellow]›[/bold yellow]  [bold yellow]Unauthenticated[/bold yellow]  "
+            "[dim](black-box, no credentials yet)[/dim]\n"
+            "    domain discovery, anonymous and guest enumeration, AS-REP roasting\n"
+            "    initial-access primitives and credential-recovery vectors\n"
+            "    [dim]requires:[/dim] a target IP range or a known DC IP",
+            title="[bold]» Choose Scan Type[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        mark_shown(NOTICE_SCAN_TYPE_EXPLAINER)
+
+    # The credentials yes/no is a per-scan decision (one Enter skips it) and is a
+    # SAFEGUARD-class question about THIS scan, so it always renders — never
+    # show-once. It gates on TTY, not on is_non_interactive, to keep existing CI
+    # behaviour identical.
     if sys.stdin.isatty():
         cred_prompt = Text.assemble(
             ("Do you have domain credentials? ", "cyan"),
@@ -1285,6 +1332,30 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
             return False
 
         print_info("Continuing with unauthenticated scan")
+
+        # SHOW-ONCE onboarding: the signed unauth playbook / note goes here (the
+        # operator has just committed to the unauthenticated path). It is show-once
+        # (key `unauth_playbook`) AND additionally gated so it is skipped when the
+        # didactic level is OFF (a senior operator asked for no teaching). Same
+        # store as the panel above (mounted state dir), so a host launcher and the
+        # container agree on whether it has been seen.
+        #
+        # TODO(onboarding-note): another agent is authoring the actual unauth
+        # playbook note signed by Yeray. When it lands, wrap its render exactly
+        # like this and drop this scaffold:
+        #
+        #     from adscan_internal.services.didactic_service import (
+        #         ExplainLevel, resolve_explain_level,
+        #     )
+        #     from adscan_core.first_run_notices import (
+        #         NOTICE_UNAUTH_PLAYBOOK, mark_shown, should_show_once,
+        #     )
+        #     if (
+        #         resolve_explain_level(shell) is not ExplainLevel.OFF
+        #         and should_show_once(NOTICE_UNAUTH_PLAYBOOK)
+        #     ):
+        #         render_unauth_playbook_note()   # <- the not-yet-written note
+        #         mark_shown(NOTICE_UNAUTH_PLAYBOOK)
     else:
         print_info(
             "[dim]Tip: If you have credentials, use `start_auth` for full coverage.[/dim]"
@@ -1743,16 +1814,13 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         properties["preflight_check_overridden"] = bool(
             shell.preflight_check_overridden
         )
-        # Add workspace_id_hash to count unique workspaces per user
-        # Hash combines TELEMETRY_ID + workspace_name for uniqueness across users
-        if shell.current_workspace:
-            import hashlib
-            from adscan_internal.telemetry import TELEMETRY_ID
+        # Attribution key shared with the rest of the unauth->credential funnel:
+        # ``workspace_type`` (audit/ctf segment) + ``workspace_id_hash`` (stable
+        # per-(install, workspace) id) so a later credential can be joined back to
+        # this session. SSOT helper — do not re-derive the hash inline.
+        from adscan_internal.cli.common import build_workspace_attribution_fields
 
-            workspace_unique_id = f"{TELEMETRY_ID}:{shell.current_workspace}"
-            properties["workspace_id_hash"] = hashlib.sha256(
-                workspace_unique_id.encode()
-            ).hexdigest()[:12]
+        properties.update(build_workspace_attribution_fields(shell))
         telemetry.capture("start_unauth", properties)
 
         # Scan each service sequentially
@@ -3646,6 +3714,11 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
 
     if not shell._prompt_auto_if_missing():
         return False
+
+    # Once-ever operator-role question, at the first interactive scan (before the
+    # heavy work). Feeds the didactic emphasis + the commercial CTA lane; silent
+    # and non-blocking in CI / offline / telemetry-off.
+    _maybe_ask_operator_role_at_startup(shell)
 
     # Smart-resume front door — when this workspace already holds results for one
     # or more scanned domains and the operator ran ``start_auth`` with NO positional

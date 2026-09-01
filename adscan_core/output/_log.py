@@ -1609,10 +1609,23 @@ def print_exception(
 ):
     """Print exception traceback with Rich formatting.
 
-    **IMPORTANT**: Tracebacks are only shown when `SECRET_MODE = True` to protect
-    internal implementation details. When `SECRET_MODE = False`, only a generic
-    error message is displayed to end users. Full traceback details are still
-    persisted to ADscan log files through the centralized Rich logging pipeline.
+    **IMPORTANT**: The full traceback is only shown ON THE VISIBLE TERMINAL under
+    ``--debug`` (:func:`is_debug_mode`). Without ``--debug`` only a generic,
+    path-stripped one-line error is displayed, so a normal run stays clean.
+
+    Two sinks always receive the full traceback, regardless of ``--debug``:
+
+    * the ADscan debug log file (``adscan.debug.log``), via
+      :func:`_log_exception_to_file`; and
+    * the session telemetry recording, rendered into the ``telemetry_console``
+      buffer. That buffer is sanitized whole-buffer, source-agnostic, and
+      fail-closed at export time (``telemetry.py``), so the traceback is scrubbed
+      by the same scrubber as every other recorded output and introduces no new
+      unsanitized channel. This is what lets a session reviewer diagnose a
+      swallowed exception that never reached the operator's terminal.
+
+    Captured credentials are protected independently by ``mark_sensitive`` +
+    the export-time sanitizer, not by this visibility gate.
 
     Args:
         show_locals: If True, show local variables in traceback (default: False)
@@ -1625,8 +1638,8 @@ def print_exception(
         try:
             risky_operation()
         except Exception as e:
-            # In SECRET_MODE: shows full traceback
-            # In normal mode: shows generic error message
+            # Under --debug: shows full traceback
+            # Without --debug: shows generic error message
             print_exception(show_locals=True, exception=e)
     """
     _log_exception_to_file(
@@ -1637,25 +1650,54 @@ def print_exception(
     console = _get_console()
     telemetry_console = _get_telemetry_console()
 
-    # Only show full tracebacks in SECRET_MODE (protects internal structure)
-    if _state._secret_mode:
+    # Always route the traceback into the SANITIZED telemetry recording, regardless
+    # of --debug. --debug governs the VISIBLE terminal only (end-user output stays
+    # generic without --debug); the session recording is the reviewer's single best
+    # bug evidence, so it must carry the traceback even when the terminal does not.
+    # The telemetry buffer is sanitized whole-buffer, source-agnostic, and
+    # fail-closed at export time (telemetry.py), so a Traceback renderable dropped
+    # into it is scrubbed identically to any other recorded output — it introduces
+    # NO new unsanitized channel. Best-effort: a broken record buffer must never
+    # break the visible flow (TeeConsole invariant).
+    if telemetry_console is not None:
+        try:
+            from rich.traceback import Traceback
+
+            if exception is not None:
+                telemetry_traceback = Traceback.from_exception(
+                    type(exception),
+                    exception,
+                    exception.__traceback__,
+                    show_locals=show_locals,
+                )
+                telemetry_console.print(telemetry_traceback)
+            else:
+                telemetry_console.print_exception(show_locals=show_locals)
+        except Exception:
+            # A telemetry-buffer failure must never interrupt the visible flow.
+            pass
+
+    # Only show full tracebacks ON SCREEN under --debug (keeps a normal run clean).
+    # The telemetry mirror already happened explicitly above, so wrap the visible
+    # print in _explicit_telemetry_mirror to keep the _TeeConsole auto-mirror from
+    # recording the same traceback a SECOND time.
+    if _state.is_debug_mode():
         # Rich's Console.print_exception() requires an active exception context.
         # When an exception object is provided (e.g. raised elsewhere and stored),
         # render it explicitly to avoid ValueError: "Value for 'trace' required...".
-        if exception is not None:
-            from rich.traceback import Traceback
+        with _state._explicit_telemetry_mirror():
+            if exception is not None:
+                from rich.traceback import Traceback
 
-            traceback_renderable = Traceback.from_exception(
-                type(exception),
-                exception,
-                exception.__traceback__,
-                show_locals=show_locals,
-            )
-            console.print(traceback_renderable)
-        else:
-            console.print_exception(show_locals=show_locals)
-            if telemetry_console is not None:
-                telemetry_console.print_exception(show_locals=show_locals)
+                traceback_renderable = Traceback.from_exception(
+                    type(exception),
+                    exception,
+                    exception.__traceback__,
+                    show_locals=show_locals,
+                )
+                console.print(traceback_renderable)
+            else:
+                console.print_exception(show_locals=show_locals)
     else:
         # Generic error message for end users (no internal details)
         # Never show tracebacks, file paths, or internal structure

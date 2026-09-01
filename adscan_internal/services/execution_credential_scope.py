@@ -120,6 +120,53 @@ class CarriedCredential:
         return SCOPE_DOMAIN
 
 
+# Which material source a resolved step actor came from — ranked by specificity
+# of proof (a purpose-minted scoped ticket outranks a generic machine account).
+ACTOR_SOURCE_SCOPED_TICKET: Final[str] = "scoped_ticket"
+ACTOR_SOURCE_CARRY_FORWARD: Final[str] = "carry_forward"
+ACTOR_SOURCE_MACHINE_ACCOUNT: Final[str] = "machine_account"
+ACTOR_SOURCE_SOURCE_OWNED: Final[str] = "source_owned"
+ACTOR_SOURCE_GENERIC_HOST: Final[str] = "generic_host"
+
+
+@dataclass(frozen=True)
+class StepExecutionActor:
+    """The concrete principal + secret an attack step executes as.
+
+    The one answer to "what material do I use to run this step against this
+    host?" — the same question the start-step selector asks as a boolean ("is
+    this step actionable?"). The selector, the per-step context builder, and the
+    dump executor all consume this so they can never disagree on whether a step
+    is runnable and, if so, as whom.
+
+    * ``username`` is the principal to log in as (for a scoped ticket, the
+      ticket's ``impersonated_user``; otherwise the owned principal).
+    * ``secret`` is the password, NT hash, or ccache path.
+    * ``islocal`` is ``"true"`` only for a credential that names an account local
+      to the host's SAM (the dump entry points take it verbatim); never inferred
+      from the account name.
+    * ``source`` names WHICH material source produced this actor, for the
+      operator log and for ranking (see the ``ACTOR_SOURCE_*`` constants). A
+      scoped-ticket / capability-bearing ccache flows through as-is and is NEVER
+      re-minted (credential-storage doctrine, second axis).
+    """
+
+    username: str
+    secret: str
+    islocal: str = "false"
+    source: str = ""
+
+    @property
+    def is_ccache(self) -> bool:
+        """Whether ``secret`` is a scoped-ticket / capability-bearing ccache path.
+
+        A scoped ticket and a capability-bearing (ESC13) ccache MUST be used
+        as-is — re-minting destroys the impersonation / synthetic SID. Only these
+        two ``source`` kinds carry a ccache in ``secret``.
+        """
+        return self.source in {ACTOR_SOURCE_SCOPED_TICKET}
+
+
 # ---------------------------------------------------------------------------
 # Which host does a step authenticate to?
 # ---------------------------------------------------------------------------
@@ -179,6 +226,61 @@ _RELATION_TO_LOCAL_SERVICE: Final[dict[str, str]] = {
     "sqladmin": "mssql",
     "sqlaccess": "mssql",
 }
+
+
+def relation_authenticates_to_source_host(relation: str) -> bool:
+    """Return whether a step authenticates to its SOURCE host (dump family + HasSession).
+
+    These are the carry-forward post-exploitation steps whose acting credential is
+    the session a PRIOR access step established on the source host — never
+    ownership of the source principal. The executor and the ownership gate resolve
+    their actor via the chained-foothold predicate for exactly this set; blind
+    "any stored credential" selection must never fire for them.
+    """
+    return str(relation or "").strip().lower() in _HOST_AUTH_FROM_SOURCE
+
+
+# --------------------------------------------------------------------------- #
+# Host-execution-read relations — the strict anti-wrong-principal gate carve-out
+# --------------------------------------------------------------------------- #
+#
+# The strict SOURCE-ownership gate exists to stop a MODIFICATION running as a
+# principal we do not control (the "DCSync-from-a-group-you-don't-control" bug,
+# which was really a *dacledit grant* running as a non-member). That danger is
+# real for control/modification steps and UNREAL for host-execution READS: for a
+# read, a wrong principal is a harmless STATUS_LOGON_FAILURE /
+# ERROR_DS_DRA_ACCESS_DENIED — an honest ``attempted`` under the
+# Exposure-Validation doctrine, never directory damage.
+#
+# This is the whole Set B (host-execution read): the source-authenticating dump
+# family + HasSession, plus DCSync. It is the SET_B side of the Set-A/Set-B split
+# that the step-execution actor SSOT uses to decide whether steps 1-3 and the
+# non-strict generic-host fallback (step 5) are even offered. It is a RELATION-
+# level predicate, NOT an ``EdgeKind`` change: DCSync's ``EdgeKind`` stays
+# ``CONTROL`` (reclassifying it would ripple into severity / ordering /
+# nomenclature) — the read-vs-control distinction lives here alone.
+#
+# DCSync joins the source-authenticating set because it, too, authenticates to a
+# host (a domain controller over DRSUAPI-over-SMB) and never runs a directory
+# WRITE: it only replicates secrets. So a scoped ``cifs/<dc>`` ticket, an owned
+# ``<dc>$`` machine account, or a generic host credential are all legitimate
+# actors to attempt it with.
+_HOST_EXECUTION_READ_RELATIONS: Final[frozenset[str]] = _HOST_AUTH_FROM_SOURCE | frozenset(
+    {"dcsync"}
+)
+
+
+def relation_is_host_execution_read(relation: str) -> bool:
+    """Return whether a relation is a HOST-EXECUTION READ (Set B) step.
+
+    Set B = the source-authenticating dump family + HasSession + DCSync. These
+    steps authenticate to a host to READ secrets; they never modify the
+    directory, so the strict anti-wrong-principal source gate does NOT apply to
+    them. Everything else (Set A: control / modification / ACL / delegation /
+    escalation / target-side access) keeps the strict gate: a wrong principal
+    there corrupts the directory or runs a write from an uncontrolled identity.
+    """
+    return str(relation or "").strip().lower() in _HOST_EXECUTION_READ_RELATIONS
 
 
 def step_authentication_host(
@@ -346,16 +448,24 @@ def islocal_flag_for(
 
 
 __all__ = [
+    "ACTOR_SOURCE_CARRY_FORWARD",
+    "ACTOR_SOURCE_GENERIC_HOST",
+    "ACTOR_SOURCE_MACHINE_ACCOUNT",
+    "ACTOR_SOURCE_SCOPED_TICKET",
+    "ACTOR_SOURCE_SOURCE_OWNED",
     "APPLIED_DOMAIN",
     "APPLIED_LOCAL",
     "CarriedCredential",
     "SCOPE_DOMAIN",
     "SCOPE_LOCAL",
+    "StepExecutionActor",
     "WITHHELD_HOST_MISMATCH",
     "WITHHELD_NOT_HOST_AUTHENTICATING",
     "derive_carried_credential",
     "islocal_flag_for",
     "local_service_for_relation",
+    "relation_authenticates_to_source_host",
+    "relation_is_host_execution_read",
     "scope_carried_credential_to_step",
     "step_authentication_host",
 ]

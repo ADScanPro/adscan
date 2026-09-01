@@ -164,6 +164,7 @@ DISPLAY_NAME_OVERRIDES: dict[str, str] = {
     "privilegedgroupcontrol": "Privileged Group Control",
     "readgmsapassword": "Read gMSA Password",
     "crossorgtgtdelegation": "Cross-Forest TGT Delegation",
+    "raisechild": "Child-to-Forest-Root Escalation",
     "readlapspassword": "Read LAPS Password",
     "readshare": "Readable Share",
     "scheduledtask": "Scheduled Task Execution",

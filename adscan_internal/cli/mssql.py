@@ -4352,10 +4352,73 @@ def run_xpcmdshell_system_escalation_followup(
                     telemetry.capture_exception(cred_exc)
                     print_exception(exception=cred_exc)
             else:
-                print_info_debug(
-                    "MSSQL SYSTEM escalation follow-up: group membership not "
-                    "confirmed; skipping credential handoff."
-                )
+                # RC1 (HTB DarkZero cross-forest): distinguish an INCONCLUSIVE
+                # verify from a real add FAILURE. When the ``net group /add``
+                # itself succeeded (``result.add_succeeded``) but the post-hoc
+                # RID-512 LDAP verify came back inconclusive over the pivot (both
+                # queries timed out / the bind failed without raising — see the
+                # [ldap-group-rid] ... INCONCLUSIVE diagnostic), the account
+                # genuinely IS a Domain Admin (the machine-account DCSync below
+                # succeeds as proof). Hand the credential off exactly like the
+                # ``skip_live_verification`` trust path (7 above): the SYSTEM
+                # session + a successful privileged group /add over the
+                # linked-server SQL channel already proved the escalation, so a
+                # frail LDAP verify over the pivot must not drop it. This is what
+                # lets ``handle_privs`` run its standard ask_for_user_privs (gated
+                # on ``updated_auth_status != "pwned"``) FROM the minted DA, which
+                # is what discovers and executes the outbound cross-domain path
+                # (DA -> DCSync -> CrossOrgTgtDelegation -> darkzero.htb). We do
+                # NOT force ask_for_user_privs — handle_privs owns that decision
+                # and is a no-op when the domain is already pwned or when we are
+                # mid attack-path execution.
+                #
+                # Only an ``add_succeeded=False`` (a genuine add FAILURE) skips
+                # the handoff — trusting THAT would hand a non-privileged
+                # credential downstream. The runtime membership snapshot
+                # (memberships.json) is NOT written here (that stays gated on the
+                # confirmed path above), per "only write a membership you have
+                # PROVEN": add_credential re-verifies the credential in its own
+                # flow, but the durable snapshot must reflect only confirmed adds.
+                if result.add_succeeded:
+                    try:
+                        target_pdc_ip, skip_live_verification = (
+                            _resolve_target_pdc_for_extraction(
+                                shell,
+                                domain=domain,
+                                target_domain=target_domain,
+                                kdc_host=kdc_host,
+                                source_host=source_host,
+                                username=username,
+                                password=password,
+                                linked_server=linked_server,
+                                xp_result=xp_result,
+                            )
+                        )
+                        print_info_debug(
+                            "MSSQL SYSTEM escalation follow-up: group /add "
+                            "succeeded but RID-512 verify was INCONCLUSIVE over "
+                            "the pivot; trusting the credential and handing it off "
+                            "(handle_privs decides whether to search attack paths "
+                            "from it)."
+                        )
+                        shell.add_credential(
+                            target_domain,
+                            admin_user,
+                            admin_pw,
+                            host=None if is_dc else target_host,
+                            pdc_ip=target_pdc_ip or None,
+                            prompt_for_user_privs_after=True,
+                            credential_origin="mssql_seimpersonate",
+                            trusted_manual_validation=True,
+                        )
+                    except Exception as inconclusive_handoff_exc:  # noqa: BLE001
+                        telemetry.capture_exception(inconclusive_handoff_exc)
+                        print_exception(exception=inconclusive_handoff_exc)
+                else:
+                    print_info_debug(
+                        "MSSQL SYSTEM escalation follow-up: group /add FAILED "
+                        "(add_succeeded=False); skipping credential handoff."
+                    )
                 # RC: even though the FRESHLY-MINTED account's group membership
                 # could not be confirmed (e.g. a single immediate RID-512 LDAP
                 # probe returned inconclusive over the pivot, or replication

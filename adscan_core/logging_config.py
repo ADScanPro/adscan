@@ -305,7 +305,6 @@ def init_logging(
     console: Console,
     verbose_mode: bool = False,
     debug_mode: bool = False,
-    secret_mode: bool = False,
     log_dir: Optional[Path] = None,
     workspace_dir: Optional[Path] = None,
     telemetry_console: Optional[Console] = None,
@@ -315,8 +314,7 @@ def init_logging(
     Args:
         console: Rich Console instance for console output
         verbose_mode: Enable verbose console output
-        debug_mode: Enable debug console output
-        secret_mode: Enable secret mode (show paths in tracebacks)
+        debug_mode: Enable debug console output (shows paths in tracebacks)
         log_dir: Directory for log files (defaults to ~/.adscan/logs)
         workspace_dir: Optional workspace directory for workspace-specific logs
 
@@ -576,7 +574,7 @@ def init_logging(
     # markup=True renders literally instead of raising a MarkupError).
     console_handler = _VisibleRichHandler(
         rich_tracebacks=True,
-        show_path=bool(debug_mode or secret_mode),
+        show_path=bool(debug_mode),
         console=console,
         show_time=False,  # Rich handles time visually
         markup=True,  # Support Rich markup in log messages

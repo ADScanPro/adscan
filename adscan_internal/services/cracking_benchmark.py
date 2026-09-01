@@ -33,8 +33,8 @@ from adscan_core.rich_output import print_exception, print_warning_debug
 # the effort engine to the safe "fast" tier and nothing else. So none of its
 # failures may reach the operator as an error.
 #
-# ``print_exception`` is the wrong sink for them on two counts. It renders
-# ``✗ Error: <str(exc)>`` with SECRET_MODE off, and the exception text here is
+# ``print_exception`` is the wrong sink for them on two counts. Without
+# ``--debug`` it renders ``✗ Error: <str(exc)>``, and the exception text here is
 # a raw ``subprocess`` message carrying the FULL internal command line
 # (``Command 'taskset -c 0-6 nice -n 19 hashcat -b ...' timed out``) — an
 # internal tool name and command string, both forbidden in default output. And
@@ -42,7 +42,7 @@ from adscan_core.rich_output import print_exception, print_warning_debug
 # the field two of these landed between a live prompt and the answer being
 # typed. ``print_warning_debug`` keeps the full detail in
 # ``adscan.debug.log`` (always) and on the console only under ``--debug``,
-# where SECRET_MODE is on and the command is fair game.
+# where the command line is fair game.
 #
 # ``adscan benchmark`` — the one place a human DID ask — still renders its own
 # clear, tool-name-free verdict when no rates come back.

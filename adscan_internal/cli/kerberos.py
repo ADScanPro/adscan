@@ -75,35 +75,41 @@ from adscan_internal.workspaces import (
 from adscan_core.rich_output import print_exception
 
 
+# DCSync target-user selector — the "krbtgt only" opt-in.
+# Label the operator reads in the selector; the value it resolves to is the
+# single account ``krbtgt`` so the call site replicates ONLY that account
+# (targeted replication, not the full NTDS walk). See ``_resolve_dcsync_target_user``.
+_DCSYNC_KRBTGT_ONLY_LABEL = "krbtgt only (prove domain compromise, no full dump)"
+_DCSYNC_KRBTGT_ONLY_VALUE = "krbtgt"
+
+
 def _resolve_dcsync_target_user(
     shell: Any, *, domain: str, username: str | None = None
 ) -> str | None:
     """Resolve the target user for interactive DCSync execution.
 
-    Keeps ``All`` as a first-class option while still guiding the operator with
-    known privileged accounts when available.
+    Offers, in order: ``All`` (full NTDS replication — the default), a
+    ``krbtgt only`` opt-in, each known Domain Admin, then ``Enter manually`` /
+    ``Cancel``.
 
-    Default-to-"All" policy (the priority is: get a DA credential first, THEN
-    replicate everything — a full "All" can be slow/fragile at 10k-user scale):
-    default to "All" when we ALREADY hold a Domain Admin credential — either the
-    domain is already pwned, OR ``username`` (the principal running THIS DCSync)
-    is itself a DA (e.g. ESC1 just minted administrator). When the executor is
-    NOT a DA (e.g. an ESC8 DC machine account replicating to EXTRACT a DA),
-    default to the single DA member so we get the DA first; the post-compromise
-    pipeline then runs the full "All" once that DA credential is in hand.
+    Default policy: the selector always defaults to ``All``. A full NTDS
+    replication is what an audit engagement wants (it feeds the password-audit
+    cracking pipeline), and a non-interactive run (``adscan ci``) auto-resolves
+    to this default — a full dump by design.
+
+    ``krbtgt only`` is an INTERACTIVE opt-in for the operator who already
+    controls a Domain Admin and wants to prove full domain compromise / krbtgt
+    persistence with the minimal-noise single-account replication instead of
+    pulling the whole directory. It resolves to the single ``krbtgt`` account,
+    which the caller turns into a targeted ``target_users=["krbtgt"]`` request.
     """
     admins = shell.get_domain_admins(domain)
-    da_set = {str(a or "").strip().casefold() for a in admins if str(a or "").strip()}
-    executor_is_da = bool(username) and str(username).strip().casefold() in da_set
-    already_pwned = (shell.domains_data.get(domain, {}) or {}).get("auth") in ["pwned"]
-    default_user = (
-        "All"
-        if (already_pwned or executor_is_da)
-        else (admins[0] if admins else "Administrator")
-    )
+    # The selector always defaults to "All" (index 0); a non-interactive run
+    # auto-resolves to it, so CI performs the full NTDS dump for the audit.
+    default_user = "All"
     selector = getattr(shell, "_questionary_select", None)
     if callable(selector):
-        options = ["All"]
+        options = ["All", _DCSYNC_KRBTGT_ONLY_LABEL]
         for admin in admins:
             candidate = str(admin or "").strip()
             if not candidate or candidate in options:
@@ -114,11 +120,7 @@ def _resolve_dcsync_target_user(
             selected_idx = selector(
                 f"Select the user to extract NTLM hashes from in {mark_sensitive(domain, 'domain')}:",
                 options,
-                default_idx=0
-                if default_user == "All"
-                else max(options.index(default_user), 0)
-                if default_user in options
-                else 0,
+                default_idx=0,  # "All" — full NTDS replication
             )
         except TypeError:
             selected_idx = selector(
@@ -130,6 +132,8 @@ def _resolve_dcsync_target_user(
         choice = options[selected_idx]
         if choice == "Cancel":
             return None
+        if choice == _DCSYNC_KRBTGT_ONLY_LABEL:
+            return _DCSYNC_KRBTGT_ONLY_VALUE
         if choice == "Enter manually":
             target_user_raw = Prompt.ask(
                 "Specify the user to extract NTLM hashes from (type 'All' for all users)",

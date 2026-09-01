@@ -533,7 +533,12 @@ def _handle_capture(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
 
-    shell.ask_for_cracking(f"{user}.NTLM{version}", domain, hash_file)
+    # hash_type MUST be the logical type (``NTLMv1``/``NTLMv2``), NOT the account
+    # name — passing ``f"{user}.NTLM{version}"`` leaked the captured principal into
+    # the ``hash_type`` telemetry property (e.g. ``"ZTJC378$.NTLMv2"``) and gave
+    # the cracking path a bogus type. The per-account hash file is already keyed by
+    # ``user`` in ``hash_file``; the type here is version-only.
+    shell.ask_for_cracking(f"NTLM{version}", domain, hash_file)
 
 
 # Suppress unused-import warning when Protocol is not picked up by ruff in older builds.
