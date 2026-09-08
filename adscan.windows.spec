@@ -43,11 +43,23 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 # ---------------------------------------------------------------------------
 # Data files embedded into the onefile archive (extracted to _MEIPASS at run).
 # Only Windows-relevant, LITE-safe assets. NO pro/ templates, NO terminfo.
+#
+# Each source dir is verified to exist before being added. A hard-coded literal
+# list here previously caused a PyInstaller ERROR (not a hard failure — the
+# build proceeded and produced a BROKEN adscan.exe) when report_samples/ was
+# missing from a checkout: report_samples/ ships the Client Deliverable Kit
+# sample PDFs LITE shows the operator as a PRO upsell (see
+# adscan_internal/cli/_sample_kit.py), so it is genuinely part of LITE — it was
+# a public-repo sync misconfiguration (fixed in scripts/sync_public_repo.exclude
+# and .forbidden) that dropped it, not a Windows-only asset. Warn and skip a
+# missing dir instead of silently shipping a corrupt exe.
 # ---------------------------------------------------------------------------
-datas = [
+_REQUIRED_DATA_DIRS = [
     ("adscan_internal/services/report_design/_css", "adscan_internal/services/report_design/_css"),
     ("adscan_internal/assets/logos", "adscan_internal/assets/logos"),
     ("adscan_internal/assets/demo_workspace", "adscan_internal/assets/demo_workspace"),
+    # The Client Deliverable Kit sample PDFs (LITE's PRO-upsell preview) —
+    # see the module note above.
     ("adscan_internal/assets/report_samples", "adscan_internal/assets/report_samples"),
     # assets/rules ships the hashcat effort-ladder rule files: the committed
     # best64.rule + OneRuleToRuleThemStill-10k.rule, AND — once the recipe has
@@ -60,6 +72,13 @@ datas = [
     # carry the data dir explicitly or Windows John cracking loses its ruleset.
     ("adscan_internal/assets/cracking", "adscan_internal/assets/cracking"),
 ]
+
+datas = []
+for _src, _dest in _REQUIRED_DATA_DIRS:
+    if os.path.isdir(_src):
+        datas.append((_src, _dest))
+    else:
+        print(f"WARNING: '{_src}' is missing — skipping (the .exe will lack this asset).")
 
 # Bundled wordlists + tool binaries, embedded only when the recipe has staged
 # them (they are large and fetched by the recipe, not tracked in git). Guarded so
