@@ -1,0 +1,187 @@
+# Windows native .exe — end-to-end release automation (public repo).
+#
+# Manual, single-workflow pipeline: build the self-contained Windows onefile
+# .exe via the committed recipe (scripts/build_adscan_windows.ps1), create a
+# GitHub Release for the version, set its body to that version's curated
+# CHANGELOG.md section, and attach the .exe as a release asset. One
+# workflow_dispatch click after pushing a new version does all of it.
+#
+# This is DELIBERATELY SEPARATE from release-notes.yml (on: release:
+# published), which keeps handling any release created by hand in the GitHub
+# UI (Linux/PyPI cuts). Fusing the two would create an event loop: this
+# workflow's own `gh release create` + asset upload would fire
+# `release: published`/`release: edited`, which release-notes.yml would then
+# react to again. Keeping them on different triggers (workflow_dispatch here,
+# release:published there) means both can touch the same release safely —
+# release-notes.yml's edit is idempotent (it just re-sets the same curated
+# body) and never gets invoked by this workflow's own commit, since this
+# workflow is not triggered by a `release` event at all.
+#
+# The changelog extractor below is copy-pasted from release-notes.yml
+# intentionally, not shared via a script import — this repo (the public LITE
+# mirror) does not carry the private repo's scripts/ directory (mirrored only
+# to scripts/build_adscan_windows.ps1, the Windows build recipe itself), so
+# each release workflow here stays self-contained. Keep the two extractors in
+# sync if the CHANGELOG.md section format ever changes.
+name: Windows build + release (.exe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 12.0.0). Defaults to pyproject.toml's [project].version."
+        type: string
+        required: false
+      onefile:
+        description: "Build a onefile .exe (true) or the folder bundle (false)"
+        type: boolean
+        required: false
+        default: true
+
+# A repo creating/editing its OWN releases uses the built-in GITHUB_TOKEN — no
+# PAT/secret required.
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-release-${{ inputs.version || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      # Windows caps paths at 260 chars (MAX_PATH) by default; enable git
+      # long-path support BEFORE the checkout, or `git checkout` fails with
+      # "Filename too long" (exit 128) on some vendored paths.
+      - name: Enable git long paths (Windows)
+        run: git config --global core.longpaths true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($v)) {
+            $line = Select-String -Path pyproject.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            if (-not $line) { throw "Could not read version from pyproject.toml" }
+            $v = $line.Matches[0].Groups[1].Value
+          }
+          Write-Host "Releasing version: $v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=v$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # A real build interpreter for pip + PyInstaller. The recipe fetches the
+      # separate EMBEDDABLE CPython for the runtime bundle itself; this
+      # setup-python is only the toolchain that assembles it.
+      - name: Set up build Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip + install PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      # windows-latest ships 7-Zip (7z.exe on PATH) and git — both required by
+      # the recipe (hashcat/john .7z extraction; PKINITtools pinned-commit
+      # clone).
+      - name: Verify build prerequisites
+        shell: pwsh
+        run: |
+          7z --help > $null 2>&1; if ($LASTEXITCODE -ne 0) { throw "7-Zip (7z) not found on PATH" }
+          git --version
+          python --version
+
+      - name: Build the Windows bundle
+        shell: pwsh
+        run: |
+          $one = if ("${{ inputs.onefile }}" -eq "true") { "-OneFile" } else { "" }
+          Write-Host "Building with onefile=${{ inputs.onefile }}"
+          # -PythonSha256 default is the pinned real hash in the recipe; no override.
+          pwsh -File scripts/build_adscan_windows.ps1 -OutDir "dist/adscan-windows" $one
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Write-Host "== dist root =="
+          Get-ChildItem dist | Select-Object Name, Length, Mode
+          if (Test-Path dist/adscan.exe) {
+            $exe = Get-Item dist/adscan.exe
+            Write-Host "onefile adscan.exe = $([math]::Round($exe.Length/1MB,1)) MB"
+          }
+
+      - name: Verify the built exe exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/adscan.exe)) {
+            throw "dist/adscan.exe was not produced by the build — refusing to cut a release with no asset."
+          }
+
+      # Same extraction logic as release-notes.yml, kept self-contained here
+      # (see the header comment for why it is not shared via scripts/).
+      - name: Extract this version's CHANGELOG section
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" > release_notes.md <<'PY'
+          import re, sys, pathlib
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          ver = re.escape(version)
+          m = re.search(
+              r"^## \[" + ver + r"\][^\n]*\n(.*?)(?=^## \[|^\[Unreleased\]:|\Z)",
+              text, re.S | re.M,
+          )
+          body = m.group(1).strip("\n") if m else ""
+          out, blocks = [], re.split(r"(?m)^(### .+)$", body)
+          it = iter(blocks[1:])
+          for header, content in zip(it, it):
+              if content.strip():
+                  out.append(header.strip() + "\n" + content.strip("\n"))
+          result = "\n\n".join(out).strip()
+          if not result:
+              sys.stderr.write(f"No CHANGELOG section for {version}; refusing an empty-notes release.\n")
+              sys.exit(1)
+          sys.stdout.write(result)
+          PY
+          echo "Extracted $(wc -l < release_notes.md) lines for ${VERSION}."
+
+      - name: Create the release with curated notes + the .exe asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating notes and uploading the .exe asset."
+            gh release edit "$TAG" --notes-file release_notes.md
+            gh release upload "$TAG" "dist/adscan.exe" --clobber
+          else
+            gh release create "$TAG" "dist/adscan.exe" \
+              --title "$TAG" \
+              --notes-file release_notes.md
+          fi
+
+      # Always keep the raw .exe as a workflow artifact too, independent of
+      # release creation succeeding — cheap insurance for debugging a failed
+      # release step without re-running the ~90-minute build.
+      - name: Upload adscan.exe as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adscan-exe-${{ steps.version.outputs.version }}
+          path: dist/adscan.exe
+          if-no-files-found: warn
+          retention-days: 14
