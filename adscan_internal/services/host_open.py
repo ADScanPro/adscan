@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Final
 
 from adscan_core import telemetry
+from adscan_core.pal import paths as pal_paths
 from adscan_core.rich_output import print_info_debug
 from adscan_core.rich_output import print_exception
 
@@ -39,8 +40,11 @@ __all__ = ("open_workspace_file", "display_host_path", "prompt_and_open")
 
 _CONTAINER_RUNTIME_ENV: Final[str] = "ADSCAN_CONTAINER_RUNTIME"
 _HOST_HELPER_SOCK_ENV: Final[str] = "ADSCAN_HOST_HELPER_SOCK"
-_CONTAINER_ADSCAN_ROOT: Final[str] = "/opt/adscan"
-_HOST_ADSCAN_ROOT: Final[str] = "~/.adscan"
+# Container/host path translation roots. The deployment-mode axis is deferred, so
+# the fixed container root (/opt/adscan) and host display root (~/.adscan) are
+# sourced from the PAL SSOT rather than written as literals here.
+_CONTAINER_ADSCAN_ROOT: Final[str] = pal_paths.container_adscan_root()
+_HOST_ADSCAN_ROOT: Final[str] = pal_paths.host_adscan_root_display()
 
 
 def _is_container_runtime() -> bool:

@@ -299,6 +299,51 @@ def _normalize_account(value: str) -> str:
     return name.strip().lower()
 
 
+def _label_realm(value: str) -> str:
+    """Return the realm qualifier of a principal label, or "" when absent.
+
+    ``PAXMOMVUA@awjom.zojij`` -> ``awjom.zojij``; ``AWJOM\\user`` -> ``AWJOM``;
+    a bare ``user`` -> ``""``. Only extracts; the caller decides whether the
+    realm is a collected domain worth targeting.
+    """
+    name = (value or "").strip()
+    if "@" in name:
+        return name.split("@", 1)[1].strip()
+    if "\\" in name:
+        return name.split("\\", 1)[0].strip()
+    return ""
+
+
+def _resolve_roast_target_domain(
+    shell: Any, *, to_label: str, path_domain: str
+) -> str | None:
+    """Resolve the domain the roast TARGET user lives in for a roast step.
+
+    Returns ``path_domain`` when ``to_label`` carries no realm qualifier or one
+    that matches ``path_domain`` (the single-domain / same-forest case, so the
+    roast is byte-identical to before). Returns the trusted domain's canonical
+    name when ``to_label`` names a DIFFERENT realm that ADscan actually collected
+    (a real cross-forest path). Returns ``None`` when the target's realm was named
+    but never collected — the caller then records an honest "not collected"
+    outcome instead of roasting the wrong (auth) domain.
+
+    Thin wrapper over the TARGET-axis SSOT
+    :func:`~adscan_internal.services.attack_step_domain_resolution.resolve_target_domain`
+    with ``node_domain=None`` (roasting resolves the target realm from the label
+    only) — the label ladder lives there so every branch shares one resolver.
+    """
+    from adscan_internal.services.attack_step_domain_resolution import (
+        resolve_target_domain,
+    )
+
+    return resolve_target_domain(
+        shell,
+        to_label=to_label,
+        node_domain=None,
+        path_domain=path_domain,
+    )
+
+
 def _is_audit_mode(shell: Any) -> bool:
     """Return whether the current shell is running in audit mode."""
     return str(getattr(shell, "type", "") or "").strip().lower() == "audit"
@@ -348,62 +393,109 @@ def _resolve_esc_auth_context(
     Returns ``(auth_domain, auth_kdc)``. The KDC is resolved via the cross-forest
     SSOT so the auth realm's DC is used; in the same-forest case it is the target
     domain's PDC, identical to the prior behaviour.
+
+    Thin wrapper over the SOURCE-axis SSOT
+    :func:`~adscan_internal.services.attack_step_domain_resolution.resolve_source_domain_and_kdc`
+    — the ESC/source-domain ladder lives there so every branch shares one resolver.
     """
-    from adscan_internal.services.cross_forest_kdc import (
-        resolve_auth_kdc_for_cross_forest,
+    from adscan_internal.services.attack_step_domain_resolution import (
+        resolve_source_domain_and_kdc,
     )
 
-    target_domain = (domain or "").strip()
-    domains_data = getattr(shell, "domains_data", None)
-    if not isinstance(domains_data, dict):
-        domains_data = {}
-
-    auth_domain = target_domain
-
-    # 1. An explicit realm qualifier on the principal label that diverges.
-    label = (raw_principal_label or "").strip()
-    qualified_realm = ""
-    if "@" in label:
-        qualified_realm = label.split("@", 1)[1].strip()
-    elif "\\" in label:
-        qualified_realm = label.split("\\", 1)[0].strip()
-    if qualified_realm and qualified_realm.lower() != target_domain.lower():
-        # Only trust a realm qualifier that names a domain ADscan actually knows.
-        if any(
-            isinstance(k, str) and k.lower() == qualified_realm.lower()
-            for k in domains_data
-        ):
-            auth_domain = qualified_realm
-
-    # 2. Otherwise, find the forest that holds this principal's credential when it
-    #    is NOT the target domain.
-    if auth_domain.lower() == target_domain.lower() and exec_username:
-        normalized = _normalize_account(exec_username)
-        for candidate_domain, candidate_data in domains_data.items():
-            if not isinstance(candidate_domain, str) or not isinstance(
-                candidate_data, dict
-            ):
-                continue
-            if candidate_domain.lower() == target_domain.lower():
-                continue
-            if get_stored_domain_credential_for_user(
-                domains_data, domain=candidate_domain, username=normalized
-            ):
-                auth_domain = candidate_domain
-                break
-
-    auth_kdc = str(
-        resolve_auth_kdc_for_cross_forest(
-            domains_data, auth_domain=auth_domain, target_domain=target_domain
-        )
-        or (
-            domains_data.get(target_domain, {}).get("pdc")
-            if isinstance(domains_data.get(target_domain), dict)
-            else ""
-        )
-        or ""
+    return resolve_source_domain_and_kdc(
+        shell,
+        target_domain=domain,
+        exec_username=exec_username,
+        raw_principal_label=raw_principal_label,
     )
-    return auth_domain, auth_kdc
+
+
+def _resolve_esc_source_credential(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str | None,
+    raw_principal_label: str | None,
+    password: str | None,
+) -> tuple[str, str, str | None]:
+    """Resolve the SOURCE axis for an ADCS/ESC step: (auth_domain, auth_kdc, secret).
+
+    Thin composition over :func:`_resolve_esc_auth_context` (the SOURCE-domain
+    SSOT): the executing credential's home forest + that forest's KDC route the
+    AS-REQ / TGT mint. In a genuine CROSS-forest ESC (``auth_domain != domain``)
+    the credential itself lives under the source forest, so the secret is looked
+    up in ``auth_domain`` — falling back to the caller-resolved ``password`` when
+    the source forest has no stored secret for the principal. In the common
+    SAME-forest case ``auth_domain == domain`` and the returned secret is the
+    caller's ``password`` unchanged, so behaviour is byte-identical to today.
+    """
+    auth_domain, auth_kdc = _resolve_esc_auth_context(
+        shell,
+        domain=domain,
+        exec_username=exec_username,
+        raw_principal_label=raw_principal_label,
+    )
+    secret = password
+    if (
+        exec_username
+        and auth_domain
+        and auth_domain.strip().casefold() != str(domain).strip().casefold()
+    ):
+        source_secret = _resolve_domain_password(shell, auth_domain, exec_username)
+        if source_secret:
+            secret = source_secret
+    return auth_domain, auth_kdc, secret
+
+
+def resolve_execution_source_credential(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str | None,
+    raw_principal_label: str | None,
+    password: str | None,
+) -> tuple[str, str, str | None]:
+    """Resolve the SOURCE axis for a non-ADCS step: (source_domain, source_kdc, secret).
+
+    The general-purpose sibling of :func:`_resolve_esc_source_credential`, for
+    the ACE/directory-relationship and host-authentication branches (AdminTo,
+    CanRDP, CanPSRemote, SqlAccess/SqlAdmin, GenericAll/GenericWrite/WriteDacl/
+    WriteOwner/AddMember/ForceChangePassword/… and the gMSA/computer-LAPS
+    password reads). Same contract, no ADCS-specific auth-context wrapper:
+    composes directly over the SOURCE-axis SSOT
+    (:func:`~adscan_internal.services.attack_step_domain_resolution.resolve_source_domain_and_kdc`,
+    the same resolver :func:`resolve_step_domains` is built on) so a cross-forest
+    step mints its credential's TGT against the principal's OWN home forest — not
+    the workspace/path ``domain`` a step handler happens to have in scope, and not
+    the target's forest either.
+
+    In a genuine CROSS-forest step (``source_domain != domain``) the credential
+    itself lives under the source forest, so the secret is looked up in
+    ``source_domain`` — falling back to the caller-resolved ``password`` when the
+    source forest has no stored secret for the principal. In the common
+    SAME-forest case ``source_domain == domain`` and the returned secret is the
+    caller's ``password`` unchanged, so behaviour is byte-identical to today.
+    """
+    from adscan_internal.services.attack_step_domain_resolution import (
+        resolve_source_domain_and_kdc,
+    )
+
+    source_domain, source_kdc = resolve_source_domain_and_kdc(
+        shell,
+        target_domain=domain,
+        exec_username=exec_username,
+        raw_principal_label=raw_principal_label,
+    )
+    secret = password
+    if (
+        exec_username
+        and source_domain
+        and source_domain.strip().casefold() != str(domain).strip().casefold()
+    ):
+        source_secret = _resolve_domain_password(shell, source_domain, exec_username)
+        if source_secret:
+            secret = source_secret
+    return source_domain, source_kdc, secret
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -3827,6 +3919,7 @@ def _resolve_host_step_credential(
     target_host: str | None,
     carried: CarriedCredential | None,
     context_password: str | None,
+    raw_principal_label: str | None = None,
 ) -> tuple[str, str]:
     """Resolve ``(secret, islocal)`` for a step that authenticates to a host.
 
@@ -3842,8 +3935,15 @@ def _resolve_host_step_credential(
        decided it applies to this step* (:func:`scope_carried_credential_to_step`
        runs once per step and withholds a host-scoped credential everywhere
        except its own host);
-    2. the stored DOMAIN credential for the principal — unchanged from before,
-       so a path that never touched a local account behaves exactly as it did;
+    2. the stored DOMAIN credential for the principal, looked up under the
+       principal's own SOURCE forest (:func:`resolve_execution_source_credential`)
+       — not blindly under the workspace/path ``domain`` — so a cross-forest step
+       (the owned principal's home forest differs from the domain currently being
+       enumerated) still finds the credential where it actually lives. Pass
+       ``raw_principal_label`` (the step's ``from_label``) when available so the
+       SOURCE-axis SSOT can see an explicit ``@realm``/``REALM\\`` qualifier;
+       byte-identical to before when the source forest equals ``domain`` (the
+       overwhelming common, single-domain-workspace case);
     3. a LOCAL account in this host's SAM.  Strictly additive: it is reached
        only when there is no domain credential at all, which previously ended
        the step with "no stored domain credential found".
@@ -3858,7 +3958,17 @@ def _resolve_host_step_credential(
         secret = str(context_password)
         return secret, islocal_flag_for(carried, username=username, secret=secret)
 
-    stored = _resolve_domain_password(shell, domain, username)
+    # Same-forest lookup first (the pre-existing behaviour, still the base
+    # password when the principal's home forest equals ``domain``), then let the
+    # SOURCE-axis SSOT override it with the credential stored under the
+    # principal's OWN forest when that differs from ``domain`` (forest-trust).
+    _source_domain, _source_kdc, stored = resolve_execution_source_credential(
+        shell,
+        domain=domain,
+        exec_username=username,
+        raw_principal_label=raw_principal_label,
+        password=_resolve_domain_password(shell, domain, username),
+    )
     if stored:
         return str(stored), "false"
 
@@ -5963,14 +6073,28 @@ def _resolve_exec_password_for_user(
     username: str,
     context_username: str | None,
     context_password: str | None,
+    raw_principal_label: str | None = None,
 ) -> str | None:
-    """Resolve the password/hash for ``username`` without mismatching context creds."""
+    """Resolve the password/hash for ``username`` without mismatching context creds.
+
+    SOURCE axis: ``username`` may live in a different forest than ``domain``
+    (e.g. a HasSession executor discovered from a prior cross-forest AdminTo).
+    ``raw_principal_label`` lets the SOURCE-axis SSOT look the credential up
+    under its own forest — byte-identical to before when they match.
+    """
     if not username:
         return None
     context_user = _normalize_account(context_username or "")
     if context_password and context_user and username.lower() == context_user.lower():
         return context_password
-    return _resolve_domain_password(shell, domain, username)
+    _source_domain, _source_kdc, secret = resolve_execution_source_credential(
+        shell,
+        domain=domain,
+        exec_username=username,
+        raw_principal_label=raw_principal_label or username,
+        password=_resolve_domain_password(shell, domain, username),
+    )
+    return secret
 
 
 def _resolve_hassession_host_and_user(
@@ -6145,6 +6269,7 @@ def _collect_previous_host_access_candidates(
                 username=user,
                 context_username=context_username,
                 context_password=context_password,
+                raw_principal_label=from_label,
             )
             if not password:
                 continue
@@ -6282,6 +6407,7 @@ def _resolve_actor_secret(
     resolved_host: str | None,
     context_username: str | None,
     context_password: str | None,
+    raw_principal_label: str | None = None,
 ) -> tuple[str, str]:
     """Resolve ``(secret, islocal)`` for a resolved actor with the context guard.
 
@@ -6290,7 +6416,10 @@ def _resolve_actor_secret(
     principal, which is what let a stale carried context drive a write as the
     wrong actor. Otherwise the host-aware store resolver runs with no context
     secret (stored domain credential → host-local account), so ``islocal`` is
-    derived from the credential and never guessed from the name.
+    derived from the credential and never guessed from the name. ``raw_principal_label``
+    (the step's ``from_label``) is forwarded to :func:`_resolve_host_step_credential`
+    so a cross-forest actor's stored credential is looked up under its own SOURCE
+    forest, not blindly under ``domain``.
     """
     normalized_user = _normalize_account(username)
     normalized_context = _normalize_account(context_username or "")
@@ -6303,6 +6432,7 @@ def _resolve_actor_secret(
             target_host=resolved_host,
             carried=None,
             context_password=context_password,
+            raw_principal_label=raw_principal_label,
         )
     return _resolve_host_step_credential(
         shell,
@@ -6312,6 +6442,7 @@ def _resolve_actor_secret(
         target_host=resolved_host,
         carried=None,
         context_password=None,
+        raw_principal_label=raw_principal_label,
     )
 
 
@@ -6408,6 +6539,7 @@ def resolve_step_execution_actor(
             resolved_host=resolved_host,
             context_username=context_username,
             context_password=context_password,
+            raw_principal_label=from_label,
         )
         if secret:
             return StepExecutionActor(
@@ -6431,6 +6563,7 @@ def resolve_step_execution_actor(
                 resolved_host=resolved_host,
                 context_username=context_username,
                 context_password=context_password,
+                raw_principal_label=from_label,
             )
             if secret:
                 print_info_debug(
@@ -6481,6 +6614,7 @@ def resolve_step_execution_actor(
             resolved_host=resolved_host,
             context_username=context_username,
             context_password=context_password,
+            raw_principal_label=from_label,
         )
         if secret:
             return StepExecutionActor(
@@ -6509,6 +6643,7 @@ def resolve_step_execution_actor(
                 target_host=resolved_host,
                 carried=None,
                 context_password=context_password,
+                raw_principal_label=from_label,
             )
             if secret:
                 return StepExecutionActor(
@@ -6782,7 +6917,14 @@ def _find_previous_adminto_exec_user_for_host(
         candidate_user = _normalize_account(from_label)
         if not _is_valid_domain_username(candidate_user):
             continue
-        if not _resolve_domain_password(shell, domain, candidate_user):
+        _cand_domain, _cand_kdc, _cand_secret = resolve_execution_source_credential(
+            shell,
+            domain=domain,
+            exec_username=candidate_user,
+            raw_principal_label=from_label,
+            password=_resolve_domain_password(shell, domain, candidate_user),
+        )
+        if not _cand_secret:
             continue
 
         step_status = str(step.get("status") or "discovered").strip().lower()
@@ -6863,6 +7005,7 @@ def _resolve_hassession_execution_user(
         username=exec_username,
         context_username=context_username,
         context_password=context_password,
+        raw_principal_label=from_label,
     )
     return exec_username, password, "generic_context"
 
@@ -9542,6 +9685,26 @@ def execute_selected_attack_path(
                     target_host=to_label,
                     carried=step_carried,
                     context_password=context_password,
+                    raw_principal_label=from_label,
+                )
+
+                # SOURCE axis for THIS credential: the forest that owns the
+                # executing principal and mints its TGT/AS-REQ, which can differ
+                # from the workspace/path ``domain`` in a forest-trust scenario.
+                # The secret itself was already resolved (source-forest-aware) by
+                # ``_resolve_host_step_credential`` above; this only needs the
+                # domain/KDC for the AS-REQ. This does NOT change the TARGET
+                # machine's reachable address — that stays
+                # resolve_netexec_target_for_node_label/to_label below.
+                from adscan_internal.services.attack_step_domain_resolution import (  # noqa: PLC0415
+                    resolve_source_domain_and_kdc,
+                )
+
+                exec_source_domain, exec_source_kdc = resolve_source_domain_and_kdc(
+                    shell,
+                    target_domain=domain,
+                    exec_username=exec_username,
+                    raw_principal_label=from_label,
                 )
                 if not exec_username or not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
@@ -9622,13 +9785,21 @@ def execute_selected_attack_path(
                 except Exception:  # noqa: BLE001
                     is_hash = False
 
-                kdc_ip: str | None = None
-                try:
-                    kdc_ip = resolve_dc_ip(
-                        (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
-                    )
-                except Exception:  # noqa: BLE001
-                    kdc_ip = None
+                # The KDC that mints the EXECUTING credential's ticket is the
+                # SOURCE forest's DC, not necessarily the workspace/path domain's
+                # (falls back to it in the common same-forest case; recomputed via
+                # resolve_dc_ip when exec_source_kdc could not resolve one).
+                kdc_ip: str | None = exec_source_kdc
+                if not kdc_ip:
+                    try:
+                        kdc_ip = resolve_dc_ip(
+                            (getattr(shell, "domains_data", {}) or {}).get(
+                                exec_source_domain, {}
+                            )
+                            or {}
+                        )
+                    except Exception:  # noqa: BLE001
+                        kdc_ip = None
 
                 marked_user = mark_sensitive(exec_username, "user")
                 marked_target = mark_sensitive(target_host, "hostname")
@@ -9678,7 +9849,7 @@ def execute_selected_attack_path(
                         _verify_attack_step_native(
                             service=service,
                             require_admin=require_admin,
-                            domain=domain,
+                            domain=exec_source_domain,
                             username=exec_username,
                             secret=password,
                             is_hash=is_hash,
@@ -11501,6 +11672,42 @@ def execute_selected_attack_path(
                     print_warning(f"Cannot execute {action}: invalid target user.")
                     return execution_started
 
+                # The roast must run against the TARGET user's own domain, which
+                # in a cross-forest path is a trusted domain different from the
+                # path/auth `domain`. `to_label` (e.g. `user@trusted.realm`)
+                # carries it; `_normalize_account` strips it, so re-derive here.
+                roast_target_domain = _resolve_roast_target_domain(
+                    shell, to_label=to_label, path_domain=domain
+                )
+                if roast_target_domain is None:
+                    named_realm = _label_realm(to_label)
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_failed",
+                        message=(
+                            f"Cannot execute {action}: target user's domain "
+                            f"'{named_realm}' was not collected; cross-domain roast "
+                            "not attempted."
+                        ),
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="attempted",
+                        reason="target_domain_not_collected",
+                    )
+                    print_warning(
+                        f"{action}: target user's domain "
+                        f"{mark_sensitive(named_realm, 'domain')} was not collected. "
+                        "Cross-domain roast not attempted. Stopping this path."
+                    )
+                    return True
+
                 execution_started = True
                 _record_attack_path_execution_event(
                     shell,
@@ -11526,11 +11733,17 @@ def execute_selected_attack_path(
                 ):
                     if key == "kerberoasting":
                         ok = run_kerberoast_for_user(
-                            shell, domain, target_user=target_user
+                            shell,
+                            domain,
+                            target_user=target_user,
+                            target_domain=roast_target_domain,
                         )
                     else:
                         ok = run_asreproast_for_user(
-                            shell, domain, target_user=target_user
+                            shell,
+                            domain,
+                            target_user=target_user,
+                            target_domain=roast_target_domain,
                         )
                 if not ok:
                     marked_user = mark_sensitive(target_user, "user")
@@ -11617,8 +11830,21 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
+                # SOURCE axis: exec_username's home forest can differ from
+                # ``domain`` in a forest-trust path — the readiness gate must
+                # look the credential up under its own forest too, or a
+                # cross-forest ESC1 blocks here before ever reaching
+                # _resolve_esc_source_credential below. Byte-identical when
+                # they match.
+                _esc1_gate_domain, _esc1_gate_kdc, password = (
+                    _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=context_password
+                        or _resolve_domain_password(shell, domain, exec_username),
+                    )
                 )
                 if not password:
                     marked_user = mark_sensitive(exec_username, "user")
@@ -11634,7 +11860,7 @@ def execute_selected_attack_path(
                     )
                     print_info_debug(
                         f"[adcsesc1] Missing credential: context_password={'set' if context_password else 'unset'}, "
-                        f"resolved_password={'set' if _resolve_domain_password(shell, domain, exec_username) else 'unset'}"
+                        f"resolved_password={'set' if password else 'unset'}"
                     )
                     return execution_started
 
@@ -11741,12 +11967,25 @@ def execute_selected_attack_path(
 
                     from adscan_internal.cli.adcs_exploitation import adcs_esc1
 
+                    (
+                        esc1_auth_domain,
+                        esc1_auth_kdc,
+                        esc1_password,
+                    ) = _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=password,
+                    )
                     esc1_result = adcs_esc1(
                         shell,
                         domain=domain,
                         username=exec_username,
-                        password=password,
+                        password=esc1_password,
                         template=template,
+                        auth_domain=esc1_auth_domain,
+                        auth_kdc=esc1_auth_kdc,
                     )
                     if not esc1_result.success:
                         _handle_failed_adcs_step(
@@ -11802,8 +12041,17 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
+                # SOURCE axis: see the ADCSESC1 branch above for why this gate
+                # must be forest-aware, not a bare domain lookup.
+                _esc3_gate_domain, _esc3_gate_kdc, password = (
+                    _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=context_password
+                        or _resolve_domain_password(shell, domain, exec_username),
+                    )
                 )
                 if not password:
                     marked_user = mark_sensitive(exec_username, "user")
@@ -11966,14 +12214,27 @@ def execute_selected_attack_path(
 
                     from adscan_internal.cli.adcs_exploitation import adcs_esc3
 
+                    (
+                        esc3_auth_domain,
+                        esc3_auth_kdc,
+                        esc3_password,
+                    ) = _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=password,
+                    )
                     esc3_success = bool(
                         adcs_esc3(
                             shell,
                             domain=domain,
                             username=exec_username,
-                            password=password,
+                            password=esc3_password,
                             template=agent_template,
                             client_auth_template=client_auth_template,
+                            auth_domain=esc3_auth_domain,
+                            auth_kdc=esc3_auth_kdc,
                         )
                     )
                     if not esc3_success:
@@ -12036,8 +12297,17 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
+                # SOURCE axis: see the ADCSESC1 branch above for why this gate
+                # must be forest-aware, not a bare domain lookup.
+                _esc4_gate_domain, _esc4_gate_kdc, password = (
+                    _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=context_password
+                        or _resolve_domain_password(shell, domain, exec_username),
+                    )
                 )
                 if not password:
                     marked_user = mark_sensitive(exec_username, "user")
@@ -12197,12 +12467,25 @@ def execute_selected_attack_path(
 
                     from adscan_internal.cli.adcs_exploitation import adcs_esc4
 
+                    (
+                        esc4_auth_domain,
+                        esc4_auth_kdc,
+                        esc4_password,
+                    ) = _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=password,
+                    )
                     esc4_result = adcs_esc4(
                         shell,
                         domain=domain,
                         username=exec_username,
-                        password=password,
+                        password=esc4_password,
                         template=template,
+                        auth_domain=esc4_auth_domain,
+                        auth_kdc=esc4_auth_kdc,
                     )
                     if not esc4_result.success:
                         _handle_failed_adcs_step(
@@ -12259,8 +12542,17 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
+                # SOURCE axis: see the ADCSESC1 branch above for why this gate
+                # must be forest-aware, not a bare domain lookup.
+                _esc13_gate_domain, _esc13_gate_kdc, password = (
+                    _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=context_password
+                        or _resolve_domain_password(shell, domain, exec_username),
+                    )
                 )
                 if not password:
                     marked_user = mark_sensitive(exec_username, "user")
@@ -12387,14 +12679,27 @@ def execute_selected_attack_path(
 
                     from adscan_internal.cli.adcs_exploitation import adcs_esc13
 
+                    (
+                        esc13_auth_domain,
+                        esc13_auth_kdc,
+                        esc13_password,
+                    ) = _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=password,
+                    )
                     esc13_success = bool(
                         adcs_esc13(
                             shell,
                             domain=domain,
                             username=exec_username,
-                            password=password,
+                            password=esc13_password,
                             template=template,
                             effective_group=effective_group,
+                            auth_domain=esc13_auth_domain,
+                            auth_kdc=esc13_auth_kdc,
                         )
                     )
                     if not esc13_success:
@@ -13893,12 +14198,25 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
+                    (
+                        esc5_auth_domain,
+                        esc5_auth_kdc,
+                        esc5_password,
+                    ) = _resolve_esc_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=password,
+                    )
                     if hasattr(shell, "adcs_golden_cert"):
                         shell.adcs_golden_cert(  # type: ignore[attr-defined]
                             domain,
                             exec_username,
-                            password,
+                            esc5_password,
                             ca_target_host,
+                            auth_domain=esc5_auth_domain,
+                            auth_kdc=esc5_auth_kdc,
                         )
                     else:
                         from adscan_internal.cli.adcs_exploitation import (
@@ -13909,8 +14227,10 @@ def execute_selected_attack_path(
                             shell,
                             domain=domain,
                             username=exec_username,
-                            password=password,
+                            password=esc5_password,
                             ca_target_host=ca_target_host,
+                            auth_domain=esc5_auth_domain,
+                            auth_kdc=esc5_auth_kdc,
                         )
                     # ESC5 returns no status flag; a captured-principal outcome
                     # emitted by adcs_golden_cert on Pass-the-Certificate success
@@ -14607,8 +14927,19 @@ def execute_selected_attack_path(
                     summary=summary,
                     from_label=from_label,
                 )
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
+                # SOURCE axis: the credential's home forest can differ from
+                # ``domain`` in a forest-trust path (from_label's principal lives
+                # in another domain). Look it up under its own forest instead of
+                # assuming ``domain`` — byte-identical when they match.
+                _delegation_source_domain, _delegation_source_kdc, password = (
+                    resolve_execution_source_credential(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        raw_principal_label=from_label,
+                        password=context_password
+                        or _resolve_domain_password(shell, domain, exec_username),
+                    )
                 )
                 if not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
@@ -14868,7 +15199,16 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                member_secret = _resolve_domain_password(shell, domain, member_user)
+                # SOURCE axis: the owned member's home forest can differ from
+                # ``domain`` in a forest-trust path — look up its credential
+                # under its own forest, byte-identical when they match.
+                _, _, member_secret = resolve_execution_source_credential(
+                    shell,
+                    domain=domain,
+                    exec_username=member_user,
+                    raw_principal_label=from_label,
+                    password=_resolve_domain_password(shell, domain, member_user),
+                )
                 _member_is_ccache_only = False
                 if member_secret:
                     try:

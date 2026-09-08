@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 
+from adscan_core.pal.platform import is_windows
 from adscan_internal.command_runner import (
     CommandRunner,
     CommandSpec,
@@ -1699,6 +1700,36 @@ class KerberosTicketService(BaseService):
                 message="Clock sync failed: invalid domain format",
             )
             return False
+
+        # Windows-native path: a domain-joined Windows host keeps its clock in
+        # sync with the DC through the OS, and the POSIX legacy paths below
+        # (os.geteuid + sudo + timedatectl + ntpdate) do not exist on Windows.
+        # Use the PAL clock seam (w32tm) and degrade honestly, never entering
+        # the POSIX code. Mirrors adscan_internal/cli/kerberos.py::sync_clock_with_pdc.
+        if is_windows():
+            from adscan_core.pal import clock as pal_clock
+
+            native_synced = pal_clock.is_domain_time_synced_natively()
+            if native_synced is True:
+                self._emit_progress(
+                    scan_id=scan_id,
+                    phase="clock_sync",
+                    progress=1.0,
+                    message="Windows host time already domain-synced natively",
+                )
+                return True
+            step = pal_clock.step_system_clock("")
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="clock_sync",
+                progress=1.0,
+                message=(
+                    "Clock stepped via w32tm"
+                    if step.stepped
+                    else f"Windows clock step unavailable ({step.reason})"
+                ),
+            )
+            return bool(step.stepped)
 
         # Container runtime path
         if is_full_container_runtime():

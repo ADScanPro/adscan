@@ -1,20 +1,20 @@
 <div align="center">
 
-<img width="740" height="198" alt="ADscan - Active Directory Pentesting Tool for Linux" src="https://github.com/user-attachments/assets/4902f205-d9bc-453e-b2ac-8c7d7fa2f329" />
+<img width="740" height="198" alt="ADscan - Active Directory Pentesting Tool for Linux, macOS and Windows" src="https://github.com/user-attachments/assets/4902f205-d9bc-453e-b2ac-8c7d7fa2f329" />
 
-# ADscan - Active Directory Pentesting Tool for Linux
+# ADscan - Active Directory Pentesting Tool for Linux, macOS and Windows
 
 [![PyPI version](https://img.shields.io/pypi/v/adscan.svg)](https://pypi.org/project/adscan/)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/adscan)
 [![GitHub stars](https://img.shields.io/github/stars/ADScanPro/adscan?logo=github)](https://github.com/ADscanPro/adscan/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/ADScanPro/adscan?logo=github)](https://github.com/ADscanPro/adscan/network/members)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](https://github.com/ADscanPro/adscan)
 [![Discord](https://img.shields.io/discord/1355089867096199300?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.com/invite/fXBR3P8H74)
 
-**Free active directory pentesting tool for Linux. Replace your AD pentest toolchain with one CLI.**
+**Free Active Directory pentesting tool. Replace your AD pentest toolchain with one CLI.**
 
-ADscan is a free Linux CLI for pentesters, red teamers, and security consultants. It covers 105 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. No Windows required.
+ADscan is a free CLI for pentesters, red teamers, and security consultants. It covers 105 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. It runs on Linux and macOS through Docker, and natively on Windows as a self-contained bundle with no Docker and no Python install.
 
 **[Docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_cta)** | [Discord](https://discord.com/invite/fXBR3P8H74) | [Website](https://adscanpro.com)
 
@@ -50,7 +50,7 @@ _Real run, no cuts: ADscan takes **HTB Forest** from zero access to Domain Admin
 
 ## Quick Start
 
-**Before you start:** ADscan runs inside Docker, so you need **Docker Engine installed and running**, and about **12 GB of free disk** for the runtime image (the installer requires 15 GB free before it will pull). Host must be **Linux or macOS**. Native Windows and WSL are not supported.
+**On Linux or macOS**, ADscan runs inside Docker, so you need **Docker Engine installed and running**, and about **12 GB of free disk** for the runtime image (the installer requires 15 GB free before it will pull).
 
 ```bash
 docker version   # if this fails, install Docker first
@@ -59,7 +59,9 @@ adscan install
 adscan start
 ```
 
-> Docker install steps per distribution, and everything else: [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)
+**On Windows**, there is no Docker and no Python to install: download the self-contained ADscan bundle and run `adscan.exe` directly. The bundle carries its own runtime and tools, so it works on a hardened, locked-down host — the common assumed-breach scope where you only have a domain-joined Windows box.
+
+> Docker install steps per distribution, the Windows bundle download, and everything else: [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)
 
 Once inside the shell, start an unauthenticated recon:
 
@@ -94,7 +96,7 @@ Most AD pentesters use 5-8 separate tools. ADscan replaces the chain:
 
 | | ADscan | NetExec/CrackMapExec | Certipy | Impacket | BloodHound CE |
 |---|---|---|---|---|---|
-| **Platform** | Linux | Linux/Win | Linux | Linux | Linux/Win |
+| **Platform** | Linux/Win | Linux/Win | Linux | Linux | Linux/Win |
 | **AD enumeration** | Full | Partial | No | Partial | No |
 | **Kerberoasting** | Yes | Yes | No | Yes | No |
 | **ADCS ESC1-16** | Yes (auto) | No | Yes (manual) | No | No |
@@ -212,18 +214,21 @@ Beta access is free for security consultants. [adscanpro.com/pro](https://adscan
 
 | | |
 |---|---|
-| **OS** | Linux (Debian/Ubuntu/Kali/Parrot) or macOS with Docker Desktop. Native Windows and WSL are not supported |
-| **Docker** | Docker Engine. Compose is no longer needed |
-| **Disk** | 15 GB free before install; the runtime image is roughly 12 GB unpacked |
-| **Privileges** | `docker` group or `sudo` |
-| **Network** | Internet (pull images) + target network |
+| **OS** | Linux (Debian/Ubuntu/Kali/Parrot) or macOS with Docker Desktop; or Windows via the native self-contained bundle (no Docker, no Python) |
+| **Docker** | Required on Linux/macOS (Docker Engine; Compose is no longer needed). Not used by the Windows bundle |
+| **Disk** | Linux/macOS: 15 GB free before install, runtime image roughly 12 GB unpacked. Windows bundle: a few hundred MB |
+| **Privileges** | Linux/macOS: `docker` group or `sudo`. Windows: runs as a normal domain user, no local admin required |
+| **Network** | Internet to pull the image or download the bundle, plus the target network |
 
 ---
 
 ## FAQ
 
 **Does ADscan work without a Windows machine?**
-Yes. ADscan runs entirely on Linux inside Docker. No Windows VM, no RDP, no agent installation required. It connects to your target AD environment over the network using standard protocols (LDAP, SMB, Kerberos).
+Yes. On Linux (or macOS) ADscan runs entirely inside Docker. No Windows VM, no RDP, no agent installation required. It connects to your target AD environment over the network using standard protocols (LDAP, SMB, Kerberos).
+
+**Does ADscan run natively on Windows?**
+Yes. There is a self-contained Windows bundle that runs `adscan.exe` directly — no Docker, no Python install, no local admin. It carries its own runtime and tools, so it works on a hardened, locked-down host, which is the usual assumed-breach scope where your only foothold is a domain-joined Windows box. The same engine runs on both platforms; only the packaging differs. On Windows without a GPU, password cracking falls back to CPU automatically, and the port scan runs in-process (no Npcap driver needed).
 
 **Is ADscan safe to run in production Active Directory environments?**
 ADscan LITE is read-only by default for enumeration. Exploitation steps (Kerberoasting, credential dumping, DCSync) require explicit operator confirmation. Run it in a test window with your client's written authorization. See the [security policy](SECURITY.md) for responsible use guidelines.

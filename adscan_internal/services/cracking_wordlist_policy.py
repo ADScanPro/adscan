@@ -15,18 +15,17 @@ auto-downgrades the rule set instead of running for hours. The original
 keeps consuming it byte-for-byte.
 
 Audit base wordlist: the bundled ``combined_audit_base.txt`` (~94.0M entries).
-It is a HOST-SIDE build-time merge of three frequency-ordered lists in strict
+It is a HOST-SIDE build-time merge of two frequency-ordered lists in strict
 priority order (best first), de-duplicated keeping the FIRST occurrence so the
 frequency ordering is preserved:
 
   1. hashmob "large" (~61.3M, richest + frequency-ordered)
   2. kerberoast_pws  (~35.6M; contributes ~32.7M UNIQUE service-account
      passwords not present in "large")
-  3. kaonashi_10K    (10K top-ranked seeds)
 
 The merge is a priority-concatenation piped through ``rling`` (order-preserving
 dedup) — NOT ``sort -u`` (which would destroy the frequency order). Only the
-merged ``combined_audit_base.txt`` ships in the runtime image; the three raw
+merged ``combined_audit_base.txt`` ships in the runtime image; the raw
 components are dropped from the build context after the merge, so the audit
 base is a single ~1GB file rather than ~2GB of overlapping lists (see
 ``scripts/build_combined_audit_wordlist.sh``). If the combined asset has not
@@ -34,10 +33,13 @@ been built yet the resolver falls back to the "large" component alone
 (``hashmob_combined_large.found``); the caller skips any tier whose file is
 missing at run time.
 """
+
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional
 
 from adscan_internal.services.cracking_benchmark import BENCHMARK_MODES
@@ -45,7 +47,7 @@ from adscan_internal.services.cracking_benchmark import BENCHMARK_MODES
 _ROCKYOU = "rockyou.txt"
 # The bundled audit base: combined_audit_base.txt (~94.0M lines) — the host-side
 # priority-concat + order-preserving rling merge of hashmob-large +
-# kerberoast_pws + kaonashi_10K. Serves both the sync tier list
+# kerberoast_pws. Serves both the sync tier list
 # (wordlist_tiers_for_workspace) and the effort base (base_for). See the module
 # docstring for the merge rationale (shipped combined-only).
 _COMBINED = "combined_audit_base.txt"
@@ -75,7 +77,9 @@ def wordlist_tiers_for_workspace(
             targeted = str(custom_wordlist_dir(domain))
             targeted_file = os.path.join(targeted, _CUSTOM_TARGETED)
         except Exception:  # noqa: BLE001 — a missing custom dir must not break selection
-            targeted_file = os.path.join(wordlists_dir, "custom", domain, _CUSTOM_TARGETED)
+            targeted_file = os.path.join(
+                wordlists_dir, "custom", domain, _CUSTOM_TARGETED
+            )
         return [targeted_file, rockyou, os.path.join(wordlists_dir, _COMBINED)]
     return [rockyou]
 
@@ -141,7 +145,7 @@ _EFFORT_RULE_INDEX: dict[str, int] = {"fast": 0, "balanced": 2, "thorough": 3}
 # --- generic base wordlist -- pluggable, never hardcoded into the effort
 # logic below. The DEFAULT audit base is the bundled combined_audit_base.txt
 # (~94.0M entries) — the host-side priority-concat + order-preserving rling
-# merge of hashmob-large + kerberoast_pws + kaonashi_10K (see the module
+# merge of hashmob-large + kerberoast_pws (see the module
 # docstring). Only the combined asset ships in the runtime image. The FALLBACK
 # is the "large" component alone (hashmob_combined_large.found): on a machine
 # where the merge has not run yet (a dev checkout, a synthetic test) base_for()
@@ -155,6 +159,14 @@ _DEFAULT_CTF_BASE_FILENAME = _ROCKYOU
 _DEFAULT_AUDIT_BASE_FILENAME = "combined_audit_base.txt"
 _AUDIT_BASE_FALLBACK_FILENAME = "hashmob_combined_large.found"
 
+# The Windows onefile .exe bundles the ~928MB combined_audit_base.txt COMPRESSED
+# with xz (built at bundle time via stdlib lzma) so the shipped binary stays
+# ~500MB instead of ~1.2GB. At runtime the resolver decompresses it ONCE into the
+# LOCALAPPDATA wordlists dir and reuses the plain .txt from then on (idempotent).
+# This suffix is the ONLY compression variant we ship; the plain .txt always wins
+# when present (Linux image, dev checkout, or a bundle that was staged raw).
+_XZ_SUFFIX = ".xz"
+
 # Approximate line counts, used ONLY as a fallback for the time-budget
 # estimate when the base file isn't present on disk yet (a fresh workspace
 # before the mounted asset is downloaded, or a synthetic test path) --
@@ -162,8 +174,8 @@ _AUDIT_BASE_FALLBACK_FILENAME = "hashmob_combined_large.found"
 # file exists, which also makes an operator-supplied ``override`` work
 # without needing its own hardcoded entry here.
 _ROCKYOU_LINES_FALLBACK = 14_344_391
-# combined_audit_base.txt measured at ~94,003,839 lines (large + kerberoast_pws
-# + kaonashi_10K, order-preserving dedup, 2026-07-07 snapshot). Used only
+# combined_audit_base.txt measured at ~94,003,839 lines (large + kerberoast_pws,
+# order-preserving dedup, 2026-07-07 snapshot). Used only
 # pre-build/pre-download; _estimate_line_count() prefers a real stat() when the
 # file exists on disk.
 _COMBINED_AUDIT_BASE_LINES_FALLBACK = 94_000_000
@@ -213,6 +225,7 @@ class EffortTier:
     rule_path: Optional[str]
     device_class: str  # "gpu" | "cpu" | "unknown"
     estimated_seconds_per_mode: "dict[str, float]" = field(default_factory=dict)
+    rule_rung: Optional[int] = None
 
 
 def _resolve_rule_asset_path(name: str) -> Optional[str]:
@@ -240,6 +253,183 @@ def _resolve_rule_asset_path(name: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         return None
     return str(managed) if managed.is_file() else None
+
+
+def _bundled_wordlists_dir() -> Optional[Path]:
+    """Return the PyInstaller-bundled ``wordlists`` directory when frozen.
+
+    The Windows onefile ``.exe`` ships heavy wordlists (the ~94M-line
+    ``combined_audit_base.txt``, rockyou) inside the binary; PyInstaller extracts
+    them under ``sys._MEIPASS`` at runtime (the ``.spec`` adds
+    ``("wordlists", "wordlists")``, so the bundled files live in
+    ``<_MEIPASS>/wordlists/``). Callers point the resolver at
+    ``%LOCALAPPDATA%\\ADscan\\wordlists`` instead, which does NOT contain the
+    bundled assets, so without this seam the bundled combined is unreachable and
+    audit cracking silently degrades to rockyou.
+
+    Mirrors the frozen + ``_MEIPASS`` guard in
+    :mod:`adscan_internal.services.credsweeper_service`. Returns ``None`` on any
+    non-frozen / non-Windows / dev checkout (``sys.frozen`` is absent), so the
+    behaviour off a frozen bundle is byte-identical to before.
+    """
+    if not (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")):
+        return None
+    meipass = getattr(sys, "_MEIPASS", None)  # type: ignore[attr-defined]
+    if not meipass:
+        return None
+    bundled = Path(meipass) / "wordlists"
+    return bundled if bundled.is_dir() else None
+
+
+def _bundled_wordlist_path(
+    filename: str, decompress_dir: Optional[str] = None
+) -> Optional[str]:
+    """Absolute path to a bundled wordlist ``filename`` under ``_MEIPASS``.
+
+    Handles both the direct-file layout (``<_MEIPASS>/wordlists/<filename>``) and
+    the nested-dir layout PyInstaller may produce
+    (``<_MEIPASS>/wordlists/<filename>/<filename>``), matching the
+    credsweeper_service seam. When only an xz-compressed variant is bundled
+    (``<filename>.xz`` — the Windows small-.exe case) it is decompressed once into
+    ``decompress_dir`` (the caller's wordlists dir) and that plain path returned.
+    Returns ``None`` when not frozen or the file (plain or .xz) is absent, so
+    non-frozen callers see no change.
+    """
+    bundled_dir = _bundled_wordlists_dir()
+    if bundled_dir is None:
+        return None
+    candidate = bundled_dir / filename
+    if candidate.is_file():
+        return str(candidate)
+    if candidate.is_dir():
+        nested = candidate / filename
+        if nested.is_file():
+            return str(nested)
+    # The plain .txt is absent from the bundle. On Windows the heavy combined is
+    # shipped xz-compressed (see _XZ_SUFFIX); decompress it ONCE into the
+    # decompress_dir (the caller's wordlists dir, i.e. LOCALAPPDATA) and resolve
+    # to that plain copy from then on.
+    return _resolve_bundled_compressed(bundled_dir, filename, decompress_dir)
+
+
+def _resolve_bundled_compressed(
+    bundled_dir: "Path", filename: str, decompress_dir: Optional[str]
+) -> Optional[str]:
+    """Resolve ``filename`` from an xz-compressed bundled variant, if present.
+
+    The Windows onefile ships the ~928MB combined_audit_base.txt as
+    ``<filename>.xz`` to keep the .exe small. This locates that compressed
+    variant under ``<_MEIPASS>/wordlists/`` (direct or nested layout) and
+    decompresses it ONCE into ``decompress_dir`` (the CALLER's wordlists dir, so
+    the decompressed copy lands exactly where ``base_for`` looks first on the
+    next run — the idempotency guarantee), returning the decompressed plain path.
+    A subsequent call reuses the already-decompressed file and never decompresses
+    again. Returns ``None`` when no compressed variant is bundled, so non-Windows
+    / raw-staged bundles are unaffected. ``decompress_dir`` falls back to the
+    LOCALAPPDATA wordlists dir when not supplied.
+    """
+    compressed_name = filename + _XZ_SUFFIX
+    compressed = bundled_dir / compressed_name
+    compressed_path: Optional[Path] = None
+    if compressed.is_file():
+        compressed_path = compressed
+    elif compressed.is_dir():
+        # PyInstaller nested-dir layout: <_MEIPASS>/wordlists/<name>.xz/<name>.xz
+        nested = compressed / compressed_name
+        if nested.is_file():
+            compressed_path = nested
+    if compressed_path is None:
+        return None
+    return _decompress_bundled_xz_once(compressed_path, filename, decompress_dir)
+
+
+def _decompress_bundled_xz_once(
+    compressed_path: "Path", plain_filename: str, decompress_dir: Optional[str]
+) -> Optional[str]:
+    """Decompress a bundled ``.xz`` wordlist into ``decompress_dir``, once.
+
+    Writes ``<decompress_dir>/<plain_filename>`` from ``compressed_path`` using
+    stdlib :mod:`lzma` (no external ``xz`` binary), mirroring the
+    decompress-on-first-run pattern used for rockyou (wordlist_service /
+    adscan.py). ``decompress_dir`` is the CALLER's wordlists dir so the plain
+    copy lands where ``base_for`` looks first next run; it defaults to the
+    LOCALAPPDATA wordlists dir when ``None`` (the two are the SAME in production —
+    both ``get_adscan_home()/wordlists``). Idempotent by construction: if the
+    destination already exists (non-empty) it is returned untouched, so the
+    ~928MB decompression happens only on the first run. Decompresses to a temp
+    sibling and atomically renames so a crash mid-write never leaves a truncated
+    file a later run would trust. Best-effort: on any error it returns ``None``
+    (the caller then degrades to its next base), never raising into the crack
+    flow.
+    """
+    import lzma  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+
+    from adscan_core.rich_output import (  # noqa: PLC0415
+        print_exception,
+        print_info_debug,
+    )
+
+    tmp: Optional[Path] = None
+    try:
+        if decompress_dir:
+            dest_dir = Path(decompress_dir)
+        else:
+            from adscan_core.pal.paths import wordlists_dir  # noqa: PLC0415
+
+            dest_dir = wordlists_dir()
+        dest = dest_dir / plain_filename
+        if dest.is_file() and dest.stat().st_size > 0:
+            return str(dest)  # already decompressed on a previous run
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        tmp = dest_dir / (plain_filename + ".partial")
+        with lzma.open(compressed_path, "rb") as src, open(tmp, "wb") as out:
+            shutil.copyfileobj(src, out)
+        os.replace(tmp, dest)
+        print_info_debug(
+            f"Decompressed bundled {plain_filename} into the wordlists dir "
+            "(first run only)."
+        )
+        return str(dest)
+    except Exception as exc:  # noqa: BLE001
+        print_exception(exception=exc)
+        try:
+            if tmp is not None and tmp.exists():
+                tmp.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
+def audit_base_is_available(wordlists_dir: str) -> bool:
+    """Whether the combined audit base is resolvable, matching ``base_for``.
+
+    The SSOT the availability check (``wordlist_service``) shares with the crack
+    SELECTOR (``base_for``), so the two never disagree. It reports ``True`` when
+    the combined_audit_base.txt is reachable by ANY of the routes ``base_for``
+    uses for it: an operator-installed / already-decompressed copy in
+    ``wordlists_dir`` (LOCALAPPDATA), the plain bundled copy under ``_MEIPASS``,
+    or the xz-compressed bundled variant that ``base_for`` decompresses on first
+    use. Purely observational — it never decompresses (a 928MB write is not an
+    "is it present?" side effect); the actual first-run decompression is
+    ``base_for``'s job when the tier is selected.
+    """
+    installed = os.path.join(wordlists_dir, _DEFAULT_AUDIT_BASE_FILENAME)
+    if os.path.isfile(installed):
+        return True
+    bundled_dir = _bundled_wordlists_dir()
+    if bundled_dir is None:
+        return False
+    plain = bundled_dir / _DEFAULT_AUDIT_BASE_FILENAME
+    if plain.is_file() or (
+        plain.is_dir() and (plain / _DEFAULT_AUDIT_BASE_FILENAME).is_file()
+    ):
+        return True
+    compressed_name = _DEFAULT_AUDIT_BASE_FILENAME + _XZ_SUFFIX
+    compressed = bundled_dir / compressed_name
+    return compressed.is_file() or (
+        compressed.is_dir() and (compressed / compressed_name).is_file()
+    )
 
 
 def _estimate_line_count(path: str, fallback: int) -> int:
@@ -272,11 +462,25 @@ def base_for(
     wt = str(workspace_type or "").strip().lower()
     if wt != "audit":
         path = os.path.join(wordlists_dir, _DEFAULT_CTF_BASE_FILENAME)
+        if os.path.isfile(path):
+            return path, _estimate_line_count(path, _ROCKYOU_LINES_FALLBACK)
+        # Frozen .exe: rockyou may only exist inside the bundle, not in the
+        # user data dir the caller passed. Prefer the bundled copy over a path
+        # to a missing file. No-op off a frozen bundle (helper returns None).
+        bundled_rockyou = _bundled_wordlist_path(
+            _DEFAULT_CTF_BASE_FILENAME, decompress_dir=wordlists_dir
+        )
+        if bundled_rockyou:
+            return bundled_rockyou, _estimate_line_count(
+                bundled_rockyou, _ROCKYOU_LINES_FALLBACK
+            )
         return path, _estimate_line_count(path, _ROCKYOU_LINES_FALLBACK)
 
     if override:
         candidate = (
-            override if os.path.isabs(override) else os.path.join(wordlists_dir, override)
+            override
+            if os.path.isabs(override)
+            else os.path.join(wordlists_dir, override)
         )
         if os.path.isfile(candidate):
             return candidate, _estimate_line_count(
@@ -285,8 +489,46 @@ def base_for(
 
     combined = os.path.join(wordlists_dir, _DEFAULT_AUDIT_BASE_FILENAME)
     if os.path.isfile(combined):
-        return combined, _estimate_line_count(combined, _COMBINED_AUDIT_BASE_LINES_FALLBACK)
+        return combined, _estimate_line_count(
+            combined, _COMBINED_AUDIT_BASE_LINES_FALLBACK
+        )
+    # Frozen .exe: the ~94M combined ships INSIDE the binary and extracts to
+    # <_MEIPASS>/wordlists/, which is NOT the user data dir the caller passes.
+    # An operator-installed combined in wordlists_dir (checked above) wins so an
+    # override still works; otherwise reach the bundled copy. No-op off a frozen
+    # bundle (helper returns None), so Linux/dev behaviour is byte-identical.
+    bundled_combined = _bundled_wordlist_path(
+        _DEFAULT_AUDIT_BASE_FILENAME, decompress_dir=wordlists_dir
+    )
+    if bundled_combined:
+        return bundled_combined, _estimate_line_count(
+            bundled_combined, _COMBINED_AUDIT_BASE_LINES_FALLBACK
+        )
     fallback = os.path.join(wordlists_dir, _AUDIT_BASE_FALLBACK_FILENAME)
+    if os.path.isfile(fallback):
+        return fallback, _estimate_line_count(
+            fallback, _AUDIT_BASE_FALLBACK_LINES_FALLBACK
+        )
+    # Last resort: any wordlist that actually EXISTS on disk beats returning a
+    # path to a missing file (the cracker would then run against nothing and
+    # recover zero — a silent false negative). Both audit bases above are
+    # Linux build-time artifacts (a ~94M merge baked into the Docker image);
+    # the Windows bundle ships only rockyou.txt, so on Windows both are absent
+    # and this fallthrough is what makes cracking actually work there. rockyou
+    # is the universally-present base (ctf default, and downloaded at build on
+    # every deployment). Only if even rockyou is missing do we return the
+    # (missing) fallback path, and the caller's coverage data-gap declares it.
+    rockyou = os.path.join(wordlists_dir, _DEFAULT_CTF_BASE_FILENAME)
+    if os.path.isfile(rockyou):
+        return rockyou, _estimate_line_count(rockyou, _ROCKYOU_LINES_FALLBACK)
+    # Frozen .exe: rockyou may only exist inside the bundle. No-op off frozen.
+    bundled_rockyou = _bundled_wordlist_path(
+        _DEFAULT_CTF_BASE_FILENAME, decompress_dir=wordlists_dir
+    )
+    if bundled_rockyou:
+        return bundled_rockyou, _estimate_line_count(
+            bundled_rockyou, _ROCKYOU_LINES_FALLBACK
+        )
     return fallback, _estimate_line_count(fallback, _AUDIT_BASE_FALLBACK_LINES_FALLBACK)
 
 
@@ -325,7 +567,9 @@ def _build_tier(
     benchmark: Optional[dict],
     base_override: Optional[str] = None,
 ) -> EffortTier:
-    base_path, base_lines = base_for(workspace_type, wordlists_dir, override=base_override)
+    base_path, base_lines = base_for(
+        workspace_type, wordlists_dir, override=base_override
+    )
     nominal_index = _EFFORT_RULE_INDEX[level]
 
     if not benchmark:
@@ -336,6 +580,7 @@ def _build_tier(
             rule_path=_resolve_rule_asset_path(rule_name) if rule_name else None,
             device_class="unknown",
             estimated_seconds_per_mode={},
+            rule_rung=0,
         )
 
     device_class = _device_class_for(benchmark, _CAP_REFERENCE_MODE)
@@ -356,6 +601,7 @@ def _build_tier(
         rule_path=_resolve_rule_asset_path(rule_name) if rule_name else None,
         device_class=device_class,
         estimated_seconds_per_mode=estimated,
+        rule_rung=capped_index,
     )
 
 
@@ -408,6 +654,7 @@ def _build_custom_tier(domain: str, benchmark: Optional[dict]) -> Optional[Effor
         rule_path=_resolve_rule_asset_path(rule_name),
         device_class=device_class,
         estimated_seconds_per_mode=estimated,
+        rule_rung=len(_RULE_LADDER) - 1,
     )
 
 
@@ -497,9 +744,7 @@ def default_effort_for_workspace(workspace_type: str) -> str:
     ``fast``, matching the existing CTF "near-instant" precedent.
     """
     return (
-        "balanced"
-        if str(workspace_type or "").strip().lower() == "audit"
-        else "fast"
+        "balanced" if str(workspace_type or "").strip().lower() == "audit" else "fast"
     )
 
 
@@ -728,7 +973,9 @@ def build_estimates_payload(
     for mode in BENCHMARK_MODES:
         per_tier: dict[str, dict] = {}
         for level in EFFORT_LEVELS:
-            est = estimate_effort(level, mode, benchmark=benchmark, base_lines=base_lines)
+            est = estimate_effort(
+                level, mode, benchmark=benchmark, base_lines=base_lines
+            )
             per_tier[level] = {
                 "seconds": round(est.seconds, 2),
                 "human": est.human,

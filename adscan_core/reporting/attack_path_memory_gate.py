@@ -392,6 +392,7 @@ def _dfs_bound_operator_message(
         "full set of routes."
     )
 
+
 # Operator-scenario discriminator. When the projected need exceeds the TOTAL
 # ceiling, freeing RAM cannot help — the ceiling is fixed and too small. When the
 # total is ample but AVAILABLE is low, another workload is holding memory and
@@ -653,8 +654,32 @@ def operator_message(projection: MemoryProjection) -> str:
 
 
 # --- Client-facing coverage declaration (mirrors cracking_coverage) -----------
+#
+# Three coverage MODES, all rendered through the ONE ``attack_path_coverage``
+# block so the PDF report and the web platform word every case identically:
+#
+#   * COMPLETE — the DFS engine evaluated every candidate route. No gap, no
+#     declaration; the block records ``complete=True`` and renders nothing.
+#   * BOUNDED — discovery hit a hard resource ceiling and STOPPED. The route set
+#     is not exhaustive; a re-run on a larger host is needed to finish it.
+#   * SAMPLED — a very large directory routed to the bounded fallback engine,
+#     which returns a coverage-FLOORED sample: every reachable high-value target
+#     is represented, but the number of routes shown per target is capped. The
+#     exposure COUNT (how many principals can reach a high-value target) is the
+#     stable figure to track across re-scans; the specific routes shown are a
+#     sample and may change from one scan to the next.
+#
+# ``COMPLETE`` and ``BOUNDED`` are byte-identical to the pre-sampled block.
 
-_COMPLETE_STATEMENT = "Attack-path discovery evaluated the full set of candidate routes."
+#: Coverage-mode tokens carried on the block, so a consumer can branch on the
+#: mode without re-deriving it from the flags.
+COVERAGE_MODE_COMPLETE = "complete"
+COVERAGE_MODE_BOUNDED = "bounded"
+COVERAGE_MODE_SAMPLED = "sampled"
+
+_COMPLETE_STATEMENT = (
+    "Attack-path discovery evaluated the full set of candidate routes."
+)
 
 
 def _coverage_statement(examined_routes: int) -> str:
@@ -679,34 +704,101 @@ def _coverage_statement(examined_routes: int) -> str:
     )
 
 
+def _sampled_statement(exposure_source_count: int | None) -> str:
+    """Render the client-facing coverage sentence for a SAMPLED discovery.
+
+    A very large directory returns a representative SAMPLE of routes rather than
+    every route: every reachable high-value target is covered, but the number of
+    routes shown per target is capped. The figure to track across re-scans is the
+    exposure COUNT — how many principals can reach a high-value target — which is
+    stable even though the individual routes shown are a sample and may change
+    between scans. Like the bounded statement it never gives the internal reason,
+    never renders a verdict about the client's directory, and never lets the
+    sampled set read as an exhaustive one.
+    """
+    if isinstance(exposure_source_count, int) and exposure_source_count > 0:
+        exposure = f"{exposure_source_count:,} principals can reach a high-value target"
+        return (
+            "This directory is large enough that attack-path discovery reports a "
+            "representative sample of routes rather than every route. Every "
+            "reachable high-value target is covered, and the exposure is measured "
+            f"as a count: {exposure}. That count is the figure to track across "
+            "re-scans, as it is stable even though the specific routes shown are a "
+            "sample and may change from one scan to the next. The routes reported "
+            "here are validated as usual."
+        )
+    return (
+        "This directory is large enough that attack-path discovery reports a "
+        "representative sample of routes rather than every route. Every reachable "
+        "high-value target is covered, and the exposure is measured as a count of "
+        "how many principals can reach a high-value target. That count is the "
+        "figure to track across re-scans, as it is stable even though the specific "
+        "routes shown are a sample and may change from one scan to the next. The "
+        "routes reported here are validated as usual."
+    )
+
+
 def build_attack_path_coverage(
     *,
-    bounded: bool,
+    bounded: bool = False,
+    sampled: bool = False,
     examined_routes: int = 0,
+    exposure_source_count: int | None = None,
 ) -> dict[str, Any]:
     """Build the ``attack_path_coverage`` block for one domain.
 
+    The block carries ONE of three coverage modes (see the module comment above):
+    COMPLETE (the DFS evaluated every route), BOUNDED (discovery hit a resource
+    ceiling and stopped short), or SAMPLED (a very large directory returned a
+    coverage-floored sample). ``bounded`` and ``sampled`` are mutually exclusive;
+    ``bounded`` wins if both are passed (a hard stop is the more conservative
+    claim).
+
     Args:
-        bounded: Whether attack-path discovery had to stop under a resource
-            limit. ``False`` records a complete run (the statement affirms full
-            coverage and ``build`` carries ``complete=True``).
-        examined_routes: Raw candidate routes examined before the bound, when
+        bounded: Whether attack-path discovery had to STOP under a resource
+            limit — the route set is not exhaustive and a re-run on a larger host
+            is needed to finish it.
+        sampled: Whether the bounded fallback engine ran and returned a
+            coverage-floored SAMPLE of routes (every reachable high-value target
+            represented, routes per target capped). The exposure count is the
+            stable metric across re-scans.
+        examined_routes: Raw candidate routes examined before a BOUNDED stop, when
             known — surfaced to the client as the coverage boundary, never the
-            reason for it.
+            reason for it. Ignored for the complete and sampled modes.
+        exposure_source_count: For the SAMPLED mode, how many principals can reach
+            a high-value target — the stable exposure figure the statement anchors
+            the re-scan narrative on. Omitted (``None``) still yields a valid
+            statement, without the concrete number.
 
     Returns:
         The block to hand to ``record_attack_path_coverage``. Always carries
-        ``statement`` so the recorder accepts it.
+        ``statement`` so the recorder accepts it, plus ``mode``, ``complete``,
+        ``sampled``, ``examined_routes`` and ``exposure_source_count``.
     """
-    complete = not bounded
+    examined = max(0, int(examined_routes))
+    source_count = (
+        max(0, int(exposure_source_count))
+        if isinstance(exposure_source_count, int)
+        else None
+    )
+    if bounded:
+        mode = COVERAGE_MODE_BOUNDED
+        statement = _coverage_statement(examined)
+    elif sampled:
+        mode = COVERAGE_MODE_SAMPLED
+        statement = _sampled_statement(source_count)
+    else:
+        mode = COVERAGE_MODE_COMPLETE
+        statement = _COMPLETE_STATEMENT
     return {
-        "complete": complete,
-        "examined_routes": max(0, int(examined_routes)),
-        "statement": (
-            _COMPLETE_STATEMENT
-            if complete
-            else _coverage_statement(max(0, int(examined_routes)))
-        ),
+        "mode": mode,
+        # ``complete`` stays the historical field the view/merge key on; it is True
+        # ONLY for the full-DFS mode, so a sampled run correctly reads as a gap.
+        "complete": mode == COVERAGE_MODE_COMPLETE,
+        "sampled": mode == COVERAGE_MODE_SAMPLED,
+        "examined_routes": examined,
+        "exposure_source_count": source_count,
+        "statement": statement,
     }
 
 
@@ -719,37 +811,80 @@ def attack_path_coverage_view(coverage: Any) -> dict[str, Any]:
     Returns a mapping with:
       * ``has_gap`` — whether to surface the declaration at all;
       * ``statement`` — the client-facing sentence (empty when complete);
-      * ``examined_routes`` — routes examined before the bound, for a machine
-        consumer.
+      * ``mode`` — ``complete`` / ``bounded`` / ``sampled``, so a renderer can
+        style the declaration (a sampled run is a coverage NOTE, not a failure);
+      * ``sampled`` — convenience boolean for the sampled mode;
+      * ``examined_routes`` — routes examined before a bounded stop;
+      * ``exposure_source_count`` — for a sampled run, the stable exposure count,
+        or ``None``.
 
     An absent or unreadable block yields ``has_gap=False`` and an empty statement:
     a scan predating this record, or a complete run, must render exactly as it did
     before rather than grow a gap notice nobody observed.
     """
     if not isinstance(coverage, Mapping):
-        return {"has_gap": False, "statement": "", "examined_routes": 0}
+        return {
+            "has_gap": False,
+            "statement": "",
+            "mode": COVERAGE_MODE_COMPLETE,
+            "sampled": False,
+            "examined_routes": 0,
+            "exposure_source_count": None,
+        }
     complete = bool(coverage.get("complete", True))
     statement = str(coverage.get("statement") or "").strip()
     try:
         examined = max(0, int(coverage.get("examined_routes") or 0))
     except (TypeError, ValueError):
         examined = 0
+    sampled = bool(coverage.get("sampled", False))
+    # Derive the mode from the block: an older bounded block predating the mode
+    # field still resolves correctly (complete=False, sampled absent → bounded).
+    mode = str(coverage.get("mode") or "").strip().lower()
+    if mode not in (
+        COVERAGE_MODE_COMPLETE,
+        COVERAGE_MODE_BOUNDED,
+        COVERAGE_MODE_SAMPLED,
+    ):
+        if complete:
+            mode = COVERAGE_MODE_COMPLETE
+        elif sampled:
+            mode = COVERAGE_MODE_SAMPLED
+        else:
+            mode = COVERAGE_MODE_BOUNDED
+    raw_source_count = coverage.get("exposure_source_count")
+    try:
+        exposure_source_count = (
+            max(0, int(raw_source_count)) if raw_source_count is not None else None
+        )
+    except (TypeError, ValueError):
+        exposure_source_count = None
     return {
         "has_gap": bool(not complete and statement),
         "statement": statement if not complete else "",
+        "mode": mode,
+        "sampled": mode == COVERAGE_MODE_SAMPLED,
         "examined_routes": examined,
+        "exposure_source_count": exposure_source_count,
     }
 
 
 def merge_attack_path_coverage(domain_entries: Any) -> dict[str, Any]:
     """Fold every domain's recorded coverage into one report-wide view.
 
-    A bounded discovery in any domain means the assessment's route set is not
-    exhaustive, so the union is a gap for the whole report. The statement returned
-    is the one that was RECORDED (never a fresh derivation), so a later change to
-    this module cannot silently rewrite a finding an already-delivered report made;
-    only when several domains recorded DIFFERENT gap statements is one re-derived
-    from the largest examined count.
+    A bounded OR sampled discovery in any domain means the assessment's route set
+    is not exhaustive, so the union is a gap for the whole report. The statement
+    returned is the one that was RECORDED (never a fresh derivation), so a later
+    change to this module cannot silently rewrite a finding an already-delivered
+    report made; only when several domains recorded DIFFERENT gap statements is
+    one re-derived.
+
+    When both a BOUNDED (hard stop) and a SAMPLED gap are present, the merged view
+    takes the BOUNDED mode: a hard stop is the more conservative, more urgent
+    claim (the route set is genuinely incomplete, versus a sampled run that still
+    covers every reachable target). A report with only sampled gaps stays sampled,
+    carrying the largest exposure count so the re-scan narrative anchors on the
+    stable figure.
 
     ``domain_entries`` is any iterable of per-domain mappings (the renderer passes
     ``report_data.values()``); non-mapping entries and the reserved non-domain
@@ -758,7 +893,9 @@ def merge_attack_path_coverage(domain_entries: Any) -> dict[str, Any]:
     """
     statements: list[str] = []
     max_examined = 0
-    saw_gap = False
+    max_source_count = 0
+    saw_bounded = False
+    saw_sampled = False
     for entry in domain_entries or ():
         if not isinstance(entry, Mapping):
             continue
@@ -766,13 +903,25 @@ def merge_attack_path_coverage(domain_entries: Any) -> dict[str, Any]:
         view = attack_path_coverage_view(block)
         if not view["has_gap"]:
             continue
-        saw_gap = True
+        if view["mode"] == COVERAGE_MODE_SAMPLED:
+            saw_sampled = True
+            count = view.get("exposure_source_count")
+            if isinstance(count, int):
+                max_source_count = max(max_source_count, count)
+        else:
+            saw_bounded = True
         max_examined = max(max_examined, int(view["examined_routes"]))
         if view["statement"] not in statements:
             statements.append(view["statement"])
-    if not saw_gap:
+    if not saw_bounded and not saw_sampled:
         return attack_path_coverage_view(None)
-    merged = build_attack_path_coverage(bounded=True, examined_routes=max_examined)
+    if saw_bounded:
+        merged = build_attack_path_coverage(bounded=True, examined_routes=max_examined)
+    else:
+        merged = build_attack_path_coverage(
+            sampled=True,
+            exposure_source_count=max_source_count or None,
+        )
     if len(statements) == 1:
         merged["statement"] = statements[0]
     return attack_path_coverage_view(merged)
@@ -780,6 +929,9 @@ def merge_attack_path_coverage(domain_entries: Any) -> dict[str, Any]:
 
 __all__ = [
     "ATTACK_PATH_COVERAGE_KEY",
+    "COVERAGE_MODE_COMPLETE",
+    "COVERAGE_MODE_BOUNDED",
+    "COVERAGE_MODE_SAMPLED",
     "FLOOR_BYTES",
     "GRAPH_BYTES_PER_ELEMENT",
     "PATH_BASE_BYTES_PER_RAWPATH",

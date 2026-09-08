@@ -4178,6 +4178,87 @@ def _sanitize_by_markers(
     return content
 
 
+# A single IPv4 quad, dot- OR underscore-separated, each octet 0-255, with an
+# optional ``/NN`` or ``_NN`` CIDR width (0-32). Anchored so it can be scanned
+# LEFT-TO-RIGHT across a run of concatenated / fused addresses: an octet is
+# 1-3 digits, so a run-together boundary (``...22192...`` = ``22`` then ``192``)
+# is split by consuming exactly one valid quad and resuming after it.
+_IPV4_QUAD_ANYWHERE_PATTERN = re.compile(
+    r"(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+    r"([._])(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+    r"([._])(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+    r"([._])(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+    r"(?:([/_])(3[0-2]|[12]?[0-9]))?"
+)
+
+
+def _mask_ipv4_run(run: str) -> str:
+    """Pseudonymize every IPv4-shaped quad inside a candidate ``run``.
+
+    This net runs AFTER the strict ``\b``-anchored dotted-quad net, which has
+    already masked every clean, standalone dotted IP (and recorded its
+    provably-fake pseudonym, whose one ``> 255`` octet must NOT be re-scrambled).
+    So this pass fires ONLY on the two DEFEAT shapes the strict net cannot see:
+      (a) an UNDERSCORE-separated quad (the ``ADSCAN_HOST_IP_<KEY>`` env-key form,
+          where dots became underscores), and
+      (b) a dotted quad FUSED to an adjacent digit run (``...22192...`` = ``22``
+          then ``192``), where the ``\b`` boundary broke.
+    A clean dot-only quad with no fused digit neighbour is left to the strict net
+    (it is already masked). Any text that is NOT a valid IPv4 quad (a version like
+    ``3.11.13`` -- three octets; a numeric literal like ``1_000_000`` -- an
+    out-of-range octet; a plain identifier like ``some_id_42``) is emitted
+    verbatim so nothing legitimate is destroyed.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        groups = match.groups()
+        octets = [groups[0], groups[2], groups[4], groups[6]]
+        seps = [groups[1], groups[3], groups[5]]
+        cidr_sep, cidr_val = groups[7], groups[8]
+
+        # Never touch a token the strict net already masked. The strict net runs
+        # FIRST and records each provably-fake replacement (whose one ``> 255``
+        # octet the regex here would split into ``4`` + ``74``, corrupting the
+        # deterministic pseudonym). Extract the FULL contiguous ``[\d._/]`` run
+        # this match sits in and skip when that run is already sanitized.
+        maximal_start, maximal_end = match.start(), match.end()
+        while maximal_start > 0 and (
+            run[maximal_start - 1].isdigit() or run[maximal_start - 1] in "._/"
+        ):
+            maximal_start -= 1
+        while maximal_end < len(run) and (
+            run[maximal_end].isdigit() or run[maximal_end] in "._/"
+        ):
+            maximal_end += 1
+        maximal_run = run[maximal_start:maximal_end]
+        if _is_already_sanitized(maximal_run):
+            return match.group(0)
+
+        # Fire only on a defeat shape. A dot-only quad that is NOT fused to an
+        # adjacent digit was already masked by the strict net, so leave it here.
+        has_underscore_sep = any(sep == "_" for sep in seps)
+        start, end = match.start(), match.end()
+        fused_before = start > maximal_start and run[start - 1].isdigit()
+        fused_after = end < maximal_end and run[end].isdigit()
+        if not (has_underscore_sep or fused_before or fused_after):
+            return match.group(0)
+
+        # Pseudonymize via the canonical dotted form so the provably-fake IPv4
+        # scrambler applies, then lay the fake octets back onto the ORIGINAL
+        # separators so the env-key underscore form stays shaped like one.
+        fake_octets = _record_pseudonym(".".join(octets), "ip").split(".")
+        rebuilt = fake_octets[0]
+        for k in range(3):
+            rebuilt += seps[k] + fake_octets[k + 1]
+        if cidr_sep is not None and cidr_val is not None:
+            # CIDR width stays readable (identical to the strict net), with its
+            # original ``/`` or ``_`` separator preserved.
+            rebuilt += cidr_sep + cidr_val
+        return rebuilt
+
+    return _IPV4_QUAD_ANYWHERE_PATTERN.sub(_replace, run)
+
+
 def _sanitize_rich_output(content: str) -> str:
     """Sanitize Rich HTML/text output before sending to telemetry.
 
@@ -4243,6 +4324,22 @@ def _sanitize_rich_output(content: str) -> str:
         lambda m: _record_pseudonym(m.group(0), "ip"),
         content,
     )
+
+    # Loose backstop for the two shapes the strict dotted-quad net above cannot
+    # see, both of which leaked a real customer subnet to a paid-audit recording:
+    #   (a) the underscore env-key form ``ADSCAN_HOST_IP_192_168_243_22`` -- an IP
+    #       folded into a variable name (dots -> underscores) that ``\b``-anchored
+    #       dotted-quad matching never touches; and
+    #   (b) run-together dotted quads ``192.168.243.22192.168.243.0/24`` -- a
+    #       broken input boundary (two ranges pasted with no separator) defeats
+    #       the ``\b`` boundary, masking only the leading run and leaving the tail
+    #       address verbatim.
+    # _IPV4_QUAD_ANYWHERE_PATTERN is self-anchored (four 0-255 octets + ``.``/``_``
+    # separators, optional CIDR) and scans left-to-right, so it rewrites ONLY
+    # genuine IPv4 quads -- a three-octet version (``3.11.13``), an out-of-range
+    # numeric literal (``1_000_000``), or a snake_case identifier (``some_id_42``)
+    # never forms a valid quad and passes through untouched.
+    content = _mask_ipv4_run(content)
 
     # Structural backstop for IPv6 addresses.
     #
@@ -4721,6 +4818,146 @@ def _sanitize_rich_output(content: str) -> str:
             f"[telemetry] Applied fallback sanitization to {replaced_leftovers} domain/user combos"
         )
 
+    # Redact the REALM inside the Kerberos ccache/klist TGS diagnostics
+    # (``ccache_servers=krbtgt/CORP.LOCAL@corp.local``,
+    # ``klist_servers=krbtgt/CORP.LOCAL``) BEFORE the path-guarded FQDN passes
+    # below. Those passes carry a ``(?<![\\/])`` lookbehind so they never mask a
+    # genuine filesystem-path component -- but the SPN's ``/`` separator trips that
+    # same guard, so the realm (preceded by ``service-class/``) was left UNREDACTED
+    # and the client's/box's organization name leaked verbatim into the uploaded
+    # session recording (winrm_psrp_service.py builds these strings from raw
+    # ``krbtgt/REALM@domain`` principals). Running an explicit pass here strips the
+    # realm (and any trailing ``@domain``) before the path guard can shield it.
+    #
+    # SCOPE -- deliberately narrow so it never collides with the existing
+    # "service"-typed SPN handling (the marked ``Service`` field and the
+    # delegation-target table cell, both masked WHOLE as one ``"service"`` token
+    # elsewhere in the pipeline) and never over-matches a filesystem path segment
+    # like ``logs/adscan.log``. It fires ONLY on the two shapes that are
+    # unambiguously the ccache/klist TGS diagnostics, never on the
+    # ``service-class/host.domain`` SPN form the service pipeline owns:
+    #   1. ANY ``service-class/REALM@domain`` -- the ``@domain`` suffix is the TGS
+    #      server-principal form, which a delegation target SPN never carries;
+    #   2. bare ``krbtgt/REALM`` -- the TGT service principal, never a delegation
+    #      target. This covers BOTH a dotted FQDN realm (``krbtgt/CORP.LOCAL``) and
+    #      a SINGLE-LABEL NetBIOS realm (``krbtgt/CONTOSO``, no dot / no @) -- the
+    #      latter otherwise slips through every FQDN net (no dot) and every @domain
+    #      net (no @), leaking the org name verbatim. It is anchored on the
+    #      well-known literal ``krbtgt/`` specifically, so a single-label realm can
+    #      never be confused with prose like ``SMB/LDAP`` / ``TCP/IP`` or an
+    #      arbitrary ``service-class/HOST`` SPN (which the "service"-typed pipeline
+    #      owns).
+    # A leading ``(?<![\w./\\-])`` boundary keeps a path segment (``logs/`` inside
+    # ``.../logs/adscan.log``) from being read as a service-class.
+    #
+    # The realm/@domain seed flows through ``_record_pseudonym(..., "domain")``
+    # (canonicalized via ``_seed_value_for_data_type``), so the realm and the
+    # ``@domain`` occurrence of the SAME domain collapse to the SAME pseudonym
+    # (one real domain -> one mask; a divergent mask is a reviewability defect).
+    spn_realm_pattern = re.compile(
+        r"""
+        (?<![\w./\\-])
+        (?:
+            (?P<svc_at>[A-Za-z][A-Za-z0-9]*)/         # any service class ...
+            (?P<realm_at>
+                (?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+
+                [A-Za-z]{2,}
+            )
+            (?P<port_at>:[0-9]{1,5})?
+            @(?P<atdomain>[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])   # ... WITH @domain
+        |
+            (?P<svc_bare>krbtgt)/                     # or bare krbtgt/REALM.FQDN
+            (?P<realm_bare>
+                (?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+
+                [A-Za-z]{2,}
+            )
+            (?P<port_bare>:[0-9]{1,5})?
+        |
+            krbtgt/                                   # or bare krbtgt/SINGLELABEL
+            (?P<realm_single>[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)
+        )
+        (?![\w.-])
+        """,
+        re.VERBOSE,
+    )
+
+    def _replace_spn_realm(match: re.Match[str]) -> str:
+        if _is_already_sanitized(match.group(0)):
+            return match.group(0)
+        if match.group("svc_at") is not None:
+            svc = match.group("svc_at")
+            realm = match.group("realm_at")
+            port = match.group("port_at") or ""
+            atdomain = match.group("atdomain")
+            realm_repl = _record_pseudonym(realm, "domain")
+            atdomain_repl = _record_pseudonym(atdomain, "domain")
+            result = f"{svc}/{realm_repl}{port}@{atdomain_repl}"
+            # Shield the masked ``<realm-last-label>@<domain>`` substring so the
+            # later ``\w+@domain`` pass does not re-mask the realm's final label as
+            # a "user". Register the exact composite it would match -- NOT the bare
+            # sub-labels, which would perturb the deterministic pseudonym stream of
+            # unrelated tokens (e.g. filesystem paths).
+            realm_last = realm_repl.rsplit(".", 1)[-1]
+            _SANITIZED_VALUES.add(f"{realm_last}@{atdomain_repl}")
+            return result
+        if match.group("svc_bare") is not None:
+            svc = match.group("svc_bare")
+            realm = match.group("realm_bare")
+            port = match.group("port_bare") or ""
+            return f"{svc}/{_record_pseudonym(realm, 'domain')}{port}"
+        # Bare single-label NetBIOS realm (``krbtgt/CONTOSO``). Same canonical
+        # ``"domain"`` seed so it collapses with any dotted/@domain occurrence of
+        # the same realm; ``krbtgt`` is a fixed literal so this cannot fire on
+        # prose or an arbitrary ``service-class/HOST`` SPN.
+        realm = match.group("realm_single")
+        return f"krbtgt/{_record_pseudonym(realm, 'domain')}"
+
+    content = spn_realm_pattern.sub(_replace_spn_realm, content)
+
+    # Redact a bare NetBIOS server name in the two UNAMBIGUOUS MSSQL linked-server
+    # positions, even when it is NOT in ``_KNOWN_NETBIOS``. A linked-server target
+    # lives in a trusted / never-enumerated domain, so its short name never enters
+    # ``enabled_computers.txt`` -> ``_KNOWN_NETBIOS``; and the bare-token gate
+    # (``_looks_like_ad_domain_token``) deliberately does NOT mask an unregistered
+    # NetBIOS-shaped word without a password tail, so ``SMB/LDAP`` / ``TCP/IP`` are
+    # never destroyed. That conservative gate left the linked-server's short
+    # hostname (``CASTELBLACK``) in cleartext in ``sp_linkedservers`` /
+    # ``@@SERVERNAME`` / ``EXEC(...) AT [link]`` diagnostics. This pass masks it
+    # ONLY where the SQL syntax makes the token unambiguously a server name -- it is
+    # POSITIONAL (anchored on ``AT [`` or the provider-token column), so it never
+    # masks an arbitrary uppercase word (``ERROR``, ``SELECT``, ``TRUE``) elsewhere.
+    # The FQDN on the same ``sp_linkedservers`` row is already masked by the FQDN
+    # nets below; this pass adds the SHORT name. The seed flows through
+    # ``_record_pseudonym(..., "hostname")`` (canonical) so it collapses with any
+    # other occurrence of that host.
+    #
+    #   1. ``AT [<NAME>]``          -- the linked-server EXEC-AT form (brackets);
+    #   2. ``<NAME> <PROVIDER> ...`` -- a linked-server-list output ROW whose first
+    #      column is the server name followed by a known OLE DB provider token
+    #      (``SQLNCLI`` / ``SQLOLEDB`` / ``MSOLEDBSQL`` / ``SQLNCLI11`` ...).
+    mssql_link_at_pattern = re.compile(r"(?i)(\bAT\s+\[)([^\]\r\n]+)(\])")
+
+    def _replace_mssql_link_at(match: re.Match[str]) -> str:
+        name = match.group(2)
+        if _is_already_sanitized(name.strip()):
+            return match.group(0)
+        return f"{match.group(1)}{_record_pseudonym(name, 'hostname')}{match.group(3)}"
+
+    content = mssql_link_at_pattern.sub(_replace_mssql_link_at, content)
+
+    mssql_link_row_pattern = re.compile(
+        r"(?m)(?<![A-Za-z0-9._$\\/-])([A-Za-z0-9][A-Za-z0-9._$-]*)(\s+)"
+        r"(SQLNCLI(?:1[01])?|SQLOLEDB|MSOLEDBSQL(?:19)?|MSDASQL|ADSDSOOBJECT|MSDAORA)\b"
+    )
+
+    def _replace_mssql_link_row(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if _is_already_sanitized(name.strip()):
+            return match.group(0)
+        return f"{_record_pseudonym(name, 'hostname')}{match.group(2)}{match.group(3)}"
+
+    content = mssql_link_row_pattern.sub(_replace_mssql_link_row, content)
+
     # Redact file paths (absolute, relative, and placeholder-backed) before domains.
     path_pattern = re.compile(
         r"""
@@ -4757,6 +4994,11 @@ def _sanitize_rich_output(content: str) -> str:
         if _is_password_context(match, content):
             return match.group(0)
         token = match.group(0)
+        # Already fully pseudonymized (e.g. a masked SPN ``realm@domain`` composite
+        # registered by the SPN-realm pass above) -- re-processing would re-mask the
+        # realm's final label as a spurious "user" and fork the pseudonym.
+        if _is_already_sanitized(token):
+            return token
         if "@" not in token:
             return token
         # Qualified well-known principal: keep the public name, sanitize domain.

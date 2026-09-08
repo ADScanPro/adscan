@@ -535,7 +535,6 @@ async def _probe_ldaps_available(
         # mismatch, broken chain, ...). Port is open but LDAPS is not
         # functional — distinct from "port closed".
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U1 LDAPS ssl.SSLError on {dc_ip}:636 after "
             f"{_now_ms() - started:.0f}ms — {type(exc).__name__}: {exc} "
@@ -570,7 +569,6 @@ async def _probe_ldaps_available(
         # answer is UNKNOWN LOW + NO sink emit — the cache stays untouched
         # and the next operation re-probes.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U1 LDAPS asyncio.TimeoutError on {dc_ip}:636 "
             f"after {_now_ms() - started:.0f}ms (budget={handshake_timeout}s) — "
@@ -593,7 +591,6 @@ async def _probe_ldaps_available(
         # Explicit TCP RST from the DC — port is closed. This IS an
         # observation; cache HIGH normally.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U1 LDAPS ConnectionRefused on {dc_ip}:636 "
             f"after {_now_ms() - started:.0f}ms — {exc}"
@@ -624,7 +621,6 @@ async def _probe_ldaps_available(
         # Other rare OSErrors are also captured here — if the kernel
         # answered, the answer is authoritative for this network state.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U1 LDAPS OSError on {dc_ip}:636 "
             f"after {_now_ms() - started:.0f}ms — {type(exc).__name__}: "
@@ -658,7 +654,6 @@ async def _probe_ldaps_available(
                 await writer.wait_closed()
             except Exception as close_exc:  # noqa: BLE001
                 telemetry.capture_exception(close_exc)
-                print_exception(exception=close_exc)
 
 
 async def _probe_ldap_starttls_available(
@@ -883,7 +878,6 @@ async def _probe_ldap_starttls_available(
         # Correct answer: UNKNOWN LOW + NO sink emit — the cache stays
         # untouched and the next operation re-probes.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U4 StartTLS asyncio.TimeoutError on {dc_ip}:389 "
             f"after {_now_ms() - started:.0f}ms (budget={handshake_timeout}s) — "
@@ -904,7 +898,6 @@ async def _probe_ldap_starttls_available(
         # Explicit TCP RST from the DC — port 389 is closed. This IS an
         # observation; cache DISABLED HIGH.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U4 StartTLS ConnectionRefused on {dc_ip}:389 "
             f"after {_now_ms() - started:.0f}ms — {exc}"
@@ -933,7 +926,6 @@ async def _probe_ldap_starttls_available(
         # primitive rather than being returned as ``err``). extendedReq was
         # accepted, the cert is broken/absent — OBSERVED DISABLED HIGH.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U4 StartTLS ssl.SSLError (raised) on {dc_ip}:389 "
             f"after {_now_ms() - started:.0f}ms — {type(exc).__name__}: {exc}"
@@ -962,7 +954,6 @@ async def _probe_ldap_starttls_available(
         # kernel telling us the DC is not routable. The network layer
         # answered, so this IS an observation; cache DISABLED HIGH.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U4 StartTLS OSError on {dc_ip}:389 after "
             f"{_now_ms() - started:.0f}ms — {type(exc).__name__}: {exc} "
@@ -992,7 +983,6 @@ async def _probe_ldap_starttls_available(
         # about OUR state, not the DC's. UNKNOWN/LOW, NO emit — cache clean,
         # next caller re-probes.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] U4 StartTLS unclassifiable exception on {dc_ip}:389 "
             f"after {_now_ms() - started:.0f}ms — {type(exc).__name__}: {exc}. "
@@ -1019,7 +1009,6 @@ async def _probe_ldap_starttls_available(
                         await res
             except Exception as close_exc:  # noqa: BLE001
                 telemetry.capture_exception(close_exc)
-                print_exception(exception=close_exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1292,7 +1281,6 @@ async def _probe_ldap_signing(
                     await res
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
-            print_exception(exception=disc_exc)
         print_info_debug(
             f"[posture_probe] U2 signing -> bind accepted (not required) on {dc_ip}:389 "
             f"in {_now_ms() - started:.0f}ms"
@@ -1318,7 +1306,6 @@ async def _probe_ldap_signing(
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         # elapsed-vs-budget delta is the key diagnostic: elapsed ~ budget
         # → genuine latency/slow DC; elapsed << budget → the coroutine was
         # starved (event-loop contention), which would argue for serializing
@@ -1339,7 +1326,6 @@ async def _probe_ldap_signing(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         # NTLM-disabled DC: the bogus-cred NTLM bind collapses in the SSP
         # BEFORE the DC validates LDAP signing, so U2 cannot measure signing
         # enforcement this way. Observe-don't-infer: return UNKNOWN/LOW with NO
@@ -1637,7 +1623,6 @@ async def _probe_ldap_signing_authenticated(
                     await res
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
-            print_exception(exception=disc_exc)
         print_info_debug(
             f"[posture_probe] A5 signing tiebreaker -> unsigned authenticated bind accepted "
             f"(not required) on {dc_ip}:389 in {_now_ms() - started:.0f}ms"
@@ -1663,7 +1648,6 @@ async def _probe_ldap_signing_authenticated(
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -1675,7 +1659,6 @@ async def _probe_ldap_signing_authenticated(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         verdict = _classify_ldap_policy_response(exc)
         print_info_debug(
             f"[posture_probe] A5 signing tiebreaker -> {verdict} (exception) on {dc_ip}:389 "
@@ -1820,7 +1803,6 @@ async def _probe_ldaps_channel_binding(
                         await res
             except Exception as disc_exc:  # noqa: BLE001
                 telemetry.capture_exception(disc_exc)
-                print_exception(exception=disc_exc)
             return None, True
         except asyncio.TimeoutError as exc:
             # elapsed-vs-budget delta is the key diagnostic: elapsed ~ budget
@@ -2267,7 +2249,6 @@ async def _probe_ldaps_channel_binding_kerberos(
                     await res
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
-            print_exception(exception=disc_exc)
         # Bind accepted with NO CBT token -> CBT not enforced for absent CBT.
         print_info_debug(
             f"[posture_probe] A6 Kerberos-CBT -> no-CBT bind ACCEPTED on "
@@ -2300,7 +2281,6 @@ async def _probe_ldaps_channel_binding_kerberos(
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] A6 Kerberos-CBT timed out after {timeout}s on "
             f"{spn_host} -- elapsed {_now_ms() - started:.0f}ms; no verdict emitted"
@@ -2316,7 +2296,6 @@ async def _probe_ldaps_channel_binding_kerberos(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         if is_ldaps_transport_failure(exc):
             return ProbeResult(
                 category=cat,
@@ -2486,7 +2465,6 @@ async def _probe_kerberos_rc4(
         )
     except KerberosEtypeError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         _emit(
             sink,
             domain=domain,
@@ -2513,7 +2491,6 @@ async def _probe_kerberos_rc4(
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2525,7 +2502,6 @@ async def _probe_kerberos_rc4(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2616,7 +2592,6 @@ async def _probe_kerberos_etype(
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2628,7 +2603,6 @@ async def _probe_kerberos_etype(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2778,7 +2752,6 @@ async def _probe_ntlm_authentication(
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2792,7 +2765,6 @@ async def _probe_ntlm_authentication(
         # TCP connect / NEGOTIATE failed -> the NTLM SSP decision was never
         # reached. Observe-don't-infer: UNKNOWN/LOW, no emit.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2804,7 +2776,6 @@ async def _probe_ntlm_authentication(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2919,7 +2890,6 @@ async def _probe_smb_signing(
         neg = await asyncio.wait_for(smb_negotiate_signing(cfg), timeout=timeout)
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -2934,7 +2904,6 @@ async def _probe_smb_signing(
         # hides the standalone negotiate step in some runtime). Try the §4.2
         # posture-aware session-setup fallback before giving up.
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture_probe] A4 NEGOTIATE read failed "
             f"({type(exc).__name__}); trying posture-aware session-setup fallback"
@@ -3032,7 +3001,6 @@ async def _probe_smb_signing_fallback(
                     signing = bool(getattr(connection, "signing_required", False))
                 except Exception as attr_exc:  # noqa: BLE001
                     telemetry.capture_exception(attr_exc)
-                    print_exception(exception=attr_exc)
             if signing:
                 _emit(
                     sink,
@@ -3078,7 +3046,6 @@ async def _probe_smb_signing_fallback(
         return await asyncio.wait_for(_run(), timeout=timeout)
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -3113,7 +3080,6 @@ async def _probe_smb_signing_fallback(
                 succeeded=True,
             )
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -3938,7 +3904,6 @@ async def probe_password_policy(
                     await res
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
-            print_exception(exception=disc_exc)
 
         if not results:
             print_info_debug(
@@ -4022,7 +3987,6 @@ async def probe_password_policy(
 
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture] Password policy probe timed out after {timeout}s "
             f"for domain={domain}"
@@ -4030,7 +3994,6 @@ async def probe_password_policy(
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture] Password policy probe failed: "
             f"{type(exc).__name__}: {exc}"
@@ -4294,7 +4257,6 @@ async def _resolve_pso_policy(
             break  # first match wins
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture] PSO user lookup failed for target_user: "
             f"{type(exc).__name__}: {exc}"
@@ -4382,7 +4344,6 @@ async def _resolve_pso_policy(
                 return _build_policy(attrs, resultant_pso_dn)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_exception(exception=exc)
             print_info_debug(
                 f"[posture] msDS-ResultantPSO BASE read failed, falling back to "
                 f"precedence computation: {type(exc).__name__}: {exc}"
@@ -4417,7 +4378,6 @@ async def _resolve_pso_policy(
             pso_attrs_by_dn[dn.upper()] = attrs
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_exception(exception=exc)
         print_info_debug(
             f"[posture] PSO container read failed: {type(exc).__name__}: {exc}"
         )
@@ -4564,13 +4524,11 @@ async def resolve_resultant_password_policy(
                             await res
                 except Exception as disc_exc:  # noqa: BLE001
                     telemetry.capture_exception(disc_exc)
-                    print_exception(exception=disc_exc)
             if pso_policy is not None:
                 _RESULTANT_POLICY_CACHE[cache_key] = pso_policy
                 return pso_policy
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_exception(exception=exc)
             print_info_debug(
                 f"[posture] PSO resolution failed; using domain default: "
                 f"{type(exc).__name__}: {exc}"

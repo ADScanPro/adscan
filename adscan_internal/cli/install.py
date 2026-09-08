@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List
+from adscan_core.pal.platform import is_windows
 from adscan_core.rich_output import print_exception
 
 
@@ -1707,6 +1708,38 @@ def run_install(
         True if installation completed successfully, False otherwise.
     """
     deps.log_free_disk_space_debug("before installation")
+
+    # Windows-native early branch. The runtime on Windows is self-contained:
+    # there is no apt (Debian package model), no pyenv, and no tool-venvs to
+    # provision. All that "install" must do is materialize the ADscan home tree
+    # so workspaces, tools, wordlists, and logs have somewhere to live. This
+    # mirrors the ``windows_native`` skip pattern used throughout
+    # adscan_internal/cli/check.py. (See docs/superpowers/specs/
+    # 2026-09-03-windows-native-runtime-portability-design.md.)
+    if is_windows():
+        deps.print_info(
+            "Windows-native: nothing to install; the runtime is self-contained."
+        )
+        # Create the ADscan home tree via the injected os_makedirs. The paths
+        # come from InstallConfig, which is built from the adscan_core path
+        # helpers (never a hardcoded %LOCALAPPDATA%).
+        for directory in (
+            config.adscan_base_dir,
+            config.tools_install_dir,
+            config.wordlists_install_dir,
+            config.tool_venvs_base_dir,
+        ):
+            deps.os_makedirs(directory, exist_ok=True)
+        deps.print_success("ADscan home directories are ready.")
+        deps.print_info(
+            "Wordlists ship with the bundle; no download is performed on Windows."
+        )
+        deps.telemetry_capture_user_property_event(
+            "install_completed", "installation_status", "windows_native"
+        )
+        deps.log_free_disk_space_debug("after installation (windows-native)")
+        return True
+
     session_env = deps.determine_session_environment()
     if deps.debug_mode:
         deps.print_info_debug(

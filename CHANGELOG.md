@@ -14,6 +14,175 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+## [12.0.0] - 2026-09-08
+
+### Added
+
+- ADscan now runs natively on Windows. Alongside the Linux Docker deployment,
+  there is now a self-contained Windows build that runs the engine directly, with
+  no Docker, no Python install, and no launcher. A low-privilege user can drop the
+  bundle on a domain-joined Windows host and run a full scan from there; port
+  scanning, password cracking, DNS resolution, clock sync and host DNS all work
+  without the Linux-only plumbing the Docker deployment relied on. Linux is
+  unchanged and remains the default.
+
+- Attack-path discovery now completes on very large, dense directories that
+  previously returned nothing. A directory with tens of thousands of objects and a
+  few heavily-connected groups used to exhaust the analysis before it produced a
+  single route; ADscan now detects that shape up front and switches to a bounded
+  per-target search that returns a representative, honestly-declared set of routes
+  with every reachable high-value target covered, instead of stopping empty.
+  Ordinary-sized directories are unaffected and still return the full set of
+  routes, byte-for-byte as before.
+
+- The report and web platform now lead remediation with the fixes that break the
+  most attack paths ADscan actually executed against your domain, so the
+  highest-leverage fix is what you see at the top, on every surface — the free
+  report, the paid deliverable, and the platform — reading the same ranking and
+  the same numbers. Each fix states how many attack paths closing it removes, a
+  fix that maps to an object with no alternate route is marked as a durable fix,
+  and a fix that only touches theoretically-mapped routes is worded as such and
+  never claimed as executed. When route discovery was sampled on a very large
+  directory the ranking says so plainly.
+
+- On a very large directory, the report and web platform now state plainly when
+  attack-path routes are a representative sample rather than every route. Every
+  reachable high-value target is still covered, and the finding to track over
+  time is the exposure count — how many principals can reach a high-value target
+  — which stays stable across re-scans even though the individual routes shown
+  may change. Ordinary-sized directories are unaffected and continue to report
+  the full set of routes.
+
+- Port scanning now runs in-process on Windows, with no nmap or Npcap needed.
+  A hardened, install-nothing Windows host has no nmap binary, and a SYN scan
+  there needs the Npcap driver plus admin rights that such a host will not have;
+  ADscan now uses a native async TCP connect scan instead. It is paced
+  conservatively by default — comparable to nmap's production-safe timing, with
+  a per-host limit and automatic back-off when the network shows signs of strain
+  — so it stays gentle on fragile hosts and monitored enterprise networks rather
+  than scanning as fast as possible. Operators who own the network can raise the
+  throughput with the `ADSCAN_PORTSCAN_CONCURRENCY` and `ADSCAN_PORTSCAN_PER_HOST`
+  environment variables. Linux is unchanged and still uses nmap's SYN scan.
+
+- Password cracking now falls back to CPU on Windows hosts with no GPU stack.
+  On a hardened Windows machine there is often no OpenCL/CUDA runtime, so the
+  GPU cracker cannot run at all; roast and captured-network-authentication
+  hashes now crack on pure CPU instead, with the recovered credentials recorded
+  the same way and the report declaring the gap honestly when no cracker is
+  available. Linux behaviour is unchanged.
+
+### Changed
+
+- The Windows download is roughly half the size. The bundled audit password
+  list is now shipped compressed and unpacked once on first use, cutting the
+  executable from about 1.2 GB to around 500 MB with no change to cracking
+  behaviour — the same list is used, it is just carried more efficiently.
+
+- Domain-wide attack-path discovery now targets high-value (Tier-0) assets
+  instead of every object. The all-targets domain sweep could not finish on a
+  large directory and the report and execution flows never used it, so a
+  production run no longer launches it silently: the CLI prints an honest note
+  and shows the Tier-0 targets, and the web platform does the same for a direct
+  API request.
+
+- Bulk DNS resolution — both during attack-graph collection and when resolving
+  computer hostnames ahead of the important-port scan — is now faster on large
+  domains and no longer needs the external massdns binary. Names resolve
+  concurrently through the DC, so the dead hosts a big network always has
+  (powered-off machines, stale A records) no longer serialize their timeouts and
+  stall the pass — a 5000-host benchmark measured it about three times faster
+  than the previous approach with identical coverage. Removing the last massdns
+  dependency also means host resolution now works on a native Windows install,
+  where that binary was unavailable.
+
+### Fixed
+
+- AS-REP roasting and Kerberoasting attack-path steps now target the user's own
+  domain in cross-forest paths, instead of roasting the wrong domain and aborting
+  the path. A trusted-domain target is roasted against its own domain controller
+  and realm; if that domain was never enumerated, the step now says so honestly
+  rather than reporting no hashes found in the wrong domain.
+- Cross-forest AD CS attacks (ESC1, ESC3, ESC4, ESC5, ESC13) now authenticate as
+  the enrolling principal against that principal's own forest, instead of assuming
+  the certificate authority's forest. When an owned account in one forest holds
+  enrollment or CA-backup rights across a trust, its ticket is now minted at its
+  home domain controller so the enrollment succeeds, rather than failing because
+  the request was sent to the wrong forest's KDC. The pre-flight readiness check
+  for ESC1, ESC3, ESC4, and ESC13 was fixed the same way — it no longer reports
+  "no stored domain credential found" for an enrolling principal whose credential
+  is stored under its own forest.
+- Attack-path steps that authenticate to a target host or exercise a directory
+  permission (local admin, remote desktop, remote management, database access,
+  full control, write property, password resets, managed-service-account and
+  computer LAPS password reads) now look up the executing account's credential
+  under that account's own domain in a cross-forest path, instead of assuming
+  the domain currently being enumerated. A low-privilege account in one forest
+  can now correctly authenticate a step against a target it can reach through a
+  trust, rather than the step failing because the credential was searched for
+  in the wrong domain.
+- Constrained delegation and resource-based constrained delegation (RBCD)
+  attack-path steps now look up the executing account's credential under that
+  account's own domain in a cross-forest path, the same fix already applied to
+  host-authentication and directory-permission steps, instead of assuming the
+  domain currently being enumerated.
+- HasSession no longer misses a viable executor discovered from an earlier
+  cross-forest AdminTo step: the search for a reusable credential now checks
+  the candidate's own domain, not only the domain currently being enumerated.
+- When the configured scan interface is stale or has no address, ADscan now
+  switches to the interface its own route check found reaches the target
+  (offering the switch interactively, adopting it automatically in unattended
+  runs) instead of dead-ending on "interface has no IPv4 address" and forcing a
+  manual interface change.
+- CPU cracking of multi-principal roast files (AS-REP and Kerberoast captures)
+  now reliably recovers the cracked passwords. The crack and the result read
+  could resolve different result stores, so recovery sometimes came back empty
+  even after John had cracked the hash; the two steps now share one pinned
+  store, and a live crack is also read directly as a backstop.
+- Password cracking on Windows now falls back to a wordlist that is actually
+  present instead of failing silently. On a Windows install the large audit
+  wordlist is not bundled, and cracking would run against a missing file and
+  recover nothing; it now degrades to the available list (rockyou) so a roasted
+  hash whose password is in that list is recovered.
+
+- Attack-path discovery no longer aborts to zero routes on a large,
+  Exchange-heavy directory when scanning from owned principals. The memory
+  estimate now reflects that a path starting from a single owned principal
+  affects far fewer accounts than a domain-wide analysis, instead of assuming
+  the whole directory as its blast radius.
+- The posture probe no longer prints red error lines for its own expected
+  results. Detecting that LDAP signing or channel binding is not enforced works
+  by sending a deliberately-rejected bind, and checking for LDAPS on a closed or
+  filtered port produces an expected connection error — both used to surface as
+  an "An error occurred" banner directly above the panel that reported the same
+  outcome as a success. A genuinely unexpected probe failure is still shown.
+- DC-candidate discovery now reports the ports actually open on each host, not
+  the ports it scanned for. A host answering only on 53/tcp (DNS) previously
+  read as though every domain-controller port was open, making it look like a
+  domain controller right before the scan stalled with nothing to enumerate.
+
+- Session recordings no longer retain an organization or host name from Kerberos
+  and SQL diagnostics — a Kerberos realm (including its short single-label form)
+  in service-principal-name output, or a linked server's short hostname in
+  SQL Server output. Each is now pseudonymized like every other domain and host,
+  and consistently, before a recording is uploaded.
+- Session recordings no longer retain an IP address or subnet embedded in an
+  environment-variable hint or run together with other input. An address folded
+  into a variable name, or two ranges pasted with no separator between them, is
+  now pseudonymized like any other address before a recording is uploaded.
+
+- Attack-path analysis no longer shows a "contact support" error anywhere it runs
+  when route discovery is bounded by available memory on a large environment — the
+  interactive listing, the report, and the platform snapshot all now state the
+  coverage boundary honestly (how many routes were examined and that the set is not
+  exhaustive) and continue instead of stopping.
+- Resuming a scan whose stored credential has since been locked or disabled now
+  shows a clear "the credential is locked or disabled — save a fresh one and
+  re-run" line instead of raw Kerberos and LDAP error traces.
+- Setting a username or password before a domain is configured no longer crashes;
+  it prints a short prompt to configure a domain first (`set domain <fqdn>`).
+
+### Removed
+
 ## [11.3.0] - 2026-09-01
 
 ### Added
@@ -537,7 +706,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v11.3.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v12.0.0...HEAD
+[12.0.0]: https://github.com/ADScanPro/adscan/compare/v11.3.0...v12.0.0
 [11.3.0]: https://github.com/ADScanPro/adscan/compare/v11.2.0...v11.3.0
 [11.2.0]: https://github.com/ADScanPro/adscan/compare/v11.1.0...v11.2.0
 [11.1.0]: https://github.com/ADScanPro/adscan/compare/v11.0.0...v11.1.0

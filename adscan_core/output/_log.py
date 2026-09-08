@@ -1699,6 +1699,32 @@ def print_exception(
             else:
                 console.print_exception(show_locals=show_locals)
     else:
+        # Last-resort presentation backstop for the deliberate memory-coverage stop.
+        # ``_AttackPathMemoryBudgetExceeded`` is a CLEAN, coverage-bounded stop — not
+        # an error — carrying an operator-safe ``operator_message`` (no module/path/
+        # verdict). Any site that fails to catch it (a future unguarded seam) must
+        # still degrade to the honest coverage line, NEVER the scary
+        # "An error occurred (...). Please try again or contact support." banner that
+        # hit a paying customer. This is presentation-only: it does NOT record
+        # coverage or run the bounded fallback (that is the service layer's job) — it
+        # only prevents the crash banner. The import is guarded so a partial
+        # ``adscan_core`` never breaks ``print_exception`` (same layer — never import
+        # ``adscan_internal`` here).
+        if exception is not None:
+            try:
+                from adscan_core.reporting.attack_path_memory_gate import (
+                    _AttackPathMemoryBudgetExceeded,
+                )
+
+                if isinstance(exception, _AttackPathMemoryBudgetExceeded):
+                    print_warning(
+                        getattr(exception, "operator_message", None) or str(exception)
+                    )
+                    return
+            except Exception:
+                # A backstop failure must never interrupt the visible flow; fall
+                # through to the generic handling below.
+                pass
         # Generic error message for end users (no internal details)
         # Never show tracebacks, file paths, or internal structure
         if exception:

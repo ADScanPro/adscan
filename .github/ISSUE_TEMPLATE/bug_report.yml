@@ -18,13 +18,13 @@ body:
     id: os
     attributes:
       label: Host OS
-      placeholder: "Kali 2026.1, Ubuntu 24.04, Debian 12"
+      placeholder: "Kali 2026.1, Ubuntu 24.04, Debian 12, Windows 11 (native .exe)"
     validations:
       required: true
   - type: input
     id: docker
     attributes:
-      label: Docker version
+      label: Docker version (leave blank if using the native Windows bundle)
       placeholder: "docker --version && docker compose version"
   - type: textarea
     id: command

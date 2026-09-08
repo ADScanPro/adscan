@@ -17,6 +17,7 @@ from typing import Any
 
 from rich.prompt import Confirm
 
+from adscan_core.pal import tools as pal_tools
 from adscan_internal import (
     print_error,
     print_exception,
@@ -125,9 +126,15 @@ def rdp_access(
 
     rdp_binary = shutil.which("xfreerdp") or shutil.which("xfreerdp3")
     if not rdp_binary:
-        print_error(
-            "RDP client not found. Please install xfreerdp via 'adscan install'."
-        )
+        # Route the availability decision through the PAL tools registry so the
+        # missing/wrong-OS branch degrades honestly: on Windows the interactive
+        # RDP client is deliberately not shipped (the operator uses native
+        # mstsc), so surface that reason instead of "install via adscan install".
+        rdp_status = pal_tools.capability_available("rdp_interactive")
+        if rdp_status.strategy == pal_tools.Strategy.DEGRADE:
+            print_error(f"Interactive RDP is not available on this platform: {rdp_status.reason}")
+        else:
+            print_error("RDP client not found. Please install xfreerdp via 'adscan install'.")
         return
 
     # Import GUI session check functions from adscan.py
@@ -164,19 +171,9 @@ def rdp_access(
                     pass
             return bool(display)
 
-        def _is_full_adscan_container_runtime() -> bool:
-            """Check if running in full ADscan container runtime."""
-            if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
-                return True
-            if not is_docker_env():
-                return False
-            if os.getenv("ADSCAN_HOME") != "/opt/adscan":
-                return False
-            return (
-                os.path.isdir("/opt/adscan/tool_venvs")
-                and os.path.isdir("/opt/adscan/tools")
-                and os.path.isdir("/opt/adscan/wordlists")
-            )
+        from adscan_internal.cli.tools_env import (
+            _is_full_adscan_container_runtime as _is_full_adscan_container_runtime,
+        )
 
     if not _has_gui_session():
         in_container = _is_full_adscan_container_runtime() or is_docker_env()
@@ -360,20 +357,9 @@ def execute_rdp_access(shell: Any, command: str) -> bool:
                 else:
                     raise ImportError("adscan module not loaded")
             except (ImportError, AttributeError):
-
-                def _is_full_adscan_container_runtime() -> bool:
-                    """Check if running in full ADscan container runtime."""
-                    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
-                        return True
-                    if not is_docker_env():
-                        return False
-                    if os.getenv("ADSCAN_HOME") != "/opt/adscan":
-                        return False
-                    return (
-                        os.path.isdir("/opt/adscan/tool_venvs")
-                        and os.path.isdir("/opt/adscan/tools")
-                        and os.path.isdir("/opt/adscan/wordlists")
-                    )
+                from adscan_internal.cli.tools_env import (
+                    _is_full_adscan_container_runtime as _is_full_adscan_container_runtime,
+                )
 
             if _is_full_adscan_container_runtime() or is_docker_env():
                 print_info(

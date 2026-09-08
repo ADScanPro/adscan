@@ -52,6 +52,7 @@ from adscan_internal.services.auth_error_classification import (
     is_unreachable_foreign_realm_error,
 )
 from adscan_internal.services.async_bridge import run_async_sync, run_sync_off_loop
+from adscan_core.pal import auth as pal_auth
 from adscan_core.rich_output import print_exception, print_info_verbose
 
 
@@ -1212,10 +1213,12 @@ def _format_gssapi_ccache_name(ccache_name: str) -> str:
 def _set_gssapi_default_ccache_from_environment() -> bool:
     """Bind python-gssapi's default ccache to ``KRB5CCNAME`` for LDAP SASL.
 
-    ldap3's GSSAPI path ultimately calls GSS-API with ``GSS_C_NO_CREDENTIAL``.
-    On some runtimes the GSS layer keeps using the UID default cache even after
-    ``KRB5CCNAME`` was updated in Python. Setting python-gssapi's krb5 ccache
-    name explicitly makes the workspace ticket authoritative for the thread.
+    The actual SASL sign+seal is done by badldap+badauth from the ccache URL /
+    ``KRB5CCNAME`` (pure-Python, cross-platform). This helper is a defensive
+    nudge for any residual code that consults the MIT-krb5 UID default cache:
+    on some runtimes the GSS layer keeps using that default even after
+    ``KRB5CCNAME`` changed. It is applied via the ``pal.auth`` seam — POSIX only;
+    a no-op on Windows (SSPI needs no default-cache nudge).
 
     Returns:
         True when a ccache was explicitly applied.
@@ -1225,27 +1228,24 @@ def _set_gssapi_default_ccache_from_environment() -> bool:
         return False
 
     ccache_name = _format_gssapi_ccache_name(ccache_env)
-    try:
-        from gssapi.raw.ext_krb5 import krb5_ccache_name  # pylint: disable=no-name-in-module
-
-        krb5_ccache_name(ccache_name.encode("utf-8"))
+    # Route the MIT-krb5 default-ccache side-effect through the PAL seam: POSIX
+    # applies it via gssapi (historical behavior); Windows skips it (SSPI +
+    # KRB5CCNAME need no default-cache nudge). The seam never raises. The actual
+    # SASL sign+seal is done by badldap+badauth from the ccache URL / KRB5CCNAME,
+    # not by python-gssapi, so a False here is a non-fatal miss, not a bind break.
+    if pal_auth.set_gssapi_default_ccache(ccache_name):
         print_info_debug(
             "[ldap] Bound python-gssapi default credential cache to "
             f"{mark_sensitive(ccache_name, 'path')}"
         )
         return True
-    except Exception as exc:  # noqa: BLE001
-        log_exception_debug(
-            "Failed to bind python-gssapi default credential cache",
-            exception=exc,
-            context={"krb5ccname": mark_sensitive(ccache_name, "path")},
-        )
+    if pal_auth.gssapi_default_ccache_supported():
         print_warning_debug(
-            "[ldap] Failed to bind python-gssapi default credential cache from "
-            f"KRB5CCNAME={mark_sensitive(ccache_name, 'path')}. "
-            f"Cause: {_format_exception_chain_summary(exc)}"
+            "[ldap] Could not bind python-gssapi default credential cache from "
+            f"KRB5CCNAME={mark_sensitive(ccache_name, 'path')}; "
+            "falling back to KRB5CCNAME only (badldap reads the ccache directly)."
         )
-        return False
+    return False
 
 
 def bind_workspace_ticket_for_user(

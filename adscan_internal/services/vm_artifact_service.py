@@ -49,6 +49,8 @@ import tempfile
 from adscan_internal import print_info, print_info_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.base_service import BaseService
+from adscan_core.pal import tools as pal_tools
+from adscan_core.pal.paths import bin_dir, tool_venvs_dir
 from adscan_core.rich_output import print_exception
 
 # Guest-relative paths of the credential-bearing artifacts inside a Windows volume.
@@ -704,6 +706,19 @@ class VMArtifactService(BaseService):
                 source_path=label, artifact_kind="memory", handled=False,
                 error_message="Memory image not found.",
             )
+        # Gate memory-image forensics through the PAL capability registry. On a
+        # platform where volatility is deliberately not shipped (DEGRADE, e.g.
+        # Windows v1) this yields an honest "not available on this platform"
+        # degrade rather than a generic missing-binary message. On POSIX
+        # (EMBEDDED_BINARY) the concrete ``_locate_volatility`` resolver stays the
+        # authority — it recognises the ``vol``/``vol3``/module invocations the
+        # registry's single binary name does not — so the present-binary path is
+        # byte-identical to before.
+        if pal_tools.resolve_strategy("vm_forensics") == pal_tools.Strategy.DEGRADE:
+            return VMArtifactExtractionResult(
+                source_path=label, artifact_kind="memory", handled=False,
+                error_message=pal_tools.capability_available("vm_forensics").reason,
+            )
         vol_cmd = self._locate_volatility()
         if not vol_cmd:
             return VMArtifactExtractionResult(
@@ -766,10 +781,9 @@ class VMArtifactService(BaseService):
         container path is checked first; then ``PATH`` (dev ``uv`` venv); then the
         ``volatility3.cli`` module (dev fallback).
         """
-        adscan_home = os.environ.get("ADSCAN_HOME", "/opt/adscan")
         for candidate in (
-            os.path.join(adscan_home, "tool_venvs", "volatility3", "venv", "bin", "vol"),
-            os.path.join(adscan_home, "bin", "vol"),
+            str(tool_venvs_dir() / "volatility3" / "venv" / "bin" / "vol"),
+            str(bin_dir() / "vol"),
         ):
             if os.path.isfile(candidate):
                 return [candidate]

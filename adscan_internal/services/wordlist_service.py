@@ -18,6 +18,8 @@ from adscan_internal.rich_output import print_error, print_info, print_warning
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
 from adscan_internal import path_utils
+from adscan_core import offline
+from adscan_core.pal.platform import is_windows
 from adscan_core.rich_output import print_exception
 
 
@@ -29,6 +31,12 @@ MISSING_REQUIRED = "missing"
 #: only consequence is reduced password-cracking coverage, which the deliverable
 #: declares as a data gap (see ``cracking_coverage``).
 MISSING_OPTIONAL = "missing (optional)"
+
+#: The combined audit base filename — the ONE corpus whose availability check
+#: must match the crack selector (``cracking_wordlist_policy.base_for``), since
+#: on the Windows .exe it lives inside the bundle, not the LOCALAPPDATA dir.
+#: Kept in lockstep with the policy SSOT (``_DEFAULT_AUDIT_BASE_FILENAME``).
+_COMBINED_AUDIT_BASE_FILENAME = "combined_audit_base.txt"
 
 
 @dataclass(frozen=True)
@@ -139,8 +147,8 @@ class WordlistService(BaseService):
         #   - rockyou.txt              (the CTF/fast base, downloaded at build)
         #   - combined_audit_base.txt  (the ~94M audit base, a build-time merge)
         #
-        # The audit base is a build-time merge (hashmob-large + kerberoast_pws +
-        # kaonashi_10K, order-preserving rling dedup) produced by
+        # The audit base is a build-time merge (hashmob-large + kerberoast_pws,
+        # order-preserving rling dedup) produced by
         # scripts/build_combined_audit_wordlist.sh; its raw components are staged
         # from wordlists/manifest.json and DROPPED after the merge, so the image
         # ships the combined only. Those raw components are therefore NOT checked
@@ -261,7 +269,9 @@ class WordlistService(BaseService):
         ]
         return candidates
 
-    def _copy_or_extract_repo_wordlist(self, definition: WordlistDefinition, final_wl_path: str) -> bool:
+    def _copy_or_extract_repo_wordlist(
+        self, definition: WordlistDefinition, final_wl_path: str
+    ) -> bool:
         """Populate a wordlist from the repo-local `wordlists/` directory if present."""
 
         os.makedirs(self.wordlists_dir, exist_ok=True)
@@ -353,6 +363,15 @@ class WordlistService(BaseService):
         if not definition.url:
             return False
 
+        # Offline-first: never fetch over the network on Windows-native (where
+        # wordlists ship embedded in the bundle) or when offline mode is enabled
+        # (air-gapped / sovereignty-driven engagements). A missing wordlist then
+        # degrades gracefully — the caller renders the reduced-coverage warning —
+        # rather than phoning home. (See docs/superpowers/specs/
+        # 2026-09-03-windows-native-runtime-portability-design.md.)
+        if is_windows() or offline.offline_mode_enabled():
+            return False
+
         try:
             os.makedirs(self.wordlists_dir, exist_ok=True)
             dl_wl_path = os.path.join(self.wordlists_dir, definition.dest)
@@ -422,11 +441,27 @@ class WordlistService(BaseService):
         return all_ok, details
 
     def _is_present(self, definition: WordlistDefinition) -> bool:
-        """Whether a wordlist is resolvable on disk, managed dir or system dir."""
+        """Whether a wordlist is resolvable on disk, managed dir or system dir.
+
+        For the combined audit base this defers to the crack SELECTOR's SSOT
+        (``cracking_wordlist_policy.audit_base_is_available``) so the
+        availability check and ``base_for`` never disagree: on the Windows .exe
+        the combined ships inside the bundle (plain or xz-compressed under
+        ``_MEIPASS``), not in the LOCALAPPDATA wordlists dir this method
+        historically inspected, which made the availability check report it
+        "not present" while cracking actually used it.
+        """
 
         final_wl_path = self._final_path_for(definition)
         if os.path.exists(final_wl_path):
             return True
+        if os.path.basename(final_wl_path) == _COMBINED_AUDIT_BASE_FILENAME:
+            from adscan_internal.services.cracking_wordlist_policy import (
+                audit_base_is_available,
+            )
+
+            if audit_base_is_available(self.wordlists_dir):
+                return True
         system_wl_path = os.path.join(
             "/usr/share/wordlists", os.path.basename(final_wl_path)
         )
@@ -497,7 +532,12 @@ class WordlistService(BaseService):
 
 
 def record_cracking_coverage_for_domain(
-    shell: Any, domain: str, *, wordlists_dir: Optional[str] = None
+    shell: Any,
+    domain: str,
+    *,
+    wordlists_dir: Optional[str] = None,
+    engine: Optional[str] = None,
+    ruleset: Optional[str] = None,
 ) -> None:
     """Stamp the cracking-coverage statement for *domain* into the report.
 
@@ -506,6 +546,14 @@ def record_cracking_coverage_for_domain(
     a scan that captured no hashes has no cracking coverage to describe, and
     stamping one anyway would put a gap notice in a report for work nobody
     asked for.
+
+    ``engine`` / ``ruleset`` are the backend and rule set an attempt actually
+    ran (``CrackResult.engine`` / ``.ruleset``). When supplied — i.e. from the
+    seam that has the effort-ladder result — the recorded block also declares,
+    in vendor-neutral prose, which cracker class and rule effort ran, so the
+    deliverable is honest about the strength of the attempt. Absent (the pre-run
+    seam that only knows the wordlist state), the block carries only the corpus
+    data-gap declaration, exactly as before.
 
     Idempotent: both crack seams may call it many times per domain and the
     recorder overwrites the same block with the same observation. Best-effort
@@ -527,7 +575,9 @@ def record_cracking_coverage_for_domain(
         record_cracking_coverage(
             shell,
             domain,
-            coverage=build_cracking_coverage(missing_wordlists=missing),
+            coverage=build_cracking_coverage(
+                missing_wordlists=missing, engine=engine, ruleset=ruleset
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
         telemetry.capture_exception(exc)

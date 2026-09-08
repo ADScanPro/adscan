@@ -40,6 +40,8 @@ from pathlib import Path
 from socket import AF_UNIX, SOCK_STREAM, socket
 from typing import Any
 
+from adscan_core.pal.paths import container_workspaces_dir
+
 
 _MAX_REQUEST_BYTES = 32_768
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -60,7 +62,7 @@ _SAFE_ISO_DATETIME_RE = re.compile(
     r"(?:Z|[+-]\d{2}:\d{2})$"
 )
 
-_CONTAINER_WORKSPACES_DIR = "/opt/adscan/workspaces"
+_CONTAINER_WORKSPACES_DIR = container_workspaces_dir()
 
 
 def _looks_like_ntlm_hash(value: str) -> bool:
@@ -74,7 +76,18 @@ def _looks_like_ntlm_hash(value: str) -> bool:
 
 
 def _resolve_host_rdp_binary() -> str | None:
-    """Resolve xfreerdp for host launches via PATH."""
+    """Resolve xfreerdp for host launches via PATH.
+
+    The availability decision flows through the PAL tools registry: when the
+    interactive-RDP capability is deliberately not shipped on this platform
+    (Windows uses native mstsc), the capability degrades and this returns
+    ``None`` — the same no-binary outcome as today, but the caller can surface
+    the registry's honest reason instead of a bare "not found".
+    """
+    from adscan_core.pal import tools as pal_tools
+
+    if pal_tools.resolve_strategy("rdp_interactive") == pal_tools.Strategy.DEGRADE:
+        return None
     return shutil_which("xfreerdp") or shutil_which("xfreerdp3")
 
 
@@ -744,12 +757,20 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         # Resolve the RDP client on the host.
         rdp_bin = _resolve_host_rdp_binary()
         if not rdp_bin:
+            from adscan_core.pal import tools as pal_tools
+
+            rdp_status = pal_tools.capability_available("rdp_interactive")
+            message = (
+                f"Interactive RDP is not available on this platform: {rdp_status.reason}"
+                if rdp_status.strategy == pal_tools.Strategy.DEGRADE
+                else "xfreerdp not found on host"
+            )
             return HostHelperResponse(
                 False,
                 127,
                 None,
                 None,
-                "xfreerdp not found on host",
+                message,
             )
 
         argv = [

@@ -22,15 +22,17 @@ from adscan_core.local_bind_address import resolve_first_available_bind_addr
 from adscan_core.port_diagnostics import is_tcp_bind_address_available, parse_host_port
 from adscan_internal import print_info_debug
 from adscan_internal.rich_output import mark_sensitive
-from adscan_core.linux_capabilities import (
-    CAP_NET_BIND_SERVICE_BIT,
-    binary_has_capability,
-    process_has_capability,
-)
+from adscan_core.linux_capabilities import binary_has_capability
+from adscan_core.pal import net as pal_net
 
+# The privileged candidates are tried first (best reachability through common
+# egress filters); the non-privileged fallback keeps HTTP staging available on a
+# host that cannot bind privileged ports (Windows without an elevated process, or
+# a POSIX runtime without CAP_NET_BIND_SERVICE) instead of failing outright.
 DEFAULT_HTTP_STAGING_BIND_CANDIDATES: tuple[str, ...] = (
     "0.0.0.0:443",
     "0.0.0.0:80",
+    "0.0.0.0:8443",
 )
 
 
@@ -138,37 +140,52 @@ class SingleFileHttpTransferService:
 
     @staticmethod
     def _can_bind_privileged_port() -> bool:
-        """Return whether the current ADscan runtime can bind privileged ports."""
+        """Return whether the current ADscan runtime can bind privileged ports.
+
+        Routes the process-level decision through the cross-platform
+        ``pal.net`` seam (POSIX: CAP_NET_BIND_SERVICE or root; Windows: an
+        elevated process), and keeps the POSIX-only file-capability check on the
+        Python binary so a runtime that carries the capability on its executable
+        (but not on the process) still qualifies.
+        """
 
         return bool(
-            process_has_capability(CAP_NET_BIND_SERVICE_BIT)
+            pal_net.can_bind_privileged_port()
             or binary_has_capability(sys.executable, "cap_net_bind_service")
         )
 
     @staticmethod
     def _assert_bind_permissions_for_bind_addr(bind_addr: str) -> None:
-        """Fail early when one privileged HTTP staging port cannot be bound."""
+        """Report unavailable when one privileged HTTP staging port cannot be bound.
+
+        The privileged-bind capability is resolved through the cross-platform
+        ``pal.net`` seam. On a host that lacks it, HTTP staging on a privileged
+        port is unavailable; the caller degrades to a non-privileged port
+        (``resolve_default_bind_addr`` selects one) or to the direct upload path.
+        """
 
         _host, port = parse_host_port(bind_addr)
         if int(port) >= 1024:
             return
-        process_has_bind_service = process_has_capability(CAP_NET_BIND_SERVICE_BIT)
+        status = pal_net.capability_available(pal_net.NET_BIND_PRIVILEGED)
         python_has_bind_service = binary_has_capability(sys.executable, "cap_net_bind_service")
         print_info_debug(
             "[http-transfer] Privileged bind diagnostics: "
             f"bind_addr={bind_addr} "
-            f"process_cap_net_bind_service={process_has_bind_service} "
+            f"os={status.os} "
+            f"process_privileged_bind={status.available} ({status.reason}) "
             f"python_binary={mark_sensitive(sys.executable, 'path')} "
             f"python_binary_has_cap_net_bind_service={python_has_bind_service}"
         )
-        if process_has_bind_service or python_has_bind_service:
+        if status.available or python_has_bind_service:
             return
         raise RuntimeError(
             "HTTP staging is configured to use a privileged port "
-            f"({bind_addr}), but neither the ADscan process nor the Python runtime binary "
-            "has CAP_NET_BIND_SERVICE. The Ligolo proxy can still bind privileged ports if its own binary "
-            "has that capability, but the embedded Python HTTP server cannot. "
-            "Grant CAP_NET_BIND_SERVICE to the container process or Python runtime, or use a custom HTTP staging address >=1024."
+            f"({bind_addr}), but this host cannot bind privileged ports ({status.reason}). "
+            "The Ligolo proxy can still bind privileged ports if its own binary "
+            "carries that capability, but the embedded Python HTTP server cannot. "
+            "Use a non-privileged HTTP staging address (>=1024), or grant the runtime the "
+            "privileged-bind capability (POSIX: CAP_NET_BIND_SERVICE; Windows: run elevated)."
         )
 
     def start(

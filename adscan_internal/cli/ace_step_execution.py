@@ -144,11 +144,19 @@ def _infer_target_enabled(
 
 
 def _node_domain(node: dict[str, Any] | None) -> str | None:
-    props = _node_props(node)
-    value = props.get("domain")
-    if isinstance(value, str) and value.strip():
-        return value.strip().lower()
-    return None
+    """Return a graph node's ``properties.domain`` lowercased, or ``None``.
+
+    Thin wrapper over the shared TARGET-axis primitive
+    :func:`~adscan_internal.services.attack_step_domain_resolution.node_domain_raw`
+    — RAW graph truth, the ``"wellknown"`` placeholder is NOT normalized here (ACE
+    stays byte-identical; the target-domain ladder normalizes the placeholder
+    itself). One reader of ``properties.domain`` across the executor.
+    """
+    from adscan_internal.services.attack_step_domain_resolution import (
+        node_domain_raw,
+    )
+
+    return node_domain_raw(node)
 
 
 def _node_sam_or_label(node: dict[str, Any] | None, fallback: str) -> str:

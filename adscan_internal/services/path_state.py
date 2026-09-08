@@ -34,6 +34,17 @@ _PROVEN_STATUSES: frozenset[str] = frozenset(
     {"success", "exploited", "domain_compromised"}
 )
 
+#: Display-status token for a pure COVERAGE-DECLARATION record — the synthetic
+#: single-step record the bounded fallback engine emits (``notes["coverage"] ==
+#: "reached_not_materialized"``) to DECLARE that a reachable high-value target was
+#: covered even though its individual route was not materialised in the capped
+#: sample. It is NOT a real attack step: it carries no client exposure and must
+#: never be counted as ``attempted`` (which would inflate the attempted totals in
+#: the report / CTEM / KPIs). It rolls up into the sampled-coverage declaration
+#: block, not into the per-path status buckets. See
+#: :func:`adscan_internal.services.attack_paths_core.is_coverage_marker_step`.
+COVERAGE_SAMPLE_STATUS: str = "coverage_sample"
+
 #: Statuses that describe NO client exposure, and therefore may never be counted
 #: into a risk figure or offered to a client as something to remediate.
 #:
@@ -43,6 +54,9 @@ _PROVEN_STATUSES: frozenset[str] = frozenset(
 #:   fix hardening they already did inverts what the report is for.
 #: * ``unsupported`` / ``unavailable`` — an ADscan data gap: no reachable surface
 #:   to walk, so the absence of a result says nothing about the client.
+#: * ``coverage_sample`` — a synthetic coverage-declaration record from the
+#:   bounded fallback (a reachable target represented without its route). It
+#:   states coverage, not exposure, so it is excluded exactly like a data gap.
 #:
 #: This is the same set as the ``None`` entries of
 #: ``exposure_score_service._PROOF_WEIGHT`` — that table builds them from here,
@@ -52,7 +66,7 @@ _PROVEN_STATUSES: frozenset[str] = frozenset(
 #: ``tests/unit/services/test_remediation_status_filter.py`` (a test-only import,
 #: which keeps this module the stdlib-only leaf its closure depends on).
 NO_EXPOSURE_STATUSES: frozenset[str] = frozenset(
-    {"closed_by_configuration", "unsupported", "unavailable"}
+    {"closed_by_configuration", "unsupported", "unavailable", COVERAGE_SAMPLE_STATUS}
 )
 
 
@@ -121,6 +135,7 @@ _NONPROVEN_CLIENT_STATUS_LABELS: dict[str, str] = {
     "blocked": "Not Executed for Safety",
     "safety_blocked": "Not Executed for Safety",
     "closed_by_configuration": "Attack Surface Reduced",
+    COVERAGE_SAMPLE_STATUS: "Reachable (route sampled)",
     "theoretical": "Theoretical",
 }
 

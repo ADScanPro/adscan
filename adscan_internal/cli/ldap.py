@@ -2543,8 +2543,13 @@ def run_ldap_admincount_and_signing(
             domain=domain,
             ldap_filter=f"(sAMAccountName={username})",
             attribute="adminCount",
-            auth_username=str(shell.domains_data[domain]["username"]),
-            auth_password=str(shell.domains_data[domain]["password"]),
+            # Resolve the active domain credential inside the query service (its
+            # SSOT fallback reads domains_data[domain]["username"/"password"]) and
+            # skip cleanly when none exists — a raw subscript KeyError'd when a
+            # blank-password Kerberos-spray foothold stored the cred only in the
+            # `credentials` map without a top-level username. Never bind empty.
+            auth_username=None,
+            auth_password=None,
             pdc=str(shell.domains_data[domain].get("pdc") or ""),
             prefer_kerberos=True,
             allow_ntlm_fallback=True,
@@ -4986,8 +4991,11 @@ def get_not_delegated_users(shell: LdapShell, domain: str) -> list[str]:
                 "(userAccountControl:1.2.840.113556.1.4.803:=1048576))"
             ),
             attribute="samAccountName",
-            auth_username=str(shell.domains_data[domain]["username"]),
-            auth_password=str(shell.domains_data[domain]["password"]),
+            # See the adminCount site: let the query service resolve the active
+            # domain credential (SSOT fallback) and skip cleanly when absent —
+            # a raw subscript KeyError'd on a blank-password spray foothold.
+            auth_username=None,
+            auth_password=None,
             pdc=str(shell.domains_data[domain].get("pdc") or ""),
             prefer_kerberos=True,
             allow_ntlm_fallback=True,

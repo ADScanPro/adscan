@@ -22,7 +22,10 @@ from adscan_internal.services import attack_path_progress
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
-from adscan_internal.services.path_state import _PROVEN_STATUSES
+from adscan_internal.services.path_state import (
+    _PROVEN_STATUSES,
+    COVERAGE_SAMPLE_STATUS,
+)
 from adscan_internal.services.tier_lattice import (
     TargetTier,
     classify_target_tier,
@@ -335,6 +338,15 @@ _SID_PATTERN = re.compile(r"(S-1-\d+(?:-\d+)+)", re.IGNORECASE)
 _CONTEXT_RELATIONS_LOWER = {
     str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS.keys()
 }
+
+# Coverage-declaration marker predicates live at the lowest level
+# (``attack_graph_core``, where the fallback floor stamps the marker) and are
+# re-bound here (via the already-imported module) so every status-bucketing
+# consumer reads the SAME definition — no drift on what "coverage declaration, not
+# a real step" means.
+COVERAGE_MARKER_NOTE = attack_graph_core.COVERAGE_MARKER_NOTE
+is_coverage_marker_step = attack_graph_core.is_coverage_marker_step
+is_coverage_marker_path = attack_graph_core.is_coverage_marker_path
 
 
 def _extract_sid(value: str) -> str | None:
@@ -753,7 +765,9 @@ def _canonical_principal_label_for_membership(node: dict[str, Any]) -> str:
     """
     kind = _node_kind(node)
     if kind in {"User", "Computer"}:
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
         for key in ("samaccountname", "sAMAccountName", "sam_account_name"):
             value = props.get(key)
             if isinstance(value, str) and value.strip():
@@ -1240,6 +1254,14 @@ def _strip_leading_relations(
 
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
+    # A pure coverage-declaration marker (the fallback floor's synthetic
+    # ``reached_not_materialized`` step) is NOT a real attack step — it declares a
+    # reachable target whose route was not materialised in the sample. Branch on it
+    # FIRST so it never counts as ``attempted`` (which would inflate the attempted
+    # totals in the report / CTEM / KPIs); it rolls up into the sampled-coverage
+    # block instead.
+    if is_coverage_marker_path(steps):
+        return COVERAGE_SAMPLE_STATUS
     statuses: list[str] = []
     # Collect the non-context actions in the SAME pass that reads the statuses so
     # each step's ``action`` is normalized once, not twice (this function is a
@@ -1621,7 +1643,10 @@ def reexpand_gentime_collapsed_pivots(
                         # endpoint so a later decorate re-walk resolves the sibling.
                         if si == step_index and "_decorate_to_id" in sib_steps[si]:
                             sib_steps[si]["_decorate_to_id"] = member_id
-                        if si == step_index + 1 and "_decorate_from_id" in sib_steps[si]:
+                        if (
+                            si == step_index + 1
+                            and "_decorate_from_id" in sib_steps[si]
+                        ):
                             sib_steps[si]["_decorate_from_id"] = member_id
             # Rebuild the exact signature from the SWAPPED nodes so containment /
             # dedup treat the sibling as its own path (the pivot node differs).
@@ -1675,9 +1700,7 @@ def maybe_reexpand_gentime_collapsed_pivots(
     if not _gentime_collapse_enabled():
         return records
     node_id_to_label = _build_node_id_to_label(graph)
-    return reexpand_gentime_collapsed_pivots(
-        records, node_id_to_label=node_id_to_label
-    )
+    return reexpand_gentime_collapsed_pivots(records, node_id_to_label=node_id_to_label)
 
 
 def collapse_sibling_pivot_paths(
@@ -1727,7 +1750,9 @@ def collapse_sibling_pivot_paths(
     """
     if len(records) <= 1:
         return records
-    effective_floor = _read_sibling_pivot_collapse_floor() if floor is None else max(2, int(floor))
+    effective_floor = (
+        _read_sibling_pivot_collapse_floor() if floor is None else max(2, int(floor))
+    )
 
     # (interior_index, relations, prefix, suffix) -> [record index]. Two records in
     # the same bucket share source, terminal, technique signature and every interior
@@ -1739,11 +1764,7 @@ def collapse_sibling_pivot_paths(
     for i, record in enumerate(records):
         nodes = record.get("nodes")
         rels = record.get("relations")
-        if (
-            not isinstance(nodes, list)
-            or not isinstance(rels, list)
-            or len(nodes) < 3
-        ):
+        if not isinstance(nodes, list) or not isinstance(rels, list) or len(nodes) < 3:
             node_seqs.append(None)
             continue
         node_str = [str(n) for n in nodes]
@@ -1834,9 +1855,7 @@ def collapse_sibling_pivot_paths(
             src_idx = label_to_rec.get(pivot_label)
             if src_idx is None:
                 continue
-            via_account_paths[pivot_label] = _extract_pivot_path_shape(
-                records[src_idx]
-            )
+            via_account_paths[pivot_label] = _extract_pivot_path_shape(records[src_idx])
         if via_account_paths:
             meta["via_account_paths"] = via_account_paths
         rep["meta"] = meta
@@ -2033,9 +2052,7 @@ def apply_affected_user_metadata(
         cached = group_affected_cache.get(group_label)
         if cached is not None:
             return cached
-        sorted_users = sorted(
-            user_group_members.get(group_label, ()), key=str.lower
-        )
+        sorted_users = sorted(user_group_members.get(group_label, ()), key=str.lower)
         sorted_computers = sorted(
             computer_group_members.get(group_label, ()), key=str.lower
         )
@@ -2706,7 +2723,9 @@ def _minimize_display_record_by_redundant_memberof(
             stripped["target"] = str(stripped_nodes[-1])
         orig_steps = record.get("steps")
         if isinstance(orig_steps, list) and orig_steps:
-            stripped_steps = [dict(s) for s in orig_steps[group_index:] if isinstance(s, dict)]
+            stripped_steps = [
+                dict(s) for s in orig_steps[group_index:] if isinstance(s, dict)
+            ]
             for i, s in enumerate(stripped_steps, start=1):
                 s["step"] = i
             stripped["steps"] = stripped_steps
@@ -2825,7 +2844,9 @@ def _minimize_display_record_by_repeated_labels(
     collapsed_to_original: list[int] = []
     for idx, label in enumerate(lowered_nodes):
         if collapsed_to_original and lowered_nodes[collapsed_to_original[-1]] == label:
-            collapsed_to_original[-1] = idx  # extend the self-loop run; keep its last index
+            collapsed_to_original[-1] = (
+                idx  # extend the self-loop run; keep its last index
+            )
         else:
             collapsed_to_original.append(idx)
     collapsed_labels = [lowered_nodes[i] for i in collapsed_to_original]
@@ -2939,7 +2960,9 @@ def filter_shortest_paths_for_principals(
 
     # Per group: (best_length, best_idx, best_tier). best_tier is the tier of the
     # currently-kept record, used to decide tier dominance against challengers.
-    best_by_key: dict[tuple[str, str, str, tuple[str, ...]], tuple[int, int, TargetTier]] = {}
+    best_by_key: dict[
+        tuple[str, str, str, tuple[str, ...]], tuple[int, int, TargetTier]
+    ] = {}
     for idx, record in enumerate(records):
         nodes = record.get("nodes")
         rels = record.get("relations")
@@ -3202,6 +3225,7 @@ def compute_display_paths_for_domain(
     start_node_ids: set[str] | None = None,
     materialized_artifacts: dict[str, Any] | None = None,
     keep_longest: bool = True,
+    force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
@@ -3275,6 +3299,7 @@ def compute_display_paths_for_domain(
         target_mode=mode,
         start_node_ids=start_node_ids,
         chokepoint_group_ids=chokepoint_group_ids,
+        force_perterminal=force_perterminal,
     )
     _log_phase_timing(
         scope="domain",
@@ -3385,6 +3410,7 @@ def compute_display_paths_for_start_node(
     expand_terminal_memberships: bool = True,
     filter_shortest_paths: bool = True,
     materialized_artifacts: dict[str, Any] | None = None,
+    force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
@@ -3492,6 +3518,7 @@ def compute_display_paths_for_start_node(
         max_paths=max_paths,
         target=target,
         target_mode=mode,
+        force_perterminal=force_perterminal,
     )
     _log_phase_timing(
         scope="start_node",
@@ -3586,6 +3613,7 @@ def compute_display_paths_for_user(
     target_mode: str = "object",
     filter_shortest_paths: bool = True,
     materialized_artifacts: dict[str, Any] | None = None,
+    force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
     start_node_id = _find_node_id_by_label(graph, username)
     if not start_node_id:
@@ -3601,6 +3629,7 @@ def compute_display_paths_for_user(
         target_mode=target_mode,
         filter_shortest_paths=filter_shortest_paths,
         materialized_artifacts=materialized_artifacts,
+        force_perterminal=force_perterminal,
     )
 
 
@@ -3616,6 +3645,7 @@ def compute_display_paths_for_principals(
     membership_sample_max: int = 3,
     target_mode: str = "object",
     filter_shortest_paths: bool = True,
+    force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     normalized_principals = [str(p or "").strip().lower() for p in principals]
@@ -3653,6 +3683,12 @@ def compute_display_paths_for_principals(
     # global cap is approximate); the post-processing pipeline handles it.
     all_records: list[dict[str, Any]] = []
     n_workers = _effective_principal_workers(len(normalized_principals))
+    # The hybrid-switch fallback route (``force_perterminal``) runs the bounded
+    # per-terminal engine, which the parallel worker path does not receive (the
+    # flag is not pickled into the pool). Force the sequential path so the flag is
+    # always honored; the fallback is single-process bounded by design anyway.
+    if force_perterminal:
+        n_workers = 0
     if n_workers >= 2:
         print_info_debug(
             f"[principals-dfs] parallel: {n_workers} workers / {len(normalized_principals)} principals"
@@ -3702,6 +3738,7 @@ def compute_display_paths_for_principals(
                 target=target,
                 target_mode=target_mode,
                 filter_shortest_paths=filter_shortest_paths,
+                force_perterminal=force_perterminal,
             )
             all_records.extend(records)
         attack_path_progress.notify_principal(_principals_total, _principals_total)

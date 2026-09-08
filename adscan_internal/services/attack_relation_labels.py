@@ -156,6 +156,8 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "sqladmin": "Database Administrator Access",
     "sqlaccess": "Database Session Access",
     "writesmbpath": "Write Access to a Network Share",
+    "hassession": "Abuse a Logged-On User Session",
+    "mssqllinkedserverlateral": "SQL Server Linked-Server Lateral Movement",
     # Membership / structural ─────────────────────────────────────────────
     "memberof": "Group Membership",
     "managerodcprp": "Read-Only Domain Controller Replication Control",
@@ -164,8 +166,11 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "dumplsa": "Extract LSA Secrets",
     "dumpdpapi": "Extract Stored Credentials",
     "dumplsass": "Extract Credentials from Memory",
+    "dumpsam": "Extract Local Account Hashes",
     "getchanges": "Directory Replication Right",
     "getchangesall": "Directory Replication Right",
+    "scheduledtask": "Session User Impersonation via Scheduled Task",
+    "xpcmdshell": "Command Execution on the SQL Server Host",
     # Credential-theft roasting ───────────────────────────────────────────
     "kerberoasting": "Service Account Credential Theft",
     "asreproasting": "Pre-Authentication-less Credential Theft",

@@ -43,6 +43,7 @@ from adscan_core.theme import (
     COLOR_SAGE,
     COLOR_STEEL,
 )
+from adscan_core.pal.platform import is_windows
 
 from adscan_internal import (
     print_error,
@@ -1969,6 +1970,47 @@ def sync_clock_with_pdc(
         print_info_debug(
             f"[kerberos] SSOT clock guard raised; trying legacy paths: {_ssot_exc}"
         )
+
+    # Windows-native: the legacy fallback below is POSIX-only (os.geteuid /
+    # sudo / timedatectl / ntpdate), none of which exist on Windows. The
+    # physical step here is w32tm via the PAL clock seam, and the SSOT above
+    # has already seeded kerbad's in-memory skew offset when it could not step
+    # (host-helper-less path), so AS/TGS KRB_AP_ERR_SKEW recovery still works.
+    # Never drop into the POSIX path on Windows.
+    if is_windows():
+        from adscan_core.pal import clock as pal_clock
+
+        # Fast path: a domain-joined Windows host usually already syncs to the
+        # DC, so no physical step is needed.
+        native_synced = pal_clock.is_domain_time_synced_natively()
+        if native_synced is True:
+            print_info_verbose(
+                "Windows host time is already domain-synced natively; no step needed."
+            )
+            return True
+
+        # A physical step (w32tm /resync) needs local admin. Under the
+        # minimum-privilege client scope we usually cannot step; degrade
+        # honestly and rely on the kerbad in-memory offset the SSOT seeded.
+        step = pal_clock.step_system_clock("")
+        if step.stepped:
+            print_success_verbose(f"Windows clock stepped via w32tm: {step.reason}")
+            return True
+
+        _set_clock_sync_disabled_reason(
+            shell,
+            key=domain,
+            reason="windows_step_unavailable",
+            detail=step.reason,
+        )
+        if verbose:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning_verbose(
+                "Windows physical clock step unavailable "
+                f"({step.reason}); relying on the in-memory Kerberos skew offset "
+                f"for {marked_domain}."
+            )
+        return False
 
     pdc_ip = shell.domains_data[domain]["pdc"]
 

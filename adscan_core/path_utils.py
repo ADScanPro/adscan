@@ -19,12 +19,15 @@ def get_effective_user_home() -> Path:
     """
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user:
-        try:
-            import pwd
+        # Imported lazily inside the function to avoid a circular import:
+        # ``adscan_core.pal.paths`` imports this module, so importing the PAL at
+        # module top would loop. ``pal.process`` only imports ``pal.platform``,
+        # so a function-scoped import is safe (mirrors ``get_adscan_home`` below).
+        from adscan_core.pal.process import lookup_user_home
 
-            return Path(pwd.getpwnam(sudo_user).pw_dir)
-        except Exception:
-            pass
+        home = lookup_user_home(sudo_user)
+        if home:
+            return Path(home)
     return Path.home()
 
 
@@ -43,13 +46,22 @@ def expand_effective_user_path(path: str) -> str:
 
 
 def get_adscan_home() -> Path:
-    """Return the base directory for ADscan runtime artifacts (``~/.adscan``).
+    """Return the base directory for ADscan runtime artifacts.
 
-    Respects ``ADSCAN_HOME`` when provided.
+    Respects ``ADSCAN_HOME`` when provided (any OS). Without an override the
+    default is OS-specific: ``%LOCALAPPDATA%\\ADscan`` on Windows,
+    ``~/.adscan`` on POSIX.
     """
     override = os.getenv("ADSCAN_HOME")
     if override:
         return Path(expand_effective_user_path(override))
+
+    from adscan_core.pal.platform import is_windows
+
+    if is_windows():
+        local_appdata = os.getenv("LOCALAPPDATA")
+        base = Path(local_appdata) if local_appdata else (Path.home() / "AppData" / "Local")
+        return base / "ADscan"
     return get_effective_user_home() / ".adscan"
 
 

@@ -176,6 +176,10 @@ _PLACEMENTS: dict[str, _Placement] = {
     "host_helper_failed": _Placement(
         "/docs/guides/troubleshooting", "host-helper-docker-mode"
     ),
+    # ── Download / update ─────────────────────────────────────────────────────
+    # Where the self-contained Windows-native bundle is published. Shown when
+    # `adscan update`/`upgrade` runs on Windows, which does not self-update.
+    "windows_update_download": _Placement("/download"),
     # ── Install / platform support ──────────────────────────────────────────
     "docker_missing": _Placement("/docs/getting-started/installation"),
     "unsupported_os": _Placement("/docs/getting-started/system-requirements"),

@@ -38,7 +38,7 @@ an open file description and the kernel releases it on close).
 from __future__ import annotations
 
 import errno
-import fcntl
+import importlib
 import json
 import os
 import secrets
@@ -198,6 +198,19 @@ def _try_flock(
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115
+    # ``fcntl`` is POSIX-only (absent on Windows). Load it lazily so this module
+    # imports cleanly off-platform. Without it the advisory single-instance lock is
+    # a best-effort no-op: we still record the metadata and return a handle so the
+    # caller proceeds. (A real Windows lock via ``msvcrt.locking`` is future work.)
+    try:
+        fcntl = importlib.import_module("fcntl")
+    except ImportError:
+        try:
+            _write_lock_metadata(handle, metadata)
+        except OSError:
+            pass
+        _HELD_LOCK_PATHS.add(path)
+        return LockHandle(path=path, fd=handle, metadata=metadata)
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -233,8 +246,11 @@ def release_lock(handle: LockHandle | None) -> None:
     except OSError:
         pass
     try:
+        fcntl = importlib.import_module("fcntl")
         fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-    except OSError:
+    except (ImportError, OSError):
+        # No POSIX ``fcntl`` (Windows) or the unlock failed: closing the fd below
+        # releases any lock anyway. Best-effort by design.
         pass
     try:
         fd.close()

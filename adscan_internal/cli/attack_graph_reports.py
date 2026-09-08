@@ -2302,6 +2302,33 @@ def run_show_attack_paths(
     membership_cache_before = get_membership_snapshot_cache_stats()
 
     start_user_norm = (start_user or "").strip().lower()
+
+    # Domain-wide all-targets is a DEV-ONLY lens (see attack_path_domain_all_policy).
+    # Domain scope = no explicit start user / users / owned. On that combination in
+    # a production run, coerce target="all" → "highvalue": the all-targets domain
+    # sweep cannot complete on a large directory and the report/execution flows
+    # never use it. A maintainer's dev session keeps it (the engine and the debug
+    # script are never touched).
+    _is_domain_scope = (
+        not start_user_norm and not start_user and not (start_users and len(start_users) > 1)
+    )
+    if _is_domain_scope:
+        from adscan_internal.services.attack_path_domain_all_policy import (
+            DOMAIN_ALL_UNSUPPORTED_NOTE,
+            is_domain_scope_all_targets,
+            is_dev_override_active,
+        )
+
+        if is_domain_scope_all_targets("domain", target):
+            if is_dev_override_active():
+                print_warning(
+                    "Running domain-wide all-targets discovery (dev override). This "
+                    "mode can exhaust memory and bound out on a large directory."
+                )
+            else:
+                print_warning(DOMAIN_ALL_UNSUPPORTED_NOTE)
+                target = "highvalue"
+
     # Two-section display (HV first + pivot section) is active when target="all".
     show_sections = target == "all"
     # When show_sections is active the panel header already shows 🎯/⚠ counts,

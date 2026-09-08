@@ -27,7 +27,9 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.pal import tools as pal_tools
 from adscan_core.rich_output import print_exception, print_warning_debug
+from adscan_internal.services.cracking.john_benchmark import run_john_benchmark
 
 # The hardware benchmark is an OPTIONAL warm-up: every failure in it degrades
 # the effort engine to the safe "fast" tier and nothing else. So none of its
@@ -134,11 +136,28 @@ def compute_fingerprint(probe_text: str) -> str:
 
     Changes whenever the GPU/CPU set changes (moved to different hardware, an
     appliance was cloned onto new hardware) -- the freshness check in
-    is_fresh() forces a re-probe on mismatch.
+    is_fresh() forces a re-probe on mismatch. The fingerprint is engine-tagged
+    (``hashcat:`` prefix) so a GPU-tool record can never be confused with a
+    :func:`compute_john_fingerprint` CPU-tool record in the shared cache file
+    (see :func:`_run_john_warmup`).
     """
     names = extract_device_names(probe_text)
-    digest_input = "|".join(sorted(names)).encode("utf-8")
+    digest_input = ("hashcat:" + "|".join(sorted(names))).encode("utf-8")
     return hashlib.sha256(digest_input).hexdigest()[:16]
+
+
+def compute_john_fingerprint() -> str:
+    """The fingerprint of a John (CPU) benchmark record.
+
+    A John self-test has no ``hashcat -I`` device enumeration to fingerprint, so
+    the record is keyed to a fixed engine-tagged seed. Because it is derived from
+    a DIFFERENT seed than :func:`compute_fingerprint`, a John-measured record can
+    never satisfy the hashcat path's freshness check (``fingerprint_matches``) and
+    vice versa — the same shared ``benchmark.json`` holds one engine's record at a
+    time and the other engine always re-measures rather than reading a stale,
+    wrong-engine record.
+    """
+    return hashlib.sha256(b"john-cpu:selftest").hexdigest()[:16]
 
 
 # --- cache IO --------------------------------------------------------------
@@ -403,6 +422,73 @@ def _probe_devices(shell: Any) -> str | None:
     )
 
 
+def _run_john_warmup(shell: Any, *, force: bool) -> dict[str, dict[str, float]] | None:
+    """Measure John (CPU) rates and persist them into the shared benchmark cache.
+
+    The CPU-only backend for the effort engine: on a host with no hashcat/GPU
+    tool, ``run_john_benchmark`` runs ``john --test`` per benchmark mode and
+    returns the SAME ``{mode: {"cpu": rate}}`` shape ``get_or_run_benchmark``
+    otherwise produces, so ``resolve_effort`` reads calibrated CPU tiers. The
+    record is fingerprinted with :func:`compute_john_fingerprint` — a DIFFERENT
+    seed than the hashcat path — so a John record and a hashcat record can never
+    be confused by the freshness check.
+
+    Runs ONLY John's self-test — never ``hashcat -b`` / ``hashcat -I``. Best-
+    effort throughout: any failure returns the prior cache's rates when one exists
+    (and is a John record on the same seed), else ``None``. NEVER raises.
+
+    Args:
+        shell: The pentest shell (or a shell-shaped object); its ``run_command``
+            is injected into ``run_john_benchmark`` as the command executor.
+        force: When ``True``, re-measures even if a fresh John record exists.
+
+    Returns:
+        ``{mode: {"cpu": rate}}`` for every measured mode, or ``None`` when
+        nothing measured and no usable cache exists.
+    """
+    from adscan_core.rich_output import print_info_debug  # noqa: PLC0415
+
+    fingerprint = compute_john_fingerprint()
+    cached = _load_cache()
+    cache_is_john = cached is not None and cached.fingerprint == fingerprint
+
+    # Warm-cache fast path: a complete, within-TTL John record on this seed — no
+    # john --test sweep at all.
+    if (
+        not force
+        and cache_is_john
+        and cached.complete
+        and is_fresh(cached, current_fingerprint=fingerprint)
+    ):
+        print_info_debug(
+            "benchmark-cache: warm-cache HIT (John CPU, complete + fresh) -- no "
+            "john --test sweep this scan"
+        )
+        return cached.rates
+
+    command_executor = getattr(shell, "run_command", None)
+    if command_executor is None:
+        return cached.rates if cache_is_john else None
+
+    rates = run_john_benchmark(command_executor)
+    if not rates:
+        # A total John failure keeps the prior John cache (better than nothing);
+        # with no usable John record, degrade to None (effort engine → "fast").
+        return cached.rates if cache_is_john else None
+
+    record = BenchmarkRecord(
+        schema_version=_BENCHMARK_SCHEMA_VERSION,
+        fingerprint=fingerprint,
+        device_names=(),
+        measured_at=_utcnow_iso(),
+        rates=rates,
+        complete=True,
+        has_gpu=False,
+    )
+    _save_cache(record)
+    return record.rates
+
+
 def get_or_run_benchmark(
     shell: Any, *, force: bool = False
 ) -> dict[str, dict[str, float]] | None:
@@ -410,11 +496,20 @@ def get_or_run_benchmark(
     entry, running a `hashcat -b` sweep only when the cache is missing, stale
     (TTL/fingerprint/schema), incomplete, or ``force`` is set.
 
+    The measurement backend is selected by PAL capability, so a host with no
+    hashcat NEVER shells ``hashcat -b`` / ``hashcat -I``:
+
+    * ``cracking_gpu`` available → the ``hashcat -b`` path below (unchanged).
+    * else ``cracking_cpu`` available → the John (CPU) ``john --test`` backend
+      (:func:`_run_john_warmup`), producing the same ``{mode: {"cpu": rate}}``
+      cache shape ``resolve_effort`` reads.
+    * else → ``None``; the effort engine forces the safe "fast" tier.
+
     Best-effort, never raises. On total failure: returns the prior cache's
     rates when one exists (better than nothing), else None (callers treat
     None as "force the fast tier" -- see cracking_wordlist_policy.resolve_effort).
 
-    Two invariants make this cheap and starvation-free:
+    Two invariants make this cheap and starvation-free (hashcat path):
 
     * **Warm cache => NO sweep.** A complete, fingerprint-fresh record short-
       circuits before any ``hashcat -b`` runs, so a machine benchmarked once
@@ -428,6 +523,12 @@ def get_or_run_benchmark(
       remaining pairs instead of re-sweeping. Without this, a scan where a crack
       always contends would discard its work every time and re-sweep forever.
     """
+    # Backend selection is capability-gated. hashcat absent → NEVER shell it.
+    if not pal_tools.capability_available("cracking_gpu").available:
+        if pal_tools.capability_available("cracking_cpu").available:
+            return _run_john_warmup(shell, force=force)
+        return None
+
     # Every hashcat launch (probe `-I`, benchmark `-b`) is serialized against
     # real cracks via the shared single-instance slot. (See
     # services/hashcat_coordination.)
@@ -711,6 +812,7 @@ __all__ = [
     "extract_device_names",
     "probe_reports_gpu",
     "compute_fingerprint",
+    "compute_john_fingerprint",
     "detect_gpu_present",
     "is_fresh",
     "get_or_run_benchmark",

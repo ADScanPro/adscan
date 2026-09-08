@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Mapping, Optional, Callable
 
+from adscan_core.pal import paths as pal_paths
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.docker_runtime import is_docker_env
 
@@ -77,19 +78,21 @@ def _is_full_adscan_container_runtime() -> bool:
     """Return True when running inside the ADscan FULL runtime container.
 
     This is distinct from "Docker is installed on the host". In this mode, ADscan
-    is already bundled with its dependencies under `/opt/adscan`, and we must
-    avoid recursive Docker-mode execution (Docker-in-Docker is not supported).
+    is already bundled with its dependencies under the container runtime root, and
+    we must avoid recursive Docker-mode execution (Docker-in-Docker is not
+    supported).
     """
     if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
         return True
     if not is_docker_env():
         return False
-    if os.getenv("ADSCAN_HOME") != "/opt/adscan":
+    container_root = pal_paths.container_adscan_root()
+    if os.getenv("ADSCAN_HOME") != container_root:
         return False
     return (
-        os.path.isdir("/opt/adscan/tool_venvs")
-        and os.path.isdir("/opt/adscan/tools")
-        and os.path.isdir("/opt/adscan/wordlists")
+        os.path.isdir(os.path.join(container_root, "tool_venvs"))
+        and os.path.isdir(os.path.join(container_root, "tools"))
+        and os.path.isdir(os.path.join(container_root, "wordlists"))
     )
 
 

@@ -9,7 +9,34 @@ from typing import Any
 from rich.console import Console
 
 from adscan_core.interaction import is_ci_marker_present
+from adscan_core.pal.platform import is_windows
 from adscan_core.sensitive import strip_sensitive_markers
+
+
+def ensure_utf8_console() -> None:
+    """Force UTF-8 output on ``sys.stdout``/``sys.stderr`` when on Windows.
+
+    The Windows console defaults to a legacy code page (typically cp1252) that
+    cannot encode the Unicode glyphs (✓ ✗ ▰ …) ADscan and Rich print throughout
+    the UI — an unhandled ``UnicodeEncodeError: 'charmap' codec can't encode …``
+    aborts the command. This reconfigures both streams to UTF-8 with
+    ``errors="replace"`` so a stray unencodable character degrades to ``?``
+    instead of crashing.
+
+    POSIX is already UTF-8, so this is a no-op there. Best-effort: any stream
+    that lacks ``reconfigure`` (an already-wrapped proxy, a redirected pipe) or
+    rejects it is skipped silently — output must never be blocked by this guard.
+    """
+    if not is_windows():
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # pragma: no cover - Windows-only, best-effort
+            pass
 
 
 class MarkerStrippingTextIO:

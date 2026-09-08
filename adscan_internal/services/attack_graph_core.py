@@ -48,6 +48,7 @@ from adscan_internal.services.privileged_group_classifier import (
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
+from adscan_internal.services.path_state import COVERAGE_SAMPLE_STATUS
 from adscan_internal.services.attack_step_catalog import (
     context_requirement_satisfied,
     derive_step_display_status,
@@ -258,7 +259,9 @@ def _candidate_is_host_control_edge(candidate_relation: str) -> bool:
     """
     from adscan_internal.services.edge_kind import classify_edge_kind  # noqa: PLC0415
 
-    return classify_edge_kind(candidate_relation).value in _HOST_CONTROL_GATED_EDGE_KINDS
+    return (
+        classify_edge_kind(candidate_relation).value in _HOST_CONTROL_GATED_EDGE_KINDS
+    )
 
 
 def _host_control_withheld_after_access(
@@ -470,6 +473,62 @@ class AttackPath:
     @property
     def length(self) -> int:
         return len(self.steps)
+
+
+#: The ``notes["coverage"]`` value stamped on the synthetic single-step record the
+#: bounded fallback engine emits to DECLARE a reachable high-value terminal whose
+#: individual route it could not materialise within the sample cap (see
+#: :func:`compute_perterminal_attack_paths`'s coverage floor). A record carrying it
+#: is a pure COVERAGE DECLARATION, never a real attack step.
+COVERAGE_MARKER_NOTE = "reached_not_materialized"
+
+
+def is_coverage_marker_step(step: Any) -> bool:
+    """Return True when a STEP is a fallback coverage-declaration marker.
+
+    The coverage floor emits a synthetic single-step record stamped
+    ``notes={"coverage": "reached_not_materialized"}`` for a reachable high-value
+    terminal it could not materialise a route to in the capped sample. Every
+    counter / renderer that buckets steps or paths by status MUST branch on this
+    FIRST and treat the record as a coverage declaration (rolled into the
+    sampled-coverage block), NOT as an ``attempted`` step — else it inflates the
+    attempted totals in the report, the web CTEM, and the KPIs.
+
+    Accepts either an :class:`AttackPathStep` (``.notes``) or a display-step dict
+    (``notes`` / ``details``), since the marker's ``notes`` are folded into the
+    display step's ``details`` by ``path_to_display_record``.
+    """
+    if step is None:
+        return False
+    containers: list[Any] = []
+    notes_attr = getattr(step, "notes", None)
+    if isinstance(notes_attr, dict):
+        containers.append(notes_attr)
+    if isinstance(step, dict):
+        for key in ("notes", "details"):
+            container = step.get(key)
+            if isinstance(container, dict):
+                containers.append(container)
+    for container in containers:
+        if str(container.get("coverage") or "").strip() == COVERAGE_MARKER_NOTE:
+            return True
+    return False
+
+
+def is_coverage_marker_path(steps: Any) -> bool:
+    """Return True when a PATH is a pure fallback coverage-declaration record.
+
+    A coverage-declaration path is the synthetic single-step record the fallback
+    floor emits (see :func:`is_coverage_marker_step`). Any renderer/counter that
+    buckets paths by status must exclude these from the real status buckets — they
+    are declared through the sampled-coverage block, never counted as
+    ``attempted``/``theoretical`` paths.
+
+    ``steps`` is the path's step list (dicts or :class:`AttackPathStep`).
+    """
+    if not isinstance(steps, (list, tuple)) or not steps:
+        return False
+    return any(is_coverage_marker_step(step) for step in steps)
 
 
 def display_record_signature(
@@ -723,9 +782,7 @@ def collect_share_exposures_from_graph(
     edges: list[Any] = graph.get("edges") or []
 
     # Domain Users SID: S-1-5-21-<domain>-513
-    domain_users_sid = (
-        f"{domain_sid.rstrip('-')}-513".upper() if domain_sid else None
-    )
+    domain_users_sid = f"{domain_sid.rstrip('-')}-513".upper() if domain_sid else None
     well_known = dict(_WELL_KNOWN_LABELS)
     if domain_users_sid:
         well_known[domain_users_sid] = "Domain Users"
@@ -1185,6 +1242,7 @@ def compute_display_paths_for_domain_unfiltered(
     target_mode: str = "object",
     start_node_ids: set[str] | None = None,
     chokepoint_group_ids: set[str] | None = None,
+    force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain (graph-only, unfiltered).
 
@@ -1223,6 +1281,7 @@ def compute_display_paths_for_domain_unfiltered(
         start_node_ids=effective_start_node_ids,
         reachable_node_ids=high_value_reachable_node_ids,
         chokepoint_group_ids=chokepoint_group_ids,
+        force_perterminal=force_perterminal,
     )
 
     return _build_light_display_records(
@@ -1391,7 +1450,9 @@ def filter_contained_paths_for_domain_listing(
         ) -> tuple[int, bool, int]:
             record = item[2]
             dct = tiers_by_id[id(record)]
-            not_hv = (not is_hv_terminal(record)) if is_hv_terminal is not None else True
+            not_hv = (
+                (not is_hv_terminal(record)) if is_hv_terminal is not None else True
+            )
             return (-dct, not_hv, len(item[1]))
 
         normalized.sort(key=_sort_key)
@@ -1473,7 +1534,8 @@ def filter_contained_paths_for_domain_listing(
                             if (
                                 cand_tier == kept_tier
                                 and cand_terminal is not None
-                                and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
+                                and cand_terminal
+                                != kept_terminal_by_id.get(id(kept_rec))
                             ):
                                 continue
                             # Keep the longer candidate when it reaches the SAME terminal
@@ -1547,9 +1609,7 @@ def filter_contained_paths_for_domain_listing(
                     if endpoints in seen_b_endpoints:
                         continue
                     seen_b_endpoints.add(endpoints)
-                    super_by_endpoints.setdefault(endpoints, []).append(
-                        (b_core, other)
-                    )
+                    super_by_endpoints.setdefault(endpoints, []).append((b_core, other))
         pass2_kept: list[dict[str, Any]] = []
         pass2_removed = 0
         for a_core, record in kept_entries:
@@ -1681,20 +1741,22 @@ def filter_domain_listing_paths(
 # Paths with lower-rank classes are dropped when a higher-rank super-path covers them.
 _OUTCOME_CLASS_RANK: dict[str, int] = {
     "direct_compromise": 100,
-    "domain_breaker": 100,      # alias used in some callers
+    "domain_breaker": 100,  # alias used in some callers
     "tier0_foothold": 80,
     "privileged_escalator": 60,
     "compromise_enabler": 50,
-    "graph_extension": 50,      # runtime alias for compromise_enabler
+    "graph_extension": 50,  # runtime alias for compromise_enabler
     "pivot": 20,
     "followup_terminal": 20,
 }
 
 
 def _outcome_class_rank(record: dict[str, Any]) -> int:
-    cls = str(
-        record.get("outcome_class") or record.get("compromise_class") or ""
-    ).strip().lower()
+    cls = (
+        str(record.get("outcome_class") or record.get("compromise_class") or "")
+        .strip()
+        .lower()
+    )
     return _OUTCOME_CLASS_RANK.get(cls, 10)
 
 
@@ -1874,9 +1936,9 @@ def deduplicate_trailing_contextual_suffix_paths(
             sig = _display_record_exact_signature(rec)
             length = len(sig[1]) if sig else 0
             return (
-                -_outcome_class_rank(rec),                          # higher class first
-                -(rec.get("target_priority_rank") or 0),            # higher priority first
-                -length,                                            # longer path first
+                -_outcome_class_rank(rec),  # higher class first
+                -(rec.get("target_priority_rank") or 0),  # higher priority first
+                -length,  # longer path first
             )
 
         group_sorted = sorted(group, key=_sort_key)
@@ -1895,6 +1957,7 @@ def compute_display_paths_for_start_node(
     max_paths: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
+    force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths starting from a specific node id."""
     mode = normalize_target_mode(target_mode)
@@ -1916,6 +1979,7 @@ def compute_display_paths_for_start_node(
         target="all",
         terminal_mode=mode,
         reachable_node_ids=high_value_reachable_node_ids,
+        force_perterminal=force_perterminal,
     )
 
     def _start_node_dedup_key(
@@ -2463,13 +2527,11 @@ def _iter_cross_org_tgt_delegation_trusts(
             attrs_int = None
         # A TrustedBy edge is source=trusting-domain -> target=partner (see
         # ldap_collector._collect_trusts), matching the domains_data convention.
-        source_label = (
-            str(edge.get("source_name") or "").strip()
-            or _node_label(str(edge.get("from") or edge.get("source") or ""))
+        source_label = str(edge.get("source_name") or "").strip() or _node_label(
+            str(edge.get("from") or edge.get("source") or "")
         )
-        target_label = (
-            str(edge.get("target_name") or "").strip()
-            or _node_label(str(edge.get("to") or edge.get("target") or ""))
+        target_label = str(edge.get("target_name") or "").strip() or _node_label(
+            str(edge.get("to") or edge.get("target") or "")
         )
         _consider(
             source_domain=source_label,
@@ -2540,9 +2602,7 @@ def couple_cross_org_tgt_delegation_edges(
     changed = False
     for trust in trusts:
         # trusting domain (whose TDO carries the attribute) = source_domain.
-        trusting_node_id = _find_domain_node_id(
-            nodes_map, label=trust["source_domain"]
-        )
+        trusting_node_id = _find_domain_node_id(nodes_map, label=trust["source_domain"])
         # compromised / trusted (partner) domain = target_domain.
         compromised_node_id = _find_domain_node_id(
             nodes_map,
@@ -2616,8 +2676,7 @@ def _iter_within_forest_child_parent(
                 continue
             tgt = str(trust.get("target_domain") or "").strip().lower()
             flags = {
-                str(f).strip().upper()
-                for f in (trust.get("attribute_flags") or ())
+                str(f).strip().upper() for f in (trust.get("attribute_flags") or ())
             }
             if tgt == parent and "WITHIN_FOREST" in flags:
                 has_within_forest = True
@@ -3172,7 +3231,6 @@ def _build_implicit_path_overlays(
         for node_id, edges in builder(graph).items():
             merged.setdefault(node_id, []).extend(edges)
     return merged
-
 
 
 def _iter_outgoing_edges_with_virtual_local_reuse(
@@ -3746,6 +3804,49 @@ _STRUCTURAL_RELATIONS_LOWER: frozenset[str] = frozenset(
 _MAX_STRUCTURAL_HOPS: int = 12
 
 
+# ---------------------------------------------------------------------------
+# Per-terminal reverse-flood engine — selector + env-tunable budgets
+# ---------------------------------------------------------------------------
+# Selected by ``ADSCAN_ATTACK_PATH_ENGINE=perterminal`` (any other value / unset
+# => the current DFS engine, byte-unaffected). See
+# ``compute_perterminal_attack_paths`` for the algorithm.
+def _perterminal_engine_selected() -> bool:
+    """Return ``True`` when the per-terminal engine is explicitly selected.
+
+    Reads ``ADSCAN_ATTACK_PATH_ENGINE`` and matches the exact value
+    ``"perterminal"`` (case/space-insensitive). Any other value — including
+    unset — leaves the current DFS engine in force.
+    """
+    return (
+        str(os.environ.get("ADSCAN_ATTACK_PATH_ENGINE", "")).strip().lower()
+        == "perterminal"
+    )
+
+
+def _perterminal_source_budget() -> int:
+    """Return the per-terminal SOURCE budget (top-N most-valuable sources kept).
+
+    Env ``ADSCAN_ATTACK_PATHS_SOURCE_BUDGET`` (default ``8``); clamped to ``>= 1``.
+    """
+    try:
+        return max(1, int(os.environ.get("ADSCAN_ATTACK_PATHS_SOURCE_BUDGET", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _perterminal_recon_slack() -> int:
+    """Return the reconstruction distance SLACK (hops longer than shortest allowed).
+
+    Env ``ADSCAN_ATTACK_PATHS_RECON_SLACK`` (default ``1`` — the measured sweet
+    spot; ``0`` => shortest-path-only, larger => more coverage at more examined
+    states). Clamped to ``>= 0``.
+    """
+    try:
+        return max(0, int(os.environ.get("ADSCAN_ATTACK_PATHS_RECON_SLACK", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _count_actionable_edges(acc_steps: list[AttackPathStep]) -> int:
     """Return the number of attack-step edges in the accumulated path.
 
@@ -3884,7 +3985,9 @@ _GENTIME_COLLAPSE_MEMBERS_KEY = "gentime_collapsed_pivot_members"
 
 
 def _read_gentime_collapse_enabled() -> bool:
-    return str(os.getenv("ADSCAN_ATTACK_PATH_GENTIME_COLLAPSE", "0")).strip().lower() in {
+    return str(
+        os.getenv("ADSCAN_ATTACK_PATH_GENTIME_COLLAPSE", "0")
+    ).strip().lower() in {
         "1",
         "true",
         "yes",
@@ -4333,6 +4436,498 @@ def admit_frontier_edge(
     return "admit", is_self_loop, step_notes
 
 
+def compute_perterminal_attack_paths(
+    *,
+    view: "AttackPathExpansionView",
+    nodes_map: dict[str, Any],
+    sources: list[str],
+    is_terminal,
+    allowed_reachable_ids: set[str],
+    max_depth: int,
+    max_paths_cap: int | None,
+    budget: "DfsMemoryBudget",
+    enforce_terminal_floor: bool = True,
+) -> list[AttackPath]:
+    """Per-terminal, budgeted, REVERSE-reachability-first path materialization.
+
+    This is BloodHound's target-rooted shape. It separates exposure (which
+    terminals are reachable) from evidence (the routes materialized as proof).
+    Instead of ONE shared-visited all-simple-paths DFS per source (which
+    explodes on hub-mesh graphs), for EACH reachable terminal it runs an
+    INDEPENDENT bounded search: a single reverse-BFS floods backward from the
+    terminal over the DFS-visible frontier (real + virtual local-reuse +
+    implicit-overlay edges) to compute the SHORTEST distance-to-terminal for
+    every node. The terminal's routes are then materialized from the top-N
+    most-valuable SOURCES (source budget), each route reconstructed by a
+    distance-descending forward walk that respects the SAME edge admissibility
+    gate (``admit_frontier_edge``) the production DFS uses — so a route is only
+    emitted if it is a legal chain.
+
+    The essential property is per-terminal INDEPENDENCE: each terminal's reverse
+    flood is its own, so a hub expanded resolving terminal ``T1`` never blocks
+    resolving ``T2`` (the shared-visited coupling that causes the explosion).
+    Combined with a per-terminal SOURCE budget, cost is
+    ``O(terminals × edges)`` for the floods plus
+    ``O(sources_kept × depth × frontier)`` for reconstruction — linear-ish in
+    terminals × budget, not combinatorial.
+
+    Args:
+        view: The expansion view exposing adjacency and the frontier iterator.
+        nodes_map: Node-id → node-dict map for the graph under analysis.
+        sources: Candidate start-principal ids (the reach roots).
+        is_terminal: Predicate ``(node_id) -> bool`` marking value sinks.
+        allowed_reachable_ids: Node ids admissible to the DFS reachability gate.
+        max_depth: Actionable-edge depth budget for a materialized route.
+        max_paths_cap: Optional global cap on the number of emitted paths.
+        budget: Memory/step budget guard, ticked per expansion.
+        enforce_terminal_floor: When True (default), a COVERAGE FLOOR runs after
+            the main materialization loop: every reachable Tier-0/value terminal
+            that ended with ZERO emitted routes (because all its reachable
+            sources fell outside the source budget, its reconstruction was cut,
+            or ``max_paths_cap`` was exhausted before it was processed) is
+            guaranteed at least ONE record — either a shortest legal route forced
+            from its single best (highest-value) hit source, or a synthetic
+            single-step record stamped ``notes={"coverage":
+            "reached_not_materialized"}`` so the terminal is DECLARED, never
+            silently absent. Reuses the flood's already-computed
+            distance/hit-source data (no re-flood, negligible budget cost). When
+            False the output is byte-identical to the pre-floor engine.
+
+    Returns:
+        The list of materialized :class:`AttackPath` routes (deduped by step
+        signature).
+    """
+    adjacency = view.adjacency
+    source_budget = _perterminal_source_budget()
+
+    # --- 1. Enumerate the terminal set --------------------------------------
+    # Reachability-first exposure model: the terminals are the VALUE sinks we
+    # materialize evidence toward. To match the DFS engine's coverage (which
+    # emits every maximal path then keeps the high-value + PROVEN ones), the
+    # terminal set is the union of:
+    #   (a) the is_terminal() sinks (domain object / tier0 in object mode),
+    #   (b) any node that is the TARGET of a PROVEN edge (success/exploited/
+    #       partial) — a validated control/access reach the report must never
+    #       drop, even onto a non-tier0 user/computer (Exposure-Validation), and
+    #   (c) high-value / promotable value candidates.
+    # The terminal set is the VALUE sinks the report headlines — NOT every
+    # controlled object. Making every control-edge TARGET a terminal is what
+    # re-creates the O(N)-terminals explosion on a hub graph (e.g. Account
+    # Operators → GenericAll → 32k accounts = 32,703 control-edge targets, so a
+    # per-terminal reverse flood becomes O(N·E)). The report's value terminals
+    # are the high-value / tier0 / promotable candidates + the domain object;
+    # plus any node that is the TARGET of a PROVEN edge (a validated reach the
+    # Exposure-Validation doctrine forbids dropping — always few in number).
+    terminal_ids: set[str] = {
+        node_id
+        for node_id, node in nodes_map.items()
+        if isinstance(node, dict) and is_terminal(node_id)
+    }
+    try:
+        terminal_ids |= _build_high_value_terminal_candidate_ids(
+            nodes_map,
+            [e for el in adjacency.values() for e in el],
+            mode="tier0",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    _PROVEN_EDGE_STATUS = {"success", "exploited", "domain_compromised", "partial"}
+    for _nid, _edges in adjacency.items():
+        for _e in _edges:
+            if str(_e.get("status") or "").strip().lower() in _PROVEN_EDGE_STATUS:
+                _to = str(_e.get("to") or "").strip()
+                if _to:
+                    terminal_ids.add(_to)
+    terminals: list[str] = sorted(terminal_ids)
+
+    source_set = set(sources)
+
+    # --- 2. Source value ranking (tier of reach + blast-radius) -------------
+    def _source_value(src: str) -> int:
+        node = nodes_map.get(src) if isinstance(nodes_map.get(src), dict) else {}
+        blast = len(adjacency.get(src, ()))
+        tier_bonus = 0
+        try:
+            if _node_high_value_rank(node) > 0:
+                tier_bonus = 50
+        except Exception:
+            tier_bonus = 0
+        return tier_bonus + blast
+
+    src_value = {s: _source_value(s) for s in sources}
+
+    def _terminal_budget(term_id: str) -> int | None:
+        node = nodes_map.get(term_id)
+        if isinstance(node, dict) and _node_is_domain(node):
+            return None  # crown jewel: unlimited
+        try:
+            if isinstance(node, dict) and _node_is_terminal_target(node, mode="tier0"):
+                return max(source_budget * 3, source_budget)
+        except Exception:
+            pass
+        return source_budget
+
+    # --- 3. Reverse adjacency over the DFS-visible frontier ------------------
+    # Built ONCE (shared, read-only) — the flood is per-terminal but the graph
+    # structure is fixed. Uses the same virtual-edge expansion as the DFS so the
+    # skeleton reflects real DFS reachability (empty-prefix over-approximation is
+    # re-tightened by the forward admissibility check at reconstruction).
+    reverse_adj: dict[str, list[str]] = {}
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        for edge in iter_view_frontier(view, str(node_id), []):
+            if not isinstance(edge, dict):
+                continue
+            to_id = str(edge.get("to") or "").strip()
+            if not to_id or to_id == str(node_id):
+                continue
+            reverse_adj.setdefault(to_id, []).append(str(node_id))
+
+    paths: list[AttackPath] = []
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
+
+    # Coverage-floor bookkeeping (only consumed when ``enforce_terminal_floor``):
+    #   - ``emitted_terminals`` — terminals with >=1 route emitted FOR THEM. Keyed
+    #     by the terminal being PROCESSED (``term_id``), NOT by ``acc_steps[-1].to_id``
+    #     (a route toward T may legitimately terminate on T, but keying by the
+    #     current terminal avoids miscrediting a shared value node).
+    #   - ``terminal_flood`` — each reachable terminal's (best hit sources, dist)
+    #     so the floor can force a route WITHOUT re-flooding (negligible budget).
+    emitted_terminals: set[str] = set()
+    terminal_flood: dict[str, tuple[list[str], dict[str, int]]] = {}
+    _current_term_id: dict[str, str | None] = {"id": None}
+
+    def _emit(acc_steps: list[AttackPathStep]) -> bool:
+        if not acc_steps:
+            return False
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return False
+        signature = tuple(attack_path_step_signature(s) for s in acc_steps)
+        if signature in seen_signatures:
+            return False
+        seen_signatures.add(signature)
+        paths.append(
+            AttackPath(
+                steps=list(acc_steps),
+                source_id=acc_steps[0].from_id,
+                target_id=acc_steps[-1].to_id,
+            )
+        )
+        _term = _current_term_id["id"]
+        if _term is not None:
+            emitted_terminals.add(_term)
+        return True
+
+    # Depth cap for the reverse flood (actionable-edge budget + structural slack).
+    _flood_cap = max_depth + _MAX_STRUCTURAL_HOPS
+    _MAX_ROUTES_PER_SRC_TERM = 6
+    # Distance slack for reconstruction: how many hops LONGER than the strict
+    # shortest an alternate route may be. 0 => shortest-path-only (loses proven
+    # longer routes); larger => more coverage at more examined-states. Env-tunable.
+    _RECON_SLACK = _perterminal_recon_slack()
+
+    # --- 4. Per-terminal INDEPENDENT reverse flood + reconstruction ---------
+    for term_id in terminals:
+        _current_term_id["id"] = term_id
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            # Cap exhausted: skip materialization but DO NOT skip the flood — the
+            # coverage floor still needs this terminal's reachability recorded so
+            # a genuinely-reachable value sink cut by the cap is restored below.
+            if enforce_terminal_floor:
+                _dist_only: dict[str, int] = {term_id: 0}
+                _frontier = [term_id]
+                _dd = 0
+                _hits: list[str] = []
+                while _frontier and _dd < _flood_cap:
+                    _dd += 1
+                    _nxt: list[str] = []
+                    for _cur in _frontier:
+                        budget.tick()
+                        for _pred in reverse_adj.get(_cur, ()):
+                            if _pred in _dist_only:
+                                continue
+                            _dist_only[_pred] = _dd
+                            _nxt.append(_pred)
+                            if _pred in source_set:
+                                _hits.append(_pred)
+                    _frontier = _nxt
+                if _hits:
+                    _hits.sort(
+                        key=lambda s: (_dist_only.get(s, 1 << 30), -src_value.get(s, 0))
+                    )
+                    terminal_flood[term_id] = (_hits, _dist_only)
+                continue
+            break
+
+        # (a) Reverse-BFS from the terminal: shortest hop-distance for each node.
+        dist: dict[str, int] = {term_id: 0}
+        frontier = [term_id]
+        d = 0
+        # collect sources hit, ordered by distance then value
+        hit_sources: list[str] = []
+        while frontier and d < _flood_cap:
+            d += 1
+            nxt: list[str] = []
+            for cur in frontier:
+                budget.tick()
+                for pred in reverse_adj.get(cur, ()):  # predecessors of cur
+                    if pred in dist:
+                        continue
+                    dist[pred] = d
+                    nxt.append(pred)
+                    if pred in source_set:
+                        hit_sources.append(pred)
+            frontier = nxt
+
+        if not hit_sources:
+            continue
+
+        # (b) Value-order the sources that can reach this terminal, apply budget.
+        t_budget = _terminal_budget(term_id)
+        hit_sources.sort(key=lambda s: (dist.get(s, 1 << 30), -src_value.get(s, 0)))
+        # Remember the FULL value-ordered reach for the coverage floor (before the
+        # budget truncation) so a terminal whose reconstruction is later cut can
+        # still be forced a route from its best source without re-flooding.
+        if enforce_terminal_floor:
+            terminal_flood[term_id] = (list(hit_sources), dist)
+        if t_budget is not None:
+            hit_sources = hit_sources[:t_budget]
+
+        # (c) For each kept source, reconstruct route(s) by a distance-descending
+        # forward walk gated by admit_frontier_edge. The distance map prunes the
+        # forward search to shortest-progressing edges only (no hub re-walk).
+        for src in hit_sources:
+            if max_paths_cap is not None and len(paths) >= max_paths_cap:
+                break
+            emitted_for_src = {"n": 0}
+
+            def _walk(current: str, visited: set[str], acc_steps: list[AttackPathStep]):
+                budget.tick()
+                if emitted_for_src["n"] >= _MAX_ROUTES_PER_SRC_TERM:
+                    return
+                if max_paths_cap is not None and len(paths) >= max_paths_cap:
+                    return
+                if acc_steps and current == term_id:
+                    if _emit(acc_steps):
+                        emitted_for_src["n"] += 1
+                    return
+                actionable_depth = _count_actionable_edges(acc_steps)
+                structural_depth = len(acc_steps) - actionable_depth
+                if (
+                    actionable_depth >= max_depth
+                    or structural_depth >= _MAX_STRUCTURAL_HOPS
+                ):
+                    return
+                cur_dist = dist.get(current)
+                if cur_dist is None:
+                    return
+                next_edges = iter_view_frontier(view, current, acc_steps)
+                if not next_edges:
+                    return
+                path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
+                for edge in next_edges:
+                    to_id = str(edge.get("to") or "")
+                    if not to_id:
+                        continue
+                    # Distance-bounded reconstruction: follow an edge that makes
+                    # progress toward the terminal within a small SLACK (keeps
+                    # near-shortest ALTERNATE routes — the second relation-route to
+                    # a value node — bounded, instead of only the single shortest).
+                    # A PROVEN edge (success/exploited/partial) is ALWAYS followed
+                    # regardless of distance so a validated-but-longer route is
+                    # never dropped (Exposure-Validation: never flatten proven).
+                    nd = dist.get(to_id)
+                    is_self = to_id == current
+                    st = str(edge.get("status") or "").strip().lower()
+                    proven_edge = st in {
+                        "success",
+                        "exploited",
+                        "domain_compromised",
+                        "partial",
+                    }
+                    if not is_self and not proven_edge:
+                        if nd is None or nd >= cur_dist + _RECON_SLACK:
+                            continue
+                    verdict, is_self_loop, step_notes = admit_frontier_edge(
+                        edge,
+                        current=current,
+                        acc_steps=acc_steps,
+                        path_rels=path_rels,
+                        visited=visited,
+                        view=view,
+                        reachable_node_ids=allowed_reachable_ids,
+                        terminal_set=None,
+                        chokepoint_root_set=set(),
+                    )
+                    if verdict != "admit":
+                        continue
+                    step = AttackPathStep(
+                        from_id=current,
+                        relation=str(edge.get("relation") or ""),
+                        to_id=to_id,
+                        status=str(edge.get("status") or "discovered"),
+                        notes=step_notes,
+                    )
+                    if not is_self_loop:
+                        visited.add(to_id)
+                    acc_steps.append(step)
+                    _walk(to_id, visited, acc_steps)
+                    acc_steps.pop()
+                    if not is_self_loop:
+                        visited.discard(to_id)
+                    if emitted_for_src["n"] >= _MAX_ROUTES_PER_SRC_TERM:
+                        return
+
+            _walk(src, visited={src}, acc_steps=[])
+
+    # --- 5. Coverage floor: every reachable Tier-0/value terminal >= 1 record -
+    # A terminal that IS reachable (its flood found sources) can still end with
+    # ZERO emitted routes — its sources fell outside the source budget, its
+    # reconstruction was cut short, or ``max_paths_cap`` was hit before it was
+    # processed. That silently drops a genuinely-reachable high-value terminal,
+    # which is unacceptable for a coverage-first tool. The floor guarantees the
+    # terminal is DECLARED: force one shortest legal route from its best source,
+    # or stamp a synthetic ``reached_not_materialized`` record. Reuses the flood
+    # data captured above (no re-flood — negligible budget cost).
+    if enforce_terminal_floor:
+        for term_id in terminals:
+            if term_id in emitted_terminals:
+                continue
+            flood = terminal_flood.get(term_id)
+            if not flood:
+                continue  # not reachable — nothing to floor
+            best_sources, term_dist = flood
+            if not best_sources:
+                continue
+            node = nodes_map.get(term_id)
+            if not isinstance(node, dict):
+                continue
+            # Only value sinks earn the floor guarantee (the terminal set also
+            # holds proven-edge targets; a Tier-0/domain terminal is the one we
+            # must never silently drop).
+            is_value_terminal = _node_is_domain(node)
+            if not is_value_terminal:
+                try:
+                    is_value_terminal = _node_is_terminal_target(node, mode="tier0")
+                except Exception:  # noqa: BLE001
+                    is_value_terminal = False
+            if not is_value_terminal:
+                continue
+
+            _current_term_id["id"] = term_id
+            best_src = best_sources[0]
+
+            # (a) Try to force ONE shortest legal route from the best source using
+            # the SAME distance-descending, admit_frontier_edge-gated walk. This
+            # ignores ``max_paths_cap`` (the floor is a coverage guarantee that
+            # overrides the display cap) but keeps every admissibility check.
+            def _force_walk(
+                current: str,
+                visited: set[str],
+                acc_steps: list[AttackPathStep],
+                *,
+                _term: str = term_id,
+                _dist: dict[str, int] = term_dist,
+            ) -> list[AttackPathStep] | None:
+                budget.tick()
+                if acc_steps and current == _term:
+                    return list(acc_steps)
+                actionable_depth = _count_actionable_edges(acc_steps)
+                structural_depth = len(acc_steps) - actionable_depth
+                if (
+                    actionable_depth >= max_depth
+                    or structural_depth >= _MAX_STRUCTURAL_HOPS
+                ):
+                    return None
+                cur_dist = _dist.get(current)
+                if cur_dist is None:
+                    return None
+                next_edges = iter_view_frontier(view, current, acc_steps)
+                if not next_edges:
+                    return None
+                path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
+                for edge in next_edges:
+                    to_id = str(edge.get("to") or "")
+                    if not to_id:
+                        continue
+                    nd = _dist.get(to_id)
+                    is_self = to_id == current
+                    if not is_self and (nd is None or nd >= cur_dist):
+                        # Shortest-progressing edges only — force the single
+                        # shortest route (no slack; the floor wants one proof).
+                        continue
+                    verdict, is_self_loop, step_notes = admit_frontier_edge(
+                        edge,
+                        current=current,
+                        acc_steps=acc_steps,
+                        path_rels=path_rels,
+                        visited=visited,
+                        view=view,
+                        reachable_node_ids=allowed_reachable_ids,
+                        terminal_set=None,
+                        chokepoint_root_set=set(),
+                    )
+                    if verdict != "admit":
+                        continue
+                    step = AttackPathStep(
+                        from_id=current,
+                        relation=str(edge.get("relation") or ""),
+                        to_id=to_id,
+                        status=str(edge.get("status") or "discovered"),
+                        notes=step_notes,
+                    )
+                    if not is_self_loop:
+                        visited.add(to_id)
+                    acc_steps.append(step)
+                    found = _force_walk(to_id, visited, acc_steps)
+                    acc_steps.pop()
+                    if not is_self_loop:
+                        visited.discard(to_id)
+                    if found is not None:
+                        return found
+                return None
+
+            forced_steps = _force_walk(best_src, visited={best_src}, acc_steps=[])
+
+            if forced_steps:
+                signature = tuple(attack_path_step_signature(s) for s in forced_steps)
+                if signature not in seen_signatures:
+                    seen_signatures.add(signature)
+                    paths.append(
+                        AttackPath(
+                            steps=list(forced_steps),
+                            source_id=forced_steps[0].from_id,
+                            target_id=forced_steps[-1].to_id,
+                        )
+                    )
+                emitted_terminals.add(term_id)
+                continue
+
+            # (b) Reconstruction genuinely failed — DECLARE the terminal with a
+            # synthetic single-step record so it is never silently absent.
+            marker_step = AttackPathStep(
+                from_id=best_src,
+                relation="Reaches",
+                to_id=term_id,
+                status="attempted",
+                notes={"coverage": "reached_not_materialized"},
+            )
+            signature = (attack_path_step_signature(marker_step),)
+            if signature not in seen_signatures:
+                seen_signatures.add(signature)
+                paths.append(
+                    AttackPath(
+                        steps=[marker_step],
+                        source_id=best_src,
+                        target_id=term_id,
+                    )
+                )
+            emitted_terminals.add(term_id)
+
+    return paths
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
@@ -4343,6 +4938,7 @@ def compute_maximal_attack_paths(
     start_node_ids: set[str] | None = None,
     reachable_node_ids: set[str] | None = None,
     chokepoint_group_ids: set[str] | None = None,
+    force_perterminal: bool = False,
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth for a full-domain graph.
 
@@ -4460,6 +5056,24 @@ def compute_maximal_attack_paths(
         chokepoint_roots.append(gid)
     chokepoint_root_set: set[str] = set(chokepoint_roots)
 
+    # --- Per-terminal reverse-flood engine (opt-in via env) ------------------
+    # When ADSCAN_ATTACK_PATH_ENGINE == "perterminal", the target-rooted engine
+    # replaces BOTH the parallel and sequential DFS below. Default OFF: the DFS
+    # path runs byte-identically to before. ``force_perterminal`` is the hybrid
+    # switch's call-scoped route (predictor / abort backstop) — same effect,
+    # without mutating the process-wide env var.
+    if _perterminal_engine_selected() or force_perterminal:
+        return compute_perterminal_attack_paths(
+            view=view,
+            nodes_map=nodes_map,
+            sources=sources,
+            is_terminal=is_terminal,
+            allowed_reachable_ids=allowed_reachable_ids,
+            max_depth=max_depth,
+            max_paths_cap=max_paths_cap,
+            budget=DfsMemoryBudget(),
+        )
+
     # --- Parallel DFS (domain scope) -----------------------------------------
     # When ADSCAN_ATTACK_PATH_WORKERS != 0 and the source set is large enough,
     # distribute the per-source DFS across spawn-context worker processes.
@@ -4540,9 +5154,10 @@ def compute_maximal_attack_paths(
             target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
         ):
             return
-        if active_guard_members is not None and len(active_guard_members) <= len(
-            acc_steps
-        ) + 1:
+        if (
+            active_guard_members is not None
+            and len(active_guard_members) <= len(acc_steps) + 1
+        ):
             # A span of N nodes can contain EVERY member only when members <= N,
             # so this O(members) subset test is skipped entirely at scale (a
             # universal group's member count vastly exceeds any path length) —
@@ -4698,6 +5313,7 @@ def compute_maximal_attack_paths_from_start(
     target: str = "highvalue",
     terminal_mode: str = "domain",
     reachable_node_ids: set[str] | None = None,
+    force_perterminal: bool = False,
 ) -> list[AttackPath]:
     """Compute maximal paths starting from a specific node."""
     if max_depth <= 0 or not start_node_id:
@@ -4750,6 +5366,24 @@ def compute_maximal_attack_paths_from_start(
         if mode == "impact":
             return _node_is_terminal_target(node, mode=mode)
         return _node_is_terminal_target(node, mode=mode)
+
+    # --- Per-terminal reverse-flood engine (opt-in via env) ------------------
+    # When ADSCAN_ATTACK_PATH_ENGINE == "perterminal", the target-rooted engine
+    # replaces the per-start DFS below. Default OFF: the DFS path runs
+    # byte-identically to before. The single start node is the only source.
+    # ``force_perterminal`` is the hybrid switch's call-scoped route (predictor /
+    # abort backstop) — same effect, without mutating the process-wide env var.
+    if _perterminal_engine_selected() or force_perterminal:
+        return compute_perterminal_attack_paths(
+            view=view,
+            nodes_map=nodes_map,
+            sources=[start_node_id],
+            is_terminal=is_terminal,
+            allowed_reachable_ids=allowed_reachable_ids,
+            max_depth=max_depth,
+            max_paths_cap=max_paths_cap,
+            budget=DfsMemoryBudget(),
+        )
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
@@ -5039,6 +5673,13 @@ def path_to_display_record(
         relations.append(step.relation)
         nodes.append(label(step.to_id))
 
+    # A pure coverage-declaration marker (the fallback floor's synthetic
+    # ``reached_not_materialized`` record) is NOT a real attack step. Branch on it
+    # FIRST so it derives the dedicated ``coverage_sample`` status and never rolls
+    # into ``attempted`` — it declares a reachable target through the sampled
+    # coverage block, it does not count as a tried-and-failed step.
+    _is_coverage_marker = is_coverage_marker_path(path.steps)
+
     derived_status = "theoretical"
     executable_steps = [
         s
@@ -5064,7 +5705,9 @@ def path_to_display_record(
     ]
     if synthetic_followup is not None:
         statuses.append(str(synthetic_followup.get("status") or "").strip().lower())
-    if statuses and all(s == "success" for s in statuses):
+    if _is_coverage_marker:
+        derived_status = COVERAGE_SAMPLE_STATUS
+    elif statuses and all(s == "success" for s in statuses):
         derived_status = "exploited"
     elif any(s in {"attempted", "failed", "error"} for s in statuses):
         derived_status = "attempted"
@@ -5349,9 +5992,7 @@ class _DecorationCaches:
             self._tier_cache[node_id] = cached
         return cached
 
-    def remediability(
-        self, relation: str, from_id: str, to_id: str
-    ) -> dict[str, str]:
+    def remediability(self, relation: str, from_id: str, to_id: str) -> dict[str, str]:
         try:
             return self._classify_edge_remediability(
                 relation, source=self._facts(from_id), target=self._facts(to_id)

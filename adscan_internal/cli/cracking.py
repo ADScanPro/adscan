@@ -19,6 +19,7 @@ from pathlib import Path
 import os
 import re
 import shlex
+import shutil
 import subprocess
 
 from adscan_internal import (
@@ -68,6 +69,8 @@ except ImportError:
     CredentialService = None  # type: ignore[assignment, misc]
     KerberosTicketService = None  # type: ignore[assignment, misc]
 
+from adscan_internal.services.cracking import hash_kind
+from adscan_internal.services.cracking.hash_kind import HashKind
 from adscan_internal.services.hashcat_service import HashcatCrackingService
 from adscan_internal.services.weakpass_service import WeakpassService, weakpass_allowed
 from adscan_internal.services.cracking_history_service import (
@@ -86,8 +89,14 @@ from adscan_internal.services.wordlist_service import (
     record_cracking_coverage_for_domain,
 )
 from adscan_core.rich_output import questionary_select_index
+from adscan_core.pal.platform import is_windows
+from adscan_core.pal import tools as pal_tools
+from adscan_internal.services.john_artifact_cracking_service import (
+    JohnArtifactCrackingService,
+)
 import rich.box
 from rich.console import Group
+from rich.markup import escape
 from rich.table import Table
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
@@ -116,9 +125,60 @@ def _ensure_enqueue_cracking_job():
         enqueue_cracking_job = _impl
     return enqueue_cracking_job
 
+
 _MINIMUM_TIMEROAST_HASHCAT_VERSION = (7, 1, 2)
 _GRAPH_TRACKED_ROAST_HASH_TYPES = {"asreproast", "kerberoast"}
 _HASHCAT_NO_DEVICE_TEXT = "No devices found/left"
+
+# Well-known values for HashcatBackendSelection.unavailable_reason. They let the
+# caller distinguish "the hashcat binary is absent / not runnable" from "hashcat
+# ran but found no usable compute device", so the operator gets an honest
+# diagnosis (install hashcat vs. check GPU/OpenCL drivers).
+_HASHCAT_UNAVAILABLE_BINARY_ABSENT = "binary_absent"
+_HASHCAT_UNAVAILABLE_NO_DEVICE = "no_device"
+
+# Hashcat mode -> John the Ripper --format, for the Windows-only CPU fallback.
+# On a hardened Windows host there is frequently no OpenCL/CUDA runtime, so
+# hashcat cannot see any compute device (or is not installed at all); John cracks
+# roast/NetNTLM/NT hashes on pure CPU with nothing installed. A mode absent from
+# this map (e.g. timeroast 31300) has no John fallback and stays on the honest
+# no_device/binary_absent degrade. This fallback is gated on ``is_windows()`` at
+# the call site — Linux keeps using hashcat and today's honest-degrade unchanged.
+#
+# Derived from the neutral HashKind registry (the SSOT) so the mode/format pairs
+# never drift. The registry carries one canonical mode per kind; the AES256 roast
+# modes (19700/19900) are not canonical representatives, so they are added here
+# explicitly from their kind's John format to preserve the historic key set.
+_HASHCAT_MODE_TO_JOHN_FORMAT: dict[str, str] = {
+    hash_kind.hashcat_mode_for(kind): john
+    for kind in HashKind
+    if (john := hash_kind.john_format_for(kind))
+}
+# AES256 roast modes share their kind's John format but are not the canonical
+# hashcat mode for that kind (the AES128 mode is). Add them so every mode the map
+# historically carried is still present.
+_HASHCAT_MODE_TO_JOHN_FORMAT["19700"] = (
+    _HASHCAT_MODE_TO_JOHN_FORMAT[  # Kerberoast AES256
+        hash_kind.hashcat_mode_for(HashKind.KERBEROAST_AES)
+    ]
+)
+_HASHCAT_MODE_TO_JOHN_FORMAT["19900"] = (
+    _HASHCAT_MODE_TO_JOHN_FORMAT[  # AS-REP roast AES256
+        hash_kind.hashcat_mode_for(HashKind.ASREP_AES)
+    ]
+)
+
+# Substrings that indicate the hashcat binary could not be located/executed at
+# all (as opposed to running and reporting no devices). Matched case-insensitively
+# against the combined probe stdout/stderr.
+_HASHCAT_BINARY_ABSENT_MARKERS = (
+    "command not found",
+    "not recognized",
+    "no such file",
+    "not found",
+    "cannot execute",
+    "permission denied",
+)
 _HASHCAT_EXHAUSTED_EXIT_CODE = 1
 # hashcat's final exit codes are distinct per abort reason (see hashcat's
 # ``main.c``: STATUS_ABORTED -> 2, STATUS_ABORTED_CHECKPOINT -> 3,
@@ -424,6 +484,10 @@ class HashcatBackendSelection:
     label: str
     is_available: bool
     probe_output: str = ""
+    # Why the backend is unavailable, when ``is_available`` is False. One of
+    # ``_HASHCAT_UNAVAILABLE_BINARY_ABSENT`` / ``_HASHCAT_UNAVAILABLE_NO_DEVICE``,
+    # or "" when available or the cause is indeterminate.
+    unavailable_reason: str = ""
 
 
 class CrackingShell(Protocol):
@@ -530,7 +594,11 @@ def _cracking_wordlist_option_rows(workspace_type: str) -> list[tuple[str, str]]
 
 
 def choose_cracking_wordlist(
-    shell: CrackingShell, hash_type: str, wordlists_dir: str, *, domain: str | None = None
+    shell: CrackingShell,
+    hash_type: str,
+    wordlists_dir: str,
+    *,
+    domain: str | None = None,
 ) -> str:
     """Interactive wordlist selector for cracking operations.
 
@@ -550,6 +618,21 @@ def choose_cracking_wordlist(
         if workspace_type == "audit"
         else os.path.join(wordlists_dir, "rockyou.txt")
     )
+    # The audit default (combined_audit_base.txt) is a Linux build-time artifact
+    # baked into the Docker image; it is NOT in the Windows bundle, which ships
+    # only rockyou.txt. If the chosen default is not on disk, degrade to any
+    # wordlist that actually exists rather than handing the cracker a missing
+    # file (which silently recovers zero — the exact false-negative seen on the
+    # Windows .exe). rockyou is the universally-present base.
+    if not os.path.isfile(default_wordlist):
+        rockyou_fallback = os.path.join(wordlists_dir, "rockyou.txt")
+        if os.path.isfile(rockyou_fallback):
+            print_info_debug(
+                "[cracking] default wordlist "
+                f"'{os.path.basename(default_wordlist)}' not present; "
+                "falling back to rockyou.txt."
+            )
+            default_wordlist = rockyou_fallback
 
     option_rows = _cracking_wordlist_option_rows(workspace_type)
     options = [label for _, label in option_rows]
@@ -642,9 +725,7 @@ def choose_cracking_wordlist(
     return default_wordlist
 
 
-def _prompt_custom_wordlist_path(
-    shell: CrackingShell, *, default_wordlist: str
-) -> str:
+def _prompt_custom_wordlist_path(shell: CrackingShell, *, default_wordlist: str) -> str:
     """Prompt for an operator-supplied wordlist path (the "Other / custom" escape
     hatch), returning ``default_wordlist`` when nothing is provided or the stream
     ends. Shared by :func:`choose_cracking_wordlist` and
@@ -711,7 +792,11 @@ _EFFORT_SELECTOR_DEFAULT_IDX = 1  # balanced
 # INLINE (a non-NetNTLM audit crack that cannot be handed to the NetNTLM
 # background job yet) so it can never hang the REPL. 0 = no cap (fast is a bare
 # wordlist and finishes on its own). Mirrors the policy tier budgets.
-_EFFORT_INLINE_RUNTIME_CAP: dict[str, int] = {"fast": 0, "balanced": 300, "thorough": 3600}
+_EFFORT_INLINE_RUNTIME_CAP: dict[str, int] = {
+    "fast": 0,
+    "balanced": 300,
+    "thorough": 3600,
+}
 
 
 @dataclass(frozen=True)
@@ -800,7 +885,9 @@ def choose_cracking_effort(
         )
         return _selection_for("balanced")
 
-    tier_labels = [_effort_tier_label(level, estimates[level]) for level in _EFFORT_SELECTOR_LEVELS]
+    tier_labels = [
+        _effort_tier_label(level, estimates[level]) for level in _EFFORT_SELECTOR_LEVELS
+    ]
     options = tier_labels + ["Other / custom wordlist"]
 
     message_lines = [f"Select the cracking effort for {hash_type}:"]
@@ -819,11 +906,17 @@ def choose_cracking_effort(
         # inline fast crack rather than launching a long background job.
         return _selection_for("fast")
     if idx == len(_EFFORT_SELECTOR_LEVELS):
-        custom_path = _prompt_custom_wordlist_path(shell, default_wordlist=default_wordlist)
+        custom_path = _prompt_custom_wordlist_path(
+            shell, default_wordlist=default_wordlist
+        )
         return EffortSelection(
             kind="custom", effort="custom", wordlist=custom_path, is_blocking=True
         )
-    level = _EFFORT_SELECTOR_LEVELS[idx] if 0 <= idx < len(_EFFORT_SELECTOR_LEVELS) else "balanced"
+    level = (
+        _EFFORT_SELECTOR_LEVELS[idx]
+        if 0 <= idx < len(_EFFORT_SELECTOR_LEVELS)
+        else "balanced"
+    )
     return _selection_for(level)
 
 
@@ -1016,6 +1109,27 @@ def _hashcat_device_args(shell: CrackingShell) -> list[str]:
     return list(_select_hashcat_backend(shell).args)
 
 
+def cracking_gpu_capability_available() -> bool:
+    """Return whether the PAL declares the ``cracking_gpu`` (hashcat) capability.
+
+    The single seam every hashcat entry point consults BEFORE probing or shelling
+    hashcat, symmetric with the ``cracking_cpu`` (John) consult at
+    :func:`_maybe_run_john_cpu_fallback`. When the PAL says GPU cracking is not
+    available on this platform, hashcat must never be probed (``hashcat -I``) or
+    invoked for a crack; the caller degrades to the no-device path (John on
+    Windows, honest degrade elsewhere). Best-effort: any resolution failure
+    resolves to unavailable so a probe error never suppresses degrade.
+
+    Returns:
+        ``True`` when the ``cracking_gpu`` capability is available on this
+        platform; ``False`` otherwise.
+    """
+    try:
+        return bool(pal_tools.capability_available("cracking_gpu").available)
+    except Exception:  # noqa: BLE001 -- capability probe is best-effort
+        return False
+
+
 def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
     """Choose the best available hashcat backend.
 
@@ -1023,11 +1137,29 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
     1. GPU/CUDA/OpenCL backends exposed to the container
     2. CPU OpenCL fallback
     3. Unavailable when hashcat cannot see any compute device
+
+    Consults the PAL ``cracking_gpu`` capability FIRST: when GPU cracking is not
+    available on this platform, the backend is reported unavailable with a
+    no-device reason WITHOUT probing ``hashcat -I`` — so a host the PAL says has
+    no hashcat never shells it, and the caller degrades to John (Windows) or the
+    honest no-device panel (elsewhere).
     """
 
     cached = getattr(shell, "_hashcat_backend_selection_cache", None)
     if isinstance(cached, HashcatBackendSelection):
         return cached
+
+    if not cracking_gpu_capability_available():
+        selection = HashcatBackendSelection(
+            args=(),
+            label="Unavailable",
+            is_available=False,
+            probe_output="",
+            unavailable_reason=_HASHCAT_UNAVAILABLE_NO_DEVICE,
+        )
+        setattr(shell, "_hashcat_backend_selection_cache", selection)
+        setattr(shell, "_hashcat_device_args_cache", list(selection.args))
+        return selection
 
     force_cpu = os.getenv("ADSCAN_HASHCAT_FORCE_CPU", "").strip().lower() in {
         "1",
@@ -1037,6 +1169,21 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
 
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
 
+    # Honest binary-presence check first: `which hashcat` on the bare name is the
+    # ground truth for "is it on PATH". If it is not, there is nothing to probe —
+    # the operator needs to install/bundle hashcat, not check GPU drivers.
+    if shutil.which("hashcat") is None:
+        selection = HashcatBackendSelection(
+            args=(),
+            label="Unavailable",
+            is_available=False,
+            probe_output="",
+            unavailable_reason=_HASHCAT_UNAVAILABLE_BINARY_ABSENT,
+        )
+        setattr(shell, "_hashcat_backend_selection_cache", selection)
+        setattr(shell, "_hashcat_device_args_cache", list(selection.args))
+        return selection
+
     try:
         probe_cmd = maybe_wrap_hashcat_for_container("hashcat -I")
         # untrusted_output: the OpenCL/CUDA device-info banner is raw hashcat
@@ -1045,20 +1192,43 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
         # text is still parsed below via probe.stdout/stderr.
         probe = shell.run_command(probe_cmd, timeout=30, untrusted_output=True)
         if probe is None:
-            raise RuntimeError("hashcat -I probe returned no result")
+            # The wrapped invocation did not run at all (binary not runnable /
+            # exec failure) — treat as binary-absent, not "no device".
+            selection = HashcatBackendSelection(
+                args=(),
+                label="Unavailable",
+                is_available=False,
+                probe_output="",
+                unavailable_reason=_HASHCAT_UNAVAILABLE_BINARY_ABSENT,
+            )
+            setattr(shell, "_hashcat_backend_selection_cache", selection)
+            setattr(shell, "_hashcat_device_args_cache", list(selection.args))
+            return selection
 
         output = (
             (getattr(probe, "stdout", "") or "")
             + "\n"
             + (getattr(probe, "stderr", "") or "")
         ).strip()
+        returncode = getattr(probe, "returncode", 0)
+        lowered_output = output.lower()
+        binary_absent = any(
+            marker in lowered_output for marker in _HASHCAT_BINARY_ABSENT_MARKERS
+        ) or (returncode not in (0, None) and not output)
         has_gpu = bool(
             re.search(r"Type\s*\.+?:\s*(GPU|Accelerator)\b", output, re.IGNORECASE)
         )
         has_cpu_opencl = bool(re.search(r"Type\s*\.+?:\s*CPU\b", output, re.IGNORECASE))
-        no_devices = _HASHCAT_NO_DEVICE_TEXT.lower() in output.lower()
 
-        if force_cpu and has_cpu_opencl:
+        if binary_absent:
+            selection = HashcatBackendSelection(
+                args=(),
+                label="Unavailable",
+                is_available=False,
+                probe_output=output,
+                unavailable_reason=_HASHCAT_UNAVAILABLE_BINARY_ABSENT,
+            )
+        elif force_cpu and has_cpu_opencl:
             selection = HashcatBackendSelection(
                 args=("-D", "1", "--opencl-device-types", "1"),
                 label="CPU OpenCL (forced)",
@@ -1079,20 +1249,25 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
                 is_available=True,
                 probe_output=output,
             )
-        elif no_devices:
-            selection = HashcatBackendSelection(
-                args=(),
-                label="Unavailable",
-                is_available=False,
-                probe_output=output,
-            )
         else:
+            # hashcat ran (binary present) but exposed no usable device — either
+            # the explicit "No devices found/left" banner or simply no Type line.
             selection = HashcatBackendSelection(
                 args=(),
                 label="Unavailable",
                 is_available=False,
                 probe_output=output,
+                unavailable_reason=_HASHCAT_UNAVAILABLE_NO_DEVICE,
             )
+    except FileNotFoundError as exc:
+        print_info_debug(f"[cracking] hashcat binary not found: {exc}")
+        selection = HashcatBackendSelection(
+            args=(),
+            label="Unavailable",
+            is_available=False,
+            probe_output=str(exc),
+            unavailable_reason=_HASHCAT_UNAVAILABLE_BINARY_ABSENT,
+        )
     except Exception as exc:  # noqa: BLE001
         print_info_debug(f"[cracking] hashcat backend probe failed: {exc}")
         selection = HashcatBackendSelection(
@@ -1100,6 +1275,7 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
             label="Unavailable",
             is_available=False,
             probe_output=str(exc),
+            unavailable_reason=_HASHCAT_UNAVAILABLE_NO_DEVICE,
         )
 
     setattr(shell, "_hashcat_backend_selection_cache", selection)
@@ -1375,6 +1551,26 @@ def _hashcat_no_device_guidance() -> str:
     )
 
 
+def _hashcat_binary_absent_guidance() -> str:
+    """Return a user-facing hint when the hashcat binary itself is unavailable.
+
+    Distinct from :func:`_hashcat_no_device_guidance`: here hashcat is not
+    installed / not on PATH, so pointing the operator at ``hashcat -I`` or GPU
+    drivers would be misleading. The fix is to install/bundle hashcat.
+    """
+
+    if os.name == "nt":
+        return (
+            "hashcat is not available on this system. The native Windows build "
+            "must ship a bundled hashcat; install hashcat and add it to PATH, "
+            "then re-run the cracking step."
+        )
+    return (
+        "hashcat is not available on this system. Install hashcat and ensure it "
+        "is on PATH, then re-run the cracking step."
+    )
+
+
 def _is_fatal_hashcat_runtime_error(output: str) -> bool:
     """Return True when hashcat failed before any useful cracking work began."""
 
@@ -1552,7 +1748,10 @@ def _extract_netntlm_username(hash_value: str) -> str | None:
 
 def _sanitize_username_field(username: str) -> str:
     """Collapse characters that would shift hashcat's ``--username`` split."""
-    return username.replace(":", "_").replace(" ", "_").strip() or _HASHCAT_UNKNOWN_USERNAME
+    return (
+        username.replace(":", "_").replace(" ", "_").strip()
+        or _HASHCAT_UNKNOWN_USERNAME
+    )
 
 
 # Per-mode guardrail rules. ``needs_prepend`` is True when the mode's raw on-disk
@@ -1710,7 +1909,9 @@ def _preflight_fix_crack_hashfile(
         return 0
 
     extractor = rule.get("extractor")
-    non_interactive = bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell)
+    non_interactive = bool(getattr(shell, "auto", False)) or is_non_interactive(
+        shell=shell
+    )
     fixed_count = 0
     placeholder_count = 0
     out_lines: list[str] = []
@@ -1781,7 +1982,10 @@ def _detect_hashcat_format_error(combined_output: str) -> bool:
     if any(marker in lowered for marker in _HASHCAT_FORMAT_ERROR_MARKERS):
         return True
     # ``Parsing Hashes: 0/N`` with no successful parse is also a format error.
-    if re.search(r"parsing hashes:\s*0/\d+", lowered) and "parsed hashes:" not in lowered:
+    if (
+        re.search(r"parsing hashes:\s*0/\d+", lowered)
+        and "parsed hashes:" not in lowered
+    ):
         return True
     return False
 
@@ -1822,7 +2026,9 @@ def _render_cracking_preflight(
     marked_domain = mark_sensitive(domain, "domain")
     backend_style = COLOR_SAGE if backend_is_gpu else COLOR_AMBER
     backend_glyph = "▲" if backend_is_gpu else "△"
-    backend_value = f"[{backend_style}]{backend_glyph} {backend_label}[/{backend_style}]"
+    backend_value = (
+        f"[{backend_style}]{backend_glyph} {backend_label}[/{backend_style}]"
+    )
 
     count_text = (
         f"[bold]{hash_count}[/bold] hash{'es' if hash_count != 1 else ''}"
@@ -2030,9 +2236,7 @@ def _build_targeted_custom_wordlist(
         return None
 
     try:
-        combined_path.write_text(
-            "\n".join(combined_lines) + "\n", encoding="utf-8"
-        )
+        combined_path.write_text("\n".join(combined_lines) + "\n", encoding="utf-8")
     except OSError as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -2111,9 +2315,7 @@ def crack_captured_netntlm(
         # then strip the first field of the hash itself), so fall back to the
         # capture's domain, then to a literal ``unknown`` placeholder -- either
         # keeps the line a valid ``field:hash`` shape that hashcat can parse.
-        username = str(
-            cap_dict.get("user") or cap_dict.get("username") or ""
-        ).strip()
+        username = str(cap_dict.get("user") or cap_dict.get("username") or "").strip()
         if not username:
             username = str(cap_dict.get("domain") or "").strip() or "unknown"
         # A colon or whitespace in the prepended field would shift hashcat's
@@ -2163,10 +2365,7 @@ def crack_captured_netntlm(
             print_error(f"Could not write the captured {version} hash file.")
             continue
 
-        print_info(
-            f"[*] Cracking {written} captured {version} hash(es) "
-            f"(mode {mode})."
-        )
+        print_info(f"[*] Cracking {written} captured {version} hash(es) (mode {mode}).")
         try:
             run_cracking(
                 shell,
@@ -2182,9 +2381,7 @@ def crack_captured_netntlm(
             print_exception(show_locals=False, exception=exc)
 
 
-def _split_roast_hashfile_by_mode(
-    hash_file: str, hash_type: str
-) -> dict[str, str]:
+def _split_roast_hashfile_by_mode(hash_file: str, hash_type: str) -> dict[str, str]:
     """Split a roast hashfile into one per-etype-resolved-mode hashfile.
 
     A single Kerberoast / AS-REP roast capture can contain hashes of DIFFERENT
@@ -2244,6 +2441,145 @@ def _split_roast_hashfile_by_mode(
             continue
         out[mode] = per_mode_path
     return out
+
+
+def _maybe_run_john_cpu_fallback(
+    shell: CrackingShell,
+    *,
+    hash_type: str,
+    hashcat_mode: str,
+    hash_description: str,
+    domain: str,
+    hash_file: str,
+    wordlists_dir: str,
+    failed: bool,
+) -> bool:
+    """Attempt a Windows-only John (CPU) crack when hashcat has no device.
+
+    Returns ``True`` when John handled the crack (the caller must ``return`` and
+    not fall through to the honest-degrade panel), ``False`` when there is no
+    usable John fallback (unsupported mode, or John/its ``--format`` unavailable)
+    so the caller renders today's honest no_device/binary_absent degrade path
+    unchanged. Best-effort: never raises.
+
+    Provenance parity: a recovered credential is persisted with the SAME
+    credential origin the hashcat path records
+    (:func:`cracking_job._credential_origin_for_mode`), so the roast/NetNTLM
+    finding reads identically whether hashcat or John did the crack.
+
+    Effort parity: John now walks the SAME effort-tier ladder hashcat walks
+    (:func:`cracking_wordlist_policy.resolve_effort`), dispatched through the
+    capability-driven engine selector, instead of a single flat wordlist.
+    """
+    from adscan_internal.services.cracking.engine_selection import (
+        run_effort_ladder,
+        select_crack_engine,
+    )
+    from adscan_internal.services.cracking.hash_kind import resolve_kind_for_mode
+    from adscan_internal.services.cracking.john_engine import JohnEngine
+    from adscan_internal.services.cracking_wordlist_policy import (
+        EffortTier,
+        default_effort_for_workspace,
+        resolve_configured_effort,
+        resolve_effort,
+    )
+
+    kind = resolve_kind_for_mode(hashcat_mode)
+    if kind is None:
+        return False
+    if not pal_tools.capability_available("cracking_cpu").available:
+        return False
+    john_path = JohnArtifactCrackingService.resolve_john_path()
+    if not john_path:
+        return False
+
+    # Resolve the SAME effort-tier ladder the hashcat path uses instead of a
+    # single flat wordlist. As with the legacy ``resolve_cracking_wordlist``
+    # path, a missing base file is warned-but-not-filtered — John runs against it
+    # and honestly recovers nothing — so behaviour matches the old single-wordlist
+    # fallback. No tiers at all -> honest degrade (return False).
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
+    effort = resolve_configured_effort(shell) or default_effort_for_workspace(
+        workspace_type
+    )
+    tiers = resolve_effort(
+        effort,
+        workspace_type=workspace_type,
+        domain=domain,
+        wordlists_dir=wordlists_dir,
+        benchmark=load_cached_benchmark(),
+    )
+    if not tiers:
+        return False
+    for tier in tiers:
+        if tier.base_path and not os.path.exists(tier.base_path):
+            print_warning(
+                f"Wordlist not found at {mark_sensitive(tier.base_path, 'path')}. "
+                "John may recover nothing; continuing anyway."
+            )
+
+    # A GPU-present misconfiguration would resolve hashcat here; this fallback is
+    # John-only (the caller reached it because hashcat has no device), so require
+    # a JohnEngine and degrade honestly otherwise.
+    engine = select_crack_engine(shell=shell, command_executor=shell.run_command)
+    if not isinstance(engine, JohnEngine):
+        return False
+
+    print_info(
+        "Hashcat found no usable compute device; falling back to CPU cracking "
+        "with John the Ripper."
+    )
+    total_hashes = _count_hashes_in_file(hash_file)
+    recovering_tier: EffortTier | None = None
+    try:
+        result = run_effort_ladder(engine, tiers, hash_file, kind.value)
+        creds: dict[str, str] = dict(result.recovered)
+        recovering_tier = next((t for t in tiers if t.name == result.tier_name), None)
+        # Now that an attempt actually ran, refine the coverage declaration with
+        # the cracker class and rule effort it used, in vendor-neutral prose. The
+        # pre-run seam stamped only the corpus data gap; this states the strength
+        # of the attempt on the record. Best-effort (see the recorder).
+        record_cracking_coverage_for_domain(
+            shell,
+            domain,
+            wordlists_dir=wordlists_dir,
+            engine=result.engine,
+            ruleset=result.ruleset,
+        )
+    except Exception as exc:  # noqa: BLE001 -- John fallback is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        creds = {}
+
+    from adscan_internal.services.background_jobs.cracking_job import (
+        _credential_origin_for_mode,
+    )
+
+    origin = _credential_origin_for_mode(hashcat_mode)
+    if creds:
+        wordlist_name = (
+            os.path.basename(recovering_tier.base_path)
+            if recovering_tier and recovering_tier.base_path
+            else None
+        )
+        _render_cracked_credentials_panel(
+            shell,
+            creds=creds,
+            hash_type=hash_type,
+            hash_description=hash_description,
+            wordlist_name=wordlist_name,
+            total_hashes=total_hashes,
+        )
+        for username, password in creds.items():
+            if not password:
+                continue
+            shell.add_credential(domain, username, password, credential_origin=origin)
+    else:
+        print_warning(
+            "CPU cracking with John the Ripper did not recover any credentials "
+            "for this capture."
+        )
+    return True
 
 
 def run_cracking(
@@ -2329,15 +2665,51 @@ def run_cracking(
         else HashcatBackendSelection(args=(), label="N/A", is_available=True)
     )
     if hashcat_mode != "Unknown" and not backend_selection.is_available:
-        print_error("Hashcat could not find a usable compute device for cracking.")
-        print_panel(
-            f"[{COLOR_AMBER}]{_GLYPH_FAILED} {_hashcat_no_device_guidance()}[/]\n\n"
-            f"[bold]Next:[/bold] verify hashcat sees a device with [code]hashcat -I[/code], "
-            f"then re-run the cracking step.",
-            title=f"[bold]Cracking cannot start[/bold] [{COLOR_MUTED}]· no compute device[/]",
-            title_align="left",
-            border_style=COLOR_CRIMSON,
-        )
+        # Windows-only CPU fallback: on a hardened Windows host there is often no
+        # OpenCL/CUDA runtime so hashcat cannot see a device (or is absent), but
+        # John cracks roast/NetNTLM/NT on pure CPU. This fires ONLY when
+        # is_windows() is True and John + a supported --format are available;
+        # every Linux/degrade path below stays byte-identical.
+        if is_windows() and _maybe_run_john_cpu_fallback(
+            shell,
+            hash_type=hash_type,
+            hashcat_mode=hashcat_mode,
+            hash_description=hash_description,
+            domain=domain,
+            hash_file=hash_file,
+            wordlists_dir=wordlists_dir,
+            failed=failed,
+        ):
+            return
+        if backend_selection.unavailable_reason == _HASHCAT_UNAVAILABLE_BINARY_ABSENT:
+            # hashcat is not installed / not runnable — do NOT point the operator
+            # at `hashcat -I` or GPU drivers; the fix is to install hashcat.
+            print_error("Hashcat is not installed or not available on this system.")
+            print_panel(
+                f"[{COLOR_AMBER}]{_GLYPH_FAILED} {escape(_hashcat_binary_absent_guidance())}[/]\n\n"
+                f"[bold]Next:[/bold] install hashcat and re-run the cracking step.",
+                title=(
+                    f"[bold]Cracking cannot start[/bold] "
+                    f"[{COLOR_MUTED}]· hashcat not available[/]"
+                ),
+                title_align="left",
+                border_style=COLOR_CRIMSON,
+            )
+        else:
+            # hashcat is present but exposed no usable compute device — the
+            # `hashcat -I` / GPU-driver guidance is the right next step here.
+            print_error("Hashcat could not find a usable compute device for cracking.")
+            print_panel(
+                f"[{COLOR_AMBER}]{_GLYPH_FAILED} {escape(_hashcat_no_device_guidance())}[/]\n\n"
+                f"[bold]Next:[/bold] verify hashcat sees a device with [code]hashcat -I[/code], "
+                f"then re-run the cracking step.",
+                title=(
+                    f"[bold]Cracking cannot start[/bold] "
+                    f"[{COLOR_MUTED}]· no compute device[/]"
+                ),
+                title_align="left",
+                border_style=COLOR_CRIMSON,
+            )
         print_info_debug(
             "hashcat -I output (first 40 lines):\n"
             + "\n".join(backend_selection.probe_output.splitlines()[:40])
@@ -3082,10 +3454,14 @@ def handle_hash_cracking_batch(
             if getattr(result, "error", None)
         }
         tls_failed_count = sum(
-            1 for result in results.values() if getattr(result, "tls_verification_failed", False)
+            1
+            for result in results.values()
+            if getattr(result, "tls_verification_failed", False)
         )
         fallback_count = sum(
-            1 for result in results.values() if getattr(result, "used_insecure_tls_fallback", False)
+            1
+            for result in results.values()
+            if getattr(result, "used_insecure_tls_fallback", False)
         )
         missing_result_count = max(len(valid_hashes) - len(results), 0)
         if error_results or tls_failed_count or fallback_count or missing_result_count:
@@ -3256,9 +3632,7 @@ def _render_cracked_credentials_panel(
     alone, so it still reads under NO_COLOR.
     """
     cracked_count = len(creds)
-    coverage = (
-        f"{cracked_count}/{total_hashes}" if total_hashes else f"{cracked_count}"
-    )
+    coverage = f"{cracked_count}/{total_hashes}" if total_hashes else f"{cracked_count}"
     title_markup = (
         f"[bold {COLOR_SAGE}]{_GLYPH_CRACKED} Cracked Credentials[/] "
         f"[{COLOR_MUTED}]· {coverage} · {hash_description}[/]"
@@ -3357,7 +3731,9 @@ def _render_credential_harvest_for_crack(
     if not creds:
         return
     source = _harvest_source_for_hash_type(hash_type)
-    ntlm_version = "v2" if "NTLMv2" in hash_type else "v1" if "NTLMv1" in hash_type else ""
+    ntlm_version = (
+        "v2" if "NTLMv2" in hash_type else "v1" if "NTLMv1" in hash_type else ""
+    )
     usernames = list(creds.keys())
     reach_by_user = classify_harvested_principals_reach(
         shell, domain=domain, usernames=usernames
@@ -4046,7 +4422,10 @@ def execute_cracking(
                         print_exception(exception=exc)
 
                     shell.add_credential(
-                        domain, username, password, metadata=cred_metadata,
+                        domain,
+                        username,
+                        password,
+                        metadata=cred_metadata,
                         credential_origin=hash_type,
                     )
 
@@ -4066,9 +4445,7 @@ def execute_cracking(
                     # machine account stays unsupported (rainbow-only) and is
                     # a no-op here.
                     if "NTLMv1" in hash_type:
-                        _maybe_materialize_ntlmv1_crack_edge(
-                            shell, domain, username
-                        )
+                        _maybe_materialize_ntlmv1_crack_edge(shell, domain, username)
 
                 # Mark remaining attempted users as failed for this wordlist.
                 if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
@@ -4149,16 +4526,16 @@ def execute_cracking(
                 except Exception as exc:  # pragma: no cover
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
-            from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+            from adscan_internal.interaction import (
+                is_non_interactive as _is_non_interactive,
+            )
+
             _non_interactive = _is_non_interactive(shell)
             if hash_type == "asreproast":
                 marked_domain = mark_sensitive(domain, "domain")
-                if (
-                    not _non_interactive
-                    and Confirm.ask(
-                        f"Do you want to crack the asreproast hashes for domain {marked_domain} with another wordlist?",
-                        default=False,
-                    )
+                if not _non_interactive and Confirm.ask(
+                    f"Do you want to crack the asreproast hashes for domain {marked_domain} with another wordlist?",
+                    default=False,
                 ):
                     shell.cracking("asreproast", domain, hash, failed=True)
             if (
@@ -4168,22 +4545,16 @@ def execute_cracking(
                 shell.ask_for_kerberoast_preauth(domain, shell.username or "")
             if hash_type == "kerberoast":
                 marked_domain = mark_sensitive(domain, "domain")
-                if (
-                    not _non_interactive
-                    and Confirm.ask(
-                        f"Do you want to crack the kerberoast hashes for domain {marked_domain} with another wordlist?",
-                        default=False,
-                    )
+                if not _non_interactive and Confirm.ask(
+                    f"Do you want to crack the kerberoast hashes for domain {marked_domain} with another wordlist?",
+                    default=False,
                 ):
                     shell.cracking("kerberoast", domain, hash, failed=True)
             if hash_type == "timeroast":
                 marked_domain = mark_sensitive(domain, "domain")
-                if (
-                    not _non_interactive
-                    and Confirm.ask(
-                        f"Do you want to crack the timeroast hashes for domain {marked_domain} with another wordlist?",
-                        default=False,
-                    )
+                if not _non_interactive and Confirm.ask(
+                    f"Do you want to crack the timeroast hashes for domain {marked_domain} with another wordlist?",
+                    default=False,
                 ):
                     shell.cracking("timeroast", domain, hash, failed=True)
     except Exception as e:

@@ -16,6 +16,7 @@ import re
 from typing import Any
 import unicodedata
 
+from adscan_core.pal.paths import wordlists_dir
 from adscan_core.username_patterns import (
     USERNAME_PATTERN_LABELS,
     generate_username_candidates_for_name_pairs,
@@ -25,23 +26,23 @@ from adscan_core.username_patterns import (
 
 STATISTICALLY_LIKELY_BASE_DIR_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/share/wordlists/statistically-likely-usernames"),
-    Path("/opt/adscan/wordlists/statistically-likely-usernames"),
+    wordlists_dir() / "statistically-likely-usernames",
 )
 
 GENERAL_COMMON_USERNAME_WORDLIST_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/share/wordlists/statistically-likely-usernames/top-formats.txt"),
-    Path("/opt/adscan/wordlists/statistically-likely-usernames/top-formats.txt"),
+    wordlists_dir() / "statistically-likely-usernames" / "top-formats.txt",
 )
 
 _REPO_WORDLIST_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "wordlists"
 
 KERBEROS_FORMAT_INFERENCE_WORDLIST_CANDIDATES: tuple[Path, ...] = (
-    Path("/opt/adscan/wordlists/kerberos-format-inference.txt"),
+    wordlists_dir() / "kerberos-format-inference.txt",
     _REPO_WORDLIST_ASSET_DIR / "kerberos-format-inference.txt",
 )
 
 KERBEROS_FORMAT_INFERENCE_METADATA_CANDIDATES: tuple[Path, ...] = (
-    Path("/opt/adscan/wordlists/kerberos-format-inference.json"),
+    wordlists_dir() / "kerberos-format-inference.json",
     _REPO_WORDLIST_ASSET_DIR / "kerberos-format-inference.json",
 )
 

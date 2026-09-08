@@ -88,6 +88,14 @@ class CABackupConfig:
     nt_hash: Optional[str] = None
     aes_key: Optional[str] = None
     kdc_ip: Optional[str] = None
+    # Cross-forest SOURCE axis: the forest the enrolling principal lives in and
+    # that forest's KDC (where its AS-REQ / TGT mint goes). ``domain`` / ``kdc_ip``
+    # stay the TARGET axis (the CA host's realm — used for the SPN/DNS resolution
+    # and the CA-machine-account S4U2Self elevation, which is a target-realm
+    # principal). When both are ``None`` the AS-REQ realm falls back to
+    # ``domain`` / ``kdc_ip``, byte-identical to the same-forest case.
+    auth_domain: Optional[str] = None
+    auth_kdc_ip: Optional[str] = None
     target_fqdn: Optional[str] = None
     service_name: Optional[str] = None
     temp_dir: str = _DEFAULT_TEMP_DIR
@@ -124,6 +132,20 @@ class CABackupConfig:
             object.__setattr__(self, "password", new_pwd)
         if new_hash != self.nt_hash:
             object.__setattr__(self, "nt_hash", new_hash)
+
+    @property
+    def effective_auth_domain(self) -> str:
+        """Realm for the AS-REQ (the forest the enrolling user lives in).
+
+        Falls back to ``domain`` (same-forest) when no cross-forest source
+        realm was supplied.
+        """
+        return self.auth_domain or self.domain
+
+    @property
+    def effective_auth_kdc_ip(self) -> Optional[str]:
+        """KDC IP for the auth realm (where the AS-REQ / TGT mint is routed)."""
+        return self.auth_kdc_ip or self.kdc_ip
 
 
 @dataclass
@@ -180,7 +202,12 @@ def _build_smb_url(config: CABackupConfig) -> str:
             "CABackupConfig must supply a ccache_path, password or nt_hash"
         )
 
-    domain_q = _q(config.domain.upper())
+    # SOURCE axis: the credential authenticates against its OWN forest (AS-REQ
+    # realm + ``dc=`` KDC). Same-forest, ``effective_auth_domain`` == ``domain``
+    # and ``effective_auth_kdc_ip`` == ``kdc_ip`` (byte-identical). The SPN target
+    # (``cifs/<CA fqdn>``) stays in the CA's realm; the KDC issues the inter-realm
+    # referral from the source TGT.
+    domain_q = _q(config.effective_auth_domain.upper())
     user_q = _q(config.username)
     # Prefer FQDN over IP so the Kerberos SPN ``cifs/<host>@<realm>`` resolves.
     target = resolve_kerberos_tcp_target(
@@ -200,7 +227,7 @@ def _build_smb_url(config: CABackupConfig) -> str:
     if target.server_ip:
         params.append(f"serverip={_q(target.server_ip)}")
     url = f"{scheme}://{domain_q}\\{user_q}:{secret}@{spn_host}"
-    kdc = config.kdc_ip or config.target_host
+    kdc = config.effective_auth_kdc_ip or config.target_host
     if kdc:
         params.append(f"dc={_q(kdc)}")
     if params:

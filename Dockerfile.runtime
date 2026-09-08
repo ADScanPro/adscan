@@ -448,8 +448,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       libbz2-dev \
       libreadline-dev \
       libsqlite3-dev \
-      libncurses-dev \
-      libncursesw5-dev \
       tk-dev \
       liblzma-dev \
       libgmp-dev \
@@ -859,8 +857,16 @@ RUN set -eux; \
 # SysWhispers4 – direct-syscall stub generator for evasion-compiled Windows binaries.
 # mingw-w64 (already installed above) provides the x86_64-w64-mingw32-g++ cross-compiler
 # required by the binary_ops Tier-2 pipeline.
+#
+# Pinned in-repo copy (src/windows_tools/syswhispers4/, commit
+# da74852278bbf945fcde237f74a6ffdac25d7f8c) instead of a git clone: the upstream
+# repo github.com/JoasASantos/SysWhispers4 was deleted, which broke every fresh
+# image build at the clone step. We ship the pinned snapshot in the repo (same
+# pattern as src/windows_tools/godpotato and the other committed windows tools),
+# so the build never depends on the vanished upstream. To bump it, replace the
+# snapshot and update .pinned_commit.
+COPY src/windows_tools/syswhispers4/ /opt/adscan/tools/syswhispers4/
 RUN set -eux; \
-  git clone --depth 1 https://github.com/JoasASantos/SysWhispers4.git /opt/adscan/tools/syswhispers4; \
   python3 -m venv /opt/adscan/tool_venvs/syswhispers4/venv; \
   /opt/adscan/tool_venvs/syswhispers4/venv/bin/python -m pip install --no-cache-dir -U pip; \
   if [ -f /opt/adscan/tools/syswhispers4/requirements.txt ]; then \

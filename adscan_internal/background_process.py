@@ -22,7 +22,6 @@ Typical usage::
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import threading
 import time
@@ -31,6 +30,12 @@ from typing import Callable
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_error, print_info_debug, print_warning
 from adscan_internal.sudo_utils import sudo_prefix_args, sudo_validate
+from adscan_core.pal.platform import is_posix
+from adscan_core.pal.process import (
+    effective_user_is_root,
+    new_session_kwargs,
+    terminate_process_group,
+)
 from adscan_core.rich_output import print_exception
 
 # Matches the signature of shell.spawn_command (accepts **kwargs forwarded to Popen).
@@ -163,8 +168,9 @@ def launch_background(
 ) -> "subprocess.Popen[str] | None":
     """Launch a command in the background, optionally with sudo elevation.
 
-    The spawned process is placed in its own process group via ``os.setsid``
-    so it can be cleanly terminated later with :func:`stop_background`.
+    The spawned process is detached into its own session/process group via the
+    PAL process seam (``start_new_session`` on POSIX) so it can be cleanly
+    terminated later with :func:`stop_background`.
 
     Args:
         command: Command to execute as a list of strings.
@@ -192,7 +198,7 @@ def launch_background(
     if env is None:
         env = os.environ.copy()
 
-    if needs_root and os.geteuid() != 0:
+    if needs_root and not effective_user_is_root():
         if not sudo_validate():
             print_error(
                 f"{label} requires root privileges. "
@@ -213,7 +219,7 @@ def launch_background(
             stdout=subprocess.PIPE if stream_output_to_debug else None,
             stderr=subprocess.PIPE if stream_output_to_debug else None,
             text=True,
-            preexec_fn=os.setsid,
+            **new_session_kwargs(),
         )
         if process and hasattr(process, "pid"):
             print_info_debug(f"[DEBUG] launch_background({label}): PID {process.pid}")
@@ -263,16 +269,20 @@ def stop_background(
         return False
     try:
         setattr(process, "_adscan_expected_stop", True)
-        pgid = os.getpgid(process.pid)
-        if os.geteuid() != 0:
-            # Process may be owned by root (launched via sudo); use sudo to kill.
+        # Sudo-kill edge case (Linux-only): the child may be owned by root
+        # (launched via sudo) while the caller is not, so it cannot signal the
+        # group directly — shell out to ``sudo kill`` on the negated pgid. This
+        # relies on POSIX process groups, so it is gated on POSIX; every other
+        # case goes through the PAL seam (SIGTERM to the group on POSIX, single
+        # ``TerminateProcess`` on Windows, which has no process groups).
+        if is_posix() and not effective_user_is_root():
+            pgid = os.getpgid(process.pid)
             subprocess.run(  # noqa: S603
                 ["sudo", "kill", "--", f"-{pgid}"],
                 check=False,
             )
-        else:
-            os.killpg(pgid, signal.SIGTERM)
-        return True
+            return True
+        return terminate_process_group(process.pid, force=False)
     except Exception as e:
         telemetry.capture_exception(e)
         print_exception(exception=e)

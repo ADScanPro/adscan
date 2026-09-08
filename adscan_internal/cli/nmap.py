@@ -14,6 +14,14 @@ import os
 import re
 import shlex
 import shutil
+
+from adscan_core.pal.process import effective_user_is_root
+from adscan_core.pal.platform import is_windows
+from adscan_internal.services.network_probe_service import (
+    ScanPacing,
+    connect_scan_open_ports_sync,
+    expand_host_expression,
+)
 import csv
 import ipaddress
 import time
@@ -42,6 +50,7 @@ from adscan_internal.cli.ci_events import emit_event, emit_operation_progress
 from adscan_internal.cli.target_scope_warning import confirm_large_target_scope
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces import domain_subpath
+from adscan_internal.services.collector.dns_resolver import resolve_hostnames_to_ipv4
 from adscan_internal.services.reachability.massdns_report import (
     _flatten_massdns_unique_ips,
     _load_massdns_resolution_report,
@@ -239,6 +248,13 @@ def discover_dc_candidates_with_nmap_details(
         )
         print_info_verbose(f"Scanning TCP ports {marked_ports} to identify likely DCs.")
 
+        if is_windows():
+            # nmap is not bundled on Windows and a SYN scan needs Npcap + admin
+            # (impossible on a hardened install-nothing host) — use the
+            # in-process TCP connect scan instead. Linux keeps nmap -sS below.
+            open_ports_by_host = _windows_connect_scan(hosts, target_ports)
+            return _report_dc_candidates(open_ports_by_host, marked_ports=marked_ports)
+
         scan_cmd = (
             f"nmap --open -n -Pn -sS -p{port_list} "
             f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
@@ -294,25 +310,76 @@ def discover_dc_candidates_with_nmap_details(
 
         gnmap_text = _read_text_file_best_effort(output_path)
         open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
-        candidates = sorted(open_ports_by_host.keys())
-
-        if candidates:
-            print_success(
-                f"Discovered {len(candidates)} DC candidate host(s) "
-                f"with ports {marked_ports} open."
-            )
-        else:
-            # Zero candidates is a dead end, not an accomplishment — a ✓ here
-            # reads as "discovery worked" right before the flow stalls.
-            print_warning(
-                f"No DC candidate hosts found with ports {marked_ports} open."
-            )
-        return open_ports_by_host
+        return _report_dc_candidates(open_ports_by_host, marked_ports=marked_ports)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Failed to run DC candidate discovery with Nmap.")
         print_exception(show_locals=False, exception=exc)
         return {}
+
+
+def _windows_connect_scan(hosts_expr: str, ports: list[int]) -> dict[str, set[int]]:
+    """Windows nmap replacement: in-process async TCP connect scan.
+
+    Expands the nmap host expression, runs the bounded connect scan at the
+    measured Windows sweet spot, and returns the same ``{host: {open_port}}``
+    shape ``_parse_gnmap_open_ports`` produces. Shared by all three scan sites.
+    """
+    print_info(
+        "Windows: in-process TCP connect scan, no nmap/Npcap needed."
+    )
+    # Safe-by-default pacing (production-polite, ~nmap -T3 posture, adaptive
+    # backoff). Env overrides (ADSCAN_PORTSCAN_CONCURRENCY / _PER_HOST) let an
+    # operator who owns the network opt into speed; the default never hammers.
+    return connect_scan_open_ports_sync(
+        expand_host_expression(hosts_expr),
+        list(ports),
+        pacing=ScanPacing.safe(),
+    )
+
+
+def _report_dc_candidates(
+    open_ports_by_host: dict[str, set[int]],
+    *,
+    marked_ports: object,
+) -> dict[str, set[int]]:
+    """Render the DC-candidate summary and return the open-port map unchanged.
+
+    Shared by the Linux nmap path and the Windows connect-scan path so both
+    report identically.
+    """
+    candidates = sorted(open_ports_by_host.keys())
+    if candidates:
+        # Report the ports ACTUALLY open per host, not the scanned set — a
+        # DNS-only host (only 53/tcp open) must not read as if all DC ports
+        # answered, or the operator mistakes a false candidate for a DC
+        # right before the flow stalls on "No domains inferred".
+        if len(candidates) <= 5:
+            per_host = "; ".join(
+                f"{mark_sensitive(host, 'host')} "
+                f"({mark_sensitive(_format_open_ports(open_ports_by_host[host]), 'text')})"
+                for host in candidates
+            )
+            print_success(
+                f"Discovered {len(candidates)} DC candidate host(s); "
+                f"open ports per host: {per_host}."
+            )
+        else:
+            union_ports: set[int] = set()
+            for ports in open_ports_by_host.values():
+                union_ports |= ports
+            print_success(
+                f"Discovered {len(candidates)} DC candidate host(s); "
+                f"open ports observed across them: "
+                f"{mark_sensitive(_format_open_ports(union_ports), 'text')}."
+            )
+    else:
+        # Zero candidates is a dead end, not an accomplishment — a ✓ here
+        # reads as "discovery worked" right before the flow stalls.
+        print_warning(
+            f"No DC candidate hosts found with ports {marked_ports} open."
+        )
+    return open_ports_by_host
 
 
 def probe_host_reachability_with_nmap(
@@ -350,42 +417,51 @@ def probe_host_reachability_with_nmap(
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{report_label}_{safe_host}.gnmap")
 
-    if output_path:
-        scan_cmd = (
-            f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
-            f"-oG {shlex.quote(output_path)} {shlex.quote(target_host)}"
-        )
+    if is_windows():
+        # nmap is not bundled on Windows and a SYN scan needs Npcap + admin
+        # (impossible on a hardened install-nothing host) — use the in-process
+        # TCP connect scan. Linux keeps nmap -sS below.
+        open_ports_by_host = _windows_connect_scan(target_host, target_ports)
+        # A connect scan has no separate host-discovery pass; a host is "up"
+        # exactly when it answered on at least one probed port.
+        up_hosts = {h for h, p in open_ports_by_host.items() if p}
     else:
-        scan_cmd = (
-            f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
-            f"{shlex.quote(target_host)}"
+        if output_path:
+            scan_cmd = (
+                f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
+                f"-oG {shlex.quote(output_path)} {shlex.quote(target_host)}"
+            )
+        else:
+            scan_cmd = (
+                f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
+                f"{shlex.quote(target_host)}"
+            )
+
+        print_info_debug(f"[nmap][single-host-probe] {scan_cmd}")
+        completed = _run_nmap_command_with_optional_sudo_retry(
+            shell,
+            command=scan_cmd,
+            domain=target_host,
+            timeout_seconds=timeout_seconds,
         )
+        if completed is None:
+            return {
+                "host": target_host,
+                "reachable": False,
+                "open_ports": [],
+                "status": "probe_failed",
+                "method": "nmap_single_host_probe",
+                "timeout_seconds": timeout_seconds,
+                "ports_scanned": target_ports,
+            }
 
-    print_info_debug(f"[nmap][single-host-probe] {scan_cmd}")
-    completed = _run_nmap_command_with_optional_sudo_retry(
-        shell,
-        command=scan_cmd,
-        domain=target_host,
-        timeout_seconds=timeout_seconds,
-    )
-    if completed is None:
-        return {
-            "host": target_host,
-            "reachable": False,
-            "open_ports": [],
-            "status": "probe_failed",
-            "method": "nmap_single_host_probe",
-            "timeout_seconds": timeout_seconds,
-            "ports_scanned": target_ports,
-        }
-
-    gnmap_text = (
-        _read_text_file_best_effort(output_path)
-        if output_path
-        else ((completed.stdout or "") + "\n" + (completed.stderr or ""))
-    )
-    up_hosts = _parse_gnmap_up_hosts(gnmap_text)
-    open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
+        gnmap_text = (
+            _read_text_file_best_effort(output_path)
+            if output_path
+            else ((completed.stdout or "") + "\n" + (completed.stderr or ""))
+        )
+        up_hosts = _parse_gnmap_up_hosts(gnmap_text)
+        open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
 
     host_open_ports = sorted(open_ports_by_host.get(target_host, set()))
     if not host_open_ports:
@@ -1209,7 +1285,7 @@ def _run_nmap_command_with_optional_sudo_retry(
 
     combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
     needs_privileges = _nmap_output_indicates_missing_privileges(combined_output)
-    can_escalate = os.geteuid() != 0 and shutil.which("sudo") is not None
+    can_escalate = not effective_user_is_root() and shutil.which("sudo") is not None
     if not needs_privileges or not can_escalate:
         return result
 
@@ -1691,7 +1767,7 @@ def _run_important_port_scan_with_dashboard(
             return result
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         needs_priv = _nmap_output_indicates_missing_privileges(combined)
-        can_escalate = os.geteuid() != 0 and shutil.which("sudo") is not None
+        can_escalate = not effective_user_is_root() and shutil.which("sudo") is not None
         if not needs_priv or not can_escalate:
             # No retry will happen: the first attempt was final — emit its tick.
             _emit_terminal_done(dash)
@@ -1784,6 +1860,24 @@ def _run_important_port_scan_with_dashboard(
             return run_scan_fallback()
 
     return result
+
+
+def _format_open_ports(ports: set[int]) -> str:
+    """Render a set of open TCP ports as a stable, comma-separated string.
+
+    Ports are sorted numerically so the output is deterministic (a set has no
+    order). Used to report the ports actually open on a host, rather than the
+    ports that were scanned.
+
+    Args:
+        ports: Open TCP port numbers for one host.
+
+    Returns:
+        Comma-separated ascending port list, or "none" when empty.
+    """
+    if not ports:
+        return "none"
+    return ",".join(str(p) for p in sorted(ports))
 
 
 def _parse_gnmap_open_ports(text: str) -> dict[str, set[int]]:
@@ -2510,58 +2604,43 @@ def _resolve_normalized_host_to_ips(
     domain: str,
     cleaned_hosts: list[str],
     report_path: str,
-    massdns_bin: str,
-    resolvers_file: str,
-    hosts_file: str,
-    massdns_output: str,
+    resolvers: list[str],
 ) -> tuple[dict[str, list[str]], bool]:
-    """Resolve hostnames to IPs, consuming the persisted massdns report when present.
+    """Resolve hostnames to IPs, consuming the persisted resolution report when present.
+
+    Resolution is performed in-process via the dnspython async SSOT
+    (``resolve_hostnames_to_ipv4``) — no external ``massdns`` binary is required,
+    so this path works on any platform (Windows included).
 
     Delta top-up: Phase 2 (the collector DNS resolver) persists a superset
     ``massdns_resolution_report.json`` into the same domain dir. When that report
-    is present, this consumes it and only runs massdns for the hostnames it does
-    not already cover. When it is absent or unreadable (Phase 2 never ran, or this
-    is a standalone ``nmap``/CLI invocation), it falls back to a full massdns
-    resolution so standalone use is never regressed.
+    is present, this consumes it and only resolves the hostnames it does not
+    already cover. When it is absent or unreadable (Phase 2 never ran, or this is
+    a standalone ``nmap``/CLI invocation), it falls back to resolving every host
+    so standalone use is never regressed.
 
     Args:
-        shell: The active shell instance (used for ``run_command``).
+        shell: The active shell instance (unused for resolution now that it is
+            in-process; retained for signature parity with the caller).
         domain: Domain name (for user-facing messages).
         cleaned_hosts: The hostnames Phase 3 needs resolved.
         report_path: Path to the persisted ``massdns_resolution_report.json``.
-        massdns_bin: Path to the massdns binary.
-        resolvers_file: Path to the massdns resolvers file.
-        hosts_file: Path to the massdns hosts input file (rewritten for the delta).
-        massdns_output: Path to the massdns NDJSON output file.
+        resolvers: Resolver IPs to query in order (the domain's DC / configured
+            DNS servers) — the same set the old massdns resolvers file was
+            built from.
 
     Returns:
         A tuple of ``(normalized_host_to_ips, ok)``. ``ok`` is ``False`` only when
-        a required massdns run failed (the caller should return early).
+        a required resolution produced nothing for a non-empty request (the
+        caller should return early).
     """
-
-    def _run_massdns(host_list_file: str) -> dict[str, list[str]] | None:
-        marked_domain = mark_sensitive(domain, "domain")
-        massdns_command = (
-            f"{shlex.quote(massdns_bin)} -r {shlex.quote(resolvers_file)} "
-            f"-t A -o J -w {shlex.quote(massdns_output)} {shlex.quote(host_list_file)}"
-        )
-        completed = shell.run_command(massdns_command, timeout=300)
-        if completed is None:
-            print_error(
-                f"Failed to resolve hostnames to IPs for domain {marked_domain} "
-                "(massdns timeout or execution error)."
-            )
-            return None
-        return parse_massdns_ndjson_a_record_map(massdns_output)
-
+    del shell  # in-process resolution no longer shells out; kept for parity.
     report_host_to_ips = _load_persisted_massdns_host_to_ips(report_path)
     marked_domain = mark_sensitive(domain, "domain")
 
     if report_host_to_ips is None:
         # Report absent / unreadable -> full resolution (no regression for standalone use).
-        host_to_ips = _run_massdns(hosts_file)
-        if host_to_ips is None:
-            return {}, False
+        host_to_ips = resolve_hostnames_to_ipv4(cleaned_hosts, resolvers)
         normalized_host_to_ips = {
             _normalize_massdns_hostname(hostname): list(ips)
             for hostname, ips in host_to_ips.items()
@@ -2580,7 +2659,7 @@ def _resolve_normalized_host_to_ips(
     if not delta_hosts:
         print_info_verbose(
             f"Reusing persisted DNS resolution for {marked_domain}; "
-            "all required hostnames are already resolved (skipping massdns)."
+            "all required hostnames are already resolved (skipping resolution)."
         )
         return normalized_host_to_ips, True
 
@@ -2588,12 +2667,7 @@ def _resolve_normalized_host_to_ips(
         f"Reusing persisted DNS resolution for {marked_domain}; "
         f"resolving {len(delta_hosts)} new hostname(s) not yet in the report."
     )
-    with open(hosts_file, "w", encoding="utf-8") as f:
-        for host in delta_hosts:
-            f.write(f"{host}\n")
-    delta_host_to_ips = _run_massdns(hosts_file)
-    if delta_host_to_ips is None:
-        return {}, False
+    delta_host_to_ips = resolve_hostnames_to_ipv4(delta_hosts, resolvers)
     for hostname, ips in delta_host_to_ips.items():
         normalized = _normalize_massdns_hostname(hostname)
         if normalized:
@@ -2613,8 +2687,8 @@ def convert_hostnames_to_ips_and_scan(
     render: bool = True,
     auto: bool = False,
 ) -> None:
-    """Convert hostnames to IP addresses using massdns, write enabled_computers_ips.txt,
-    and then execute the port scan.
+    """Convert hostnames to IP addresses via in-process DNS, write
+    enabled_computers_ips.txt, and then execute the port scan.
 
     Args:
         shell: The active shell instance with workspace and domain data.
@@ -2695,70 +2769,24 @@ def convert_hostnames_to_ips_and_scan(
             )
             return
 
-        resolvers_file = os.path.join(
-            shell.current_workspace_dir or "",
-            shell.domains_dir,
-            domain,
-            "massdns_resolvers.txt",
-        )
-        hosts_file = os.path.join(
-            shell.current_workspace_dir or "",
-            shell.domains_dir,
-            domain,
-            "massdns_hosts.txt",
-        )
-        with open(resolvers_file, "w", encoding="utf-8") as f:
-            for resolver in resolvers:
-                f.write(f"{resolver}\n")
-        with open(hosts_file, "w", encoding="utf-8") as f:
-            for host in cleaned_hosts:
-                f.write(f"{host}\n")
-
-        marked_resolvers = mark_sensitive(resolvers_file, "path")
         print_info_debug(
-            f"Using massdns resolvers file {marked_resolvers} with {len(resolvers)} resolver(s)."
+            f"Resolving {len(cleaned_hosts)} hostname(s) via in-process DNS "
+            f"with {len(resolvers)} resolver(s)."
         )
         if len(resolvers) < 5:
             marked_resolvers_list = [
                 mark_sensitive(resolver, "ip") for resolver in resolvers
             ]
             print_info_debug(
-                f"massdns resolvers list: {', '.join(marked_resolvers_list)}"
+                f"DNS resolvers list: {', '.join(marked_resolvers_list)}"
             )
-        massdns_bin = shutil.which("massdns")
-        if not massdns_bin:
-            adscan_home = os.getenv("ADSCAN_HOME") or ""
-            candidates = [
-                os.path.join(adscan_home, "bin", "massdns"),
-                os.path.join(adscan_home, "tools", "massdns", "bin", "massdns"),
-            ]
-            for candidate in candidates:
-                if candidate and os.path.exists(candidate):
-                    massdns_bin = candidate
-                    break
-        if not massdns_bin:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(
-                f"massdns is not available; cannot resolve computers for {marked_domain}."
-            )
-            return
-
-        massdns_output = os.path.join(
-            shell.current_workspace_dir or "",
-            shell.domains_dir,
-            domain,
-            "massdns_output.jsonl",
-        )
 
         normalized_host_to_ips, resolution_ok = _resolve_normalized_host_to_ips(
             shell=shell,
             domain=domain,
             cleaned_hosts=cleaned_hosts,
             report_path=resolution_report_file,
-            massdns_bin=massdns_bin,
-            resolvers_file=resolvers_file,
-            hosts_file=hosts_file,
-            massdns_output=massdns_output,
+            resolvers=resolvers,
         )
         if not resolution_ok:
             return
@@ -2810,17 +2838,17 @@ def convert_hostnames_to_ips_and_scan(
                     if fallback_pdc_ip:
                         unique_ips = [fallback_pdc_ip]
                 fallback_message = (
-                    "MassDNS resolved no hostnames. Using the persisted PDC IP "
-                    "as a fallback target."
+                    "DNS resolution resolved no hostnames. Using the persisted "
+                    "PDC IP as a fallback target."
                 )
                 if fallback_reason == "best_effort_pdc":
                     fallback_message = (
-                        "MassDNS resolved no hostnames via SRV-backed DNS. "
+                        "DNS resolution resolved no hostnames via SRV-backed DNS. "
                         "Using the persisted PDC IP as a best-effort fallback target."
                     )
                 print_warning(fallback_message)
                 print_info_debug(
-                    f"[massdns] PDC fallback injected for "
+                    f"DNS PDC fallback injected for "
                     f"{mark_sensitive(domain, 'domain')}: "
                     f"reason={fallback_reason or 'persisted_pdc'} "
                     f"ip={mark_sensitive(unique_ips[0], 'ip')}"
@@ -2837,7 +2865,7 @@ def convert_hostnames_to_ips_and_scan(
             input_file=str(computers_file),
             resolvers=resolvers,
             ip_file=ip_file,
-            raw_output_file=massdns_output,
+            raw_output_file=None,
         )
         _show_massdns_resolution_summary(
             shell,
@@ -2997,77 +3025,110 @@ def convert_hostnames_to_ips_and_scan(
                 # Best-effort; nmap will still run and we can parse stdout as fallback.
                 pass
 
-            port_scan_command = (
-                f"nmap -sS -PS{important_ports_csv} "
-                f"-PA{important_ports_csv} "
-                f"-p{important_ports_csv} "
-                f"-n -vvv --stats-every 2s -iL {shlex.quote(str(ip_file))} "
-                f"-oN {shlex.quote(str(scan_output_path))} "
-                f"-oG {shlex.quote(str(scan_output_path))}.gnmap"
-            )
-            marked_domain = mark_sensitive(domain, "domain")
-            print_info(
-                f"Executing combined reachability and important-port scan in domain {marked_domain}..."
-            )
-            print_info_debug(f"Port scan command: {port_scan_command}")
-
-            # Upfront patience notice -- threshold-gated on the IP count queued
-            # for the scan. Silent for small scopes; a single line under
-            # non-interactive runs. Never blocks the scan.
-            try:
-                maybe_show_patience_notice(
-                    PatienceNoticeConfig(
-                        operation="Important port scan",
-                        unit="hosts",
-                        threshold=100,
-                        env_var="ADSCAN_PATIENCE_THRESHOLD_IMPORTANT_PORT_SCAN",
-                    ),
-                    count=ip_count,
-                    non_interactive=is_non_interactive(shell),
+            if is_windows():
+                # nmap is not bundled on Windows and a SYN scan needs Npcap +
+                # admin (impossible on a hardened install-nothing host) — use
+                # the in-process TCP connect scan. Linux keeps nmap -sS below.
+                marked_domain = mark_sensitive(domain, "domain")
+                print_info(
+                    f"Executing combined reachability and important-port scan in domain {marked_domain}..."
                 )
-            except Exception:  # noqa: BLE001 -- notice must never abort the scan
-                pass
+                open_ports_by_host = _windows_connect_scan(
+                    "\n".join(str(ip) for ip in unique_ips), important_ports
+                )
+                # A connect scan has no separate host-discovery pass; a host is
+                # "up" exactly when it answered on at least one probed port.
+                discovery_up_ips = {h for h, p in open_ports_by_host.items() if p}
+                # No gnmap file on the Windows path; label the artifact source.
+                gnmap_path = "windows_connect_scan"
+                reachable_ips = [ip for ip in unique_ips if ip in discovery_up_ips]
+                no_response_ips = [
+                    ip for ip in unique_ips if ip not in discovery_up_ips
+                ]
+                _write_ip_list_file(reachable_ip_file, reachable_ips)
+                _write_ip_list_file(no_response_ip_file, no_response_ips)
+                if not open_ports_by_host:
+                    print_info_debug(
+                        "[DEBUG] Windows connect scan found no open ports."
+                    )
+            else:
+                port_scan_command = (
+                    f"nmap -sS -PS{important_ports_csv} "
+                    f"-PA{important_ports_csv} "
+                    f"-p{important_ports_csv} "
+                    f"-n -vvv --stats-every 2s -iL {shlex.quote(str(ip_file))} "
+                    f"-oN {shlex.quote(str(scan_output_path))} "
+                    f"-oG {shlex.quote(str(scan_output_path))}.gnmap"
+                )
+                marked_domain = mark_sensitive(domain, "domain")
+                print_info(
+                    f"Executing combined reachability and important-port scan in domain {marked_domain}..."
+                )
+                print_info_debug(f"Port scan command: {port_scan_command}")
 
-            # Streaming live dashboard. Nmap is launched non-blocking via
-            # spawn_command and its -vvv --stats-every stdout is parsed in real
-            # time, so the host counter + percent advance DURING the scan. The
-            # streaming runner owns its own wall-clock timeout (Popen.readline
-            # has none), sudo-retry, and the timeout-recovery prompt; LiveSession
-            # handles the non-TTY/CI fallback. FAIL-SAFE: if streaming can't be
-            # set up it falls back to the buffered path (run_scan_fallback), and
-            # the authoritative post-scan .gnmap parse below is unchanged.
-            def _run_port_scan_buffered() -> any:
-                return _run_nmap_command_with_optional_sudo_retry(
+                # Upfront patience notice -- threshold-gated on the IP count queued
+                # for the scan. Silent for small scopes; a single line under
+                # non-interactive runs. Never blocks the scan.
+                try:
+                    maybe_show_patience_notice(
+                        PatienceNoticeConfig(
+                            operation="Important port scan",
+                            unit="hosts",
+                            threshold=100,
+                            env_var="ADSCAN_PATIENCE_THRESHOLD_IMPORTANT_PORT_SCAN",
+                        ),
+                        count=ip_count,
+                        non_interactive=is_non_interactive(shell),
+                    )
+                except Exception:  # noqa: BLE001 -- notice must never abort the scan
+                    pass
+
+                # Streaming live dashboard. Nmap is launched non-blocking via
+                # spawn_command and its -vvv --stats-every stdout is parsed in real
+                # time, so the host counter + percent advance DURING the scan. The
+                # streaming runner owns its own wall-clock timeout (Popen.readline
+                # has none), sudo-retry, and the timeout-recovery prompt; LiveSession
+                # handles the non-TTY/CI fallback. FAIL-SAFE: if streaming can't be
+                # set up it falls back to the buffered path (run_scan_fallback), and
+                # the authoritative post-scan .gnmap parse below is unchanged.
+                def _run_port_scan_buffered() -> any:
+                    return _run_nmap_command_with_optional_sudo_retry(
+                        shell,
+                        command=port_scan_command,
+                        domain=domain,
+                        timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
+                        _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
+                        _sudo_validate=_sudo_validate,
+                        retry_debug_context="combined reachability/port scan",
+                    )
+
+                completed_scan_process = _run_important_port_scan_with_dashboard(
                     shell,
                     command=port_scan_command,
                     domain=domain,
                     timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
+                    run_scan_fallback=_run_port_scan_buffered,
+                    # Drive the platform's "X of Y hosts" port-scan bar off the
+                    # queued IP count (enabled_computers_ips.txt line count).
+                    total_hosts=ip_count,
                     _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
                     _sudo_validate=_sudo_validate,
-                    retry_debug_context="combined reachability/port scan",
                 )
 
-            completed_scan_process = _run_important_port_scan_with_dashboard(
-                shell,
-                command=port_scan_command,
-                domain=domain,
-                timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
-                run_scan_fallback=_run_port_scan_buffered,
-                # Drive the platform's "X of Y hosts" port-scan bar off the
-                # queued IP count (enabled_computers_ips.txt line count).
-                total_hosts=ip_count,
-                _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
-                _sudo_validate=_sudo_validate,
-            )
+                if completed_scan_process is None:
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_error(
+                        f"Failed to run Nmap port scan for domain {marked_domain} (timeout or execution error)."
+                    )
+                    return
 
-            if completed_scan_process is None:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_error(
-                    f"Failed to run Nmap port scan for domain {marked_domain} (timeout or execution error)."
-                )
-                return
+                if completed_scan_process.returncode != 0:
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_error(f"Nmap port scan for domain {marked_domain} failed.")
+                    if completed_scan_process.stderr:
+                        print_error(f"Error details: {completed_scan_process.stderr}")
+                    return
 
-            if completed_scan_process.returncode == 0:
                 marked_domain = mark_sensitive(domain, "domain")
                 print_info_verbose(f"Nmap scan stdout for domain {marked_domain}:")
                 gnmap_path = f"{scan_output_path}.gnmap"
@@ -3090,77 +3151,72 @@ def convert_hostnames_to_ips_and_scan(
                         for line in normal_text.splitlines():
                             shell.console.print(line)
 
-                # Per-service {service}/ips.txt, bounded by the active-host cap.
-                # The port scan above already ran on ALL hosts (cheap, complete
-                # reachability inventory); this caps the REACHABLE active set to the
-                # top host_cap hosts representative-first (Tier 0 first) as a single
-                # union, then writes each service list as union ∩ service-open. With
-                # host_cap=0 it is a no-op (every reachable service host written).
-                _write_capped_service_ips(shell, domain, open_ports_by_host)
+            # Per-service {service}/ips.txt, bounded by the active-host cap.
+            # The port scan above already ran on ALL hosts (cheap, complete
+            # reachability inventory); this caps the REACHABLE active set to the
+            # top host_cap hosts representative-first (Tier 0 first) as a single
+            # union, then writes each service list as union ∩ service-open. With
+            # host_cap=0 it is a no-op (every reachable service host written).
+            _write_capped_service_ips(shell, domain, open_ports_by_host)
 
-                discovered_hosts = len(open_ports_by_host)
-                discovered_ports = sum(len(p) for p in open_ports_by_host.values())
-                print_success(
-                    f"Important port scan for the domain completed (hosts_with_open_ports={discovered_hosts}, open_tcp_ports={discovered_ports})."
-                )
-                generated_at = (
-                    datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-                )
-                reachability_payload = _build_network_reachability_report(
-                    cleaned_hosts,
-                    {
-                        hostname: normalized_host_to_ips.get(
-                            str(hostname or "").strip().rstrip(".").lower(),
-                            [],
-                        )
-                        for hostname in cleaned_hosts
-                    },
-                    discovery_up_ips=discovery_up_ips,
-                    ports_scanned=important_ports,
-                    open_ports_by_host=open_ports_by_host,
-                    port_scan_performed=True,
-                    domain=domain,
-                    resolved_ip_file=ip_file,
-                    reachable_ip_file=reachable_ip_file,
-                    no_response_ip_file=no_response_ip_file,
-                    discovery_output_file=gnmap_path,
-                    port_scan_output_file=gnmap_path,
-                    generated_at=generated_at,
-                )
-                wrote_report = _write_network_reachability_report(
-                    reachability_report_file,
-                    reachability_payload,
-                )
-                # Produce always; render only when not deferred to Phase 3.
-                if render:
-                    _show_network_reachability_summary(
-                        shell,
-                        payload=reachability_payload,
-                        report_file=(
-                            reachability_report_file if wrote_report else None
-                        ),
+            discovered_hosts = len(open_ports_by_host)
+            discovered_ports = sum(len(p) for p in open_ports_by_host.values())
+            print_success(
+                f"Important port scan for the domain completed (hosts_with_open_ports={discovered_hosts}, open_tcp_ports={discovered_ports})."
+            )
+            generated_at = (
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            )
+            reachability_payload = _build_network_reachability_report(
+                cleaned_hosts,
+                {
+                    hostname: normalized_host_to_ips.get(
+                        str(hostname or "").strip().rstrip(".").lower(),
+                        [],
                     )
-                services = [
-                    "smb",
-                    "rdp",
-                    "mssql",
-                    "winrm",
-                    "ftp",
-                    "ssh",
-                    "dns",
-                    "http",
-                    "https",
-                    "ldap",
-                    "vnc",
-                    "kerberos",
-                ]
-                for service in services:
-                    shell.consolidate_service_ips(service)
-            else:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_error(f"Nmap port scan for domain {marked_domain} failed.")
-                if completed_scan_process.stderr:
-                    print_error(f"Error details: {completed_scan_process.stderr}")
+                    for hostname in cleaned_hosts
+                },
+                discovery_up_ips=discovery_up_ips,
+                ports_scanned=important_ports,
+                open_ports_by_host=open_ports_by_host,
+                port_scan_performed=True,
+                domain=domain,
+                resolved_ip_file=ip_file,
+                reachable_ip_file=reachable_ip_file,
+                no_response_ip_file=no_response_ip_file,
+                discovery_output_file=gnmap_path,
+                port_scan_output_file=gnmap_path,
+                generated_at=generated_at,
+            )
+            wrote_report = _write_network_reachability_report(
+                reachability_report_file,
+                reachability_payload,
+            )
+            # Produce always; render only when not deferred to Phase 3.
+            if render:
+                _show_network_reachability_summary(
+                    shell,
+                    payload=reachability_payload,
+                    report_file=(
+                        reachability_report_file if wrote_report else None
+                    ),
+                )
+            services = [
+                "smb",
+                "rdp",
+                "mssql",
+                "winrm",
+                "ftp",
+                "ssh",
+                "dns",
+                "http",
+                "https",
+                "ldap",
+                "vnc",
+                "kerberos",
+            ]
+            for service in services:
+                shell.consolidate_service_ips(service)
         else:
             _remove_file_if_exists(reachable_ip_file)
             _remove_file_if_exists(no_response_ip_file)

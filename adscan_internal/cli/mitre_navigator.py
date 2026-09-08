@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
+from adscan_core.pal.paths import get_workspaces_dir
 from adscan_core.reporting.finding_vuln_map import build_vuln_map_from_findings
 from adscan_core.rich_output import (
     print_error,
@@ -64,7 +65,7 @@ from adscan_core.rich_output import print_exception
 # ---------------------------------------------------------------------------
 def _workspaces_root() -> Path:
     """Return the workspaces root, container path first, host fallback."""
-    container = Path("/opt/adscan/workspaces")
+    container = get_workspaces_dir()
     if container.is_dir():
         return container
     return Path.home() / ".adscan" / "workspaces"

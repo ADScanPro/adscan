@@ -49,6 +49,7 @@ from adscan_core.cvss import (
     ADSCAN_PRIORITY_SHORT_LABEL,
     CVSS_BASE_LABEL,
 )
+from adscan_core.pal.paths import static_dir
 from adscan_core.paths import get_adscan_home_dir
 from adscan_core.rich_output import (
     print_error,
@@ -888,7 +889,7 @@ def render_bonus(
 # Instead the LITE Dockerfile copies a single pre-baked PDF here (the
 # private build pipeline produces it via ``scripts/bake_cheatsheet.sh``
 # using the PRO renderer and seeds it into the build context).
-_LITE_STATIC_CHEATSHEET_PATH = Path("/opt/adscan/static/cheatsheet/Quick_Start_Cheatsheet.pdf")
+_LITE_STATIC_CHEATSHEET_PATH = static_dir() / "cheatsheet" / "Quick_Start_Cheatsheet.pdf"
 
 
 def _try_use_baked_static(bonus_key: str, output_path: Path) -> int | None:
@@ -964,7 +965,7 @@ def _run_one(args: argparse.Namespace, bonus_key: str) -> int:
             return 1
 
     # Show the HOST path so the operator can copy/paste it. Inside the
-    # container the artefact lives at /opt/adscan/bonuses/<file>, but the
+    # container the artefact lives under the ADscan-home bonuses dir, but the
     # bind mount surfaces the same bytes at ~/.adscan/bonuses/<file> on
     # the host — that's the path they'll actually need.
     from adscan_internal.services.host_open import display_host_path

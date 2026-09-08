@@ -151,33 +151,9 @@ def autodetect_interface_addresses(interface_name: str) -> tuple[str, str, str] 
     is treated as a fatal config error by the suite.
     """
 
-    try:
-        import netifaces  # noqa: PLC0415
-    except ImportError:
-        return None
-    try:
-        addrs = netifaces.ifaddresses(interface_name)
-    except (ValueError, OSError):
-        return None
+    from adscan_core.pal import net as pal_net
 
-    mac_entries = addrs.get(netifaces.AF_LINK, [])
-    ipv4_entries = addrs.get(netifaces.AF_INET, [])
-    ipv6_entries = addrs.get(netifaces.AF_INET6, [])
-
-    mac = next((e["addr"] for e in mac_entries if e.get("addr")), None)
-    ipv4 = next((e["addr"] for e in ipv4_entries if e.get("addr")), None)
-    linklocal = None
-    for entry in ipv6_entries:
-        addr = entry.get("addr", "")
-        # netifaces returns link-local with %iface scope appended on Linux.
-        bare = addr.split("%", 1)[0]
-        if bare.lower().startswith("fe80:"):
-            linklocal = bare
-            break
-
-    if not (mac and ipv4 and linklocal):
-        return None
-    return mac, ipv4, linklocal
+    return pal_net.interface_mac_ipv4_linklocal(interface_name)
 
 
 def is_ipv6_address(value: str) -> bool:

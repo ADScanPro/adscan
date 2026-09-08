@@ -22,6 +22,8 @@ import signal
 from typing import Any, Dict, List
 
 from adscan_core.outbound_links import cta_markup, cta_url
+from adscan_core.pal import paths as pal_paths
+from adscan_core.pal.platform import is_windows
 from adscan_core.path_utils import get_adscan_state_dir
 from adscan_core.theme import (
     COLOR_WARNING,
@@ -55,10 +57,20 @@ from adscan_core.rich_output import print_exception
 
 _MINIMUM_HASHCAT_VERSION = (7, 1, 2)
 _JOHN_AVX2_REQUIRED_RE = re.compile(r"avx2 is required for this build", re.IGNORECASE)
-_RUNTIME_MANAGED_JOHN_PATHS = (
-    "/opt/adscan/tools/john/run/john",
-    "/opt/adscan/bin/john",
-)
+
+
+def _runtime_managed_john_paths() -> tuple[str, ...]:
+    """Return the runtime-managed John the Ripper executable candidates.
+
+    Resolved at call time so the ADscan home override is honoured. Order is
+    preserved: the bundled build under ``tools/john/run`` first, then ``bin``.
+    """
+    return (
+        str(pal_paths.tools_dir() / "john" / "run" / "john"),
+        str(pal_paths.bin_dir() / "john"),
+    )
+
+
 _REQUIRED_JOHN_CONVERTERS = (
     "keepass2john",
     "zip2john",
@@ -496,16 +508,18 @@ def _resolve_runtime_managed_john_converter_path(converter_name: str) -> str | N
     if not normalized_name:
         return None
 
+    bin_base = pal_paths.bin_dir()
+    john_run_base = pal_paths.tools_dir() / "john" / "run"
     candidates = [
         shutil.which(normalized_name),
         shutil.which(f"{normalized_name}.py"),
         shutil.which(f"{normalized_name}.pl"),
-        f"/opt/adscan/bin/{normalized_name}",
-        f"/opt/adscan/bin/{normalized_name}.py",
-        f"/opt/adscan/bin/{normalized_name}.pl",
-        f"/opt/adscan/tools/john/run/{normalized_name}",
-        f"/opt/adscan/tools/john/run/{normalized_name}.py",
-        f"/opt/adscan/tools/john/run/{normalized_name}.pl",
+        str(bin_base / normalized_name),
+        str(bin_base / f"{normalized_name}.py"),
+        str(bin_base / f"{normalized_name}.pl"),
+        str(john_run_base / normalized_name),
+        str(john_run_base / f"{normalized_name}.py"),
+        str(john_run_base / f"{normalized_name}.pl"),
     ]
     for candidate in candidates:
         normalized_candidate = str(candidate or "").strip()
@@ -527,9 +541,10 @@ def _validate_runtime_managed_john_converters(
     normalized_john = str(john_executable or "").strip()
     if not normalized_john:
         return []
+    adscan_home_prefix = str(pal_paths.get_adscan_home_dir()) + os.sep
     if (
-        normalized_john not in _RUNTIME_MANAGED_JOHN_PATHS
-        and not normalized_john.startswith("/opt/adscan/")
+        normalized_john not in _runtime_managed_john_paths()
+        and not normalized_john.startswith(adscan_home_prefix)
     ):
         return []
 
@@ -598,6 +613,7 @@ class VirtualEnvCheckConfig:
     venv_path: str
     full_container_runtime: bool
     fix_mode: bool
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -644,6 +660,19 @@ def check_virtual_environment(
     if config.full_container_runtime:
         deps.print_info_verbose(
             "Running inside the ADscan FULL container - skipping host virtual environment checks."
+        )
+        return True, all_ok
+
+    if config.windows_native:
+        # Windows-native runs the engine in-process with no Docker and no
+        # managed ``~/.adscan/venv`` — the running interpreter IS the runtime.
+        # Accept it: report the running interpreter and skip the POSIX venv probe.
+        running_python = sys.executable or "python"
+        running_version = (
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        )
+        deps.print_success(
+            f"Python runtime: {running_python} (Python {running_version})"
         )
         return True, all_ok
 
@@ -758,9 +787,11 @@ def check_core_dependencies(
     # Find system python3 executable (same logic as handle_install)
     system_python = shutil.which("python3")
     if not system_python:
-        # Fallback to sys.executable if python3 not found (but this might be PyInstaller binary)
-        system_python = sys.executable
-        deps.print_warning("python3 not found in PATH, using sys.executable")
+        # Windows ships the interpreter as ``python`` / ``python3.exe``; the
+        # bare ``python3`` name is a POSIX convention. Resolve it quietly there.
+        system_python = shutil.which("python") or sys.executable
+        if not is_windows():
+            deps.print_warning("python3 not found in PATH, using sys.executable")
 
     if not system_python:
         deps.print_warning(
@@ -897,6 +928,7 @@ class GoToolchainCheckConfig:
     full_container_runtime: bool
     fix_mode: bool
     session_env: str
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -933,6 +965,14 @@ def check_go_toolchain(
     if config.full_container_runtime:
         deps.print_info(
             "Skipping Go toolchain and htb-cli verification (running in container)."
+        )
+        return True
+
+    if config.windows_native:
+        # The Go toolchain (and the HTB-lab-only htb-cli) are Linux-host
+        # deployment plumbing. Windows-native does not provision them.
+        deps.print_info(
+            "Skipping Go toolchain and htb-cli verification (Windows-native runtime)."
         )
         return True
 
@@ -1048,6 +1088,7 @@ class ExternalToolsCheckConfig:
     pip_tools_config: Mapping[str, Dict[str, Any]]
     tool_venvs_base_dir: str
     fix_mode: bool
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -1084,6 +1125,17 @@ def check_external_tools(
     deps: ExternalToolsCheckDeps,
 ) -> bool:
     """Check that external Python tools in their isolated venvs are healthy."""
+    # Windows-native does not use POSIX subprocess-isolated per-tool venvs
+    # (the ``<base>/<tool>/venv/bin/python`` layout is Linux-only). The
+    # capabilities those venvs provided on Linux come from the in-process
+    # vendored/native stack or degrade gracefully via ``pal.tools`` on Windows,
+    # so there is nothing to validate here.
+    if config.windows_native:
+        deps.print_info_verbose(
+            "Skipping isolated external-Python-tool venv verification (Windows-native runtime)."
+        )
+        return True
+
     deps.print_info("Checking external Python tools in their isolated environments...")
 
     missing_tools: List[str] = []
@@ -1389,6 +1441,9 @@ class SystemPackagesCheckConfig:
     # (foreign container). Used to give a clearer message than a per-tool apt
     # hint when required packages are missing.
     foreign_container_runtime: bool = False
+    # True on Windows-native, where the dpkg/apt system-package model does not
+    # exist. The distro-package check is skipped entirely.
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -1452,6 +1507,15 @@ def check_system_packages(
     deps: SystemPackagesCheckDeps,
 ) -> tuple[bool, List[str]]:
     """Check essential system packages and optionally attempt --fix via apt-get."""
+    if config.windows_native:
+        # The essential-system-packages check is backed by ``dpkg -l`` (Debian
+        # package database) with ``sudo apt install`` fix hints. Neither exists on
+        # Windows-native, so the distro-package model does not apply. Skip it.
+        deps.print_info(
+            "Skipping distro system-package verification (Windows-native runtime)."
+        )
+        return True, []
+
     deps.print_info("Checking for essential system packages...")
     package_results = deps.verify_system_packages(
         config.system_packages_to_verify, mode="check"
@@ -1630,6 +1694,7 @@ class ExternalBinaryToolsCheckConfig:
     venv_path: str
     full_container_runtime: bool
     fix_mode: bool
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -1688,8 +1753,14 @@ def check_external_binary_tools(
                 )
                 external_tool_check_to_base[tool_name] = tool_name
 
-        # Optional venv-link check (not applicable in full container runtime)
-        if tool_cfg.get("check_venv_link", False) and not config.full_container_runtime:
+        # Optional venv-link check (POSIX-only; not applicable in the full
+        # container runtime, nor on Windows-native where there is no
+        # ``venv/bin/<name>`` symlink layout).
+        if (
+            tool_cfg.get("check_venv_link", False)
+            and not config.full_container_runtime
+            and not config.windows_native
+        ):
             binary_name = tool_cfg.get("name", tool_name)
             external_tools_to_verify[f"{tool_name}_venv_link"] = os.path.join(
                 config.venv_path, "bin", binary_name
@@ -1737,7 +1808,28 @@ def check_external_binary_tools(
                     f"{tool_check_name} not found at {tool_path}. Try reinstalling."
                 )
                 still_missing.append(tool_check_name)
+        if still_missing and config.windows_native:
+            # The Windows tool layout may not be provisioned yet. Degrade to a
+            # warning rather than aborting the preflight over Linux-shaped paths.
+            deps.print_warning(
+                "Some external tools are not present in the Windows tools directory yet; "
+                "features that rely on them will be unavailable."
+            )
+            return True, still_missing
         return (len(still_missing) == 0), still_missing
+
+    if missing_checks and config.windows_native:
+        # The Windows tool layout may not be provisioned yet. Degrade to a
+        # warning rather than aborting the preflight over Linux-shaped paths.
+        for tool_check_name in missing_checks:
+            deps.print_warning(
+                f"{tool_check_name} not found in the Windows tools directory."
+            )
+        deps.print_warning(
+            "Some external tools are not present yet; features that rely on them "
+            "will be unavailable."
+        )
+        return True, missing_checks
 
     # No fix mode or nothing missing
     return (len(missing_checks) == 0), missing_checks
@@ -1760,7 +1852,7 @@ def _normalize_missing_system_packages_for_runtime(
 
     if "john" in normalized_missing:
         john_executable = None
-        preferred_runtime_john = "/opt/adscan/tools/john/run/john"
+        preferred_runtime_john = str(pal_paths.tools_dir() / "john" / "run" / "john")
         if os.path.exists(preferred_runtime_john):
             john_executable = preferred_runtime_john
             deps.print_info_debug(
@@ -1962,17 +2054,30 @@ def _binary_has_cap_net_bind_service(binary_path: str) -> bool:
     return binary_has_capability(binary_path, "cap_net_bind_service")
 
 
-def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) -> bool:
+def check_ligolo_ng_runtime_tooling(
+    *, full_container_runtime: bool, deps: Any, windows_native: bool = False
+) -> bool:
     """Check the ligolo-ng binaries managed by the ADscan runtime.
 
     The Docker runtime should provide the local proxy binary. Windows agents
     can be cached ahead of time or fetched on demand later, so missing agent
     caches are informational rather than fatal.
+
+    On Windows-native the proxy is optional pivot tooling that can be staged on
+    demand, so a missing proxy is informational (never a hard failure), and the
+    POSIX executable-bit check is skipped (it has no meaning on Windows).
     """
     deps.print_info("Checking ligolo-ng pivot tooling...")
     local_os, local_arch = get_current_ligolo_proxy_target()
     proxy_path = get_ligolo_proxy_local_path(target_os=local_os, arch=local_arch)
     if proxy_path is None:
+        if windows_native:
+            deps.print_info(
+                f"ligolo-ng proxy v{LIGOLO_NG_VERSION} is not staged for "
+                f"{local_os}/{local_arch}. ADscan will stage it on demand before "
+                "creating a pivot."
+            )
+            return True
         deps.print_error(
             f"ligolo-ng proxy v{LIGOLO_NG_VERSION} not found for {local_os}/{local_arch}."
         )
@@ -1986,7 +2091,7 @@ def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) 
             )
         return False
 
-    if not os.access(proxy_path, os.X_OK):
+    if not windows_native and not os.access(proxy_path, os.X_OK):
         deps.print_error(f"ligolo-ng proxy is present but not executable: {proxy_path}")
         deps.print_instruction(f"Run: chmod +x {proxy_path}")
         return False
@@ -2217,7 +2322,7 @@ def check_runtime_python_dependencies(
         return all_ok
 
     runtime_python_candidates = [
-        "/opt/adscan/venv/bin/python",
+        str(pal_paths.runtime_venv_dir() / "bin" / "python"),
         shutil.which("python3"),
     ]
     if os.path.basename(sys.executable).startswith("python"):
@@ -2239,8 +2344,9 @@ def check_runtime_python_dependencies(
         return False
 
     clean_env = deps.get_clean_env_for_compilation()
-    if os.path.isdir("/opt/adscan/ms-playwright"):
-        clean_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/adscan/ms-playwright")
+    ms_playwright_dir = str(pal_paths.playwright_browsers_dir())
+    if os.path.isdir(ms_playwright_dir):
+        clean_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", ms_playwright_dir)
     elif os.path.exists("/usr/bin/chromium"):
         clean_env.setdefault("ADSCAN_CHROMIUM_EXECUTABLE", "/usr/bin/chromium")
     elif os.path.exists("/usr/bin/chromium-browser"):
@@ -2327,7 +2433,7 @@ def check_playwright_chromium_runtime(
         return True
 
     runtime_python_candidates = [
-        "/opt/adscan/venv/bin/python",
+        str(pal_paths.runtime_venv_dir() / "bin" / "python"),
         shutil.which("python3"),
     ]
     if os.path.basename(sys.executable).startswith("python"):
@@ -2349,8 +2455,9 @@ def check_playwright_chromium_runtime(
         return False
 
     clean_env = deps.get_clean_env_for_compilation()
-    if os.path.isdir("/opt/adscan/ms-playwright"):
-        clean_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/adscan/ms-playwright")
+    ms_playwright_dir = str(pal_paths.playwright_browsers_dir())
+    if os.path.isdir(ms_playwright_dir):
+        clean_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", ms_playwright_dir)
     elif os.path.exists("/usr/bin/chromium"):
         clean_env.setdefault("ADSCAN_CHROMIUM_EXECUTABLE", "/usr/bin/chromium")
     elif os.path.exists("/usr/bin/chromium-browser"):
@@ -2403,6 +2510,7 @@ class DNSResolverCheckConfig:
 
     fix_mode: bool
     full_container_runtime: bool
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -2443,6 +2551,15 @@ def check_dns_resolver(
         bool: True if Unbound is active and ready, False otherwise.
     """
     all_ok = True
+    if config.windows_native:
+        # Unbound / dnsmasq / systemd-resolved conflict management is Linux DNS
+        # plumbing (and ``os.geteuid`` does not exist on Windows). ADscan-native
+        # on Windows uses the host resolver; skip this check explicitly rather
+        # than relying on an AttributeError being swallowed.
+        deps.print_info_verbose(
+            "Skipping local DNS resolver verification (Windows-native runtime)."
+        )
+        return True
     try:
         in_container = config.full_container_runtime
         systemd_available = deps.is_systemd_available()
@@ -2918,6 +3035,7 @@ class PyenvCheckConfig:
     fix_mode: bool
     python_version: str
     venv_path: str
+    windows_native: bool = False
 
 
 @dataclass(frozen=True)
@@ -2949,6 +3067,12 @@ def check_pyenv_status(*, config: PyenvCheckConfig, deps: PyenvCheckDeps) -> boo
     """
     if config.full_container_runtime:
         deps.print_info_verbose("Skipping pyenv verification (running in container).")
+        return True
+
+    # Windows-native has no pyenv (a Linux Python-version manager) and the
+    # running interpreter is already the correct Python — nothing to verify.
+    if config.windows_native:
+        deps.print_info_verbose("Skipping pyenv verification (Windows-native runtime).")
         return True
 
     deps.print_info("Checking pyenv and Python version management...")
@@ -3196,6 +3320,12 @@ def run_check(
 
     all_ok = True
     full_container_runtime = deps.is_full_adscan_container_runtime()
+    # Windows-native = the engine runs in-process on Windows with no Docker.
+    # The Linux deployment-plumbing checks (managed venv, dpkg, Go, POSIX tool
+    # links, Unbound) are skipped/replaced so the preflight is minimal there.
+    # Always False on a Linux host and inside the container, so POSIX behaviour
+    # is byte-identical.
+    windows_native = is_windows() and not full_container_runtime
     session_env = deps.determine_session_environment()
     fix_mode = (
         bool(getattr(config.args, "fix", False)) if config.args is not None else False
@@ -3267,6 +3397,7 @@ def run_check(
                 venv_path=config.venv_path,
                 full_container_runtime=full_container_runtime,
                 fix_mode=fix_mode,
+                windows_native=windows_native,
             ),
             deps=VirtualEnvCheckDeps(
                 ensure_dir_writable=deps.ensure_dir_writable,
@@ -3336,6 +3467,7 @@ def run_check(
                 pip_tools_config=config.pip_tools_config,
                 tool_venvs_base_dir=config.tool_venvs_base_dir,
                 fix_mode=fix_mode,
+                windows_native=windows_native,
             ),
             deps=ExternalToolsCheckDeps(
                 run_command=deps.run_command,
@@ -3402,6 +3534,7 @@ def run_check(
             fix_mode=fix_mode,
             full_container_runtime=full_container_runtime,
             foreign_container_runtime=foreign_container_runtime,
+            windows_native=windows_native,
         ),
         deps=SystemPackagesCheckDeps(
             verify_system_packages=deps.verify_system_packages,
@@ -3433,6 +3566,7 @@ def run_check(
         config=DNSResolverCheckConfig(
             fix_mode=fix_mode,
             full_container_runtime=full_container_runtime,
+            windows_native=windows_native,
         ),
         deps=DNSResolverCheckDeps(
             is_unbound_listening_local=deps.is_unbound_listening_local,
@@ -3471,6 +3605,7 @@ def run_check(
             venv_path=config.venv_path,
             full_container_runtime=full_container_runtime,
             fix_mode=fix_mode,
+            windows_native=windows_native,
         ),
         deps=ExternalBinaryToolsCheckDeps(
             expand_effective_user_path=deps.expand_effective_user_path,
@@ -3489,6 +3624,7 @@ def run_check(
     ligolo_ok = check_ligolo_ng_runtime_tooling(
         full_container_runtime=full_container_runtime,
         deps=deps,
+        windows_native=windows_native,
     )
     if not ligolo_ok:
         all_ok = False
@@ -3526,6 +3662,7 @@ def run_check(
                 full_container_runtime=full_container_runtime,
                 fix_mode=fix_mode,
                 session_env=session_env,
+                windows_native=windows_native,
             ),
             deps=GoToolchainCheckDeps(
                 configure_go_official_path=deps.configure_go_official_path,
@@ -3560,6 +3697,7 @@ def run_check(
                 fix_mode=fix_mode,
                 python_version=config.python_version,
                 venv_path=config.venv_path,
+                windows_native=windows_native,
             ),
             deps=PyenvCheckDeps(
                 check_and_ensure_pyenv_status=deps.check_and_ensure_pyenv_status,

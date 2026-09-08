@@ -16,6 +16,7 @@ import os
 import re
 import sys
 
+from adscan_core.pal.platform import is_windows
 from adscan_internal import (
     print_error,
     print_info,
@@ -2158,11 +2159,11 @@ def _list_local_interfaces_with_ipv4() -> list[tuple[str, list[str]]]:
     interfaces without an IPv4 address are kept (shown as ``no IPv4``) so the
     operator still sees the full picture.
     """
+    from adscan_core.pal import net as pal_net
+
     interfaces: list[tuple[str, list[str]]] = []
     try:
-        import netifaces
-
-        for iface in netifaces.interfaces():
+        for iface in pal_net.interface_names():
             if str(iface).strip().lower() in {"lo", "lo0"}:
                 continue
             interfaces.append((str(iface), get_interface_ipv4_addresses(str(iface))))
@@ -2216,6 +2217,7 @@ def _maybe_offer_interface_switch_on_route_mismatch(
     require_dc_ports: bool,
     interactive: bool,
     domain: str | None = None,
+    configured_interface_is_dead: bool = False,
 ) -> bool | None:
     """Offer to switch to the interface that actually routes to the target.
 
@@ -2227,10 +2229,24 @@ def _maybe_offer_interface_switch_on_route_mismatch(
     normal source IP / default route, so a route mismatch against it is
     meaningless).
 
-    The confirm defaults to NO (keep current) and the interface select defaults
-    to the interface the route actually uses, so a single Enter does the right
-    thing. In non-interactive runs both helpers auto-resolve to those
-    conservative defaults — keep current, never switch, never hang.
+    Two regimes, chosen by ``configured_interface_is_dead``:
+
+    * **Advisory (default).** The configured interface is itself usable (it has
+      an IPv4) and merely differs from the route the kernel picked — a benign
+      multi-homed / policy-routing situation. The confirm defaults to NO (keep
+      current) and non-interactive runs keep the configured interface. This is
+      the conservative, byte-identical legacy behaviour.
+    * **Recovery.** The configured interface is stale/IP-less — a dead-end that
+      would otherwise abort the scan — while the route the kernel picked resolves
+      through an interface that DOES carry a valid IPv4 (verified via the PAL).
+      ADscan already computed that interface and its source address, so it can
+      recover: interactive runs OFFER the switch with the confirm defaulting to
+      YES (a single Enter adopts it), and non-interactive runs AUTO-ADOPT it
+      rather than dead-ending. Only entered when the route interface is provably
+      usable, so recovery never trades a dead interface for another dead one.
+
+    The interface select defaults to the interface the route actually uses, so a
+    single Enter does the right thing.
 
     Returns:
         ``None`` when no switch happened (caller keeps its normal flow), or the
@@ -2239,6 +2255,18 @@ def _maybe_offer_interface_switch_on_route_mismatch(
     route_interface = str(mismatch_route.route_interface or "").strip()
     if not route_interface:
         return None
+
+    # Recovery is only safe when the route-actual interface is provably usable.
+    # Verify through the PAL (never trust a name alone): a non-empty IPv4 set on
+    # the route interface, corroborated by the route's own source address, means
+    # switching to it recovers the scan rather than swapping one dead interface
+    # for another. If the route interface has no IPv4 either, fall back to the
+    # advisory regime so we never auto-adopt a second dead-end.
+    route_interface_ipv4 = get_interface_ipv4_addresses(route_interface)
+    route_interface_is_usable = bool(route_interface_ipv4) or bool(
+        str(mismatch_route.source_ip or "").strip()
+    )
+    is_recovery = configured_interface_is_dead and route_interface_is_usable
 
     # Skip entirely when the SELECTED operating interface is a Ligolo TUN. This is
     # a property of the configured interface BY ITS NATURE (name), independent of
@@ -2263,16 +2291,44 @@ def _maybe_offer_interface_switch_on_route_mismatch(
         if mismatch_route.source_ip
         else "[unknown]"
     )
-    prompt = (
-        f"Route to the target goes via '{route_interface}' (source {marked_route_src}), "
-        f"not the configured '{configured_interface or '[unset]'}'. "
-        "Switch to the interface that actually routes to the target?"
-    )
+    if is_recovery:
+        prompt = (
+            f"The configured interface '{configured_interface or '[unset]'}' has no usable "
+            f"IPv4 address, but the route to the target goes via '{route_interface}' "
+            f"(source {marked_route_src}), which does. "
+            "Switch to the interface that actually routes to the target?"
+        )
+    else:
+        prompt = (
+            f"Route to the target goes via '{route_interface}' (source {marked_route_src}), "
+            f"not the configured '{configured_interface or '[unset]'}'. "
+            "Switch to the interface that actually routes to the target?"
+        )
 
     from adscan_internal.interaction import is_non_interactive
 
     if is_non_interactive(shell):
-        # Conservative default: keep the configured interface, never switch.
+        if is_recovery:
+            # Recovery: the configured interface is a dead-end but ADscan already
+            # computed a usable route interface. Auto-adopt it rather than
+            # aborting the scan unattended.
+            print_info(
+                f"Configured interface '{configured_interface or '[unset]'}' has no usable "
+                f"IPv4; auto-switching to route-detected interface '{route_interface}' "
+                f"(source {marked_route_src})."
+            )
+            return _switch_interface_and_revalidate(
+                shell,
+                mode_label=mode_label,
+                chosen_interface=route_interface,
+                configured_interface=configured_interface,
+                target_ip=target_ip,
+                hosts_expression=hosts_expression,
+                require_dc_ports=require_dc_ports,
+                interactive=interactive,
+                domain=domain,
+            )
+        # Advisory: the configured interface is usable, keep it, never switch.
         print_info_debug(
             "[network-preflight] non-interactive; keeping configured interface "
             f"'{configured_interface or '[unset]'}' despite route mismatch."
@@ -2282,7 +2338,10 @@ def _maybe_offer_interface_switch_on_route_mismatch(
     if not interactive:
         return None
 
-    if not confirm_ask(prompt, default=False):
+    # Recovery defaults the confirm to YES (a single Enter adopts the interface
+    # ADscan already proved routes to the target); the advisory regime keeps the
+    # conservative default of NO.
+    if not confirm_ask(prompt, default=is_recovery):
         return None
 
     interfaces = _list_local_interfaces_with_ipv4()
@@ -2318,6 +2377,37 @@ def _maybe_offer_interface_switch_on_route_mismatch(
         print_info(f"Interface unchanged ('{chosen_interface}').")
         return None
 
+    return _switch_interface_and_revalidate(
+        shell,
+        mode_label=mode_label,
+        chosen_interface=chosen_interface,
+        configured_interface=configured_interface,
+        target_ip=target_ip,
+        hosts_expression=hosts_expression,
+        require_dc_ports=require_dc_ports,
+        interactive=interactive,
+        domain=domain,
+    )
+
+
+def _switch_interface_and_revalidate(
+    shell: Any,
+    *,
+    mode_label: str,
+    chosen_interface: str,
+    configured_interface: str | None,
+    target_ip: str | None,
+    hosts_expression: str | None,
+    require_dc_ports: bool,
+    interactive: bool,
+    domain: str | None = None,
+) -> bool:
+    """Apply an interface switch, record it, and re-run the preflight.
+
+    Single implementation of the "adopt ``chosen_interface`` then re-validate"
+    sequence, shared by the interactive select path and the non-interactive
+    recovery auto-adopt path so they can never drift.
+    """
     new_ip = _apply_interface_switch(shell, interface=chosen_interface)
     if new_ip:
         print_success(
@@ -2334,7 +2424,7 @@ def _maybe_offer_interface_switch_on_route_mismatch(
         "start_network_preflight_interface_switch",
         properties={
             "mode": mode_label,
-            "route_interface": route_interface,
+            "route_interface": chosen_interface,
             "switched": True,
         },
     )
@@ -2645,7 +2735,16 @@ def _run_start_network_preflight(
         },
     )
 
-    if not failures and mismatch_route is not None:
+    # Recovery: the configured interface is itself dead (no usable IPv4) while a
+    # route mismatch points at a usable interface. This is the dead-end case that
+    # used to abort the scan with "Interface <x> has no IPv4 address" even though
+    # ADscan had already computed a working interface. The interface-switch offer
+    # must fire here too — not only on the no-failures advisory path — so it can
+    # recover instead of forcing a manual `set interface`.
+    interface_check_failed = any(
+        check.name == "Interface" and check.status == "fail" for check in checks
+    )
+    if mismatch_route is not None and (not failures or interface_check_failed):
         switched = _maybe_offer_interface_switch_on_route_mismatch(
             shell,
             mode_label=mode_label,
@@ -2656,6 +2755,7 @@ def _run_start_network_preflight(
             require_dc_ports=require_dc_ports,
             interactive=interactive,
             domain=domain,
+            configured_interface_is_dead=interface_check_failed,
         )
         if switched is not None:
             # Interface was switched and the route check re-ran with it.
@@ -3299,8 +3399,13 @@ def maybe_relaunch_into_venv(
     - If not in venv and not frozen, execve into `<VENV_PATH>/bin/python`.
     - If venv python missing, print guidance and exit(1).
     - If execve fails, capture telemetry and exit(1).
+
+    Windows-native is treated exactly like the frozen case: the bundle's
+    embedded ``py\\python.exe`` IS the runtime, there is no managed venv at
+    ``~/.adscan/venv`` (and its ``bin/python`` POSIX layout does not exist on
+    Windows), so no relaunch is possible or wanted — return early.
     """
-    if is_venv() or is_frozen:
+    if is_venv() or is_frozen or is_windows():
         return
 
     print_info_verbose("Not in venv and running as script. Relaunching...")

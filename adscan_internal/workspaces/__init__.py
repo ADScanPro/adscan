@@ -30,7 +30,6 @@ from .domains import (
 )
 from .subpaths import domain_path as domain_subpath, domain_relpath
 from .layout import DEFAULT_DOMAIN_LAYOUT, DomainLayout
-from .ui import select_workspace_curses
 from .paths import (
     domain_dir,
     get_workspace_cwd,
@@ -73,7 +72,6 @@ __all__ = [
     "domain_relpath",
     "DEFAULT_DOMAIN_LAYOUT",
     "DomainLayout",
-    "select_workspace_curses",
     "save_domain_data",
     "save_workspace_data",
     "get_workspace_cwd",

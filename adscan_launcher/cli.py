@@ -1569,10 +1569,17 @@ def _guard_supported_host_platform(
             "ADscan launcher Docker mode is supported on Linux and macOS hosts."
         )
         print_instruction(f"Detected platform: {host_platform}")
-        print_instruction(
-            "Use a supported host: Linux (recommended: Kali, Ubuntu, Debian, or "
-            "Parrot) or macOS with Docker Desktop, then retry."
-        )
+        if host_platform.lower() == "windows":
+            print_instruction(
+                "On Windows, use the native self-contained bundle instead of this "
+                "PyPI launcher: download adscan.exe (no Docker, no Python install) "
+                "and run it directly."
+            )
+        else:
+            print_instruction(
+                "Use a supported host: Linux (recommended: Kali, Ubuntu, Debian, or "
+                "Parrot) or macOS with Docker Desktop, then retry."
+            )
         print_instruction(
             "System requirements: " + cta_display_url("unsupported_platform")
         )

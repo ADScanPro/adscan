@@ -30,6 +30,9 @@ import os
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.reporting.attack_path_memory_gate import (
+    _AttackPathMemoryBudgetExceeded,
+)
 from adscan_core.reporting.domain_scope import has_collection_evidence
 from adscan_core.rich_output import (
     mark_sensitive,
@@ -49,11 +52,20 @@ class _ReportShell:
     ``_get_workspace_cwd`` to resolve the on-disk ``attack_graph.json``; it never
     authenticates or mutates. A throwaway object keeps the report generators from
     having to own a full ``PentestShell``.
+
+    ``domains_data`` is an empty dict, not absent: an annotate/decorate stage in
+    ``compute_display_paths_for_domain`` (affected-user metadata, owned-user
+    resolution) reads ``shell.domains_data`` and an unguarded reader raises
+    ``AttributeError`` when the attribute is missing (observed on Ctrl+C report
+    generation). An empty dict is the correct "no live credential state" for a
+    report-only shell — every reader treats a missing-domain lookup as empty, so
+    ``{}`` yields the same result while never raising.
     """
 
     def __init__(self, workspace_dir: str) -> None:
         self.current_workspace_dir = str(workspace_dir)
         self.domains_dir = "domains"
+        self.domains_data: dict[str, Any] = {}
 
     def _get_workspace_cwd(self) -> str:
         return self.current_workspace_dir
@@ -120,6 +132,38 @@ def compute_report_attack_paths(
             keep_longest=True,
             no_cache=no_cache,
         )
+    except _AttackPathMemoryBudgetExceeded as exc:
+        # A DELIBERATE, clean coverage-bounded stop — NOT an error. Discovery hit
+        # the memory ceiling and stopped cleanly before it could be SIGKILLed. The
+        # SERVICE-layer ``compute_display_paths_for_domain`` now recovers this at
+        # the source, so this catch is a belt-and-suspenders backstop for a future
+        # in which the service seam changes. Route it through the ONE shared
+        # recovery helper (operator line + honest coverage declaration + bounded
+        # per-terminal fallback), NEVER a hand-duplicated copy of that logic and
+        # NEVER a traceback / "contact support" line, per CLAUDE.md § "A bounded
+        # computation is a data gap — declare it, never a scary crash". The helper
+        # is best-effort and never raises; its ``recompute_bounded`` re-runs the
+        # domain compute with ``force_perterminal=True`` so the deliverable carries
+        # the real per-terminal + floor route set instead of an empty one.
+        def _recompute_bounded_report() -> list[dict[str, Any]]:
+            return attack_graph_service.compute_display_paths_for_domain(
+                shell,
+                domain,
+                max_depth=max_depth,
+                target="highvalue",
+                target_mode="object",
+                display_friendly=True,
+                keep_longest=True,
+                no_cache=no_cache,
+                force_perterminal=True,
+            )
+
+        paths = attack_graph_service._recover_from_memory_abort(  # noqa: SLF001
+            shell, domain, exc, recompute_bounded=_recompute_bounded_report
+        )
+        if not isinstance(paths, list):
+            return []
+        return [path for path in paths if isinstance(path, dict)]
     except Exception as exc:  # noqa: BLE001 - a report never crashes on paths
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

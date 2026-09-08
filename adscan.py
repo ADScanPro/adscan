@@ -10,7 +10,6 @@ from adscan_internal.rich_output import (
 import argparse
 import atexit
 from collections.abc import Callable
-import curses
 import inspect  # For function parameter inspection
 import ipaddress
 import json
@@ -43,7 +42,6 @@ if TYPE_CHECKING:
     )
 
 # Third-party imports
-import netifaces
 import psutil
 import requests
 import rich.box
@@ -66,7 +64,7 @@ from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style as PromptStyle
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 from rich.traceback import install as install_rich_traceback
@@ -211,7 +209,11 @@ from adscan_core.lab_catalog import (
     get_labs_for_provider as get_catalog_labs_for_provider,
     is_lab_whitelisted as is_catalog_lab_whitelisted,
 )
-from adscan_core.console_runtime import build_rich_console as _build_rich_console
+from adscan_core.console_runtime import (
+    build_rich_console as _build_rich_console,
+    ensure_utf8_console as _ensure_utf8_console,
+)
+from adscan_core.pal import process as pal_process
 from adscan_core.native_secret_scrub import scrub_native_secrets
 from adscan_core.outbound_links import cta_display_url, cta_markup, cta_url
 from adscan_core.lab_context import build_lab_telemetry_fields
@@ -648,7 +650,7 @@ def _run_systemctl_command(
 
     cmd: list[str] = ["systemctl"] + args
     cmd_env: dict[str, str] | None = None
-    if os.geteuid() != 0:
+    if not pal_process.effective_user_is_root():
         if not _sudo_validate():
             raise RuntimeError("sudo validation failed for systemctl")
         cmd_env = _build_effective_user_env_for_command(cmd, shell=False)
@@ -1174,7 +1176,7 @@ def _get_port_53_listeners_text(*, use_sudo: bool) -> str:
     """
     try:
         prefix: list[str] = []
-        if use_sudo and os.geteuid() != 0:
+        if use_sudo and not pal_process.effective_user_is_root():
             prefix = _sudo_prefix_args(non_interactive=True)
         ss_tcp = run_command(
             prefix + ["ss", "-H", "-ltnup"], check=False, capture_output=True, text=True
@@ -1217,13 +1219,13 @@ def _stop_dns_resolver_service_for_unbound(
         print_info_verbose(
             f"[dns] Stopping conflicting resolver '{service_name}' ({context})..."
         )
-        if os.geteuid() != 0 and not _sudo_validate():
+        if not pal_process.effective_user_is_root() and not _sudo_validate():
             print_warning(
                 "Cannot stop conflicting DNS resolver automatically without sudo privileges."
             )
             return
 
-        sudo_prefix = _sudo_prefix_args() if os.geteuid() != 0 else []
+        sudo_prefix = _sudo_prefix_args() if not pal_process.effective_user_is_root() else []
 
         if systemd_available:
             run_command(
@@ -1263,7 +1265,7 @@ def _start_unbound_without_systemd() -> bool:
     """
     try:
         local_ip = _get_adscan_local_resolver_ip()
-        if os.geteuid() != 0:
+        if not pal_process.effective_user_is_root():
             return False
         if _is_unbound_listening_local(resolver_ip=local_ip):
             return True
@@ -1314,7 +1316,7 @@ def _start_unbound_without_systemd_via_sudo() -> bool:
     """
     try:
         local_ip = _get_adscan_local_resolver_ip()
-        if os.geteuid() == 0:
+        if pal_process.effective_user_is_root():
             return _start_unbound_without_systemd()
         if not shutil.which("sudo"):
             return False
@@ -1424,18 +1426,23 @@ def _get_effective_user_name_and_group() -> tuple[str, str]:
     Returns:
         (username, groupname)
     """
-    import pwd
-
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user:
         try:
+            import pwd  # POSIX-only; guarded (Windows lacks pwd).
+
             pw = pwd.getpwnam(sudo_user)
             return pw.pw_name, pw.pw_name
         except Exception:
             return sudo_user, sudo_user
 
-    pw = pwd.getpwuid(os.getuid())
-    return pw.pw_name, pw.pw_name
+    # POSIX resolves the current uid's name via the PAL seam (which does
+    # ``pwd.getpwuid(os.getuid()).pw_name`` — byte-identical to the previous
+    # implementation — while isolating the POSIX-only ``pwd``/``os.getuid``
+    # import so this never raises on Windows, where it returns
+    # ``getpass.getuser()``).
+    name = pal_process.current_user_name() or os.path.basename(os.path.expanduser("~"))
+    return name, name
 
 
 def _dir_is_writable(path: str) -> bool:
@@ -1479,7 +1486,7 @@ def _ensure_dir_writable(
         # Legacy root-owned directories (created by older sudo-based installs) are
         # a common cause. If `--fix` is enabled, attempt to repair via sudo even
         # if we cannot traverse the directory as the current user.
-        if fix and os.geteuid() != 0:
+        if fix and not pal_process.effective_user_is_root():
             if not _sudo_validate():
                 return False
             user, group = _get_effective_user_name_and_group()
@@ -1557,7 +1564,7 @@ def _ensure_dir_writable(
     chmod_args.extend(["u+rwX", path])
 
     try:
-        if os.geteuid() == 0:
+        if pal_process.effective_user_is_root():
             run_command(chown_args, check=False, capture_output=True, timeout=60)
             run_command(chmod_args, check=False, capture_output=True, timeout=60)
         else:
@@ -1758,7 +1765,7 @@ def _cleanup_legacy_adscan_sudo_alias() -> None:
     """Best-effort removal of the legacy auto-sudo alias from user shell configs."""
     try:
         target_user: str | None
-        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        if pal_process.effective_user_is_root() and os.environ.get("SUDO_USER"):
             target_user = os.environ.get("SUDO_USER")
         else:
             target_user = os.environ.get("USER")
@@ -1804,7 +1811,7 @@ def _guard_root_shell_without_user_context(command: str) -> None:
         command: The CLI subcommand (start/install/check/etc.)
     """
     try:
-        if os.geteuid() != 0:
+        if not pal_process.effective_user_is_root():
             return
         if os.getenv("CI"):
             return
@@ -2074,6 +2081,19 @@ def _guard_host_direct_core_launch(command: str | None) -> None:
     # containerized. Refusing there would break every build. This is the
     # root-cause scope: "host" means not-in-a-container.
     if is_docker_env():
+        return
+    # Windows-native is a SUPPORTED direct-launch deployment, not a bypassed
+    # container. There is no Docker launcher / runtime image on Windows (by
+    # design — see docs/superpowers/specs/2026-09-03-windows-native-runtime-
+    # portability-design.md): the engine runs in-process from adscan.py /
+    # adscan.exe. So the guard's entire rationale — bundled tooling, the
+    # loopback DNS resolver, the privileged host-helper, and the per-scan
+    # workspace all missing because you skipped the container — does not apply
+    # here; direct execution IS the intended runtime mode. On POSIX the guard
+    # still refuses a bare-host launch exactly as before.
+    from adscan_core.pal.platform import is_windows
+
+    if is_windows():
         return
     # Lightweight verbs that legitimately run outside the container (mirrors the
     # in-container guard's exemptions), plus the internal-only escape hatch.
@@ -2517,7 +2537,7 @@ EXTERNAL_TOOLS_CONFIG = {
 #
 # Only runtime-DOWNLOADABLE lists belong here. rockyou.txt is the single such
 # list. The audit base ships as combined_audit_base.txt — a ~94M build-time
-# merge (hashmob-large + kerberoast_pws + kaonashi_10K, order-preserving rling
+# merge (hashmob-large + kerberoast_pws, order-preserving rling
 # dedup) produced by scripts/build_combined_audit_wordlist.sh and baked into the
 # image; its raw components are staged from wordlists/manifest.json at build time
 # and dropped afterwards, so they never ship and are NOT installable at runtime.
@@ -6785,7 +6805,7 @@ def _install_pyenv_python_and_venv(python_version="3.12.3", venv_path=None):
     # Ensure permissions are correct (legacy installs could leave root-owned shims).
     try:
         if pyenv_target_user:
-            if os.geteuid() == 0:
+            if pal_process.effective_user_is_root():
                 run_command(
                     [
                         "chown",
@@ -8873,7 +8893,9 @@ def handle_install(install_args=None):
             os_makedirs=os.makedirs,
             os_path_exists=os.path.exists,
             os_getenv=os.getenv,
-            os_geteuid=os.geteuid,
+            # os.geteuid does not exist on Windows; provide a cross-platform
+            # equivalent (0 == root) so building InstallDeps never AttributeErrors.
+            os_geteuid=lambda: 0 if pal_process.effective_user_is_root() else 1,
             subprocess_run=subprocess.run,
             debug_mode=DEBUG_MODE,
         ),
@@ -9603,162 +9625,6 @@ class PentestShell:
 
         execute_audit_post_compromise(self, domain, username, credential)
 
-    def _curses_select(self, title: str, options: list[str], default_idx: int = 0):
-        """Simple curses menu to choose an option.
-        Returns the index of the selected option or None if cancelled.
-        """
-        selected = default_idx
-
-        def _fallback_selection() -> int | None:
-            # Fallback using Rich + IntPrompt when curses is unavailable or no TTY
-            try:
-                print_info_debug(
-                    "[DEBUG] Falling back to non-curses selection UI (no TTY or curses error)"
-                )
-            except Exception:
-                pass
-            try:
-                print_info(f"[bold]{title}[/bold]")
-                for idx, opt in enumerate(options, start=1):
-                    print_info(f"  {idx}. {opt}")
-                try:
-                    # Default maps to 1-based index for prompt
-                    default_number = (
-                        (default_idx + 1) if 0 <= default_idx < len(options) else 1
-                    )
-                    choice_num = IntPrompt.ask(
-                        "Enter a number (0 to cancel)", default=default_number
-                    )
-                except Exception:
-                    return None
-                if choice_num == 0:
-                    return None
-                if 1 <= choice_num <= len(options):
-                    return choice_num - 1
-            except Exception as e:
-                try:
-                    telemetry.capture_exception(e)
-                    print_exception(exception=e)
-                except Exception:
-                    pass
-            return None
-
-        # Pre-check: require TTY and a valid TERM for curses, set terminfo hints
-        term = os.environ.get("TERM", "")
-        try:
-            print_info_debug(
-                f"[DEBUG] curses precheck: stdin_isatty={sys.stdin.isatty()} stdout_isatty={sys.stdout.isatty()} TERM='{term}'"
-            )
-        except Exception:
-            pass
-        # Prefer bundled terminfo if packaged
-        try:
-            meipass = getattr(sys, "_MEIPASS", None)
-            bundled_terminfo = os.path.join(meipass, "terminfo") if meipass else None
-            if bundled_terminfo and os.path.isdir(bundled_terminfo):
-                os.environ.setdefault("TERMINFO", bundled_terminfo)
-                print_info_debug(
-                    f"[DEBUG] Using bundled TERMINFO at {bundled_terminfo}"
-                )
-            else:
-                # Provide common default DIRS if not set
-                os.environ.setdefault(
-                    "TERMINFO_DIRS",
-                    "/usr/share/terminfo:/lib/terminfo:/usr/lib/terminfo:/etc/terminfo",
-                )
-        except Exception:
-            pass
-        if (
-            not sys.stdin.isatty()
-            or not sys.stdout.isatty()
-            or term in ("", "dumb", "unknown")
-        ):
-            return _fallback_selection()
-
-        def _menu(stdscr):
-            nonlocal selected
-            try:
-                curses.curs_set(0)
-            except Exception:
-                # Ignore if terminal cannot change cursor visibility
-                pass
-            stdscr.keypad(True)
-            while True:
-                stdscr.erase()
-                height, width = stdscr.getmaxyx()
-                stdscr.addstr(0, 2, title[: width - 4], curses.A_BOLD)
-                for idx, opt in enumerate(options):
-                    y = 2 + idx
-                    if y >= height - 1:
-                        break  # avoid overflow
-                    if idx == selected:
-                        stdscr.attron(curses.A_REVERSE)
-                        stdscr.addstr(y, 4, opt[: width - 8])
-                        stdscr.attroff(curses.A_REVERSE)
-                    else:
-                        stdscr.addstr(y, 4, opt[: width - 8])
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key in (curses.KEY_UP, ord("k")) and selected > 0:
-                    selected -= 1
-                elif key in (curses.KEY_DOWN, ord("j")) and selected < len(options) - 1:
-                    selected += 1
-                elif key in (curses.KEY_ENTER, 10, 13):
-                    return
-                elif key in (27, ord("q")):  # ESC or q to cancel
-                    selected = None
-                    return
-
-        try:
-            curses.wrapper(_menu)
-        except Exception as e:
-            # Fall back and capture exception in telemetry
-            try:
-                telemetry.capture_exception(e)
-                print_exception(exception=e)
-            except Exception:
-                pass
-            try:
-                print_info_debug(
-                    f"[DEBUG] curses.wrapper failed: {type(e).__name__}: {e}"
-                )
-            except Exception:
-                pass
-            # Retry with more conservative TERM values if possible
-            try:
-                if sys.stdin.isatty() and sys.stdout.isatty():
-                    original_term = os.environ.get("TERM", "")
-                    for alt_term in ("xterm", "vt100", "linux"):
-                        try:
-                            os.environ["TERM"] = alt_term
-                            print_info_debug(
-                                f"[DEBUG] Retrying curses with TERM='{alt_term}'"
-                            )
-                            curses.wrapper(_menu)
-                            # Success with alternative TERM
-                            return selected
-                        except Exception as e2:
-                            try:
-                                telemetry.capture_exception(e2)
-                                print_exception(exception=e2)
-                            except Exception:
-                                pass
-                            try:
-                                print_info_debug(
-                                    f"[DEBUG] Retry with TERM='{alt_term}' failed: {type(e2).__name__}: {e2}"
-                                )
-                            except Exception:
-                                pass
-                        finally:
-                            if original_term:
-                                os.environ["TERM"] = original_term
-                            else:
-                                os.environ.pop("TERM", None)
-            except Exception:
-                pass
-            return _fallback_selection()
-        return selected
-
     def _questionary_select(
         self,
         title: str,
@@ -9768,8 +9634,6 @@ class PentestShell:
     ):
         """Interactive menu using Questionary to choose an option.
         Returns the index of the selected option or None if cancelled.
-
-        This is a drop-in replacement for _curses_select with a modern UI.
 
         Args:
             title (str): Prompt/question text to display
@@ -13333,17 +13197,12 @@ class PentestShell:
         This helper is used by the `session` command to present sensible
         LHOST candidates when generating payloads or listing interfaces.
         """
+        from adscan_core.pal import net as pal_net
+
         ip_to_iface: dict[str, str] = {}
         try:
-            for iface in netifaces.interfaces():
-                try:
-                    addresses = netifaces.ifaddresses(iface)
-                except ValueError:
-                    # Interface disappeared between listing and lookup
-                    continue
-                inet_addresses = addresses.get(netifaces.AF_INET) or []
-                for addr in inet_addresses:
-                    ip = addr.get("addr")
+            for iface in pal_net.interface_names():
+                for ip in pal_net.interface_ipv4_addresses_for(iface):
                     if not ip or ip.startswith("127."):
                         continue
                     ip_to_iface[ip] = iface
@@ -14931,15 +14790,27 @@ class PentestShell:
                 apply_telemetry_setting(self, request)
 
             elif variable == "username":
-                self.domains_data[self.domain]["username"] = value
-                marked_username_1 = mark_sensitive(
-                    self.domains_data[self.domain]["username"], "user"
-                )
+                if self.domain is None:
+                    print_error(
+                        "No domain is configured yet. Configure a domain first: "
+                        "set domain <fqdn>"
+                    )
+                    return
+                domain_entry = self.domains_data.setdefault(self.domain, {})
+                domain_entry["username"] = value
+                marked_username_1 = mark_sensitive(domain_entry["username"], "user")
                 print_success(f"User configured: {marked_username_1}")
             elif variable == "password":
-                self.domains_data[self.domain]["password"] = value
+                if self.domain is None:
+                    print_error(
+                        "No domain is configured yet. Configure a domain first: "
+                        "set domain <fqdn>"
+                    )
+                    return
+                domain_entry = self.domains_data.setdefault(self.domain, {})
+                domain_entry["password"] = value
                 marked_username_1 = mark_sensitive(
-                    self.domains_data[self.domain]["username"], "user"
+                    domain_entry.get("username"), "user"
                 )
                 print_success(
                     f"Password for user {marked_username_1} configured."
@@ -15266,48 +15137,6 @@ class PentestShell:
         from adscan_internal.cli.workspaces import workspace_select
 
         workspace_select(self)
-
-    def select_workspace_curses(self, stdscr, workspaces):
-        """Curses function to select a workspace."""
-        curses.curs_set(0)  # Hide the cursor
-        stdscr.clear()
-
-        selected_index = 0
-        num_workspaces = len(workspaces)
-
-        while True:
-            stdscr.clear()
-            stdscr.addstr(0, 0, "Select a workspace using the arrow keys and Enter:\n")
-
-            for idx, ws in enumerate(workspaces):
-                if idx == selected_index:
-                    stdscr.addstr(idx + 1, 0, f"> {ws}", curses.A_REVERSE)
-                else:
-                    stdscr.addstr(idx + 1, 0, f" {ws}")
-
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == curses.KEY_UP:
-                selected_index = (selected_index - 1) % num_workspaces
-            elif key == curses.KEY_DOWN:
-                selected_index = (selected_index + 1) % num_workspaces
-            elif key == curses.KEY_ENTER or key in [10, 13]:
-                from adscan_internal.workspaces import activate_workspace
-
-                activate_workspace(
-                    self,
-                    workspaces_dir=self.workspaces_dir,
-                    workspace_name=workspaces[selected_index],
-                )
-                self.load_workspace_data(self.current_workspace_dir)
-                # stdscr.addstr(num_workspaces + 2, 0, f"Workspace '{self.current_workspace}' selected.") # Curses will exit
-                # stdscr.refresh()
-                # stdscr.getch() # Wait for a key press before exiting curses mode
-                break
-        # After curses wrapper finishes, print success message using Rich
-        marked_current_workspace_1 = mark_sensitive(self.current_workspace, "workspace")
-        print_success(f"Workspace '{marked_current_workspace_1}' selected.")
 
     def workspace_show(self):
         """Displays detailed information about the current workspace using a Rich Panel."""
@@ -18372,6 +18201,62 @@ class PentestShell:
             ccache_path=ccache_path if isinstance(ccache_path, str) else None,
         )
 
+    def _resume_stored_credential_is_revoked(self, domain: str) -> bool:
+        """Return True (and print a clean line) when a resumed scan's stored credential is revoked.
+
+        Only fires on a RESUMED scan (``_workspace_action == "resume"``) that
+        carries a stored domain credential for the effective user. Verifies that
+        credential once through :meth:`verify_domain_credentials`, which routes
+        KDC_ERR_CLIENT_REVOKED through the credential-service classifier and
+        disambiguates locked vs disabled. On a definitive account-locked /
+        account-disabled verdict it prints one actionable line and returns True so
+        the caller aborts before any raw re-authentication (no tracebacks). Any
+        other outcome (valid, transient error, no stored credential, or a
+        first-run scan) returns False and the normal flow proceeds unchanged.
+
+        Best-effort: never raises into the caller.
+        """
+        try:
+            from adscan_internal.cli.common import (
+                resolve_effective_username_for_domain,
+            )
+            from adscan_internal.services.credential_service import CredentialStatus
+
+            domain_data = self.domains_data.get(domain) or {}
+            if domain_data.get("_workspace_action") != "resume":
+                return False
+
+            user = resolve_effective_username_for_domain(self, domain, default="")
+            if not user:
+                return False
+
+            cred_map = domain_data.get("credentials")
+            cred_value = cred_map.get(user) if isinstance(cred_map, dict) else None
+            if not cred_value:
+                return False
+
+            # Verify silently through the classifier SSOT. It prints the clean
+            # locked/disabled/etc. line itself; we only add the actionable
+            # follow-up for the genuinely-unrecoverable revoked verdicts.
+            self.verify_domain_credentials(domain, user, cred_value)
+            result = self._last_domain_credential_verification_result
+            status = getattr(result, "status", None)
+            if status in (
+                CredentialStatus.ACCOUNT_LOCKED,
+                CredentialStatus.ACCOUNT_DISABLED,
+            ):
+                marked_user = mark_sensitive(user, "user")
+                print_error(
+                    f"The stored credential for '{marked_user}' is now locked or "
+                    "disabled at the KDC and cannot be used to resume this scan. "
+                    "Save a fresh credential and re-run."
+                )
+                return True
+        except Exception as exc:  # noqa: BLE001 — the guard must never break the flow.
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        return False
+
     def do_enum_authenticated(self, domain):
         """
         Initializes the enumeration of an authenticated domain, i.e., using valid user credentials.
@@ -18385,6 +18270,22 @@ class PentestShell:
             domain (str): The name of the domain to enumerate.
         """
         domain = resolve_repl_domain_or_default(self, domain) or ""
+
+        # Resume guard — a stored credential can be REVOKED between runs.
+        # On a resumed scan the credential was persisted by a prior session and
+        # may now be locked/disabled at the KDC (an admin rotated/disabled the
+        # account, a lockout policy tripped). Re-running authenticated
+        # enumeration with it makes every transport (Kerberos AS-REQ → LDAP bind
+        # → SMB) fail raw with KDC_ERR_CLIENT_REVOKED / SEC_E_LOGON_DENIED, which
+        # surfaced to a paying customer as full tracebacks instead of a clear
+        # line. Verify ONCE through the credential-service classifier (the SSOT
+        # for KDC_ERR_CLIENT_REVOKED → locked/disabled disambiguation): on a
+        # definitive account-locked/disabled verdict, print one actionable line
+        # and stop before any raw re-auth. This is presentation + classification,
+        # NOT recovery — a revoked account cannot be fixed client-side.
+        if self._resume_stored_credential_is_revoked(domain):
+            return
+
         # Posture freshness guard — convergence point for both Scenario A
         # (start_auth with explicit creds) and Scenario B (start_unauth
         # discovered creds via add_credential). Idempotent: no-op when posture
@@ -24592,7 +24493,7 @@ class PentestShell:
                 else:
                     marked_username = mark_sensitive(username, "user")
                     respuesta = Confirm.ask(
-                        f"Do you want to enumerate post-auth service access for user {marked_username}?"
+                        f"Do you want to enumerate post-auth service access for user {marked_username}?", default=True
                     )
                     if respuesta:  # Prompt.ask for (y/n) returns boolean
                         self.user_postauth_access(domain, username, password)
@@ -25396,7 +25297,15 @@ class PentestShell:
             effective_group=effective_group,
         )
 
-    def adcs_golden_cert(self, domain, username, password, ca_target_host=None):
+    def adcs_golden_cert(
+        self,
+        domain,
+        username,
+        password,
+        ca_target_host=None,
+        auth_domain=None,
+        auth_kdc=None,
+    ):
         """Wrapper for AD CS ESC5 (CA key theft and certificate forge) exploitation."""
         from adscan_internal.cli.adcs_exploitation import (
             adcs_golden_cert as _adcs_golden_cert,
@@ -25408,6 +25317,8 @@ class PentestShell:
             username=username,
             password=password,
             ca_target_host=ca_target_host,
+            auth_domain=auth_domain,
+            auth_kdc=auth_kdc,
         )
 
     def make_template_vulnerable(self, domain, username, password, command, template):
@@ -29177,7 +29088,7 @@ class PentestShell:
         the command with ``sudo`` and disables output capture so the sudo password
         prompt is visible to the user.
         """
-        if os.geteuid() == 0:
+        if pal_process.effective_user_is_root():
             return self.run_command(
                 command,
                 timeout=timeout,
@@ -29227,7 +29138,7 @@ class PentestShell:
                 return True
             if os.path.exists(path):
                 return True
-            if os.geteuid() == 0:
+            if pal_process.effective_user_is_root():
                 os.makedirs(path, exist_ok=True)
                 return True
             result = self._run_privileged_command(
@@ -29314,7 +29225,7 @@ class PentestShell:
                 if not self._ensure_system_dir(parent):
                     return False
 
-            if os.geteuid() == 0:
+            if pal_process.effective_user_is_root():
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
                 os.chmod(path, mode)
@@ -29354,7 +29265,7 @@ class PentestShell:
         try:
             if not os.path.exists(path):
                 return True
-            if os.geteuid() == 0:
+            if pal_process.effective_user_is_root():
                 os.remove(path)
                 return True
             result = self._run_privileged_command(
@@ -29642,7 +29553,17 @@ class PentestShell:
         When ``dns_a_records`` is provided, the resolver service refuses to write
         a line whose IP is not one of the domain's own A-records (defense-in-depth
         against the cross-domain leak). Legacy callers pass nothing → unchanged.
+
+        Windows-native: there is no /etc/hosts and the host already resolves AD
+        names through its own configured DNS (typically the DC); downstream IP
+        resolution goes through resolve_host_address / resolve_dc_ip regardless.
+        This is the single chokepoint for every /etc/hosts write, so gating it
+        here neutralizes all callers at once and avoids the POSIX sudo path.
         """
+        from adscan_core.pal.platform import is_windows
+
+        if is_windows():
+            return True
         try:
             service = self._get_dns_resolver_service()
             return service.add_hosts_entry(
@@ -30120,11 +30041,15 @@ class PentestShell:
         # the dashboard picks up workspace changes the moment
         # ``workspace_select`` runs.
         #
-        # Environment label resolved once at process start; we mirror
-        # the value the legacy path computes in capture_session_end.
-        environment = (
-            os.getenv("ADSCAN_SESSION_ENV") or os.getenv("ADSCAN_ENV") or "prod"
-        ).strip().lower() or "prod"
+        # Environment label resolved once at process start through the SAME
+        # detector the legacy ``capture_session_end`` metadata path uses, so the
+        # streamed chunks and the assembled recording never disagree. The
+        # detector already folds in CI detection, dev-machine-id detection, and
+        # the ADSCAN_SESSION_ENV/ADSCAN_ENV manual override internally (and
+        # refuses to force "prod" on a known dev machine). Resolving env-vars
+        # only here previously bypassed the dev-machine detection and uploaded
+        # dev runs bucketed as "prod", polluting the prod review queue.
+        environment = (_determine_session_environment() or "prod").strip().lower() or "prod"
 
         started_at_dt = datetime.now(timezone.utc)
         session_started_monotonic = time.monotonic()
@@ -31688,11 +31613,13 @@ def _print_check_summary(all_ok: bool):
     from rich.panel import Panel
     from rich.text import Text
 
+    from adscan_core.pal.platform import is_windows
     from adscan_internal import create_status_table, reset_spacing
     from adscan_internal.cli.check import get_check_failure_recovery_guidance
     from adscan_internal.theme import ADSCAN_PRIMARY
 
     full_container_runtime = _is_full_adscan_container_runtime()
+    windows_native = is_windows() and not full_container_runtime
 
     # Build status items for create_status_table
     status_items = []
@@ -31704,6 +31631,19 @@ def _print_check_summary(all_ok: bool):
                 "name": "Python Virtual Env",
                 "status": "success",
                 "details": "Not required (ADscan Docker runtime)",
+            }
+        )
+    elif windows_native:
+        # Windows-native runs the engine in-process; the running interpreter IS
+        # the runtime, there is no managed ~/.adscan/venv.
+        running_version = (
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        )
+        status_items.append(
+            {
+                "name": "Python Virtual Env",
+                "status": "success",
+                "details": f"Not required (Windows-native runtime, Python {running_version})",
             }
         )
     else:
@@ -31840,8 +31780,32 @@ def _build_update_context(
     )
 
 
+def _handle_windows_update_noop() -> int:
+    """Handle `adscan update`/`upgrade` on Windows-native as a clean no-op.
+
+    On Windows there is no ADscan Docker image and no pip package to upgrade —
+    the runtime ships as a self-contained bundle. So this prints the running
+    version and points the user at the official download page for the latest
+    build, then returns success. It performs NO Docker or pip operation. Self-
+    update is intentionally not implemented (see docs/superpowers/specs/
+    2026-09-03-windows-native-runtime-portability-design.md).
+    """
+    license_mode = _resolve_license_mode(requested_pro=False)
+    print_info(f"ADscan {_format_runtime_version_tag(license_mode)}")
+    print_instruction(
+        "Windows-native builds do not self-update. Download the latest version "
+        f"from {cta_display_url('windows_update_download')}"
+    )
+    return 0
+
+
 def _maybe_offer_adscan_upgrade(command: str | None = None) -> None:
     """Offer to upgrade ADscan before running any other checks."""
+    # Windows-native has no updatable image/package; skip the upgrade offer.
+    from adscan_core.pal.platform import is_windows
+
+    if is_windows():
+        return
     offer_updates_for_command(_build_update_context(), command or "unknown")
 
 
@@ -31999,6 +31963,25 @@ def _questionary_select_standalone(title: str, options: list, default_idx: int =
         return options.index(chosen) if chosen in options else default_idx
     except Exception:
         return default_idx
+
+
+def _should_use_docker_mode() -> bool:
+    """Whether a host invocation should launch the containerized runtime.
+
+    ADscan has two direct-execution deployments that must run the engine
+    IN-PROCESS (never "docker mode"):
+
+    - inside the Linux container (`is_docker_env()` is True); and
+    - on Windows-native, where there is no Docker launcher or runtime image by
+      design (see docs/superpowers/specs/2026-09-03-windows-native-runtime-
+      portability-design.md) — the engine runs from adscan.py / adscan.exe.
+
+    On a POSIX host outside the container this returns True, so the command
+    dispatch launches the container exactly as before.
+    """
+    from adscan_core.pal.platform import is_windows
+
+    return not is_docker_env() and not is_windows()
 
 
 def handle_ci(args):
@@ -32333,6 +32316,11 @@ if __name__ == "__main__":
     import multiprocessing
 
     multiprocessing.freeze_support()
+
+    # Force UTF-8 on the Windows console before ANY output — the legacy cp1252
+    # code page cannot encode the Unicode glyphs (✓ ✗ ▰ …) Rich prints, and an
+    # unhandled UnicodeEncodeError would abort the CLI. No-op on POSIX.
+    _ensure_utf8_console()
 
     init_sentry()
     _cleanup_legacy_adscan_sudo_alias()
@@ -32810,7 +32798,9 @@ if __name__ == "__main__":
         install_success = False
         installation_mode = "unknown"
         try:
-            use_docker_mode = not is_docker_env()
+            # Route through the shared predicate so Windows-native (no Docker by
+            # design) installs in-process, exactly like check/ci/start.
+            use_docker_mode = _should_use_docker_mode()
             if use_docker_mode:
                 # Track Docker mode selection
                 installation_mode = "docker"
@@ -32848,7 +32838,7 @@ if __name__ == "__main__":
             )
         sys.exit(0 if install_success else 1)
     elif args.command == "start":
-        use_docker_mode = not is_docker_env()
+        use_docker_mode = _should_use_docker_mode()
         if use_docker_mode:
             exit_code = _handle_start_docker_mode(
                 verbose=bool(getattr(args, "verbose", False)),
@@ -32866,7 +32856,7 @@ if __name__ == "__main__":
         check_success = False
         use_docker_mode = False
         try:
-            use_docker_mode = not is_docker_env()
+            use_docker_mode = _should_use_docker_mode()
             if use_docker_mode:
                 check_success = _handle_check_docker_mode()
                 _LAST_CHECK_SESSION_EXTRA = {"mode": "docker"}
@@ -32883,6 +32873,12 @@ if __name__ == "__main__":
                 )
         sys.exit(0 if check_success else 1)
     elif args.command in ("update", "upgrade"):
+        from adscan_core.pal.platform import is_windows
+
+        if is_windows():
+            # Windows-native: no image, no pip package. Clean no-op.
+            sys.exit(_handle_windows_update_noop())
+
         pull_timeout_arg = getattr(args, "pull_timeout", None)
         docker_pull_timeout_seconds: int | None
         if pull_timeout_arg is None:
@@ -32907,7 +32903,7 @@ if __name__ == "__main__":
         print(f"ADscan {_format_runtime_version_tag(license_mode)}")
         sys.exit(0)
     elif args.command == "ci":
-        use_docker_mode = not is_docker_env()
+        use_docker_mode = _should_use_docker_mode()
         if use_docker_mode:
             exit_code = _handle_ci_docker_mode(
                 mode=str(getattr(args, "mode", "")),

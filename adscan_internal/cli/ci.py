@@ -706,6 +706,17 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     if created_workspace and not getattr(args, "keep_workspace", False):
         try:
+            # Release the workspace-scoped log file handles before removing the
+            # directory. On Windows a file with an open handle (the workspace
+            # <ws>/logs/adscan.debug.log RotatingFileHandler) cannot be deleted
+            # (WinError 32); POSIX tolerates it, but detaching first is correct
+            # on every OS.
+            try:
+                from adscan_core.logging_config import update_workspace_logging
+
+                update_workspace_logging(None)
+            except Exception:  # noqa: BLE001 — best-effort; never block cleanup
+                pass
             shutil.rmtree(shell.current_workspace_dir)
             marked_current_workspace_1 = mark_sensitive(
                 shell.current_workspace, "workspace"

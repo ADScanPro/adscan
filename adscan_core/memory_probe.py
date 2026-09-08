@@ -21,15 +21,16 @@ Sources, in order of preference for the container ceiling:
 3. Fallback — ``MemAvailable`` from ``/proc/meminfo`` (a HOST figure, not a
    container ceiling — the returned ``source`` says so).
 
-Current RSS is read from ``/proc/self/status`` (``VmRSS``), falling back to
-``resource.getrusage`` (``ru_maxrss``, a high-water mark, not live RSS).
+Current RSS is read from ``/proc/self/status`` (``VmRSS``), falling back to the
+PAL peak-RSS reader (``ru_maxrss`` on POSIX, a high-water mark, not live RSS).
 """
 
 from __future__ import annotations
 
-import resource
 from dataclasses import dataclass
 from typing import Optional
+
+from adscan_core.pal.process import peak_rss_bytes
 
 # cgroup v2 unified-hierarchy mount root + the limit/usage file names within a
 # cgroup directory. The process's OWN cgroup is resolved from ``/proc/self/cgroup``
@@ -219,23 +220,21 @@ def _read_mem_available() -> Optional[int]:
 def read_process_rss_bytes() -> Optional[int]:
     """Return current process RSS in bytes, best-effort.
 
-    Prefers ``/proc/self/status`` (``VmRSS``, live RSS). Falls back to
-    ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` (a high-water mark, in KiB on
-    Linux) when the status file is unavailable. Returns ``None`` when neither is
-    readable.
+    Prefers ``/proc/self/status`` (``VmRSS``, live RSS). Falls back to the PAL
+    peak-RSS reader (``resource.getrusage(RUSAGE_SELF).ru_maxrss`` on POSIX, a
+    high-water mark; ``psutil`` on Windows) when the status file is unavailable.
+    Returns ``None`` when neither is readable.
     """
     raw = _read_text(_PROC_SELF_STATUS)
     if raw is not None:
         vmrss = _parse_meminfo_kb(raw, "VmRSS:")
         if vmrss is not None:
             return vmrss
-    try:
-        # ru_maxrss is in kilobytes on Linux.
-        maxrss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if isinstance(maxrss_kb, int) and maxrss_kb > 0:
-            return maxrss_kb * 1024
-    except (OSError, ValueError):
-        pass
+    # High-water mark (peak RSS in bytes) via the PAL process seam — POSIX reads
+    # ``resource.getrusage``, Windows falls back to ``psutil`` / ``None``.
+    peak = peak_rss_bytes()
+    if isinstance(peak, int) and peak > 0:
+        return peak
     return None
 
 

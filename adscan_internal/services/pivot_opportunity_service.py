@@ -77,6 +77,17 @@ LIVE_SERVICE_UNREACHABLE_STATUSES = frozenset(
     }
 )
 
+# Substring that identifies the "no Ligolo proxy configured" RuntimeError raised
+# by ``LigoloProxyService._get_api_base_url`` when a pivot API call is attempted
+# with no proxy running. The pivot-offer seam catches exactly this condition and
+# translates it into actionable operator guidance instead of a raw traceback.
+_LIGOLO_PROXY_UNAVAILABLE_MARKER = "proxy API address is not available"
+
+# Per-session guard so the "no pivot configured" guidance is shown at most once
+# per blocked target, even when several attack paths share the same unreachable
+# host and the executor re-enters the pivot-offer seam for each one.
+_PIVOT_UNAVAILABLE_NOTICE_SHOWN: set[tuple[str, str]] = set()
+
 
 @dataclass(frozen=True, slots=True)
 class PivotProbeCandidate:
@@ -237,13 +248,46 @@ def maybe_offer_pivot_opportunity_for_host_viability(
     summary = str(operator_summary or "").strip()
     if summary:
         print_info(summary)
-    maybe_offer_pivot_opportunity_followup(
-        shell,
-        domain=domain,
-        blocked_target=blocked_target,
-        workflow_intent_override=workflow_intent_override,
-    )
+    try:
+        maybe_offer_pivot_opportunity_followup(
+            shell,
+            domain=domain,
+            blocked_target=blocked_target,
+            workflow_intent_override=workflow_intent_override,
+        )
+    except RuntimeError as exc:
+        if _LIGOLO_PROXY_UNAVAILABLE_MARKER not in str(exc):
+            raise
+        _notify_no_pivot_proxy_configured(
+            domain=domain, blocked_target=blocked_target
+        )
     return True
+
+
+def _notify_no_pivot_proxy_configured(*, domain: str, blocked_target: str) -> None:
+    """Emit actionable guidance, once per target, when no pivot proxy exists.
+
+    Pursuing a pivot for an unreachable host reaches into the Ligolo-ng proxy
+    API. When no proxy is running that call raises a ``RuntimeError`` the
+    executor would otherwise surface as a bare error line (repeated once per
+    attack path sharing the target). This replaces it with a single clear,
+    operator-facing next step.
+    """
+
+    notice_key = (str(domain or "").strip().lower(), str(blocked_target or "").strip().lower())
+    if notice_key in _PIVOT_UNAVAILABLE_NOTICE_SHOWN:
+        print_info_debug(
+            "pivot-opportunity: suppressing repeated no-pivot notice: "
+            f"target={mark_sensitive(blocked_target, 'hostname')}"
+        )
+        return
+    _PIVOT_UNAVAILABLE_NOTICE_SHOWN.add(notice_key)
+    marked_target = mark_sensitive(blocked_target or "the target host", "hostname")
+    print_warning(
+        f"No Ligolo pivot is configured for this workspace, and {marked_target} is not "
+        "reachable from your current vantage. To pursue this path, start a pivot with "
+        "'ligolo proxy start', deploy an agent on a reachable host, then retry this step."
+    )
 
 
 def ensure_host_bound_workflow_target_viable(

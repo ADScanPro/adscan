@@ -11,9 +11,9 @@ orchestration and user experience.
 
 from __future__ import annotations
 
+import importlib
 import os
 import platform
-import pty
 import re
 import shlex
 import shutil
@@ -547,15 +547,24 @@ def run_docker_stream(
         cmd = ["sudo", f"--preserve-env={preserve_env}"] + cmd
 
     use_pty = bool(sys.stdout.isatty() and sys.stdin.isatty() and not os.getenv("CI"))
+    pty_module = None
+    if use_pty:
+        # ``pty`` is POSIX-only (absent on Windows). Load it lazily so this module
+        # imports cleanly off-platform; if it is unavailable, fall back to the
+        # no-PTY pipe path below (Docker just loses its rich progress UI).
+        try:
+            pty_module = importlib.import_module("pty")
+        except ImportError:
+            use_pty = False
     # Streams to the terminal but returns its output tail to the caller, so the
     # launcher outlives it — not a handoff. (Today this only carries
     # ``docker pull``, which the argv gate ignores anyway.)
     _fire_pre_container_exec_hook(cmd, surrenders_terminal=False)
-    if use_pty:
+    if use_pty and pty_module is not None:
         # If we pipe stdout/stderr, Docker disables its rich progress UI because it
         # thinks it's not attached to a TTY. Use a PTY in interactive sessions so
         # users see Docker's native progress rendering.
-        master_fd, slave_fd = pty.openpty()
+        master_fd, slave_fd = pty_module.openpty()
         proc = subprocess.Popen(  # noqa: S603
             cmd,
             stdout=slave_fd,

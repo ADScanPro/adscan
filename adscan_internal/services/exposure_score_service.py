@@ -1016,6 +1016,7 @@ def compute_exposure_kpis(
     domain_users: Sequence[str] | None = None,
     excluded_users: Sequence[str] | None = None,
     population_tier_breakdown: Mapping[str, Any] | None = None,
+    reachability: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Compute the exposure KPI block (path-axis + user-axis blast radius).
 
@@ -1059,6 +1060,10 @@ def compute_exposure_kpis(
             consumed by the privilege-sprawl figure, which is what makes
             excluding the already-privileged accounts from the path figure
             defensible rather than a way of hiding them.
+        reachability: Optional reachable-terminal summary (from
+            ``summarize_reachable_terminals``). When supplied, stamped verbatim
+            as the ``"reachability"`` key; ``None`` leaves the key absent.
+            Additive — never affects ``path_axis`` / ``user_axis``.
 
     Returns:
         The ``exposure_kpis`` dict persisted verbatim under
@@ -1263,6 +1268,8 @@ def compute_exposure_kpis(
             bucket: max(0, int(population_tier_breakdown.get(bucket, 0) or 0))
             for bucket in ("tier0", "tier0_direct", "tier1", "tier2")
         }
+    if reachability is not None:
+        block["reachability"] = dict(reachability)
     return block
 
 

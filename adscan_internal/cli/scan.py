@@ -1087,7 +1087,7 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         resolved_ip = address.resolved_ip
         if not resolved_ip:
             print_info_debug(
-                f"unauth-guest: dropping target {target} — could not resolve to an IP."
+                f"unauth-guest: dropping target {mark_sensitive(target, 'ip')} — could not resolve to an IP."
             )
             continue
         if resolved_ip in seen_ips:

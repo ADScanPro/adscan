@@ -13,18 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Protocol
-import ipaddress
 import platform
 import re
 import shlex
 
-from adscan_internal import telemetry
 from adscan_internal.services.async_bridge import run_async_sync
 from adscan_internal.services.network_probe_service import (
     tcp_probe,
     tcp_probe_batch,
 )
-from adscan_core.rich_output import print_exception
 
 
 # Canonical TCP port set for judging whether a target IP is a reachable DC.
@@ -94,29 +91,14 @@ class TargetReachabilityAssessment:
 
 
 def get_interface_ipv4_addresses(interface: str) -> list[str]:
-    """Return IPv4 addresses configured on an interface."""
-    if not interface:
-        return []
-    try:
-        import netifaces
+    """Return IPv4 addresses configured on an interface.
 
-        addresses = netifaces.ifaddresses(interface)
-        inet_addresses = addresses.get(netifaces.AF_INET) or []
-        values: list[str] = []
-        for entry in inet_addresses:
-            candidate = str(entry.get("addr", "")).strip()
-            if not candidate:
-                continue
-            try:
-                ipaddress.ip_address(candidate)
-            except ValueError:
-                continue
-            values.append(candidate)
-        return values
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return []
+    Delegates to the PAL network seam (``netifaces`` on POSIX, ``psutil`` on
+    Windows). The seam is best-effort and returns an empty list on any error.
+    """
+    from adscan_core.pal import net as pal_net
+
+    return pal_net.interface_ipv4_addresses_for(interface)
 
 
 # Substrings that mean "the route tool itself could not run" (binary absent),

@@ -385,6 +385,12 @@ class TechniquePriority:
     max_choke_point_severity: str
     #: Strongest exploitation evidence among the affected paths (3 proven … 1 none).
     max_status_weight: int
+    #: Identifier of the node this technique's top choke point maps to, best-effort
+    #: — the object a client would fix. Taken from the max-blast affected path's
+    #: ``top_choke_point`` (its ``node_id`` when present, else ``source_label``).
+    #: Empty when no affected path carried a choke record. Used only to attach the
+    #: structural-choke durability badge; it never sets order.
+    top_choke_point_id: str
     remediation_complexity: str
     remediation_complexity_rank: int
     remediation_effort: str
@@ -507,12 +513,24 @@ def compute_technique_priorities(
         principal = _path_principal(path)
 
         choke_point = path.get("top_choke_point")
+        choke_id = ""
         if isinstance(choke_point, Mapping):
             try:
                 blast = int(choke_point.get("blast_radius") or 1)
             except (TypeError, ValueError):
                 blast = 1
-            choke_severity = str(choke_point.get("severity") or "medium").strip().lower()
+            choke_severity = (
+                str(choke_point.get("severity") or "medium").strip().lower()
+            )
+            # The object a client would fix: an explicit node id when the graph
+            # stamped one, else the choke's source label. Carried through so the
+            # report can attach the structural-choke durability badge — it never
+            # affects ordering.
+            for _id_key in ("node_id", "source_label"):
+                _id_val = choke_point.get(_id_key)
+                if isinstance(_id_val, str) and _id_val.strip():
+                    choke_id = _id_val.strip()
+                    break
         else:
             blast = 1
             choke_severity = "medium"
@@ -537,6 +555,7 @@ def compute_technique_priorities(
                     "max_choke_severity": "low",
                     "max_evidence": 0,
                     "sample_step": None,
+                    "top_choke_point_id": "",
                 }
                 accumulators[technique] = state
 
@@ -548,6 +567,12 @@ def compute_technique_priorities(
             if status == "exploited":
                 state["exploited_paths"] += 1
             state["worst_severity"] = min(state["worst_severity"], severity)
+            # The choke id follows the max-blast path: the widest-blast choke is
+            # the one whose durability badge is worth surfacing.
+            if blast > state["max_blast"] and choke_id:
+                state["top_choke_point_id"] = choke_id
+            elif not state["top_choke_point_id"] and choke_id:
+                state["top_choke_point_id"] = choke_id
             state["max_blast"] = max(state["max_blast"], blast)
             if _SEVERITY_WEIGHT.get(choke_severity, 0) > _SEVERITY_WEIGHT.get(
                 state["max_choke_severity"], 0
@@ -569,7 +594,10 @@ def compute_technique_priorities(
             sample = state["sample_step"]
             if sample is None or not isinstance(sample.get("details"), Mapping):
                 for step in step_list:
-                    if not isinstance(step, Mapping) or _step_action(step).lower() != technique:
+                    if (
+                        not isinstance(step, Mapping)
+                        or _step_action(step).lower() != technique
+                    ):
                         continue
                     verdict = remediability_for_step(step)
                     if verdict is not None and not verdict.is_remediable:
@@ -601,6 +629,7 @@ def compute_technique_priorities(
                 max_blast_radius=int(state["max_blast"]),
                 max_choke_point_severity=str(state["max_choke_severity"]),
                 max_status_weight=int(state["max_evidence"]),
+                top_choke_point_id=str(state["top_choke_point_id"]),
                 remediation_complexity=str(metadata["remediation_complexity"]),
                 remediation_complexity_rank=complexity_rank(
                     str(metadata["remediation_complexity"])

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 from typing import Any, Dict
+from adscan_core.pal.process import current_user_name, effective_user_is_root
 from adscan_core.rich_output import print_exception
 
 
@@ -508,18 +509,11 @@ def check_executable_help_works(
                 os.makedirs(manspider_logs_dir, exist_ok=True)
 
                 # Prefer fixing ownership to the effective invoking user.
-                import pwd
+                current_name = current_user_name()
+                target_user = os.environ.get("SUDO_USER") or current_name
+                target_group = current_name
 
-                target_user = (
-                    os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
-                )
-                target_group = None
-                try:
-                    target_group = pwd.getpwuid(os.getuid()).pw_name
-                except Exception:
-                    target_group = None
-
-                if os.geteuid() == 0:
+                if effective_user_is_root():
                     deps.run_command(
                         [
                             "chown",
@@ -589,18 +583,11 @@ def check_executable_help_works(
                 )
                 continue
             try:
-                import pwd
+                current_name = current_user_name()
+                target_user = os.environ.get("SUDO_USER") or current_name
+                target_group = current_name
 
-                target_user = (
-                    os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
-                )
-                target_group = None
-                try:
-                    target_group = pwd.getpwuid(os.getuid()).pw_name
-                except Exception:
-                    target_group = None
-
-                if os.geteuid() == 0:
+                if effective_user_is_root():
                     # Running as root: fix directly.
                     deps.run_command(
                         [

@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from adscan_core import telemetry
+from adscan_core.pal import auth as pal_auth
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.domain_posture import (
     ConstraintCategory,
@@ -582,32 +583,19 @@ class WinRMPSRPService:
         previous = os.environ.get("KRB5CCNAME")
         previous_gssapi_ccache: bytes | None = None
         gssapi_ccache_set = False
+        # KRB5CCNAME is the load-bearing pointer (pyspnego's GSSAPI backend on
+        # POSIX and badauth both read it); set it cross-platform. The gssapi
+        # default-cache swap is a POSIX-only defensive nudge routed through the
+        # pal.auth seam — a no-op on Windows, where pyspnego uses SSPI.
         os.environ["KRB5CCNAME"] = krb5ccname_value
-        try:
-            from gssapi.raw.ext_krb5 import krb5_ccache_name  # type: ignore[import]  # pylint: disable=no-name-in-module
-
-            previous_gssapi_ccache = krb5_ccache_name(krb5ccname_value.encode("utf-8"))
-            gssapi_ccache_set = True
-        except Exception as exc:  # pragma: no cover - optional runtime dependency
-            print_info_debug(
-                "[winrm_psrp] unable to set thread-local GSSAPI ccache; "
-                f"falling back to KRB5CCNAME only: {mark_sensitive(str(exc), 'text')}"
-            )
+        gssapi_ccache_set, previous_gssapi_ccache = pal_auth.swap_gssapi_default_ccache(
+            krb5ccname_value
+        )
         try:
             yield
         finally:
             if gssapi_ccache_set:
-                try:
-                    from gssapi.raw.ext_krb5 import krb5_ccache_name  # type: ignore[import]  # pylint: disable=no-name-in-module
-
-                    krb5_ccache_name(previous_gssapi_ccache)
-                except (
-                    Exception
-                ) as exc:  # pragma: no cover - optional runtime dependency
-                    print_info_debug(
-                        "[winrm_psrp] unable to restore thread-local GSSAPI ccache: "
-                        + mark_sensitive(str(exc), "text")
-                    )
+                pal_auth.restore_gssapi_default_ccache(previous_gssapi_ccache)
             if previous is None:
                 os.environ.pop("KRB5CCNAME", None)
             else:

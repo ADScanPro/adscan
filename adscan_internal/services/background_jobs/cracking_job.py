@@ -10,6 +10,7 @@ The runtime keys on an explicit hashcat ``mode`` string (not the old NetNTLM-onl
 ``ntlm_version`` assumption). ``ntlm_version`` is still accepted as a
 backward-compatible way to derive the NetNTLM mode for existing callers.
 """
+
 from __future__ import annotations
 
 import json
@@ -187,6 +188,7 @@ def _repl_reserved_cores(cpu_count: int) -> int:
     if cpu_count <= _SMALL_HOST_CORE_THRESHOLD:
         return _REPL_RESERVED_CORES_SMALL
     return _REPL_RESERVED_CORES_LARGE
+
 
 # Crack subprocess bounding. A crack must run until it cracks the hash, exhausts
 # its wordlist x rules keyspace, or is stopped — it must NEVER be killed while it
@@ -422,10 +424,145 @@ def _emit_last_status(crack_result: Any, status_sink: StatusSink) -> None:
         print_exception(exception=exc)
 
 
+def _hashcat_backend_no_device(shell: Any) -> bool:
+    """Return whether hashcat is present but exposed no usable compute device.
+
+    Best-effort probe reusing the interactive backend selector so the two paths
+    agree on "hashcat cannot run here". Any failure resolves to ``False`` (assume
+    a device is available) so a probe error never suppresses a real hashcat crack.
+    """
+    try:
+        from adscan_internal.cli.cracking import (  # noqa: PLC0415
+            _HASHCAT_UNAVAILABLE_NO_DEVICE,
+            _select_hashcat_backend,
+        )
+
+        selection = _select_hashcat_backend(shell)
+        return (not selection.is_available) and (
+            selection.unavailable_reason == _HASHCAT_UNAVAILABLE_NO_DEVICE
+        )
+    except Exception as exc:  # noqa: BLE001 -- probe is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
+def _run_john_cpu_tier(shell: Any, hash_file: str, wordlist: str, mode: str) -> dict:
+    """Run one John (CPU) crack pass for the background path via the shared engine.
+
+    The background analog of the interactive Windows-only John fallback: crack a
+    multi-principal roast/NetNTLM capture on pure CPU when hashcat has no device.
+    Routes through the capability-driven selector so BOTH the background and the
+    interactive paths dispatch John through the SAME
+    :class:`~adscan_internal.services.cracking.john_engine.JohnEngine` behind one
+    selector — no per-path John command construction. Returns ``{username:
+    password}`` for every recovered principal (empty on no match / unsupported
+    mode / John unavailable). Never raises.
+    """
+    from adscan_internal.services.cracking.engine_selection import (  # noqa: PLC0415
+        select_crack_engine,
+    )
+    from adscan_internal.services.cracking.hash_kind import (  # noqa: PLC0415
+        resolve_kind_for_mode,
+    )
+    from adscan_internal.services.cracking.john_engine import JohnEngine  # noqa: PLC0415
+
+    kind = resolve_kind_for_mode(mode)
+    if kind is None:
+        return {}
+    run_command = getattr(shell, "run_command", None)
+    if run_command is None:
+        return {}
+    # This branch is only reached when hashcat has no device, so the selector
+    # resolves to John (never hashcat here). Guard the type so a GPU-present
+    # misconfiguration degrades to a no-op rather than re-dispatching hashcat.
+    engine = select_crack_engine(shell=shell, command_executor=run_command)
+    if not isinstance(engine, JohnEngine):
+        return {}
+    tier = EffortTier(
+        name=_method_label(wordlist, None),
+        base_path=wordlist,
+        rule_path=None,
+        device_class="cpu",
+    )
+    try:
+        return dict(engine.run(tier, hash_file, hash_kind=kind.value).recovered)
+    except Exception as exc:  # noqa: BLE001 -- John fallback is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return {}
+
+
 def _run_hashcat_tier(
-    shell: Any, hash_file: str, wordlist: str, mode: str,
-    *, rules_path: Optional[str] = None, status_sink: Optional[StatusSink] = None,
-    slot_state_sink: Optional[SlotStateSink] = None, background: bool = False,
+    shell: Any,
+    hash_file: str,
+    wordlist: str,
+    mode: str,
+    *,
+    rules_path: Optional[str] = None,
+    status_sink: Optional[StatusSink] = None,
+    slot_state_sink: Optional[SlotStateSink] = None,
+    background: bool = False,
+) -> dict:
+    """Run one crack pass, dispatching hashcat vs the Windows-only John fallback.
+
+    On Windows, when hashcat is present but exposes no compute device AND the
+    mode has a supported John ``--format``, this runs a John CPU tier instead of
+    dead-ending on an empty hashcat result. Every other host (Linux, or Windows
+    with a usable device / an unsupported mode) runs the hashcat tier exactly as
+    before — the Linux path is byte-identical.
+
+    The PAL ``cracking_gpu`` capability is consulted FIRST (symmetric with the
+    ``cracking_cpu`` consult on the John path): when GPU cracking is not
+    available on this platform, hashcat is never shelled — the crack routes to
+    John on Windows (supported mode) or degrades honestly (empty result)
+    elsewhere, without invoking ``_run_hashcat_tier_impl``.
+    """
+    from adscan_core.pal.platform import is_windows  # noqa: PLC0415
+    from adscan_internal.cli.cracking import (  # noqa: PLC0415
+        cracking_gpu_capability_available,
+    )
+
+    gpu_unavailable = not cracking_gpu_capability_available()
+
+    # No usable hashcat here: either the PAL says GPU cracking is unavailable, or
+    # a Windows host has hashcat but no compute device. In both cases route to
+    # John on Windows for a supported mode; otherwise degrade honestly WITHOUT
+    # shelling hashcat.
+    if gpu_unavailable or (is_windows() and _hashcat_backend_no_device(shell)):
+        if is_windows():
+            from adscan_internal.services.cracking.hash_kind import (  # noqa: PLC0415
+                resolve_kind_for_mode,
+            )
+
+            if resolve_kind_for_mode(mode) is not None:
+                return _run_john_cpu_tier(shell, hash_file, wordlist, mode)
+        if gpu_unavailable:
+            # Non-Windows (or an unsupported mode on Windows) with no GPU
+            # capability: honest degrade — never probe/shell hashcat.
+            return {}
+    return _run_hashcat_tier_impl(
+        shell,
+        hash_file,
+        wordlist,
+        mode,
+        rules_path=rules_path,
+        status_sink=status_sink,
+        slot_state_sink=slot_state_sink,
+        background=background,
+    )
+
+
+def _run_hashcat_tier_impl(
+    shell: Any,
+    hash_file: str,
+    wordlist: str,
+    mode: str,
+    *,
+    rules_path: Optional[str] = None,
+    status_sink: Optional[StatusSink] = None,
+    slot_state_sink: Optional[SlotStateSink] = None,
+    background: bool = False,
 ) -> dict:
     """Run one hashcat pass against ``hash_file`` with ``wordlist`` under ``mode``.
 
@@ -483,7 +620,10 @@ def _run_hashcat_tier(
         # be parsed (see parse_hashcat_status_json) and surfaced in the harvest
         # row. Harmless to the crack itself; ignored when unparseable.
         status_args = [
-            "--status", "--status-json", "--status-timer", _STATUS_TIMER_SECONDS,
+            "--status",
+            "--status-json",
+            "--status-timer",
+            _STATUS_TIMER_SECONDS,
         ]
         # Isolation applies ONLY to a BACKGROUND crack (the operator is driving
         # the REPL while this runs on a worker thread). A FOREGROUND/blocking
@@ -506,17 +646,31 @@ def _run_hashcat_tier(
             launch_prefix = []
             device_args = []
         crack_argv = [
-            *launch_prefix, "hashcat", "-m", mode, "--username",
-            *status_args, *device_args, *rules_args,
-            hash_file, wordlist,
+            *launch_prefix,
+            "hashcat",
+            "-m",
+            mode,
+            "--username",
+            *status_args,
+            *device_args,
+            *rules_args,
+            hash_file,
+            wordlist,
         ]
         crack_cmd = " ".join(shlex.quote(str(a)) for a in crack_argv)
         # The --show pass is a quick potfile lookup (no kernels), so it only
         # inherits the launch prefix (taskset/nice) — not the device flags — and
         # only when the crack itself was launched with isolation.
         show_argv = [
-            *launch_prefix, "hashcat", "-m", mode, "--username",
-            "--outfile-format", "2", hash_file, "--show",
+            *launch_prefix,
+            "hashcat",
+            "-m",
+            mode,
+            "--username",
+            "--outfile-format",
+            "2",
+            hash_file,
+            "--show",
         ]
         show_cmd = " ".join(shlex.quote(str(a)) for a in show_argv)
         # STREAM the crack: a per-line handler parses each --status-json tick the
@@ -587,7 +741,9 @@ def _run_hashcat_tier(
         if show_result is None:
             # crack-show: the --show completion pass returned no result object —
             # a match written to the potfile would then be invisible to the parse.
-            print_info_debug(f"crack-show: mode={mode} show_result=None (no matches parsed)")
+            print_info_debug(
+                f"crack-show: mode={mode} show_result=None (no matches parsed)"
+            )
             return {}
         show_output = getattr(show_result, "stdout", "") or ""
         if not show_output.strip():
@@ -716,8 +872,10 @@ class CrackingJobRuntime:
 
     def start(self) -> bool:
         self._thread = threading.Thread(
-            target=_run_crack_tiers, args=(self,),
-            name=f"job-cracking-{self.user}", daemon=True,
+            target=_run_crack_tiers,
+            args=(self,),
+            name=f"job-cracking-{self.user}",
+            daemon=True,
         )
         self._thread.start()
         return True
@@ -737,7 +895,11 @@ class CrackingJobRuntime:
         #              view renders "queued" so a waiting crack no longer reads as
         #              a false "cracking".
         phase = "cracking" if holds_slot else "queued"
-        snap: dict[str, Any] = {"cracked": self.cracked, "user": self.user, "phase": phase}
+        snap: dict[str, Any] = {
+            "cracked": self.cracked,
+            "user": self.user,
+            "phase": phase,
+        }
         if method:
             snap["method"] = method
         if progress_pct is not None:
@@ -905,14 +1067,18 @@ def _run_crack_tiers(runtime: "CrackingJobRuntime") -> None:
                 runtime._end_tier()
                 runtime._emit_terminal_result(
                     JobResult(
-                        job_id=runtime.job_id, kind="cracking", scope=runtime.user,
+                        job_id=runtime.job_id,
+                        kind="cracking",
+                        scope=runtime.user,
                         summary=(
                             f"{_mode_label(runtime.mode)} for "
                             f"{mark_sensitive(runtime.user, 'user')} did not complete"
                         ),
                         detail={
-                            "status": "failed", "user": runtime.user,
-                            "mode": runtime.mode, "version": runtime.ntlm_version,
+                            "status": "failed",
+                            "user": runtime.user,
+                            "mode": runtime.mode,
+                            "version": runtime.ntlm_version,
                             "max_effort": runtime.max_effort,
                             "hash_file": runtime.hash_file,
                         },
@@ -976,15 +1142,17 @@ def _run_crack_tiers_impl(runtime: "CrackingJobRuntime") -> None:
             continue
         last_method = _method_label(wordlist, rules_path)
         estimate = (
-            runtime._tier_estimates[idx]
-            if idx < len(runtime._tier_estimates)
-            else None
+            runtime._tier_estimates[idx] if idx < len(runtime._tier_estimates) else None
         )
         runtime._begin_tier(last_method, estimate)
         try:
             matches = _run_hashcat_tier(
-                runtime.shell, runtime.hash_file, wordlist, runtime.mode,
-                rules_path=rules_path, status_sink=runtime._on_tier_status,
+                runtime.shell,
+                runtime.hash_file,
+                wordlist,
+                runtime.mode,
+                rules_path=rules_path,
+                status_sink=runtime._on_tier_status,
                 slot_state_sink=runtime._on_slot_state,
                 background=runtime.background,
             )
@@ -995,7 +1163,9 @@ def _run_crack_tiers_impl(runtime: "CrackingJobRuntime") -> None:
         cracked_users = _persist_matches(runtime, matches) if matches else []
         if cracked_users:
             runtime.cracked = len(cracked_users)
-            primary = runtime.user if runtime.user in cracked_users else cracked_users[0]
+            primary = (
+                runtime.user if runtime.user in cracked_users else cracked_users[0]
+            )
             extra = len(cracked_users) - 1
             summary = f"Cracked {label} for {mark_sensitive(primary, 'user')}"
             if extra > 0:
@@ -1006,16 +1176,22 @@ def _run_crack_tiers_impl(runtime: "CrackingJobRuntime") -> None:
             # in the workspace registry, exactly like domains_data; never
             # printed (the cracking notification line omits it).
             detail = {
-                "status": "cracked", "user": primary,
+                "status": "cracked",
+                "user": primary,
                 "users": cracked_users,
-                "domain": runtime.domain, "wordlist": os.path.basename(wordlist),
+                "domain": runtime.domain,
+                "wordlist": os.path.basename(wordlist),
                 "method": last_method,
-                "mode": runtime.mode, "version": runtime.ntlm_version,
-                "max_effort": runtime.max_effort, "hash_file": runtime.hash_file,
+                "mode": runtime.mode,
+                "version": runtime.ntlm_version,
+                "max_effort": runtime.max_effort,
+                "hash_file": runtime.hash_file,
             }
             if runtime.background:
                 detail["secret"] = str(matches.get(primary) or "")
-                detail["secrets"] = {u: str(matches.get(u) or "") for u in cracked_users}
+                detail["secrets"] = {
+                    u: str(matches.get(u) or "") for u in cracked_users
+                }
             runtime._end_tier()
             # Terminal emit: the crack ladder produced a match and stops here.
             # ``terminal=True`` transitions the job to a terminal registry state at
@@ -1023,7 +1199,9 @@ def _run_crack_tiers_impl(runtime: "CrackingJobRuntime") -> None:
             # lingering as "running" forever (until session finalize).
             runtime._emit_terminal_result(
                 JobResult(
-                    job_id=runtime.job_id, kind="cracking", scope=runtime.user,
+                    job_id=runtime.job_id,
+                    kind="cracking",
+                    scope=runtime.user,
                     summary=summary,
                     detail=detail,
                     terminal=True,
@@ -1036,15 +1214,18 @@ def _run_crack_tiers_impl(runtime: "CrackingJobRuntime") -> None:
     # cracked emit above), so an uncracked crack does not linger in active().
     runtime._emit_terminal_result(
         JobResult(
-            job_id=runtime.job_id, kind="cracking", scope=runtime.user,
-            summary=(
-                f"{label} for {mark_sensitive(runtime.user, 'user')} not cracked"
-            ),
+            job_id=runtime.job_id,
+            kind="cracking",
+            scope=runtime.user,
+            summary=(f"{label} for {mark_sensitive(runtime.user, 'user')} not cracked"),
             detail={
-                "status": "uncracked", "user": runtime.user,
+                "status": "uncracked",
+                "user": runtime.user,
                 "method": last_method,
-                "mode": runtime.mode, "version": runtime.ntlm_version,
-                "max_effort": runtime.max_effort, "hash_file": runtime.hash_file,
+                "mode": runtime.mode,
+                "version": runtime.ntlm_version,
+                "max_effort": runtime.max_effort,
+                "hash_file": runtime.hash_file,
             },
             terminal=True,
         )

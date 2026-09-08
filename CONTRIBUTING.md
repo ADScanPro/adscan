@@ -8,8 +8,8 @@ When reporting a bug, include:
 
 - ADscan version: `adscan version`
 - Host OS and version
-- Docker Engine and Compose versions
-- Install method: `pipx`, `pip`, local `uv`, or Docker-only
+- Install method: `pipx`, `pip`, local `uv`, or Docker-only (Linux/macOS); or the native Windows bundle (`adscan.exe`)
+- Docker Engine and Compose versions, if applicable (not used by the native Windows bundle)
 - Command that failed
 - Sanitized output, stack trace, or workspace path
 - Lab or environment type, if safe to share

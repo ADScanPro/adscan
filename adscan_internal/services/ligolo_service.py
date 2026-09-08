@@ -41,14 +41,11 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from typing import Any
 
-from adscan_internal import print_info_debug, print_info_verbose
+from adscan_internal import print_info_debug, print_info_verbose, print_warning
 from adscan_core import telemetry
 from adscan_core.local_bind_address import resolve_first_available_bind_addr
-from adscan_core.linux_capabilities import (
-    CAP_NET_BIND_SERVICE_BIT,
-    binary_has_capability,
-    process_has_capability,
-)
+from adscan_core.linux_capabilities import binary_has_capability
+from adscan_core.pal import net as pal_net
 from adscan_internal.ligolo_manager import (
     LIGOLO_NG_VERSION,
     get_current_ligolo_proxy_target,
@@ -549,30 +546,41 @@ class LigoloProxyService:
             api_laddr,
         ]
 
-    def _assert_bind_permissions_for_listen_addr(self, listen_addr: str) -> None:
-        """Fail early when a privileged Ligolo port cannot be bound by the runtime."""
+    def _check_bind_permissions_for_listen_addr(self, listen_addr: str) -> str | None:
+        """Return an unavailable reason when a privileged Ligolo port cannot be bound.
+
+        Returns ``None`` when the runtime can bind ``listen_addr`` (a
+        non-privileged port, or a privileged port the process/binary is allowed
+        to bind). Returns a short human-readable reason when a privileged bind is
+        unavailable on this host, so the caller can degrade to "pivot unavailable"
+        rather than crash. The privileged-bind capability is resolved through the
+        cross-platform ``pal.net`` seam; the POSIX-only file capability on the
+        ligolo-ng proxy binary is honoured too, since that binary can bind
+        privileged ports even when the ADscan process cannot.
+        """
 
         _host, port = _parse_host_port(listen_addr)
         if int(port) >= 1024:
-            return
+            return None
         proxy_path = str(self.get_proxy_binary_path())
-        process_has_bind_service = process_has_capability(CAP_NET_BIND_SERVICE_BIT)
+        bind_status = pal_net.capability_available(pal_net.NET_BIND_PRIVILEGED)
         binary_has_bind_service = binary_has_capability(proxy_path, "cap_net_bind_service")
         print_info_debug(
             "[ligolo] Privileged bind diagnostics: "
             f"listen_addr={listen_addr} "
-            f"process_cap_net_bind_service={process_has_bind_service} "
+            f"os={bind_status.os} "
+            f"process_privileged_bind={bind_status.available} ({bind_status.reason}) "
             f"proxy_binary_has_cap_net_bind_service={binary_has_bind_service}"
         )
-        if process_has_bind_service or binary_has_bind_service:
-            return
-        raise RuntimeError(
-            "Ligolo proxy is configured to use a privileged port "
-            f"({listen_addr}), but neither the ADscan process nor the ligolo-ng proxy binary "
-            "has CAP_NET_BIND_SERVICE. Rebuild the runtime image with "
-            "'setcap cap_net_admin,cap_net_bind_service+ep' on the ligolo proxy binary, "
-            "grant CAP_NET_BIND_SERVICE to the container, or use a custom listen address >=1024 "
-            "after verifying pivot egress."
+        if bind_status.available or binary_has_bind_service:
+            return None
+        return (
+            f"the pivot listener needs privileged port {listen_addr}, but this host cannot bind "
+            f"privileged ports ({bind_status.reason}) and the ligolo-ng proxy binary does not "
+            "carry CAP_NET_BIND_SERVICE. Grant the runtime the privileged-bind capability "
+            "(POSIX: 'setcap cap_net_admin,cap_net_bind_service+ep' on the ligolo proxy binary or "
+            "CAP_NET_BIND_SERVICE on the container; Windows: run elevated), or start the proxy on a "
+            "custom listen address >=1024 after verifying pivot egress"
         )
 
     def resolve_default_listen_addr(self) -> str:
@@ -689,6 +697,36 @@ class LigoloProxyService:
             "workspace_dir": str(self.workspace_dir),
         }
 
+    def _build_pivot_unavailable_state(
+        self,
+        *,
+        listen_addr: str,
+        api_laddr: str,
+        selfcert_domain: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Build one persisted state payload for a pivot that could not start.
+
+        Used when the runtime cannot bind the requested privileged listener
+        (e.g. Windows without an elevated process, or a POSIX runtime without
+        CAP_NET_BIND_SERVICE). The state carries no ``api_laddr`` and no ``pid``
+        so ``is_proxy_available`` reports the pivot as unavailable and callers
+        degrade to the direct upload path instead of routing through a proxy.
+        """
+
+        return {
+            "api_laddr": "",
+            "current_domain": self.current_domain,
+            "failure_reason": "privileged_bind_unavailable",
+            "listen_addr": listen_addr,
+            "requested_api_laddr": api_laddr,
+            "selfcert_domain": selfcert_domain,
+            "status": "unavailable",
+            "unavailable_reason": reason,
+            "updated_at": _utc_now_iso(),
+            "workspace_dir": str(self.workspace_dir),
+        }
+
     def _emit_command_debug(self, command: list[str], *, cwd: Path | None = None) -> None:
         """Emit the exact proxy command through ADscan debug logging."""
 
@@ -770,7 +808,20 @@ class LigoloProxyService:
         self.validate_proxy_api_contract()
         listen_addr = str(listen_addr or "").strip() or self.resolve_default_listen_addr()
         api_laddr = str(api_laddr or "").strip() or self.resolve_default_api_laddr()
-        self._assert_bind_permissions_for_listen_addr(listen_addr)
+        bind_unavailable_reason = self._check_bind_permissions_for_listen_addr(listen_addr)
+        if bind_unavailable_reason is not None:
+            degraded_state = self._build_pivot_unavailable_state(
+                listen_addr=listen_addr,
+                api_laddr=api_laddr,
+                selfcert_domain=selfcert_domain,
+                reason=bind_unavailable_reason,
+            )
+            self.save_state(degraded_state)
+            print_warning(
+                "Ligolo pivot proxy is unavailable on this host: "
+                + str(mark_sensitive(bind_unavailable_reason, "detail"))
+            )
+            return degraded_state
         self._write_managed_config(api_laddr=api_laddr, selfcert_domain=selfcert_domain)
         command = self.build_proxy_command(
             listen_addr=listen_addr,
@@ -867,6 +918,26 @@ class LigoloProxyService:
         if not api_laddr:
             raise RuntimeError("Ligolo-ng proxy API address is not available in workspace state.")
         return f"http://{api_laddr}"
+
+    def is_proxy_available(self) -> bool:
+        """Return whether a Ligolo-ng proxy is configured with a live API address.
+
+        A best-effort predicate the executor uses to decide, up front, whether a
+        pivot can even be attempted for an unreachable target. It never raises:
+        it only reports whether the persisted workspace state carries a proxy API
+        address (``api_laddr``) that a subsequent API call could reach. When this
+        returns ``False`` there is no pivot proxy to route through, so callers
+        should emit actionable guidance instead of provoking a raw
+        ``RuntimeError`` from ``_get_api_base_url``.
+        """
+
+        try:
+            state = self.get_status()
+        except Exception:  # pragma: no cover - best effort only
+            return False
+        if str(state.get("status") or "").strip().lower() == "not_configured":
+            return False
+        return bool(str(state.get("api_laddr") or "").strip())
 
     def _emit_api_debug(
         self,

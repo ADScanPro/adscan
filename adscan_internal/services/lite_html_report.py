@@ -106,6 +106,15 @@ from adscan_core.posture_score import (
     compute_posture_score,
 )
 from adscan_core.reporting.attack_path_memory_gate import merge_attack_path_coverage
+from adscan_core.reporting.chokepoint_copy import (
+    CHOKEPOINT_MAX_ROWS,
+    STRUCTURAL_CHOKE_BADGE,
+    chokepoint_headline,
+    is_structural_choke,
+    remediation_item_line,
+    remediation_kpi_lines,
+    remediation_start_here_headline,
+)
 from adscan_core.reporting.host_enrichment_coverage import (
     merge_host_enrichment_coverage,
 )
@@ -147,6 +156,10 @@ from adscan_internal.services.attack_step_catalog import (
 from adscan_internal.services.attack_surface_analysis import (
     compute_attack_surface_analysis,
     top_remediation_targets,
+)
+from adscan_internal.services.technique_priority import (
+    TechniquePriority,
+    compute_technique_priorities,
 )
 from adscan_internal.services.brand_assets import (
     brand_favicon_data_uri,
@@ -351,6 +364,99 @@ class ChokePointRow:
 
 
 @dataclass(frozen=True)
+class ChokePointRemediationRow:
+    """One prioritized choke object: remove it, and N validated routes close.
+
+    This is the CARDINALITY-based remediation ranking (which single object, if
+    fixed, severs the most validated routes to Tier 0) — the "validated cut set"
+    signal, distinct from the path-centrality ranking in :class:`ChokePointRow`.
+    Read straight from the persisted, pre-ranked ``ranked_chokepoints`` rows, so
+    the free report, the paid deliverable and the platform agree on which fix
+    matters most.
+    """
+
+    rank: int
+    object_label: str
+    protected_target: str
+    severity: str
+    routes_severed: int
+    domain: str
+
+
+@dataclass(frozen=True)
+class ChokePointRemediation:
+    """The "Start here" prioritized choke-point section, resolved for render.
+
+    ``present`` is ``False`` on a scan whose data carries no
+    ``chokepoint_cardinality`` block (an older scan, or one that never computed
+    it): the section is then omitted and the report reads exactly as before.
+    """
+
+    present: bool
+    headline: str
+    rows: tuple[ChokePointRemediationRow, ...]
+    #: The honest redundancy note, shown when the leading choke's domain has node
+    #: chokes but no single-edge choke: cutting one permission severs nothing;
+    #: only removing the object closes the routes. Empty otherwise.
+    edge_note: str
+    bounded: bool
+
+
+@dataclass(frozen=True)
+class LiteRemediationStartHereRow:
+    """One ranked fix in the "Start here" lead: break the most attack paths.
+
+    The counts are framed executed-first, exactly as the PRO deliverable does:
+    a row whose technique appears in paths ADscan executed end to end (
+    :attr:`exploited_paths` > 0) is worded off its EXECUTED count against the
+    executed-path total, so "validated" is literally true; a theoretical-only
+    row is worded "mapped" off its all-status count and never claims execution.
+    """
+
+    rank: int
+    label: str
+    item_line: str
+    #: The structural-choke durability badge decorates a row whose remediation
+    #: maps to a true articulation point (a persisted node total-cut > 0). It
+    #: DECORATES; it never sets order.
+    badge: bool
+    badge_label: str
+    paths_affected: int
+    exploited_paths: int
+    executed: bool
+
+
+@dataclass(frozen=True)
+class LiteRemediationStartHere:
+    """The "Start here" lead section, led by the validated-paths-broken ranking.
+
+    Mirrors the PRO deliverable's ``build_remediation_start_here`` render model
+    (E4): the LITE report LEADS with the same technique ranking ADscan already
+    computes (:func:`compute_technique_priorities`) — fixes ordered by how many
+    attack paths each one breaks, weighting executed over theoretical and
+    remediation effort — reframed to counts and executed-framed. The order stays
+    the ranking's own; the structural-choke badge decorates but never reorders.
+
+    ``present`` is ``False`` on a scan with no attack paths (or none carrying
+    client exposure): the lead is omitted and the older centrality "techniques"
+    table falls back into place.
+    """
+
+    present: bool
+    headline: str
+    #: Executed-path total (the proven bucket) — the executed row's denominator.
+    total_executed_paths: int
+    #: All-status attack-path total — the mapped (theoretical-only) denominator.
+    total_mapped_paths: int
+    rows: tuple[LiteRemediationStartHereRow, ...]
+    #: The KPI-card lines for the top fix (same top row the section leads with),
+    #: so the headline card and the section can never state different numbers.
+    kpi_big: str
+    kpi_ratio: str
+    kpi_context: str
+
+
+@dataclass(frozen=True)
 class EnvironmentChangeRow:
     """One directory change ADscan made, as disclosed to the client."""
 
@@ -482,6 +588,21 @@ class LiteReportModel:
     paths_omitted: int
     proven_paths: int
     choke_points: tuple[ChokePointRow, ...]
+    #: The prioritized "Start here" choke-point remediation section, ranked by the
+    #: validated cut set (which object, if fixed, severs the most validated routes
+    #: to Tier 0). Read from the persisted, pre-ranked ``ranked_chokepoints`` so
+    #: the free report, the paid deliverable and the platform agree. ``present``
+    #: is ``False`` — and the section is omitted — on a scan without the block.
+    chokepoint_remediation: ChokePointRemediation
+    #: The "Start here" lead, led by the validated-paths-broken ranking (E4). The
+    #: SAME lead as the PRO deliverable: fixes ordered by how many attack paths
+    #: each breaks, executed-framed, with the structural-choke badge. When
+    #: ``present`` it LEADS the remediation block and demotes the old centrality
+    #: "techniques" table; when ``present`` is ``False`` (no paths) the older
+    #: table falls back into the lead. Read from the tier-shared
+    #: :func:`compute_technique_priorities` + ``adscan_core`` copy SSOT — no
+    #: ``adscan_internal.pro`` import.
+    remediation_start_here: LiteRemediationStartHere
     changes: ChangeDisclosure
     #: What the PROVEN compromise obliges the reader to do — reset krbtgt twice,
     #: rotate every recovered credential, revoke a certificate the CA issued.
@@ -858,7 +979,11 @@ def _step_narrative(step: dict[str, Any]) -> str:
         return _strip_relation_prefix(text, relation)
 
     entry = get_attack_step_entry(relation)
-    description = str(entry.description).strip() if entry is not None and entry.description else ""
+    description = (
+        str(entry.description).strip()
+        if entry is not None and entry.description
+        else ""
+    )
     # A description that opens with the edge token ("ADCS ESC8 privilege
     # escalation path") only restates the technique headline this step already
     # carries. Printing both is a line that says the same thing twice; the
@@ -871,7 +996,12 @@ def _step_narrative(step: dict[str, Any]) -> str:
     source, target = _step_endpoints(step)
     known = f"{description} {affected}".lower()
     endpoints = ""
-    if source and target and source.lower() not in known and target.lower() not in known:
+    if (
+        source
+        and target
+        and source.lower() not in known
+        and target.lower() not in known
+    ):
         endpoints = f"from {source} to {target}"
 
     if description:
@@ -1136,6 +1266,334 @@ def build_choke_points(
     return tuple(rows)
 
 
+#: How many prioritized choke objects the "Start here" section shows. Kept short
+#: for the same reason as the technique ranking: a head of high-impact fixes, not
+#: a second full table. Aliased to the shared cross-tier cap so LITE, PRO, and the
+#: web CTEM show the SAME number of choke rows for one scan (no cross-tier drift).
+MAX_CHOKEPOINT_REMEDIATIONS = CHOKEPOINT_MAX_ROWS
+
+#: Display casing for the persisted severity string of a choke's protected
+#: target. Mirrors the PRO renderer's map so the two tiers word severity the same.
+_CHOKEPOINT_SEVERITY_LABELS: dict[str, str] = {
+    "CRITICAL": "Critical",
+    "HIGH": "High",
+    "MEDIUM": "Medium",
+    "LOW": "Low",
+    "INFO": "Informational",
+}
+
+#: The honest note when a domain has node chokes but no single-edge choke: on a
+#: dense directory graph no lone permission is the bottleneck, so removing the
+#: OBJECT is what closes the routes. Vendor-neutral, client-facing prose; matches
+#: the PRO renderer's wording so both tiers say the same thing.
+_CHOKEPOINT_EDGE_REDUNDANCY_NOTE = (
+    "Fixing an individual permission severs 0 routes here because the paths are "
+    "redundant; only removing the object itself closes them."
+)
+
+
+def _node_cardinality_map(domains: dict[str, Any]) -> dict[str, int]:
+    """Build the node total-cut map used only for the structural-choke badge.
+
+    Keyed for the badge by BOTH node id (from the persisted
+    ``top_node_chokepoints``) AND node label (from the enriched
+    ``ranked_chokepoints`` when present), so a priority row whose choke id is a
+    label or an id resolves either way. Mirrors the PRO caller's derivation so
+    the badge decision is identical across tiers.
+    """
+    card: dict[str, int] = {}
+    if not isinstance(domains, dict):
+        return card
+    for domain_data in domains.values():
+        if not isinstance(domain_data, dict):
+            continue
+        block = domain_data.get("chokepoint_cardinality")
+        if not isinstance(block, dict):
+            continue
+        for node in block.get("top_node_chokepoints") or []:
+            if not isinstance(node, dict):
+                continue
+            nid = str(node.get("node_id") or "").strip()
+            try:
+                value = int(node.get("cardinality") or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if nid and value > 0:
+                card[nid] = max(card.get(nid, 0), value)
+        for ranked in block.get("ranked_chokepoints") or []:
+            if not isinstance(ranked, dict):
+                continue
+            try:
+                value = int(ranked.get("cardinality") or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value <= 0:
+                continue
+            for id_key in ("node_id", "node_label"):
+                id_val = str(ranked.get(id_key) or "").strip()
+                if id_val:
+                    card[id_val] = max(card.get(id_val, 0), value)
+    return card
+
+
+def build_lite_remediation_start_here(
+    raw_paths: list[dict[str, Any]],
+    domains: dict[str, Any],
+    *,
+    total_executed_paths: int,
+    total_mapped_paths: int,
+    bounded: bool = False,
+    limit: int = MAX_CHOKEPOINT_REMEDIATIONS,
+) -> LiteRemediationStartHere:
+    """Build the "Start here" lead led by the validated-paths-broken ranking.
+
+    This is the LITE mirror of the PRO deliverable's
+    ``build_remediation_start_here`` (E4). It leads the remediation block with the
+    technique ranking ADscan already computes — fixes ordered by how many of the
+    client's attack paths each one breaks, weighting executed over theoretical and
+    remediation effort (:func:`compute_technique_priorities`). It does NOT reorder
+    that ranking: it consumes the rows in the order given, reframes the copy to
+    counts through the shared ``adscan_core.reporting.chokepoint_copy`` SSOT, and
+    attaches the structural-choke badge as an independent decoration.
+
+    The displayed COUNT is scoped to what ADscan actually EXECUTED, so the
+    "validated / executed" wording is literally true (the "validated, not
+    estimated" wedge). A row is worded off its EXECUTED count
+    (``exploited_paths``) against the executed-path total; a row whose technique
+    appears only in THEORETICAL paths (executed count 0) is worded "mapped" off
+    its all-status count against the mapped-path total, and never claims execution.
+    The ORDER stays the ranking's regardless.
+
+    The node total-cut ("choke cardinality") is not the lead here — it survives
+    only as the :data:`STRUCTURAL_CHOKE_BADGE` on a row whose remediation maps to
+    a true articulation point (a node whose persisted total-cut cardinality is
+    positive). The badge decorates; it never sets order.
+
+    Pure / side-effect-free. It uses NOTHING from ``adscan_internal.pro`` — the
+    ranking lives under ``services/`` and the copy under ``adscan_core`` (the tier
+    boundary), so both tiers derive the same lead without a shared PRO import.
+
+    Args:
+        raw_paths: The union of every domain's attack-path records — the same
+            paths the report renders. Passed to ``compute_technique_priorities``.
+        domains: The technical report's ``domains`` mapping, read only for the
+            persisted node total-cut used by the structural-choke badge.
+        total_executed_paths: Attack paths ADscan executed end to end (the proven
+            bucket) — the denominator for an executed-framed row.
+        total_mapped_paths: The total attack paths (all statuses) — the
+            denominator for a theoretical-only ("mapped") row.
+        bounded: Whether route discovery was bounded or sampled, which caveats
+            the headline.
+        limit: Maximum ranked rows to surface.
+
+    Returns:
+        A resolved :class:`LiteRemediationStartHere`. ``present`` is ``False`` —
+        and the lead is omitted — when there are no priorities to lead with (no
+        paths, or none carrying client exposure).
+    """
+    _empty = LiteRemediationStartHere(
+        present=False,
+        headline="",
+        total_executed_paths=int(total_executed_paths),
+        total_mapped_paths=int(total_mapped_paths),
+        rows=(),
+        kpi_big="",
+        kpi_ratio="",
+        kpi_context="",
+    )
+    if not raw_paths:
+        return _empty
+
+    priorities: list[TechniquePriority] = compute_technique_priorities(
+        raw_paths, total_paths=total_mapped_paths
+    )
+    if not priorities:
+        return _empty
+
+    card_map = _node_cardinality_map(domains)
+
+    rows: list[LiteRemediationStartHereRow] = []
+    for entry in priorities[:limit]:
+        exploited = int(entry.exploited_paths)
+        affected = int(entry.paths_affected)
+        # The count is scoped to what was EXECUTED so "executed" is literally
+        # true. A technique that only appears in theoretical paths (executed
+        # count 0) is worded "mapped" and never claims execution.
+        row_executed = exploited > 0
+        item_line = remediation_item_line(
+            paths_broken=exploited if row_executed else affected,
+            total_validated_paths=(
+                int(total_executed_paths) if row_executed else int(total_mapped_paths)
+            ),
+            executed=row_executed,
+            mapped=not row_executed,
+        )
+        choke_id = entry.top_choke_point_id.strip() or None
+        badge = bool(is_structural_choke(choke_id, card_map))
+        rows.append(
+            LiteRemediationStartHereRow(
+                rank=len(rows) + 1,
+                label=str(entry.label or entry.technique or ""),
+                item_line=item_line,
+                badge=badge,
+                badge_label=STRUCTURAL_CHOKE_BADGE if badge else "",
+                paths_affected=affected,
+                exploited_paths=exploited,
+                executed=row_executed,
+            )
+        )
+
+    if not rows:
+        return _empty
+
+    # The headline claims execution only when the top fix touches an executed
+    # path. If the top fix is theoretical-only it speaks of MAPPED paths so the
+    # lead never overstates.
+    top = rows[0]
+    top_executed = top.executed
+    top_paths_broken = top.exploited_paths if top_executed else top.paths_affected
+    top_denominator = (
+        int(total_executed_paths) if top_executed else int(total_mapped_paths)
+    )
+    headline = remediation_start_here_headline(
+        top_paths_broken=top_paths_broken,
+        total_validated_paths=top_denominator,
+        bounded=bounded,
+        mapped=not top_executed,
+    )
+    kpi = remediation_kpi_lines(
+        top_paths_broken=top_paths_broken,
+        total_validated_paths=top_denominator,
+        executed=top_executed,
+        mapped=not top_executed,
+        bounded=bounded,
+    )
+    return LiteRemediationStartHere(
+        present=True,
+        headline=headline,
+        total_executed_paths=int(total_executed_paths),
+        total_mapped_paths=int(total_mapped_paths),
+        rows=tuple(rows),
+        kpi_big=kpi["big"],
+        kpi_ratio=kpi["ratio"],
+        kpi_context=kpi["context"],
+    )
+
+
+def build_chokepoint_remediation(
+    domains: dict[str, Any], *, limit: int = MAX_CHOKEPOINT_REMEDIATIONS
+) -> ChokePointRemediation:
+    """Build the "Start here" prioritized choke-point section from the persisted block.
+
+    A choke point is a directory object whose removal severs the most validated
+    attack routes to high-value (Tier 0) targets. This is the CARDINALITY-based
+    remediation ranking mandated by the project doctrine (rank by validated cut
+    set, never by materialized-path centrality), read straight from each domain's
+    persisted ``chokepoint_cardinality["ranked_chokepoints"]`` — already
+    severity-led, blast-radius-tied, JSON-safe and labelled at the one seam that
+    HAS the graph. LITE therefore needs NO graph access and NO ranking here: it
+    reads the pre-ranked rows, aggregates them across domains, and renders.
+
+    The rows are sorted by the persisted ``(severity_rank, -cardinality)`` key —
+    the same two-axis order the paid deliverable and the platform use — so all
+    three surfaces agree on which fix matters most. The headline's routes number
+    is the TOP single choke's OWN cardinality (the "fix 1 object" carry-forward),
+    never the aggregate of the shown rows. The bounded caveat and the honest
+    edge-cuts-0 note both ride on the domain that owns that leading choke.
+
+    Args:
+        domains: The technical report's ``domains`` mapping (domain → data dict).
+        limit: Maximum choke rows to render.
+
+    Returns:
+        A resolved :class:`ChokePointRemediation`. ``present`` is ``False`` — and
+        the section is omitted — when no domain carries a
+        ``chokepoint_cardinality`` block with pre-ranked rows (a scan predating
+        this signal renders exactly as before).
+    """
+    _empty = ChokePointRemediation(
+        present=False, headline="", rows=(), edge_note="", bounded=False
+    )
+    if not isinstance(domains, dict):
+        return _empty
+
+    # Gather every domain's pre-ranked choke rows, tagged with the domain and its
+    # block so the leading choke's caveat/edge-note can be resolved after sorting.
+    gathered: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    for domain_name, domain_data in domains.items():
+        if not isinstance(domain_data, dict):
+            continue
+        block = domain_data.get("chokepoint_cardinality")
+        if not isinstance(block, dict):
+            continue
+        ranked = block.get("ranked_chokepoints")
+        if not isinstance(ranked, list):
+            continue
+        for entry in ranked:
+            if isinstance(entry, dict):
+                gathered.append((entry, str(domain_name), block))
+
+    if not gathered:
+        return _empty
+
+    # Sort by the persisted two-axis key: severity leads (lower rank = more
+    # severe), then blast radius descending. This mirrors the stamp seam's order
+    # so a cross-domain report keeps the same "which fix first" verdict.
+    gathered.sort(
+        key=lambda g: (
+            int(g[0].get("severity_rank") or 0),
+            -int(g[0].get("cardinality") or 0),
+        )
+    )
+
+    rows: list[ChokePointRemediationRow] = []
+    for entry, domain_name, _block in gathered[:limit]:
+        severity_value = str(entry.get("severity") or "").upper()
+        rows.append(
+            ChokePointRemediationRow(
+                rank=len(rows) + 1,
+                object_label=str(entry.get("node_label") or entry.get("node_id") or ""),
+                protected_target=str(entry.get("protected_terminal_label") or ""),
+                severity=_CHOKEPOINT_SEVERITY_LABELS.get(
+                    severity_value, severity_value.title()
+                ),
+                routes_severed=int(entry.get("cardinality") or 0),
+                domain=domain_name,
+            )
+        )
+
+    if not rows:
+        return _empty
+
+    # The leading choke owns the caveat and the honest edge-note. The block that
+    # produced the top gathered row is the second tuple element's source.
+    _top_entry, _top_domain, top_block = gathered[0]
+    bounded = bool(top_block.get("bounded"))
+
+    # The copy says "fix 1 object", so the headline number is the TOP single
+    # choke's OWN blast radius, never the aggregate of the shown rows.
+    headline = chokepoint_headline(
+        top_object_count=len(rows),
+        routes_severed=rows[0].routes_severed,
+        bounded=bounded,
+    )
+
+    # Honest edge-cuts-0 note: node chokes present, but no single-edge choke, so
+    # only removing the object closes the routes. Keyed on the leading choke's
+    # OWN domain block (top_chokepoints holds the edge chokes).
+    top_edges = top_block.get("top_chokepoints")
+    has_edge_choke = isinstance(top_edges, list) and bool(top_edges)
+    edge_note = "" if has_edge_choke else _CHOKEPOINT_EDGE_REDUNDANCY_NOTE
+
+    return ChokePointRemediation(
+        present=True,
+        headline=headline,
+        rows=tuple(rows),
+        edge_note=edge_note,
+        bounded=bounded,
+    )
+
+
 #: Status tones for the change ledger, mapped from the cleanup taxonomy's
 #: buckets onto the design system's chip tones. ``manual`` is the one the
 #: client must act on, so it carries the same weight as an unresolved finding.
@@ -1177,12 +1635,12 @@ def _change_rows(
         if not isinstance(entry, dict):
             continue
         detail = str(
-            entry.get("manual_reason_label")
-            or entry.get("remediation_command")
-            or ""
+            entry.get("manual_reason_label") or entry.get("remediation_command") or ""
         ).strip()
         performed_at = _display_timestamp(
-            entry.get("verified_at") or entry.get("reverted_at") or entry.get("registered_at")
+            entry.get("verified_at")
+            or entry.get("reverted_at")
+            or entry.get("registered_at")
         )
         rows.append(
             EnvironmentChangeRow(
@@ -1255,14 +1713,17 @@ def build_change_disclosure(
         return int(value) if isinstance(value, int) else fallback
 
     return ChangeDisclosure(
-        total=_count("total", len(manual) + len(reverted) + len(kept) + len(in_progress)),
+        total=_count(
+            "total", len(manual) + len(reverted) + len(kept) + len(in_progress)
+        ),
         reverted=len(reverted),
         manual_required=len(manual),
         kept=len(kept),
         in_progress=len(in_progress),
         manual_rows=_change_rows(manual, "manual"),
         reverted_rows=_change_rows(reverted, "reverted"),
-        other_rows=_change_rows(kept, "kept") + _change_rows(in_progress, "in_progress"),
+        other_rows=_change_rows(kept, "kept")
+        + _change_rows(in_progress, "in_progress"),
         determined=True,
     )
 
@@ -1306,7 +1767,9 @@ def build_bottom_line(
     # 1. The number and the band. Posture, not exposure: the scale runs the
     #    other way (100 is healthy), and calling a 2 an "exposure score" in a
     #    document titled Exposure Report reads as "2% exposed, we are fine".
-    parts.append(f"The posture score is {score.score} of 100, in the {score.label.lower()} band.")
+    parts.append(
+        f"The posture score is {score.score} of 100, in the {score.label.lower()} band."
+    )
 
     # 2. WHY it sits there — lead with the dominant driver.
     if paths_to_da > 0:
@@ -1328,7 +1791,9 @@ def build_bottom_line(
             f"({critical} critical, {high} high) drive the score."
         )
     else:
-        parts.append("No paths to domain compromise and no high-priority findings were identified.")
+        parts.append(
+            "No paths to domain compromise and no high-priority findings were identified."
+        )
 
     # 3. The floor, stated plainly, with what lifts the cap.
     if floored:
@@ -1638,7 +2103,9 @@ def build_report_model(
     if not domain_names:
         domain_label = "the assessed environment"
     elif multi_domain:
-        domain_label = f"{len(domain_names)} domains ({', '.join(sorted(domain_names))})"
+        domain_label = (
+            f"{len(domain_names)} domains ({', '.join(sorted(domain_names))})"
+        )
     else:
         domain_label = domain_names[0]
 
@@ -1687,6 +2154,19 @@ def build_report_model(
         paths_omitted=max(0, paths_total - len(path_rows)),
         proven_paths=proven,
         choke_points=build_choke_points(raw_paths),
+        chokepoint_remediation=build_chokepoint_remediation(domains),
+        # The "Start here" LEAD (E4): the same validated-paths-broken ranking the
+        # PRO deliverable leads with. Counts scoped to what ADscan EXECUTED
+        # (``proven``) so "validated" is literally true; the all-status
+        # ``paths_total`` is the mapped denominator for a theoretical-only fix.
+        # Route discovery being bounded/sampled caveats the headline.
+        remediation_start_here=build_lite_remediation_start_here(
+            raw_paths,
+            domains,
+            total_executed_paths=proven,
+            total_mapped_paths=paths_total,
+            bounded=bool(merge_attack_path_coverage(domains.values()).get("has_gap")),
+        ),
         changes=build_change_disclosure(
             environment_changes
             if environment_changes is not None
@@ -1893,9 +2373,7 @@ def render_report_pdf(
     if not available:
         raise EngineRenderError(f"Chromium engine unavailable: {reason}")
     if html_text is None:
-        html_text = render_report_html(
-            model, webfonts=not offline_mode_enabled()
-        )
+        html_text = render_report_html(model, webfonts=not offline_mode_enabled())
     return engine.render_pdf(
         html_text,
         base_url=None,
@@ -2001,8 +2479,109 @@ def _stamp_domain_assessments(
             enumerated, basis = resolve_domain_assessment(
                 workspace_dir, domain, entries.get(domain)
             )
-            record_domain_assessment(
-                shell, domain, enumerated=enumerated, basis=basis
+            record_domain_assessment(shell, domain, enumerated=enumerated, basis=basis)
+            changed = True
+        except Exception as exc:  # noqa: BLE001 - a report never fails on this
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    return changed
+
+
+def _stamp_chokepoints(
+    workspace_dir: str, domains: list[str], raw_domains: Any = None
+) -> bool:
+    """Stamp the choke-point cardinality block for each domain (LITE flow).
+
+    The choke-point "Start here" section of the LITE report reads
+    ``domains[<domain>]["chokepoint_cardinality"]["ranked_chokepoints"]``, which
+    is computed and persisted by the tier-shared, LITE-safe SSOT
+    :func:`~adscan_internal.services.chokepoint_cardinality.stamp_chokepoint_cardinality_for_domain`.
+    In a PRO run the same seam is stamped by the PRO report service; but the LITE
+    render flow never calls that path, so without this the community report's
+    choke section renders empty. This mirrors the PRO seam's reachability
+    derivation exactly (same graph load, same start-id + terminal builders, same
+    ``bounded`` resolution) so both tiers produce the identical block.
+
+    Idempotent: the shared helper skips a domain that already carries a valid
+    ranked block (e.g. a prior PRO run persisted it into the same
+    ``technical_report.json``), so this never recomputes/overwrites.
+
+    Best-effort by construction: every domain is guarded, so a missing/unreadable
+    attack graph leaves that domain's choke block absent and the document simply
+    omits the section rather than failing generation.
+
+    Returns:
+        ``True`` when any domain's block was stamped to disk.
+    """
+    from types import SimpleNamespace
+
+    from adscan_internal.services.chokepoint_cardinality import (
+        resolve_choke_bounded,
+        stamp_chokepoint_cardinality_for_domain,
+    )
+
+    entries = raw_domains if isinstance(raw_domains, dict) else {}
+    changed = False
+    for domain in domains:
+        try:
+            shell = SimpleNamespace(current_workspace_dir=str(workspace_dir))
+            domain_data = entries.get(domain)
+            if not isinstance(domain_data, dict):
+                domain_data = {}
+            # Idempotency: if the block is already ranked (a PRO run stamped it),
+            # skip the graph load entirely.
+            existing = domain_data.get("chokepoint_cardinality")
+            if (
+                isinstance(existing, dict)
+                and existing.get("schema_version")
+                and isinstance(existing.get("ranked_chokepoints"), list)
+            ):
+                continue
+
+            # Mirror the PRO seam: reachability is computed over the BASE attack
+            # graph (load_attack_graph), normalizing the node dict->list shape,
+            # then the real reachable value-terminal id set is used as the choke
+            # scope. See report_service.ensure_report_attack_paths.
+            from adscan_internal.services.attack_graph_service import (
+                _resolve_domain_enabled_low_priv_user_start_ids,
+                load_attack_graph,
+            )
+            from adscan_internal.services.attack_reachability import (
+                compute_reachable_terminals,
+            )
+
+            graph = load_attack_graph(shell, domain)
+            start_ids = _resolve_domain_enabled_low_priv_user_start_ids(
+                shell, domain, graph
+            )
+            raw_nodes = graph.get("nodes")
+            norm_graph = {
+                "nodes": (
+                    list(raw_nodes.values())
+                    if isinstance(raw_nodes, dict)
+                    else (raw_nodes or [])
+                ),
+                "edges": graph.get("edges") or [],
+            }
+            reachable_terminals = compute_reachable_terminals(
+                norm_graph, start_node_ids=start_ids, target="all"
+            )
+            value_terminal_ids = {
+                str(t.node_id) for t in reachable_terminals if t.node_id
+            }
+            if not value_terminal_ids:
+                continue
+
+            # The LITE flow has no scan-shell engine marker; the persisted
+            # coverage block (H4) is the authoritative capped-run signal.
+            bounded = resolve_choke_bounded(domain_data, engine_marker_bounded=False)
+            stamp_chokepoint_cardinality_for_domain(
+                shell=shell,
+                domain=domain,
+                norm_graph=norm_graph,
+                value_terminals=value_terminal_ids,
+                bounded=bounded,
+                domain_data=domain_data,
             )
             changed = True
         except Exception as exc:  # noqa: BLE001 - a report never fails on this
@@ -2122,6 +2701,23 @@ def generate_lite_report_artifacts(
             restamped = read_json_file(str(tr_path))
             if isinstance(restamped, dict):
                 technical_report = restamped
+
+        # Stamp the choke-point cardinality block ("Start here" remediation) for
+        # each domain. The PRO report service computes+persists it in its own
+        # attack-path seam; the LITE render flow never calls that path, so in a
+        # LITE build (pro/ stripped) the block would be absent and the choke
+        # section would render empty. This tier-shared, LITE-safe seam produces
+        # the identical block. Idempotent — a domain a prior PRO run already
+        # stamped is skipped. Re-read the report when anything was written so the
+        # model reads the stamped block.
+        if _stamp_chokepoints(
+            workspace_dir,
+            domain_names,
+            technical_report.get("domains"),
+        ):
+            restamped_choke = read_json_file(str(tr_path))
+            if isinstance(restamped_choke, dict):
+                technical_report = restamped_choke
 
         workspace_name = str(
             getattr(shell, "current_workspace", None)
@@ -2303,7 +2899,9 @@ def _print_report_ready_panel(
                 # selects, never all of them. Kept under 70 characters so the
                 # bullet does not wrap on an 80-column terminal (see the same
                 # note on adscan_core.pro_upsell._KIT_ITEMS).
-                Text("  Security Assessment Report mapped to DORA, NIS2, ENS or ISO 27001"),
+                Text(
+                    "  Security Assessment Report mapped to DORA, NIS2, ENS or ISO 27001"
+                ),
                 Text("  Per-finding remediation your client's sysadmin can execute"),
                 Text("  AD Hardening Playbook"),
                 Text("  AD Control Coverage Report"),
@@ -2529,6 +3127,31 @@ _TEMPLATE = r"""<!DOCTYPE html>
 .choke-table th.col-princ { width: 18%; }
 .choke-tech { font-weight: 600; color: var(--text); line-height: 1.35; }
 .choke-n { font-family: var(--font-mono); font-weight: 600; color: var(--text-2); }
+/* Structural-choke durability badge on a "Start here" fix (no alternate route). */
+.ds-choke-badge {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 1px 7px;
+  border: 1px solid var(--accent, #0E6E78);
+  border-radius: 999px;
+  font-size: 8pt;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent, #0E6E78);
+  line-height: 1.4;
+}
+
+/* The prioritized "Start here" remediation ranking (validated cut set). */
+.ds-headline {
+  font-family: var(--font-display); font-size: 11pt; font-weight: 600;
+  color: var(--text); line-height: 1.4; margin: 0 0 3.5mm;
+}
+.remediation-table { table-layout: fixed; }
+.remediation-table th.col-rank { width: 7%; text-align: right; }
+.remediation-table th.col-object { width: 33%; }
+.remediation-table th.col-target { width: 27%; }
+.remediation-table th.col-rsev { width: 15%; }
+.remediation-table th.col-routes { width: 18%; }
 
 /* ── Attack paths ───────────────────────────────────────────────────────── */
 .path + .path { margin-top: 5mm; }
@@ -2864,10 +3487,105 @@ ol.oblig-steps > li {
   </section>
   {% endif %}
 
-  {% if m.choke_points %}
+  {% if m.remediation_start_here.present %}
   <section class="ds-section section-new-page">
     <div class="ds-section-head">
-      <div class="ds-eyebrow">Where to start</div>
+      <div class="ds-eyebrow">Start here</div>
+      <h2 class="ds-section-title">Fixes that break the most attack paths</h2>
+      <p class="ds-section-lead">
+        Ranked by how many attack paths each fix eliminates, most first. Work them
+        in this order.
+      </p>
+    </div>
+    <p class="ds-headline">{{ m.remediation_start_here.headline }}</p>
+    <table class="adscan-table remediation-table">
+      <thead>
+        <tr>
+          <th class="col-rank">#</th>
+          <th class="col-object">Fix</th>
+          <th class="col-routes">Impact</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in m.remediation_start_here.rows %}
+        <tr>
+          <td class="ds-rank">{{ c.rank }}</td>
+          <td>
+            <div class="choke-tech">{{ c.label }}</div>
+            {% if c.badge %}<div class="ds-choke-badge">{{ c.badge_label }}</div>{% endif %}
+          </td>
+          <td>{{ c.item_line }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="ds-fineprint">
+      <b>How to read this.</b> Each fix eliminates the count of attack paths shown:
+      &ldquo;validated&rdquo; paths are ones ADscan executed end to end, &ldquo;mapped&rdquo;
+      paths are ones it identified but did not run. Paths overlap, so the counts are not
+      meant to add up. A &ldquo;{{ m.remediation_start_here.rows[0].badge_label if m.remediation_start_here.rows[0].badge else 'durable fix' }}&rdquo;
+      badge marks an object with no alternate route around it, so the fix holds as the
+      directory changes. The step-by-step remediation for each one, written for the
+      administrator who has to apply it, is part of <a href="{{ m.pro_url }}">ADscan PRO</a>.
+    </div>
+  </section>
+  {% endif %}
+
+  {% if m.chokepoint_remediation.present %}
+  <section class="ds-section{% if not m.remediation_start_here.present %} section-new-page{% endif %}">
+    <div class="ds-section-head">
+      <div class="ds-eyebrow">Structural choke points</div>
+      <h2 class="ds-section-title">The objects to fix first</h2>
+      <p class="ds-section-lead">
+        A handful of objects sit across the most validated routes to your Tier 0.
+        Remove them, in this order, and whole groups of routes close at once. Ranked
+        by how many routes each one severs, most severe first.
+      </p>
+    </div>
+    <p class="ds-headline">{{ m.chokepoint_remediation.headline }}</p>
+    <table class="adscan-table remediation-table">
+      <thead>
+        <tr>
+          <th class="col-rank">#</th>
+          <th class="col-object">Object to remove</th>
+          <th class="col-target">Protected target</th>
+          <th class="col-rsev">Severity</th>
+          <th class="col-routes">Routes severed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in m.chokepoint_remediation.rows %}
+        <tr>
+          <td class="ds-rank">{{ c.rank }}</td>
+          <td><div class="choke-tech">{{ c.object_label }}</div></td>
+          <td>{{ c.protected_target or '—' }}</td>
+          <td><span class="chip {{ c.severity | lower }}">{{ c.severity }}</span></td>
+          <td class="choke-n">{{ c.routes_severed }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if m.chokepoint_remediation.edge_note %}
+    <div class="ds-note">
+      <div class="ds-note-k">Why remove the object</div>
+      <div class="ds-note-t">{{ m.chokepoint_remediation.edge_note }}</div>
+    </div>
+    {% endif %}
+    <div class="ds-fineprint">
+      <b>How to read this.</b> &ldquo;Routes severed&rdquo; is how many validated
+      routes to a high-value (Tier 0) target stop working once that object is
+      removed. Severity is that of the target the object protects. Routes overlap,
+      so the counts are not meant to add up.
+      The step-by-step remediation for each one, written for the administrator who
+      has to apply it, is part of <a href="{{ m.pro_url }}">ADscan PRO</a>.
+    </div>
+  </section>
+  {% endif %}
+
+  {% if m.choke_points %}
+  <section class="ds-section{% if not m.remediation_start_here.present and not m.chokepoint_remediation.present %} section-new-page{% endif %}">
+    <div class="ds-section-head">
+      <div class="ds-eyebrow">Supporting detail</div>
       <h2 class="ds-section-title">The techniques that carry the most paths</h2>
       <p class="ds-section-lead">
         The {{ m.paths_total }} path{{ '' if m.paths_total == 1 else 's' }} above are not
@@ -3188,15 +3906,20 @@ ol.oblig-steps > li {
 __all__ = (
     "AttackPathRow",
     "ChangeDisclosure",
+    "ChokePointRemediation",
+    "ChokePointRemediationRow",
     "ChokePointRow",
     "EnvironmentChangeRow",
     "FindingAssetCoverage",
     "FindingRow",
     "LITE_PDF_MARGIN",
     "LITE_THEME",
+    "LiteRemediationStartHere",
+    "LiteRemediationStartHereRow",
     "LiteReportArtifacts",
     "LiteReportModel",
     "MAX_CHOKE_POINTS",
+    "MAX_CHOKEPOINT_REMEDIATIONS",
     "MAX_RENDERED_PATHS",
     "PathStepRow",
     "ReportContentMetrics",
@@ -3204,6 +3927,8 @@ __all__ = (
     "build_bottom_line",
     "build_change_disclosure",
     "build_choke_points",
+    "build_chokepoint_remediation",
+    "build_lite_remediation_start_here",
     "build_pdf_options",
     "build_report_model",
     "build_severity_slices",

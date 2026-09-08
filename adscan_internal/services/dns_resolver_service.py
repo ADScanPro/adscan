@@ -19,6 +19,7 @@ import os
 import platform
 import re
 
+from adscan_core.pal.platform import is_windows
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
@@ -255,6 +256,11 @@ class DNSResolverService(BaseService):
 
     def ensure_unbound_available(self) -> bool:
         """Ensure Unbound is installed and its config directory exists."""
+        # Windows-native uses the host's own DNS resolver (typically the DC on a
+        # domain-joined machine); there is no local Unbound to install, and the
+        # POSIX privilege check below (os.geteuid) does not exist on Windows.
+        if is_windows():
+            return False
         try:
             if self._rt.is_full_container_runtime():
                 result = self._host.run_command("which unbound", timeout=10, ignore_errors=True)

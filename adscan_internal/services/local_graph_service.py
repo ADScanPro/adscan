@@ -243,17 +243,36 @@ class LocalGraphService:
         principal_name: str,
         *,
         principal_type: str | None = None,
+        object_id: str | None = None,
+        lookup_name: str | None = None,
     ) -> dict[str, Any] | None:
-        """Return a principal node using the local graph compatibility lookup."""
+        """Return a principal node using the local graph compatibility lookup.
+
+        Resolution order: the human-facing ``principal_name`` first, then any
+        alternate ``lookup_name`` (e.g. a UPN/short form), then the SID via
+        ``object_id`` — ``_find_node`` indexes the objectId/SID candidate set,
+        so a name-less enrichment (SID only) still resolves.
+        """
         kind = (
             principal_type[:1].upper() + principal_type[1:] if principal_type else None
         )
-        if kind in {"User", "Group", "Computer"}:
-            return self._find_node(domain, principal_name, kind=kind)
+
+        def _lookup(name: str | None) -> dict[str, Any] | None:
+            candidate = str(name or "").strip()
+            if not candidate:
+                return None
+            if kind in {"User", "Group", "Computer"}:
+                return self._find_node(domain, candidate, kind=kind)
+            return (
+                self.get_user_node_by_samaccountname(domain, candidate)
+                or self.get_group_node_by_samaccountname(domain, candidate)
+                or self.get_computer_node_by_name(domain, candidate)
+            )
+
         return (
-            self.get_user_node_by_samaccountname(domain, principal_name)
-            or self.get_group_node_by_samaccountname(domain, principal_name)
-            or self.get_computer_node_by_name(domain, principal_name)
+            _lookup(principal_name)
+            or _lookup(lookup_name)
+            or _lookup(object_id)
         )
 
     def get_users(

@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 
+from adscan_core.pal.platform import is_windows
 from adscan_internal import telemetry
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.rich_output import (
@@ -3036,8 +3037,16 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
     # If the system resolver is not using the local Unbound instance first, ADscan's
     # conditional forwarding may not apply to the rest of the tooling even if the
     # Unbound config is correct. This is a hard requirement for reliable scans.
+    #
+    # Windows-native: there is no local Unbound and no /etc/resolv.conf — the host
+    # resolves AD names through its own configured DNS (typically the DC). This
+    # whole resolv.conf advisory/self-heal block is Linux/container plumbing;
+    # skip it and go straight to the cross-platform dnspython verification below
+    # (reading /etc/resolv.conf here raised FileNotFoundError and aborted the scan).
     try:
-        if not getattr(shell, "_resolv_conf_local_warning_sent", False):
+        if not is_windows() and not getattr(
+            shell, "_resolv_conf_local_warning_sent", False
+        ):
             resolv_nameservers: list[str] = []
             try:
                 with open("/etc/resolv.conf", encoding="utf-8") as rf:
@@ -3408,6 +3417,37 @@ def update_resolver_for_domain(
     print_info_debug(
         f"[dns] update_resolver_for_domain: resolved pdc_ip={mark_sensitive(pdc_ip, 'ip')}"
     )
+
+    # Windows-native: the host resolves AD names through its own configured DNS
+    # (typically the DC), so there is no local Unbound to stage and no
+    # /etc/hosts / resolv.conf to rewrite — that whole layer is Linux/container
+    # plumbing. The DC-IP, hostname and FQDN persistence above (the part
+    # downstream transport actually needs) has already run. Verify the domain
+    # resolves via the host resolver and return, never entering the POSIX
+    # unbound/hosts/sudo path (which would crash on os.geteuid).
+    if is_windows():
+        print_info_verbose(
+            "Windows-native: using the host DNS resolver; no local Unbound setup needed."
+        )
+        # Verify via the cross-platform dnspython SRV/A check against the DC
+        # resolver (never the Linux-only local-Unbound path). A failure here is
+        # non-fatal: downstream transport resolves DC IPs via resolve_dc_ip /
+        # resolve_host_address regardless, so a strict AD-DNS SRV miss (common
+        # in some lab/segmented setups) must not abort the scan.
+        try:
+            service = shell._get_dns_discovery_service()
+            verified, _error_kind = service.verify_dns_resolution(
+                domain=domain, resolver_ip=pdc_ip
+            )
+        except Exception as verify_exc:  # noqa: BLE001 — verification is best-effort
+            telemetry.capture_exception(verify_exc)
+            print_exception(exception=verify_exc)
+            verified = False
+        if verified and dns_configured is not None:
+            dns_configured.add(memo_key)
+        # Return True so the resolver step never aborts the Windows scan over a
+        # DNS-verification miss; the DC IP/hostname persistence above already ran.
+        return True
 
     # Use Unbound as a local resolver with per-domain conditional forwarding.
     if not shell._ensure_unbound_available():

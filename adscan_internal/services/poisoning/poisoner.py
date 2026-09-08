@@ -82,19 +82,9 @@ PoisonCallback = Callable[[PoisonObservation], Awaitable[None]] | None
 def _interface_primary_ipv4(interface_name: str) -> str | None:
     """Return the first IPv4 address bound to ``interface_name`` (or ``None``)."""
 
-    try:
-        import netifaces  # noqa: PLC0415  (optional dep, lazy import)
-    except ImportError:
-        return None
-    try:
-        addresses = netifaces.ifaddresses(interface_name)
-    except (ValueError, OSError):
-        return None
-    for entry in addresses.get(netifaces.AF_INET, []):
-        addr = entry.get("addr")
-        if addr:
-            return addr
-    return None
+    from adscan_core.pal import net as pal_net
+
+    return pal_net.interface_ipv4_for(interface_name)
 
 
 def _should_respond(

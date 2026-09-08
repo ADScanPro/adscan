@@ -1167,7 +1167,7 @@ def resolve_host_address(
         print_info(
             Text(
                 "○  Unattended run: skipped. To reach it next time, set "
-                f"ADSCAN_HOST_IP_{env_key}=<ip> before the run.",
+                f"ADSCAN_HOST_IP_{mark_sensitive(env_key, 'ip')}=<ip> before the run.",
                 style="dim",
             )
         )

@@ -111,8 +111,17 @@ def _query_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> li
             _log_resolv_conf_state(hostname)
             raise
 
+        # When configured from /etc/resolv.conf, an FQDN nameserver line may have
+        # been ingested — strip it so it can never crash resolve() with a bare
+        # ValueError. No-op when resolver_ip drives an explicit nameserver below.
+        _sanitize_resolver_nameservers(resolver)
+
         if resolver_ip:
-            resolver.nameservers = [resolver_ip]
+            nameserver_ip = _nameserver_ip(resolver_ip, timeout_s)
+            # _nameserver_ip already guarantees an IP-or-None, but re-verify at the
+            # setter so no non-IP can ever reach dnspython (defense in depth).
+            if nameserver_ip and is_ip_address(nameserver_ip):
+                resolver.nameservers = [nameserver_ip]
         resolver.timeout = timeout_s
         resolver.lifetime = timeout_s
         answers = resolver.resolve(hostname, "A")
@@ -122,13 +131,24 @@ def _query_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> li
                 found.append(candidate)
     except dns.exception.DNSException as exc:
         print_info_debug(
-            f"[kerberos-target] A lookup failed for {mark_sensitive(hostname, 'hostname')}: {exc}"
+            f"[kerberos-target] A lookup failed for {mark_sensitive(hostname, 'hostname')}: "
+            f"{mark_sensitive(str(exc), 'hostname')}"
+        )
+    except ValueError as exc:
+        # dnspython raises a bare ValueError (NOT a DNSException) when a nameserver
+        # value is not an IP literal — a DNS-configuration condition (e.g. an FQDN
+        # nameserver in /etc/resolv.conf), not an ADscan bug. Degrade cleanly to a
+        # normal lookup failure: no per-lookup traceback, no telemetry noise.
+        print_info_debug(
+            f"[kerberos-target] A lookup failed for {mark_sensitive(hostname, 'hostname')} "
+            f"(DNS resolver config): {mark_sensitive(str(exc), 'hostname')}"
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(
-            f"[kerberos-target] unexpected A lookup error for {mark_sensitive(hostname, 'hostname')}: {exc}"
+            f"[kerberos-target] unexpected A lookup error for "
+            f"{mark_sensitive(hostname, 'hostname')}: {mark_sensitive(str(exc), 'hostname')}"
         )
     return found
 
@@ -137,6 +157,80 @@ def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str
     """Resolve a single A record (first in resolution order)."""
     records = _query_a_records(fqdn, resolver_ip, timeout_s)
     return records[0] if records else None
+
+
+def _nameserver_ip(resolver_ip: str | None, timeout_s: float) -> str | None:
+    """Return an IP literal usable as a dnspython nameserver, or ``None``.
+
+    ``dns.resolver.Resolver.nameservers`` accepts only IP literals — assigning an
+    FQDN raises ``ValueError`` (NOT a ``dns.exception.DNSException``), which
+    escapes the caller's specific ``except`` into its broad ``except`` and dumps a
+    full traceback per lookup. A DC known only by hostname reaches this path in
+    multi-forest engagements, so guard it:
+
+    * already an IP -> return it unchanged;
+    * an FQDN -> resolve it to an IP once via the system resolver (no explicit
+      nameserver, so this cannot recurse) so the intended nameserver is still
+      used rather than silently falling back to ``/etc/resolv.conf``;
+    * unresolvable / empty -> ``None``, letting the caller skip the explicit
+      ``nameservers`` assignment and fall through to ``/etc/resolv.conf`` cleanly.
+
+    Hard invariant (locked by tests): this function NEVER returns a hostname. The
+    return is an IP literal or ``None`` — verified with :func:`is_ip_address`
+    before returning — and the internal resolution is wrapped so ANY failure
+    (``ValueError`` from a malformed resolv.conf nameserver, a socket error, a
+    ``DNSException``) yields ``None`` rather than propagating. A non-IP must never
+    reach ``resolver.nameservers``, in any environment.
+    """
+    candidate = str(resolver_ip or "").strip()
+    if not candidate:
+        return None
+    if is_ip_address(candidate):
+        return candidate
+    try:
+        resolved = _query_a_record(candidate, None, timeout_s)
+    except Exception:  # noqa: BLE001 - a resolve-time error must never leak an FQDN to the setter
+        resolved = None
+    # Only an IP literal may be returned; a hostname (or anything is_ip_address
+    # rejects) is discarded so it can never reach dnspython's nameservers setter.
+    if resolved and is_ip_address(resolved):
+        print_info_debug(
+            "[kerberos-target] resolver given as hostname "
+            f"{mark_sensitive(candidate, 'hostname')}; using resolved nameserver "
+            f"{mark_sensitive(resolved, 'ip')}"
+        )
+        return resolved
+    print_info_debug(
+        "[kerberos-target] resolver given as hostname "
+        f"{mark_sensitive(candidate, 'hostname')} could not be resolved to an IP; "
+        "falling back to /etc/resolv.conf nameservers"
+    )
+    return None
+
+
+def _sanitize_resolver_nameservers(resolver) -> None:  # noqa: ANN001 - dnspython Resolver
+    """Drop any non-IP nameserver dnspython accepted from ``/etc/resolv.conf``.
+
+    ``dns.resolver.Resolver(configure=True)`` reads ``/etc/resolv.conf``. If that
+    file carries an FQDN nameserver line (``nameserver dc01.corp.local`` — seen in
+    containers whose resolver was seeded from a hostname), dnspython 2.x may store
+    it and then raise ``ValueError`` later inside ``resolve()`` when it tries to
+    use it. Strip every stored nameserver that is not an IP literal so a malformed
+    resolv.conf entry can never reach the wire path and crash the lookup. If
+    stripping leaves no nameservers, the entries are left untouched — dnspython's
+    own ``NoNameservers`` (a ``DNSException``) is then handled cleanly by the
+    caller's specific ``except`` rather than a bare ``ValueError``.
+    """
+    try:
+        current = list(getattr(resolver, "nameservers", []) or [])
+    except Exception:  # noqa: BLE001
+        return
+    ip_only = [ns for ns in current if is_ip_address(str(ns))]
+    if ip_only and len(ip_only) != len(current):
+        try:
+            resolver.nameservers = ip_only
+        except Exception:  # noqa: BLE001 - never let sanitization itself raise
+            pass
 
 
 def _log_resolv_conf_state(context: str) -> None:
@@ -173,8 +267,14 @@ def _query_ptr_record(ip: str, resolver_ip: str | None, timeout_s: float) -> str
         import dns.resolver
 
         resolver = dns.resolver.Resolver(configure=not bool(resolver_ip))
+        # Strip any FQDN nameserver ingested from /etc/resolv.conf (see the
+        # A-record path) so a malformed entry cannot crash the PTR lookup.
+        _sanitize_resolver_nameservers(resolver)
         if resolver_ip:
-            resolver.nameservers = [resolver_ip]
+            nameserver_ip = _nameserver_ip(resolver_ip, timeout_s)
+            # Re-verify at the setter: only an IP literal may reach dnspython.
+            if nameserver_ip and is_ip_address(nameserver_ip):
+                resolver.nameservers = [nameserver_ip]
         resolver.timeout = timeout_s
         resolver.lifetime = timeout_s
         reverse_name = dns.reversename.from_address(ip_clean)
@@ -185,13 +285,22 @@ def _query_ptr_record(ip: str, resolver_ip: str | None, timeout_s: float) -> str
                 return candidate
     except dns.exception.DNSException as exc:
         print_info_debug(
-            f"[kerberos-target] PTR lookup failed for {mark_sensitive(ip_clean, 'ip')}: {exc}"
+            f"[kerberos-target] PTR lookup failed for {mark_sensitive(ip_clean, 'ip')}: "
+            f"{mark_sensitive(str(exc), 'ip')}"
+        )
+    except ValueError as exc:
+        # See _query_a_records: a non-IP nameserver value raises a bare ValueError
+        # (DNS-configuration condition, not an ADscan bug). Degrade cleanly.
+        print_info_debug(
+            f"[kerberos-target] PTR lookup failed for {mark_sensitive(ip_clean, 'ip')} "
+            f"(DNS resolver config): {mark_sensitive(str(exc), 'ip')}"
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(
-            f"[kerberos-target] unexpected PTR lookup error for {mark_sensitive(ip_clean, 'ip')}: {exc}"
+            f"[kerberos-target] unexpected PTR lookup error for "
+            f"{mark_sensitive(ip_clean, 'ip')}: {mark_sensitive(str(exc), 'ip')}"
         )
     return None
 

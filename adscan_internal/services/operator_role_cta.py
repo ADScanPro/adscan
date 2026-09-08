@@ -14,6 +14,12 @@ call-to-action branch by who the operator is:
   operators are pentesters, /pro is the light safe ask, and the Enterprise demo
   is only offered on a POSITIVE buyer signal, never by default.
 
+**Windows-no-role exception.** When the role is UNKNOWN *and* the host is
+Windows, the lane defaults to **Enterprise** instead of /pro: a Windows host
+almost certainly means a sysadmin running ADscan on their own domain-joined
+machine, not a pentester. An EXPLICIT non-buyer role (e.g. a consultant on
+Windows) still wins — it stays on /pro. Linux with no role is unchanged (/pro).
+
 This module owns the mapping so the two CTA call sites (the session-summary hint
 and the domain-compromise victory panel) cannot drift apart. It never raises —
 an unreadable profile resolves to the /pro lane.
@@ -45,18 +51,28 @@ def resolve_cta_lane() -> CtaLane:
     """Return the CTA lane for the persisted operator role.
 
     Reads the local role profile; a buyer role (own-estate) resolves to
-    :attr:`CtaLane.ENTERPRISE`, everything else (including an unknown / unset /
-    unreadable role) to :attr:`CtaLane.PRO`. Never raises.
+    :attr:`CtaLane.ENTERPRISE`. An explicit non-buyer role resolves to
+    :attr:`CtaLane.PRO`. When no role is set (None / unknown), the host OS is
+    the tie-breaker: a Windows host defaults to :attr:`CtaLane.ENTERPRISE`
+    (almost certainly a sysadmin on their own domain-joined machine), a
+    non-Windows host to :attr:`CtaLane.PRO`. Never raises.
     """
     try:
+        from adscan_core.pal.platform import is_windows
         from adscan_internal.services.operator_role_profile import get_operator_role
 
         role = get_operator_role()
+        if role in _BUYER_ROLES:
+            return CtaLane.ENTERPRISE
+        if role is not None:
+            # An explicit non-buyer role wins, even on Windows.
+            return CtaLane.PRO
+        if is_windows():
+            # Role unknown + Windows host → sysadmin default.
+            return CtaLane.ENTERPRISE
+        return CtaLane.PRO
     except Exception:  # noqa: BLE001
         return CtaLane.PRO
-    if role in _BUYER_ROLES:
-        return CtaLane.ENTERPRISE
-    return CtaLane.PRO
 
 
 def is_enterprise_lane() -> bool:

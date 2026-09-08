@@ -95,6 +95,14 @@ class ClientPathTotals:
     ``paths_total`` is the inventory (it keeps the positive
     ``closed_by_configuration`` bucket visible); ``paths_open_exposure`` is the
     only one a client-facing risk figure may use.
+
+    The ``reachable_*`` fields are a DIFFERENT quantity from the ``paths_*``
+    ones: they are k-independent SET cardinalities (the number of DISTINCT
+    reachable compromise terminals), not enumerated path counts. They are the
+    EXPOSURE numbers — "how many distinct high-value targets can be reached" —
+    distinct from the ``paths_*`` EVIDENCE numbers, which count validated/
+    identified routes. They are populated whenever the run stamped a
+    ``reachability`` block and default to 0 otherwise.
     """
 
     paths_total: int = 0
@@ -104,6 +112,12 @@ class ClientPathTotals:
     paths_partial: int = 0
     paths_closed_by_configuration: int = 0
     paths_not_assessed: int = 0
+    #: Reachable-terminal SET cardinalities (k-independent EXPOSURE numbers).
+    reachable_full_domain_compromise: int = 0
+    reachable_tier0: int = 0
+    reachable_domain_object: int = 0
+    reachable_tier0_direct: int = 0
+    reachable_tier0_enabler: int = 0
     #: ``compromise_class`` -> open-exposure path count. Drives the reach label
     #: without any surface re-deriving the class ordering.
     open_exposure_by_class: Mapping[str, int] = field(default_factory=dict)
@@ -148,6 +162,20 @@ class ClientPathTotals:
                 self.paths_closed_by_configuration + other.paths_closed_by_configuration
             ),
             paths_not_assessed=self.paths_not_assessed + other.paths_not_assessed,
+            reachable_full_domain_compromise=(
+                self.reachable_full_domain_compromise
+                + other.reachable_full_domain_compromise
+            ),
+            reachable_tier0=self.reachable_tier0 + other.reachable_tier0,
+            reachable_domain_object=(
+                self.reachable_domain_object + other.reachable_domain_object
+            ),
+            reachable_tier0_direct=(
+                self.reachable_tier0_direct + other.reachable_tier0_direct
+            ),
+            reachable_tier0_enabler=(
+                self.reachable_tier0_enabler + other.reachable_tier0_enabler
+            ),
             open_exposure_by_class=by_class,
         )
 
@@ -167,6 +195,11 @@ class ClientPathTotals:
             "paths_partial": self.paths_partial,
             "paths_closed_by_configuration": self.paths_closed_by_configuration,
             "paths_not_assessed": self.paths_not_assessed,
+            "reachable_full_domain_compromise": self.reachable_full_domain_compromise,
+            "reachable_tier0": self.reachable_tier0,
+            "reachable_domain_object": self.reachable_domain_object,
+            "reachable_tier0_direct": self.reachable_tier0_direct,
+            "reachable_tier0_enabler": self.reachable_tier0_enabler,
         }
 
 
@@ -199,6 +232,9 @@ def client_path_totals_from_kpis(
     path_axis = exposure_kpis.get("path_axis")
     if not isinstance(path_axis, Mapping):
         return ClientPathTotals()
+
+    reachability = exposure_kpis.get("reachability")
+    reach = reachability if isinstance(reachability, Mapping) else {}
 
     total = 0
     open_exposure = 0
@@ -238,6 +274,13 @@ def client_path_totals_from_kpis(
         paths_partial=partial,
         paths_closed_by_configuration=closed_by_configuration,
         paths_not_assessed=not_assessed,
+        reachable_full_domain_compromise=_coerce_int(
+            reach.get("full_domain_compromise")
+        ),
+        reachable_tier0=_coerce_int(reach.get("tier0_reachable")),
+        reachable_domain_object=_coerce_int(reach.get("domain_object")),
+        reachable_tier0_direct=_coerce_int(reach.get("tier0_direct")),
+        reachable_tier0_enabler=_coerce_int(reach.get("tier0_enabler")),
         open_exposure_by_class=by_class,
     )
 
@@ -246,6 +289,7 @@ def client_path_totals_from_paths(
     paths: Sequence[Mapping[str, Any]],
     *,
     executions: Sequence[Mapping[str, Any]] | None = None,
+    reachability: Mapping[str, int] | None = None,
 ) -> ClientPathTotals:
     """Return the named totals for an already-computed path set. Pure.
 
@@ -255,6 +299,10 @@ def client_path_totals_from_paths(
         executions: Optional path-execution sidecar rows, so a path's status is
             its executed :class:`PathState` rather than the LDAP-derived display
             status — the same reconciliation the report applies.
+        reachability: Optional reachable-terminal summary (from
+            :func:`~adscan_internal.services.attack_reachability.summarize_reachable_terminals`).
+            When supplied it populates the ``reachable_*`` EXPOSURE fields;
+            ``None`` leaves the block absent and those fields default to 0.
     """
     from adscan_internal.services.exposure_score_service import compute_exposure_kpis
 
@@ -264,6 +312,7 @@ def client_path_totals_from_paths(
         # user-axis percentages do, and this module reads neither.
         domain_user_count=None,
         executions=list(executions) if executions else None,
+        reachability=reachability,
     )
     return client_path_totals_from_kpis(kpis)
 
