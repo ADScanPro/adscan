@@ -179,7 +179,7 @@ jobs:
       # release step without re-running the ~90-minute build.
       - name: Upload adscan.exe as a workflow artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: adscan-exe-${{ steps.version.outputs.version }}
           path: dist/adscan.exe
