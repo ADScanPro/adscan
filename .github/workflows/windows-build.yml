@@ -81,7 +81,7 @@ jobs:
       # separate EMBEDDABLE CPython for the runtime bundle itself; this
       # setup-python is only the toolchain that assembles it.
       - name: Set up build Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
