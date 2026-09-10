@@ -25,6 +25,9 @@ from adscan_internal.services.privileged_group_classifier import (
     resolve_privileged_followup_decision,
     sid_rid,
 )
+from adscan_internal.services.share_credential_provenance_service import (
+    reconcile_share_credential_edge_sources,
+)
 from adscan_internal.workspaces import domain_subpath, write_json_file
 from adscan_core.rich_output import print_exception
 
@@ -189,7 +192,62 @@ def _build_classified_node_payloads(result: CollectionResult) -> list[dict[str, 
         props["tier0_membership_keys"] = list(matched_keys)
         props["target_terminal_class"] = terminal_class
 
+    _stamp_privilege_tier_on_payloads(result, payloads)
     return list(payloads.values())
+
+
+def _stamp_privilege_tier_on_payloads(
+    result: CollectionResult, payloads: dict[str, dict[str, Any]]
+) -> None:
+    """Stamp ``properties["privilege_tier"]`` on every graph node payload (Phase 1c).
+
+    Additive: writes the enriched tier-SSOT :class:`PrivilegeTier` value onto each
+    node so downstream consumers can key on ONE per-node tier. No reader consumes
+    it yet (the reader switch is Phase 2), so this cannot move any attack path.
+
+    GAP-B (the load-bearing correctness point): User/Computer nodes are stamped
+    with the MEMBERSHIP-AWARE tier from :func:`_classify_principals_by_membership`
+    (the same SSOT that stamps ``computers.json``/``users.json``), NEVER the bare
+    node-resolver — a member of Domain Admins grades ``tier0_direct`` via its
+    transitive group closure, which a per-node identity read would miss and grade
+    ``tier2``. Group / Domain / ADCS nodes carry their tier on their own identity,
+    so they resolve through :func:`privilege_tier_for_node` (which grades a DA
+    group ``tier0_direct``, DNSAdmins ``tier0_escalation_capable``, and a CA /
+    certificate template ``tier0_escalation_capable`` by kind).
+    """
+    from adscan_internal.services.collector.inventory_persistence import (  # noqa: PLC0415
+        _classify_principals_by_membership,
+    )
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        PrivilegeTier,
+        privilege_tier_for_node,
+    )
+
+    # Membership-aware tiers for User/Computer (tier0/tier1 only; tier2 omitted to
+    # keep the inventory compact). Anything absent defaults to tier2 below. The
+    # third map records HOW a computer's tier was inferred (axis-1 confidence).
+    _, member_tier_by_id, member_tier_basis_by_id = (
+        _classify_principals_by_membership(result)
+    )
+
+    for sid, payload in payloads.items():
+        kind = str(payload.get("kind") or "").strip().lower()
+        props = payload.setdefault("properties", {})
+        if not isinstance(props, dict):
+            props = {}
+            payload["properties"] = props
+        if kind in ("user", "computer"):
+            tier_value = member_tier_by_id.get(sid, PrivilegeTier.TIER2.value)
+        else:
+            # Group / Domain / ADCS — tier is a property of the node's own
+            # identity, resolved through the enriched tier SSOT.
+            tier_value = privilege_tier_for_node(payload).value
+        props["privilege_tier"] = tier_value
+        # Computers carry the tier-basis (heuristic Tier 1 vs deterministic
+        # Tier 0) so the report can declare how each server tier was inferred.
+        basis_value = member_tier_basis_by_id.get(sid)
+        if basis_value:
+            props["privilege_tier_basis"] = basis_value
 
 
 def _merge_system_tags(existing: object, *tags: str) -> str:
@@ -495,6 +553,21 @@ class CollectorPersistence:
             domain=domain,
             result=result,
         )
+        # Reconcile share-file credential edges to the measured read-set now that
+        # inventory/relationships.json AND the attack graph both exist for this
+        # domain. The unauth GPP / share-spidering edge is built in Phase 2.5,
+        # BEFORE the collector writes relationships.json, so its source fell to the
+        # honest anonymous fallback; this is the first seam where the measured
+        # read-set is available to source it correctly. Best-effort: a failure
+        # must never abort persistence. See Task 2.1.
+        reconciled = 0
+        try:
+            reconciled = reconcile_share_credential_edge_sources(shell, domain, graph)
+            if reconciled:
+                attack_graph_service.save_attack_graph(shell, domain, graph)
+        except Exception as exc:  # noqa: BLE001 - never break collection persistence
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         return {
             "nodes": len(node_payloads),
             "edges": edge_count + derived_edges,

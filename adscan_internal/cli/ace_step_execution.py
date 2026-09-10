@@ -860,12 +860,23 @@ def resolve_execution_candidates(
             candidate_users = list(dict.fromkeys(matched_via_membership))
             group_members_resolved = True
             source_tag = "group_membership"
-            print_info_debug(
-                "[exec-user] Group-membership resolution: selected "
-                f"{len(candidate_users)} candidate(s) for "
-                f"from_label={mark_sensitive(str(from_label or ''), 'node')}: "
-                f"{_preview_users(candidate_users)}"
+            # Suppress in batch mode (the readiness pass resolves the SAME
+            # from_label across thousands of paths, emitting a byte-for-byte
+            # identical line each time). One line per unique from_label is
+            # enough; outside a batch scope this logs as before.
+            from adscan_internal.services._annotation_log_dedup import (  # noqa: PLC0415
+                annotation_log_seen,
             )
+
+            if not annotation_log_seen(
+                ("exec-user-membership", str(from_label or ""), str(len(candidate_users)))
+            ):
+                print_info_debug(
+                    "[exec-user] Group-membership resolution: selected "
+                    f"{len(candidate_users)} candidate(s) for "
+                    f"from_label={mark_sensitive(str(from_label or ''), 'node')}: "
+                    f"{_preview_users(candidate_users)}"
+                )
         elif member_sams_raw is None:
             # INDETERMINATE, not "nobody". No membership snapshot exists, so we
             # did not check and find nothing — we could not check at all. Both
@@ -996,12 +1007,23 @@ def resolve_execution_candidates(
             if isinstance(creds, dict)
             else "[]"
         )
-        print_info_debug(
-            "[exec-user] Found "
-            f"{len(candidate_users)} candidate user(s) with stored credentials. "
-            f"candidates={_preview_users(candidate_users)} "
-            f"stored_credentials={stored_credential_preview}"
+        # Suppress in batch mode: the readiness pass resolves the SAME from_label
+        # across thousands of paths and prints this identical line each time. One
+        # line per unique (from_label, candidate count) is enough; outside a batch
+        # scope this logs as before.
+        from adscan_internal.services._annotation_log_dedup import (  # noqa: PLC0415
+            annotation_log_seen,
         )
+
+        if not annotation_log_seen(
+            ("exec-user-found", str(from_label or ""), str(len(candidate_users)))
+        ):
+            print_info_debug(
+                "[exec-user] Found "
+                f"{len(candidate_users)} candidate user(s) with stored credentials. "
+                f"candidates={_preview_users(candidate_users)} "
+                f"stored_credentials={stored_credential_preview}"
+            )
         return candidate_users, source_tag
 
     print_info_debug(

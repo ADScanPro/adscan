@@ -1744,6 +1744,16 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 secret=leak.cleartext,
                 artifact=leak.unc_path,
                 origin="unauth_enrichment",
+                # Thread the workspace + share so the resolver fires on the measured
+                # read-set (Seam A), sourcing the edge from who could actually READ
+                # the leaked file — not the Domain Users placeholder. ``domain`` is
+                # the enumeration domain whose inventory/relationships.json holds the
+                # read-set. ``perspective`` records that the SYSVOL/share read was an
+                # unauthenticated bind, so the read-set-absent fallback is honest.
+                shell=self,
+                domain=domain,
+                shares=[leak.source_share] if leak.source_share else None,
+                perspective="anonymous",
             )
             _add_credential(
                 self,
@@ -1819,6 +1829,13 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 secret=autologin.password,
                 artifact=autologin.unc_path,
                 origin="unauth_enrichment",
+                # Same read-set threading as the cpassword loop: source the edge from
+                # the measured share read-set, falling back honestly to the
+                # unauthenticated perspective when no read-set is available.
+                shell=self,
+                domain=domain,
+                shares=[autologin.source_share] if autologin.source_share else None,
+                perspective="anonymous",
             )
             _add_credential(
                 self,

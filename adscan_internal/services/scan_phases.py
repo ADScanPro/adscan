@@ -262,6 +262,8 @@ REPORT_FRAMEWORK_CHOICES: tuple[str, ...] = (
     "iso27001",
     "dora",
     "pci_dss",
+    # CIS Windows Server Benchmark — technical hardening, not a regulation.
+    "cis",
 )
 REPORT_THEME_CHOICES: tuple[str, ...] = (
     "corporate_light",

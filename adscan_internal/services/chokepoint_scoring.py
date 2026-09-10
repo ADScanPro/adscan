@@ -103,8 +103,41 @@ def _node_is_tier0_asset(node: Mapping[str, Any] | None) -> bool:
     return False
 
 
+def _is_builtin_local_group(node: Mapping[str, Any]) -> bool:
+    """Return True when a node is a BUILTIN local group (not a domain principal.
+
+    A BUILTIN local group (Administrators, Users, Guests, Power Users, ...) has
+    the well-known SID prefix ``S-1-5-32-`` or lives under the directory's
+    ``CN=Builtin`` container. Its ``sAMAccountName`` is frequently a common
+    English word, so rendering it bare (the graph-wide ``NAME@DOMAIN`` label
+    convention) is ambiguous against a same-named domain object.
+
+    Args:
+        node: A node dict (already confirmed to be a Mapping).
+
+    Returns:
+        True when the node is a BUILTIN local group.
+    """
+    props = node.get("properties")
+    props = props if isinstance(props, Mapping) else {}
+    sid = str(
+        node.get("objectId") or node.get("objectid") or props.get("objectid") or ""
+    ).upper()
+    if sid.startswith("S-1-5-32-"):
+        return True
+    dn = str(props.get("distinguishedname") or "")
+    return ",CN=BUILTIN," in dn.upper()
+
+
 def _node_label(node: Mapping[str, Any] | None, fallback: str) -> str:
     """Return a node's display label, falling back to name then id.
+
+    A BUILTIN local group (SID prefix ``S-1-5-32-`` or ``CN=Builtin`` in its
+    DN) is qualified as ``BUILTIN\\<samaccountname>`` instead of the bare
+    graph-wide ``NAME@DOMAIN`` label — that convention is correct for domain
+    accounts but ambiguous for a BUILTIN group whose name is a common English
+    word (``Users``, ``Administrators``, ``Guests``, ``Power Users``), which a
+    reader cannot distinguish from ``Domain Users`` or a container.
 
     Args:
         node: A node dict, or ``None``.
@@ -115,6 +148,15 @@ def _node_label(node: Mapping[str, Any] | None, fallback: str) -> str:
     """
     if not isinstance(node, Mapping):
         return fallback
+    if _is_builtin_local_group(node):
+        props = node.get("properties")
+        props = props if isinstance(props, Mapping) else {}
+        sam = str(props.get("samaccountname") or "").strip()
+        if sam:
+            return f"BUILTIN\\{sam}"
+        bare = str(node.get("label") or node.get("name") or fallback)
+        name_part = bare.split("@", 1)[0]
+        return f"BUILTIN\\{name_part.title()}"
     return str(node.get("label") or node.get("name") or fallback)
 
 

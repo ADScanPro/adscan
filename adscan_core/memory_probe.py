@@ -18,11 +18,22 @@ Sources, in order of preference for the container ceiling:
 1. cgroup v2 — ``/sys/fs/cgroup/memory.max`` (value ``max`` means unlimited).
 2. cgroup v1 — ``/sys/fs/cgroup/memory/memory.limit_in_bytes`` (a very large
    sentinel near ``PAGE_COUNTER_MAX`` means unlimited).
-3. Fallback — ``MemAvailable`` from ``/proc/meminfo`` (a HOST figure, not a
-   container ceiling — the returned ``source`` says so).
+3. ``MemAvailable`` from ``/proc/meminfo`` (a HOST figure, not a container
+   ceiling — the returned ``source`` says so).
+4. Final fallback — ``psutil.virtual_memory()`` (``.total`` as the ceiling,
+   ``.available`` as free-now). This is what carries the gate on **native
+   Windows**, where there is no cgroup and no ``/proc``, so sources 1–3 all
+   return nothing and the gate would otherwise never fire. ``psutil`` is
+   cross-platform and already shipped (it backs ``pal.process.peak_rss_bytes``),
+   so it also serves as a universal last resort on any host whose cgroup/proc
+   files are unreadable. It runs LAST, so on native Linux the cgroup/proc
+   sources still win and behaviour is byte-identical. Like the meminfo source
+   it reports HOST figures — the ``source`` tag says so; never mix a host
+   number with a container ceiling silently.
 
 Current RSS is read from ``/proc/self/status`` (``VmRSS``), falling back to the
-PAL peak-RSS reader (``ru_maxrss`` on POSIX, a high-water mark, not live RSS).
+PAL peak-RSS reader (``ru_maxrss`` on POSIX, ``psutil`` on Windows — a
+high-water mark, not live RSS).
 """
 
 from __future__ import annotations
@@ -68,6 +79,12 @@ _CGROUP_V1_UNLIMITED_FLOOR = 1 << 62
 SOURCE_CGROUP_V2 = "cgroup_v2"
 SOURCE_CGROUP_V1 = "cgroup_v1"
 SOURCE_PROC_MEMINFO = "proc_meminfo"
+#: psutil host figures (``virtual_memory().total`` / ``.available``). A HOST
+#: number, not a container ceiling — kept a distinct tag so a downstream reader
+#: never mistakes it for a cgroup cap. This is the source that carries the memory
+#: gate on native Windows (no cgroup, no ``/proc``) and the universal last resort
+#: elsewhere.
+SOURCE_PSUTIL_HOST = "psutil_host"
 SOURCE_UNKNOWN = "unknown"
 
 
@@ -78,11 +95,13 @@ class MemorySituation:
     Attributes:
         available_bytes: Memory the process can still use before it is killed.
             For a cgroup source this is ``limit - current_usage``; for the
-            ``/proc/meminfo`` fallback it is host ``MemAvailable``. ``None`` when
-            nothing could be read.
-        limit_bytes: The memory ceiling. The cgroup limit when readable, else
-            ``None`` (an unlimited/unreadable cgroup, or the meminfo fallback
-            which has no per-process ceiling).
+            ``/proc/meminfo`` fallback it is host ``MemAvailable``; for the
+            psutil fallback it is host ``virtual_memory().available``. ``None``
+            when nothing could be read.
+        limit_bytes: The memory ceiling. The cgroup limit when readable; host
+            physical total (``virtual_memory().total``) for the psutil source;
+            else ``None`` (an unlimited/unreadable cgroup, or the meminfo
+            fallback which has no ceiling figure).
         rss_bytes: Current process resident set size, or ``None``.
         source: One of the ``SOURCE_*`` tags identifying where
             ``available_bytes``/``limit_bytes`` came from — so a later reader
@@ -217,6 +236,36 @@ def _read_mem_available() -> Optional[int]:
     return _parse_meminfo_kb(raw, "MemAvailable:")
 
 
+def _read_psutil_host_situation() -> Optional[tuple[int, int]]:
+    """Return ``(available_bytes, total_bytes)`` from psutil, or ``None``.
+
+    Reads ``psutil.virtual_memory()``: ``.available`` is the memory free right
+    now (the real headroom the gate compares against), ``.total`` is the physical
+    ceiling (analogous to a cgroup limit — used by the gate's scenario classifier
+    to tell "resize the host" apart from "free memory held by another workload").
+    Both are HOST figures.
+
+    ``psutil`` is cross-platform, so this works on Windows AND Linux; it is wired
+    as the LAST source in :func:`read_memory_situation`, so the Linux cgroup/proc
+    paths still take precedence and only Windows (or a host with no readable
+    cgroup/proc files) reaches it. Best-effort: any import/read error, or a
+    non-positive ``.available``, returns ``None`` so the caller degrades to
+    :data:`SOURCE_UNKNOWN` exactly as before — a broken reader must never break
+    discovery.
+    """
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        available = int(vm.available)
+        total = int(vm.total)
+    except Exception:  # noqa: BLE001 — a memory beacon must never crash the caller.
+        return None
+    if available <= 0 or total <= 0:
+        return None
+    return available, total
+
+
 def read_process_rss_bytes() -> Optional[int]:
     """Return current process RSS in bytes, best-effort.
 
@@ -242,10 +291,14 @@ def read_memory_situation() -> MemorySituation:
     """Return a best-effort :class:`MemorySituation` snapshot.
 
     Never raises. Resolves the container ceiling from cgroup v2, then cgroup v1,
-    then falls back to host ``MemAvailable`` — tagging ``source`` so a later
-    reader can tell a container ceiling apart from a host figure. ``available``
-    for a cgroup source is ``limit - usage`` (clamped at 0); for the fallback it
-    is host ``MemAvailable``.
+    then host ``MemAvailable`` (``/proc/meminfo``), then — as the universal final
+    fallback for hosts without cgroup/proc, chiefly **native Windows** —
+    ``psutil.virtual_memory()`` (``.total`` ceiling, ``.available`` free-now).
+    ``source`` is tagged so a later reader can tell a container ceiling apart
+    from a host figure. ``available`` for a cgroup source is ``limit - usage``
+    (clamped at 0); for the meminfo source it is host ``MemAvailable``; for the
+    psutil source it is host ``.available``. The psutil source runs LAST so the
+    Linux cgroup/proc paths are byte-identical.
     """
     rss = read_process_rss_bytes()
 
@@ -287,6 +340,19 @@ def read_memory_situation() -> MemorySituation:
                 rss_bytes=rss,
                 source=SOURCE_PROC_MEMINFO,
             )
+
+        # Final fallback — psutil host figures. This is the ONLY source on native
+        # Windows (no cgroup, no ``/proc``), and a universal last resort anywhere
+        # cgroup/proc are unreadable. It runs LAST, so Linux is byte-identical.
+        psutil_situation = _read_psutil_host_situation()
+        if psutil_situation is not None:
+            available, total = psutil_situation
+            return MemorySituation(
+                available_bytes=available,
+                limit_bytes=total,
+                rss_bytes=rss,
+                source=SOURCE_PSUTIL_HOST,
+            )
     except Exception:  # noqa: BLE001 — a memory beacon must never crash the caller.
         pass
 
@@ -322,5 +388,6 @@ __all__ = (
     "SOURCE_CGROUP_V2",
     "SOURCE_CGROUP_V1",
     "SOURCE_PROC_MEMINFO",
+    "SOURCE_PSUTIL_HOST",
     "SOURCE_UNKNOWN",
 )

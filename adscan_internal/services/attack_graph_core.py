@@ -706,6 +706,16 @@ _EFFECTIVE_RELATION_TO_LABEL: dict[str, str] = {
 
 def _share_node_is_tier0(node: dict[str, Any]) -> bool:
     """Lightweight Tier-0 check suitable for graph-level share enumeration."""
+    # Tier-label SSOT: prefer the stamped, membership-aware label; the legacy
+    # signals below remain the fallback for a node that carries no stamp (an older
+    # graph). The stamped-label read is unconditional — validated in lab and made
+    # permanent (the ADSCAN_TIER_LABEL_SSOT reader switch was removed 2026-09-09).
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        node_is_tier0_by_stamped_label,
+    )
+
+    if node_is_tier0_by_stamped_label(node):
+        return True
     if bool(node.get("isTierZero")):
         return True
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
@@ -1062,7 +1072,35 @@ def load_attack_graph(path: Path) -> dict[str, Any] | None:
             # Best-effort normalisation; in-memory data is already correct.
             pass
     _backfill_edge_kinds(data)
+    _backfill_privilege_tier(data)
     return data
+
+
+def _backfill_privilege_tier(graph: dict[str, Any]) -> None:
+    """In-memory backfill of the per-node ``privilege_tier`` stamp (Phase 1c/2/3).
+
+    A fresh scan stamps ``properties["privilege_tier"]`` at collection
+    (``collector/persistence._stamp_privilege_tier_on_payloads``). Graphs
+    collected before that stamp existed carry no label, so the tier-label SSOT
+    readers would silently fall back to the legacy signals on every persisted
+    workspace; this backfill closes that gap by authoring the stamp at load.
+
+    Phase 3 (GAP-B): the backfill is now MEMBERSHIP-AWARE. It delegates to the
+    tier-SSOT ``stamp_membership_aware_privilege_tier``, which resolves each
+    User/Computer's transitive group closure from the graph's OWN ``MemberOf``
+    edges (the same source the collector-side stamp uses) and grades it through
+    the SSOT classifiers — so a Domain Admins MEMBER grades ``tier0_direct`` and
+    a Backup Operators member grades ``tier0_escalation_capable``, instead of the
+    bare per-node read's membership-blind ``tier2``/degraded-escalation verdict.
+    Additive and idempotent: it only WRITES the field, never removes one, and
+    skips an already-stamped node — so re-running it is a no-op and it never
+    changes a graph that already carries stamps.
+    """
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        stamp_membership_aware_privilege_tier,
+    )
+
+    stamp_membership_aware_privilege_tier(graph)
 
 
 def _backfill_edge_kinds(graph: dict[str, Any]) -> None:
@@ -6194,6 +6232,21 @@ def _node_domain_sid(node: dict[str, Any]) -> str | None:
 
 
 def _node_is_tier0(node: dict[str, Any]) -> bool:
+    # Tier-label SSOT: consult the node's stamped, membership-aware
+    # ``privilege_tier`` label FIRST. This is a strict superset of the legacy
+    # detectors below (a DA member the legacy flag captured is ALSO tier0_direct on
+    # the stamp, and the reconciled escalation groups + ADCS CAs the legacy flag
+    # missed are now covered), so the stamped-label read can only ADD a correct
+    # Tier-0 promotion, never drop one. The legacy detectors still run so a node
+    # with no stamp (an older graph) is unaffected. The stamped-label read is
+    # unconditional — validated in lab and made permanent (the ADSCAN_TIER_LABEL_SSOT
+    # reader switch was removed 2026-09-09).
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        node_is_tier0_by_stamped_label,
+    )
+
+    if node_is_tier0_by_stamped_label(node):
+        return True
     if bool(node.get("isTierZero")):
         return True
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}

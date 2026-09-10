@@ -120,6 +120,8 @@ _KNOWN_LAUNCHER_COMMANDS = {
     "tui",
     "ci",
     "demo",
+    "report",
+    "writeup",
     "update",
     "upgrade",
     "version",
@@ -235,6 +237,25 @@ class _DeliverablesAwareParser(argparse.ArgumentParser):
         )
 
         lines: list[str] = []
+
+        # Automation section — `ci` is the one PRO automation surface today
+        # (autonomous, non-interactive scanning). Badge is catalog-driven via
+        # `tier_for_command`, never hardcoded, so it stays correct if the
+        # catalog ever adds a second automation command.
+        automation_descriptions: dict[str, str] = {
+            "ci": "Autonomous, non-interactive scanning",
+        }
+        automation_names = [
+            name for name in automation_descriptions if _tier_for_command(name) == "PRO"
+        ]
+        if automation_names:
+            lines.append("")
+            lines.append("Automation — PRO")
+            for name in automation_names:
+                badge = f"[{_tier_for_command(name)}]"
+                desc = automation_descriptions.get(name, name)
+                lines.append(f"  {name:<18} {desc:<43} {badge}")
+
         for tier_key, header in groups:
             names = buckets.get(tier_key) or []
             if not names:
@@ -492,12 +513,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Boot the workbench on top of the deterministic demo workspace.",
     )
 
+    from adscan_core.cli_catalog import tier_for_command as _ci_tier_for_command
+
     ci = sub.add_parser(
         "ci",
-        help="[EXPERIMENTAL] Run ADscan in autonomous mode (no prompts, end-to-end automated scan)",
+        help=(
+            "Run ADscan in autonomous mode (no prompts, end-to-end automated scan)"
+            f"  [{_ci_tier_for_command('ci')}]"
+        ),
         parents=[update_check_parent],
         description=(
-            "EXPERIMENTAL · BETA — Autonomous scan mode.\n\n"
+            "Autonomous scan mode.\n\n"
             "`adscan ci` launches ADscan in fully non-interactive mode: sensible "
             "defaults are applied, every confirmation prompt is skipped, and the "
             "complete scan pipeline (preflight → recon → enumeration → "
@@ -505,13 +531,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Intended for CI/CD pipelines, automated lab validation (HTB/GOAD), "
             "and unattended engagements where a human is not available to drive "
             "the interactive shell.\n\n"
-            "STATUS — Beta. Behaviour, defaults, and output format may change "
-            "between releases. The interactive `adscan start` shell is the "
-            "supported production path; `adscan ci` is the automation companion "
-            "and is graduating from experimental as confidence in the autonomous "
-            "decisions accumulates.\n\n"
-            "If autonomous decisions look wrong on your engagement, re-run with "
-            "`--debug` and report the trace at " + cta_url("ci_help_debug")
+            "The interactive `adscan start` shell remains available for scans "
+            "where operator judgement is preferred.\n\n"
+            "If a run fails, re-run with `--debug` and report the trace at "
+            + cta_url("ci_help_debug")
         ),
         # The scan arguments below are forwarded to the container runtime through
         # argparse.REMAINDER (`args`), so argparse cannot list them natively. The
@@ -763,7 +786,7 @@ def _build_parser() -> argparse.ArgumentParser:
                 "--frameworks", dest="ws_frameworks", default=None,
                 help=(
                     "Comma-separated compliance frameworks: "
-                    "ens, nis2, iso27001, dora, pci_dss. "
+                    "ens, nis2, iso27001, dora, pci_dss, cis. "
                     "Default: none — pick the regimes that apply."
                 ),
             )
@@ -784,6 +807,52 @@ def _build_parser() -> argparse.ArgumentParser:
                     "runs. The ADscan mark stays; full white-label is a paid tier."
                 ),
             )
+
+    # ── adscan report (tier-adaptive report regeneration) ──────────────
+    # Regenerates the report for a kept workspace without re-scanning. Unlike
+    # `deliver`, `report` is NOT PRO-gated — it renders in either tier (LITE:
+    # the exposure report with its PRO CTA; PRO: the single Security
+    # Assessment Report PDF), so it is registered as a plain known launcher
+    # command rather than through the PRO-upsell deliverable loop above.
+    report_p = sub.add_parser(
+        "report",
+        help="Regenerate the report for a kept workspace (no re-scan). [LITE/PRO]",
+    )
+    report_p.add_argument(
+        "--workspace", dest="workspace", default=None,
+        help="Workspace name or path (default: prompt or most-recent).",
+    )
+    report_p.add_argument(
+        "--client", dest="client", default=None,
+        help="Client name embedded in the report's cover as the display name (PRO only).",
+    )
+    report_p.add_argument(
+        "--frameworks", dest="frameworks", default=None,
+        help=(
+            "Comma-separated compliance frameworks (PRO only): "
+            "ens, nis2, iso27001, dora, pci_dss, cis. Default: none."
+        ),
+    )
+
+    # ── adscan writeup (lab writeup evidence spine) ─────────────────────
+    # Writes the mechanical two-thirds of a lab writeup from a kept
+    # workspace, without re-scanning. LITE-safe and NOT PRO-gated — mirrors
+    # `report`'s plain-passthrough registration.
+    writeup_p = sub.add_parser(
+        "writeup",
+        help="Write a Markdown evidence spine for a lab writeup from a kept workspace. [LITE/PRO]",
+    )
+    writeup_p.add_argument(
+        "--workspace", dest="workspace", default=None,
+        help="Workspace name or path (default: prompt or most-recent).",
+    )
+    writeup_p.add_argument(
+        "output_dir", nargs="?", default=None,
+        help=(
+            "Destination directory for the spine (default: a timestamped "
+            "directory under <workspace>/writeups/)."
+        ),
+    )
 
     upd = sub.add_parser(
         "update", help="Update the launcher (pip) and pull the latest ADscan image"
@@ -2069,10 +2138,12 @@ def _run_pro_passthrough_with_upsell_gate(
     # and the rc came back as 42.
     if rc == 42 and is_pro_only(cmd):
         try:
+            from adscan_core.operator_role import resolve_cta_lane
             from adscan_core.pro_upsell import render_pro_upsell_panel
 
+            lane = resolve_cta_lane()
             console = Console(theme=ADSCAN_THEME)
-            panel = render_pro_upsell_panel(cmd, context="direct_invocation")
+            panel = render_pro_upsell_panel(cmd, context="direct_invocation", lane=lane)
             console.print(panel)
             return 0
         except Exception as exc:  # noqa: BLE001 — best-effort upsell render
@@ -2083,6 +2154,75 @@ def _run_pro_passthrough_with_upsell_gate(
     # Defensive: a malformed exit 42 (e.g. PRO container emitting 42 by
     # accident, or a future protocol change) should not eat user output.
     return int(rc)
+
+
+def _ci_handle_passthrough_rc(rc: int) -> int:
+    """Map the `ci` container rc to a host exit code, honoring exit-42.
+
+    LITE exits 42 (+ the pro_required JSON) when `ci` is PRO-gated. Render the
+    canonical PRO upsell and exit 0 — the user tried a PRO feature, not a broken
+    command. Any other rc (including a clean PRO run) is propagated verbatim.
+    """
+    from adscan_core.cli_catalog import is_pro_only
+
+    if rc == 42 and is_pro_only("ci"):
+        try:
+            from adscan_core.operator_role import resolve_cta_lane
+            from adscan_core.pro_upsell import render_pro_upsell_panel
+
+            lane = resolve_cta_lane()
+            console = Console(theme=ADSCAN_THEME)
+            console.print(
+                render_pro_upsell_panel("ci", context="direct_invocation", lane=lane)
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001 — best-effort upsell render
+            capture_exception(exc)
+            print_exception(exception=exc)
+            return rc
+    return int(rc)
+
+
+def _maybe_pregate_pro_command(cmd: str) -> None:
+    """Skip the container entirely for a PRO-only command under confirmed LITE.
+
+    ``resolve_runtime_license_mode()`` already resolves the tier for free
+    (no network, no ``docker run``) before every passthrough command. For a
+    PRO-only command (``is_pro_only(cmd)``) known to be running against a
+    LITE image, spending a full container start (entrypoint, Unbound, DNS,
+    capability setup) just to have it exit 42 is wasted work. Render the
+    canonical upsell panel and exit 0 immediately instead.
+
+    This is a **pre-gate**, not a replacement for the exit-42 protocol: it is
+    fail-safe by construction and only fires on a CONFIRMED ``"LITE"``. Any
+    other result (``"PRO"``, or ``None`` when the tier cannot be resolved
+    locally, e.g. no image pulled yet) is a no-op — the function returns
+    normally and the caller proceeds to `docker run`, where the container's
+    own exit-42 + ``_run_pro_passthrough_with_upsell_gate`` /
+    ``_ci_handle_passthrough_rc`` remain the backstop.
+
+    Args:
+        cmd: The subcommand about to run (e.g. ``"ci"``, ``"deliver"``,
+            ``"report"``). A no-op for any command not in
+            :data:`adscan_core.cli_catalog.PRO_ONLY_COMMANDS`.
+
+    Raises:
+        SystemExit: With code 0, when the pre-gate fires.
+    """
+    from adscan_core.cli_catalog import is_pro_only
+
+    if not is_pro_only(cmd):
+        return
+    if (resolve_runtime_license_mode() or "").upper() != "LITE":
+        return
+
+    from adscan_core.operator_role import resolve_cta_lane
+    from adscan_core.pro_upsell import render_pro_upsell_panel
+
+    lane = resolve_cta_lane()
+    console = Console(theme=ADSCAN_THEME)
+    console.print(render_pro_upsell_panel(cmd, context="direct_invocation", lane=lane))
+    raise SystemExit(0)
 
 
 def _render_host_welcome() -> None:
@@ -2365,6 +2505,10 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     if cmd == "ci":
+        # Host-side pre-gate: skip the container entirely when the resolvable
+        # tier is confirmed LITE. No-op (returns) for PRO / unresolvable —
+        # the exit-42 backstop below still applies in that case.
+        _maybe_pregate_pro_command(cmd)
         # Pass-through execution inside the container, but still do Docker-mode preflight.
         passthrough = list(getattr(ns, "args", []) or [])
         # argparse.REMAINDER keeps leading --, but may start with a "--" separator.
@@ -2399,21 +2543,82 @@ def main(argv: list[str] | None = None) -> None:
         # its cover. Consumed at the seam, like --scan-config.
         passthrough = _ci_client_logo_from_flags(ns, passthrough)
         ci_extra_env = list(posture_env) + list(scan_config_env)
+        _ci_rc = _run_host_command_with_session_capture(
+            command_type="ci",
+            telemetry_console=telemetry_console,
+            runner=lambda: run_adscan_passthrough_docker(
+                adscan_args=["ci"] + passthrough,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=int(ns.pull_timeout),
+                allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                extra_env=ci_extra_env,
+                extra_mounts=scan_config_mounts,
+            ),
+            extra={"mode": "docker", "session_scope": "launcher_preflight"},
+            allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+        )
+        raise SystemExit(_ci_handle_passthrough_rc(int(_ci_rc)))
+
+    if cmd == "report":
+        # Plain passthrough, no PRO-upsell gate — `report` is NOT PRO-gated,
+        # it renders in either tier (see report_cmd.run_report_sync). Mirrors
+        # `deliver`'s explicit-flag forwarding but skips
+        # `_run_pro_passthrough_with_upsell_gate` since exit-42 never fires
+        # for this command.
+        report_args: list[str] = ["report"]
+        report_workspace = getattr(ns, "workspace", None)
+        if report_workspace:
+            report_args.extend(["--workspace", str(report_workspace)])
+        report_client = getattr(ns, "client", None)
+        if report_client:
+            report_args.extend(["--client", str(report_client)])
+        report_frameworks = getattr(ns, "frameworks", None)
+        if report_frameworks:
+            report_args.extend(["--frameworks", str(report_frameworks)])
+        if bool(getattr(ns, "debug", False)):
+            report_args.append("--debug")
         raise SystemExit(
             _run_host_command_with_session_capture(
-                command_type="ci",
+                command_type="report",
                 telemetry_console=telemetry_console,
                 runner=lambda: run_adscan_passthrough_docker(
-                    adscan_args=["ci"] + passthrough,
+                    adscan_args=report_args,
                     verbose=bool(getattr(ns, "verbose", False)),
                     debug=bool(getattr(ns, "debug", False)),
-                    pull_timeout_seconds=int(ns.pull_timeout),
-                    allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
-                    extra_env=ci_extra_env,
-                    extra_mounts=scan_config_mounts,
+                    pull_timeout_seconds=3600,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
-                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS) | {"report"},
+            )
+        )
+
+    if cmd == "writeup":
+        # Plain passthrough, no PRO-upsell gate — `writeup` is NOT PRO-gated,
+        # it renders in either tier. Mirrors `report`'s explicit-flag
+        # forwarding but skips `_run_pro_passthrough_with_upsell_gate` since
+        # exit-42 never fires for this command.
+        writeup_args: list[str] = ["writeup"]
+        writeup_workspace = getattr(ns, "workspace", None)
+        if writeup_workspace:
+            writeup_args.extend(["--workspace", str(writeup_workspace)])
+        writeup_output_dir = getattr(ns, "output_dir", None)
+        if writeup_output_dir:
+            writeup_args.append(str(writeup_output_dir))
+        if bool(getattr(ns, "debug", False)):
+            writeup_args.append("--debug")
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="writeup",
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=writeup_args,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=3600,
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS) | {"writeup"},
             )
         )
 
@@ -2443,6 +2648,10 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     if cmd in _DELIVERABLE_PASSTHROUGH_COMMANDS:
+        # Host-side pre-gate: no-op for LITE-tier deliverables (cheatsheet,
+        # mitre-navigator) since `is_pro_only` gates first; skips the
+        # container for `deliver` under a confirmed LITE license.
+        _maybe_pregate_pro_command(cmd)
         deliv_args: list[str] = [cmd]
         output_path = getattr(ns, "output_path", None)
         if output_path:

@@ -65,6 +65,7 @@ __all__ = [
     "cta_display_url",
     "cta_link_style",
     "cta_markup",
+    "cta_placement_for_lane",
     "cta_url",
     "known_placements",
 ]
@@ -141,6 +142,8 @@ _PLACEMENTS: dict[str, _Placement] = {
     # person who books a demo and buys, not the pentester who runs the tool.
     "victory_enterprise_demo": _Placement("/get-a-demo"),
     "session_summary_enterprise_demo": _Placement("/get-a-demo"),
+    # Gate placement for the Enterprise CTA lane mapping (used by cta_placement_for_lane).
+    "pro_gate_enterprise_demo": _Placement("/get-a-demo"),
     # The "Get beta access" line shown when a PRO-only import is absent.
     # (``beta_access_graph_validation`` was retired when attack-graph finding
     # validation moved into the tier-shared derivation and stopped being a
@@ -294,3 +297,32 @@ def cta_link_style(placement: str, base_style: str = "") -> str:
 def known_placements() -> frozenset[str]:
     """Return every registered placement name."""
     return frozenset(_PLACEMENTS)
+
+
+_CTA_LANE_ENTERPRISE_PLACEMENT = "pro_gate_enterprise_demo"  # SSOT reference for orphan-placement guard
+
+
+def cta_placement_for_lane(
+    lane: "CtaLane", *, surface: str = "pro_upsell_panel"
+) -> str:
+    """Map a commercial CTA lane to a placement key in _PLACEMENTS.
+
+    A PRO lane returns the specified surface (defaulting to "pro_upsell_panel"),
+    which points at the /pro tier. An ENTERPRISE lane returns the /get-a-demo
+    gate placement, which points at the demo gate.
+
+    The CtaLane enum is imported lazily to avoid any module-load cycle.
+
+    Args:
+        lane: A CtaLane value (PRO or ENTERPRISE).
+        surface: The default placement key for the PRO lane. Ignored when lane is
+            ENTERPRISE. Defaults to "pro_upsell_panel".
+
+    Returns:
+        A placement key present in _PLACEMENTS.
+    """
+    from adscan_core.operator_role import CtaLane
+
+    if lane is CtaLane.ENTERPRISE:
+        return _CTA_LANE_ENTERPRISE_PLACEMENT
+    return surface

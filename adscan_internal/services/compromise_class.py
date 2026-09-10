@@ -39,7 +39,12 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
-from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
+from adscan_internal.services.edge_kind import (
+    ControlStrength,
+    EdgeKind,
+    classify_edge_kind,
+    edge_control_strength,
+)
 
 
 class CompromiseClass(str, Enum):
@@ -278,6 +283,25 @@ _DIRECT_DOMAIN_BREAKER_NAMES: frozenset[str] = frozenset(
 )
 
 
+# ADCS node kinds whose identity IS a Tier-0 escalation surface (axis 1). The
+# collector emits these kinds (:data:`collector.models.NodeKind`): the
+# Certification Authority objects (EnterpriseCA / RootCA / AIACA) and the
+# certificate templates (CertTemplate). Reaching an ESC-vulnerable template or a
+# CA is a one-technique path to domain compromise, so they grade
+# ``tier0_escalation_capable`` from their kind — the SSOT no longer needs the
+# collector's ``isTierZero`` side-flag to know a CA is Tier 0. NTAuthStore is the
+# trust anchor, not itself an escalation target, so it is deliberately excluded.
+_ADCS_ESCALATION_NODE_KINDS: frozenset[str] = frozenset(
+    {"enterpriseca", "rootca", "aiaca", "certificationauthority", "certtemplate"}
+)
+
+# Directory CONTAINER kinds that are NOT security principals and therefore carry
+# no granted Privilege Tier. Their tier must never be derived from a name match
+# (the ``Domain Controllers`` OU is the canonical trap) — controlling a container
+# is an edge-severity concern, not a tier the container itself holds.
+_STRUCTURAL_CONTAINER_NODE_KINDS: frozenset[str] = frozenset({"ou", "container", "gpo"})
+
+
 # Well-known GROUP RIDs whose MEMBERSHIP confers a tier (NOT the principal's own
 # RID — those are :data:`_DIRECT_DOMAIN_BREAKER_RIDS`). A computer/user that is a
 # MEMBER of one of these groups is classified by these sets, so a SID-based
@@ -313,9 +337,42 @@ _DIRECT_DOMAIN_BREAKER_GROUP_RIDS: frozenset[int] = frozenset({512, 516, 518, 51
 # computer whose OWN role is a (read-only) DC (``primaryGroupID`` 521) — is
 # Tier 0 *direct* as the DC machine, and is decided by the caller's ``is_dc``
 # fast-path BEFORE this membership classifier runs ("highest impact wins").
-_PRIVILEGED_ESCALATOR_GROUP_RIDS: frozenset[int] = frozenset(
-    {548, 549, 550, 551, 517, 526, 527, 498, 521}
-)
+# HEURISTIC domain-assigned RIDs (Phase 2 / tier-label SSOT). The collector
+# GUESSES these for DNSAdmins / Exchange because those groups have NO fixed
+# well-known RID (unlike 512 Domain Admins). Because the guess is not a stable
+# identity, matching a node's OWN rid against them mis-grades an ordinary USER
+# that happens to hold that RID (measured: PETYER.BAELISH@...-1121 wrongly
+# promoted). So they are gated to GROUP nodes only in
+# :func:`_is_privileged_escalator_principal` — never applied to a User/Computer.
+_HEURISTIC_ESCALATOR_GROUP_RIDS: frozenset[int] = frozenset({1101, 1119, 1121})
+
+
+# Privileged-escalator GROUP RIDs whose membership owns the forest via ONE known
+# technique (Tier 0 escalation-capable). RECONCILED (tier-label SSOT, 2026-09-09)
+# to equal the collector's tier-zero target set minus the direct breakers — one
+# reconciled definition DERIVED from the collector's frozenset so the two can
+# never drift again. Adds GPCO 520, RODC-family 498/521, Cert Publishers 517,
+# Key Admins 526/527, the Operators 548-551, Incoming Forest Trust Builders 557,
+# and the heuristic Exchange/DNSAdmins RIDs 1101/1119/1121; 559 Performance Log
+# Users / 562 Distributed COM Users / 569 Cryptographic Operators are included
+# for BloodHound parity, NOT because they are direct escalators (see the client
+# glossary basis + `classification_basis`). This MOVES the computed path set
+# (measured Goad sevenkingdoms domain-all 44->46, Forest domain-all 722->725) via
+# the `source_privilege_tier` decoration + the domain-listing collapse, so it
+# ships WITH the deliberate Phase-2 snapshot re-baseline. Import is deferred to
+# avoid a circular import at module load (privileged_group_classifier imports
+# nothing from here, but the direction is kept lazy for safety).
+def _reconciled_escalator_group_rids() -> frozenset[int]:
+    """Return the collector's tier-zero escalation RID set (superset - breakers)."""
+    from adscan_internal.services.privileged_group_classifier import (  # noqa: PLC0415
+        _DIRECT_TIER_ZERO_RIDS,
+        _TIER_ZERO_TARGET_RIDS,
+    )
+
+    return _TIER_ZERO_TARGET_RIDS - _DIRECT_TIER_ZERO_RIDS
+
+
+_PRIVILEGED_ESCALATOR_GROUP_RIDS: frozenset[int] = _reconciled_escalator_group_rids()
 
 
 def _rid_from_group_token(value: str) -> int | None:
@@ -345,7 +402,9 @@ def _node_rid(node: Mapping[str, Any] | None) -> int | None:
     """Return the RID (trailing SID component) of a node, or ``None``."""
     if not node:
         return None
-    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    )
     for value in (
         props.get("objectid") if isinstance(props, Mapping) else None,
         props.get("objectId") if isinstance(props, Mapping) else None,
@@ -384,7 +443,9 @@ def _is_direct_domain_breaker_target(node: Mapping[str, Any] | None) -> bool:
             return True
     if bool(node.get("is_dc")):
         return True
-    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    )
     if isinstance(props, Mapping) and bool(props.get("is_dc")):
         return True
     return False
@@ -434,7 +495,18 @@ def _is_privileged_escalator_principal(node: Mapping[str, Any] | None) -> bool:
         return False
     rid = _node_rid(node)
     if rid is not None and rid in _PRIVILEGED_ESCALATOR_GROUP_RIDS:
-        return True
+        # Trap #2 (tier-label SSOT): the HEURISTIC RIDs (DNSAdmins / Exchange,
+        # 1101/1119/1121) are guessed per-domain and are NOT stable identities,
+        # so they must match a GROUP node only — matching them on a User/Computer
+        # node's OWN rid mis-grades an ordinary principal that happens to hold
+        # that RID. The FIXED well-known escalator RIDs (520, 549, ...) are real
+        # group RIDs and match regardless of the node's (sometimes unresolved)
+        # kind.
+        if rid in _HEURISTIC_ESCALATOR_GROUP_RIDS:
+            if str(node.get("kind") or "").strip().lower() == "group":
+                return True
+        else:
+            return True
     name = _node_name(node).strip().lower()
     if not name:
         return False
@@ -780,6 +852,255 @@ def privilege_tier_for_computer(
     return PrivilegeTier.TIER2
 
 
+class TierBasis(str, Enum):
+    """How a computer's :class:`PrivilegeTier` was inferred (axis-1 confidence).
+
+    Tier 0 is deterministic (control-plane group membership / DC role) — a HIGH-
+    confidence verdict. Tier 1 is heuristic (the current Microsoft AD DS tier
+    model, updated 2026-05, states there is NO canonical AD attribute or group
+    for Tier 1: "the credential and the keyboard define the tier, not the IP
+    address" — it is org-assigned). ``tier_basis`` records WHICH signal produced a
+    given verdict so the client report can declare Tier 1 as an inference and stay
+    honest about it, and so a customer override is explainable.
+
+    Only the non-Tier-0 refinement path carries a basis; a Tier 0 verdict from
+    group membership or the DC fast-path needs none (it is deterministic).
+    """
+
+    #: Deterministic — control-plane group membership or the DC fast-path.
+    TIER0_GROUP = "tier0_group"
+    #: Heuristic Tier 1 — member server by OS/SPN role, no stronger signal.
+    SERVER_HEURISTIC = "server_heuristic"
+    #: Heuristic Tier 1, STRENGTHENED — publishes an application-class SPN
+    #: (MSSQLSvc / Exchange / SharePoint), a positive "this is a real app server"
+    #: signal beyond the generic every-server SPNs.
+    APP_SPN = "app_spn"
+    #: Tier 2 correction — a member server where ordinary users log on
+    #: interactively (RDS / Citrix / Terminal server). Microsoft's #1 documented
+    #: Tier-1 misclassification: these are Tier 2 clients despite being "Server".
+    RDS_DOWNGRADE = "rds_downgrade"
+    #: Tier 0 correction — a "server" that controls a Tier 0 asset (a jump server
+    #: used to reach a DC, a hypervisor of a Tier-0 VM, a backup/EDR/monitoring
+    #: agent with Tier-0 control). Microsoft: these are Tier 0, NOT Tier 1.
+    TIER0_CONTROL = "tier0_control"
+
+
+# Application-class SPN service classes: publishing one is a positive signal that
+# a member server runs a real line-of-business application (Tier 1), beyond the
+# generic SPNs EVERY domain-joined server carries. Matched case-insensitively
+# against the service-class prefix (the token before the first ``/``).
+#
+# DELIBERATELY EXCLUDED — the generic SPNs on every server, which carry NO tier
+# signal: HOST, WSMAN (every server exposes WinRM), TERMSRV (present on every
+# server incl. DCs — see GOAD winterfell/braavos), RESTRICTEDKRBHOST, RPC, DNS,
+# GC, LDAP, DFSR, CIFS. HTTP is INCLUDED — a bare HTTP SPN marks a Kerberos web
+# endpoint (SharePoint / IIS app), a genuine application role, unlike WSMAN.
+_APP_SERVER_SPN_CLASSES: frozenset[str] = frozenset(
+    {
+        "mssqlsvc",  # Microsoft SQL Server
+        "exchangemdb",  # Exchange mailbox database
+        "exchangeab",  # Exchange address book
+        "exchangerfr",  # Exchange referral
+        "http",  # SharePoint / IIS / any Kerberos web app
+    }
+)
+
+
+def spns_indicate_app_server(spns: Iterable[str] | None) -> bool:
+    """Return whether any SPN marks a member server as an application server.
+
+    Reads the service-class prefix (token before the first ``/``) of each SPN and
+    tests it against :data:`_APP_SERVER_SPN_CLASSES` (MSSQL / Exchange /
+    SharePoint-HTTP). Generic every-server SPNs (HOST, WSMAN, TERMSRV,
+    RestrictedKrbHost, RPC, DNS, GC, LDAP, DFSR) never match — they carry no tier
+    signal. Case-insensitive; tolerant of ``None`` / non-string entries.
+
+    Args:
+        spns: The computer's ``serviceprincipalnames`` list, or ``None``.
+
+    Returns:
+        ``True`` iff at least one SPN is an application-class service.
+    """
+    if not spns:
+        return False
+    for spn in spns:
+        if not spn:
+            continue
+        service_class = str(spn).split("/", 1)[0].strip().lower()
+        if service_class in _APP_SERVER_SPN_CLASSES:
+            return True
+    return False
+
+
+def refine_server_privilege_tier(
+    base_tier: PrivilegeTier,
+    *,
+    controls_tier0_asset: bool = False,
+    has_broad_interactive_logon: bool = False,
+    has_app_server_spn: bool = False,
+) -> tuple[PrivilegeTier, str | None]:
+    """Refine a member server's heuristic Tier-1 verdict with graph signals.
+
+    Axis 1 (GRANT tier). Grounded in the current Microsoft AD DS tier model
+    (https://learn.microsoft.com/windows-server/identity/ad-ds/tier-model,
+    updated 2026-05): a member server is Tier 1 by default, but three documented
+    corrections apply, each detectable from collected graph edges. This function
+    is PURE — the caller (collector-side or load-side stamp) derives the three
+    boolean signals from the edges it holds and passes them in, mirroring how
+    ``is_dc`` / ``is_server`` are already explicit inputs to
+    :func:`privilege_tier_for_computer`.
+
+    **Tier 0 is never touched.** A ``base_tier`` inside the Tier 0 boundary
+    (DC / control-plane group membership) is deterministic and returned unchanged
+    with basis :attr:`TierBasis.TIER0_GROUP`. A base ``TIER1`` (member server by
+    OS) is refined; a base ``TIER2`` is refined ONLY when it publishes an
+    application-class SPN (which itself proves it is a server, even with no OS
+    string) — otherwise a plain workstation stays Tier 2. Precedence, highest-
+    impact first:
+
+    1. **controls_tier0_asset → Tier 0 (escalation-capable),
+       :attr:`TierBasis.TIER0_CONTROL`.** The server holds a control / admin /
+       exec / delegation edge onto a Tier 0 asset — a jump server used to reach a
+       DC, a hypervisor of a Tier-0 VM, or a backup/EDR/monitoring agent with
+       Tier-0 control. Microsoft is explicit these are Tier 0, NOT Tier 1.
+       Graded escalation-capable (not direct): control OVER a Tier-0 asset is one
+       technique from domain, not membership of a direct-breaker group.
+    2. **has_broad_interactive_logon → Tier 2,
+       :attr:`TierBasis.RDS_DOWNGRADE`.** A broad user population
+       (Domain Users / Authenticated Users / Everyone) can log on interactively —
+       an RDS / Citrix / Terminal server, which Microsoft classifies as a Tier 2
+       CLIENT despite the "Server" OS. This is the single most common field
+       Tier-1 misclassification. Superseded by (1): a jump server also carrying
+       broad logon is still Tier 0 (controlling a DC outranks being a shared
+       host).
+    3. **Otherwise Tier 1**, with basis :attr:`TierBasis.APP_SPN` when the server
+       publishes an application-class SPN (MSSQL / Exchange / SharePoint — a
+       positive "real app server" signal), else :attr:`TierBasis.SERVER_HEURISTIC`
+       (member server by OS role alone, the low-confidence default).
+
+    Args:
+        base_tier: The tier from :func:`privilege_tier_for_computer` (group
+            membership + DC + server heuristic), refined only when it is
+            ``TIER1``.
+        controls_tier0_asset: The server has an outbound control/admin/exec/
+            delegation edge onto a Tier 0 asset (jump-server / hypervisor / EDR
+            over Tier 0). See the collector-side derivation.
+        has_broad_interactive_logon: A broad user group can interactively log on
+            to the server (RDS / Citrix), detected via a broad-group ``CanRDP``
+            edge into it.
+        has_app_server_spn: The server publishes an application-class SPN
+            (:func:`spns_indicate_app_server`).
+
+    Returns:
+        A ``(PrivilegeTier, tier_basis)`` pair. ``tier_basis`` is a
+        :class:`TierBasis` ``.value`` (or ``None`` when the base is Tier 2 with no
+        server role, so the compact-artifact contract — no field for a plain
+        Tier 2 — is preserved).
+    """
+    if base_tier.is_tier0:
+        return base_tier, TierBasis.TIER0_GROUP.value
+
+    # An application-class SPN (MSSQL / Exchange / SharePoint) is itself proof the
+    # host is a server, even when the OS string is absent (the collector often
+    # cannot read operatingSystem). So it PROMOTES a base Tier 2 (no OS-based
+    # server detection) to a member server, in addition to strengthening an
+    # already-detected server's confidence. This is conservative — only the
+    # curated app-class SPN classes qualify, never the generic every-server SPNs.
+    is_member_server = base_tier is PrivilegeTier.TIER1 or has_app_server_spn
+    if not is_member_server:
+        # Plain Tier 2 workstation with no server signal — no refinement applies
+        # and no basis is recorded (keeps the artifact compact).
+        return base_tier, None
+
+    # Member server. Apply the corrections highest-impact-first.
+    if controls_tier0_asset:
+        return PrivilegeTier.TIER0_ESCALATION_CAPABLE, TierBasis.TIER0_CONTROL.value
+    if has_broad_interactive_logon:
+        return PrivilegeTier.TIER2, TierBasis.RDS_DOWNGRADE.value
+    if has_app_server_spn:
+        return PrivilegeTier.TIER1, TierBasis.APP_SPN.value
+    return PrivilegeTier.TIER1, TierBasis.SERVER_HEURISTIC.value
+
+
+#: Control strengths that count as ADMINISTERING a host BY GRANT (axis 1). A
+#: principal holding one of these over a computer manages that computer, so its
+#: effective tier is floored by that computer's tier. FULL = local admin
+#: (``AdminTo``); CONDITIONAL_EXEC = DB sysadmin (``SQLAdmin``). SESSION
+#: (CanRDP/CanPSRemote/ExecuteDCOM) and LOW (SQLAccess) are REACH, not grant —
+#: they never promote the tier (that is axis-2 reach).
+_ADMIN_GRANT_CONTROL_STRENGTHS: frozenset[ControlStrength] = frozenset(
+    {ControlStrength.FULL, ControlStrength.CONDITIONAL_EXEC}
+)
+
+
+def relation_is_admin_grant(relation: str | None) -> bool:
+    """Return whether an edge relation ADMINISTERS its target host BY GRANT.
+
+    ``True`` for ``AdminTo`` (FULL local admin) and ``SQLAdmin`` (DB sysadmin) —
+    the full-control grants that make a principal an administrator of the target,
+    flooring the principal's effective Privilege Tier (axis 1). ``False`` for
+    session/reach edges (CanRDP / CanPSRemote / ExecuteDCOM / SQLAccess), which
+    are axis-2 reach and never promote the tier. Reuses the
+    :func:`edge_control_strength` SSOT — no relation list is duplicated.
+    """
+    return edge_control_strength(relation) in _ADMIN_GRANT_CONTROL_STRENGTHS
+
+
+def privilege_tier_for_principal_with_admin_assets(
+    membership_tier: PrivilegeTier,
+    administered_asset_tiers: Iterable[PrivilegeTier] | None = None,
+) -> PrivilegeTier:
+    """Return a principal's effective Tier: membership floored by administered assets.
+
+    Axis 1 (GRANT tier). A principal's effective Privilege Tier is the HIGHEST
+    tier of the assets it ADMINISTERS BY GRANT (AdminTo / SQLAdmin — full
+    control, see :func:`relation_is_admin_grant`), floored by its own
+    group-membership tier. This is Microsoft-documented, not novel: the current
+    AD DS tier model defines Tier 1 as "member servers AND the identities that
+    manage them", so a principal that administers a Tier-1 server IS Tier 1.
+
+    **Group membership still wins (highest-impact-wins).** A Tier-0 principal
+    stays Tier 0 regardless of what it administers — its membership tier already
+    outranks any member server. Conversely a Tier-2 principal that is local admin
+    over a Tier-1 app server is promoted to Tier 1; over only Tier-2 assets it
+    stays Tier 2.
+
+    **Scope discipline (axis 1 vs axis 2).** This ONLY floors by the administered
+    asset's OWN granted tier. It deliberately does NOT auto-promote a principal to
+    Tier 0 from an ``AdminTo`` onto a DC: reaching a Tier 0 asset by an access
+    grant is an axis-2 REACH finding (``Tier0Foothold``), computed by the
+    attack-path engine, not a change to the principal's axis-1 granted tier. So an
+    administered Tier-0 asset floors the principal at most to Tier 0
+    escalation-capable ONLY when it is already governed by membership — here we
+    clamp the administered-asset contribution to Tier 1, because admin-over-a-DC
+    is the axis-2 concern and must not silently reclassify the principal's grant.
+
+    Args:
+        membership_tier: The principal's tier from group membership
+            (:func:`privilege_tier_for_principal`).
+        administered_asset_tiers: The granted tiers of every computer the
+            principal administers by grant (AdminTo / SQLAdmin). Empty / ``None``
+            → the membership tier is returned unchanged.
+
+    Returns:
+        The effective :class:`PrivilegeTier` — the higher (by ``rank``) of the
+        membership tier and the strongest administered-asset contribution.
+    """
+    effective = membership_tier
+    if membership_tier.is_tier0:
+        # A Tier 0 principal already outranks any member server it administers.
+        return membership_tier
+    for asset_tier in administered_asset_tiers or ():
+        # Axis-1 clamp: admin over a Tier-0 asset does NOT promote the principal's
+        # GRANT tier to Tier 0 — that is the axis-2 reach finding. It contributes
+        # at most Tier 1 (managing infrastructure). A Tier-1 asset contributes
+        # Tier 1; a Tier-2 asset contributes Tier 2.
+        contribution = PrivilegeTier.TIER1 if asset_tier.is_tier0 else asset_tier
+        if contribution.rank > effective.rank:
+            effective = contribution
+    return effective
+
+
 def privilege_tier_for_computer_node(
     node: Mapping[str, Any] | None,
     *,
@@ -828,7 +1149,9 @@ def privilege_tier_for_computer_node(
 
     dc_role = classify_computer_node_role(dict(node))
 
-    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    )
     os_str = ""
     for key in ("operatingsystem", "operatingSystem"):
         val = (props or {}).get(key) or node.get(key)
@@ -925,9 +1248,353 @@ def privilege_tier_for_node(
     kind = str(node.get("kind") or "").strip().lower()
     if kind == "domain":
         return PrivilegeTier.TIER0_DIRECT
+    if kind in _STRUCTURAL_CONTAINER_NODE_KINDS:
+        # A directory CONTAINER — an OU, a generic Container, a GPO — is not a
+        # security PRINCIPAL and has no granted Privilege Tier. Without this guard,
+        # the ``Domain Controllers`` OU (kind=OU, a GUID objectid, no SID) matches
+        # ``_is_direct_domain_breaker_target`` purely by its NAME and grades
+        # Tier-0 direct, which then (via the stamped-label reader) mis-promotes the
+        # container to a Tier-0 asset. Controlling a container is a real ACL
+        # finding, but that is the EDGE's severity, not the container's own tier.
+        return PrivilegeTier.TIER2
+    if kind in _ADCS_ESCALATION_NODE_KINDS:
+        # A CA or certificate template is a Tier-0 escalation surface by kind —
+        # no group membership or collector side-flag needed. This closes GAP-C's
+        # axis-1 half: an ADCS node's granted tier is derived from its identity.
+        return PrivilegeTier.TIER0_ESCALATION_CAPABLE
     if kind == "computer":
         return privilege_tier_for_computer_node(node, is_tier0_asset=is_tier0_asset)
     return privilege_tier_for_principal_node(node, is_tier0_asset=is_tier0_asset)
+
+
+def node_stamped_privilege_tier(node: Mapping[str, Any] | None) -> PrivilegeTier | None:
+    """Return the :class:`PrivilegeTier` STAMPED on a graph node, or ``None``.
+
+    Reads ``properties["privilege_tier"]`` (or the top-level ``privilege_tier``)
+    written at collection time by the membership-aware stamp (Phase 1c,
+    ``collector/persistence._stamp_privilege_tier_on_payloads``). This is the
+    SSOT reader for Phase 2: it returns the tier a User/Computer was graded WITH
+    its transitive group closure (GAP-B) and a Group/Domain/ADCS node was graded
+    by its own identity — a signal a per-node bare resolver cannot reproduce for a
+    Domain Admins MEMBER. Returns ``None`` when the node carries no stamp (an
+    older graph, or a synthetic node), so callers fall back to the bare resolver.
+    """
+    if not isinstance(node, Mapping):
+        return None
+    raw = None
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), Mapping) else None
+    )
+    if isinstance(props, Mapping):
+        raw = props.get("privilege_tier")
+    if raw is None:
+        raw = node.get("privilege_tier")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return PrivilegeTier(raw.strip().lower())
+    except ValueError:
+        return None
+
+
+def node_is_tier0_by_stamped_label(node: Mapping[str, Any] | None) -> bool:
+    """Return whether a node's STAMPED ``privilege_tier`` places it in Tier 0.
+
+    ``True`` iff the stamped label is ``tier0_direct`` or
+    ``tier0_escalation_capable``. Returns ``False`` when the node carries no
+    stamp (the caller decides the fallback). This is the label-based replacement
+    for the legacy ``isTierZero`` flag read, consumed unconditionally by the
+    attack-path engine's Tier-0 readers (``_node_is_tier0`` /
+    ``_share_node_is_tier0`` in ``attack_graph_core``, ``_is_stamped_direct_breaker``
+    in ``tier_lattice``).
+    """
+    tier = node_stamped_privilege_tier(node)
+    return tier is not None and tier.is_tier0
+
+
+def _node_group_tokens_for_kind(node: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the SID + name tokens a group node contributes to a membership set.
+
+    Both the group's SID (``objectId`` / ``properties.objectid``) and its name
+    (``label`` / ``properties.name``) are emitted so the tier classifier's RID
+    path (SID-only memberships, e.g. a computer in Cert Publishers) AND its name
+    path (name-only groups, e.g. DnsAdmins / Exchange) both fire — mirroring the
+    collector-side ``_classify_principals_by_membership._group_tokens``.
+    """
+    tokens: list[str] = []
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    )
+    sid = str((props or {}).get("objectid") or node.get("objectId") or "").strip()
+    if sid:
+        tokens.append(sid)
+    name = str(
+        (props or {}).get("name") or node.get("label") or node.get("name") or ""
+    ).strip()
+    if name:
+        tokens.append(name)
+    return tuple(tokens)
+
+
+#: Well-known SIDs whose membership is the ENTIRE authenticated / user population
+#: (RDS/Citrix downgrade signal). Mirrors the collector-side
+#: ``inventory_persistence._BROAD_LOGON_WELL_KNOWN_SIDS``. Domain Users is matched
+#: by its ``-513`` RID suffix; a scoped group (Remote Desktop Users) is NOT broad.
+_BROAD_LOGON_WELL_KNOWN_SIDS: frozenset[str] = frozenset(
+    {"S-1-1-0", "S-1-5-11", "S-1-5-32-545"}
+)
+#: Names of the broad populations, for graphs that key the source by name only.
+_BROAD_LOGON_NAMES: frozenset[str] = frozenset(
+    {"everyone", "authenticated users", "users", "domain users"}
+)
+
+
+def _graph_node_is_broad_logon_source(node: Mapping[str, Any] | None) -> bool:
+    """Return whether a node is the whole authenticated / standard-user population.
+
+    ``True`` for Everyone / Authenticated Users / BUILTIN\\Users / Domain Users —
+    the broad populations whose ``CanRDP`` right marks an RDS / Citrix server. Reads
+    the node's SID (``objectid`` / ``objectId``) and, as a fallback, its name/label.
+    """
+    if not isinstance(node, Mapping):
+        return False
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    )
+    sid = str((props or {}).get("objectid") or node.get("objectId") or "").strip().upper()
+    if sid:
+        if sid in _BROAD_LOGON_WELL_KNOWN_SIDS or sid.endswith("-513"):
+            return True
+    name = str(
+        (props or {}).get("name") or node.get("label") or node.get("name") or ""
+    ).strip().lower()
+    # Strip a trailing @domain to match "domain users@corp.local".
+    name = name.split("@", 1)[0].strip()
+    return name in _BROAD_LOGON_NAMES
+
+
+def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
+    """Stamp ``properties["privilege_tier"]`` on every graph node, in place.
+
+    The MEMBERSHIP-AWARE tier SSOT for a persisted attack-graph dict (``nodes``
+    keyed by node id, ``edges`` a list of ``{"from","to","relation"}``). This is
+    the load-side counterpart to the collector-side
+    ``collector.persistence._stamp_privilege_tier_on_payloads`` — it resolves the
+    SAME thing (GAP-B) from the SAME source (the graph's own ``MemberOf`` edges)
+    so a Domain Admins MEMBER grades ``tier0_direct`` via its transitive group
+    closure, and a Backup Operators member grades ``tier0_escalation_capable`` —
+    a signal the bare per-node resolver (which reads only a node's OWN identity)
+    cannot reproduce.
+
+    Reuses the tier-classification SSOT — :func:`privilege_tier_for_principal`
+    (users) / :func:`privilege_tier_for_computer` (computers) fed the transitive
+    group tokens, :func:`privilege_tier_for_node` (groups / Domain / ADCS on
+    their own identity) — never a parallel tier taxonomy. The MemberOf closure
+    itself is a cycle-safe walk over the graph's edges (the collector does the
+    equivalent over ``result.edges``); the tier verdict is never re-derived here.
+
+    Additive + idempotent: only WRITES ``privilege_tier`` (never removes another
+    field) and skips a node that already carries a stamp, so re-running it is a
+    no-op and it never changes a graph that already carries stamps.
+
+    Args:
+        graph: A parsed attack-graph dict. No-op when ``nodes`` is not a dict.
+    """
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, dict):
+        return
+    edges = graph.get("edges")
+
+    # Build MemberOf parent adjacency by node id: principal/group -> {parent group}.
+    # The edge from/to are node-dict keys, so the closure walks on ids directly.
+    parents_by_id: dict[str, set[str]] = {}
+    if isinstance(edges, list):
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            if str(edge.get("relation") or "").strip() != "MemberOf":
+                continue
+            src = str(edge.get("from") or "").strip()
+            dst = str(edge.get("to") or "").strip()
+            if src and dst:
+                parents_by_id.setdefault(src, set()).add(dst)
+
+    def _expand_groups(start: str) -> set[str]:
+        """Return every group node id reachable from ``start`` (cycle-safe)."""
+        seen: set[str] = set()
+        stack: list[str] = list(parents_by_id.get(start, ()))
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(parents_by_id.get(current, ()))
+        return seen
+
+    def _group_tokens(node_id: str) -> list[str]:
+        tokens: list[str] = []
+        for group_id in _expand_groups(node_id):
+            group_node = nodes.get(group_id)
+            if isinstance(group_node, Mapping):
+                tokens.extend(_node_group_tokens_for_kind(group_node))
+        return tokens
+
+    # ── Edge-signal indices for the Tier-1 refinements (PART A + PART B) ──────
+    # Mirror the collector-side derivation exactly, but keyed on graph NODE IDS
+    # (the edge from/to are node-dict keys here, not necessarily SIDs).
+    admin_grant_targets_by_src: dict[str, set[str]] = {}
+    broad_logon_targets: set[str] = set()
+    deleg_targets_by_src: dict[str, set[str]] = {}
+    if isinstance(edges, list):
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            relation = str(edge.get("relation") or "").strip()
+            src = str(edge.get("from") or "").strip()
+            dst = str(edge.get("to") or "").strip()
+            if not src or not dst:
+                continue
+            if relation_is_admin_grant(relation):
+                admin_grant_targets_by_src.setdefault(src, set()).add(dst)
+            elif relation == "CanRDP" and _graph_node_is_broad_logon_source(
+                nodes.get(src)
+            ):
+                broad_logon_targets.add(dst)
+            elif relation == "AllowedToDelegate":
+                deleg_targets_by_src.setdefault(src, set()).add(dst)
+
+    from adscan_internal.services.computer_node_role import (  # noqa: PLC0415
+        classify_computer_node_role,
+    )
+
+    def _graph_target_is_tier0(target_id: str, self_id: str) -> bool:
+        """Return whether a target node is a Tier 0 asset (for PART A control)."""
+        target = nodes.get(target_id)
+        if not isinstance(target, Mapping) or target_id == self_id:
+            return False
+        if classify_computer_node_role(dict(target)) is not None:
+            return True
+        if node_is_tier0_by_stamped_label(target):
+            return True
+        tprops = (
+            target.get("properties")
+            if isinstance(target.get("properties"), Mapping)
+            else {}
+        )
+        if bool(target.get("isTierZero")) or bool((tprops or {}).get("isTierZero")):
+            return True
+        # Tier-0 group membership via the target's OWN transitive closure.
+        tier = privilege_tier_for_node(target, is_tier0_asset=False)
+        if tier.is_tier0:
+            return True
+        cls = classify_principal_by_groups(
+            _group_tokens(target_id),
+            sid=str((tprops or {}).get("objectid") or target.get("objectId") or "")
+            or None,
+        )
+        return _COMPROMISE_CLASS_TO_PRIVILEGE_TIER.get(
+            cls, PrivilegeTier.TIER2
+        ).is_tier0
+
+    # Resolved computer tiers by node id — PASS 1 fills, PASS 2 (PART B) reads.
+    computer_tier_by_id: dict[str, PrivilegeTier] = {}
+
+    def _resolve_and_stamp_computer(node_id: str, node: dict[str, Any]) -> None:
+        props = node.setdefault("properties", {})
+        if not isinstance(props, dict):
+            props = {}
+            node["properties"] = props
+        if props.get("privilege_tier") or node.get("privilege_tier"):
+            # Already stamped — record the tier for PART B, never recompute.
+            existing = node_stamped_privilege_tier(node)
+            if existing is not None:
+                computer_tier_by_id[node_id] = existing
+            return
+        sid = str(props.get("objectid") or node.get("objectId") or "").strip() or None
+        is_tier0_flag = bool(node.get("isTierZero")) or bool(props.get("isTierZero"))
+        os_str = str(
+            props.get("os")
+            or props.get("operatingsystem")
+            or props.get("operatingSystem")
+            or node.get("operatingsystem")
+            or ""
+        ).lower()
+        # Mirror the collector-side computer stamp EXACTLY (DC fast-path wins).
+        base_tier = privilege_tier_for_computer(
+            group_names=_group_tokens(node_id),
+            sid=sid,
+            is_dc=classify_computer_node_role(dict(node)) is not None,
+            is_tier0_asset=is_tier0_flag,
+            is_server="server" in os_str,
+        )
+        controls_tier0 = any(
+            _graph_target_is_tier0(t, node_id)
+            for t in admin_grant_targets_by_src.get(node_id, set())
+            | deleg_targets_by_src.get(node_id, set())
+        )
+        spns = (props or {}).get("serviceprincipalnames")
+        refined_tier, basis = refine_server_privilege_tier(
+            base_tier,
+            controls_tier0_asset=controls_tier0,
+            has_broad_interactive_logon=node_id in broad_logon_targets,
+            has_app_server_spn=spns_indicate_app_server(
+                spns if isinstance(spns, (list, tuple)) else None
+            ),
+        )
+        computer_tier_by_id[node_id] = refined_tier
+        props["privilege_tier"] = refined_tier.value
+        if basis is not None:
+            props["privilege_tier_basis"] = basis
+
+    # ── PASS 1 — Computers (PART A) — before principals so PART B reads them ──
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("kind") or "").strip().lower() == "computer":
+            _resolve_and_stamp_computer(node_id, node)
+
+    # ── PASS 2 — Users + all other node kinds ────────────────────────────────
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict):
+            continue
+        kind = str(node.get("kind") or "").strip().lower()
+        if kind == "computer":
+            continue  # already stamped in PASS 1
+        props = node.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            node["properties"] = props
+        if props.get("privilege_tier") or node.get("privilege_tier"):
+            # Already stamped (a fresh scan, or a prior backfill) — never recompute.
+            continue
+
+        sid = str(props.get("objectid") or node.get("objectId") or "").strip() or None
+        is_tier0_flag = bool(node.get("isTierZero")) or bool(props.get("isTierZero"))
+
+        if kind == "user":
+            tier = privilege_tier_for_principal(_group_tokens(node_id), sid=sid)
+            if tier is PrivilegeTier.TIER2 and is_tier0_flag:
+                # No resolvable Tier-0 membership but the collector flagged it
+                # Tier-0 — honour the degraded signal via the node resolver
+                # (conservative escalation-capable verdict, never a lost finding).
+                tier = privilege_tier_for_principal_node(node, is_tier0_asset=True)
+            # PART B — floor by the tier of the computers this user administers by
+            # grant (AdminTo/SQLAdmin). Session/reach edges never entered the index.
+            administered = [
+                computer_tier_by_id[t]
+                for t in admin_grant_targets_by_src.get(node_id, ())
+                if t in computer_tier_by_id
+            ]
+            if administered:
+                tier = privilege_tier_for_principal_with_admin_assets(
+                    tier, administered
+                )
+        else:
+            # Group / Domain / ADCS / container — tier is a property of the node's
+            # own identity; the enriched node resolver already grades these.
+            tier = privilege_tier_for_node(node, is_tier0_asset=is_tier0_flag)
+
+        props["privilege_tier"] = tier.value
 
 
 def is_structural_hierarchy_source(node: Mapping[str, Any] | None) -> bool:
@@ -1128,30 +1795,109 @@ def tier_glossary() -> list[dict[str, str]]:
                 "Backup Operators, Account Operators, Server Operators, "
                 "Print Operators, DnsAdmins, Cert Publishers, Key Admins, "
                 "Group Policy Creator Owners, the read-only Domain Controller "
-                "groups, and the Exchange privileged groups."
+                "groups, and the Exchange privileged groups; the Certification "
+                "Authority and certificate templates."
             ),
             "meaning": (
                 "Inside the Tier 0 boundary: not immediate domain ownership, "
                 "but owns the forest through one known escalation technique "
                 "(e.g. Backup Operators reading NTDS.dit)."
             ),
+            # The classification-basis note (axis: escalation_technique vs
+            # tooling_parity), derived from the collector follow-up mode so the
+            # auditor question "why is Cryptographic Operators Tier 0?" has one
+            # documented answer. Client-safe, native-tool-neutral prose.
+            "basis": (
+                "Most groups in this tier have a concrete single-step escalation "
+                "to domain control. A small set (Cryptographic Operators, "
+                "Distributed COM Users, Performance Log Users) is included for "
+                "industry-tooling parity: they are flagged conservatively as "
+                "Tier 0 even though no single-step domain-compromise technique is "
+                "known for them today."
+            ),
         },
         {
             "tier": PrivilegeTier.TIER1.value,
             "label": privilege_tier_label(PrivilegeTier.TIER1),
-            "groups": "Member servers and the accounts that administer them.",
+            "groups": (
+                "Member servers (SQL, Exchange, SharePoint, line-of-business "
+                "application servers) and the accounts that administer them."
+            ),
             "meaning": (
                 "Server and application plane. Controls business workloads "
                 "and their data, but not the identity control plane."
+            ),
+            # Tier 1 has NO canonical AD attribute or group (unlike Tier 0). The
+            # current Microsoft AD DS tier model states the tier is defined by
+            # scope of control, not a static attribute, so ADscan infers it and
+            # says so — the customer can override any Tier 1 verdict.
+            "basis": (
+                "Tier 1 is inferred, not read from a fixed attribute: a machine "
+                "is graded Tier 1 from its server role (operating system and "
+                "published service names such as SQL or Exchange), and an account "
+                "is graded Tier 1 when it holds full administrative control over a "
+                "Tier 1 server. A server where ordinary users log on interactively "
+                "(a Remote Desktop or Citrix host) is treated as Tier 2, and a "
+                "server that administers a Domain Controller or other Tier 0 asset "
+                "is treated as Tier 0. These inferences are conservative and "
+                "customer-overridable."
             ),
         },
         {
             "tier": PrivilegeTier.TIER2.value,
             "label": privilege_tier_label(PrivilegeTier.TIER2),
-            "groups": "Standard users and workstations.",
+            "groups": "Standard user accounts and workstations.",
             "meaning": (
                 "Standard user plane. No granted privilege over servers or "
-                "the domain by membership alone."
+                "the domain by membership alone — where an intrusion begins and "
+                "what ADscan measures reach FROM."
+            ),
+        },
+    ]
+
+
+def tier_model_notes() -> list[dict[str, str]]:
+    """Return the tier-model explanatory notes for the client glossary/legend.
+
+    The companion prose to :func:`tier_glossary`: how ADscan's Tier 0/1/2 maps to
+    the current Microsoft AD DS tier model, the confidence of each tier, and the
+    optional Enterprise Access Model (EAM) plane mapping. SSOT for the CONTENT so
+    the PDF report annex and any platform legend render the SAME text; client-safe,
+    vendor-neutral, English. Each entry is a ``{"heading", "body"}`` string dict.
+    """
+    return [
+        {
+            "heading": "Confidence of each tier",
+            "body": (
+                "Tier 0 is determined deterministically from control-plane group "
+                "membership and Domain Controller role, so it is a high-confidence "
+                "classification. Tier 1 is inferred from server role and "
+                "administrative control, because Active Directory has no fixed "
+                "attribute for it; every Tier 1 verdict is a conservative "
+                "inference and is customer-overridable."
+            ),
+        },
+        {
+            "heading": "How ADscan maps to Microsoft's tier model",
+            "body": (
+                "ADscan applies Microsoft's AD DS tier model. Tier 0 (the "
+                "identity control plane) and Tier 1 (server and application "
+                "administration) follow Microsoft's definitions directly. For "
+                "Tier 2, ADscan uses the attack-path convention — every standard "
+                "user account — because that is where an intrusion begins and what "
+                "ADscan measures reach FROM. Microsoft's tier model is an "
+                "administration framework; ADscan is an exposure framework, so the "
+                "two describe the same boundary from different sides."
+            ),
+        },
+        {
+            "heading": "Enterprise Access Model mapping",
+            "body": (
+                "For teams that use Microsoft's newer Enterprise Access Model, the "
+                "tiers map as follows: Tier 0 corresponds to the Control plane, "
+                "Tier 1 to the Management and Data/Workload plane, and Tier 2 to "
+                "User and Application access. Tier 0/1/2 remains the primary label "
+                "throughout this report."
             ),
         },
     ]
@@ -1498,10 +2244,7 @@ def derive_tier0_population_stat(
         and count > 0
         and (
             degenerate
-            or (
-                count >= _TIER0_SPRAWL_FLOOR
-                and pct >= _TIER0_SPRAWL_SHARE * 100.0
-            )
+            or (count >= _TIER0_SPRAWL_FLOOR and pct >= _TIER0_SPRAWL_SHARE * 100.0)
         )
     )
     if direct is None:

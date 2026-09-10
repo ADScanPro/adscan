@@ -1606,6 +1606,7 @@ def print_exception(
     exception: Optional[Exception] = None,
     *,
     context: Optional[Dict[str, Any]] = None,
+    visible: bool = True,
 ):
     """Print exception traceback with Rich formatting.
 
@@ -1613,7 +1614,8 @@ def print_exception(
     ``--debug`` (:func:`is_debug_mode`). Without ``--debug`` only a generic,
     path-stripped one-line error is displayed, so a normal run stays clean.
 
-    Two sinks always receive the full traceback, regardless of ``--debug``:
+    Two sinks always receive the full traceback, regardless of ``--debug`` (and
+    regardless of ``visible``):
 
     * the ADscan debug log file (``adscan.debug.log``), via
       :func:`_log_exception_to_file`; and
@@ -1633,6 +1635,15 @@ def print_exception(
             the current exception context (must be called within except block).
         context: Optional key/value diagnostics for the file log. Values should
             already be wrapped with ``mark_sensitive`` when sensitive.
+        visible: When False, the two evidence sinks above STILL receive the full
+            traceback, but NOTHING is rendered to the operator's visible terminal
+            (neither the ``--debug`` traceback nor the non-``--debug`` generic
+            one-liner). Use it when the caller renders its OWN clean, actionable
+            message for an EXPECTED condition (e.g. a wrong credential the DC
+            rejected) and the generic error banner would be noise. Do NOT use it
+            to hide a genuine ADscan fault — an unclassifiable error must keep the
+            default ``visible=True`` so it stays debuggable on screen under
+            ``--debug`` and surfaces the generic line otherwise.
 
     Examples:
         try:
@@ -1676,6 +1687,12 @@ def print_exception(
         except Exception:
             # A telemetry-buffer failure must never interrupt the visible flow.
             pass
+
+    # Evidence-only mode: both sinks above already have the full traceback; the
+    # caller renders its own clean line for an EXPECTED condition, so render NOTHING
+    # to the operator's visible terminal (no --debug traceback, no generic banner).
+    if not visible:
+        return
 
     # Only show full tracebacks ON SCREEN under --debug (keeps a normal run clean).
     # The telemetry mirror already happened explicitly above, so wrap the visible

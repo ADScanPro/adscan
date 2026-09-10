@@ -16,7 +16,7 @@ generous padding, mono-styled CTA URL. No emojis.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from rich.console import Group
 from rich.panel import Panel
@@ -24,9 +24,20 @@ from rich.text import Text
 
 from adscan_core.outbound_links import cta_display, cta_link_style
 
+if TYPE_CHECKING:
+    from adscan_core.operator_role import CtaLane
+
 UpsellContext = Literal["direct_invocation", "post_scan", "help_listing"]
 
 _BRAND_CYAN = "bright_cyan"
+
+# Non-deliverable PRO commands render a distinct, on-message panel body
+# instead of the kit panel below. `ci` is the first member: autonomous,
+# non-interactive scanning has nothing to do with the Client Deliverable
+# Kit, and pointing a `ci` user at `generate_report` (a kit-only verb) was
+# both wrong and confusing. Extend this set when a new non-deliverable PRO
+# command needs its own upsell body.
+_AUTONOMOUS_MODE_FEATURES: frozenset[str] = frozenset({"ci"})
 
 _FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "playbook": "AD Hardening Playbook",
@@ -77,35 +88,16 @@ def _feature_display_name(feature: str) -> str:
     return _FEATURE_DISPLAY_NAMES.get(feature, feature.replace("_", " ").title())
 
 
-def render_pro_upsell_panel(
-    feature: str,
-    context: UpsellContext,
-    *,
-    report_path: str | None = None,
-) -> Panel:
-    """Render the canonical PRO upsell panel for the Client Deliverable Kit.
+def _primary_cta(placement: str = "pro_upsell_panel") -> Text:
+    # Short, clean text; the tracking parameters ride in the hyperlink target.
+    return Text(
+        cta_display(placement),
+        style=cta_link_style(placement, f"{_BRAND_CYAN} on grey11"),
+    )
 
-    The panel leads with what the LITE operator can do RIGHT NOW — generate the
-    free HTML exposure report — and only then states what the paid kit adds. It
-    reads as a next step after a successful scan, never as a refusal.
 
-    Args:
-        feature: PRO verb being promoted (kept for call-site compatibility;
-            the body is kit-focused and no longer branches on it).
-        context: Where the panel is rendered (unused for copy today; kept for
-            signature stability across the three call sites).
-        report_path: Absolute path to an exposure report already generated in
-            this workspace. When provided, the panel points at that file instead
-            of telling the operator to generate one again.
-
-    Returns:
-        A configured :class:`rich.panel.Panel` ready to print. Callers should
-        print it with ``console.print(panel)`` directly — wrapping it through
-        ``print_panel`` produces a double-bordered render. Most callers prefer
-        :func:`print_pro_upsell` which handles this.
-    """
-    del feature, context  # body is kit-focused; params kept for compatibility
-
+def _render_kit_panel_body(*, report_path: str | None) -> list[Text]:
+    """Body for the Client Deliverable Kit upsell (deliver/generate_report/…)."""
     eyebrow = Text(
         "CLIENT DELIVERABLE KIT · PRO FEATURE",
         style=f"bold {_BRAND_CYAN}",
@@ -130,13 +122,7 @@ def render_pro_upsell_panel(
 
     cost = Text("An evening of writing, or a ZIP at the end of the engagement.")
 
-    # Short, clean text; the tracking parameters ride in the hyperlink target.
-    primary_cta = Text(
-        cta_display("pro_upsell_panel"),
-        style=cta_link_style("pro_upsell_panel", f"{_BRAND_CYAN} on grey11"),
-    )
-
-    parts: list[Text] = [
+    return [
         eyebrow,
         Text(""),
         header,
@@ -148,8 +134,147 @@ def render_pro_upsell_panel(
         Text(""),
         cost,
         Text(""),
-        primary_cta,
+        _primary_cta("pro_upsell_panel"),
     ]
+
+
+def _render_autonomous_mode_panel_body() -> list[Text]:
+    """Body for the `adscan ci` (autonomous/non-interactive mode) upsell.
+
+    Distinct from the Client Deliverable Kit panel: `ci` is about how a scan
+    RUNS (unattended, scripted, no prompts), not about the report artefacts
+    the kit renders. Never suggests `generate_report` here — that verb is
+    kit-focused and irrelevant to what a `ci` user is trying to do.
+    """
+    eyebrow = Text(
+        "AUTONOMOUS MODE · PRO FEATURE",
+        style=f"bold {_BRAND_CYAN}",
+    )
+    header = Text("Autonomous Scanning", style="bold")
+
+    capability = Text(
+        "'adscan ci' runs a full assessment end to end with no prompts: "
+        "CI/CD pipelines, lab automation, and scheduled or unattended runs.\n"
+        "This is a PRO capability."
+    )
+
+    lite_line = Text(
+        "The free LITE tier includes the full interactive 'adscan start' "
+        "workflow, on every platform: the same engine, driven step by step."
+    )
+
+    return [
+        eyebrow,
+        Text(""),
+        header,
+        Text(""),
+        capability,
+        Text(""),
+        lite_line,
+        Text(""),
+        _primary_cta("pro_upsell_panel"),
+    ]
+
+
+def _render_enterprise_panel_body() -> list[Text]:
+    """Body for the Enterprise-lane upsell: one platform pitch, any feature.
+
+    Shown instead of a per-feature PRO body when the operator's role profile
+    resolves to the buyer lane (own-estate security/sysadmin/CISO): the ask is
+    not "run this CLI yourself", it is continuous validation delivered as a
+    platform, with a report built for a board or an auditor.
+    """
+    from adscan_core.operator_role import CtaLane
+    from adscan_core.outbound_links import cta_placement_for_lane
+
+    eyebrow = Text(
+        "ENTERPRISE PLATFORM · CONTINUOUS VALIDATION",
+        style=f"bold {_BRAND_CYAN}",
+    )
+    header = Text("ADscan Enterprise", style="bold")
+
+    capability = Text(
+        "The Active Directory exposure ADscan just surfaced is real, and it "
+        "will not stay still: new users, new group memberships and new "
+        "misconfigurations reopen paths to Domain Admin between scans.\n"
+        "ADscan Enterprise validates your domain continuously and turns every "
+        "run into a report your board and your auditors can read."
+    )
+
+    platform_line = Text(
+        "No CLI to run, no scan to remember: a platform your team logs into, "
+        "with trend lines, ownership and remediation tracked over time."
+    )
+
+    return [
+        eyebrow,
+        Text(""),
+        header,
+        Text(""),
+        capability,
+        Text(""),
+        platform_line,
+        Text(""),
+        _primary_cta(cta_placement_for_lane(CtaLane.ENTERPRISE)),
+    ]
+
+
+def render_pro_upsell_panel(
+    feature: str,
+    context: UpsellContext,
+    *,
+    report_path: str | None = None,
+    lane: "CtaLane | None" = None,
+) -> Panel:
+    """Render the canonical PRO upsell panel for the triggering ``feature``.
+
+    Most PRO commands are deliverable-family (``deliver``, ``generate_report``,
+    ``playbook``, ``coverage_matrix``) and render the Client Deliverable Kit
+    panel: it leads with what the LITE operator can do RIGHT NOW — generate the
+    free HTML exposure report — and only then states what the paid kit adds.
+
+    ``ci`` (and any future non-deliverable PRO command registered in
+    :data:`_AUTONOMOUS_MODE_FEATURES`) renders a distinct, accurate body
+    instead: autonomous/non-interactive scanning has nothing to do with the
+    Client Deliverable Kit, so it must not reuse that panel's copy.
+
+    ``lane`` overrides both of the above: when it resolves to
+    :attr:`~adscan_core.operator_role.CtaLane.ENTERPRISE`, the panel renders
+    the single Enterprise-platform body regardless of ``feature`` — the
+    operator's role profile says they are a buyer evaluating their own
+    estate, not a pentester who wants the CLI feature they just typed.
+
+    Args:
+        feature: PRO verb that triggered the panel. Selects the panel body
+            when ``lane`` is not the Enterprise lane.
+        context: Where the panel is rendered (unused for copy today; kept for
+            signature stability across call sites).
+        report_path: Absolute path to an exposure report already generated in
+            this workspace. Only consulted for the kit panel; when provided,
+            the panel points at that file instead of telling the operator to
+            generate one again.
+        lane: The resolved commercial CTA lane. ``None`` (the default) and
+            :attr:`~adscan_core.operator_role.CtaLane.PRO` are equivalent and
+            render the existing per-feature PRO body with the ``/pro`` CTA.
+            :attr:`~adscan_core.operator_role.CtaLane.ENTERPRISE` renders the
+            Enterprise-platform body with the ``/get-a-demo`` CTA.
+
+    Returns:
+        A configured :class:`rich.panel.Panel` ready to print. Callers should
+        print it with ``console.print(panel)`` directly — wrapping it through
+        ``print_panel`` produces a double-bordered render. Most callers prefer
+        :func:`print_pro_upsell` which handles this.
+    """
+    del context  # unused for copy today; kept for signature stability
+
+    from adscan_core.operator_role import CtaLane
+
+    if lane is CtaLane.ENTERPRISE:
+        parts = _render_enterprise_panel_body()
+    elif feature in _AUTONOMOUS_MODE_FEATURES:
+        parts = _render_autonomous_mode_panel_body()
+    else:
+        parts = _render_kit_panel_body(report_path=report_path)
 
     return Panel(
         Group(*parts),
@@ -163,6 +288,7 @@ def print_pro_upsell(
     context: UpsellContext,
     *,
     report_path: str | None = None,
+    lane: "CtaLane | None" = None,
 ) -> None:
     """Render the PRO upsell panel and print it without double-wrapping.
 
@@ -174,10 +300,16 @@ def print_pro_upsell(
     This helper prints the panel directly through the shared Rich console so the
     operator sees the canonical single-frame premium panel. ``report_path`` is
     forwarded so the panel can point at an already-generated exposure report.
+    ``lane`` is forwarded so this peak-value gate also routes by operator role
+    (see :func:`render_pro_upsell_panel`); callers should resolve it via
+    :func:`adscan_core.operator_role.resolve_cta_lane` rather than leave it
+    unset, so a buyer role reaches the Enterprise body here too.
     """
     from adscan_core.output._panels import _get_console
 
-    panel = render_pro_upsell_panel(feature, context, report_path=report_path)
+    panel = render_pro_upsell_panel(
+        feature, context, report_path=report_path, lane=lane
+    )
     _get_console().print(panel)
 
 

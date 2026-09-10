@@ -635,6 +635,16 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.HOST_SCOPED,
         record_containers=("control_exposure_users",),
     ),
+    # Tier-0 access exposure (axis 2): the affected assets are the Tier-0 targets
+    # the non-privileged principals can reach (the DCs / ADCS CA / Exchange in
+    # ``tier0_targets``), plus the exposed principals themselves. Host-scoped: a
+    # named machine the reader can act on, never a category.
+    "tier0_access_exposure": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+        record_containers=("tier0_targets", "exposed_principals"),
+    ),
     "gpp_autologin": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,

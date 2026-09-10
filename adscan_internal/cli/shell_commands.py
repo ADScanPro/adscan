@@ -362,7 +362,7 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
         long_help=(
             "Usage:\n"
             "  deliver [--client NAME] [--engagement CODE] [--output DIR]\n"
-            "          [--only SLUGS] [--frameworks ens,iso27001,dora,pci_dss]\n"
+            "          [--only SLUGS] [--frameworks ens,iso27001,dora,pci_dss,cis]\n"
             "          [--no-navigator]\n"
             "          [--theme dark|light|premium_dark|corporate_light]\n\n"
             "Generates the four PDFs in parallel and packages them into a single ZIP\n"

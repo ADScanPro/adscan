@@ -1257,6 +1257,21 @@ def compute_exposure_kpis(
         "path_axis": path_axis,
         "user_axis": user_axis,
     }
+    # Distinct closed-by-config AVENUES — the cross-tier HEADLINE unit for
+    # "attack surface reduced / hardening observed". ``path_axis[…][
+    # "closed_by_configuration"]`` counts closed-by-config PATHS, and several
+    # path variants can traverse ONE avenue, so the PDF report and the web CTEM
+    # both lead with THIS avenue count (via the shared
+    # ``count_distinct_hardening_avenues`` SSOT) rather than the path count — so a
+    # client reading the free report, the paid report and the platform never sees
+    # one appear to have found MORE hardening. Additive: it does NOT change
+    # ``path_axis`` (still the path count, used elsewhere). Stamped from the same
+    # records the axes are built from, so it needs no separate recompute.
+    from adscan_internal.services.attack_path_counts import (  # noqa: PLC0415
+        count_distinct_hardening_avenues,
+    )
+
+    block["hardening_avenue_count"] = count_distinct_hardening_avenues(records)
     if excluded:
         # Why the denominator reads as it does. A reader who counts the accounts
         # in the appendix and lands one short is owed the reason, and the reason
@@ -1271,6 +1286,197 @@ def compute_exposure_kpis(
     if reachability is not None:
         block["reachability"] = dict(reachability)
     return block
+
+
+def stamp_exposure_kpis_for_domain(
+    shell: Any,
+    domain: str,
+    *,
+    summaries: Sequence[Mapping[str, Any]],
+    domain_data: dict[str, Any],
+    domain_user_count: int | None = None,
+    domain_users: Sequence[str] | None = None,
+    computed_at: str | None = None,
+    reachability: Mapping[str, int] | None = None,
+) -> None:
+    """Compute + persist the exposure-KPI block for one domain (tier-shared, LITE-safe).
+
+    This is the ONE tier-shared, LITE-safe stamp seam for ``exposure_kpis``. Both
+    the PRO report service (``report_service.ensure_report_attack_paths``) and the
+    LITE report flow (``lite_html_report._stamp_exposure_kpis``) call it, so the
+    block — the ``path_axis`` + ``user_axis`` blast radius that feeds the headline
+    exposure figure (``derive_domain_user_reach``) — is computed identically in
+    both tiers. It depends only on modules under ``services``/``adscan_core`` —
+    never ``adscan_internal.pro`` — so it is reachable from the stripped LITE
+    build. It mirrors the choke-point stamp seam
+    (``chokepoint_cardinality.stamp_chokepoint_cardinality_for_domain``): the
+    exposure_kpis block used to be stamped ONLY in the PRO attack-path seam, so a
+    LITE build (``pro/`` stripped) never persisted it and the community report's
+    headline figure rendered empty.
+
+    The population denominator, the executed-path sidecar, and the reachable
+    value-terminal summary are all resolved from the workspace here (via
+    ``shell.current_workspace_dir``), so both callers get identical behavior
+    without duplicating the resolution. The block is ALWAYS produced (even for an
+    empty path set — ``compute_exposure_kpis`` returns a present ``path_axis`` /
+    ``user_axis`` for empty input), so a consumer degrades to an available /
+    empty figure rather than a silently absent key.
+
+    Idempotency: if ``domain_data`` already carries a valid ``exposure_kpis``
+    block (schema_version + a ``path_axis``) — e.g. a PRO run stamped it and the
+    LITE flow reads the same ``technical_report.json`` — the block is left
+    untouched and nothing is recomputed/overwritten.
+
+    Best-effort by design: a failure must NEVER break report generation, so the
+    whole body is guarded and the block is simply absent on failure. Persists to
+    ``domains[<domain>]["exposure_kpis"]`` (both the in-memory ``domain_data`` and
+    the technical-report file).
+
+    Args:
+        shell: A shell namespace carrying ``current_workspace_dir`` (the same
+            shape ``record_exposure_kpis`` is called with).
+        domain: The domain the block belongs to.
+        summaries: Attack-path summary records (as produced by
+            ``get_attack_path_summaries`` / ``compute_report_attack_paths``).
+        domain_data: The in-memory report entry to stamp the block onto.
+        domain_user_count: The enabled-account denominator. When ``None``, it is
+            resolved from the workspace via the account-population SSOT.
+        domain_users: The enabled account names. When ``None``, resolved from the
+            workspace alongside the count.
+        computed_at: Provenance timestamp (ISO-8601), passed through verbatim.
+        reachability: Optional pre-computed reachable-terminal summary (from
+            ``summarize_reachable_terminals``). When supplied it is used as-is —
+            the PRO seam already computes it for the choke-point wiring, so it
+            passes it here to avoid a second graph reload. When ``None`` the
+            reachable-terminal summary is computed over the base graph.
+    """
+    # Idempotency guard: a valid block means a prior seam (PRO or an earlier LITE
+    # pass) already stamped it. Do not recompute/overwrite.
+    existing = domain_data.get("exposure_kpis")
+    if (
+        isinstance(existing, dict)
+        and existing.get("schema_version")
+        and isinstance(existing.get("path_axis"), dict)
+    ):
+        return
+
+    try:
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - never let an import break the report
+        telemetry = None  # type: ignore[assignment]
+        print_exception = None  # type: ignore[assignment]
+
+    try:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            record_exposure_kpis,
+        )
+        from adscan_internal.services.account_population import (  # noqa: PLC0415
+            resolve_account_population,
+            resolve_population_tier_breakdown,
+        )
+        from adscan_internal.services.post_exploitation.path_promotion import (  # noqa: PLC0415
+            load_executions,
+        )
+
+        workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+        _kpi_shell = SimpleNamespace(
+            current_workspace_dir=workspace_dir,
+            domains_dir="domains",
+        )
+        records = [r for r in summaries if isinstance(r, Mapping)]
+
+        # Denominator = the ENABLED USER population minus machine-managed accounts
+        # (SSOT: services/account_population). Resolved from the workspace unless
+        # the caller supplied it explicitly.
+        _population = resolve_account_population(_kpi_shell, domain)
+        if domain_user_count is not None:
+            _user_count = int(domain_user_count)
+        elif _population.available:
+            _user_count = _population.total
+        else:
+            from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+                get_domain_users_for_domain,
+            )
+
+            _domain_users = get_domain_users_for_domain(_kpi_shell, domain)
+            _user_count = len(_domain_users) if _domain_users else 0
+
+        _domain_users_names = (
+            list(domain_users)
+            if domain_users is not None
+            else (_population.sorted_accounts() or None)
+        )
+        _executions = load_executions(_kpi_shell, domain)
+
+        # Reachable EXPOSURE numbers (k-independent set cardinalities of distinct
+        # reachable terminals) over the BASE attack graph. When the caller already
+        # computed it (the PRO seam does, for the choke-point wiring), reuse it to
+        # avoid a second graph reload. Otherwise compute it here. Best-effort: a
+        # failure must never break the block, so it is guarded and leaves
+        # reachability=None (the reachable_* fields then default to 0).
+        _reachability = dict(reachability) if reachability is not None else None
+        if _reachability is None:
+            try:
+                from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+                    _resolve_domain_enabled_low_priv_user_start_ids,
+                    load_attack_graph,
+                )
+                from adscan_internal.services.attack_reachability import (  # noqa: PLC0415
+                    compute_reachable_terminals,
+                    summarize_reachable_terminals,
+                )
+
+                _graph = load_attack_graph(_kpi_shell, domain)
+                _start_ids = _resolve_domain_enabled_low_priv_user_start_ids(
+                    _kpi_shell, domain, _graph
+                )
+                # SHAPE: the runtime graph stores nodes as a DICT (id->node).
+                # compute_reachable_terminals iterates graph["nodes"] as a LIST of
+                # node dicts, so normalize before passing (else it computes 0).
+                _nodes = _graph.get("nodes")
+                _norm_graph = {
+                    "nodes": (
+                        list(_nodes.values())
+                        if isinstance(_nodes, dict)
+                        else (_nodes or [])
+                    ),
+                    "edges": _graph.get("edges") or [],
+                }
+                _reachable_terminals = compute_reachable_terminals(
+                    _norm_graph, start_node_ids=_start_ids, target="all"
+                )
+                _reachability = summarize_reachable_terminals(_reachable_terminals)
+            except Exception as _reach_exc:  # noqa: BLE001
+                if print_exception is not None:
+                    print_exception(exception=_reach_exc)
+                _reachability = None
+
+        _kpis = compute_exposure_kpis(
+            records,
+            domain_user_count=_user_count,
+            domain_users=_domain_users_names,
+            excluded_users=_population.sorted_excluded() or None,
+            population_tier_breakdown=resolve_population_tier_breakdown(
+                _kpi_shell, domain, _population
+            ),
+            executions=_executions or None,
+            computed_at=computed_at or None,
+            reachability=_reachability,
+        )
+        domain_data["exposure_kpis"] = _kpis
+        record_exposure_kpis(
+            SimpleNamespace(current_workspace_dir=workspace_dir),
+            domain,
+            kpis=_kpis,
+        )
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort, never fatal
+        if telemetry is not None:
+            telemetry.capture_exception(exc)
+        if print_exception is not None:
+            print_exception(exception=exc)
 
 
 #: How many top contributing paths to surface for explainability.
@@ -1636,5 +1842,6 @@ __all__ = [
     "ExposureContributor",
     "compute_exposure_score",
     "compute_exposure_kpis",
+    "stamp_exposure_kpis_for_domain",
     "derive_domain_user_reach",
 ]

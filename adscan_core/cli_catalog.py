@@ -21,10 +21,13 @@ Tier = Literal["LITE", "PRO"]
 # Commands that require PRO. Matches the dispatch gate in ``adscan.py``
 # and the post-exit-42 upsell in ``adscan_launcher/cli.py``.
 #
-# After the surface-unification kill, the only PRO command is ``deliver``.
-# The four PDFs that used to be standalone commands are now reachable via
-# ``adscan deliver --only playbook|checklist|coverage-matrix|executive``.
+# PRO-gated commands: ``deliver`` (the full Client Deliverable Kit) and
+# ``ci`` (autonomous/non-interactive mode — automation is a PRO capability;
+# the LITE user drives ``adscan start`` interactively). ``ci`` is gated by
+# module absence like every PRO surface: LITE lacks ``adscan_internal.pro``
+# so ``is_pro()`` is False and the dispatch gate returns exit-42.
 PRO_ONLY_COMMANDS: frozenset[str] = frozenset({
+    "ci",
     "deliver",
 })
 

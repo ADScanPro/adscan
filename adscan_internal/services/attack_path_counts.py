@@ -317,6 +317,83 @@ def client_path_totals_from_paths(
     return client_path_totals_from_kpis(kpis)
 
 
+def iter_distinct_hardening_avenues(
+    raw_paths: Sequence[Mapping[str, Any]] | None,
+) -> list[tuple[str, str]]:
+    """Distinct closed-by-config AVENUES in the raw path set, in first-seen order.
+
+    An "avenue" is a way an attacker would have relayed or escalated that the
+    client's own configuration or topology closes with certainty. Several attack
+    PATHS can traverse ONE avenue (e.g. two chains that both start with the same
+    relay), so the closed-by-config PATH count over-states how much hardening the
+    reader intuits. This collapses that: each closed-by-config path contributes
+    its ``(relation, observed-reason)`` pair, deduplicated so N identical closes
+    read as one avenue.
+
+    This is the cross-tier SSOT for the "attack surface reduced / hardening
+    observed" HEADLINE unit, so the free LITE report and the paid PRO deliverable
+    lead with the SAME number and a client never sees the paid report appear to
+    have "found more" hardening (dual-tier doctrine: the two must never disagree
+    on a number). The identity is read off the same on-disk fields both tiers
+    already carry — the closing step's ``details.blocked_reason`` (the engine
+    spreads the edge ``notes`` into the step ``details``) and the step's own
+    ``action``/``relation`` — so no tier re-derives it.
+
+    Returns:
+        The list of distinct ``(relation, blocked_reason)`` pairs (raw, so each
+        tier can word its own client-safe prose from them). Non-closed paths and
+        malformed records are ignored. Empty when nothing was closed by config.
+    """
+    avenues: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for path in raw_paths or []:
+        if not isinstance(path, Mapping):
+            continue
+        if str(path.get("status") or "").strip().lower() != "closed_by_configuration":
+            continue
+        reason = ""
+        relation = ""
+        steps = path.get("steps")
+        for step in steps if isinstance(steps, Sequence) else []:
+            if not isinstance(step, Mapping):
+                continue
+            if (
+                str(step.get("status") or "").strip().lower()
+                != "closed_by_configuration"
+            ):
+                continue
+            details = step.get("details")
+            details = details if isinstance(details, Mapping) else {}
+            reason = str(details.get("blocked_reason") or "").strip()
+            relation = str(step.get("action") or step.get("relation") or "").strip()
+            if reason:
+                break
+        if not relation:
+            relations = path.get("relations")
+            if isinstance(relations, Sequence) and not isinstance(relations, str):
+                relation = str(relations[0] or "").strip() if relations else ""
+        # Case-fold the relation so two records that differ only in casing on the
+        # BloodHound edge token are one avenue; the reason is the observed
+        # configuration sentence and is compared verbatim.
+        key = (relation.lower(), reason)
+        if key in seen:
+            continue
+        seen.add(key)
+        avenues.append((relation, reason))
+    return avenues
+
+
+def count_distinct_hardening_avenues(
+    raw_paths: Sequence[Mapping[str, Any]] | None,
+) -> int:
+    """Number of distinct closed-by-config avenues — the shared hardening headline.
+
+    Thin cardinality wrapper over :func:`iter_distinct_hardening_avenues`; see it
+    for the definition of an "avenue" and why this is the cross-tier headline unit.
+    """
+    return len(iter_distinct_hardening_avenues(raw_paths))
+
+
 def _stamped_exposure_kpis(workspace_dir: str, domain: str) -> Mapping[str, Any] | None:
     """Return the run-stamped ``exposure_kpis`` block, or ``None``.
 

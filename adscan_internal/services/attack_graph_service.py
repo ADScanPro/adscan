@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from collections import OrderedDict
@@ -64,10 +65,13 @@ from adscan_internal.services.attack_paths_materialized_cache import (
     MaterializedPreparedRuntimeGraph,
     build_attack_path_artifact_fingerprint,
     invalidate_attack_path_artifacts,
+    load_disk_cached_attack_path_results,
     load_materialized_attack_path_artifacts,
     load_materialized_prepared_runtime_graph,
+    persist_attack_path_results_to_disk,
     persist_materialized_attack_path_artifacts,
     persist_materialized_prepared_runtime_graph,
+    unlink_attack_path_results_for_domain,
 )
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
@@ -97,6 +101,7 @@ from adscan_internal.services.compromise_class import (
     privilege_tier_for_node,
     privilege_tier_for_principal,
 )
+from adscan_internal.services.tier_descent_prune import apply_tier_descent_prune
 from adscan_internal.services.tier_lattice import (
     stamp_records_domain_compromise_tier,
     stamp_records_target_tier,
@@ -105,6 +110,7 @@ from adscan_internal.services.membership_snapshot import (
     load_membership_snapshot as _load_membership_snapshot_impl,
     membership_snapshot_path as _membership_snapshot_path,
     snapshot_has_sid_metadata as _snapshot_has_sid_metadata,
+    _canonical_membership_label as _canonical_membership_label_full,
 )
 from adscan_internal.services.high_value import (
     classify_users_tier0_high_value,
@@ -372,8 +378,34 @@ _ATTACK_PATHS_CACHE_ENABLED = os.getenv(
     "ADSCAN_ATTACK_PATHS_CACHE_ENABLED", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _ATTACK_PATHS_CACHE_MAX_ENTRIES = _env_int("ADSCAN_ATTACK_PATHS_CACHE_MAX_ENTRIES", 64)
+# NOTE: kept defined for backward compatibility but NO LONGER used to gate the
+# store. A path-COUNT cap bounds the wrong dimension: per-path RAM is not
+# constant (~11KB + 20B*affected_width, a 30x span), so 2000 paths is ~20MB on a
+# narrow domain but ~1GB on a wide corporate "Domain Users" domain. The store is
+# now bounded by an ESTIMATED per-entry BYTE ceiling plus a "caching-is-a-win"
+# gate (see ``_attack_paths_cache_put``).
 _ATTACK_PATHS_CACHE_MAX_RECORDS = _env_int(
     "ADSCAN_ATTACK_PATHS_CACHE_MAX_RECORDS", 2000
+)
+# Per-entry byte-estimation proxy. Measured within +/-10% (over-estimates at the
+# low end, which is the safe direction). Pure arithmetic on ``record["meta"]`` —
+# no OS calls, so the admission decision is identical on Linux/macOS/Windows.
+_CACHE_ENTRY_BASE_BYTES = _env_int("ADSCAN_ATTACK_PATHS_CACHE_ENTRY_BASE_BYTES", 11_000)
+_CACHE_ENTRY_BYTES_PER_AFFECTED = _env_int(
+    "ADSCAN_ATTACK_PATHS_CACHE_ENTRY_BYTES_PER_AFFECTED", 20
+)
+# Reject an entry whose estimated deep-copied size exceeds this ceiling (256 MB).
+# Admits a 2000-path entry up to affected width ~6150 (the ordinary enterprise
+# case); rejects the ~404 MB / width-10k monster that alone x64 LRU slots would
+# OOM a small box.
+_CACHE_ENTRY_MAX_BYTES = _env_int(
+    "ADSCAN_ATTACK_PATHS_CACHE_ENTRY_MAX_BYTES", 256 * 1024 * 1024
+)
+# Estimated wall-clock cost of ``copy.deepcopy`` per byte (measured). Used only to
+# compare against the real recompute time in the "caching-is-a-win" gate — pure
+# arithmetic, no timing dependency at admission.
+_CACHE_DEEPCOPY_SEC_PER_BYTE = _env_float(
+    "ADSCAN_ATTACK_PATHS_CACHE_DEEPCOPY_SEC_PER_BYTE", 1.6e-8
 )
 _ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH = os.getenv(
     "ADSCAN_ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH", "0"
@@ -410,6 +442,38 @@ _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE: OrderedDict[
 _ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES = _env_int(
     "ADSCAN_ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES",
     16,
+)
+
+# Epoch-keyed in-process memo for the fully-prepared (parsed + schema-backfilled +
+# enriched) attack graph returned by ``load_attack_graph``. The per-path readiness
+# / offer-evaluation pass drives ``load_attack_graph`` thousands of times per run
+# (~2.7x per path on Forest, 16,922 loads) through independent read-only lookup
+# helpers, each of which otherwise re-reads and re-parses the whole
+# ``attack_graph.json`` from disk. The graph is READ, not mutated, during that
+# pass, so serving one already-prepared object per graph epoch collapses the
+# dominant cost of the eval pass (the JSON re-parse + ``_enrich_foreign_dc_nodes``)
+# to a single load per epoch.
+#
+# NEVER-STALE contract: the key is ``attack_paths_epoch_fingerprint`` —
+# ``(graph_mtime, snapshot_mtime)`` — the SAME epoch the compute cache keys on.
+# Any ``save_attack_graph`` bumps the graph file mtime, so the very next load
+# computes a fresh epoch and the stale entry is never matched; every mutating
+# writer in this module loads-mutates-then-saves, so a mid-pass step execution
+# that writes the graph is picked up on its next load. ``_invalidate_attack_paths_cache``
+# also clears this memo (belt-and-suspenders). Bounded tiny (the pass works one
+# domain at a time); per-process, never persisted. Returns the shared object — the
+# readiness-pass callers are read-only lookups (audited: ``get_node_by_label`` /
+# ``resolve_source_node_kind`` / ``_resolve_step_execution_host`` /
+# ``resolve_netexec_target_for_node_label``); the only in-place mutators are the
+# writer functions, which each ``save_attack_graph`` (busting the memo) after the
+# mutation in the same synchronous call. Locked by
+# ``tests/unit/services/test_load_attack_graph_memo.py``.
+_LOAD_ATTACK_GRAPH_MEMO_ENABLED = os.getenv(
+    "ADSCAN_LOAD_ATTACK_GRAPH_MEMO_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+_LOAD_ATTACK_GRAPH_MEMO_MAX_ENTRIES = 2
+_LOAD_ATTACK_GRAPH_MEMO: "OrderedDict[tuple[str, tuple[Any, ...]], dict[str, Any]]" = (
+    OrderedDict()
 )
 
 
@@ -2268,6 +2332,25 @@ def _resolve_exposure_source_count(shell: object, domain: str) -> int | None:
         graph = load_attack_graph(shell, domain)
         if not isinstance(graph, dict):
             return None
+        return _resolve_exposure_source_count_for_graph(graph)
+    except Exception as exc:  # noqa: BLE001 — the count is best-effort.
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
+def _resolve_exposure_source_count_for_graph(graph: dict[str, Any]) -> int | None:
+    """Return the exposure source count for an ALREADY-loaded graph, or None.
+
+    The graph-only core of :func:`_resolve_exposure_source_count`, split out so a
+    caller that already holds the loaded graph (the pre-flight builder) can reuse
+    the SAME value-terminal set — domain objects plus the tier-0 / promotable
+    high-value candidates — without a second ``load_attack_graph``. Best-effort:
+    returns ``None`` on any failure or when no value terminal exists.
+    """
+    try:
+        if not isinstance(graph, dict):
+            return None
         nodes = graph.get("nodes")
         nodes_map = (
             nodes
@@ -2371,6 +2454,8 @@ def _emit_attack_path_discovery_started(
 
         nodes_count = 0
         edges_count = 0
+        mega_hub_count = 0
+        predicts_sampled = False
         try:
             base_graph = load_attack_graph(shell, domain)
             if isinstance(base_graph, dict):
@@ -2380,7 +2465,41 @@ def _emit_attack_path_discovery_started(
                     nodes_count = len(base_nodes)
                 if isinstance(base_edges, (list, dict)):
                     edges_count = len(base_edges)
+                # The same predictor the routing decision runs, off the graph we
+                # already loaded — no second load. This carries the engine
+                # decision (scale + sampled-mode verdict) into the CI capture and
+                # the collapsed operator line below.
+                try:
+                    from adscan_internal.services.attack_path_explosion_predictor import (
+                        count_control_mega_hubs,
+                        predicts_explosion,
+                    )
+
+                    mega_hub_count = count_control_mega_hubs(base_graph)
+                    predicts_sampled = predicts_explosion(base_graph)
+                except Exception:  # noqa: BLE001 — predictor read is best-effort.
+                    pass
         except Exception:  # noqa: BLE001 — a beacon must never block discovery.
+            pass
+
+        # Collapsed pre-flight for the non-interactive (`adscan ci`) run: one line,
+        # not the full REPL panel — the scale + the engine-routing decision. Gated
+        # to non-interactive so the interactive path shows only the rich panel.
+        try:
+            from adscan_internal.interaction import is_non_interactive
+
+            if is_non_interactive(shell):
+                marked = mark_sensitive(domain, "domain")
+                verdict = (
+                    f"sampled mode ({mega_hub_count} control mega-hubs)"
+                    if predicts_sampled
+                    else "full discovery"
+                )
+                print_info(
+                    f"Attack graph {marked}: {nodes_count:,} nodes, "
+                    f"{edges_count:,} edges -> {verdict}."
+                )
+        except Exception:  # noqa: BLE001 — the one-liner is best-effort.
             pass
 
         properties: dict[str, Any] = {
@@ -2390,6 +2509,8 @@ def _emit_attack_path_discovery_started(
             "target_mode": target_mode,
             "nodes": nodes_count,
             "edges": edges_count,
+            "mega_hub_count": mega_hub_count,
+            "predicts_sampled": predicts_sampled,
         }
         try:
             properties.update(memory_probe.memory_situation_fields())
@@ -2459,30 +2580,180 @@ def _attack_paths_cache_base_key(
     scope: str,
     params: tuple[Any, ...],
 ) -> tuple[Any, ...]:
-    """Build cache key bound to graph/snapshot mtimes plus query params."""
-    graph_path = _graph_path(shell, domain)
-    snapshot_path = _membership_snapshot_path(shell, domain)
+    """Build cache key bound to the shared graph epoch plus query params.
+
+    The epoch tokens come from :func:`attack_paths_epoch_fingerprint` (the ONE
+    SSOT) so the compute cache inherits whichever invalidation semantics that
+    function is in — legacy mtime (flag off) or structural (flag on). This is why
+    a status-only write no longer colds the compute cache under the structural
+    epoch, while a topology change still does.
+    """
+    graph_epoch, snapshot_epoch = attack_paths_epoch_fingerprint(shell, domain)
     return (
         str(domain or "").strip().lower(),
         str(scope or "").strip().lower(),
-        _file_mtime_token(graph_path),
-        _file_mtime_token(snapshot_path),
+        graph_epoch,
+        snapshot_epoch,
         params,
     )
 
 
-def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
-    """Return the graph-epoch tokens the attack-path compute cache keys on.
+# Sentinel the structural hash returns when it cannot canonicalize a graph. It
+# is intentionally NOT a stable value keyed on content: two malformed graphs
+# must NOT collide into a warm cache hit, so it embeds a fresh token per call
+# (forces a recompute rather than a blind serve).
+_STRUCTURAL_HASH_ERROR_PREFIX = "structural-error:"
 
-    Single source of truth for the ``(graph_mtime, snapshot_mtime)`` invalidation
-    epoch shared by :func:`_attack_paths_cache_base_key`. A per-principal reach
-    memo in front of the set-granular compute cache MUST key on THESE exact
-    tokens (not a parallel epoch) so that every ``save_attack_graph`` — which
-    bumps the graph file mtime AND calls :func:`_invalidate_attack_paths_cache` —
-    also ages out every memoized per-principal reach. This is what makes such a
-    memo provably never-stale: a step-state change (persisted inside
-    ``attack_graph.json``) changes the graph mtime, hence the epoch, hence forces
-    a recompute.
+
+def _graph_structural_hash(graph: dict[str, Any]) -> str:
+    """Return a stable structural fingerprint of an attack graph.
+
+    Covers EXACTLY the fields route discovery reads to build DFS adjacency
+    (cross-reference ``attack_graph_core.build_expansion_view`` /
+    ``admit_frontier_edge`` / ``_is_nontraversable_attack_edge``):
+
+    - the NODE set (id + ``kind`` — ``kind`` gates the ``WriteSPN`` → Computer
+      non-traversable rule; it is a structural attribute, never a status field);
+    - the EDGE set as ``(from, relation, to)`` triples, endpoint-key-agnostic
+      (``from``/``source`` and ``to``/``target``, mirroring every graph consumer
+      so a freshly-inserted ``source``/``target``-keyed derived edge counts).
+
+    It deliberately IGNORES ``status`` / ``notes`` / ``knowledge`` / timestamps
+    (``last_seen`` / ``generated_at`` / ``discovered_at``) — none of them change
+    which routes exist, so a status-only write leaves this hash unchanged (the
+    whole point: caches stay warm across the post-ex status storm).
+
+    Deterministic across runs: node/edge tuples are sorted before hashing, so
+    there is no set/dict-iteration-order dependence.
+
+    Best-effort: on a malformed graph it returns a per-call error sentinel that
+    forces a recompute (never a blind stale serve) and never raises.
+    """
+    try:
+        node_tokens: list[str] = []
+        nodes = graph.get("nodes")
+        node_iter: list[Any]
+        if isinstance(nodes, dict):
+            node_iter = list(nodes.values())
+        elif isinstance(nodes, list):
+            node_iter = nodes
+        else:
+            node_iter = []
+        for node in node_iter:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "")
+            if not node_id:
+                continue
+            kind = str(node.get("kind") or "").strip().lower()
+            node_tokens.append(f"{node_id}\x1f{kind}")
+
+        edge_tokens: list[str] = []
+        edges = graph.get("edges")
+        edge_iter = edges if isinstance(edges, list) else []
+        for edge in edge_iter:
+            if not isinstance(edge, dict):
+                continue
+            from_id = str(edge.get("from") or edge.get("source") or "")
+            to_id = str(edge.get("to") or edge.get("target") or "")
+            relation = str(edge.get("relation") or "")
+            if not from_id or not to_id or not relation:
+                continue
+            edge_tokens.append(f"{from_id}\x1f{relation}\x1f{to_id}")
+
+        hasher = hashlib.blake2b(digest_size=16)
+        # Length-prefix each section so a node token can never be confused with
+        # an edge token (canonical, unambiguous join).
+        hasher.update(f"N{len(node_tokens)}\x1e".encode("utf-8"))
+        for token in sorted(node_tokens):
+            hasher.update(token.encode("utf-8"))
+            hasher.update(b"\x1e")
+        hasher.update(f"E{len(edge_tokens)}\x1e".encode("utf-8"))
+        for token in sorted(edge_tokens):
+            hasher.update(token.encode("utf-8"))
+            hasher.update(b"\x1e")
+        return hasher.hexdigest()
+    except Exception:  # noqa: BLE001 — best-effort; never raise, force recompute
+        return f"{_STRUCTURAL_HASH_ERROR_PREFIX}{uuid.uuid4().hex}"
+
+
+def _hash_membership_map(hasher: "hashlib._Hash", label: str, mapping: Any) -> None:
+    """Fold a ``label -> [values]`` membership map into ``hasher``, order-stable."""
+    if not isinstance(mapping, dict):
+        return
+    hasher.update(f"M{label}:{len(mapping)}\x1e".encode("utf-8"))
+    for key in sorted(str(k) for k in mapping.keys()):
+        values = mapping.get(key)
+        if isinstance(values, (list, tuple, set)):
+            joined = "\x1f".join(sorted(str(v) for v in values))
+        else:
+            joined = str(values)
+        hasher.update(f"{key}\x1f{joined}\x1e".encode("utf-8"))
+
+
+def _snapshot_structural_hash(shell: object, domain: str) -> str:
+    """Return a stable structural fingerprint of the membership snapshot.
+
+    Covers the reachability-relevant structure the group-expansion layer reads:
+    the snapshot's node set + ``(from, relation, to)`` MemberOf triples (same
+    shape as the attack graph, so it reuses :func:`_graph_structural_hash`) AND
+    the built membership maps (``user_to_groups`` / ``computer_to_groups`` /
+    ``group_to_parents``) when present — a runtime group add/remove mutates one
+    of those, and it changes which routes exist, so it MUST move this hash.
+
+    Ignores ``generated_at`` and any per-snapshot timestamp. Best-effort: returns
+    a per-call error sentinel on failure (forces recompute) and never raises.
+    """
+    try:
+        snapshot = _load_membership_snapshot(shell, domain)
+        if not isinstance(snapshot, dict):
+            # An absent snapshot is a STABLE structural state (no memberships),
+            # distinct from a load error. Key it on a fixed token so two absent
+            # loads agree (no spurious invalidation), unlike the error sentinel.
+            return "structural-snapshot:absent"
+        hasher = hashlib.blake2b(digest_size=16)
+        # The snapshot's own node/edge graph (MemberOf topology).
+        hasher.update(_graph_structural_hash(snapshot).encode("utf-8"))
+        hasher.update(b"\x1e")
+        _hash_membership_map(hasher, "u2g", snapshot.get("user_to_groups"))
+        _hash_membership_map(hasher, "c2g", snapshot.get("computer_to_groups"))
+        _hash_membership_map(hasher, "g2p", snapshot.get("group_to_parents"))
+        return hasher.hexdigest()
+    except Exception:  # noqa: BLE001 — best-effort; never raise, force recompute
+        return f"{_STRUCTURAL_HASH_ERROR_PREFIX}{uuid.uuid4().hex}"
+
+
+def _structural_epoch_enabled() -> bool:
+    """Return True when the structural attack-path cache epoch is enabled.
+
+    Read at call time (not module load) so a test / operator can toggle
+    ``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH`` without re-importing the module.
+    Currently defaults ON for LAB VALIDATION: the structural epoch changes the
+    never-stale cache contract, and it is turned on in-code so a real post-ex lab
+    run (GOAD/Forest) can validate it without the operator setting the env var.
+    This default is PROVISIONAL — pending the lab-validation handoff (does a real
+    DCSync-inserted ``derived`` edge still surface its route; does the deliverable
+    match a flag-OFF run). Revert to ``"0"`` if validation is not clean; set
+    ``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH=0`` to force the proven mtime path.
+    """
+    return os.getenv("ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _mtime_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
+    """Return the legacy ``(graph_mtime, snapshot_mtime)`` file-mtime epoch.
+
+    This is the ORIGINAL invalidation epoch — cheap disk stats, changes on EVERY
+    ``save_attack_graph`` (including status-only writes). It is the flag-OFF
+    behaviour of :func:`attack_paths_epoch_fingerprint` AND the key
+    :func:`load_attack_graph`'s own memo uses unconditionally (the load memo only
+    needs to invalidate on ANY file change, and mtime does that cheaply without
+    the recursion a structural key would create — the fingerprint loads the graph
+    via ``load_attack_graph``).
 
     Returns:
         ``(graph_mtime_token, snapshot_mtime_token)`` — each a float mtime or
@@ -2493,24 +2764,246 @@ def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...
     return (_file_mtime_token(graph_path), _file_mtime_token(snapshot_path))
 
 
+def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
+    """Return the graph-epoch tokens the attack-path compute caches key on.
+
+    Single source of truth for the invalidation epoch shared by the compute
+    cache (:func:`_attack_paths_cache_base_key`) and the credential-harvest reach
+    memo. Every consumer keys on THESE exact tokens (not a parallel epoch), so a
+    change to what this returns propagates the invalidation semantics to all of
+    them with no per-consumer change.
+
+    Two modes, selected by ``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH``:
+
+    - **OFF (default)** — the legacy ``(graph_mtime, snapshot_mtime)`` tuple. Every
+      ``save_attack_graph`` bumps the graph mtime, so a step-state (status) write
+      changes the epoch and colds the caches. Provably never-stale, but re-runs
+      the compute on every post-ex status write (the recompute storm).
+    - **ON (structural)** — ``(graph_structural_hash, snapshot_structural_hash)``
+      computed from the already-warm loaded graph
+      (:func:`_graph_structural_hash` / :func:`_snapshot_structural_hash`). A
+      status/notes/timestamp-only write does NOT change the hash (caches stay warm,
+      correctly); a topology change (new edge/node, runtime membership add) DOES
+      (caches invalidate, correctly). This kills the recompute storm while
+      remaining never-stale for the route SET. A warm serve additionally re-derives
+      each record's display status from current step statuses (see
+      :func:`_attack_paths_cache_get`), so a reused set is never status-stale.
+
+    Best-effort: any structural-hash failure falls back to the mtime tuple — never
+    raises, never a blind stale serve.
+
+    Returns:
+        A 2-tuple of epoch tokens (mtime floats OR structural hex hashes).
+    """
+    if not _structural_epoch_enabled():
+        return _mtime_epoch_fingerprint(shell, domain)
+    try:
+        graph = load_attack_graph(shell, domain)
+        graph_hash = _graph_structural_hash(graph)
+        snapshot_hash = _snapshot_structural_hash(shell, domain)
+        return (graph_hash, snapshot_hash)
+    except Exception:  # noqa: BLE001 — never raise; fall back to the proven mtime epoch
+        return _mtime_epoch_fingerprint(shell, domain)
+
+
+def _build_current_edge_status_index(graph: dict[str, Any]) -> dict[tuple[str, str, str], str]:
+    """Index the warm graph's CURRENT edge statuses by ``(from, relation, to)`` label.
+
+    Endpoints are resolved node-id -> label and normalized with
+    :func:`_normalize_account` so they compare against a cached step's
+    ``details.from``/``details.to`` labels. Relation is lower-cased. Best-effort:
+    a malformed graph yields an empty index (no re-derivation, cached serve).
+    """
+    index: dict[tuple[str, str, str], str] = {}
+    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+
+    def _label_for(node_id: str) -> str:
+        node = nodes.get(node_id) if isinstance(nodes, dict) else None
+        if isinstance(node, dict):
+            return str(node.get("label") or node.get("name") or node_id)
+        return node_id
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        from_id = str(edge.get("from") or edge.get("source") or "")
+        to_id = str(edge.get("to") or edge.get("target") or "")
+        relation = str(edge.get("relation") or "").strip().lower()
+        status = str(edge.get("status") or "").strip().lower()
+        if not from_id or not to_id or not relation or not status:
+            continue
+        key = (
+            _normalize_account(_label_for(from_id)),
+            relation,
+            _normalize_account(_label_for(to_id)),
+        )
+        index[key] = status
+    return index
+
+
+def _rederive_cached_record_statuses(
+    records: list[dict[str, Any]], *, shell: object, domain: str
+) -> list[dict[str, Any]]:
+    """Refresh a warm-served record set's step + display statuses from the graph.
+
+    Under the structural epoch a status-only write is a cache HIT, so the cached
+    records carry the step statuses that were current WHEN they were stored — now
+    stale. This re-reads the CURRENT edge status for each step from the warm graph,
+    passes it through the SAME per-step display transform the record builders use
+    (:func:`derive_step_display_status` — a ``context_only`` hop such as MemberOf
+    becomes ``structural``; a display verdict such as ``unsupported`` is preserved),
+    and re-derives each record's display ``status`` via the SSOT
+    (:func:`_derive_display_status_from_steps`). Routing the raw status through the
+    display transform makes the warm-served status byte-identical to what a cold
+    compute would bake, so a reused route set is never status-stale (a proven step
+    is never shown as ``theoretical`` and vice versa) and a structural hop is never
+    mislabeled ``theoretical``.
+
+    Mutates ``records`` in place (they are already a deepcopy from the cache) and
+    returns them. Best-effort: on any failure the records pass through unchanged
+    (a slightly-stale status beats a broken serve, and the mtime-epoch default is
+    unaffected since it never serves a status-changed set warm).
+    """
+    try:
+        graph = load_attack_graph(shell, domain)
+        status_index = _build_current_edge_status_index(graph)
+        if not status_index:
+            return records
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            steps = record.get("steps")
+            if not isinstance(steps, list):
+                continue
+            changed = False
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                relation = str(step.get("action") or "").strip().lower()
+                details = step.get("details") if isinstance(step.get("details"), dict) else {}
+                key = (
+                    _normalize_account(str(details.get("from") or "")),
+                    relation,
+                    _normalize_account(str(details.get("to") or "")),
+                )
+                current = status_index.get(key)
+                if current is None:
+                    continue
+                # Route the RAW edge status through the SAME display transform the
+                # record builders use, so the warm-served status is byte-identical
+                # to what a cold compute would bake (a context_only relation like
+                # MemberOf -> "structural", a display verdict like "unsupported"
+                # preserved). Without this the re-derive would overwrite the baked
+                # display status with the raw status and mislabel a structural hop
+                # as "Theoretical" in the client report.
+                current_display = str(
+                    derive_step_display_status(step.get("action"), current) or ""
+                ).strip().lower()
+                if current_display and current_display != str(step.get("status") or "").strip().lower():
+                    step["status"] = current_display
+                    changed = True
+            if changed:
+                record["status"] = _derive_display_status_from_steps(steps)
+        return records
+    except Exception:  # noqa: BLE001 — best-effort; a cached serve is better than a crash
+        return records
+
+
 def _attack_paths_cache_get(
-    key: tuple[Any, ...], *, domain: str, scope: str, no_cache: bool = False
+    key: tuple[Any, ...],
+    *,
+    domain: str,
+    scope: str,
+    no_cache: bool = False,
+    shell: object | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Return cached attack-path records when available."""
+    """Return cached attack-path records when available.
+
+    Under the structural epoch (``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH``) a
+    status-only write is a HIT, so a warm serve re-derives each record's step +
+    display status from the CURRENT graph via
+    :func:`_rederive_cached_record_statuses` (needs ``shell``). Under the legacy
+    mtime epoch a status write was a MISS anyway, so the re-derivation is skipped
+    (byte-identical to before).
+    """
     if no_cache or not _ATTACK_PATHS_CACHE_ENABLED:
         return None
     cached = _ATTACK_PATHS_COMPUTE_CACHE.get(key)
     if cached is None:
-        _cache_stats_inc(domain, "misses")
+        # L1 MISS -> try the L2 disk sidecar (cold-start reuse). A disk hit is
+        # promoted into L1 through the existing put path so the byte-budget
+        # ceiling / eviction still governs the in-memory copy (a monster disk hit
+        # cannot blow the memory bound). ``shell`` is required to resolve the
+        # workspace dir; a shell-less call (the unit put helper) skips disk.
+        disk_records = _load_attack_paths_disk_cache(
+            key, domain=domain, scope=scope, shell=shell
+        )
+        if disk_records is None:
+            _cache_stats_inc(domain, "misses")
+            return None
+        _cache_stats_inc(domain, "disk_hits")
+        # Promote into L1 (no compute time -> win-gate skipped, byte ceiling still
+        # applies). ``shell=None`` here so the promote does NOT re-write the disk
+        # sidecar we just read from.
+        _attack_paths_cache_put(
+            key, disk_records, domain=domain, scope=scope, compute_seconds=None
+        )
+        cached = disk_records
+    else:
+        _cache_stats_inc(domain, "hits")
+        # LRU touch.
+        _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
+        print_info_debug(
+            f"[attack_paths] cache hit: domain={mark_sensitive(domain, 'domain')} "
+            f"scope={scope} records={len(cached)}"
+        )
+    served = copy.deepcopy(cached)
+    if shell is not None and _structural_epoch_enabled():
+        served = _rederive_cached_record_statuses(served, shell=shell, domain=domain)
+    return served
+
+
+def _load_attack_paths_disk_cache(
+    key: tuple[Any, ...],
+    *,
+    domain: str,
+    scope: str,
+    shell: object | None,
+) -> list[dict[str, Any]] | None:
+    """Return the disk L2 result set for a key, or None (best-effort)."""
+    if shell is None:
         return None
-    _cache_stats_inc(domain, "hits")
-    # LRU touch.
-    _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
-    print_info_debug(
-        f"[attack_paths] cache hit: domain={mark_sensitive(domain, 'domain')} "
-        f"scope={scope} records={len(cached)}"
-    )
-    return copy.deepcopy(cached)
+    try:
+        return load_disk_cached_attack_path_results(
+            shell=shell, domain=domain, cache_key=key
+        )
+    except Exception:  # noqa: BLE001 — a disk error must fall back to compute, never raise
+        return None
+
+
+def _estimate_cache_entry_bytes(records: list[dict[str, Any]]) -> int:
+    """Estimate the deep-copied RAM footprint of a cached entry.
+
+    O(N), no recursion. Per-path RAM is a tight linear model
+    ``base + per_affected * affected_width`` where the affected width is the
+    blast-radius list ``apply_affected_user_metadata`` stores in ``meta``. Read
+    ``meta`` defensively — a record may be missing ``meta`` or either count
+    (``affected_computer_count`` is only written when there are affected
+    computers), and any missing key contributes 0. Pure arithmetic, so the
+    estimate is identical on Linux/macOS/Windows.
+    """
+    total = 0
+    for record in records:
+        meta = record.get("meta") if isinstance(record, dict) else None
+        affected = 0
+        if isinstance(meta, dict):
+            for count_key in ("affected_user_count", "affected_computer_count"):
+                value = meta.get(count_key, 0)
+                if isinstance(value, int) and value > 0:
+                    affected += value
+        total += _CACHE_ENTRY_BASE_BYTES + _CACHE_ENTRY_BYTES_PER_AFFECTED * affected
+    return total
 
 
 def _attack_paths_cache_put(
@@ -2519,17 +3012,61 @@ def _attack_paths_cache_put(
     *,
     domain: str,
     scope: str,
+    compute_seconds: float | None = None,
+    shell: object | None = None,
+    no_cache: bool = False,
 ) -> None:
-    """Store attack-path records in bounded LRU cache."""
-    if not _ATTACK_PATHS_CACHE_ENABLED:
+    """Store attack-path records in a bounded LRU cache (+ optional disk L2).
+
+    The entry is bounded by an estimated per-entry BYTE ceiling and a
+    "caching-is-a-win" gate, NOT by a path count (which bounds the wrong
+    dimension — see ``_ATTACK_PATHS_CACHE_MAX_RECORDS``):
+
+    1. Skip when the estimated deep-copied size exceeds ``_CACHE_ENTRY_MAX_BYTES``
+       (``reason=entry_too_large``). A single wide entry can otherwise be
+       hundreds of MB x up to 64 LRU slots -> OOM on a small box.
+    2. Skip when caching would be a net loss — the estimated ``copy.deepcopy``
+       time to serve a future hit is >= the ``compute_seconds`` it took to
+       produce these records (``reason=deepcopy_exceeds_recompute``). The
+       genuinely dangerous wide entries are exactly the ones this refuses, so
+       refusing them costs nothing. When ``compute_seconds`` is None the caller
+       did not measure the recompute time, so this gate is skipped (the byte
+       ceiling still applies) — never guess a recompute time.
+
+    Both gates are pure arithmetic on data already in ``record["meta"]`` plus the
+    caller's measured elapsed time; there is no OS call, memory probe, or cgroup
+    read, so admission is identical across platforms.
+
+    When ``shell`` is provided (the real compute call sites) AND ``no_cache`` is
+    False, the same admitted record set is ALSO written to the L2 disk sidecar so
+    a cold-start process reuses it — governed by the SAME two gates (a monster
+    entry the byte ceiling rejects, or a wide entry the win-gate rejects, is not
+    worth persisting on disk either). The disk write NEVER re-triggers on the
+    disk-hit promotion path (that call passes ``shell=None``), so a served disk
+    hit is not re-written.
+    """
+    if no_cache or not _ATTACK_PATHS_CACHE_ENABLED:
         return
-    if len(records) > _ATTACK_PATHS_CACHE_MAX_RECORDS:
+    estimated_entry_bytes = _estimate_cache_entry_bytes(records)
+    if estimated_entry_bytes > _CACHE_ENTRY_MAX_BYTES:
         _cache_stats_inc(domain, "skips")
         print_info_debug(
             f"[attack_paths] cache skip: domain={mark_sensitive(domain, 'domain')} "
-            f"scope={scope} records={len(records)} reason=too_many"
+            f"scope={scope} records={len(records)} bytes={estimated_entry_bytes} "
+            f"reason=entry_too_large"
         )
         return
+    if compute_seconds is not None:
+        estimated_deepcopy_seconds = estimated_entry_bytes * _CACHE_DEEPCOPY_SEC_PER_BYTE
+        if estimated_deepcopy_seconds >= compute_seconds:
+            _cache_stats_inc(domain, "skips")
+            print_info_debug(
+                f"[attack_paths] cache skip: domain={mark_sensitive(domain, 'domain')} "
+                f"scope={scope} records={len(records)} "
+                f"deepcopy={estimated_deepcopy_seconds:.3f}s recompute={compute_seconds:.3f}s "
+                f"reason=deepcopy_exceeds_recompute"
+            )
+            return
     _ATTACK_PATHS_COMPUTE_CACHE[key] = copy.deepcopy(records)
     _cache_stats_inc(domain, "stores")
     _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
@@ -2543,10 +3080,79 @@ def _attack_paths_cache_put(
         f"[attack_paths] cache store: domain={mark_sensitive(domain, 'domain')} "
         f"scope={scope} records={len(records)} entries={len(_ATTACK_PATHS_COMPUTE_CACHE)}"
     )
+    # L2 disk sidecar — only from real compute call sites (shell present), only
+    # for an entry that passed BOTH gates above (composes with the byte-budget),
+    # and never on the disk-hit promotion (shell=None) or no_cache path.
+    if shell is not None:
+        _store_attack_paths_disk_cache(key, records, domain=domain, scope=scope, shell=shell)
 
 
-def _invalidate_attack_paths_cache(domain: str, *, reason: str) -> None:
-    """Invalidate in-memory attack-path cache entries for a domain."""
+def _store_attack_paths_disk_cache(
+    key: tuple[Any, ...],
+    records: list[dict[str, Any]],
+    *,
+    domain: str,
+    scope: str,
+    shell: object,
+) -> None:
+    """Persist an admitted record set to the disk L2 (best-effort)."""
+    try:
+        epoch = attack_paths_epoch_fingerprint(shell, domain)
+    except Exception:  # noqa: BLE001 — no epoch stamp is fine; unlink falls back to wipe-all
+        epoch = None
+    try:
+        wrote = persist_attack_path_results_to_disk(
+            shell=shell, domain=domain, cache_key=key, records=records, epoch=epoch
+        )
+    except Exception:  # noqa: BLE001 — a disk write error must never break the in-memory serve
+        return
+    if wrote:
+        _cache_stats_inc(domain, "disk_stores")
+
+
+def _invalidate_load_attack_graph_memo(domain: str) -> None:
+    """Drop every epoch-keyed load-graph memo entry for a domain."""
+    if not _LOAD_ATTACK_GRAPH_MEMO:
+        return
+    domain_key = str(domain or "").strip().lower()
+    for key in [k for k in _LOAD_ATTACK_GRAPH_MEMO if k[0] == domain_key]:
+        _LOAD_ATTACK_GRAPH_MEMO.pop(key, None)
+
+
+def _invalidate_attack_paths_cache(
+    domain: str, *, reason: str, shell: object | None = None
+) -> None:
+    """Invalidate in-memory attack-path cache entries for a domain.
+
+    When ``shell`` is provided (the ``save_attack_graph`` seam), this ALSO
+    actively unlinks the domain's L2 disk result sidecars (GUARD 1). The disk
+    entry's epoch-bearing key already makes a stale file unreachable, but a graph
+    change is the moment to reclaim the disk too, not leave it for the file-count
+    LRU. Best-effort — never raises.
+
+    Under the STRUCTURAL epoch (``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH``) the
+    in-memory compute cache is NOT popped here: the compute-cache key embeds the
+    structural graph hash, so a topology change already re-keys the entry to a
+    natural MISS while a status-only write keeps the key for a warm HIT (served
+    with a status re-derive). Popping the entry would DEFEAT that warm serve —
+    the entire point of the epoch — so the epoch, not this imperative pop, is the
+    sole arbiter of the compute cache. Under the legacy mtime epoch the pop stays
+    (a status write was a miss there anyway; keeping it is byte-identical to the
+    proven path).
+    """
+    # Belt-and-suspenders: drop the epoch-keyed load memo for this domain even
+    # when the compute cache is disabled. The mtime epoch already ages the memo
+    # out on the next load after a save, but actively clearing it here (on every
+    # ``save_attack_graph``) guarantees a mutated graph is never served from the
+    # memo — independent of the compute-cache toggle below.
+    _invalidate_load_attack_graph_memo(domain)
+    if shell is not None:
+        _unlink_attack_paths_disk_cache(shell, domain, reason=reason)
+    # Structural epoch: the compute-cache key IS the epoch, so a pop is redundant
+    # (topology change -> re-key -> miss) AND harmful (status write -> same key ->
+    # would cold the warm serve). Leave the entry; the epoch decides.
+    if _structural_epoch_enabled():
+        return
     if not _ATTACK_PATHS_CACHE_ENABLED:
         return
     domain_key = str(domain or "").strip().lower()
@@ -2564,6 +3170,33 @@ def _invalidate_attack_paths_cache(domain: str, *, reason: str) -> None:
         print_info_debug(
             f"[attack_paths] cache invalidated: domain={mark_sensitive(domain, 'domain')} "
             f"entries={removed} reason={reason}"
+        )
+
+
+def _unlink_attack_paths_disk_cache(shell: object, domain: str, *, reason: str) -> None:
+    """Actively unlink the domain's STALE L2 disk result sidecars (GUARD 1).
+
+    Passes the CURRENT graph epoch so a sidecar written under the same epoch (a
+    status-only write under the structural epoch) is KEPT for the warm serve —
+    only genuinely stale files (a moved epoch, i.e. a topology change) are deleted.
+    On any epoch-resolution error the epoch is None and the unlink wipes ALL files
+    (the safe direction). Best-effort — never raises.
+    """
+    try:
+        current_epoch = attack_paths_epoch_fingerprint(shell, domain)
+    except Exception:  # noqa: BLE001 — unknown epoch -> wipe-all (safe)
+        current_epoch = None
+    try:
+        removed = unlink_attack_path_results_for_domain(
+            shell, domain, current_epoch=current_epoch
+        )
+    except Exception:  # noqa: BLE001 — disk hygiene must never break the graph write
+        return
+    if removed:
+        _cache_stats_inc(domain, "disk_invalidations", by=1)
+        print_info_debug(
+            f"[attack_paths] disk result cache unlinked: domain={mark_sensitive(domain, 'domain')} "
+            f"files={removed} reason={reason}"
         )
 
 
@@ -2613,42 +3246,16 @@ def _invalidate_materialized_attack_path_cache(domain: str) -> None:
             _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.pop(key, None)
 
 
-def force_fresh_attack_paths_recompute(domain: str, *, reason: str) -> None:
-    """Drop every in-memory cache layer that could feed stale paths to a recompute.
-
-    Called by the post-execution refresh flow (both CI and interactive) so the
-    next ``get_attack_path_summaries`` call rebuilds from the on-disk graph
-    instead of returning a cached version computed *before* the attack ran.
-
-    Why this exists even though ``save_attack_graph`` already invalidates the
-    cache via mtime keys:
-
-    * **Defense in depth.** The mtime-based key works under normal POSIX
-      timing, but a filesystem with second-resolution mtimes (older NFS, some
-      FUSE mounts) can produce identical timestamps for back-to-back writes
-      and miss the invalidation. Forcing the drop guarantees correctness
-      regardless of the underlying filesystem clock.
-    * **Single point of policy.** The post-execution refresh is the moment
-      when freshness matters most — the operator just changed AD state and
-      expects to see the consequences immediately. Centralising the
-      invalidation here means a future caller cannot accidentally inherit
-      stale paths by forgetting to invalidate.
-    * **Symmetry between CI and interactive.** Both modes now go through
-      this helper before recomputing, so the two presentation flows can no
-      longer diverge in their freshness guarantees — a recurring class of
-      bug surfaced by the 2026-05-20 HTB Puppy infinite-loop incident.
-
-    The two caches dropped here are the ones that can hold attack-path data
-    keyed by graph state: the LRU summary cache (``_ATTACK_PATHS_COMPUTE_CACHE``)
-    populated by ``compute_display_paths_for_*`` and the materialized-artifacts
-    cache (``_ATTACK_PATHS_MATERIALIZED_CACHE`` +
-    ``_ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE``) used by the runtime DFS.
-    Other caches (membership snapshot, posture, kerberos tickets) are
-    intentionally left alone because their state is governed by separate
-    invariants — touching them here would be a layering violation.
-    """
-    _invalidate_attack_paths_cache(domain, reason=reason)
-    _invalidate_materialized_attack_path_cache(domain)
+# NOTE (2026-09-09, invalidation-SSOT unification): the imperative helper
+# ``force_fresh_attack_paths_recompute`` was DELETED. Under the structural epoch
+# the compute-cache key IS the epoch, so the post-execution refresh flows recompute
+# via their own ``recompute_summaries`` callback and the epoch alone decides HIT
+# (status-only write -> warm serve with re-derive) vs MISS (topology change -> fresh
+# compute). A dedicated force-drop is redundant (topology change re-keys the entry)
+# and harmful (a status write would cold the warm serve). The materialized/prepared
+# caches stay a separate mtime-keyed subsystem (their fingerprint refuses a stale
+# hit), so no imperative drop is needed for them either.
+# See docs/superpowers/specs/2026-09-09-invalidation-ssot-unification-design.md.
 
 
 def _build_recursive_membership_closure(
@@ -3063,6 +3670,7 @@ __all__ = [
     "resolve_group_user_members",
     "resolve_group_members_by_rid",
     "resolve_principal_groups",
+    "resolve_target_labels",
     "resolve_user_sid",
     "_normalize_machine_account",
 ]
@@ -7475,6 +8083,57 @@ def _enrich_foreign_dc_nodes(shell: object, domain: str, graph: dict[str, Any]) 
 
 
 def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
+    """Load or initialize the attack graph for a domain (epoch-memoized).
+
+    Thin memoizing entry over :func:`_load_and_prepare_attack_graph`. During the
+    per-path readiness / offer-evaluation pass this is called thousands of times
+    for the same unchanged graph; the memo returns the already-parsed, already-
+    enriched object for a ``(domain, epoch)`` without touching disk. The epoch is
+    :func:`attack_paths_epoch_fingerprint` — ``(graph_mtime, snapshot_mtime)`` —
+    so any :func:`save_attack_graph` (which bumps the graph mtime) forces the next
+    load to miss the memo and re-read, making the memo provably never-stale. See
+    ``_LOAD_ATTACK_GRAPH_MEMO`` for the read-only-callers audit.
+    """
+    if not _LOAD_ATTACK_GRAPH_MEMO_ENABLED:
+        return _load_and_prepare_attack_graph(shell, domain)
+
+    domain_key = str(domain or "").strip().lower()
+    try:
+        path = _graph_path(shell, domain)
+        # Only memoize when the graph file EXISTS: the file-absent branch returns a
+        # fresh empty dict (an ambiguous ``(None, None)`` epoch shared by every
+        # not-yet-created graph), which a caller then mutates before the first save,
+        # so caching it would leak that scaffold across unrelated domains/workspaces.
+        if not os.path.exists(path):
+            return _load_and_prepare_attack_graph(shell, domain)
+        # The load memo keys on the MTIME epoch unconditionally — NOT the public
+        # structural epoch. Two reasons: (1) the load memo only needs to
+        # invalidate on ANY file change (a re-read of the parsed graph is cheap;
+        # it is the downstream COMPUTE that is expensive and wants the structural
+        # epoch), and (2) the structural epoch computes its hash BY loading the
+        # graph via this very function — keying the load memo on it would recurse.
+        epoch = _mtime_epoch_fingerprint(shell, domain)
+    except Exception:  # noqa: BLE001 — never fail a load over the memo key
+        return _load_and_prepare_attack_graph(shell, domain)
+
+    # Key on the resolved FILE PATH (not just the domain name): the same domain
+    # name legitimately maps to different files across workspaces, and the mtime
+    # epoch alone cannot tell them apart.
+    memo_key = (domain_key, path, epoch)
+    cached = _LOAD_ATTACK_GRAPH_MEMO.get(memo_key)
+    if cached is not None:
+        _LOAD_ATTACK_GRAPH_MEMO.move_to_end(memo_key)
+        return cached
+
+    data = _load_and_prepare_attack_graph(shell, domain)
+    _LOAD_ATTACK_GRAPH_MEMO[memo_key] = data
+    _LOAD_ATTACK_GRAPH_MEMO.move_to_end(memo_key)
+    while len(_LOAD_ATTACK_GRAPH_MEMO) > _LOAD_ATTACK_GRAPH_MEMO_MAX_ENTRIES:
+        _LOAD_ATTACK_GRAPH_MEMO.popitem(last=False)
+    return data
+
+
+def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]:
     """Load or initialize the attack graph for a domain."""
     path = _graph_path(shell, domain)
     if os.path.exists(path):
@@ -7573,6 +8232,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
             # compromised DC to its own domain. Depends on live domains_data, so
             # it cannot be a version-gated maintenance pass.
             _enrich_foreign_dc_nodes(shell, domain, data)
+            attack_graph_core._backfill_privilege_tier(data)
             return data
         if schema_version in {"1.0"}:
             migrated = _migrate_attack_graph(data)
@@ -7595,6 +8255,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 )
                 save_attack_graph(shell, domain, migrated)
                 _enrich_foreign_dc_nodes(shell, domain, migrated)
+                attack_graph_core._backfill_privilege_tier(migrated)
                 return migrated
     return {
         "schema_version": ATTACK_GRAPH_SCHEMA_VERSION,
@@ -8110,7 +8771,7 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
         )
 
     write_json_file(path, graph)
-    _invalidate_attack_paths_cache(domain, reason="graph_saved")
+    _invalidate_attack_paths_cache(domain, reason="graph_saved", shell=shell)
     _invalidate_materialized_attack_path_cache(domain)
     invalidate_attack_path_artifacts(shell, domain)
     try:
@@ -9465,13 +10126,21 @@ def record_credential_source_steps(
                 shell, domain, graph, username=entry_label
             )
         elif entry_kind == "group":
-            entry_id = ensure_entry_node_for_domain(
-                shell, domain, graph, label=entry_label, entry_kind="group"
-            )
+            # A global well-known read-set SID (Everyone/Authenticated Users/Anonymous
+            # Logon/Guests) must fuse onto the shared cross-domain name:<SID> node, even
+            # when the DISPLAY label is localized and never matches the by-name map.
+            # Prefer the measured source_sid; fall back to the English label.
+            entry_id = _resolve_wellknown_source_entry(graph, entry_label, notes)
+            if entry_id is None:
+                entry_id = ensure_entry_node_for_domain(
+                    shell, domain, graph, label=entry_label, entry_kind="group"
+                )
         else:
-            entry_id = ensure_entry_node_for_domain(
-                shell, domain, graph, label=entry_label, entry_kind=entry_kind or None
-            )
+            entry_id = _resolve_wellknown_source_entry(graph, entry_label, notes)
+            if entry_id is None:
+                entry_id = ensure_entry_node_for_domain(
+                    shell, domain, graph, label=entry_label, entry_kind=entry_kind or None
+                )
         edge = upsert_edge(
             graph,
             from_id=entry_id,
@@ -11009,23 +11678,26 @@ def _resolve_bloodhound_principal_node(
     return candidates[0][1]
 
 
-def resolve_entry_label_for_auth(auth_username: str | None) -> str:
-    """Resolve the entry label based on authentication context.
+def resolve_entry_label_for_auth(auth_username: str | None, *, perspective: str | None = None) -> str:
+    """Resolve the entry label for a credential-provenance step.
 
-    Returns a stable label for non-authenticated sessions, otherwise the
-    provided username (lowercased at call sites when needed).
+    Domain Users is never a fallback. The ladder: an explicit authenticated
+    username wins; an unauthenticated perspective (null/anonymous/guest)
+    resolves to ANONYMOUS LOGON / GUESTS; otherwise the honest authenticated
+    default is Authenticated Users (S-1-5-11) — the broadest scope that needs
+    only an authenticated bind (and a truer reach answer than Domain Users,
+    which under-states it to a single domain's users).
     """
-    if not auth_username:
-        return "Domain Users"
-    normalized = str(auth_username).strip()
-    if not normalized:
-        return "Domain Users"
+    persp = str(perspective or "").strip().lower()
+    normalized = str(auth_username or "").strip()
     lowered = normalized.lower()
-    if lowered in {"null", "anonymous"}:
+    if lowered in {"null", "anonymous"} or persp in {"null", "anonymous"}:
         return "ANONYMOUS LOGON"
-    if lowered == "guest":
+    if lowered == "guest" or persp == "guest":
         return "GUESTS"
-    return normalized
+    if normalized:
+        return normalized
+    return "Authenticated Users"
 
 
 # Genuinely-global well-known principals carry a domain-AGNOSTIC @WELLKNOWN label
@@ -11039,6 +11711,19 @@ def resolve_entry_label_for_auth(auth_username: str | None) -> str:
 _GLOBAL_WELL_KNOWN_ENTRY_SIDS: dict[str, tuple[str, str]] = {
     "authenticated users": ("S-1-5-11", "Authenticated Users"),
     "everyone": ("S-1-1-0", "Everyone"),
+    # Anonymous Logon and Guests carry globally-fixed SIDs too, so a Spanish DC's
+    # "Invitados" fuses with S-1-5-32-546. Keying them here (same as Everyone /
+    # Authenticated Users) merges the entry node with the collector-injected
+    # S-1-5-7 / S-1-5-32-546 node instead of forking per domain by localized name.
+    "anonymous logon": ("S-1-5-7", "Anonymous Logon"),
+    "guests": ("S-1-5-32-546", "Guests"),
+}
+
+# Reverse index SID -> by-name key, so a credential-source step expressed by its
+# measured read-capable SID (notes["source_sid"]) can fuse onto the shared node even
+# when the DISPLAY label is localized and never matches the by-name map above.
+_GLOBAL_WELL_KNOWN_ENTRY_BY_SID: dict[str, str] = {
+    sid: label_key for label_key, (sid, _name) in _GLOBAL_WELL_KNOWN_ENTRY_SIDS.items()
 }
 
 
@@ -11057,9 +11742,19 @@ def _resolve_global_well_known_entry(
     if entry is None:
         return None
     sid, display_name = entry
+    # Derive the node KIND from the collector's canonical SID→kind SSOT rather than
+    # hardcoding "Group": most well-known SIDs are Groups, but some (e.g. Anonymous
+    # Logon S-1-5-7) are typed "User". Node-id derivation keys User/Computer nodes by
+    # NAME and all other kinds by objectId, so a hardcoded "Group" forks the entry
+    # node (name:S-1-5-7) away from the collector-injected User node
+    # (name:anonymous logon). Using the collector SSOT's kind makes the entry node
+    # BYTE-IDENTICAL to well_known_sids._make_well_known_node, so the two fuse.
+    from adscan_internal.services.collector.well_known_sids import _WELL_KNOWN
+
+    kind = _WELL_KNOWN.get(sid, (display_name, "Group"))[1]
     node_record = {
         "name": f"{display_name}@WELLKNOWN",
-        "kind": ["Group"],
+        "kind": [kind],
         "objectId": sid,
         "properties": {
             "name": f"{display_name}@WELLKNOWN",
@@ -11073,6 +11768,29 @@ def _resolve_global_well_known_entry(
     return _node_id(node_record)
 
 
+def _resolve_wellknown_source_entry(
+    graph: dict[str, Any],
+    entry_label: str,
+    notes: dict[str, Any],
+) -> str | None:
+    """Resolve a credential-source entry to the fused well-known node when possible.
+
+    A credential read-set is measured by SID, so prefer ``notes["source_sid"]`` when it
+    names a global well-known principal (Everyone/Authenticated Users/Anonymous Logon/
+    Guests) — this fuses onto the shared cross-domain ``name:<SID>`` node even when the
+    DISPLAY label is localized and never matches the by-name map. Fall back to the
+    label. Returns ``None`` for a non-well-known entry so the caller keeps today's
+    per-domain ``ensure_entry_node_for_domain`` behaviour.
+    """
+    source_sid = str(notes.get("source_sid") or "").strip().upper()
+    label_key = _GLOBAL_WELL_KNOWN_ENTRY_BY_SID.get(source_sid)
+    if label_key is not None:
+        resolved = _resolve_global_well_known_entry(graph, label_key)
+        if resolved:
+            return resolved
+    return _resolve_global_well_known_entry(graph, str(entry_label or "").strip().lower())
+
+
 def _resolve_special_principal_entry(
     shell: object,
     domain: str,
@@ -11084,6 +11802,10 @@ def _resolve_special_principal_entry(
     global_entry = _resolve_global_well_known_entry(graph, label_lower)
     if global_entry:
         return global_entry
+    # Unreachable for anonymous logon / guests: both are in
+    # _GLOBAL_WELL_KNOWN_ENTRY_SIDS, so _resolve_global_well_known_entry above
+    # short-circuits and returns first. Dead but harmless Neo4j (legacy BloodHound)
+    # fallback kept for any future non-global well-known added to this map.
     sid_suffix_map = {
         "anonymous logon": "S-1-5-7",
         "guests": "S-1-5-32-546",
@@ -12799,8 +13521,12 @@ def upsert_roast_entry_edge(
     """Upsert an entry-vector edge for roasting: Entry -> roast_type -> username."""
     roast_type_norm = (roast_type or "").strip().lower()
     relation_map = {
-        "kerberoast": ("Kerberoasting", "user", "Domain Users"),
-        "asreproast": ("ASREPRoasting", "user", "Domain Users"),
+        # Authenticated Users (S-1-5-11) is the collector's SSOT source for
+        # authenticated-bind roasting edges; using it makes the execution recorder
+        # upsert the collector edge in place instead of inserting a Domain-Users-keyed
+        # duplicate.
+        "kerberoast": ("Kerberoasting", "user", "Authenticated Users"),
+        "asreproast": ("ASREPRoasting", "user", "Authenticated Users"),
         "timeroast": ("Timeroasting", "computer", "ANONYMOUS LOGON"),
     }
     relation_info = relation_map.get(roast_type_norm)
@@ -13114,8 +13840,12 @@ def update_roast_entry_edge_status(
     """
     roast_type_norm = (roast_type or "").strip().lower()
     relation_map = {
-        "kerberoast": ("Kerberoasting", "user", "Domain Users"),
-        "asreproast": ("ASREPRoasting", "user", "Domain Users"),
+        # Authenticated Users (S-1-5-11) is the collector's SSOT source for
+        # authenticated-bind roasting edges; using it makes the execution recorder
+        # upsert the collector edge in place instead of inserting a Domain-Users-keyed
+        # duplicate.
+        "kerberoast": ("Kerberoasting", "user", "Authenticated Users"),
+        "asreproast": ("ASREPRoasting", "user", "Authenticated Users"),
         "timeroast": ("Timeroasting", "computer", "ANONYMOUS LOGON"),
     }
     relation_info = relation_map.get(roast_type_norm)
@@ -15276,6 +16006,24 @@ def _apply_local_postprocessing_pipeline(
     # chain) using the total order T4(object) > T3(breaker group) > T2(enabler) >
     # T1(host). _label_to_node is required here to recognize the Domain object as T4.
     stamp_records_domain_compromise_tier(records, label_to_node=_label_to_node)
+    # Tier-descent noise prune (flag-gated, default OFF → byte-identical passthrough).
+    # Runs right after the tier stamps (is_tier_zero / target_priority_class /
+    # per-node ESAE tier are all resolvable here) and BEFORE the contained/prefix
+    # filters, so those O(N^2) stages see the smaller set. Deletes only descending +
+    # unprotected + non-pivot paths, with Protection A (peak-preservation) + the
+    # per-source guard making it coverage-safe. On `target=highvalue` every terminal
+    # is record-protected → nothing is pruned (byte-identical, the red line).
+    _n_before_descent_prune = len(records)
+    records = apply_tier_descent_prune(records, _label_to_node)
+    if len(records) != _n_before_descent_prune:
+        _maybe_print_attack_paths_summary_debug(
+            domain,
+            records,
+            stage_label=(
+                "6/6 · after tier-descent prune "
+                f"({_n_before_descent_prune - len(records)} removed)"
+            ),
+        )
     if not display_friendly:
         result, n_contained = (
             attack_graph_core.filter_contained_paths_for_domain_listing(
@@ -15521,7 +16269,7 @@ def compute_display_paths_for_user(
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="user", no_cache=no_cache
+        cache_key, domain=domain, scope="user", no_cache=no_cache, shell=shell
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(cached, domain=domain, scope="user")
@@ -15673,7 +16421,15 @@ def compute_display_paths_for_user(
         target=target,
         target_mode=target_mode,
     )
-    _attack_paths_cache_put(cache_key, records, domain=domain, scope="user")
+    _attack_paths_cache_put(
+        cache_key,
+        records,
+        domain=domain,
+        scope="user",
+        compute_seconds=_total_elapsed,
+        shell=shell,
+        no_cache=no_cache,
+    )
     return records
 
 
@@ -15728,7 +16484,7 @@ def compute_display_paths_for_domain(
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="domain", no_cache=no_cache
+        cache_key, domain=domain, scope="domain", no_cache=no_cache, shell=shell
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
@@ -15891,7 +16647,15 @@ def compute_display_paths_for_domain(
         target=target,
         target_mode=target_mode,
     )
-    _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
+    _attack_paths_cache_put(
+        cache_key,
+        records,
+        domain=domain,
+        scope="domain",
+        compute_seconds=_total_elapsed,
+        shell=shell,
+        no_cache=no_cache,
+    )
     return records
 
 
@@ -16831,6 +17595,193 @@ def get_owned_attack_path_summaries_to_target(
     )
 
 
+def _build_target_label_index(
+    shell: object, domain: str
+) -> dict[str, dict[str, Any]]:
+    """Return the {label: node} index the target-label filter matches against.
+
+    Same index the attack-path compute builds internally: the membership
+    snapshot (users/groups) merged with the attack-graph nodes (domains,
+    computers, CAs, OUs). Every label a summary record can terminate at lives
+    here, so it is the canonical name-space for resolving ``--target``.
+    """
+    snapshot = _load_membership_snapshot(shell, domain)
+    base_graph = _load_attack_graph_for_paths(shell, domain)
+    return _build_snapshot_label_to_node(snapshot, base_graph=base_graph)
+
+
+def _object_ids_for_label(
+    label: str, label_index: dict[str, dict[str, Any]]
+) -> set[str]:
+    """Return the objectId(s) a canonical label maps to in the graph.
+
+    A node's SID is carried at the top level (``objectId``) or under
+    ``properties``. Empty set when the label is unknown or carries no SID.
+    """
+    node = label_index.get(label)
+    if not isinstance(node, dict):
+        return set()
+    ids: set[str] = set()
+    for candidate in (
+        node.get("objectId"),
+        (node.get("properties") or {}).get("objectId")
+        if isinstance(node.get("properties"), dict)
+        else None,
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            ids.add(text.upper())
+    return ids
+
+
+def _labels_sharing_object_ids(
+    object_ids: set[str], label_index: dict[str, dict[str, Any]]
+) -> set[str]:
+    """Return every label whose node shares one of ``object_ids``.
+
+    This is the multi-label OR resolver: the SAME principal (e.g. a Tier-0
+    group) can appear in the graph under both a SID-keyed and a name-keyed
+    label, and matching only one silently drops half the paths. Collecting all
+    labels that share the SID guarantees the filter ORs both.
+    """
+    if not object_ids:
+        return set()
+    matches: set[str] = set()
+    for label, node in label_index.items():
+        if not isinstance(node, dict):
+            continue
+        node_ids = _object_ids_for_label(label, label_index)
+        if node_ids & object_ids:
+            matches.add(label)
+    return matches
+
+
+def _closest_target_candidates(
+    user_target: str, label_index: dict[str, dict[str, Any]], *, limit: int = 8
+) -> list[str]:
+    """Return the labels most similar to a failed ``--target`` for the hint.
+
+    Substring matches first (what the operator most likely meant), then a
+    difflib similarity ranking over the remaining labels. Sampled from the real
+    graph, never invented (mirrors the debug skill's "don't invent labels" rule).
+    """
+    import difflib
+
+    needle = str(user_target or "").strip().upper()
+    all_labels = sorted(label_index.keys())
+    if not needle:
+        return all_labels[:limit]
+
+    substring = [label for label in all_labels if needle in label.upper()]
+    remaining = [label for label in all_labels if label not in substring]
+    fuzzy = difflib.get_close_matches(needle, remaining, n=limit, cutoff=0.4)
+    ordered = substring + fuzzy
+    return ordered[:limit]
+
+
+def resolve_target_labels(
+    shell: object, domain: str, user_target: str
+) -> tuple[str, ...]:
+    """Resolve an operator ``--target`` string to canonical graph label(s).
+
+    The attack-path summary filter (``AttackPathSummaryFilters.target_labels``)
+    matches summary records by their canonical terminal label. The operator,
+    though, types a friendly name (``Domain Admins``, a host, an OU). This is
+    the single resolver both the REPL flag and any future caller share, so the
+    name-space is defined in exactly one place.
+
+    Resolution ladder (first non-empty result wins, then always widened to all
+    SID-twins):
+
+    1. **Exact label** — the operator pasted a canonical label already in the
+       graph label index (``DOMAIN ADMINS@ESSOS.LOCAL``, ``DC01$@CORP.LOCAL``,
+       an OU distinguished name). Return it as-is.
+    2. **Canonical membership label** — normalise the friendly name with the
+       membership canonicalizer (handles ``name``, ``NAME@DOMAIN`` and
+       ``DOMAIN\\name`` forms) and match it against the index.
+    3. **Group-membership index** — if the canonical label is not a direct
+       index entry but IS a known group in the membership snapshot, take it
+       (a Tier-0 group present in memberships whose graph label form differs).
+    4. **Host / OU** — covered by steps 1-2 (host ``SAM$@DOMAIN`` and OU DN both
+       flow through the same index), so no special-casing.
+
+    Whatever ladder step matches, the result is widened to EVERY label in the
+    index that shares the matched node's objectId (SID). That is the multi-label
+    OR guarantee: a group keyed by SID under one node and by name under another
+    must return BOTH labels or paths silently vanish.
+
+    Args:
+        shell: Active shell/session object.
+        domain: Domain whose attack graph defines the label name-space.
+        user_target: The operator-supplied target string.
+
+    Returns:
+        A tuple of canonical labels (OR-matched by the summary filter). Empty
+        when nothing resolves — the caller must then fail loudly with the
+        closest-candidate hints from ``_closest_target_candidates`` rather than
+        silently returning no paths.
+    """
+    raw = str(user_target or "").strip()
+    if not raw:
+        return ()
+
+    label_index = _build_target_label_index(shell, domain)
+    if not label_index:
+        return ()
+
+    matched: set[str] = set()
+
+    # 1. Exact label match (case-insensitive against the canonical UPPER index).
+    upper = raw.upper()
+    if upper in label_index:
+        matched.add(upper)
+    else:
+        for label in label_index:
+            if label.upper() == upper:
+                matched.add(label)
+                break
+
+    # 2. Canonical membership label (handles name / NAME@DOMAIN / DOMAIN\name).
+    if not matched:
+        canonical = _canonical_membership_label_full(domain, raw)
+        if canonical and canonical in label_index:
+            matched.add(canonical)
+        elif canonical:
+            for label in label_index:
+                if label.upper() == canonical.upper():
+                    matched.add(label)
+                    break
+
+        # 3. Group-membership index fallback — a group known to the membership
+        #    snapshot whose graph label form is not a direct index entry.
+        if not matched and canonical:
+            snapshot = _load_membership_snapshot(shell, domain)
+            try:
+                user_members, computer_members, _ = (
+                    attack_paths_core.build_group_member_index(snapshot, domain)
+                )
+            except Exception:  # noqa: BLE001 — best-effort fallback tier
+                user_members, computer_members = {}, {}
+            group_labels = set(user_members) | set(computer_members)
+            for group_label in group_labels:
+                if group_label.upper() == canonical.upper():
+                    matched.add(group_label)
+                    break
+
+    if not matched:
+        return ()
+
+    # Widen to every SID-twin so a group present under both a SID-keyed and a
+    # name-keyed label is OR-matched (the top correctness risk).
+    widened: set[str] = set(matched)
+    for label in list(matched):
+        widened |= _labels_sharing_object_ids(
+            _object_ids_for_label(label, label_index), label_index
+        )
+
+    return tuple(sorted(widened))
+
+
 def _diagnose_zero_domain_paths(
     shell: object,
     domain: str,
@@ -17294,7 +18245,7 @@ def compute_display_paths_for_principals(
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="principals", no_cache=no_cache
+        cache_key, domain=domain, scope="principals", no_cache=no_cache, shell=shell
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
@@ -17478,5 +18429,13 @@ def compute_display_paths_for_principals(
         target=target,
         target_mode=target_mode,
     )
-    _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
+    _attack_paths_cache_put(
+        cache_key,
+        records,
+        domain=domain,
+        scope="principals",
+        compute_seconds=_total_elapsed,
+        shell=shell,
+        no_cache=no_cache,
+    )
     return records

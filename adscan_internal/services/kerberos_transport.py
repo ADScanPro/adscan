@@ -630,6 +630,69 @@ def _classify_recoverable_kerberos_failure(
     return None
 
 
+def _render_tgt_mint_failure(config: "KerberosConfig", exc: Exception) -> None:
+    """Render a TGT-mint failure at the ``get_tgt`` pre-mint seam WITHOUT alarming.
+
+    ``get_tgt`` is a PRE-MINT step: a Kerberos-leg failure here is followed by an
+    NTLM fallback downstream, so at THIS seam we do not yet know whether the
+    credential is genuinely bad or whether the Kerberos leg simply cannot mint a
+    TGT for this principal (a machine account whose AES preauth can't be derived
+    from an NT hash, a non-default machine-account salt, etc.) while NTLM will
+    accept the very same credential. Telling the operator "the DC rejected this
+    credential" HERE would mark a VALID, working credential as wrong — the worst
+    outcome. So this seam NEVER emits a user-facing rejection line; the
+    higher-level credential-verification / auth-scan layer owns the final
+    operator message once it knows whether EVERY method failed.
+
+    The three-way boundary (final rendering happens upstream, not here):
+
+    * **(A) Credential genuinely bad** — Kerberos preauth fails AND NTLM also
+      fails. The clean "credential rejected" one-liner is rendered by the
+      credential-verification layer, NOT here.
+    * **(B) Credential VALID, Kerberos-leg failure recoverable by NTLM** — this
+      session's case. A classified credential-rejection-shaped Kerberos error at
+      the pre-mint is DEBUG-ONLY here: the full traceback still reaches the debug
+      log + sanitized recording (evidence), but nothing user-facing is shown, and
+      the scan continues on the NTLM fallback.
+    * **(C) Genuine ADscan fault / unclassifiable** — kept debuggable:
+      ``capture_exception`` + the default ``print_exception`` (generic line at
+      INFO, full traceback under ``--debug``).
+    """
+    from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
+        is_credential_rejection_error,
+    )
+
+    if not is_credential_rejection_error(exc):
+        # (C) Unclassifiable / genuine fault — keep the full debugging path.
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return
+
+    # (A)/(B) A credential-rejection-shaped Kerberos failure at the PRE-MINT seam.
+    # We cannot yet tell (A) bad-credential from (B) valid-credential-but-Kerberos-
+    # leg-fails-and-NTLM-recovers, because the NTLM fallback runs downstream. Never
+    # alarm here: keep the full traceback in the debug log + recording (evidence)
+    # and surface a DEBUG-only diagnostic. The final operator message — if the
+    # credential truly fails every method — is the credential-verification layer's
+    # job.
+    print_exception(exception=exc, visible=False)
+
+    from adscan_internal.rich_output import mark_sensitive  # noqa: PLC0415
+
+    domain = getattr(config, "domain", "") or ""
+    username = getattr(config, "username", "") or ""
+    principal = f"{username}@{domain}" if username and domain else (username or domain)
+    marked_principal = (
+        mark_sensitive(principal, "user") if principal else "this principal"
+    )
+    print_info_debug(
+        "[kerberos_transport] TGT pre-mint refused for "
+        f"{marked_principal} (credential-rejection-shaped Kerberos error) — "
+        "NTLM fallback runs downstream; deferring the operator verdict to the "
+        "credential-verification layer."
+    )
+
+
 async def get_tgt(config: KerberosConfig) -> bytes:
     """Obtain a TGT and return it as ccache bytes.
 
@@ -763,8 +826,7 @@ async def get_tgt(config: KerberosConfig) -> bytes:
         raise
     except Exception as exc:
         _emit_kerberos_failure_posture(config, exc)
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _render_tgt_mint_failure(config, exc)
         _raise_translated_kerbad_error(exc)
 
 

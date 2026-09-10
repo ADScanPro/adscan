@@ -165,7 +165,7 @@ CI_PASSTHROUGH = PassthroughCommand(
         PassthroughArg(("--report-format",), "Report format.", choices=("pdf",)),
         PassthroughArg(
             ("--frameworks",),
-            "Compliance frameworks: ens,nis2,iso27001,dora,pci_dss (default: ens).",
+            "Compliance frameworks: ens,nis2,iso27001,dora,pci_dss,cis (default: ens).",
             metavar="LIST",
         ),
         PassthroughArg(("--report-engine",), "PDF engine.", choices=("chromium",)),

@@ -71,6 +71,7 @@ except ImportError:
 
 from adscan_internal.services.cracking import hash_kind
 from adscan_internal.services.cracking.hash_kind import HashKind
+from adscan_internal.services.hashcat_coordination import unique_crack_session_name
 from adscan_internal.services.hashcat_service import HashcatCrackingService
 from adscan_internal.services.weakpass_service import WeakpassService, weakpass_allowed
 from adscan_internal.services.cracking_history_service import (
@@ -220,6 +221,14 @@ _HASHCAT_BENIGN_STDERR_PATTERNS = (
     "nvmlDeviceGetFanSpeed(): Not Supported",
     "Mixing --show with --username or --dynamic-x can cause exponential delay in output.",
 )
+# hashcat's single-instance guard: a second process sharing the same session
+# name (the default ``hashcat``) aborts with this line and exit code 255. Every
+# ADscan crack now runs under a unique ``--session`` name (see
+# ``_build_hashcat_cmd`` / hashcat_coordination), so ADscan's own runs can no
+# longer collide — but an EXTERNAL hashcat the operator started, or a genuinely
+# concurrent instance, can still hold the lock. When that happens we report it
+# as a clean, actionable line, never as a raw rc=255 error dump.
+_HASHCAT_ALREADY_RUNNING_TEXT = "Already an instance"
 
 # Output signatures that mean hashcat could NOT PARSE the hash file (a FORMAT
 # error), as opposed to "wordlist exhausted / no match". These are emitted by
@@ -1414,6 +1423,12 @@ def _build_hashcat_cmd(
         if runtime_seconds is not None and int(runtime_seconds) > 0
         else []
     )
+    # A per-run session name (not the default ``hashcat``) so a leftover lock
+    # from a killed prior run — or a concurrent ADscan cracking process — never
+    # aborts this launch with "Already an instance '<...>' running on pid N"
+    # (exit 255). The lock hashcat enforces is keyed on the session name; a
+    # unique name makes the collision impossible. See hashcat_coordination.
+    session_args = ["--session", unique_crack_session_name()]
     argv: list[str] = [
         "hashcat",
         "-m",
@@ -1422,6 +1437,7 @@ def _build_hashcat_cmd(
         "0",
         "--username",
         "--force",
+        *session_args,
         *tuning_args,
         *device_args,
         *rules_args,
@@ -4116,6 +4132,19 @@ def execute_cracking(
             if not runtime_capped_abort and not _is_nonfatal_hashcat_exit_code(
                 completed_process_initial.returncode
             ):
+                # A concurrent/leftover hashcat instance holds the single-
+                # instance lock. ADscan's own runs use a unique --session so
+                # they never collide, so this means an EXTERNAL hashcat is
+                # running. Report it cleanly and skip — never dump the raw
+                # rc=255 error. The operator can re-run this hash set once the
+                # other instance finishes.
+                if _HASHCAT_ALREADY_RUNNING_TEXT in combined_output:
+                    print_warning(
+                        "Another password-cracking run is already active on this host, "
+                        "so this hash set was skipped. Re-run the cracking step once the "
+                        "current run finishes."
+                    )
+                    return {"status": "skipped_already_running", "cracked_count": 0}
                 print_warning(
                     f"Initial cracking command may have failed. Return code: {completed_process_initial.returncode}"
                 )

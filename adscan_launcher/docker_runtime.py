@@ -806,11 +806,15 @@ def image_exists(image: str) -> bool:
     """Return True if the docker image exists locally."""
     if not docker_available():
         return False
+    # 25s (not 10s): on a loaded daemon a healthy `docker image inspect` can take
+    # well over 10s, and a false timeout here made `get_docker_update_info` treat
+    # the image as absent (still recoverable — it pulls anyway) but at the cost of
+    # a scary traceback. Kept bounded so the check can never hang the command.
     proc = run_docker(
         ["docker", "image", "inspect", image],
         check=False,
         capture_output=True,
-        timeout=10,
+        timeout=25,
     )
     return proc.returncode == 0
 

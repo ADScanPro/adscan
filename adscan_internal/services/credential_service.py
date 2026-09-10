@@ -461,6 +461,94 @@ class CredentialService(BaseService):
                     definitive=True,
                 )
             if code_name == "KDC_ERR_PREAUTH_FAILED":
+                # MACHINE-ACCOUNT carve-out (lockout-safe by design).
+                #
+                # A machine account (sAMAccountName ends in "$") that NTLM
+                # ACCEPTS can still fail AES pre-auth with KDC_ERR_PREAUTH_FAILED
+                # on an AES-only KDC whose salt was NOT advertised via
+                # ETYPE-INFO2 (the best-effort probe fell back to None), because
+                # the AES key was then derived with the wrong salt. The vendor
+                # fix (_default_aes_salt) corrects the DEFAULT machine salt; this
+                # is the belt-and-suspenders confirmation for the residual case
+                # (non-default salt the probe missed, or any other AES-key
+                # derivation edge): before declaring the credential INVALID,
+                # confirm it over a salt-independent path — RC4 Kerberos (derives
+                # from the NT hash, no salt) then an NTLM bind (which is what
+                # proved the credential valid in the first place).
+                #
+                # This chaining is SAFE ONLY for machine accounts: a computer
+                # account has NO lockout policy (badPwdCount never locks a
+                # computer account — MS by design), so extra auth attempts
+                # cannot lock it out. For a USER account each extra attempt is
+                # +1 badPwdCount and risks a real lockout, so a user's
+                # PREAUTH_FAILED stays INVALID-definitive with NO extra attempt.
+                # That asymmetry is the whole point of this branch.
+                is_machine_account = username.endswith("$")
+                # Bracket-free markers only — a "[..]" token is parsed as Rich
+                # markup (CLAUDE.md § Square brackets), so render the etype list
+                # as a comma-joined string, never its list repr.
+                etypes_str = (
+                    ",".join(str(e) for e in requested_etypes)
+                    if isinstance(requested_etypes, (list, tuple))
+                    else str(requested_etypes)
+                )
+                print_info_debug(
+                    "machine-account-preauth-diag "
+                    f"machine_account={is_machine_account} "
+                    f"requested_etypes={etypes_str} "
+                    f"context={context or 'default'} code=KDC_ERR_PREAUTH_FAILED"
+                )
+                if not is_machine_account:
+                    return _fail(
+                        CredentialStatus.INVALID,
+                        f"Invalid credentials — the KDC rejected the secret{suffix}",
+                        definitive=True,
+                    )
+                # (i) RC4 Kerberos — salt-independent (NT-hash-derived key). Only
+                # meaningful when the credential is NTLM-native (password / NT
+                # hash) and the KDC still offers RC4; on an AES-only KDC this
+                # raises KDC_ERR_ETYPE_NOTSUPP and we fall through to NTLM.
+                if credential_type in ("password", "hash"):
+                    try:
+                        from dataclasses import replace as _dc_replace
+
+                        rc4_cfg = _dc_replace(cfg, etypes=[23])
+                        rc4_ccache = await get_tgt(rc4_cfg)
+                        print_info_debug(
+                            "machine-account-preauth-diag rc4_kerberos=confirmed"
+                        )
+                        return _ok(rc4_ccache)
+                    except Exception as rc4_exc:  # noqa: BLE001
+                        # Expected on an AES-only KDC (ETYPE_NOTSUPP) or a truly
+                        # bad secret; never fatal — fall through to the NTLM
+                        # confirmation, which is the load-bearing check.
+                        print_info_debug(
+                            "machine-account-preauth-diag "
+                            f"rc4_kerberos=unavailable ({type(rc4_exc).__name__})"
+                        )
+                # (ii) NTLM bind (LDAP/389 then SMB/445). This is what a caller
+                # observed accepting the credential; a success here proves the
+                # secret is correct and the AES failure was a salt/derivation
+                # artifact, not a wrong secret.
+                ntlm_result = await self._verify_via_ntlm(
+                    domain=domain,
+                    target_ip=kdc_ip,
+                    username=username,
+                    credential=credential,
+                    credential_type=credential_type,
+                    posture_snapshot=posture_snapshot,
+                )
+                if ntlm_result is not None and ntlm_result.is_valid:
+                    print_info_debug(
+                        "machine-account-preauth-diag "
+                        f"ntlm=confirmed protocol={ntlm_result.protocol_used}"
+                    )
+                    return ntlm_result
+                # No salt-independent path confirmed it — the KDC-named rejection
+                # stands. Definitive INVALID, exactly as for a user account.
+                print_info_debug(
+                    "machine-account-preauth-diag confirmation=none verdict=INVALID"
+                )
                 return _fail(
                     CredentialStatus.INVALID,
                     f"Invalid credentials — the KDC rejected the secret{suffix}",

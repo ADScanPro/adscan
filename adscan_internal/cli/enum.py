@@ -234,16 +234,16 @@ def do_enum_configs(self, domain: str) -> None:
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Krbtgt analysis error: {str(e)[:50]}")
 
-    # Step 7: DC Access Analysis
+    # Step 7: Tier-0 Access Exposure
     tracker.start_step(
-        "Domain Controller Access Check",
-        details="Checking non-admin DC access paths",
+        "Tier-0 Access Exposure",
+        details="Checking which non-privileged accounts can reach a Tier-0 asset",
     )
     try:
         self.do_dc_access(domain)
-        tracker.complete_step(details="DC access analysis completed")
+        tracker.complete_step(details="Tier-0 access exposure assessed")
     except Exception as e:  # noqa: BLE001
-        tracker.fail_step(details=f"DC access error: {str(e)[:50]}")
+        tracker.fail_step(details=f"Tier-0 access error: {str(e)[:50]}")
 
     # Step 8: LAPS Coverage Fallback
     tracker.start_step(

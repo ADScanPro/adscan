@@ -35,6 +35,8 @@ the same thread never deadlocks.
 
 from __future__ import annotations
 
+import os
+import secrets
 import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional
@@ -117,4 +119,30 @@ def hashcat_slot(
                 _HASHCAT_SLOT.release()
 
 
-__all__ = ["hashcat_slot", "real_crack_pending"]
+def unique_crack_session_name(prefix: str = "adscan") -> str:
+    """Return a per-run cracking session name unique across processes and runs.
+
+    hashcat and John both enforce a single-instance lock keyed on the session
+    NAME (hashcat's default is ``hashcat``; John's is ``john``). A second run
+    that reuses the default name while an instance is still alive — or a run
+    whose predecessor was killed and left a stale lock/restore file behind —
+    aborts with ``Already an instance '<...>' running on pid N`` and exit code
+    255. Handing every ADscan crack its own session name makes that collision
+    impossible: a leftover lock is keyed on the OLD name, and no two ADscan
+    runs (concurrent or sequential) ever share one.
+
+    The name combines the current PID with a short random suffix, so it is
+    distinct even for two crackers launched within the same process image and
+    stays valid as a filesystem session-file component on both Linux and
+    Windows.
+
+    Args:
+        prefix: Leading token for the session name (defaults to ``adscan``).
+
+    Returns:
+        A session name of the form ``<prefix>-<pid>-<hex>``.
+    """
+    return f"{prefix}-{os.getpid()}-{secrets.token_hex(4)}"
+
+
+__all__ = ["hashcat_slot", "real_crack_pending", "unique_crack_session_name"]

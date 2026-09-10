@@ -444,14 +444,12 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
             dc_ip=_ci_dc,
             credential_label=_ci_cred,
             scan_mode="ci",
-            experimental=True,
         )
     )
     # Premium one-shot callout that frames the autonomous flow + sets
-    # operator expectations (BETA, defaults may shift, fallback paths).
+    # operator expectations (no prompts, defaults applied, fallback paths).
     # Always shown — the cost of redundancy here is much lower than the
-    # cost of an operator believing autonomous output equals supported
-    # contract.
+    # cost of an operator being surprised by an unattended decision.
     print_ci_autonomous_callout()
 
     from adscan_internal.cli.common import build_telemetry_context

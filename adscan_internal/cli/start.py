@@ -86,7 +86,7 @@ from adscan_internal.services.network_preflight_service import (
 from adscan_internal.services.session_compromise_state_service import (
     mark_session_compromise_evaluable,
 )
-from adscan_internal.services.scan_outcome_telemetry import emit_scan_outcome
+from adscan_internal.services.scan_outcome_telemetry import emit_scan_outcome, write_scan_summary
 from adscan_core.rich_output_collection import (
     SessionHeader,
     print_session_header,
@@ -1791,10 +1791,17 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         )
         _maybe_apply_domain_inference(shell, known_domain)
         mark_workspace_start_scan_completed(shell, "start_unauth")
-        emit_scan_outcome(shell, "start_unauth")
         shell.workspace_save()
         if not shell._is_ctf_domain_pwned(known_domain):
             shell.ask_for_unauth_scan(known_domain)
+        # NOTE: scan_outcome telemetry and scan_summary.json are written once
+        # at the shared post-scan seam in ``run_start_unauth`` (after
+        # ``scan_ran`` is True), never here. Unlike the onboarding marker
+        # above (which only needs to be set once a scan has *launched*),
+        # ``ask_for_unauth_scan`` below can discover credentials and drive a
+        # full unauth->auth compromise (roast/crack/DCSync); writing the
+        # summary before it ran captured pre-compromise state. See the
+        # equally-shared seam in ``_run_start_auth_impl`` for the auth mirror.
         return True
     else:
         # Original flow: scan services to discover domains
@@ -3770,6 +3777,35 @@ def run_start_unauth(shell, args: str | None) -> None:
             # cancelled discovery, preflight abort) and delegation to
             # run_start_auth return False so we don't render a false completion.
             if scan_ran:
+                # scan_outcome telemetry + scan_summary.json are written HERE,
+                # once, for both unauth branches — never inside
+                # ``_run_start_unauth_impl`` itself. Both branches only return
+                # True (making scan_ran True) AFTER
+                # ``shell.ask_for_unauth_scan(...)`` has already run to
+                # completion, and that call is what can discover credentials
+                # mid-scan and drive a full unauth->auth compromise
+                # (Kerberoast/AS-REP roast -> crack -> DCSync). Writing the
+                # summary any earlier captures pre-compromise state on a
+                # domain that ends up fully owned. This mirrors the
+                # already-correct auth seam, where ``add_credential`` (which
+                # drives the same compromise pipeline synchronously) runs
+                # before its own summary write in ``_run_start_auth_impl``.
+                #
+                # NOTE: the workspace-onboarding "scan started" marker
+                # (``mark_workspace_start_scan_completed``) deliberately stays
+                # inside ``_run_start_unauth_impl`` (its original position),
+                # not here — it only needs to be set once a scan has
+                # *launched*, has no ordering dependency on compromise, and
+                # moving it into this wrapper would change the wrapper's
+                # shell contract (it would then require a real ``shell`` with
+                # a ``.variables`` dict, breaking callers/tests that drive
+                # this wrapper with a minimal stand-in).
+                emit_scan_outcome(shell, "start_unauth")
+                write_scan_summary(
+                    shell,
+                    "start_unauth",
+                    getattr(shell, "current_workspace_dir", None) or "",
+                )
                 # Re-materialize the web-consumed attack-path snapshot as a pure
                 # projection of the reconciled graph BEFORE the loot card / web
                 # handoff, so a compromised domain is never ingested as
@@ -4477,6 +4513,7 @@ def _start_auth_with_params(
     )
     mark_workspace_start_scan_completed(shell, "start_auth")
     emit_scan_outcome(shell, "start_auth")
+    write_scan_summary(shell, "start_auth", shell.current_workspace_dir or "")
     if hasattr(shell, "save_workspace_data"):
         try:
             shell.save_workspace_data()

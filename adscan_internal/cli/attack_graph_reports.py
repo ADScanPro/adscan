@@ -1721,6 +1721,47 @@ def _execution_allowed_for_start(
     return False
 
 
+def _render_attack_path_preflight(shell: object, target_domain: str) -> None:
+    """Render the graph-stats pre-flight panel once per domain per command.
+
+    A best-effort, static one-shot panel shown before the attack-path compute: the
+    graph scale, the heaviest control-hub fan-outs, and whether discovery will run
+    in sampled mode (the routing decision the engine already takes). It reads
+    counts off the loaded graph and runs the cheap predictor — it NEVER triggers a
+    path compute. A shell-scoped set (kept off ``domains_data`` so it never reaches
+    ``save_workspace_data``) de-duplicates the render across a multi-call command
+    (a per-domain scan sweep) so the same domain's pre-flight prints once.
+
+    Interactive only: non-interactive (`adscan ci`) runs get the collapsed
+    one-liner from the discovery beacon instead, so the CI log is not flooded with
+    a multi-line panel per domain.
+    """
+    try:
+        from adscan_internal.interaction import is_non_interactive
+
+        if is_non_interactive(shell):
+            return
+        shown: set[str] = getattr(shell, "_attack_path_preflight_shown", None)  # type: ignore[assignment]
+        if not isinstance(shown, set):
+            shown = set()
+            setattr(shell, "_attack_path_preflight_shown", shown)
+        key = str(target_domain).strip().lower()
+        if key in shown:
+            return
+        shown.add(key)
+        from adscan_internal.services.graph_stats_service import (
+            build_graph_stats,
+            render_graph_stats_panel,
+        )
+
+        stats = build_graph_stats(shell, target_domain)
+        if stats.nodes == 0 and stats.edges == 0:
+            return
+        render_graph_stats_panel(stats, target_domain)
+    except Exception:  # noqa: BLE001 — the pre-flight must never break discovery.
+        pass
+
+
 def _format_compute_duration(seconds: float) -> str:
     """Return a compact human duration (e.g. ``2h 14m 03s`` / ``19.2s``)."""
     seconds = max(0.0, float(seconds))
@@ -1911,6 +1952,7 @@ def run_show_attack_paths(
     no_cache: bool = False,
     keep_longest: bool = False,
     seen_path_keys: set[tuple[Any, ...]] | None = None,
+    target_labels: tuple[str, ...] = (),
 ) -> None:
     """Show attack paths and optionally a detailed path.
 
@@ -1926,8 +1968,15 @@ def run_show_attack_paths(
     trust-connected domain's owned start set also discovers is shown exactly once
     (under the first domain that lists it), with full coverage preserved. Every
     other caller passes ``None`` (no de-duplication, byte-identical behaviour).
+
+    ``target_labels`` narrows the result to paths that terminate at a specific
+    named object (a group, host or OU) resolved via ``resolve_target_labels``.
+    It is a POST-compute label filter over the identical ``target``-class compute
+    — the returned set is a strict subset. Empty (the default) leaves the compute
+    byte-identical.
     """
     from adscan_internal.services.attack_graph_service import (
+        AttackPathSummaryFilters,
         get_attack_paths_cache_stats,
         get_attack_path_summaries,
         get_owned_domain_usernames_for_attack_paths,
@@ -2033,10 +2082,14 @@ def run_show_attack_paths(
                 index=display_idx,
                 search_mode_label=summary_search_mode_label,
             )
-            _maybe_offer_execution(path)
-            # ALWAYS recompute + re-render the attack-paths table after any
-            # interaction with a path, regardless of whether execution
-            # actually started.  Reasons:
+            # ``_maybe_offer_execution`` returns "did state change / should we
+            # refresh": True on real execution OR a blocked-path pivot probe
+            # that persisted viability evidence; False on No / config-closed /
+            # gate-refused with no pivot. Capture it — recompute the whole path
+            # set only when something the sort key reads actually changed.
+            executed = _maybe_offer_execution(path)
+            # Recompute + re-render the attack-paths table only when execution
+            # or a pivot probe actually changed state.  Reasons:
             #   - Execution succeeded → edge status moved to attempted/
             #     exploited and the canonical sort key (status_order)
             #     deprioritises it on the next render.
@@ -2046,12 +2099,10 @@ def run_show_attack_paths(
             #     unreachable target with ``viability_rank=1`` so the
             #     canonical sort buries them.
             #   - User declined / gate refused / inference skipped probe
-            #     → no state change, but recomputing keeps the table
-            #     consistent with the regla "no priorizar paths ya
-            #     ejecutados ni paths con host inalcanzable" on every
-            #     menu iteration. The cost is one materialised-cache
-            #     hit on the prepared runtime graph; the DFS itself is
-            #     bounded by the same depth/scope as the initial run.
+            #     → ``executed`` is False and nothing sort-relevant was
+            #     persisted (readiness metadata is a copy, never saved), so
+            #     the current view is already correct — skip the wasted
+            #     cache-drop + DFS + minimize.
             # In CTF AND audit workspaces, once the domain is compromised the
             # owned-scope path list is exhausted — skip the recompute +
             # re-display so the operator lands cleanly on the post-compromise
@@ -2075,19 +2126,19 @@ def run_show_attack_paths(
             )
             if _now_pwned and getattr(shell, "type", None) in ("ctf", "audit"):
                 return
-            # Symmetry with the CI/non-interactive flow: drop every
-            # attack-path cache layer before recomputing so the operator
-            # sees the freshest possible view of post-execution state.
-            # See ``force_fresh_attack_paths_recompute`` docstring for the
-            # full rationale on why centralising the invalidation here
-            # is load-bearing even though ``save_attack_graph`` already
-            # invalidates the cache on every edge write.
-            from adscan_internal.services.attack_graph_service import (
-                force_fresh_attack_paths_recompute,
-            )
-            force_fresh_attack_paths_recompute(
-                target_domain, reason="post_execution_refresh_interactive"
-            )
+            if not executed:
+                # No execution and no pivot probe persisted anything the sort
+                # key reads — the current view is already correct, so skip the
+                # DFS + minimize entirely.
+                return
+            # Symmetry with the CI/non-interactive flow: recompute so the
+            # operator sees the freshest post-execution state. The structural
+            # epoch is the sole cache arbiter — no imperative drop. The
+            # execution just wrote to the on-disk graph, so ``_compute_paths()``
+            # (which calls ``get_attack_path_summaries``) MISSes on a topology
+            # change (a new derived/AdminTo edge -> re-keyed -> fresh compute) or
+            # HITs-with-status-re-derive on a status-only write. Either way the
+            # returned set reflects the write.
             path_refs[:] = _compute_paths()
             if path_refs:
                 # Annotate before sort/render so the canonical sort key
@@ -2387,6 +2438,12 @@ def run_show_attack_paths(
         _compute_progress.record_ordering(time.monotonic() - _order_t0)
         return ordered
 
+    _summary_filters = (
+        AttackPathSummaryFilters(target_labels=tuple(target_labels))
+        if target_labels
+        else None
+    )
+
     def _compute_paths() -> list[dict[str, Any]]:
         if start_user_norm == "owned":
             owned_users = get_owned_domain_usernames_for_attack_paths(
@@ -2406,6 +2463,7 @@ def run_show_attack_paths(
                 max_paths=max_paths_compute,
                 target=target,
                 target_mode=target_mode,
+                summary_filters=_summary_filters,
                 display_friendly=display_friendly,
                 no_cache=no_cache,
             )
@@ -2432,6 +2490,7 @@ def run_show_attack_paths(
                 max_paths=max_paths_compute,
                 target=target,
                 target_mode=target_mode,
+                summary_filters=_summary_filters,
                 display_friendly=display_friendly,
                 no_cache=no_cache,
             )
@@ -2449,6 +2508,7 @@ def run_show_attack_paths(
                 max_paths=max_paths_compute,
                 target=target,
                 target_mode=target_mode,
+                summary_filters=_summary_filters,
                 display_friendly=display_friendly,
                 no_cache=no_cache,
             )
@@ -2461,11 +2521,20 @@ def run_show_attack_paths(
             max_paths=max_paths_compute,
             target=target,
             target_mode=target_mode,
+            summary_filters=_summary_filters,
             display_friendly=display_friendly,
             no_cache=no_cache,
             keep_longest=keep_longest,
         )
         return _sort_paths(domain_paths)
+
+    # Pre-flight: a static one-shot panel showing the graph scale, the top control
+    # hubs and whether discovery WILL route to the sampled fallback engine — the
+    # routing decision ADscan already takes silently. Rendered ONCE per domain per
+    # command (a shell-scoped guard covers a multi-call command so a scan sweep
+    # does not repeat it), before the compute. It reads counts off the graph and
+    # runs the cheap predictor only — it never triggers a path compute.
+    _render_attack_path_preflight(shell, target_domain)
 
     # The compute is a single blocking synchronous call whose containment filter
     # can run for a very long time on large graphs (2h+ on a 774-host scan). Wrap
@@ -4841,12 +4910,450 @@ def execute_tier0_highvalue_sprawl(
 
 
 # ============================================================================
+# Tier-0 Access Exposure (axis 2 — Compromise Reach)
+# ============================================================================
+#
+# "Which non-privileged principals can reach a Tier-0 asset, and by what means"
+# is an axis-2 (Compromise Reach) finding: it reports what a Tier-2 principal can
+# TAKE OVER via a validated access edge onto a DC / ADCS CA / Exchange server. It
+# NEVER re-tiers the principal — a Tier-2 user with CanRDP to a DC stays Tier 2
+# (axis 1, GRANT); only its REACH is Tier 0. The delta between the two axes IS
+# the finding.
+
+# ---------------------------------------------------------------------------
+# Severity threshold table — a clearly-marked, tunable constant table.
+# ---------------------------------------------------------------------------
+#
+# Three design principles, each with its source, encoded below:
+#
+#  1. COLLAPSE BY TIER. Any Tier-0 asset is equally security-sensitive — a DC, an
+#     ADCS certification authority, and an on-prem Exchange server are all in the
+#     identity control plane and effectively in control of each other (Microsoft
+#     AD DS Tier Model / Enterprise Access Model: "the security sensitivity of
+#     all Tier 0 assets is equivalent"). So severity does NOT sub-grade by the
+#     specific target's directness (tier0_direct DC vs tier0_escalation_capable
+#     CA/Exchange). The reached asset is still recorded per-record (target /
+#     target_role / target_tier) so the client sees WHICH asset — it just does
+#     not fragment the severity. Safe because Tier 0 is DETERMINISTIC
+#     (control-plane group membership), not the lower-confidence Tier-1 heuristic
+#     — there is no false-Tier-0 risk to hedge against.
+#
+#  2. GRADE BY ACCESS STRENGTH. What the attacker can DO on the asset is what
+#     moves severity: full local admin → SYSTEM/LSASS (AdminTo) > an interactive/
+#     remote session at the privilege you land with (CanRDP/CanPSRemote/
+#     ExecuteDCOM) > a DB sysadmin role reaching the host only via an extra,
+#     often-disabled step (SQLAdmin) > a DB session with no host code-execution
+#     (SQLAccess). This is the control-strength SSOT ``edge_control_strength``
+#     (full > session > conditional_exec > low), never re-derived here.
+#       - AdminTo (full): CRITICAL on presence. Full admin over ANY Tier-0 host
+#         is control of a Tier-0 asset (CIS 2.2.7 requires DC logon rights to be
+#         Administrators-only; a non-Tier-0 admin on a DC is already a failed
+#         control), as reliable in practice as DCSync for domain compromise.
+#       - Session: HIGH on presence. CIS 2.2.7 makes any non-Tier-0 principal
+#         with logon/RDP rights to a DC a failed control, so it is HIGH the
+#         moment one exists — never held at MEDIUM pending a concentration cut.
+#       - SQLAdmin (conditional_exec): HIGH on presence [engineering judgment —
+#         no public benchmark grades DB-role reach onto a Tier-0 host].
+#       - SQLAccess (low): MEDIUM on presence [engineering judgment — no public
+#         benchmark].
+#
+#  3. ESCALATE BY CONCENTRATION, never de-escalate. When the SAME kind of access
+#     is held broadly, a single ordinary credential is more likely all that
+#     stands between the attacker and the control plane, so concentration raises
+#     the band ONE step. The cutoff is PingCastle's P-AdminNum admin-sprawl
+#     trigger: >10% of enabled accounts OR >50 principals. Concentration ONLY
+#     escalates — a large absolute count must never read as sub-HIGH, and a count
+#     below the cutoff never lowers a presence severity. [Engineering judgment:
+#     PingCastle's line grades GRANTED admin count; here it is applied by analogy
+#     to REACHABLE access — a related but distinct quantity.]
+#
+# Tune the two concentration knobs together; the presence bands are structural.
+_TIER0_ACCESS_CONCENTRATION_RATIO = 0.10  # >10% of enabled accounts (PingCastle P-AdminNum)
+_TIER0_ACCESS_CONCENTRATION_COUNT = 50  # OR >50 principals (PingCastle P-AdminNum)
+
+# Access strengths grouped by what the reached access GRANTS. Kept as a display/
+# bucketing grouping, NOT a re-derivation of control strength — the SSOT is
+# ``edge_control_strength`` (full / session / conditional_exec / low).
+_TIER0_ACCESS_ADMIN_STRENGTHS: frozenset[str] = frozenset({"full"})  # AdminTo → SYSTEM
+_TIER0_ACCESS_SESSION_STRENGTHS: frozenset[str] = frozenset({"session"})  # CanRDP/PSRemote/DCOM
+_TIER0_ACCESS_SQLADMIN_STRENGTHS: frozenset[str] = frozenset({"conditional_exec"})  # SQLAdmin
+_TIER0_ACCESS_SQLACCESS_STRENGTHS: frozenset[str] = frozenset({"low"})  # SQLAccess
+
+
+def _calculate_tier0_access_exposure(
+    *,
+    records: list[dict[str, Any]],
+    enabled_users: list[str],
+) -> dict[str, Any]:
+    """Compute the Tier-0 access exposure block + concentration finding (Layer 1/2).
+
+    Args:
+        records: Output of ``get_principals_with_tier0_access`` — one entry per
+            (principal, target, relation) with ``principal_tier``,
+            ``target_tier``, ``control_strength``, ``via_group``.
+        enabled_users: The enabled human-user baseline (the concentration
+            denominator).
+
+    Returns:
+        The persisted ``tier0_access_exposure`` block: the raw ``records``, the
+        severity verdict, the concentration ratios segmented by admin-vs-session
+        and target directness, and the unique principals/targets involved.
+    """
+    enabled_keys = {
+        normalize_samaccountname(user)
+        for user in enabled_users
+        if str(user).strip()
+    }
+    enabled_keys.discard(None)  # type: ignore[arg-type]
+    enabled_count = len(enabled_keys)
+
+    # Bucket exposed principals by ACCESS STRENGTH only — severity is collapsed
+    # by tier (any Tier-0 asset is equally sensitive), so the specific target's
+    # directness never splits the counts. The target IS still recorded per-record
+    # for reporting; it just does not fragment severity.
+    admin_principals: set[str] = set()  # AdminTo (full) → CRITICAL on presence
+    session_principals: set[str] = set()  # CanRDP/PSRemote/DCOM → HIGH on presence
+    sqladmin_principals: set[str] = set()  # SQLAdmin → HIGH on presence
+    sqlaccess_principals: set[str] = set()  # SQLAccess → MEDIUM on presence
+    all_principals: set[str] = set()
+    targets: set[str] = set()
+
+    for record in records:
+        principal = str(record.get("principal") or "").strip()
+        if not principal:
+            continue
+        all_principals.add(principal)
+        target = str(record.get("target") or "").strip()
+        if target:
+            targets.add(target)
+        strength = str(record.get("control_strength") or "").strip().lower()
+        if strength in _TIER0_ACCESS_ADMIN_STRENGTHS:
+            admin_principals.add(principal)
+        elif strength in _TIER0_ACCESS_SESSION_STRENGTHS:
+            session_principals.add(principal)
+        elif strength in _TIER0_ACCESS_SQLADMIN_STRENGTHS:
+            sqladmin_principals.add(principal)
+        else:
+            sqlaccess_principals.add(principal)
+
+    def _ratio(principals: set[str]) -> float:
+        return (len(principals) / enabled_count) if enabled_count else 0.0
+
+    def _is_concentrated(principals: set[str]) -> bool:
+        """PingCastle P-AdminNum admin-sprawl trigger: >10% enabled OR >50."""
+        count = len(principals)
+        return count > _TIER0_ACCESS_CONCENTRATION_COUNT or (
+            _ratio(principals) > _TIER0_ACCESS_CONCENTRATION_RATIO
+        )
+
+    session_ratio = _ratio(session_principals)
+    sqlaccess_ratio = _ratio(sqlaccess_principals)
+    exposed_ratio = _ratio(all_principals)
+
+    # Severity — the strongest access bucket wins, then concentration escalates
+    # (never de-escalates) by one band. Collapsed by tier: any Tier-0 target.
+    session_concentrated = _is_concentrated(session_principals)
+    sqlaccess_concentrated = _is_concentrated(sqlaccess_principals)
+    if admin_principals:
+        # AdminTo → any Tier-0 asset = full admin control = CRITICAL, always.
+        severity = "critical"
+    elif session_principals and session_concentrated:
+        # Session on ≥1 Tier-0 asset is HIGH; broad concentration escalates it.
+        severity = "critical"
+    elif session_principals or sqladmin_principals:
+        # Session (CIS 2.2.7 failed control on presence) or SQLAdmin = HIGH.
+        severity = "high"
+    elif sqlaccess_principals and sqlaccess_concentrated:
+        # SQLAccess is MEDIUM on presence, escalated to HIGH by concentration.
+        severity = "high"
+    elif sqlaccess_principals:
+        severity = "medium"
+    elif all_principals:
+        severity = "low"
+    else:
+        severity = "none"
+
+    return {
+        "records": records,
+        "detected": bool(all_principals),
+        "severity": severity,
+        "enabled_user_count": enabled_count,
+        "exposed_principal_count": len(all_principals),
+        "exposed_ratio": round(exposed_ratio, 4),
+        "exposed_percentage": round(exposed_ratio * 100, 2),
+        # Counts by access strength (tier-collapsed — a target-agnostic view).
+        "admin_to_tier0_count": len(admin_principals),
+        "session_tier0_count": len(session_principals),
+        "session_tier0_percentage": round(session_ratio * 100, 2),
+        "session_tier0_concentrated": session_concentrated,
+        "sqladmin_tier0_count": len(sqladmin_principals),
+        "sqlaccess_tier0_count": len(sqlaccess_principals),
+        "sqlaccess_tier0_percentage": round(sqlaccess_ratio * 100, 2),
+        "sqlaccess_tier0_concentrated": sqlaccess_concentrated,
+        "exposed_principals": sorted(all_principals) or None,
+        "tier0_targets": sorted(targets) or None,
+    }
+
+
+# Human-readable labels for the access relations (vendor-neutral, client-safe).
+_TIER0_ACCESS_RELATION_LABELS: dict[str, str] = {
+    "adminto": "local administrator",
+    "canpsremote": "remote PowerShell session",
+    "canrdp": "remote desktop session",
+    "executedcom": "DCOM execution",
+    "sqladmin": "database administrator",
+    "sqlaccess": "database session",
+}
+
+
+def _humanize_access_relation(relation: str) -> str:
+    """Return a vendor-neutral, client-safe phrase for an access relation."""
+    return _TIER0_ACCESS_RELATION_LABELS.get(
+        str(relation or "").strip().lower(), str(relation or "").strip() or "access"
+    )
+
+
+def _render_tier0_access_exposure_summary(
+    *,
+    domain: str,
+    block: dict[str, Any],
+) -> None:
+    """Render the graded Tier-0 access exposure panel (Layer 3, CLI)."""
+    records = block.get("records") or []
+    enabled_count = int(block.get("enabled_user_count") or 0)
+    exposed_count = int(block.get("exposed_principal_count") or 0)
+    percentage = float(block.get("exposed_percentage") or 0.0)
+    severity = str(block.get("severity") or "none")
+
+    critical = severity == "critical"
+    high = severity == "high"
+    border_style, glyph, posture_style = _severity_palette(
+        critical_hit=critical,
+        high_hit=high,
+        has_findings=exposed_count > 0,
+    )
+
+    headline = Text()
+    if exposed_count:
+        headline.append(
+            f"{exposed_count} of {enabled_count}  ",
+            style=f"bold {posture_style.split()[-1]}",
+        )
+        headline.append(
+            "enabled accounts can reach a Tier-0 asset\n", style="default"
+        )
+        headline.append("Domain  ", style="dim")
+        headline.append(
+            f"{mark_sensitive(domain, 'domain')}", style=f"bold {ADSCAN_PRIMARY}"
+        )
+        headline.append("    Concentration  ", style="dim")
+        headline.append(f"{percentage:.2f}%", style="bold")
+    else:
+        headline.append(
+            "No non-privileged account has a validated path onto a Tier-0 asset.",
+            style=COLOR_SAGE,
+        )
+
+    body: list[Any] = [headline]
+
+    if records:
+        # Group by (target, relation, target_role) so the graded list reads by
+        # asset and access means, ordered strongest-control-first.
+        _strength_rank = {"full": 4, "session": 3, "conditional_exec": 2, "low": 1}
+        grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for record in records:
+            key = (
+                str(record.get("target") or ""),
+                str(record.get("relation") or ""),
+                str(record.get("target_role") or ""),
+                str(record.get("control_strength") or ""),
+            )
+            grouped.setdefault(key, []).append(record)
+
+        table = Table(
+            title="Tier-0 Access Detail",
+            title_style="bold",
+            show_header=True,
+            header_style="dim bold",
+            box=SIMPLE,
+            pad_edge=False,
+            padding=(0, 1),
+        )
+        table.add_column("Tier-0 asset")
+        table.add_column("Access")
+        table.add_column("Principals", justify="right", no_wrap=True)
+        table.add_column("Who")
+
+        for key in sorted(
+            grouped,
+            key=lambda k: (-_strength_rank.get(k[3], 0), k[2], k[0], k[1]),
+        ):
+            target, relation, role, strength = key
+            entries = grouped[key]
+            principals = sorted(
+                {str(e.get("principal") or "") for e in entries if e.get("principal")}
+            )
+            # Every target here is a Tier-0 asset by construction, and severity
+            # is tier-collapsed: full local admin (CRITICAL) and any session
+            # onto a Tier-0 asset (HIGH) both read as hot rows.
+            hot = strength in ("full", "session")
+            asset_cell = Text()
+            asset_cell.append(mark_sensitive(target, "hostname"), style="bold")
+            if role:
+                asset_cell.append(f"  [{role}]", style=COLOR_MUTED)
+            access_cell = Text(_humanize_access_relation(relation), style="default")
+            if len(principals) > 10:
+                who_cell = Text(f"{len(principals)} accounts", style=COLOR_MUTED)
+            else:
+                who_cell = Text(
+                    ", ".join(mark_sensitive(p, "user") for p in principals),
+                    style="default",
+                )
+            table.add_row(
+                asset_cell,
+                access_cell,
+                _count_cell(
+                    len(principals),
+                    hot=hot,
+                    severity=COLOR_CRIMSON if hot else COLOR_AMBER,
+                ),
+                who_cell,
+            )
+        body.extend([Text(""), table])
+
+    next_action = Text()
+    next_action.append("Next:  ", style="dim")
+    if critical:
+        next_action.append(
+            "an account outside the Tier-0 tier holds local administrator rights on a "
+            "domain controller — remove the standing grant and rebuild it as a "
+            "least-privilege, just-in-time role.",
+            style="default",
+        )
+    elif high:
+        next_action.append(
+            "trim who can open a session on your Tier-0 assets; move interactive "
+            "administration onto dedicated privileged workstations and accounts.",
+            style="default",
+        )
+    elif exposed_count:
+        next_action.append(
+            "review each account's need to reach a Tier-0 asset and reduce the "
+            "standing set to the minimum operationally required.",
+            style=COLOR_MUTED,
+        )
+    else:
+        next_action.append(
+            "Tier-0 asset access is contained; keep it under observation.",
+            style=COLOR_SAGE,
+        )
+    body.extend([Text(""), next_action])
+
+    _get_console().print(
+        Panel(
+            Group(*body),
+            title=Text(f" {glyph}  Tier-0 Access Exposure ", style="bold"),
+            title_align="left",
+            border_style=border_style,
+            box=ROUNDED,
+            padding=(1, 2),
+        )
+    )
+
+
+def _persist_and_render_tier0_access_exposure(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    records: list[dict[str, Any]],
+    enabled_users: list[str],
+) -> None:
+    """Compute, persist and render the Tier-0 access exposure (Layers 1-3)."""
+    try:
+        block = _calculate_tier0_access_exposure(
+            records=records,
+            enabled_users=enabled_users,
+        )
+
+        exposed_principals = block.get("exposed_principals") or []
+        artifact_path = shell._write_user_list_file(
+            domain,
+            "tier0_access_exposure.txt",
+            exposed_principals if isinstance(exposed_principals, list) else [],
+        )
+        value = {
+            **block,
+            "artifact_path": domain_relpath(
+                shell.domains_dir,
+                domain,
+                "tier0_access_exposure.txt",
+            ),
+        }
+        shell.update_report_field(domain, "tier0_access_exposure", value)
+
+        try:
+            from adscan_core.reporting.technical_report import record_technical_finding
+
+            record_technical_finding(
+                shell,
+                domain,
+                key="tier0_access_exposure",
+                value=bool(block.get("detected")),
+                details=value,
+                evidence=[
+                    {
+                        "type": "artifact",
+                        "summary": "Non-privileged principals with access to a Tier-0 asset",
+                        "artifact_path": domain_relpath(
+                            shell.domains_dir,
+                            domain,
+                            "tier0_access_exposure.txt",
+                        ),
+                    },
+                ],
+            )
+        except Exception as exc:  # pragma: no cover
+            if not handle_optional_report_service_exception(
+                exc,
+                action="Technical finding sync",
+                debug_printer=print_info_debug,
+                prefix="[tier0-access]",
+            ):
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_info_debug(
+                    f"[tier0-access] Failed to persist technical finding: {exc}"
+                )
+
+        print_info_debug(
+            f"[tier0-access] Wrote Tier-0 access artifact to "
+            f"{mark_sensitive(artifact_path, 'path')}"
+        )
+        _render_tier0_access_exposure_summary(domain=domain, block=block)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Error assessing Tier-0 access exposure for domain {marked_domain}: {str(exc)}"
+        )
+        print_exception(show_locals=False, exception=exc)
+
+
+# ============================================================================
 # DC Access Functions
 # ============================================================================
 
 
 def run_dc_access(shell: BloodHoundShell, domain: str) -> None:
-    """Check non-admin users access privileges on DCs on domain.
+    """Report which non-privileged principals can reach a Tier-0 asset (axis 2).
+
+    Implements the Tier-0 access exposure capability (Layers 1-3): it reads the
+    materialized attack graph for every access edge (AdminTo / CanPSRemote /
+    CanRDP / ExecuteDCOM / SQLAdmin / SQLAccess) from a NON-Tier-0 principal onto
+    a Tier-0 asset (a DC, an ADCS CA, an Exchange server), persists the
+    ``tier0_access_exposure`` block, records the concentration technical finding,
+    and renders the graded CLI panel. A Tier-2 principal with such reach stays
+    Tier 2 — only its REACH is Tier 0.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
@@ -4854,14 +5361,21 @@ def run_dc_access(shell: BloodHoundShell, domain: str) -> None:
     """
     marked_domain = mark_sensitive(domain, "domain")
     print_info(
-        f"Checking non admin users access privs on DCs on domain {marked_domain}"
+        f"Assessing Tier-0 asset access exposure on domain {marked_domain}"
     )
     try:
-        paths = shell._get_graph_service().get_users_with_dc_access(domain)
-        execute_dc_access(shell, None, domain, paths=paths)
+        records = shell._get_graph_service().get_principals_with_tier0_access(domain)
+        enabled_users = _load_workspace_user_list(
+            shell,
+            domain=domain,
+            filename="enabled_users.txt",
+        )
+        if not enabled_users:
+            enabled_users = shell._get_graph_service().get_users(domain=domain)
+        execute_dc_access(shell, None, domain, records=records, enabled_users=enabled_users)
     except Exception as exc:
         telemetry.capture_exception(exc)
-        print_error("Failed to query graph for DC access paths.")
+        print_error("Failed to assess Tier-0 asset access exposure.")
         print_exception(show_locals=False, exception=exc)
 
 
@@ -4870,19 +5384,34 @@ def execute_dc_access(
     command: str | None,
     domain: str,
     paths: list[dict] | None = None,
+    *,
+    records: list[dict[str, Any]] | None = None,
+    enabled_users: list[str] | None = None,
 ) -> None:
-    """Execute the BloodHound command and process the output for DC access.
+    """Persist + render the Tier-0 access exposure, or run the legacy DC-access path.
 
-    For each target (destino) and each relation (acl):
-    - If more than 10 accounts possess the relation, print the count.
-    - Otherwise, print the account names.
+    When ``records`` is supplied (the current path from :func:`run_dc_access`), it
+    computes the concentration block, persists ``tier0_access_exposure`` +
+    the technical finding, and renders the graded panel. When only ``paths`` /
+    ``command`` are supplied (the legacy BloodHound-service call site), it keeps
+    the original grouped print behaviour.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
-        command: Command string (legacy, not used when paths is provided)
+        command: Command string (legacy, not used when paths/records is provided)
         domain: Domain name
-        paths: List of access path dictionaries (if None, will execute command)
+        paths: Legacy list of access path dictionaries
+        records: Tier-0 access records from ``get_principals_with_tier0_access``
+        enabled_users: Enabled human-user baseline (concentration denominator)
     """
+    if records is not None:
+        _persist_and_render_tier0_access_exposure(
+            shell,
+            domain=domain,
+            records=records,
+            enabled_users=enabled_users or [],
+        )
+        return
     try:
         if paths is None:
             print_info_verbose(f"Executing BloodHound DC access check: {command}")

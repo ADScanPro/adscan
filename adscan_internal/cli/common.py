@@ -6,8 +6,10 @@ circular dependencies and duplicate code.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import inspect
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 from adscan_core.outbound_links import cta_markup, cta_url
@@ -15,6 +17,7 @@ from adscan_core.lab_context import (
     build_lab_telemetry_fields,
     build_workspace_telemetry_fields,
 )
+from adscan_core.paths import get_workspaces_dir
 from adscan_internal.path_utils import get_adscan_state_dir
 from adscan_internal.telemetry import TELEMETRY_ID
 from adscan_internal.rich_output import (
@@ -27,6 +30,129 @@ from rich.text import Text
 
 import os
 from adscan_core.rich_output import print_exception
+
+# ---------------------------------------------------------------------------
+# Workspace resolution + compliance-framework parsing — LITE-safe.
+#
+# These two helpers (and the framework constants they share) originally lived
+# in ``adscan_internal/cli/deliver.py``. ``deliver.py`` is a PRO-flow module
+# stripped from the LITE image, but ``_resolve_workspace``/``_parse_frameworks``
+# have no PRO dependency — they only touch ``get_workspaces_dir`` (core),
+# ``is_non_interactive`` (LITE-safe), and ``questionary``. Their old location
+# meant ``adscan report``/``adscan writeup`` (both LITE-safe, NOT PRO-gated)
+# crashed in a real LITE image with
+# ``ModuleNotFoundError: No module named 'adscan_internal.cli.deliver'`` the
+# moment a workspace was resolved — this module is their LITE-safe home so
+# ``report_cmd``/``writeup_cmd`` never import ``deliver`` at all.
+# ``deliver.py`` re-imports all four symbols from here (its own uses of
+# ``_resolve_workspace``/``_parse_frameworks``/``_FRAMEWORK_KEY_MAP``/
+# ``_VALID_FRAMEWORK_KEYS`` are unaffected — same names, new home).
+# ---------------------------------------------------------------------------
+
+# ENS and NIS2 are DISTINCT compliance regimes (ENS = Spanish public sector /
+# CCN-CERT; NIS2 = EU critical-infrastructure directive) and are selectable
+# independently — a client may need NIS2 but not ENS. They share findings/
+# attack-path semantics, which is modularized in the content layer, not by
+# collapsing them into one key.
+_FRAMEWORK_KEY_MAP: dict[str, str] = {
+    "ENS Alto — Spain / CCN-CERT (recommended)": "ens",
+    "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
+    "ISO 27001:2022 — International ISMS standard": "iso27001",
+    "DORA — EU 2022/2554 (financial sector)": "dora",
+    "PCI DSS v4.0.1 — Payment Card Industry": "pci_dss",
+    # CIS is technical hardening config best-practice, NOT a regulation — the
+    # label says so explicitly so the operator never confuses it with a legal
+    # obligation (see the compliance report's non-regulatory framing).
+    "CIS Microsoft Windows Server Benchmark v4.0.0 — technical hardening (not a regulation)": "cis",
+}
+_VALID_FRAMEWORK_KEYS: tuple[str, ...] = tuple(_FRAMEWORK_KEY_MAP.values())
+
+
+def _resolve_workspace(args: argparse.Namespace) -> Path | None:
+    """Resolve the target workspace directory.
+
+    Order:
+        1. Explicit ``--workspace`` flag (CLI, launcher, shell).
+        2. ``ADSCAN_CURRENT_WORKSPACE`` env var (set by the shell when
+           dispatching internal commands).
+        3. Interactive questionary picker over ``~/.adscan/workspaces/``.
+
+    Returns ``None`` if no workspace can be resolved (e.g. non-TTY,
+    no flag, no existing workspaces).
+    """
+    explicit = getattr(args, "workspace", None)
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        if not candidate.is_absolute():
+            candidate = get_workspaces_dir() / candidate
+        return candidate.resolve()
+
+    env_ws = os.environ.get("ADSCAN_CURRENT_WORKSPACE", "").strip()
+    if env_ws:
+        return Path(env_ws).expanduser().resolve()
+
+    workspaces_root = get_workspaces_dir()
+    if not workspaces_root.is_dir():
+        return None
+
+    candidates = sorted(p for p in workspaces_root.iterdir() if p.is_dir())
+    if not candidates:
+        return None
+
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
+        # Non-interactive: fall back to the most recently modified one.
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    try:
+        from questionary import select  # type: ignore[import-untyped]
+
+        choice = select(
+            "Pick a workspace to deliver:",
+            choices=[p.name for p in candidates],
+        ).ask()
+    except Exception:  # noqa: BLE001 — questionary missing or non-TTY edge cases
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    if not choice:
+        return None
+    return (workspaces_root / choice).resolve()
+
+
+def _parse_frameworks(raw: str | None) -> list[str] | None:
+    """Validate a comma-separated framework list from ``--frameworks``.
+
+    Args:
+        raw: Raw ``--frameworks`` value, or ``None`` if the flag was not
+            passed. Empty / whitespace-only string is treated as ``None``.
+
+    Returns:
+        Canonicalised list of framework keys (preserving caller order, no
+        duplicates) when ``raw`` is a non-empty valid input. ``None`` when
+        the flag was not provided — caller should then prompt or default.
+
+    Raises:
+        ValueError: Any token is not a known framework key. The message
+            names the bad token and the allowed set so the operator can
+            self-correct without reading source.
+    """
+    if raw is None or not raw.strip():
+        return None
+    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        return None
+    invalid = [tok for tok in tokens if tok not in _VALID_FRAMEWORK_KEYS]
+    if invalid:
+        raise ValueError(
+            f"--frameworks: unknown value(s): {', '.join(invalid)}. "
+            f"Use one of: {', '.join(_VALID_FRAMEWORK_KEYS)}."
+        )
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for tok in tokens:
+        if tok not in seen:
+            seen.add(tok)
+            ordered.append(tok)
+    return ordered
 
 _WORKSPACE_ONBOARDING_KEY = "workspace_onboarding"
 _WORKSPACE_SCAN_STARTED_KEY = "start_scan_completed"

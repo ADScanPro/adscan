@@ -16638,20 +16638,12 @@ def _offer_attack_paths_for_execution_summaries_impl(
         return Confirm.ask(prompt, default=default)
 
     def _refresh_summaries() -> list[dict[str, Any]]:
-        # Force-drop every attack-path cache layer before recomputing.
-        # The on-disk graph has just been mutated by the execution we are
-        # refreshing for — relying on the mtime-based invalidation that
-        # ``save_attack_graph`` triggers is correct under normal POSIX
-        # timing but can silently miss on filesystems with coarse mtime
-        # resolution. Centralising the drop here matches the user
-        # expectation: "after an execution, the next list MUST reflect
-        # the change".
-        from adscan_internal.services.attack_graph_service import (
-            force_fresh_attack_paths_recompute,
-        )
-        force_fresh_attack_paths_recompute(
-            domain, reason="post_execution_refresh"
-        )
+        # Recompute after the execution mutated the on-disk graph. No imperative
+        # cache drop: the structural epoch is the sole compute-cache arbiter, so
+        # the recompute below MISSes on a topology change (a new derived/AdminTo
+        # edge re-keys the cache) or HITs-with-status-re-derive on a status-only
+        # write. Either way "after an execution, the next list reflects the
+        # change" holds without a filesystem-mtime-dependent force-drop.
 
         # ORDER MATTERS: annotate FIRST so the canonical sort key in
         # ``order_attack_paths_for_display`` can read
@@ -17612,16 +17604,13 @@ def _finalize_post_execution_snapshot(
         if recompute_summaries is not None:
             # Scope-aware refresh: the caller's recompute callback rebuilds
             # summaries with its exact scope/target from the reconciled on-disk
-            # graph. Drop every attack-path cache layer first so the recompute
-            # cannot serve pre-execution paths (same freshness contract as
-            # ``_refresh_summaries``).
-            from adscan_internal.services.attack_graph_service import (
-                force_fresh_attack_paths_recompute,
-            )
-
-            force_fresh_attack_paths_recompute(
-                domain, reason="post_execution_finalize"
-            )
+            # graph. No imperative cache drop — the structural epoch is the sole
+            # compute-cache arbiter (same freshness contract as
+            # ``_refresh_summaries``): the reconciled graph's topology change
+            # re-keys the compute cache to a MISS, and a status-only reconcile
+            # HITs-with-status-re-derive. This is the highest-risk removal (the
+            # abnormal-exit snapshot backstop that guards a compromised-domain
+            # render); the recompute+re-derive still surfaces every new route.
             fresh = list(recompute_summaries() or [])
             # Re-derive each path's top-level status from its reconciled
             # per-step statuses (the shared SSOT) so a step that transitioned

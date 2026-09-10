@@ -766,6 +766,316 @@ class LocalGraphService:
 
         return results
 
+    def get_principals_with_tier0_access(
+        self, domain: str
+    ) -> list[dict[str, Any]]:
+        """Return non-Tier-0 principals that have an ACCESS edge onto a Tier-0 asset.
+
+        Axis 2 (Compromise Reach), NOT axis 1: this reports what a principal can
+        REACH, never re-tiering the principal itself. For every access/auth edge
+        (``AdminTo`` / ``CanPSRemote`` / ``CanRDP`` / ``ExecuteDCOM`` /
+        ``SQLAdmin`` / ``SQLAccess`` — the relations carrying a
+        :class:`ControlStrength`) that terminates on a Tier-0 COMPUTER asset (a
+        DC, an ADCS CA, an Exchange server), it attributes the reach to every
+        NON-Tier-0 source principal, following ``MemberOf`` transitively so a
+        group-held session/admin edge reaches each member.
+
+        The two axes stay separate, per CLAUDE.md § Nomenclature Standard: a
+        Tier-2 user with ``CanRDP`` to a DC is reported here as Tier-2 (its
+        ``principal_tier``) with a Tier-0 REACH (``target_tier``). A source that
+        is itself Tier-0 is excluded — its access to a Tier-0 asset is structural
+        AD hierarchy, not an exposure finding.
+
+        Args:
+            domain: The domain whose materialized attack graph is read.
+
+        Returns:
+            One record per (principal, target, relation) with keys:
+            ``principal``, ``principal_object_id``, ``principal_tier`` (the tier
+            the principal IS GRANTED — Tier 2/1/…), ``target``,
+            ``target_object_id``, ``target_role`` (``"DC"`` / ``"ADCS CA"`` /
+            ``"Exchange"`` / ``"Tier 0"``), ``target_tier``
+            (``tier0_direct`` / ``tier0_escalation_capable``), ``relation``,
+            ``control_strength`` (``full`` / ``session`` / ``conditional_exec`` /
+            ``low``), ``via_group`` (the group label the edge was held by, or
+            ``""`` when the principal holds it directly), ``target_enabled``.
+        """
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            PrivilegeTier,
+            _node_group_tokens_for_kind,
+            node_stamped_privilege_tier,
+            privilege_tier_for_computer,
+            privilege_tier_for_node,
+            privilege_tier_for_principal,
+            privilege_tier_for_principal_node,
+        )
+        from adscan_internal.services.computer_node_role import (  # noqa: PLC0415
+            node_is_rodc_computer,
+        )
+        from adscan_internal.services.edge_kind import (  # noqa: PLC0415
+            ControlStrength,
+            edge_control_strength,
+        )
+
+        graph = self._graph(domain)
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        edges = graph.get("edges") if isinstance(graph, dict) else None
+        if not isinstance(nodes, dict) or not isinstance(edges, list):
+            return []
+
+        # Index nodes by every identifier an edge endpoint might use.
+        node_by_ref: dict[str, dict[str, Any]] = {}
+        for key, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            properties = node.get("properties") or {}
+            for candidate in (
+                key,
+                node.get("id"),
+                node.get("objectId"),
+                node.get("objectid"),
+                properties.get("objectid"),
+                properties.get("objectId"),
+            ):
+                ref = str(candidate or "").strip()
+                if ref:
+                    node_by_ref.setdefault(ref, node)
+
+        def _target_tier_of(node: dict[str, Any]) -> PrivilegeTier:
+            # The TARGET's granted tier — a Tier-0 ASSET must be recognised even
+            # when it carries only the degraded ``isTierZero`` flag (a collector
+            # highvalue tag with no resolvable Tier-0 GROUP membership, e.g. an
+            # ADCS CA or Exchange host tagged but ungrouped). Prefer the
+            # collector-stamped membership-aware tier, else the node resolver WITH
+            # the degraded flag so the asset is still graded Tier 0.
+            stamped = node_stamped_privilege_tier(node)
+            if stamped is not None:
+                return stamped
+            is_t0_flag = bool(node.get("isTierZero")) or bool(
+                (node.get("properties") or {}).get("isTierZero")
+            )
+            if str(node.get("kind") or "").strip().lower() == "computer":
+                return privilege_tier_for_node(node, is_tier0_asset=is_t0_flag)
+            return privilege_tier_for_principal_node(node, is_tier0_asset=is_t0_flag)
+
+        def _source_grant_tier_of(
+            node_ref: str, node: dict[str, Any]
+        ) -> PrivilegeTier:
+            # The SOURCE principal's GRANTED tier — MEMBERSHIP-BASED ONLY, never
+            # the degraded ``isTierZero`` highvalue flag. A low-priv account that
+            # the collector merely TAGGED high-value (e.g. Forest's svc-alfresco:
+            # a kerberoastable Tier-2 service account flagged highvalue) must keep
+            # its true Tier-2 grant, so its Tier-0 REACH is REPORTED, not
+            # suppressed as "structural". A principal is structurally Tier-0 only
+            # by real control-plane GROUP MEMBERSHIP — so grade the source from
+            # its transitive MemberOf closure in THIS graph (the same SSOT the
+            # collector uses), NOT from the collector stamp (which may itself be
+            # the degraded highvalue-flag fallback) and NOT from the highvalue
+            # tag. This is the axis-1/axis-2 separation: highvalue-tag ≠ granted
+            # Tier 0.
+            group_tokens: list[str] = []
+            for group_id in _closure(node_ref):
+                group_node = nodes.get(group_id)
+                if isinstance(group_node, dict):
+                    group_tokens.extend(_node_group_tokens_for_kind(group_node))
+            props = node.get("properties") or {}
+            sid = (
+                str(props.get("objectid") or node.get("objectId") or "").strip()
+                or None
+            )
+            if str(node.get("kind") or "").strip().lower() == "computer":
+                return privilege_tier_for_computer(
+                    group_names=group_tokens, sid=sid, is_tier0_asset=False
+                )
+            return privilege_tier_for_principal(group_tokens, sid=sid)
+
+        def _target_role(node: dict[str, Any]) -> str:
+            # LABEL ONLY — the display string the client sees for the reached
+            # asset. It never affects inclusion (membership-driven "is Tier 0")
+            # or severity (access-strength + concentration, tier-collapsed). RODC
+            # detection reuses the computer-role SSOT (primaryGroupID 521 / local
+            # krbtgt SPN / RODC UAC bit / explicit flags), never a hand-rolled
+            # check. Any Tier-0 asset with no specific label falls back to the
+            # generic "Tier 0 asset" — still correctly included and rated.
+            props = node.get("properties") or {}
+            name = self._ace_principal_name(node, props).lower()
+            if node_is_rodc_computer(node):
+                return "RODC"
+            if bool(node.get("is_dc")) or bool(props.get("is_dc")):
+                return "DC"
+            for fragment in ("exch", "mail"):
+                if fragment in name:
+                    return "Exchange"
+            for fragment in ("adcs", "-ca", "certsrv", "pki"):
+                if fragment in name:
+                    return "ADCS CA"
+            tier = _target_tier_of(node)
+            if tier is PrivilegeTier.TIER0_DIRECT:
+                return "DC"
+            return "Tier 0 asset"
+
+        # Build membership adjacency and collect access edges onto Tier-0
+        # COMPUTER targets in one pass. Only a Tier-0 computer counts as an
+        # "asset" here — a DC, an ADCS CA host, an Exchange server; a Tier-0
+        # GROUP/user is not a reachable machine.
+        member_of: dict[str, set[str]] = {}
+        access_edges: list[tuple[str, str, str, dict[str, Any]]] = []
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            frm = str(edge.get("from") or "").strip()
+            to = str(edge.get("to") or "").strip()
+            if not frm or not to:
+                continue
+            relation = str(edge.get("relation") or "")
+            if relation == "MemberOf":
+                member_of.setdefault(frm, set()).add(to)
+                continue
+            strength = edge_control_strength(relation)
+            if strength is ControlStrength.NOT_APPLICABLE:
+                continue
+            target_node = node_by_ref.get(to)
+            if not target_node:
+                continue
+            if str(target_node.get("kind") or "").strip().lower() != "computer":
+                continue
+            if not _target_tier_of(target_node).is_tier0:
+                continue
+            access_edges.append((frm, to, relation, target_node))
+
+        if not access_edges:
+            return []
+
+        # Transitive members of a group (inverse of the MemberOf closure), built
+        # ONCE so a group-held access edge is attributed to every member without
+        # an O(N^2) per-group re-walk (enterprise scale: § AD constraints §10).
+        closure_cache: dict[str, set[str]] = {}
+
+        def _closure(start: str) -> set[str]:
+            cached = closure_cache.get(start)
+            if cached is not None:
+                return cached
+            seen: set[str] = set()
+            stack = list(member_of.get(start, ()))
+            while stack:
+                current = stack.pop()
+                if current not in seen:
+                    seen.add(current)
+                    stack.extend(member_of.get(current, ()))
+            closure_cache[start] = seen
+            return seen
+
+        members_by_group: dict[str, set[str]] = {}
+        for src_ref in member_of:
+            for group_ref in _closure(src_ref):
+                members_by_group.setdefault(group_ref, set()).add(src_ref)
+
+        def _transitive_members(group_ref: str) -> set[str]:
+            return members_by_group.get(group_ref, set())
+
+        results: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        limit = 1000
+        for frm, to, relation, target_node in access_edges:
+            holder_node = node_by_ref.get(frm)
+            holder_kind = (
+                str(holder_node.get("kind") or "").strip().lower()
+                if holder_node
+                else ""
+            )
+            via_group = ""
+            if holder_kind == "group":
+                via_group = self._ace_principal_name(
+                    holder_node, holder_node.get("properties") or {}
+                )
+                # Attribute to every transitive member principal.
+                candidate_refs = _transitive_members(frm)
+            elif holder_kind in ("user", "computer"):
+                candidate_refs = {frm}
+            else:
+                continue
+
+            tgt_props = target_node.get("properties") or {}
+            tgt_name = self._ace_principal_name(target_node, tgt_props)
+            tgt_role = _target_role(target_node)
+            tgt_tier = _target_tier_of(target_node)
+            strength = edge_control_strength(relation)
+
+            for principal_ref in candidate_refs:
+                principal_node = node_by_ref.get(principal_ref)
+                if not principal_node:
+                    continue
+                if str(principal_node.get("kind") or "").strip().lower() not in (
+                    "user",
+                    "computer",
+                ):
+                    continue
+                principal_tier = _source_grant_tier_of(principal_ref, principal_node)
+                # Exclude a Tier-0 source: its access to a Tier-0 asset is
+                # structural AD hierarchy, not an exposure finding.
+                if principal_tier.is_tier0:
+                    continue
+                p_props = principal_node.get("properties") or {}
+                principal_name = self._ace_principal_name(principal_node, p_props)
+                if not principal_name:
+                    continue
+                dedup = (
+                    principal_name.lower(),
+                    tgt_name.lower(),
+                    relation.lower(),
+                )
+                if dedup in seen_keys:
+                    continue
+                seen_keys.add(dedup)
+                results.append(
+                    {
+                        "principal": principal_name,
+                        "principal_object_id": self._ace_object_id(
+                            principal_ref, principal_node, p_props
+                        ),
+                        "principal_tier": principal_tier.value,
+                        "target": tgt_name,
+                        "target_object_id": self._ace_object_id(
+                            to, target_node, tgt_props
+                        ),
+                        "target_role": tgt_role,
+                        "target_tier": tgt_tier.value,
+                        "relation": relation,
+                        "control_strength": strength.value,
+                        "via_group": via_group,
+                        "target_enabled": bool(tgt_props.get("enabled", True)),
+                    }
+                )
+                if len(results) >= limit:
+                    return results
+        return results
+
+    def get_users_with_dc_access(self, domain: str) -> list[dict[str, Any]]:
+        """Back-compat alias for the DC/Tier-0 access reader.
+
+        The legacy CLI call site (``run_dc_access``) expects this name. It now
+        returns the Tier-0 access exposure records from
+        :meth:`get_principals_with_tier0_access` — which covers DCs plus the
+        other Tier-0 assets (ADCS CA, Exchange) — mapped to the legacy
+        ``{origen, destino, acl, ...}`` shape the DC-access renderer consumes.
+        """
+        records = self.get_principals_with_tier0_access(domain)
+        legacy: list[dict[str, Any]] = []
+        for record in records:
+            legacy.append(
+                {
+                    "origen": record["principal"],
+                    "tipoorigen": "User",
+                    "dominio_origen": domain,
+                    "destino": record["target"],
+                    "tipodestino": "Computer",
+                    "dominio_destino": domain,
+                    "acl": record["relation"],
+                    "target_enabled": record.get("target_enabled", True),
+                }
+            )
+        return legacy
+
 
 def _ad_time_to_epoch_seconds(value: object) -> int | None:
     """Normalize AD FILETIME, generalized time, or epoch seconds to epoch seconds."""

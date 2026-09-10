@@ -8,9 +8,215 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Compliance reports can now map findings to the CIS Microsoft Windows Server
+  Benchmark, selectable alongside ENS, NIS2, ISO 27001, DORA and PCI DSS. Each
+  executed attack path or validated finding is tied to the specific CIS control
+  the environment deviates from — a Kerberoastable service to the
+  Kerberos-encryption-types control, a DCSync to the directory-replication-rights
+  control, an SMBv1 host to the SMBv1 driver control — so the root-cause
+  misconfiguration behind an exposure is explicit and independently verifiable
+  against the published benchmark. The mapping is version-aware: it cites the
+  control from the benchmark of each affected host's actual Windows version
+  (Server 2016 / 2019 / 2022 / 2025 and Windows 10 / 11 — the same weakness
+  carries a different control id across versions) and lists the affected hosts
+  per control; a non-Windows host is out of scope and never cited. Shown in both
+  the PDF report and the web platform. It is presented as a technical hardening
+  baseline, not a legal obligation, kept apart from the regulatory frameworks,
+  and makes no certification claim.
+- The learning mode now teaches the ADCS certificate-services attacks (ESC2
+  through ESC17), the coercion and relay techniques (PetitPotam, PrinterBug,
+  DFSCoerce, coerce-and-relay to ADCS, coerce-to-TGT), and the named CVEs
+  (Zerologon, noPac, EternalBlue/MS17-010, PrintNightmare). Each now renders a
+  full teaching card before it runs and on demand via `explain <technique>` —
+  what the weakness is and why it works, the by-hand command, the MITRE ATT&CK
+  mapping and detection events, a native check to confirm the finding, and
+  remediation. These techniques previously executed but taught nothing.
+- The learning mode now also teaches the core lateral-movement and access
+  techniques (local admin, RDP, WinRM, DCOM, session impersonation), the DCSync
+  and secret-dump primitives (the three replication rights, LSA/LSASS/DPAPI
+  dumping, LAPS read, the Kerberos Key List attack), the ACL-abuse primitives
+  (ownership, all-extended-rights, SPN write, account-restriction write, logon-
+  script write, shadow credentials), the delegation and cross-forest escalations
+  (SPN-jacking, cross-organization TGT delegation, child-to-forest-root), and the
+  MSSQL escalations (sysadmin to SYSTEM, TRUSTWORTHY-database abuse). Each now
+  renders the same full teaching card and `explain <technique>` view.
+- Reports and the CLI now show which non-privileged accounts can reach a Tier-0
+  asset (a domain controller, an ADCS certification authority, or an Exchange
+  server) and by what means — full local administrator, a remote session, or a
+  database role — along with the share of the domain that holds such access. It
+  distinguishes what an account *is granted* from what it can *reach*: an
+  ordinary account with a path onto a domain controller stays an ordinary
+  account, and the finding is that it can reach the control plane at all.
+- Attack-path discovery now shows a pre-flight panel before it runs: the graph's
+  node and edge scale, the control hubs driving the density (with their fan-out
+  counts), and whether discovery will run in sampled mode on a large, dense
+  directory. A new `graph_stats <domain>` shell command shows the same summary on
+  demand, and `adscan ci` prints a one-line version. It reads the already-computed
+  graph and never triggers a path computation, so it is instant even on a large
+  domain.
+- Attack paths can now be queried to one named target from the REPL. Alongside
+  the target classes (all, Tier-0, low-privilege), `attack_paths <domain>
+  --target "Domain Admins"` (or a host, or an OU) shows only the validated routes
+  that reach that specific object. The name is resolved to its canonical graph
+  label — including the case where a group appears under both its SID and its
+  name — and an unmatched target lists the closest objects in the graph rather
+  than returning an empty result.
+- Attack-path results now persist to disk per workspace, so reopening a workspace
+  or a fresh `adscan ci` run reuses the prior run's path set instead of
+  recomputing the full discovery pass when nothing in the directory changed. The
+  cached set is deleted the moment the graph changes, so a stale set is never
+  served, and it is skipped entirely under `--no-cache`.
+
 ### Changed
 
+- A credential found in a file on a share (a Group Policy Preferences password,
+  a recovered SecureString, a secret in a spidered file) is now attributed in
+  the attack graph to the principals that can actually READ that share — the
+  measured share-ACL and file-NTFS read set — instead of the account that
+  happened to recover it. Every such finding now reads the same way, whether
+  ADscan reached it unauthenticated or with credentials, so the report and the
+  platform agree on who could reach the exposed secret.
+- Member servers are now tiered from what they actually do, not just their
+  operating system. A Remote Desktop or Citrix host where ordinary users log on
+  is classified Tier 2 (a user workstation) rather than Tier 1; a server that
+  administers a Domain Controller or other Tier 0 asset — a jump box, a
+  hypervisor or a backup agent with that reach — is raised to Tier 0; and a
+  server publishing a SQL, Exchange or SharePoint service is recognised as an
+  application server. Every Tier 1 verdict now records how it was inferred, and
+  the report states that Tier 1 is heuristic and customer-overridable while
+  Tier 0 is derived deterministically.
+- Accounts are now tiered by the servers they administer, not only by their
+  group membership. An account that holds local administrator rights (or SQL
+  sysadmin) over a Tier 1 application server is classified Tier 1, so a service
+  or operations account that manages business servers reads as the
+  server-tier identity it is. Interactive-only access such as Remote Desktop
+  does not change the tier, and a Tier 0 group membership always takes
+  precedence.
+- The free exposure report now carries three additions that make it read as a
+  complete assessment: the executive page leads with a labelled exposure figure —
+  the share of accounts with a validated path to Tier 0, the report's headline
+  number — set beside the posture score with each figure's direction spelled out
+  ("higher is worse" against "higher is safer") so the two never read as
+  contradictory; a green "Attack surface already reduced" callout naming the
+  attacker avenues your own configuration already closes (enforced LDAP signing and
+  channel binding defeating a relay, a single-domain-controller topology mitigating
+  self-relay), each avenue describing what it would have achieved so two closes
+  sharing one root cause read as distinct; and a compact Tier 0/1/2 legend that
+  makes the direct-versus-escalation-capable split explicit for an auditor.
+- The Enterprise platform's attack-graph node panel now shows the exact privilege
+  tier a principal or asset holds — "Tier 0: Domain Control", "Tier 0:
+  Escalation-capable", "Tier 1: Server / Application Admin" — instead of a coarse
+  "High Value" / "Tier 0" badge. An escalation-capable Tier 0 group (Backup
+  Operators, DnsAdmins, and the like) now reads as the containment-boundary risk
+  it is, distinct from a Domain Admin, so an auditor can see the classification
+  at a glance. It matches the tier badge already used across the asset register.
+- Attack-path discovery can now drop the redundant "descends in tier" routes that
+  dominate a hub-heavy directory — a route that peaks at a high-privilege object
+  mid-path and then fans back down to a lower-tier target it already controls,
+  adding no new reach. Removing that noise leaves the report and result set
+  focused on the routes that actually gain ground, and on a large domain it keeps
+  the wide result set small enough to compute and cache. Nothing that gains reach
+  is ever dropped: a route to a Tier-0 target, a route through a Tier-0 object, and
+  any route that lands a session on a host are all kept. Opt-in this release via
+  `ADSCAN_ATTACK_PATHS_TIER_DESCENT_PRUNE=1` pending field validation; the default
+  is unchanged.
+- `adscan ci` (autonomous, non-interactive scanning) is now a PRO capability. The free LITE tier keeps the full interactive `adscan start` workflow on every platform; automation and unattended/CI runs are part of PRO. `adscan ci` is no longer marked beta.
+- Attack-path caches can now key their validity on the graph's structure instead
+  of its file timestamp, so recording an executed step's outcome (a status change)
+  no longer forces a full attack-path recompute — only a real topology change (a
+  newly proven route, a new edge or node) does. On a large directory this removes
+  the per-step recompute storm during post-exploitation while still surfacing
+  every new route. Opt-in this release via `ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH=1`
+  pending field validation; the default is unchanged.
+- The report's tier legend now explains WHY each Tier 0 group is classified there.
+  A small set of groups (Cryptographic Operators, Distributed COM Users,
+  Performance Log Users) is flagged as Tier 0 for parity with industry tooling
+  even though no single-step domain-compromise technique is known for them today;
+  the legend now says so directly, so an auditor reading the report can see the
+  basis for each classification instead of asking.
+- Privilege-tier classification now recognizes the full Tier 0 control-plane set
+  consistently across the report and the platform, from ONE authored source.
+  Group Policy Creator Owners, DnsAdmins, the Exchange privileged groups, the
+  read-only Domain Controller groups, Cryptographic Operators, and the
+  Certification Authority and its certificate templates are all graded Tier 0
+  wherever a tier is shown; and a member of Domain Admins (or any direct
+  domain-breaker group) is now graded Tier 0 — direct by its group membership, not
+  by name alone. This closes a gap where an escalation group, an ADCS asset, or a
+  privileged member could read as a standard object on one surface and Tier 0 on
+  another.
+- The minimum supported Python is now 3.10 (was 3.9). Ninety days of usage
+  telemetry show no one running ADscan on 3.9 — the lowest version in the field is
+  3.10, and most runs are on 3.13 — so the 3.9 floor was carrying maintenance cost
+  for an audience that no longer exists.
+
 ### Fixed
+
+- `adscan update` no longer prints a raw error trace when the local image check is slow to respond; it reports the delay in one line and proceeds to refresh the image.
+- A valid computer-account credential is no longer reported as invalid when the domain controller enforces AES Kerberos with a non-default salt; the check now derives the machine-account key correctly and confirms the credential over RC4/NTLM before rejecting it.
+- Password cracking no longer fails when a previous cracking run is still active; each run uses its own session so concurrent or leftover runs don't block a new one.
+- `adscan ci` and other scans no longer abort at preflight when the bundled credential-scanning tool is a newer build than expected; the version check now matches the shipped tool.
+- The authenticated scan no longer prints a raw multi-line error trace when the
+  Kerberos ticket step for a credential fails, and no longer implies a valid
+  credential was rejected when only the Kerberos step failed but the scan
+  continued over NTLM (a common case for machine accounts). A genuine bad
+  credential is still reported clearly by the credential check.
+
+- The free and paid reports now report the same "attack surface reduced" number.
+  Both lead with the count of distinct attacker avenues the environment's own
+  configuration already closes, rather than the paid report counting the
+  individual route variants through those avenues — so a scan that shows "2
+  avenues already closed" in the free report no longer reads as "4 hardening
+  observed" in the paid one.
+
+- The free exposure report's headline figure — the share of ordinary accounts
+  with a validated path to Tier 0 — is now populated in every scan. It was blank
+  in the free report because the underlying blast-radius data was computed only in
+  the paid report path; it is now derived once and read by both, so the free and
+  paid reports always quote the same number.
+
+- Kerberoasting and AS-REP Roasting attack-path steps no longer produce a
+  duplicate entry vector wrongly sourced from Domain Users. The step's outcome now
+  attaches to the same Authenticated Users origin the graph already records for
+  authenticated-bind attacks, so an executed roast updates that route in place
+  instead of adding a second, out-of-sync copy that started the chain from the
+  wrong principal.
+
+- Declining the "Execute this attack path now?" prompt in the interactive
+  attack-path view no longer triggers a full attack-path recompute. The list
+  refreshes only when an execution or a blocked-path pivot probe actually changed
+  state; a plain "No" keeps the view as-is instead of dropping the cache and
+  re-running discovery for nothing.
+
+- Structural attack-path hops — a group membership and other context relations —
+  are no longer mislabeled as "Theoretical" in the report when a scan reuses a
+  cached path set after recording an executed step's outcome. The reused route now
+  carries exactly the status a fresh computation would, so a structural hop reads
+  as "Structural" and a proven step never regresses.
+
+- The attack-path result cache is now bounded by memory rather than a fixed path
+  count. It caches results that fit and skips ones too large to hold or not worth
+  the copy, instead of a blind 2000-path cap that under-bounded RAM on wide
+  directories — where a single cached result of an ordinary "Domain Users"
+  population could reach a gigabyte and, across the cache, exhaust memory on a
+  small machine. What ADscan computes and serves is unchanged; only which results
+  are worth keeping is.
+
+- Attack-path execution readiness no longer re-parses the attack graph from disk
+  once per candidate route. On a dense directory the post-discovery pass that
+  decides which routes are executable used to read and re-parse the whole graph
+  file thousands of times, turning what should be a few seconds into minutes;
+  the graph is now read once per run, cutting that pass from about forty seconds
+  to roughly one on a mid-size directory and scaling far better on large ones.
+  The repeated candidate-resolution log lines are de-duplicated too, so a `--debug`
+  transcript no longer floods with the same line per route.
+
+- Attack-path discovery now detects the memory ceiling when ADscan runs natively
+  on Windows. On the Windows build there is no container cgroup, so a large or
+  dense directory previously had no live ceiling to check against and relied only
+  on a fixed cap that could stop early on a large host or too late on a small one;
+  ADscan now reads the host's real memory limit and free memory, so a run on a big
+  directory stops cleanly with a clear message instead of being killed. The Linux
+  deployment is unchanged.
 
 ### Removed
 

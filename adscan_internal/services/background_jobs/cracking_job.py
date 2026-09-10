@@ -601,6 +601,7 @@ def _run_hashcat_tier_impl(
     """
     from adscan_internal.services.hashcat_coordination import (  # noqa: PLC0415
         hashcat_slot,
+        unique_crack_session_name,
     )
     from adscan_internal.services.hashcat_service import (  # noqa: PLC0415
         HashcatCrackingService,
@@ -645,12 +646,20 @@ def _run_hashcat_tier_impl(
         else:
             launch_prefix = []
             device_args = []
+        # A per-run session name (not the default ``hashcat``) so a leftover
+        # lock from a killed prior run — or a concurrent ADscan cracking
+        # process — never aborts this launch with "Already an instance
+        # '<...>' running on pid N" (exit 255). Only the crack acquires the
+        # session lock; the ``--show`` potfile read below does not, so it needs
+        # no session name.
+        session_args = ["--session", unique_crack_session_name()]
         crack_argv = [
             *launch_prefix,
             "hashcat",
             "-m",
             mode,
             "--username",
+            *session_args,
             *status_args,
             *device_args,
             *rules_args,

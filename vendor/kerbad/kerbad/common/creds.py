@@ -98,6 +98,38 @@ class KerberosCredential:
 			if c_enctype in common_enctypes:
 				return c_enctype
 
+	def _default_aes_salt(self) -> bytes:
+		# ADscan vendor fix: correct DEFAULT AES salt for MACHINE accounts.
+		#
+		# The AES PBKDF2 salt is username-shaped for user/service accounts
+		# (REALM + sAMAccountName) but host-shaped for a computer account:
+		#   REALM + "host" + <dnsHostName>.lower()
+		# e.g.  ESSOS.LOCALhostmachine.essos.local
+		# (MS-KILE / RFC 3962 salt derivation for computer principals).
+		#
+		# This salt is only used when the KDC did NOT advertise the salt via
+		# ETYPE-INFO2 (the aioclient probe is best-effort and silently falls back
+		# to None on any probe failure). Before this fix the fallback derived a
+		# machine account's AES key with the USER salt, so a machine credential
+		# that NTLM accepts still failed AES preauth with KDC_ERR_PREAUTH_FAILED
+		# even though the secret is correct — a false negative on a valid
+		# credential.
+		#
+		# For the DEFAULT salt the computer's DNS name follows the deterministic
+		# convention <shortname>.<domain>, so it is derivable from the
+		# sAMAccountName (username sans trailing "$") + domain alone — the same
+		# convention ADscan already uses in
+		# adscan_internal/services/krb_ap_req.py::derive_service_keys. When the
+		# KDC uses a NON-default salt the ETYPE-INFO2 probe supplies it directly
+		# and this fallback is never reached.
+		username = self.username or ""
+		if username.endswith("$"):
+			host = username[:-1].lower()
+			if "." not in host:
+				host = "%s.%s" % (host, self.domain.lower())
+			return ("%shost%s" % (self.domain.upper(), host)).encode()
+		return (self.domain.upper() + username).encode()
+
 	def get_key_for_enctype(self, etype:EncryptionType, salt:bytes = None) -> bytes:
 		"""
 		Returns the encryption key bytes for the enctryption type.
@@ -107,7 +139,7 @@ class KerberosCredential:
 				return bytes.fromhex(self.kerberos_key_aes_256)
 			if self.password is not None:
 				if not salt:
-					salt = (self.domain.upper() + self.username).encode()
+					salt = self._default_aes_salt()
 				return string_to_key(Enctype.AES256, self.password, salt).contents
 			raise Exception('There is no key for AES256 encryption')
 		elif etype == EncryptionType.AES128_CTS_HMAC_SHA1_96:
@@ -115,7 +147,7 @@ class KerberosCredential:
 				return bytes.fromhex(self.kerberos_key_aes_128)
 			if self.password is not None:
 				if not salt:
-					salt = (self.domain.upper() + self.username).encode()
+					salt = self._default_aes_salt()
 				return string_to_key(Enctype.AES128, self.password, salt).contents
 			raise Exception('There is no key for AES128 encryption')
 		elif etype == EncryptionType.ARCFOUR_HMAC_MD5:

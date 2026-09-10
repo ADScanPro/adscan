@@ -7,12 +7,17 @@ module emits the second part and nothing else. It records what was scanned,
 what the graph held, which steps ran, what came back, and what did not work,
 in the section order the genre already uses. The writing stays with the author.
 
-That split is deliberate and it is the whole design. The paragraphs are what
-make a writeup worth reading and worth someone's name on it; a machine writing
-them produces the exact register this community identifies and punishes. So
-every place a human sentence belongs carries an HTML-comment marker instead of
-a generated one. An unedited spine renders as an empty section, which is an
-obvious gap, rather than as filler that reads like it was meant.
+The split used to be literal: earlier versions of this module left an
+HTML-comment marker (``adscan:write``) everywhere a human sentence belonged,
+and rendered an unedited section as visibly empty rather than filler nobody
+wrote. That marker is gone. Every section now drafts deterministically from
+facts already on the workspace — the target, the proven chain in the order it
+ran, the terminal outcome, the credentials recovered — in the tool's own
+register: causal and verifiable, never a decision or a struggle sentence, and
+never asserting more than the record supports. A run that proved nothing
+still gets an honest sentence stating that. Nothing here interprets the run;
+it states what happened and how each claim was proven, which is what makes
+the artifact tool-native rather than a scaffold waiting on an author.
 
 The problem being solved is not typing speed. Lab platforms hold back
 publication until a target retires, so the gap between owning a box and writing
@@ -34,11 +39,18 @@ Four rules the content obeys:
   and where the chain reads "not executed" while the workspace holds the krbtgt
   hash and both flags, the document says so in one line rather than leaving the
   reader to notice the contradiction alone.
-* **The client catalogs are not a source of prose here.** ``attack_step_catalog``
-  and the PRO vulnerability catalog are authored client-safe — vendor-neutral,
-  native-RSAT remediation, executive register. A lab audience wants the
-  opposite. What is taken from the catalog is the public technique NAME and a
-  canonical reference, never a paragraph.
+* **The client catalogs are a source of causal, offensive content here — never
+  struggle narrative.** ``attack_step_catalog`` is authored to carry two things
+  this artifact renders per step verbatim: the didactic ``narrative_template``
+  ("why this technique works", causal and verifiable, the same register as the
+  in-shell didactic card) and the ``manual_command`` (the real by-hand
+  offensive command, copy-pasteable, the one field the catalog allows to name
+  offensive tooling). Neither is struggle narrative — nothing here claims what
+  the author felt or decided, only what the graph and the catalog prove is
+  true. The PRO vulnerability catalog (client-safe, executive register) is
+  still never consulted from this module. What is ALSO taken from
+  ``attack_step_catalog`` is the public technique NAME and a canonical
+  reference, so the writeup survives a reader who has never run ADscan.
 * **Every step carries the public technique name and a reference**, so the
   writeup survives a reader who has never run ADscan. That is also what stops
   the artifact reading as an advertisement.
@@ -70,6 +82,8 @@ from adscan_internal.services.attack_step_catalog import (
     get_attack_step_entry,
     get_bh_canonical_cypher_name,
     normalize_relation,
+    render_step_manual_command,
+    render_step_narrative,
 )
 from adscan_internal.services.compromise_class import (
     CompromiseClass,
@@ -96,9 +110,10 @@ WRITEUP_DIRNAME = "writeups"
 SPINE_FILENAME = "writeup.md"
 ASSETS_DIRNAME = "assets"
 
-# The marker that means "a human writes here". Greppable on purpose: an author
-# can find every remaining one with a single search, and an HTML comment
-# renders as nothing on GitHub, Hugo and Obsidian alike.
+# Kept as the structural regression check: the renderer no longer emits this
+# marker anywhere (every section drafts deterministically instead), and
+# ``count_write_markers``/the test suite grep for it so a future change that
+# reintroduces a human-fill placeholder fails loudly rather than shipping.
 WRITE_MARKER = "adscan:write"
 
 # Verbs this module may print. Every one ships in LITE — a reproduction line
@@ -286,6 +301,7 @@ _EVIDENCE_LABELS: tuple[tuple[str, str], ...] = (
     ("rights", "rights"),
     ("share", "share"),
     ("share_path", "share path"),
+    ("artifact", "artifact"),
     ("note", "note"),
     ("notes", "note"),
 )
@@ -306,11 +322,14 @@ _DEAD_END_PHRASES: dict[str, str] = {
 
 # How an alternate route's engine status reads in a writeup. The engine
 # vocabulary (``theoretical``, ``exploited``) is precise and internal; a reader
-# wants to know whether it was walked.
+# wants to know whether it was walked. "Structurally proven" (not a bare "not
+# executed") is deliberate: these routes were derived from the reconciled
+# attack graph by the same engine that walked the primary chain, not guessed —
+# the gap is that ADscan did not RUN them, never that they are speculative.
 _ROUTE_STATES: dict[str, str] = {
-    "theoretical": "not executed",
-    "discovered": "not executed",
-    "attempted": "attempted",
+    "theoretical": "structurally proven, not executed",
+    "discovered": "structurally proven, not executed",
+    "attempted": "attempted, did not complete",
     "partial": "partly executed",
     "exploited": "executed",
     "success": "executed",
@@ -318,6 +337,14 @@ _ROUTE_STATES: dict[str, str] = {
     "closed_by_configuration": "closed by configuration",
     "unsupported": "no execution path",
 }
+
+# Bounded-coverage cap for the route map (spec §6 / CLAUDE.md Exposure
+# Validation): never silently truncate a client-facing evidence list. Below
+# this count every discovered route is shown; at or above it the list is cut
+# to the top-ranked ``_ROUTE_MAP_MAX`` (already proven-first, per
+# ``order_paths_for_client_presentation``) and the render says so explicitly,
+# so a reader can never mistake a bounded view for the complete graph.
+_ROUTE_MAP_MAX = 50
 
 _PLATFORM_LABELS: dict[str, str] = {
     "hackthebox": "Hack The Box",
@@ -402,6 +429,22 @@ class SpineStep:
     #: timeline (a timestamp, an attempt count, a failure history) it cannot
     #: stand behind.
     recorded: bool = False
+    #: The raw ``{"action": <relation>, "details": {...}}`` dict the attack-step
+    #: catalog helpers (``render_step_narrative``, ``render_step_manual_command``)
+    #: expect. Carried alongside the already-resolved display fields above rather
+    #: than reconstructed from them, because the catalog's placeholder
+    #: substitution reads the ORIGINAL ``details`` (including ``dc_ip``/``domain``,
+    #: which the display fields do not carry). ``None`` for a step built without a
+    #: source raw dict — the renderer then omits the narrative/command cleanly.
+    catalog_step: dict[str, Any] | None = None
+    #: True when the graph edge's own ``notes.origin`` records this credential as
+    #: found by unauthenticated enumeration (an anonymous/guest SMB sweep reading
+    #: SYSVOL for GPP leaks) rather than an authenticated technique run against
+    #: the directory. This is the entry-vector fact a writeup otherwise loses:
+    #: the step still renders as an ordinary stage, but this marks the ONE stage
+    #: that needed no credential at all to reach — read straight from the graph,
+    #: never inferred.
+    discovered_unauth: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +458,7 @@ class SpineStage:
     credential_origin: str | None = None
     secret_kind: str | None = None
     has_stored_secret: bool = False
+    secret_value: str = ""
 
     @property
     def heading(self) -> str:
@@ -469,6 +513,7 @@ class CredentialRow:
     principal: str
     secret_kind: str
     origin: str | None = None
+    value: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,12 +538,22 @@ class FlagRow:
 
 @dataclass(frozen=True, slots=True)
 class AltRoute:
-    """Another chain the graph carried to a comparable target."""
+    """Another chain the graph carried to a comparable target.
+
+    ``status_reason`` is the evidence behind ``status``, pulled from the path's
+    own steps rather than invented at render time: for a route closed by
+    configuration it is the observed hardening fact (a POSITIVE finding, never
+    a defensive-control claim — see the Exposure-Validation doctrine); for a
+    route that was attempted and did not land it is where the chain stopped.
+    Empty when the status carries no further evidence to add (an executed or
+    unwalked route needs none).
+    """
 
     source: str
     target: str
     techniques: tuple[str, ...]
     status: str
+    status_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -546,13 +601,15 @@ class SpineInputs:
 
     @property
     def beyond_root_warranted(self) -> bool:
-        """Return whether there is a root to write beyond.
+        """Return whether there is a root to point beyond.
 
-        "Beyond root" is the section where an author writes what they took apart
-        after the box was finished, so it only belongs in a document where the
-        box WAS finished: the chain landed, and it landed either on a closing
-        step or on a captured flag. Everywhere else it arrived as an empty
-        heading whose own instruction was to delete it.
+        "Beyond this route" is a pointer to the routes the graph found and did
+        not walk, so it only belongs in a document where the box WAS finished:
+        the chain landed, and it landed either on a closing step or on a
+        captured flag. A run that never landed has nothing finished to look
+        "beyond" from. (The caller also requires ``alt_routes`` to be
+        non-empty before printing the section — a finished box with no other
+        discovered route has nothing to point at either.)
         """
         return self.terminal_proven and bool(self.terminal_steps or self.flags)
 
@@ -1141,6 +1198,7 @@ def _build_steps(
     domain: str,
     accounts: frozenset[str],
     origins: CredentialOrigins,
+    dc_ip: str | None = None,
 ) -> list[SpineStep]:
     """Return the ordered steps of one chain, enriched with execution outcomes."""
     steps: list[SpineStep] = []
@@ -1161,6 +1219,14 @@ def _build_steps(
         if proof:
             outcome = "success"
         attribution = () if proof else origins.attribution_for(relation)
+        # The catalog's manual-command/narrative templates substitute {dc_ip} /
+        # {domain} placeholders from ``details`` — a raw step from the graph
+        # rarely carries them, so they are stamped in here from what the spine
+        # already resolved for this domain. Missing values degrade to the
+        # catalog's own literal <dc_ip>/<domain> tokens, never a crash.
+        catalog_details = dict(details)
+        catalog_details.setdefault("dc_ip", dc_ip or "")
+        catalog_details.setdefault("domain", domain)
         steps.append(
             SpineStep(
                 technique=technique_for(relation),
@@ -1188,6 +1254,9 @@ def _build_steps(
                 failures_before=record.failures_before,
                 failures_after=record.failures_after,
                 recorded=record.recorded,
+                catalog_step={"action": relation, "details": catalog_details},
+                discovered_unauth=str(details.get("origin") or "").strip().lower()
+                == "unauth_enrichment",
             )
         )
     return steps
@@ -1233,7 +1302,8 @@ def _split_into_stages(
         meta = _lookup_ci(credential_meta, step.target)
         meta = meta if isinstance(meta, dict) else {}
         origin = str(meta.get("credential_origin") or "") or None
-        has_secret = _lookup_ci(credentials, step.target) is not None
+        stored_secret = _lookup_ci(credentials, step.target)
+        has_secret = stored_secret is not None
         stages.append(
             SpineStage(
                 principal=step.target,
@@ -1243,6 +1313,7 @@ def _split_into_stages(
                 credential_origin=origin,
                 secret_kind=str(meta.get("secret_kind") or "") or None,
                 has_stored_secret=has_secret,
+                secret_value=str(stored_secret or ""),
             )
         )
         pending = []
@@ -1268,6 +1339,55 @@ def _terminal_title(compromise_class: str, target: str, *, proven: bool) -> str:
     if proven:
         return outcome
     return f"Route to {outcome[0].lower() + outcome[1:]}"
+
+
+def _route_status_reason(path: dict[str, Any]) -> str:
+    """Return the evidence behind an alternate route's status, if any.
+
+    Two statuses carry a reason worth showing a reader:
+
+    * ``closed_by_configuration`` — the observed hardening fact (LDAP signing,
+      no ADCS, single-DC reflection, …), read from the step's own
+      ``blocked_reason`` note. A POSITIVE finding, so this is never phrased as
+      a defensive product having stopped anything (Exposure-Validation
+      doctrine) — it is stated as the configuration itself.
+    * ``attempted`` (and its execution-record synonyms) — where the chain
+      stopped: the technique of the last step the run actually tried.
+
+    Every other status (executed, structurally proven, partial) needs no
+    reason line — the status word already says what happened. Best-effort:
+    a path with no matching step returns ``""`` rather than guessing.
+    """
+    status = str(path.get("status") or "").strip().lower()
+    steps = path.get("steps")
+    steps = steps if isinstance(steps, list) else []
+    if status == "closed_by_configuration":
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if (
+                str(step.get("status") or "").strip().lower()
+                != "closed_by_configuration"
+            ):
+                continue
+            details = step.get("details")
+            details = details if isinstance(details, dict) else {}
+            reason = str(details.get("blocked_reason") or "").strip()
+            if reason:
+                return reason
+        return ""
+    if status in {"attempted", "failed", "error"}:
+        last_relation = ""
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            step_status = str(step.get("status") or "").strip().lower()
+            if step_status in {"attempted", "failed", "error"}:
+                last_relation = str(step.get("action") or "").strip()
+        if last_relation:
+            return f"stopped at {technique_for(last_relation).name}"
+        return ""
+    return ""
 
 
 def _collect_dead_ends(
@@ -1358,7 +1478,9 @@ def _collect_credentials(domain_data: dict[str, Any]) -> tuple[CredentialRow, ..
             origin = _ORIGIN_SUPPLIED
         else:
             origin = None
-        rows.append(CredentialRow(principal=principal, secret_kind=kind, origin=origin))
+        rows.append(
+            CredentialRow(principal=principal, secret_kind=kind, origin=origin, value=secret)
+        )
     return tuple(rows)
 
 
@@ -1824,6 +1946,9 @@ def collect_spine_inputs(
     credentials = domain_data.get("credentials")
     credentials = credentials if isinstance(credentials, dict) else {}
     origins = _credential_origins(credential_meta)
+    # Resolved once and reused both for the target card and for the catalog's
+    # {dc_ip} placeholder substitution in each step's manual command / narrative.
+    dc_ip = str(domain_data.get("dc_ip") or domain_data.get("pdc") or "") or None
 
     # "What HAPPENED" is the run's own PROVEN edges, assembled in order — the
     # primary chain, with a coverage line disclosing how much of what the run
@@ -1847,7 +1972,12 @@ def collect_spine_inputs(
         primary = theoretical_primary or {}
     chain_steps = (
         _build_steps(
-            primary, execution, domain=domain, accounts=accounts, origins=origins
+            primary,
+            execution,
+            domain=domain,
+            accounts=accounts,
+            origins=origins,
+            dc_ip=dc_ip,
         )
         if primary
         else []
@@ -1861,8 +1991,12 @@ def collect_spine_inputs(
         if n
     )
 
+    # The route map is the differentiator: every route the graph carried to a
+    # high-value target, not a curated top few — a competing writeup can only
+    # show the ONE chain the author happened to walk. Uncapped, subject only to
+    # the bounded-coverage honesty rule below (never silently truncate).
     alt_routes: list[AltRoute] = []
-    for path in ordered[1:6]:
+    for path in ordered[1:]:
         relations = [str(r) for r in (path.get("relations") or []) if r]
         nodes = [str(n) for n in (path.get("nodes") or []) if n]
         alt_routes.append(
@@ -1879,6 +2013,7 @@ def collect_spine_inputs(
                     if normalize_relation(r) != "memberof"
                 ),
                 status=str(path.get("status") or "discovered"),
+                status_reason=_route_status_reason(path),
             )
         )
 
@@ -1948,7 +2083,7 @@ def collect_spine_inputs(
             domain_data.get("pdc_hostname_fqdn") or domain_data.get("dc_fqdn") or ""
         )
         or None,
-        dc_ip=str(domain_data.get("dc_ip") or domain_data.get("pdc") or "") or None,
+        dc_ip=dc_ip,
         operating_system=_dc_operating_system(domain_dir),
         first_seen=_timestamp_display(min(timestamps) if timestamps else None),
         last_seen=_timestamp_display(max(timestamps) if timestamps else None),
@@ -1983,15 +2118,6 @@ def collect_spine_inputs(
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────
-
-
-def _write_here(instruction: str) -> str:
-    """Return a human-only placeholder.
-
-    An HTML comment renders as nothing, so a spine published without editing
-    shows a visibly empty section instead of prose nobody wrote.
-    """
-    return f"<!-- {WRITE_MARKER}: {instruction} -->"
 
 
 def _asset_name(source: str) -> str:
@@ -2132,6 +2258,20 @@ def _attribution_phrase(step: SpineStep) -> str:
     )
 
 
+def _render_step_command_block(catalog_step: dict[str, Any]) -> list[str]:
+    """Return the offensive by-hand command for one step, fenced — or nothing.
+
+    ``render_step_manual_command`` returns an empty string for a technique the
+    catalog has no authored ``manual_command`` for yet (the P2-pending
+    techniques). That is a real, honest state — not a formatting gap — so it
+    renders as no block at all, never an empty fence and never a placeholder.
+    """
+    command = render_step_manual_command(catalog_step)
+    if not command:
+        return []
+    return ["```text", command, "```", ""]
+
+
 def _render_step(step: SpineStep) -> list[str]:
     """Return one step as a single dense line plus whatever evidence it carries.
 
@@ -2146,6 +2286,20 @@ def _render_step(step: SpineStep) -> list[str]:
     if step.is_context:
         return [
             f"**{step.technique.name}** · `{step.source}` is a member of `{step.target}`",
+            "",
+        ]
+
+    lead: list[str] = []
+    if step.discovered_unauth:
+        # This is the initial-access fact a graph-edge-only writeup otherwise
+        # skips: the credential below was not found by an authenticated
+        # technique at all, it turned up in an anonymous SMB sweep before the
+        # run held any credential. Stated once, ahead of the step's own line,
+        # never folded into the technique's generic narrative (which assumes
+        # an authenticated reader and would misstate this one).
+        lead = [
+            "Found during unauthenticated enumeration, before this run held "
+            "any credential — the actual entry point.",
             "",
         ]
 
@@ -2170,13 +2324,88 @@ def _render_step(step: SpineStep) -> list[str]:
     if step.technique.mitre_url:
         facts.append(f"[{step.technique.mitre_id}]({step.technique.mitre_url})")
 
-    lines = [" · ".join(facts), ""]
+    lines = [*lead, " · ".join(facts), ""]
+    # The causal "why this works" narrative and the offensive by-hand command,
+    # both sourced from the catalog verbatim — never the defensive verify_*
+    # command, which belongs to the client report, not a technique writeup.
+    # Both are omitted cleanly (no placeholder, no empty fence) when the step
+    # carries no raw dict (an older code path) or the catalog has no authored
+    # content yet for this relation.
+    if step.catalog_step is not None:
+        narrative = render_step_narrative(step.catalog_step)
+        if narrative:
+            lines.append(narrative)
+            lines.append("")
+        lines.extend(_render_step_command_block(step.catalog_step))
     if step.evidence:
         lines.append("```text")
         lines.extend(f"{label}: {value}" for label, value in step.evidence)
         lines.append("```")
         lines.append("")
     return lines
+
+
+def _summary_step_phrase(step: SpineStep) -> str:
+    """Return one link of the Summary's chain: the step's short causal narrative.
+
+    ``render_step_narrative(..., short=True)`` is the catalog's pre-authored,
+    causal one-liner — the same register as the per-step narrative rendered
+    lower in the document, never a decision or struggle sentence invented here.
+    A technique with no authored short narrative yet (a P2-pending catalog
+    entry, e.g. GPP cpassword at the time of writing) has nothing to render, so
+    the chain falls back to the technique's public display name rather than a
+    blank link — the reader still sees every hop that happened.
+    """
+    if step.catalog_step is not None:
+        narrative = render_step_narrative(step.catalog_step, short=True)
+        if narrative:
+            return narrative
+    return step.technique.name
+
+
+def _render_summary(inputs: SpineInputs) -> list[str]:
+    """Return the ``## Summary`` section, drafted from the executed chain.
+
+    One deterministic paragraph, built from facts the workspace already proved
+    rather than a placeholder waiting on the author: the target, the proven
+    steps chained in the order they ran, and the terminal outcome. This is
+    causal, not struggle narrative — it states what the chain IS ("X falls in
+    N steps: A leads to B leads to C, ending in domain compromise"), never why
+    anyone chose it or how it felt to run. No LLM, no interpretation: every
+    clause traces to a field already on ``inputs``.
+
+    An unproven chain (nothing this run executed) still drafts a paragraph —
+    the same causal register, with the honest qualifier that the graph found
+    the route rather than the run proving it, never a claim of execution the
+    workspace does not support. A workspace with no chain at all (enumeration
+    only, no path discovered) falls back to the plainest true sentence: what
+    was scanned and what came of it.
+    """
+    proven_steps = [
+        step
+        for step in inputs.chain_steps
+        if not step.is_context and step.outcome == "success"
+    ]
+    discovered_steps = [step for step in inputs.chain_steps if not step.is_context]
+    if not proven_steps and not discovered_steps:
+        return [f"`{inputs.domain}` was enumerated; the graph found no route to walk."]
+    if not proven_steps:
+        chain = " → ".join(_summary_step_phrase(step) for step in discovered_steps)
+        step_count = _count_phrase(len(discovered_steps), "step")
+        return [
+            f"`{inputs.domain}`: the graph found a route in {step_count}: "
+            f"{chain}. Structurally proven, not executed this run."
+        ]
+    chain = " → ".join(_summary_step_phrase(step) for step in proven_steps)
+    step_count = _count_phrase(len(proven_steps), "step")
+    outcome = (
+        inputs.terminal_title[0].lower() + inputs.terminal_title[1:]
+        if inputs.terminal_proven
+        else "a route that did not close"
+    )
+    return [
+        f"`{inputs.domain}` falls in {step_count}: {chain}, ending in {outcome}."
+    ]
 
 
 def _render_frontmatter(inputs: SpineInputs, *, today: str) -> list[str]:
@@ -2211,14 +2440,25 @@ def _render_header_note() -> list[str]:
         "<!--",
         "  Evidence spine generated by ADscan from the scan workspace. Everything",
         "  below is mechanical: what answered, what the directory held, which steps",
-        f"  ran and what came back. Each `{WRITE_MARKER}` marker is a paragraph only",
-        "  you can write: search for them, write past them, delete them as you go.",
+        "  ran and what came back.",
         "",
         "  Solutions to a practice target are normally publishable only once the",
         "  target has retired; confirming that, and clearing `draft: true`, is the",
         "  author's call.",
         "-->",
     ]
+
+
+#: The accountability line every spine carries near the top: what the reader
+#: is holding was not written by a person filling in gaps, it was generated
+#: from the same graph the tool used to run the attack — and every claim in
+#: it is tagged with how it was proven (executed, structurally proven, not
+#: executed) rather than asserted flat.
+PROVENANCE_NOTE = (
+    "This writeup was generated deterministically from an executed, verified "
+    "attack graph. Every claim carries its evidence status; nothing was "
+    "inferred."
+)
 
 
 def _render_target_table(inputs: SpineInputs) -> list[str]:
@@ -2303,49 +2543,77 @@ def _render_enumeration(inputs: SpineInputs) -> list[str]:
         if coverage:
             lines.append(coverage)
             lines.append("")
-    if inputs.alt_routes:
-        lines.append("### Other routes in the graph")
+    lines.extend(_render_route_map(inputs))
+    return lines
+
+
+def _render_route_map(inputs: SpineInputs) -> list[str]:
+    """Return the route-map section: every route the graph carried, tagged honestly.
+
+    This is the differentiator over a hand-written writeup: a human author
+    documents the ONE chain they walked, while ADscan's graph carries every
+    OTHER route it discovered to a comparable target — and each one is tagged
+    with exactly how far it was verified. An unexecuted route is never
+    dressed up as proven, and a route closed by observed configuration is
+    stated as the positive hardening fact it is, not as a failure.
+
+    Bounded-coverage honesty rule (spec §6): the list is never silently cut.
+    Under ``_ROUTE_MAP_MAX`` every route shows; at or above it, only the
+    top-ranked ``_ROUTE_MAP_MAX`` are shown (the routes are already ordered
+    proven-first) and the section says in words how many were left out.
+    """
+    if not inputs.alt_routes:
+        return []
+    total = len(inputs.alt_routes)
+    bounded = total > _ROUTE_MAP_MAX
+    shown = inputs.alt_routes[:_ROUTE_MAP_MAX] if bounded else inputs.alt_routes
+    lines = ["### Other routes in the graph", ""]
+    lines.append(
+        "Every other route ADscan's graph carried to a comparable target, and "
+        "how far each one was verified — not just the one chain above."
+    )
+    lines.append("")
+    for route in shown:
+        via = ", then ".join(route.techniques) if route.techniques else "a direct edge"
+        state = _ROUTE_STATES.get(route.status, route.status)
+        reason = f" — {route.status_reason}" if route.status_reason else ""
+        lines.append(
+            f"- `{route.source}` to `{route.target}` via {via} ({state}){reason}"
+        )
+    if bounded:
         lines.append("")
-        for route in inputs.alt_routes:
-            via = (
-                ", then ".join(route.techniques)
-                if route.techniques
-                else "a direct edge"
-            )
-            state = _ROUTE_STATES.get(route.status, route.status)
-            lines.append(f"- `{route.source}` to `{route.target}` via {via} ({state})")
-        lines.append("")
+        lines.append(
+            f"Showing {len(shown)} of {total} discovered routes "
+            f"(ranked proven-first; the rest were not walked)."
+        )
+    lines.append("")
     return lines
 
 
 def _render_stage(stage: SpineStage, *, index: int) -> list[str]:
-    """Return one identity stage: heading, steps, then the space for the writing."""
+    """Return one identity stage: heading, steps, then the recovered secret.
+
+    No stage-level "how you found this and why it worked" placeholder: the
+    catalog's causal narrative is already rendered per step by
+    ``_render_step`` (``render_step_narrative``), so a second slot asking the
+    same question at the stage level would either repeat that prose or sit
+    empty. The steps above already say why the technique works; this section
+    adds only what the graph does not already state per edge.
+    """
     lines = [f"## {stage.heading}", ""]
     for step in stage.steps:
         lines.extend(_render_step(step))
     kind = secret_kind_label(stage.secret_kind or "") or "credential"
-    if stage.credential_origin:
+    if stage.credential_origin and stage.secret_value:
         lines.append(
-            f"The {kind} for `{stage.principal}` is in the workspace, recovered via "
-            f"{credential_origin_label(stage.credential_origin)}."
+            f"`{stage.principal}` → {kind} `{stage.secret_value}` "
+            f"(recovered via {credential_origin_label(stage.credential_origin)})."
         )
         lines.append("")
-    elif stage.has_stored_secret:
-        lines.append(
-            f"The {kind} for `{stage.principal}` is in the workspace. How it was "
-            "recovered was not recorded, so that part is yours to fill in."
-        )
+    elif stage.has_stored_secret and stage.secret_value:
+        lines.append(f"`{stage.principal}` → {kind} `{stage.secret_value}`.")
         lines.append("")
     lines.append(f"<!-- screenshot: {ASSETS_DIRNAME}/{index:02d}-{stage.slug}.png -->")
-    lines.append("")
-    lines.append(
-        _write_here(
-            "how you found this and why it worked. The steps above say what ran; "
-            "this says what you were thinking"
-            if stage.proven
-            else "why this route looked right, and where it stopped"
-        )
-    )
     lines.append("")
     return lines
 
@@ -2402,10 +2670,11 @@ def _render_credential_ledger(inputs: SpineInputs) -> list[str]:
     known = [row for row in inputs.credentials if row.origin]
     lines = ["### Credentials recovered", ""]
     if not known:
-        lines.append("| Account | Secret |")
-        lines.append("|---|---|")
+        lines.append("| Account | Secret | Value |")
+        lines.append("|---|---|---|")
         for row in inputs.credentials:
-            lines.append(f"| `{row.principal}` | {row.secret_kind} |")
+            shown = f"`{row.value}`" if row.value else "—"
+            lines.append(f"| `{row.principal}` | {row.secret_kind} | {shown} |")
         lines.append("")
         lines.append(
             "This run did not record how each secret was obtained, so the "
@@ -2413,14 +2682,64 @@ def _render_credential_ledger(inputs: SpineInputs) -> list[str]:
         )
         lines.append("")
         return lines
-    lines.append("| Account | Secret | Recovered via |")
-    lines.append("|---|---|---|")
+    lines.append("| Account | Secret | Value | Recovered via |")
+    lines.append("|---|---|---|---|")
     for row in inputs.credentials:
+        shown = f"`{row.value}`" if row.value else "—"
         lines.append(
-            f"| `{row.principal}` | {row.secret_kind} | {row.origin or 'not recorded'} |"
+            f"| `{row.principal}` | {row.secret_kind} | {shown} | "
+            f"{row.origin or 'not recorded'} |"
         )
     lines.append("")
     return lines
+
+
+def _terminal_outcome_statement(inputs: SpineInputs) -> str:
+    """Return the one fact-only sentence closing the terminal section.
+
+    Sourced entirely from the terminal step's own technique name and the
+    credential ledger already printed above it — never a struggle or decision
+    sentence, only what the last edge and the recovered secrets prove. A
+    chain that never landed states where it stopped, in the same neutral
+    register the dead-ends section already uses, never a claim that a
+    defence stopped it (Exposure-Validation doctrine).
+    """
+    last = inputs.terminal_steps[-1] if inputs.terminal_steps else None
+    if not inputs.terminal_proven:
+        if last is None:
+            return ""
+        stopped_at = _DEAD_END_PHRASES.get(last.outcome, "did not complete")
+        return (
+            f"`{last.technique.name}` against `{last.target}` {stopped_at}. "
+            "Nothing below this line was confirmed."
+        )
+    secrets = [row for row in inputs.credentials if row.value]
+    outcome = inputs.terminal_title[0].lower() + inputs.terminal_title[1:]
+    if last is None:
+        if not secrets:
+            return f"This run confirmed {outcome}."
+        return (
+            f"This run confirmed {outcome}, recovering "
+            f"{_count_phrase(len(secrets), 'secret')}."
+        )
+    technique = last.technique.name
+    target = last.target
+    if not secrets:
+        return f"`{technique}` against `{target}` succeeded, confirming {outcome}."
+    kinds = sorted({secret_kind_label(row.secret_kind) or row.secret_kind for row in secrets})
+    kind_phrase = _join_bare(kinds)
+    return (
+        f"`{technique}` against `{target}` succeeded, returning "
+        f"{_count_phrase(len(secrets), 'secret')} ({kind_phrase}) and confirming "
+        f"{outcome}."
+    )
+
+
+def _join_bare(names: list[str]) -> str:
+    """Return ``a``, ``a and b``, ``a, b and c`` for plain (unquoted) names."""
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _render_terminal(inputs: SpineInputs, *, index: int) -> list[str]:
@@ -2448,14 +2767,10 @@ def _render_terminal(inputs: SpineInputs, *, index: int) -> list[str]:
         f"<!-- screenshot: {ASSETS_DIRNAME}/{index:02d}-{_slug(heading)}.png -->"
     )
     lines.append("")
-    lines.append(
-        _write_here(
-            "what the last step actually gave you, and how you confirmed it"
-            if inputs.terminal_proven
-            else "how far this route got and what was missing to finish it"
-        )
-    )
-    lines.append("")
+    statement = _terminal_outcome_statement(inputs)
+    if statement:
+        lines.append(statement)
+        lines.append("")
     return lines
 
 
@@ -2566,14 +2881,11 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
     lines.append("")
     lines.append(f"# {inputs.title}")
     lines.append("")
+    lines.append(f"> {PROVENANCE_NOTE}")
+    lines.append("")
     lines.append("## Summary")
     lines.append("")
-    lines.append(
-        _write_here(
-            "the one paragraph people quote. What the target is, the chain end to "
-            "end, and the idea a reader should leave with. Write it last"
-        )
-    )
+    lines.extend(_render_summary(inputs))
     lines.append("")
     lines.append("## Target")
     lines.append("")
@@ -2587,15 +2899,14 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
         lines.extend(_render_terminal(inputs, index=len(inputs.stages) + 1))
     lines.extend(_render_dead_ends(inputs))
     lines.extend(_render_changes(inputs))
-    if inputs.beyond_root_warranted:
-        lines.append("## Beyond root")
+    if inputs.beyond_root_warranted and inputs.alt_routes:
+        lines.append("## Beyond this route")
         lines.append("")
         lines.append(
-            _write_here(
-                "the part only you can write. What you took apart after the target "
-                "was done, and what it taught you. Delete this section if there is "
-                "nothing"
-            )
+            f"This is the one chain the run walked end to end. The graph carried "
+            f"{_count_phrase(len(inputs.alt_routes), 'other route')} to a "
+            "comparable target — see \"Other routes in the graph\" under Domain "
+            "enumeration for how far each one was verified."
         )
         lines.append("")
     lines.extend(_render_reproduce(inputs))
@@ -2693,12 +3004,19 @@ def _emit_generated(properties: dict[str, Any]) -> None:
 
 
 def count_write_markers(markdown: str) -> int:
-    """Return how many human-only placeholders a rendered spine carries."""
+    """Return how many human-only placeholders a rendered spine carries.
+
+    The renderer no longer emits any — every section drafts from the
+    workspace or states its own gap honestly — so this stays at 0 for every
+    spine this module writes today. Kept as a structural check: a marker
+    reappearing here means a future change regressed the tool-native
+    guarantee, and this is what a test greps for to catch it.
+    """
     return markdown.count(f"<!-- {WRITE_MARKER}:")
 
 
 def _print_ready_panel(artifacts: SpineArtifacts, markers: int) -> None:
-    """Print the post-generation panel: the path, then what is left to do."""
+    """Print the post-generation panel: the path, then what is in it."""
     from rich.console import Group
     from rich.text import Text
 
@@ -2713,13 +3031,11 @@ def _print_ready_panel(artifacts: SpineArtifacts, markers: int) -> None:
         ),
         Text(""),
         Text(
-            (
-                f"One place is left blank for your writing, marked {WRITE_MARKER}."
-                if markers == 1
-                else f"{markers} places are left blank for your writing, each "
-                f"marked {WRITE_MARKER}."
-            )
-            + " Nothing in the file interprets the run. That part is yours."
+            "Generated end to end from the workspace: nothing is left blank for "
+            "hand-fill, and every claim states how it was proven."
+            if markers == 0
+            else f"{markers} place(s) still carry a `{WRITE_MARKER}` marker — "
+            "unexpected; search for them before publishing."
         ),
         Text(""),
         Text(
@@ -2861,6 +3177,7 @@ __all__ = [
     "ASSETS_DIRNAME",
     "LITE_CLI_COMMANDS",
     "LITE_REPL_VERBS",
+    "PROVENANCE_NOTE",
     "SPINE_FILENAME",
     "WRITEUP_DIRNAME",
     "WRITE_MARKER",

@@ -367,7 +367,7 @@ FROM debian:trixie-slim AS runtime-common
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
-ARG CREDSWEEPER_VERSION=1.15.1
+ARG CREDSWEEPER_VERSION=1.17.0
 ARG HASHCAT_VERSION=7.1.2
 ARG LIGOLO_NG_VERSION=0.8.3
 ARG FREERDP_VERSION=3.24.1
@@ -547,7 +547,7 @@ RUN printf '%s\n' \
 RUN set -eux; \
   python3 -m venv /tmp/playwright-installer; \
   /tmp/playwright-installer/bin/python -m pip install --no-cache-dir --upgrade pip; \
-  /tmp/playwright-installer/bin/python -m pip install --no-cache-dir playwright==1.60.0; \
+  /tmp/playwright-installer/bin/python -m pip install --no-cache-dir playwright==1.61.0; \
   PLAYWRIGHT_BROWSERS_PATH=/opt/adscan/ms-playwright \
     /tmp/playwright-installer/bin/python -m playwright install chromium; \
   rm -rf /tmp/playwright-installer
@@ -1308,7 +1308,7 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
     selenium==4.31.0 \
     textual==0.80.1 \
     "redis>=5.0.0,<7.1.0" \
-    playwright==1.60.0 \
+    playwright==1.61.0 \
     jinja2>=3.0 \
     "scapy>=2.5.0,<3.0"
 

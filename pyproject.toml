@@ -8,7 +8,7 @@ version = "12.0.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = [
     "active-directory",
     "activedirectory",
@@ -36,7 +36,7 @@ dependencies = [
     "requests>=2.31.0,<3.0",
     "packaging>=23.0,<27.0",
     "certifi>=2023.0.0",
-    "credsweeper==1.15.1; python_version >= '3.10'",
+    "credsweeper==1.17.0",
     "sentry-sdk>=1.40.0,<3.0",
 ]
 
@@ -57,7 +57,7 @@ dev = [
     "badldap>=0.7.5,<0.8",
     "kerbad>=0.5.9",
     "impacket==0.13.1",
-    "pytest>=8.0,<9.0",
+    "pytest>=8.0,<10.0",
     # pytest-timeout converts hung tests into explicit failures with a
     # stack trace at the deadline instead of letting them stall CI for
     # hours. Configured in pytest.ini with a 60s default per test plus
@@ -109,11 +109,11 @@ cli = [
     # source-available license. openpyxl (XLSX) and python-docx (DOCX) cover the
     # other two formats and are already present.
     "pdfplumber>=0.11,<0.12",
-    "playwright==1.60.0",
+    "playwright==1.61.0",
     "jinja2>=3.0",
     "graphviz>=0.20",
     "python-magic>=0.4.27,<0.5; platform_system == 'Linux'",
-    "markitdown>=0.1.5,<0.2; python_version >= '3.10'",
+    "markitdown>=0.1.5,<0.2",
     "dnspython>=2.7.0,<3.0",
     # `pydantic-ai-slim` (not full `pydantic-ai`, which drags xai-sdk and pins
     # `packaging<26` — incompatible with packaging>=26 needed elsewhere). Only
@@ -129,12 +129,11 @@ cli = [
     "scapy>=2.5.0,<3.0",
     "prompt_toolkit",
     "questionary",
-    "pypsrp[kerberos]==0.8.1; python_version < '3.10'",
-    "pypsrp[kerberos]==0.9.0; python_version >= '3.10'",
+    "pypsrp[kerberos]==0.9.1",
     "pydantic-settings>=2.4.0",
     "selenium>=4.28.0,<5.0",
     "textual>=0.80.0",
-    "redis>=5.0.0,<7.1.0",
+    "redis>=5.0.0,<8.1.0",
     "winacl==0.1.9",
     # Offline VM disk-image credential extraction (vm_artifact_service): dissect
     # reads VMware/Hyper-V disk-image containers + NTFS in pure Python (userspace,

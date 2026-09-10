@@ -71,9 +71,9 @@ Once inside the shell, start an unauthenticated recon:
 
 This discovers domain controllers, SMB exposure, null sessions, and roastable accounts without credentials. From there, run `start_auth` with a domain user to enumerate LDAP, collect BloodHound data, and build the attack graph.
 
-### One command instead of the shell
+### One command instead of the shell (PRO)
 
-`adscan ci` runs the whole pipeline non-interactively: preflight, recon, enumeration, exploitation, reporting, no prompts. Same engine, no shell.
+`adscan ci` runs the whole pipeline non-interactively: preflight, recon, enumeration, exploitation, reporting, no prompts. Same engine, no shell. It is a **PRO** capability — automation and unattended runs are what you're paying for; the free LITE tier gives you the full interactive `adscan start` shell on every platform.
 
 ```bash
 # Authenticated scan of a domain
@@ -86,7 +86,7 @@ adscan ci unauth --type audit --interface eth0 --dc-ip 10.0.0.1
 
 `--type`, `--interface` and the `auth`/`unauth` positional are required. `adscan ci --help` lists the rest.
 
-`adscan ci` is still marked beta: it makes every decision the interactive shell would ask you about, and those defaults and its output format can change between releases. The interactive `adscan start` shell is the supported path for client work; `ci` is for pipelines, lab automation, and unattended runs.
+`adscan ci` makes every decision the interactive shell would ask you about, so it's built for pipelines, lab automation, and unattended engagement runs. For client work where you want to review each decision, the interactive `adscan start` shell (free on LITE) is the supported path.
 
 ---
 

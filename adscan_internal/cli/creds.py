@@ -4650,8 +4650,18 @@ def process_cpassword_text(
                     hosts=source_hosts,
                     shares=source_shares,
                     artifact=source or None,
-                    auth_username=auth_username,
                     origin=provenance_origin,
+                    # Source the edge from the MEASURED read-capable set for the share
+                    # when one exists (uniform with the unauth path, scan.py) — threading
+                    # the workspace + share so the resolver fires on
+                    # inventory/relationships.json. When NO read-set is available, pass
+                    # auth_username so the fallback sources from the user that actually
+                    # read the file (direct proof) — NOT generic Authenticated Users,
+                    # which would over-state reach (Task 1.7).
+                    shell=shell,
+                    domain=domain,
+                    share=source_shares[0] if source_shares else None,
+                    auth_username=auth_username,
                 )
                 if source_hosts or source_shares:
                     marked_hosts = (
@@ -4741,8 +4751,16 @@ def _store_recovered_securestring_credential(
             hosts=source_hosts,
             shares=source_shares,
             artifact=source or None,
-            auth_username=auth_username,
             origin=provenance_origin,
+            # Consistent with the unauth path and the GPP caller: the edge source is
+            # the measured read-capable set for the share when one exists. When NO
+            # read-set is available, pass auth_username so the fallback sources from
+            # the user that actually read the file (direct proof), not generic
+            # Authenticated Users (Task 1.7).
+            shell=shell,
+            domain=domain,
+            share=source_shares[0] if source_shares else None,
+            auth_username=auth_username,
         )
         add_credential(
             shell,

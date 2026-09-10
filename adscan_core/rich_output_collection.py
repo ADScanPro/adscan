@@ -92,13 +92,12 @@ class SessionHeader:
     """Context shown at scan start: workspace, target, credential, mode.
 
     The ``experimental`` flag is the TUI-level signal that the active
-    command is in BETA — autonomous flow, behaviour may change between
-    releases. When set, the Mode row is annotated with a visible
-    ``⚡ EXPERIMENTAL · AUTONOMOUS`` badge using the amber accent so
-    operators see at a glance that the run is unattended and not yet a
-    stable contract. The information is duplicated in a dedicated
-    callout panel (:func:`print_ci_autonomous_callout`) for first-run
-    discoverability.
+    command is running unattended (autonomous, no operator prompts).
+    When set, the Mode row is annotated with a visible
+    ``⚡ AUTONOMOUS`` badge using the amber accent so operators see at a
+    glance that the run is hands-off. The information is duplicated in a
+    dedicated callout panel (:func:`print_ci_autonomous_callout`) for
+    first-run discoverability.
     """
 
     workspace: str
@@ -116,7 +115,7 @@ def print_session_header(header: SessionHeader) -> None:
     Shows the ASCII gradient logo, a tagline line, then a compact info
     bar with workspace, target domain, DC IP, credential, and mode.
     When ``header.experimental`` is set the Mode row carries an inline
-    BETA badge so the experimental status is always visible — never
+    AUTONOMOUS badge so unattended runs are always visible — never
     hidden behind a help flag.
     """
     from adscan_core.branding import build_gradient_ascii, ADSCAN_TAGLINE
@@ -146,16 +145,11 @@ def print_session_header(header: SessionHeader) -> None:
     mode_style = _AMBER if header.scan_mode == "ci" else _SAGE
     mode_cell = f"[{mode_style}]{header.scan_mode.upper()}[/]"
     if header.experimental:
-        # Inline badge — always visible, no chrome. The ⚡ glyph and the
-        # explicit word "EXPERIMENTAL" mean the indicator is legible even
-        # under NO_COLOR. The "AUTONOMOUS" qualifier disambiguates what
-        # makes this mode different (no prompts, defaults applied).
-        mode_cell = (
-            f"{mode_cell}   "
-            f"[bold {_AMBER}]⚡ EXPERIMENTAL[/] "
-            f"[{_MUTED}]·[/] "
-            f"[bold {_STEEL}]AUTONOMOUS[/]"
-        )
+        # Inline badge — always visible, no chrome. The ⚡ glyph plus the
+        # explicit word "AUTONOMOUS" mean the indicator is legible even
+        # under NO_COLOR, and disambiguates what makes this mode different
+        # (no prompts, defaults applied).
+        mode_cell = f"{mode_cell}   [bold {_AMBER}]⚡ AUTONOMOUS[/]"
     grid.add_row("Mode", mode_cell)
 
     _emit(
@@ -170,7 +164,7 @@ def print_session_header(header: SessionHeader) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Autonomous / experimental mode callout
+# Autonomous mode callout
 # ---------------------------------------------------------------------------
 
 
@@ -183,9 +177,9 @@ def print_ci_autonomous_callout() -> None:
     * ``adscan ci`` is a thin wrapper that drives the same engine the
       interactive ``adscan start`` shell drives, with all confirmation
       prompts skipped and defaults applied automatically.
-    * The mode is **experimental / beta** — defaults are calibrated for
-      common lab and CI flows; behaviour may change between releases as
-      heuristics improve.
+    * Defaults are calibrated for common lab and CI/CD flows, and are
+      applied without a prompt — this callout exists so the operator
+      knows which decisions were made unattended.
     * Concrete recovery paths if a run looks wrong: ``--debug``, the
       docs link, and re-running in interactive mode for the same
       target.
@@ -211,10 +205,10 @@ def print_ci_autonomous_callout() -> None:
         ),
     )
     body.add_row(
-        f"[bold {_AMBER}]Status[/]",
+        f"[bold {_AMBER}]Defaults[/]",
         (
-            f"[bold {_AMBER}]BETA · EXPERIMENTAL[/]  "
-            f"[{_MUTED}]Heuristic defaults may change between releases.[/]"
+            f"[bold {_AMBER}]Applied automatically[/]  "
+            f"[{_MUTED}]No confirmation prompts — see below to review or override.[/]"
         ),
     )
     body.add_row(
@@ -229,7 +223,7 @@ def print_ci_autonomous_callout() -> None:
 
     panel = Panel(
         body,
-        title=f"[bold {_AMBER}]⚡ Autonomous Mode (Experimental)[/]",
+        title=f"[bold {_AMBER}]⚡ Autonomous Mode[/]",
         title_align="left",
         border_style=f"bold {_AMBER}",
         box=ROUNDED,

@@ -90,10 +90,12 @@ from jinja2 import Environment, select_autoescape
 
 from adscan_core import telemetry
 from adscan_core.offline import offline_mode_enabled
+from adscan_core.operator_role import resolve_cta_lane
 from adscan_core.outbound_links import (
     cta_display_url,
     cta_link_style,
     cta_markup,
+    cta_placement_for_lane,
     cta_url,
 )
 from adscan_core.posture_score import (
@@ -165,9 +167,14 @@ from adscan_internal.services.brand_assets import (
     brand_favicon_data_uri,
     brand_logo_svg_markup,
 )
+from adscan_internal.services.attack_path_counts import (
+    client_path_totals_from_kpis,
+    iter_distinct_hardening_avenues,
+)
 from adscan_internal.services.compromise_class import (
     CompromiseClass,
     compromise_reach_label_short,
+    tier_glossary,
 )
 from adscan_internal.services.environment_change_ledger import (
     EnvironmentChangeResolution,
@@ -538,6 +545,71 @@ class SeveritySlice:
 
 
 @dataclass(frozen=True)
+class HardeningAvenueRow:
+    """One attack avenue this environment's configuration already closes.
+
+    ``technique`` is the client headline (the business phrase from the shared
+    label SSOT); ``reason`` is the specific configuration ADscan observed to
+    close it — read verbatim off the closed-by-configuration path's own step
+    detail (the engine spreads the edge ``notes`` into the step ``details``, so
+    ``blocked_reason`` is on-disk data, not a re-derivation here). Positive by
+    construction: this is where existing hardening stopped an attacker, never a
+    claim that a defensive product detected or blocked anything.
+    """
+
+    technique: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class HardeningObserved:
+    """The "attack surface already reduced" positive callout, resolved.
+
+    An avenue ADscan tried to walk and found closed with certainty by the
+    client's own configuration or topology (enforced LDAP signing and channel
+    binding defeating an NTLM relay, a single-domain-controller topology that
+    mitigates self-relay). It is the credibility move that reads a document as
+    an honest assessment rather than a list of only bad news: it names what the
+    client already did right.
+
+    ``count`` is the shared cross-tier cardinality
+    (:attr:`~adscan_internal.services.attack_path_counts.ClientPathTotals.paths_closed_by_configuration`),
+    so the free report, the paid deliverable and the platform agree on how many
+    avenues were closed. ``rows`` names each one for the reader.
+
+    ``present`` is ``False`` — and the callout is omitted — on a run that closed
+    no avenue by configuration, so the document says nothing rather than an
+    empty positive.
+
+    Doctrine (CLAUDE.md § Exposure Validation): this is a POSITIVE fact about
+    OBSERVED configuration, excluded from the exposure score, and NEVER phrased
+    as a defensive product (EDR / AV / MDI) blocking an attack.
+    """
+
+    present: bool
+    count: int
+    rows: tuple[HardeningAvenueRow, ...]
+
+
+@dataclass(frozen=True)
+class TierGlossaryRow:
+    """One entry in the compact Tier 0/1/2 legend.
+
+    Straight from the shared SSOT
+    :func:`~adscan_internal.services.compromise_class.tier_glossary`, so the free
+    report, the paid deliverable and the platform define the tiers identically.
+    The mandatory client glossary (CLAUDE.md § Nomenclature Standard) is what
+    lets a bank auditor confirm how ADscan classified each object — in
+    particular the Tier 0 direct-vs-escalation-capable split.
+    """
+
+    tier: str
+    label: str
+    groups: str
+    meaning: str
+
+
+@dataclass(frozen=True)
 class LiteReportModel:
     """Everything the template needs, fully resolved and client-safe."""
 
@@ -653,6 +725,39 @@ class LiteReportModel:
     #: boundary so it never reads as exhaustive; the identity graph is always 100%.
     #: SSOT: :mod:`adscan_core.reporting.host_enrichment_coverage`.
     host_enrichment_coverage_statement: str = ""
+    #: The "attack surface already reduced" positive callout: avenues this
+    #: environment's configuration closed with certainty. Present only when the
+    #: run closed at least one; count is the shared cross-tier cardinality.
+    #: SSOT: :mod:`adscan_internal.services.attack_path_counts`.
+    hardening: HardeningObserved = HardeningObserved(
+        present=False, count=0, rows=()
+    )
+    #: The headline exposure figure, LABELLED distinctly from the posture score:
+    #: the share of accounts with a validated path to Tier 0 — ADscan's thesis as
+    #: a number. Read from the shared
+    #: :class:`~adscan_internal.services.exposure_score_service.DomainUserReach`
+    #: SSOT, and drawn from the SAME branch the verdict prose leads with, so the
+    #: card and the sentence can never quote different numbers: the ordinary
+    #: (non-Tier-0) share when the engine's Tier split reconciles, otherwise the
+    #: directory-wide share. ``exposure_reach_label`` / ``exposure_reach_sub``
+    #: carry the matching wording so a reader knows which population it counts;
+    #: ``exposure_reach_available`` is ``False`` only when there is no reach to
+    #: state at all (no KPI block, or nothing reaches Tier 0), and the figure is
+    #: then omitted rather than printed as an unbacked zero.
+    exposure_reach_pct: float = 0.0
+    exposure_reach_available: bool = False
+    #: The figure's key line, e.g. "Ordinary accounts exposed" (Tier split
+    #: reconciled) or "Domain accounts exposed" (directory-wide fallback).
+    exposure_reach_label: str = ""
+    #: The figure's sub-line, e.g. "have a validated path to Tier 0 · higher is
+    #: worse". Always ends with the direction cue so the card can never read as
+    #: the opposite-polarity posture score beside it.
+    exposure_reach_sub: str = ""
+    #: The compact Tier 0/1/2 legend (CLAUDE.md § Nomenclature Standard makes it
+    #: mandatory). From the shared SSOT
+    #: :func:`~adscan_internal.services.compromise_class.tier_glossary`, so every
+    #: surface defines the tiers identically.
+    tier_glossary: tuple[TierGlossaryRow, ...] = ()
     pro_url: str = _PRO_URL
     repo_url: str = _LITE_REPO_URL
 
@@ -2008,6 +2113,60 @@ def build_verdict_reach(
     return f"{lead} ({reach.pct:g}% of the directory)."
 
 
+@dataclass(frozen=True)
+class ExposureFigure:
+    """The one exposure percentage a CISO forwards, with its own labels.
+
+    ``available`` is the SAME condition the verdict prose uses to decide whether
+    to state a reach at all, so the card and the sentence appear together and
+    quote the same number. ``pct`` and the two labels are drawn from whichever
+    branch the prose leads with — the ordinary (non-Tier-0) share when the
+    engine's Tier split reconciles, otherwise the directory-wide share.
+    """
+
+    available: bool
+    pct: float
+    #: Figure key line, e.g. "Ordinary accounts exposed".
+    label: str
+    #: Figure sub-line, always ending in the direction cue "higher is worse".
+    sub: str
+
+
+def build_exposure_figure(reach: DomainUserReach) -> ExposureFigure:
+    """Resolve the ledger's headline exposure figure from the shared reach SSOT.
+
+    Mirrors :func:`build_verdict_reach`'s branch selection EXACTLY so the ledger
+    figure and the verdict sentence can never disagree: the ordinary
+    (non-administrative) share when the engine's Tier breakdown reconciled, and
+    the directory-wide share as the honest fallback when it did not. The figure
+    was previously gated on the ordinary split alone, so it vanished from the
+    one page a reader forwards whenever the split did not reconcile — exactly the
+    messier real-client artifact where the number matters most.
+
+    The sub-line always ends in "higher is worse" so the card cannot be read as
+    the opposite-polarity posture score set beside it (higher is safer).
+
+    Returns an unavailable figure when there is no reach to state — no KPI block,
+    or nothing reaches Tier 0 — so the ledger omits it rather than print a zero
+    it cannot stand behind.
+    """
+    if not reach.available or reach.affected <= 0 or reach.total <= 0:
+        return ExposureFigure(available=False, pct=0.0, label="", sub="")
+    if reach.ordinary_available and reach.ordinary_affected > 0:
+        return ExposureFigure(
+            available=True,
+            pct=reach.ordinary_pct,
+            label="Ordinary accounts exposed",
+            sub="have a validated path to Tier 0 · higher is worse",
+        )
+    return ExposureFigure(
+        available=True,
+        pct=reach.pct,
+        label="Domain accounts exposed",
+        sub="hold a path to full domain compromise · higher is worse",
+    )
+
+
 def build_severity_slices(counts: dict[str, int]) -> tuple[SeveritySlice, ...]:
     """Turn severity counts into the proportional bar's segments.
 
@@ -2025,6 +2184,193 @@ def build_severity_slices(counts: dict[str, int]) -> tuple[SeveritySlice, ...]:
             share=round(counts.get(sev, 0) / denominator * 100, 2),
         )
         for sev in _SEVERITY_ORDER
+    )
+
+
+#: Polished client-facing phrasings for the known configuration-close reasons,
+#: keyed by a substring of the engine's ``blocked_reason``. The engine strings are
+#: correct and English, but written for an operator; these read as the positive
+#: fact the callout is about, and they NEVER attribute the close to a defensive
+#: product. Any unmapped reason falls through unchanged (already client-safe).
+_HARDENING_REASON_PHRASES: tuple[tuple[str, str], ...] = (
+    (
+        "channel binding",
+        "LDAP signing and channel binding are enforced, defeating an NTLM relay to LDAP",
+    ),
+    (
+        "signing is enforced",
+        "LDAP signing is enforced, defeating an NTLM relay to LDAP",
+    ),
+    (
+        "reflection",
+        "the single-domain-controller topology mitigates NTLM self-relay",
+    ),
+)
+
+
+def _hardening_reason_phrase(reason: str) -> str:
+    """Return the client-facing sentence for a configuration-close reason.
+
+    Maps the engine's ``blocked_reason`` to a polished, positive phrasing where
+    one is known, and passes an unmapped reason through cleaned of a leading
+    dash. Never names a defensive product — this describes OBSERVED configuration
+    (CLAUDE.md § Exposure Validation).
+    """
+    text = str(reason or "").strip()
+    lowered = text.lower()
+    chosen = ""
+    for needle, phrase in _HARDENING_REASON_PHRASES:
+        if needle in lowered:
+            chosen = phrase
+            break
+    # Unmapped: keep the engine's own English, tidied. It is already client-safe
+    # (an observed configuration/topology fact), just written tersely.
+    if not chosen:
+        chosen = text.lstrip("-— ").strip() or "Closed by configuration"
+    # Rendered as its own sentence after the technique lead-in, so it opens with a
+    # capital.
+    return chosen[:1].upper() + chosen[1:] if chosen else chosen
+
+
+#: What each closed avenue WOULD have achieved, keyed by a substring of the raw
+#: relation token. Two avenues can share ONE root-cause configuration (a single
+#: DC mitigates every NTLM self-relay variant), which without this clause makes
+#: their lines read as a copy-paste. Naming the outcome each avenue targeted
+#: keeps them distinct while the shared root cause stays honest on both. Written
+#: vendor-neutral (technique, not tool) — client-facing prose (CLAUDE.md).
+_HARDENING_AVENUE_OUTCOME: tuple[tuple[str, str], ...] = (
+    (
+        "shadowcred",
+        "Relaying the captured authentication would have written shadow credentials "
+        "to seize the target account",
+    ),
+    (
+        "rbcd",
+        "Relaying the captured authentication would have granted resource-based "
+        "delegation over the target host",
+    ),
+    (
+        "constraineddeleg",
+        "Relaying the captured authentication would have added a "
+        "constrained-delegation path onto the target host",
+    ),
+)
+
+
+def _hardening_avenue_reason(relation: str, reason: str) -> str:
+    """Compose an avenue's line: what it would have achieved, then the root cause.
+
+    Two avenues closed by the SAME configuration (e.g. a single-DC topology that
+    mitigates every NTLM self-relay variant) would otherwise carry the identical
+    root-cause sentence and read as boilerplate. Prepending the per-avenue
+    OUTCOME clause — derived from the relation, so it differs per avenue — keeps
+    each line distinct while the shared root cause stays truthful on both. An
+    avenue with no known outcome clause falls back to the root cause alone.
+    """
+    root = _hardening_reason_phrase(reason)
+    token = str(relation or "").lower()
+    for needle, outcome in _HARDENING_AVENUE_OUTCOME:
+        if needle in token:
+            # "<outcome clause>, but <root cause>." — the outcome distinguishes
+            # the avenue, the shared root cause (lower-cased into the clause)
+            # states the observed fact that closes it.
+            root_body = root[:1].lower() + root[1:] if root else root
+            return f"{outcome}, but {root_body}"
+    return root
+
+
+def build_hardening_observed(
+    domains: dict[str, Any], raw_paths: list[dict[str, Any]]
+) -> HardeningObserved:
+    """Resolve the "attack surface already reduced" positive callout.
+
+    The COUNT is the number of distinct AVENUES the reader sees listed (the
+    deduplicated rows), because the lead prose reads "N attacker avenues" and
+    lists exactly those rows. The shared cross-tier cardinality
+    (:func:`~adscan_internal.services.attack_path_counts.client_path_totals_from_kpis`
+    ``paths_closed_by_configuration``) counts closed-by-config PATHS — several of
+    which can run through ONE avenue — so it is used only as the fallback count
+    when no per-avenue rows resolved (an older graph), never as the avenue count
+    above a shorter list.
+
+    The ROWS name each avenue for the reader, read off the closed-by-config
+    paths already in ``raw_paths`` — their technique (the shared business-label
+    SSOT) and the specific configuration ADscan observed to close it
+    (``details.blocked_reason``, on-disk data the engine spread from the edge
+    ``notes``). Deduplicated by ``(technique, reason)`` so N identical closes on
+    N hosts read as one avenue, not N lines.
+
+    Returns an empty (``present=False``) callout when nothing was closed by
+    configuration, so the document omits the section rather than showing an
+    empty positive.
+    """
+    totals = None
+    if isinstance(domains, dict):
+        for entry in domains.values():
+            if not isinstance(entry, dict):
+                continue
+            kpis = entry.get("exposure_kpis")
+            if not isinstance(kpis, Mapping):
+                continue
+            domain_totals = client_path_totals_from_kpis(kpis)
+            totals = domain_totals if totals is None else totals.merged_with(domain_totals)
+    count = totals.paths_closed_by_configuration if totals is not None else 0
+
+    # The distinct AVENUES are derived by the cross-tier SSOT
+    # (:func:`~adscan_internal.services.attack_path_counts.iter_distinct_hardening_avenues`)
+    # so the free LITE callout and the paid PRO "hardening observed" headline lead
+    # with the SAME number — a client reading both must never see the paid report
+    # appear to have "found more" hardening. LITE builds its client-safe prose
+    # from each avenue's raw ``(relation, reason)``; it does NOT dedup a second
+    # time.
+    rows: list[HardeningAvenueRow] = []
+    for relation, reason in iter_distinct_hardening_avenues(raw_paths):
+        technique = _technique_phrase(relation) if relation else ""
+        # A relation the shared label SSOT has no business phrase for comes back
+        # as its raw edge token (no spaces) — off-register for client prose, so
+        # humanize it rather than print a BloodHound token. The reason line
+        # already carries the substance, so an unhumanizable token can also just
+        # be dropped; humanizing keeps the row's lead-in useful.
+        if technique and " " not in technique and technique == relation:
+            technique = _humanize_relation(relation)
+        # Compose the per-avenue reason: what THIS avenue would have achieved,
+        # then the shared root cause. Two avenues closed by one configuration
+        # then read as distinct avenues, not a copy-paste of one sentence.
+        phrase = _hardening_avenue_reason(relation, reason)
+        rows.append(HardeningAvenueRow(technique=technique, reason=phrase))
+
+    # The callout counts distinct AVENUES (the deduplicated rows), because the
+    # lead prose says "N attacker avenues" and lists exactly those rows — so the
+    # number and the list must agree. The KPI cardinality
+    # (``paths_closed_by_configuration``) counts closed-by-config PATHS, and
+    # several paths can traverse ONE avenue (e.g. two chains both starting with
+    # the same relay), so using it as the avenue count reads "4 avenues" above a
+    # list of 2. When there are no rows (an older graph with the count stamped
+    # but no matching path record), fall back to the KPI count so the positive
+    # still shows, just without per-avenue lines.
+    present = count > 0 or bool(rows)
+    resolved_count = len(rows) if rows else count
+    return HardeningObserved(
+        present=present, count=resolved_count, rows=tuple(rows)
+    )
+
+
+def build_tier_glossary_rows() -> tuple[TierGlossaryRow, ...]:
+    """Resolve the compact Tier 0/1/2 legend from the shared SSOT.
+
+    Content comes verbatim from
+    :func:`~adscan_internal.services.compromise_class.tier_glossary` (label,
+    which groups, one-line meaning), so no second tier vocabulary is authored
+    here.
+    """
+    return tuple(
+        TierGlossaryRow(
+            tier=str(entry.get("tier") or ""),
+            label=str(entry.get("label") or ""),
+            groups=str(entry.get("groups") or ""),
+            meaning=str(entry.get("meaning") or ""),
+        )
+        for entry in tier_glossary()
     )
 
 
@@ -2117,10 +2463,19 @@ def build_report_model(
     # administrators from the first defensible, and where it is pathological it
     # takes the headline — the engine decides which, so the free document, the
     # paid one and the platform cannot read one scan three ways.
+    domain_user_reach = derive_domain_user_reach(domains)
     verdict_reach = build_verdict_reach(
-        derive_domain_user_reach(domains),
+        domain_user_reach,
         aggregate_tier0_population(domains),
     )
+    # The headline exposure figure, LABELLED distinctly from the posture score.
+    # Resolved from the SAME shared DomainUserReach SSOT and the SAME branch the
+    # verdict prose leads with (ordinary share when the Tier split reconciled,
+    # directory-wide share otherwise), so the ledger card and the verdict
+    # sentence can never quote different numbers — and the figure appears
+    # whenever the prose states a reach, not only on the subset of artifacts
+    # whose Tier split happens to reconcile.
+    exposure_figure = build_exposure_figure(domain_user_reach)
 
     return LiteReportModel(
         workspace_name=workspace_name,
@@ -2185,6 +2540,12 @@ def build_report_model(
         host_enrichment_coverage_statement=(
             merge_host_enrichment_coverage(domains.values()).get("statement") or ""
         ),
+        hardening=build_hardening_observed(domains, raw_paths),
+        exposure_reach_pct=exposure_figure.pct,
+        exposure_reach_available=exposure_figure.available,
+        exposure_reach_label=exposure_figure.label,
+        exposure_reach_sub=exposure_figure.sub,
+        tier_glossary=build_tier_glossary_rows(),
     )
 
 
@@ -2590,6 +2951,78 @@ def _stamp_chokepoints(
     return changed
 
 
+def _stamp_exposure_kpis(
+    workspace_dir: str,
+    domains: list[str],
+    raw_paths: list[dict[str, Any]],
+    raw_domains: Any = None,
+) -> bool:
+    """Stamp the exposure-KPI block for each domain (LITE flow).
+
+    The headline exposure figure of the LITE report reads
+    ``domains[<domain>]["exposure_kpis"]["user_axis"]`` (via
+    ``derive_domain_user_reach``), which is computed and persisted by the
+    tier-shared, LITE-safe SSOT
+    :func:`~adscan_internal.services.exposure_score_service.stamp_exposure_kpis_for_domain`.
+    In a PRO run the same seam is stamped by the PRO report service; the LITE
+    render flow never calls that path, so without this the community report's
+    headline figure AND its user-reach verdict prose render empty. This mirrors
+    ``_stamp_chokepoints`` exactly — same tier-shared SSOT, same idempotency.
+
+    Idempotent: the shared helper skips a domain that already carries a valid
+    ``exposure_kpis`` block (e.g. a prior PRO run persisted it into the same
+    ``technical_report.json``), so this never recomputes/overwrites.
+
+    Best-effort by construction: every domain is guarded inside the SSOT, so a
+    missing/unreadable attack graph leaves that domain's block absent and the
+    document degrades to an empty figure rather than failing generation.
+
+    Returns:
+        ``True`` when any domain's block was stamped to disk.
+    """
+    from types import SimpleNamespace
+
+    from adscan_internal.services.exposure_score_service import (
+        stamp_exposure_kpis_for_domain,
+    )
+
+    entries = raw_domains if isinstance(raw_domains, dict) else {}
+    changed = False
+    for domain in domains:
+        try:
+            shell = SimpleNamespace(
+                current_workspace_dir=str(workspace_dir), domains_dir="domains"
+            )
+            domain_data = entries.get(domain)
+            if not isinstance(domain_data, dict):
+                domain_data = {}
+            # Idempotency: a PRO run may have already stamped the block into the
+            # same technical_report.json — skip if it is present and valid.
+            existing = domain_data.get("exposure_kpis")
+            if (
+                isinstance(existing, dict)
+                and existing.get("schema_version")
+                and isinstance(existing.get("path_axis"), dict)
+            ):
+                continue
+            summaries = [
+                path for path in raw_paths if str(path.get("_domain") or "") == domain
+            ]
+            stamp_exposure_kpis_for_domain(
+                shell,
+                domain,
+                summaries=summaries,
+                domain_data=domain_data,
+            )
+            # The SSOT persisted to disk; signal a re-read to the caller.
+            if isinstance(domain_data.get("exposure_kpis"), dict):
+                changed = True
+        except Exception as exc:  # noqa: BLE001 - a report never fails on this
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    return changed
+
+
 @dataclass(frozen=True)
 class LiteReportArtifacts:
     """What one LITE report generation produced.
@@ -2701,6 +3134,24 @@ def generate_lite_report_artifacts(
             restamped = read_json_file(str(tr_path))
             if isinstance(restamped, dict):
                 technical_report = restamped
+
+        # Stamp the exposure-KPI block (path-axis + user-axis blast radius) for
+        # each domain. The PRO report service computes+persists it in its own
+        # attack-path seam; the LITE render flow never calls that path, so in a
+        # LITE build (pro/ stripped) the block would be absent and the headline
+        # exposure figure would render empty. This tier-shared, LITE-safe seam
+        # produces the identical block. Idempotent — a domain a prior PRO run
+        # already stamped is skipped. Re-read the report when anything was
+        # written so the model reads the stamped block.
+        if _stamp_exposure_kpis(
+            workspace_dir,
+            domain_names,
+            raw_paths,
+            technical_report.get("domains"),
+        ):
+            restamped_kpis = read_json_file(str(tr_path))
+            if isinstance(restamped_kpis, dict):
+                technical_report = restamped_kpis
 
         # Stamp the choke-point cardinality block ("Start here" remediation) for
         # each domain. The PRO report service computes+persists it in its own
@@ -2841,11 +3292,21 @@ def _print_report_ready_panel(
     line naming the paid, client-ready version. Built from Rich ``Text`` objects
     (never markup strings) so an absolute path in the body can never be misread
     as Rich markup.
+
+    This is a peak-value moment — the operator just received the free LITE
+    report and is shown what the paid step adds — printed live at the
+    operator's own prompt (never inside a document that could be forwarded
+    to a stranger, unlike the report's internal ``lite_report`` CTA). So it
+    routes by the persisted operator role like the launcher/deliver PRO
+    gates: a buyer sees the Enterprise-demo link, a pentester (or unknown
+    role) keeps the unchanged ``/pro`` link.
     """
     from rich.console import Group
     from rich.text import Text
 
     from adscan_core.rich_output import print_panel
+
+    placement = cta_placement_for_lane(resolve_cta_lane(), surface="report_ready_panel")
 
     # The PDF leads when it exists: it is the copy that gets forwarded onward.
     lines: list[Text] = []
@@ -2910,8 +3371,8 @@ def _print_report_ready_panel(
                 Text("An evening of writing, or a ZIP at the end of the engagement."),
                 Text(""),
                 Text(
-                    cta_display_url("report_ready_panel"),
-                    style=cta_link_style("report_ready_panel"),
+                    cta_display_url(placement),
+                    style=cta_link_style(placement),
                 ),
             ]
         )
@@ -2920,9 +3381,7 @@ def _print_report_ready_panel(
             Text.from_markup(
                 "Client-ready version mapped to your engagement's regime, "
                 "per-finding remediation and your own branding: "
-                + cta_markup(
-                    "report_ready_panel", cta_display_url("report_ready_panel")
-                ),
+                + cta_markup(placement, cta_display_url(placement)),
                 style="dim",
             )
         )
@@ -3140,6 +3599,44 @@ _TEMPLATE = r"""<!DOCTYPE html>
   color: var(--accent, #0E6E78);
   line-height: 1.4;
 }
+
+/* ── Hardening callout ───────────────────────────────────────────────────
+   The one positive on the executive page: avenues configuration already
+   closed. Built on the design system's green (the same hue the config-close
+   status chip uses), a top accent rule not a side stripe, mirroring the .ds-note
+   shape so it reads as the same family of aside. Kept whole across a page break
+   so the positive is not split from its list. */
+.hardening {
+  border-top: 2px solid var(--green);
+  border-bottom: 1px solid var(--line);
+  background: rgba(47,111,79,0.05);
+  padding: 4.5mm 5mm 5mm;
+  page-break-inside: avoid; break-inside: avoid;
+}
+.hardening-k {
+  font-size: 6.5pt; font-weight: 700; letter-spacing: 0.26em;
+  text-transform: uppercase; color: var(--green); margin-bottom: 2.5mm;
+}
+.hardening-lead {
+  font-family: var(--font-serif); font-size: 10.5pt; font-style: italic;
+  line-height: 1.6; color: var(--text-2); max-width: 68ch; margin: 0;
+}
+ul.hardening-list { margin: 3mm 0 0; padding-left: 5mm; }
+ul.hardening-list > li {
+  font-size: 8.5pt; color: var(--text-2); line-height: 1.5; margin: 0 0 1.8mm;
+}
+.hardening-tech { font-weight: 700; color: var(--text); }
+
+/* ── Tier legend ─────────────────────────────────────────────────────────
+   The mandatory Tier 0/1/2 glossary. A hairline reference table, not a boxed
+   card — the register the paid deliverable renders its legend in. */
+.tier-table { table-layout: fixed; }
+.tier-table th.col-tier { width: 26%; }
+.tier-table th.col-tier-groups { width: 40%; }
+.tier-table th.col-tier-meaning { width: 34%; }
+.tier-label { font-weight: 700; color: var(--text); line-height: 1.35; }
+.tier-groups { font-size: 8pt; color: var(--text-2); line-height: 1.45; }
+.tier-meaning { font-size: 8pt; color: var(--text-3); line-height: 1.45; }
 
 /* The prioritized "Start here" remediation ranking (validated cut set). */
 .ds-headline {
@@ -3377,6 +3874,23 @@ ol.oblig-steps > li {
     {% if m.verdict_reach %}<p class="ds-verdict-sub">{{ m.verdict_reach }}</p>{% endif %}
 
     <div class="ds-cols">
+      {# The exposure figure, LABELLED so it can never read as the posture score
+         beside it: the share of accounts with a validated path to Tier 0 — the
+         product's thesis as a number, and the one figure shared with the paid
+         deliverable and the platform. It is drawn as a percentage of exposed
+         people, which runs the OPPOSITE way to the posture score (higher is
+         worse here, higher is safer there), so its sub-line states its
+         direction. The label and sub-line come from the model, which picks the
+         ordinary-account share when the Tier split reconciled and the
+         directory-wide share otherwise, matching the verdict sentence exactly.
+         Omitted only when there is no reach to state at all. #}
+      {% if m.exposure_reach_available %}
+      <div class="ds-col">
+        <div class="ds-figure-v{% if m.exposure_reach_pct %} critical{% endif %}">{{ '%g'|format(m.exposure_reach_pct) }}<small>%</small></div>
+        <div class="ds-figure-k">{{ m.exposure_reach_label }}</div>
+        <div class="ds-figure-sub">{{ m.exposure_reach_sub }}</div>
+      </div>
+      {% endif %}
       <div class="ds-col">
         <div class="ds-figure-v{% if m.priority_findings %} critical{% endif %}">{{ m.priority_findings }}</div>
         <div class="ds-figure-k">High-priority findings</div>
@@ -3432,6 +3946,52 @@ ol.oblig-steps > li {
     </div>
   </section>
 
+  {# Page-break bookkeeping for the post-executive page. The FIRST content section
+     after the executive page opens a fresh page; every later section flows
+     naturally. The positive hardening callout, when present, IS that first
+     section — so it opens the page and the section after it does NOT force a
+     second break, which is what previously stranded the callout alone at the top
+     of an otherwise blank page. Each candidate section below forces its break
+     only while this flag is still False, then sets it. #}
+  {% set _page2 = namespace(broken=False) %}
+
+  {# The one positive on the executive page. An attacker's avenue that this
+     environment's own configuration closes with certainty is a finding worth
+     stating in its own right: it names what the client already did right, which
+     is what reads the document as an honest assessment rather than a list of
+     only bad news. Doctrine (Exposure Validation): this is OBSERVED
+     configuration, excluded from every score, and never a claim that a security
+     PRODUCT detected or blocked anything. Shown only when an avenue was closed;
+     the count is the shared cross-tier cardinality. It leads the post-executive
+     page (rather than being wedged onto page one, where it does not fit, or
+     orphaned onto its own blank page): it deliberately opens the page and the
+     next section flows beneath it. #}
+  {% if m.hardening.present %}
+  {% set _one_hd = m.hardening.count == 1 %}
+  <section class="ds-section section-new-page">
+    {% set _page2.broken = True %}
+    <div class="hardening">
+      <div class="hardening-k">Attack surface already reduced</div>
+      <p class="hardening-lead">
+        {{ m.hardening.count }} attacker {{ 'avenue' if _one_hd else 'avenues' }}
+        that would otherwise appear below {{ 'is' if _one_hd else 'are' }} already
+        closed by this environment's own configuration. ADscan observed the closure
+        directly at the protocol level, so the {{ 'avenue is' if _one_hd else 'avenues are' }}
+        not presently exploitable. This is hardening you already have.
+      </p>
+      {% if m.hardening.rows %}
+      <ul class="hardening-list">
+        {% for a in m.hardening.rows %}
+        <li>
+          {% if a.technique %}<span class="hardening-tech">{{ a.technique }}.</span> {% endif %}{{ a.reason }}.
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
   {# What the assessment PROVED, and therefore what has to happen regardless of
      which finding gets fixed first. Same derivation as the paid deliverable
      (services/post_compromise_obligations): withholding a safety-critical
@@ -3441,7 +4001,8 @@ ol.oblig-steps > li {
      it is read before the evidence, not after it. #}
   {% if m.obligations %}
   {% set _one = (m.obligations | length) == 1 %}
-  <section class="ds-section section-new-page">
+  <section class="ds-section{% if not _page2.broken %} section-new-page{% endif %}">
+    {% set _page2.broken = True %}
     <div class="ds-section-head">
       <div class="ds-eyebrow">Do this first</div>
       <h2 class="ds-section-title">What the proof obliges</h2>
@@ -3488,7 +4049,8 @@ ol.oblig-steps > li {
   {% endif %}
 
   {% if m.remediation_start_here.present %}
-  <section class="ds-section section-new-page">
+  <section class="ds-section{% if not _page2.broken %} section-new-page{% endif %}">
+    {% set _page2.broken = True %}
     <div class="ds-section-head">
       <div class="ds-eyebrow">Start here</div>
       <h2 class="ds-section-title">Fixes that break the most attack paths</h2>
@@ -3532,7 +4094,8 @@ ol.oblig-steps > li {
   {% endif %}
 
   {% if m.chokepoint_remediation.present %}
-  <section class="ds-section{% if not m.remediation_start_here.present %} section-new-page{% endif %}">
+  <section class="ds-section{% if not _page2.broken and not m.remediation_start_here.present %} section-new-page{% endif %}">
+    {% set _page2.broken = True %}
     <div class="ds-section-head">
       <div class="ds-eyebrow">Structural choke points</div>
       <h2 class="ds-section-title">The objects to fix first</h2>
@@ -3583,7 +4146,8 @@ ol.oblig-steps > li {
   {% endif %}
 
   {% if m.choke_points %}
-  <section class="ds-section{% if not m.remediation_start_here.present and not m.chokepoint_remediation.present %} section-new-page{% endif %}">
+  <section class="ds-section{% if not _page2.broken and not m.remediation_start_here.present and not m.chokepoint_remediation.present %} section-new-page{% endif %}">
+    {% set _page2.broken = True %}
     <div class="ds-section-head">
       <div class="ds-eyebrow">Supporting detail</div>
       <h2 class="ds-section-title">The techniques that carry the most paths</h2>
@@ -3632,7 +4196,48 @@ ol.oblig-steps > li {
   </section>
   {% endif %}
 
-  <section class="ds-section{% if not m.choke_points %} section-new-page{% endif %}">
+  {# The tier legend, before the evidence uses the vocabulary. Trust
+     infrastructure for an auditor: it pre-answers "how did you classify this?"
+     and makes the Tier 0 direct-vs-escalation-capable split explicit — a Backup
+     Operator is inside the same containment boundary as a Domain Admin, and a
+     document that reaches Tier 0 through one of them has to say so plainly.
+     Content is the shared SSOT (compromise_class.tier_glossary), so the free
+     report, the paid deliverable and the platform define the tiers identically. #}
+  {% if m.tier_glossary %}
+  <section class="ds-section{% if not _page2.broken and not m.choke_points %} section-new-page{% endif %}">
+    {% set _page2.broken = True %}
+    <div class="ds-section-head">
+      <div class="ds-eyebrow">Reference</div>
+      <h2 class="ds-section-title">How assets are tiered</h2>
+      <p class="ds-section-lead">
+        The Microsoft tiered administration model. A tier is a containment boundary:
+        compromise of any Tier&nbsp;0 asset can lead to control of the whole domain, whether
+        directly or through one known escalation. This is how every object and path in this
+        report is classified.
+      </p>
+    </div>
+    <table class="adscan-table tier-table">
+      <thead>
+        <tr>
+          <th class="col-tier">Tier</th>
+          <th class="col-tier-groups">Who is in it</th>
+          <th class="col-tier-meaning">What that means</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in m.tier_glossary %}
+        <tr>
+          <td><div class="tier-label">{{ t.label }}</div></td>
+          <td class="tier-groups">{{ t.groups }}</td>
+          <td class="tier-meaning">{{ t.meaning }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  <section class="ds-section{% if not m.tier_glossary and not m.choke_points %} section-new-page{% endif %}">
     <div class="ds-section-head">
       <div class="ds-eyebrow">Evidence</div>
       <h2 class="ds-section-title">Findings</h2>
@@ -3910,8 +4515,11 @@ __all__ = (
     "ChokePointRemediationRow",
     "ChokePointRow",
     "EnvironmentChangeRow",
+    "ExposureFigure",
     "FindingAssetCoverage",
     "FindingRow",
+    "HardeningAvenueRow",
+    "HardeningObserved",
     "LITE_PDF_MARGIN",
     "LITE_THEME",
     "LiteRemediationStartHere",
@@ -3924,14 +4532,18 @@ __all__ = (
     "PathStepRow",
     "ReportContentMetrics",
     "SeveritySlice",
+    "TierGlossaryRow",
     "build_bottom_line",
     "build_change_disclosure",
     "build_choke_points",
     "build_chokepoint_remediation",
+    "build_exposure_figure",
+    "build_hardening_observed",
     "build_lite_remediation_start_here",
     "build_pdf_options",
     "build_report_model",
     "build_severity_slices",
+    "build_tier_glossary_rows",
     "build_verdict",
     "build_verdict_reach",
     "derive_report_content_metrics",

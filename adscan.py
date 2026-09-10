@@ -3332,7 +3332,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         # "extra_specs": ["python-magic==0.4.27"],
     },
     "credsweeper": {
-        "spec": "credsweeper==1.15.1",
+        "spec": "credsweeper==1.17.0",
         "check_target": "credsweeper",
         "check_type": "executable",
         "exe_name": "credsweeper",
@@ -27064,7 +27064,7 @@ class PentestShell:
         only paths to non-high-value targets (pivot opportunities, lateral movement).
 
         Usage:
-            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest]
+            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest] [--target LABEL]
 
         Args:
             domain: Target domain (e.g. `north.sevenkingdoms.local`)
@@ -27085,6 +27085,11 @@ class PentestShell:
                 holistic kill chain by default (all distinct entry points, with the
                 broadest-reach and PROVEN paths preserved). This opt-out reverts to the
                 legacy most-direct-route view. (--keep-longest is retained as a no-op.)
+            --target LABEL: Show only paths that reach one named object — a group,
+                host or OU (e.g. `--target "Domain Admins"`, `--target DC01$`). The
+                name is resolved to its canonical graph label; on no match the command
+                lists the closest objects instead of returning empty. Implies the full
+                target universe (as `--all`) unless combined with `--lowpriv`.
 
         Examples:
             attack_paths north.sevenkingdoms.local
@@ -27092,6 +27097,8 @@ class PentestShell:
             attack_paths north.sevenkingdoms.local --all
             attack_paths north.sevenkingdoms.local --lowpriv
             attack_paths north.sevenkingdoms.local --keep-longest
+            attack_paths north.sevenkingdoms.local --target "Domain Admins"
+            attack_paths north.sevenkingdoms.local owned --target DC01$
             attack_paths north.sevenkingdoms.local --max 20 --depth 6
             attack_paths north.sevenkingdoms.local --path-steps 2
             attack_paths north.sevenkingdoms.local jon.snow
@@ -27105,12 +27112,19 @@ class PentestShell:
             ATTACK_PATHS_MAX_DEPTH_USER,
         )
 
-        parts = args.split()
+        # shlex.split so a quoted multi-word target (``--target "Domain Admins"``)
+        # survives as one token — the REPL dispatcher re-quotes whitespace-bearing
+        # args, so this is the exact inverse and byte-compatible for single-word
+        # tokens. Fall back to a plain split on mismatched quotes.
+        try:
+            parts = shlex.split(args)
+        except ValueError:
+            parts = args.split()
         domain = parts[0] if parts else (self.domain or "")
         if not domain:
             print_instruction(
                 "Usage: attack_paths <domain> [user|owned|user1 user2 ...] [index] [--max N] [--depth N] "
-                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest]"
+                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest] [--target LABEL]"
             )
             return
 
@@ -27124,6 +27138,7 @@ class PentestShell:
         target_mode = "object"
         no_cache = False
         keep_longest = True
+        user_target: str | None = None
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -27189,6 +27204,14 @@ class PentestShell:
                     max_path_steps = None
                 i += 1
                 continue
+            if token == "--target" and i + 1 < len(parts):
+                user_target = parts[i + 1]
+                i += 2
+                continue
+            if token.startswith("--target="):
+                user_target = token.split("=", 1)[1]
+                i += 1
+                continue
             if token == "--no-cache":
                 no_cache = True
                 i += 1
@@ -27235,6 +27258,45 @@ class PentestShell:
             start_user = None  # principals scope handled via start_users
 
         attack_target = "lowpriv" if lowpriv else "all" if include_all else "highvalue"
+
+        # Resolve a named --target (a group, host or OU) to its canonical graph
+        # label(s). The filter is a post-compute label narrowing over the full
+        # target=all universe, so a named target that is NOT Tier-0-classed still
+        # resolves. Compute over target=all unless the operator asked --lowpriv.
+        target_labels: tuple[str, ...] = ()
+        if user_target:
+            from adscan_internal.services.attack_graph_service import (
+                _closest_target_candidates,
+                _build_target_label_index,
+                resolve_target_labels,
+            )
+
+            target_labels = resolve_target_labels(self, domain, user_target)
+            if not target_labels:
+                marked = mark_sensitive(user_target, "user")
+                print_error(
+                    f"No graph object matches --target '{marked}' in {mark_sensitive(domain, 'domain')}."
+                )
+                try:
+                    label_index = _build_target_label_index(self, domain)
+                    candidates = _closest_target_candidates(user_target, label_index)
+                except Exception:  # noqa: BLE001
+                    candidates = []
+                if candidates:
+                    print_instruction(
+                        "Closest objects in the graph (pass the exact label):"
+                    )
+                    for candidate in candidates:
+                        print_info(f"  {candidate}")
+                else:
+                    print_instruction(
+                        "No attack graph is loaded for this domain, or it has no "
+                        "objects. Run a scan first, then retry."
+                    )
+                return
+            if not lowpriv:
+                attack_target = "all"
+
         run_show_attack_paths(
             self,
             domain,
@@ -27249,6 +27311,7 @@ class PentestShell:
             allow_execution=True,
             no_cache=no_cache,
             keep_longest=keep_longest,
+            target_labels=target_labels,
         )
 
     def do_attack_steps(self, args):
@@ -27332,6 +27395,48 @@ class PentestShell:
             max_display=max_display,
             relation_filter=relation_filter,
         )
+
+    def do_graph_stats(self, args):
+        """Show a pre-flight summary of a domain's attack graph before discovery.
+
+        A pentester's pre-flight: node/edge scale, the control hubs with the
+        heaviest fan-out (the density drivers), whether attack-path discovery will
+        run in sampled mode (the engine-routing decision ADscan already takes
+        silently), and how many principals hold a validated path to a Tier-0
+        target. It reads counts off the loaded graph and runs the cheap explosion
+        predictor — it does NOT compute attack paths, so it is instant even on a
+        large directory.
+
+        Usage:
+            graph_stats <domain>
+
+        Args:
+            domain: Target domain (e.g. `north.sevenkingdoms.local`)
+
+        Examples:
+            graph_stats north.sevenkingdoms.local
+            graph_stats corp.local
+        """
+        from adscan_internal.services.graph_stats_service import (
+            build_graph_stats,
+            render_graph_stats_panel,
+        )
+
+        parts = args.split()
+        domain = parts[0] if parts else (self.domain or "")
+        if not domain:
+            print_instruction("Usage: graph_stats <domain>")
+            return
+        if domain not in self.domains:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_error(
+                f"Domain '{marked_domain}' is not configured. "
+                "Please add or select a valid domain."
+            )
+            return
+
+        stats = build_graph_stats(self, domain)
+        render_graph_stats_panel(stats, domain)
 
     def do_explain(self, args):
         """Explain an Active Directory attack technique (didactic mode).
@@ -28388,8 +28493,9 @@ class PentestShell:
             "ISO 27001:2022 — International ISMS standard": "iso27001",
             "DORA — EU 2022/2554 (financial sector)": "dora",
             "PCI DSS v4.0 — Payment Card Industry": "pci_dss",
+            "CIS Microsoft Windows Server Benchmark v4.0.0 — technical hardening (not a regulation)": "cis",
         }
-        _VALID_FRAMEWORK_KEYS = {"ens", "nis2", "iso27001", "dora", "pci_dss"}
+        _VALID_FRAMEWORK_KEYS = {"ens", "nis2", "iso27001", "dora", "pci_dss", "cis"}
 
         frameworks_arg: list[str] | None = None
         frameworks_index = profile_index + 1
@@ -28402,7 +28508,7 @@ class PentestShell:
             if not frameworks_arg:
                 print_error(
                     f"Invalid frameworks '{args_parts[frameworks_index]}'. "
-                    f"Valid values: ens, nis2, iso27001, dora, pci_dss"
+                    f"Valid values: ens, nis2, iso27001, dora, pci_dss, cis"
                 )
                 return None
         else:
@@ -32105,15 +32211,14 @@ def add_ci_subparser(subparsers):
     """
     ci_parser = subparsers.add_parser(
         "ci",
-        help="[EXPERIMENTAL] Run ADscan in autonomous mode (skips all prompts, applies defaults)",
+        help="Run ADscan in autonomous mode (skips all prompts, applies defaults)",
         description=(
-            "EXPERIMENTAL · BETA — Autonomous (non-interactive) scan mode.\n\n"
+            "Autonomous (non-interactive) scan mode.\n\n"
             "Skips every prompt, applies sensible defaults, and runs the full "
             "ADscan pipeline end-to-end. Intended for CI/CD, automated lab "
             "validation (HTB/GOAD), and unattended engagements.\n\n"
-            "STATUS — Beta. Behaviour, defaults, and output format may change "
-            "between releases. Use `adscan start` for interactive scans where "
-            "operator judgement is preferred."
+            "Use `adscan start` for interactive scans where operator judgement "
+            "is preferred."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -32217,7 +32322,7 @@ def add_ci_subparser(subparsers):
     ci_parser.add_argument(
         "--frameworks",
         default=None,
-        help="Comma-separated compliance frameworks: ens,nis2,iso27001,dora,pci_dss (default: ens).",
+        help="Comma-separated compliance frameworks: ens,nis2,iso27001,dora,pci_dss,cis (default: ens).",
     )
     ci_parser.add_argument(
         "--report-engine",
@@ -32524,6 +32629,17 @@ if __name__ == "__main__":
         else:
             _add_deliver_subparser(subparsers)
 
+    # ── adscan report (tier-adaptive report regeneration) ─────────────
+    # Regenerates the report from a kept workspace without re-scanning. LITE
+    # renders the exposure report (with its PRO CTA); PRO renders the single
+    # Security Assessment Report PDF. NOT PRO-gated — ships in both tiers, so
+    # unlike `deliver` this needs no LITE-stub fallback.
+    if "report" not in subparsers.choices:
+        from adscan_internal.cli.report_cmd import (
+            add_report_subparser as _add_report_subparser,
+        )
+        _add_report_subparser(subparsers)
+
     # ── adscan mitre-navigator ────────────────────────────────────────────
     # MITRE ATT&CK Navigator layer export (LITE + PRO). LITE writes a
     # community-watermarked JSON snapshot; PRO adds an interactive HTML
@@ -32533,6 +32649,17 @@ if __name__ == "__main__":
             add_mitre_navigator_subparser as _add_mitre_navigator_subparser,
         )
         _add_mitre_navigator_subparser(subparsers)
+
+    # ── adscan writeup (lab writeup evidence spine) ────────────────────
+    # Writes the mechanical two-thirds of a lab writeup from a kept
+    # workspace: ports, directory contents, the attack chain, per-step
+    # outcomes with public references, credential provenance, and dead
+    # ends. LITE-safe and NOT PRO-gated — ships in both tiers.
+    if "writeup" not in subparsers.choices:
+        from adscan_internal.cli.writeup_cmd import (
+            add_writeup_subparser as _add_writeup_subparser,
+        )
+        _add_writeup_subparser(subparsers)
 
     # ── adscan tui ────────────────────────────────────────────────────────
     # Top-level launcher for the Textual workbench. Equivalent to
@@ -32750,7 +32877,7 @@ if __name__ == "__main__":
     # and raw internal-detail visibility).
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "execute", "doctor", "install", "check", "deliver", "mitre-navigator")
+        and args.command in ("start", "ci", "execute", "doctor", "install", "check", "deliver", "report", "writeup", "mitre-navigator")
         and hasattr(args, "debug")
         and args.debug
     ):
@@ -32975,6 +33102,12 @@ if __name__ == "__main__":
     elif args.command == "deliver":
         from adscan_internal.cli.deliver import run_deliver_sync as _run_deliver_sync
         sys.exit(_run_deliver_sync(args))
+    elif args.command == "report":
+        from adscan_internal.cli.report_cmd import run_report_sync as _run_report_sync
+        sys.exit(_run_report_sync(args))
+    elif args.command == "writeup":
+        from adscan_internal.cli.writeup_cmd import run_writeup_sync as _run_writeup_sync
+        sys.exit(_run_writeup_sync(args))
     elif args.command == "mitre-navigator":
         from adscan_internal.cli.mitre_navigator import (
             run_mitre_navigator_sync as _run_mitre_navigator_sync,

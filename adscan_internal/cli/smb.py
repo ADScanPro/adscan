@@ -10660,8 +10660,16 @@ def _handle_prioritized_findings_actions(
                     hosts=[host] if host else None,
                     shares=[share] if share else None,
                     artifact=path or None,
-                    auth_username=auth_username,
                     origin="share_spidering",
+                    # Consistent with the unauth path: the edge source is the measured
+                    # read-capable set for the share when one exists. Thread the
+                    # workspace + share so the resolver fires; pass auth_username so the
+                    # no-read-set fallback sources from the user that actually read the
+                    # file (direct proof), not generic Authenticated Users (Task 1.7).
+                    shell=shell,
+                    domain=domain,
+                    share=share or None,
+                    auth_username=auth_username,
                 )
             try:
                 shell.add_credential(

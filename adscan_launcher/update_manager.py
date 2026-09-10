@@ -721,6 +721,26 @@ def get_docker_update_info(ctx: UpdateContext) -> dict:
                 f"=> needs_update={info['needs_update']}"
             )
         return info
+    except subprocess.TimeoutExpired as exc:
+        # The local image check (`docker image inspect`) timed out — common when
+        # the Docker daemon is busy. This is recoverable and expected: the update
+        # flow already handles an unconfirmed local image as "needs update" and
+        # pulls it, so it must NOT surface as a scary traceback. Report the delay
+        # in one clean line and let the pull proceed. The full traceback still
+        # reaches the debug log and the session recording (visible=False keeps it
+        # off the terminal, without swallowing it).
+        timeout_seconds = getattr(exc, "timeout", None)
+        seconds_text = f"{int(timeout_seconds)}s" if timeout_seconds else "the timeout"
+        ctx.telemetry_capture_exception(exc)
+        print_exception(exception=exc, visible=False)
+        ctx.print_info(
+            f"Could not inspect the local image within {seconds_text}; "
+            "treating it as out of date and refreshing it."
+        )
+        info["needs_update"] = True
+        info["image_present"] = False
+        info["error"] = "local-image-inspect-timeout"
+        return info
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
         print_exception(exception=exc)

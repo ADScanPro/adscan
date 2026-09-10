@@ -132,6 +132,26 @@ def edge_grants_local_admin_session(
     )
 
 
+def _is_stamped_direct_breaker(node: Mapping[str, Any] | None) -> bool:
+    """Return whether ``node`` carries a membership-aware ``tier0_direct`` stamp.
+
+    Tier-label SSOT: this augments the name/RID ``is_direct_domain_breaker_target``
+    detector so a terminal on a Domain Admins MEMBER (a User the NAME matcher on
+    its own identity misses, but whose membership-aware stamp is ``tier0_direct``)
+    is classified into the top ``domain`` lane. It is purely ADDITIVE — it only
+    ever RAISES a terminal into the protective domain lane, never lowers one — so
+    the redundant-MemberOf minimizer never strips a proven compromise prefix. The
+    stamped-label read is unconditional — validated in lab and made permanent (the
+    ADSCAN_TIER_LABEL_SSOT reader switch was removed 2026-09-09).
+    """
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        PrivilegeTier,
+        node_stamped_privilege_tier,
+    )
+
+    return node_stamped_privilege_tier(node) is PrivilegeTier.TIER0_DIRECT
+
+
 def classify_target_tier(
     *,
     relation: str | None,
@@ -156,7 +176,9 @@ def classify_target_tier(
     #    user would be indistinguishable (both domain/_DOMAIN_LEVEL), and the
     #    redundant-MemberOf minimizer would wrongly strip the compromise prefix.
     #    Mirrors the self_cred_recovered bump DumpLSA gets on a (non-breaker) host.
-    if is_direct_domain_breaker_target(target_node):
+    if is_direct_domain_breaker_target(target_node) or _is_stamped_direct_breaker(
+        target_node
+    ):
         return TargetTier(
             lane="domain",
             level=_DOMAIN_LEVEL,
@@ -360,6 +382,24 @@ def domain_compromise_tier(target_node: Mapping[str, Any] | None) -> int:
         return _DOMAIN_COMPROMISE_TIER_DIRECT_BREAKER
     if is_privileged_escalator_target(target_node):
         return _DOMAIN_COMPROMISE_TIER_ENABLER
+    # Tier-label SSOT scoping note — this 4-tier TOTAL ORDER is deliberately NOT
+    # migrated to the stamped ``privilege_tier``, even though the stamp is now
+    # membership-aware. The migration was IMPLEMENTED and MEASURED — but it still
+    # MOVES the reach set. This order drives the domain-listing prefix/contained
+    # COLLAPSE, and promoting the (correct) DA-member / escalation terminals from
+    # the low-priv floor to rank 3/2 reshuffles which representative survives: on
+    # Goad-example essos it traded five ``target=all`` stepping-stone
+    # representations to a Tier-2 gMSA for a broader-source one (count 48->43,
+    # 59->53), a change that could not be proven lossless. The failure is inherent
+    # to re-ranking a COLLAPSE total order, not to membership-blindness, so this
+    # reader stays on its legacy name/RID classification. The Tier-0 SELECTION
+    # improvement (a DA member / escalation group / ADCS CA now correctly CHOSEN as
+    # a high-value target) flows through ``_node_is_tier0`` (a provable lossless
+    # superset) and the per-target lane via ``classify_target_tier`` (which the
+    # redundant-MemberOf minimizer consumes and which IS migrated, count-identical).
+    # When the ADSCAN_TIER_LABEL_SSOT reader switch was removed (2026-09-09, once
+    # the migrated readers were lab-validated), this reader was left legacy on
+    # purpose — it never read the switch, so its behaviour is unchanged.
     return _DOMAIN_COMPROMISE_TIER_LOWPRIV
 
 

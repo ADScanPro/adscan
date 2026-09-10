@@ -228,8 +228,17 @@ class JohnArtifactCrackingService(BaseService):
             )
         marked_hash = mark_sensitive(hash_file, "path")
         marked_wordlist = mark_sensitive(wordlist_path, "path")
+        # A per-run session name so a leftover ``.rec`` from a killed prior run
+        # or a concurrent ADscan cracking process never locks this John launch
+        # out (see crack_hashes_file / hashcat_coordination).
+        from adscan_internal.services.hashcat_coordination import (  # noqa: PLC0415
+            unique_crack_session_name,
+        )
+
         command = (
-            f"{_shell_quote(self._john_path)} --wordlist={_shell_quote(wordlist_path)} "
+            f"{_shell_quote(self._john_path)} "
+            f"--session={_shell_quote(unique_crack_session_name('adscan-john'))} "
+            f"--wordlist={_shell_quote(wordlist_path)} "
             f"{_shell_quote(hash_file)}"
         )
         print_info_debug(
@@ -408,8 +417,21 @@ class JohnArtifactCrackingService(BaseService):
                 f"--config={_shell_quote(conf_path)} "
                 f"--rules={_shell_quote(normalized_rules)} "
             )
+        # A per-run session name (not John's default ``john``) so a leftover
+        # ``.rec`` recovery file from a killed prior run — or a concurrent
+        # ADscan cracking process — never locks this launch out
+        # ("Crash recovery file is locked"). Mirrors the hashcat session fix;
+        # the crack owns the session, the ``--show`` pot read below does not.
+        from adscan_internal.services.hashcat_coordination import (  # noqa: PLC0415
+            unique_crack_session_name,
+        )
+
+        session_fragment = (
+            f"--session={_shell_quote(unique_crack_session_name('adscan-john'))} "
+        )
         crack_command = (
             f"{_shell_quote(self._john_path)} --format={_shell_quote(normalized_format)} "
+            f"{session_fragment}"
             f"{rules_fragment}"
             f"--pot={quoted_pot} "
             f"--wordlist={_shell_quote(wordlist_path)} {_shell_quote(john_input_file)}"

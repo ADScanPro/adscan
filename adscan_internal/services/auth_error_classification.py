@@ -295,3 +295,67 @@ def is_unreachable_foreign_realm_error(exc_or_msg: Any) -> bool:
     for this case — the realm is genuinely out of reach with this credential.
     """
     return _matches_any_marker(exc_or_msg, UNREACHABLE_FOREIGN_REALM_ERROR_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Credential rejection — the DC POSITIVELY refused the supplied secret/principal.
+# This is a USER problem (a wrong password or NT hash, an unknown/disabled/locked
+# account), NOT an ADscan fault, so it must render as ONE clean, actionable line
+# and NEVER as a multi-frame Rich traceback. It is the local-realm counterpart of
+# ``is_unreachable_foreign_realm_error`` (which owns the CROSS-realm case): the KDC
+# named the reason and the reason is "this credential does not work here".
+#
+# The distinction that draws the expected-vs-unexpected boundary: only errors where
+# the server DEFINITIVELY named a credential/account cause belong here. A generic
+# transport/network failure, an unclassifiable KDC refusal, or any real ADscan bug
+# is deliberately NOT matched, so it keeps the full-traceback debugging path.
+# ---------------------------------------------------------------------------
+CREDENTIAL_REJECTION_ERROR_MARKERS: tuple[str, ...] = (
+    # kerbad KerberosError names — the KDC verified and refused the credential.
+    # KDC_ERR_PREAUTH_FAILED (0x18) — wrong password / NT hash / AES key.
+    "ERROR NAME: KDC_ERR_PREAUTH_FAILED",
+    "KDC_ERR_PREAUTH_FAILED",
+    "PREAUTH FAILED",
+    "PRE-AUTHENTICATION INFORMATION WAS INVALID",
+    # KDC_ERR_C_PRINCIPAL_UNKNOWN — the client principal does not exist.
+    "ERROR NAME: KDC_ERR_C_PRINCIPAL_UNKNOWN",
+    "KDC_ERR_C_PRINCIPAL_UNKNOWN",
+    "CLIENT NOT FOUND IN KERBEROS DATABASE",
+    # KDC_ERR_CLIENT_REVOKED (0x12) — account disabled or locked out.
+    "ERROR NAME: KDC_ERR_CLIENT_REVOKED",
+    "KDC_ERR_CLIENT_REVOKED",
+    "CREDENTIALS HAVE BEEN REVOKED",
+    # KDC_ERR_KEY_EXPIRED (0x17) — password expired, must change before logon.
+    "ERROR NAME: KDC_ERR_KEY_EXPIRED",
+    "KDC_ERR_KEY_EXPIRED",
+    "PASSWORD HAS EXPIRED",
+    # NTLM/SPNEGO wording for the same "the secret is wrong" verdict, in case a
+    # credential rejection surfaces on the NTLM leg instead of Kerberos.
+    "SEC_E_LOGON_DENIED",
+    "STATUS_LOGON_FAILURE",
+    "INVALIDCREDENTIALS",
+)
+
+
+def is_credential_rejection_error(exc_or_msg: Any) -> bool:
+    """Return True for a Kerberos/NTLM error SHAPED like a credential rejection.
+
+    A wrong-password/NT-hash preauth failure, an unknown client principal, or a
+    disabled/locked/expired account. These are NOT ADscan faults, so a caller must
+    not present a multi-frame Rich traceback for them.
+
+    IMPORTANT — this is a SHAPE classifier, not a final verdict. A
+    credential-rejection-shaped Kerberos error does NOT prove the credential is
+    bad: a machine account whose AES preauth cannot be derived from an NT hash, or
+    a non-default machine-account salt, fails the Kerberos leg with
+    ``KDC_ERR_PREAUTH_FAILED`` while NTLM accepts the SAME (valid) credential.
+    Only the layer that has tried EVERY auth method (Kerberos AND NTLM) may render
+    a "credential rejected" verdict. An early pre-mint seam with an NTLM fallback
+    downstream (``kerberos_transport.get_tgt``) must therefore defer — keep the
+    traceback as evidence and stay DEBUG-only, never alarm the operator here.
+
+    Deliberately conservative: it matches ONLY errors where the server named a
+    credential/account cause. A generic transport failure or an unclassifiable
+    refusal is NOT matched, so a genuine ADscan bug keeps the full-traceback path.
+    """
+    return _matches_any_marker(exc_or_msg, CREDENTIAL_REJECTION_ERROR_MARKERS)

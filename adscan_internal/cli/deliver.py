@@ -38,7 +38,6 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
-from adscan_core.paths import get_workspaces_dir
 from adscan_core.rich_output import (
     print_error,
     print_info,
@@ -48,6 +47,12 @@ from adscan_core.rich_output import (
     print_warning,
 )
 from adscan_core.rich_output import print_exception
+from adscan_internal.cli.common import (
+    _FRAMEWORK_KEY_MAP,
+    _VALID_FRAMEWORK_KEYS,
+    _parse_frameworks,
+    _resolve_workspace,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +162,13 @@ _ONLY_ALIASES: dict[str, str] = {"report": "executive", "checklist": "executive"
 # independently — a client may need NIS2 but not ENS. They share findings/
 # attack-path semantics, which is modularized in the content layer, not by
 # collapsing them into one key.
-_FRAMEWORK_KEY_MAP: dict[str, str] = {
-    "ENS Alto — Spain / CCN-CERT (recommended)": "ens",
-    "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
-    "ISO 27001:2022 — International ISMS standard": "iso27001",
-    "DORA — EU 2022/2554 (financial sector)": "dora",
-    "PCI DSS v4.0.1 — Payment Card Industry": "pci_dss",
-}
-_VALID_FRAMEWORK_KEYS: tuple[str, ...] = tuple(_FRAMEWORK_KEY_MAP.values())
+#
+# ``_FRAMEWORK_KEY_MAP`` / ``_VALID_FRAMEWORK_KEYS`` live in
+# ``adscan_internal.cli.common`` (imported above) — LITE-safe home shared with
+# ``_parse_frameworks``/``_resolve_workspace`` so ``report``/``writeup`` never
+# need to import this PRO-flow module (LITE strips ``deliver.py``; see
+# ``report_cmd.py``'s docstring for the full story).
+#
 # Default selection when the caller does not choose any framework: NONE. The
 # client must explicitly pick the regimes that apply to them (e.g. PCI DSS +
 # ISO 27001), so no compliance regime is forced onto a report that did not
@@ -188,56 +192,6 @@ def _is_inside_shell() -> bool:
     rather than prompting.
     """
     return os.environ.get("ADSCAN_INSIDE_SHELL", "").strip() == "1"
-
-
-def _resolve_workspace(args: argparse.Namespace) -> Path | None:
-    """Resolve the target workspace directory.
-
-    Order:
-        1. Explicit ``--workspace`` flag (CLI, launcher, shell).
-        2. ``ADSCAN_CURRENT_WORKSPACE`` env var (set by the shell when
-           dispatching internal commands).
-        3. Interactive questionary picker over ``~/.adscan/workspaces/``.
-
-    Returns ``None`` if no workspace can be resolved (e.g. non-TTY,
-    no flag, no existing workspaces).
-    """
-    explicit = getattr(args, "workspace", None)
-    if explicit:
-        candidate = Path(explicit).expanduser()
-        if not candidate.is_absolute():
-            candidate = get_workspaces_dir() / candidate
-        return candidate.resolve()
-
-    env_ws = os.environ.get("ADSCAN_CURRENT_WORKSPACE", "").strip()
-    if env_ws:
-        return Path(env_ws).expanduser().resolve()
-
-    workspaces_root = get_workspaces_dir()
-    if not workspaces_root.is_dir():
-        return None
-
-    candidates = sorted(p for p in workspaces_root.iterdir() if p.is_dir())
-    if not candidates:
-        return None
-
-    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-    if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
-        # Non-interactive: fall back to the most recently modified one.
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-
-    try:
-        from questionary import select  # type: ignore[import-untyped]
-
-        choice = select(
-            "Pick a workspace to deliver:",
-            choices=[p.name for p in candidates],
-        ).ask()
-    except Exception:  # noqa: BLE001 — questionary missing or non-TTY edge cases
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-    if not choice:
-        return None
-    return (workspaces_root / choice).resolve()
 
 
 def _resolve_client_meta(args: argparse.Namespace) -> tuple[str, str]:
@@ -440,43 +394,6 @@ def _parse_only(raw: str | None) -> tuple[_KitItem, ...]:
         )
     selected_slugs = set(normalised)
     return tuple(item for item in _KIT if item.slug in selected_slugs)
-
-
-def _parse_frameworks(raw: str | None) -> list[str] | None:
-    """Validate a comma-separated framework list from ``--frameworks``.
-
-    Args:
-        raw: Raw ``--frameworks`` value, or ``None`` if the flag was not
-            passed. Empty / whitespace-only string is treated as ``None``.
-
-    Returns:
-        Canonicalised list of framework keys (preserving caller order, no
-        duplicates) when ``raw`` is a non-empty valid input. ``None`` when
-        the flag was not provided — caller should then prompt or default.
-
-    Raises:
-        ValueError: Any token is not a known framework key. The message
-            names the bad token and the allowed set so the operator can
-            self-correct without reading source.
-    """
-    if raw is None or not raw.strip():
-        return None
-    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
-    if not tokens:
-        return None
-    invalid = [tok for tok in tokens if tok not in _VALID_FRAMEWORK_KEYS]
-    if invalid:
-        raise ValueError(
-            f"--frameworks: unknown value(s): {', '.join(invalid)}. "
-            f"Use one of: {', '.join(_VALID_FRAMEWORK_KEYS)}."
-        )
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for tok in tokens:
-        if tok not in seen:
-            seen.add(tok)
-            ordered.append(tok)
-    return ordered
 
 
 def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
@@ -1341,10 +1258,15 @@ async def run_deliver(args: argparse.Namespace) -> int:
         # Use the canonical helper so we don't double-wrap the panel
         # (``print_panel`` adds its own border around the already-bordered
         # panel returned by the renderer). Single source of truth lives
-        # in ``adscan_core.pro_upsell.print_pro_upsell``.
+        # in ``adscan_core.pro_upsell.print_pro_upsell``. This is a
+        # peak-value commercial gate (a LITE operator reached for a PRO
+        # deliverable), so it routes by operator lane exactly like the
+        # launcher's PRO gate — a buyer role sees the Enterprise body, not
+        # the pentester /pro CTA.
+        from adscan_core.operator_role import resolve_cta_lane
         from adscan_core.pro_upsell import print_pro_upsell
 
-        print_pro_upsell("deliver", "direct_invocation")
+        print_pro_upsell("deliver", "direct_invocation", lane=resolve_cta_lane())
         return 2
 
     try:
