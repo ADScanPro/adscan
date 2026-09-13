@@ -133,7 +133,7 @@ cli = [
     "pydantic-settings>=2.4.0",
     "selenium>=4.28.0,<5.0",
     "textual>=0.80.0",
-    "redis>=5.0.0,<8.1.0",
+    "redis>=5.0.0,<8.2.0",
     "winacl==0.1.9",
     # Offline VM disk-image credential extraction (vm_artifact_service): dissect
     # reads VMware/Hyper-V disk-image containers + NTFS in pure Python (userspace,
