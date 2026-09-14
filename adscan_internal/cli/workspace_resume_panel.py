@@ -69,20 +69,35 @@ def resolve_workspace_action(
         f"domain_auth={snapshot.domain_auth!r} phase1_complete={snapshot.phase1_complete}"
     )
 
+    override_action = _env_override_action()
+    if override_action is not None:
+        # Explicit operator override always wins over every heuristic below.
+        _emit_action_event(override_action, snapshot, source="auto")
+        print_info(f"Workspace action: {_ACTION_LABELS[override_action]}")
+        return override_action, snapshot
+
     if not snapshot.has_attack_graph and not snapshot.phase1_complete:
         # Nothing to resume — caller should run the full flow as a fresh scan.
         action = WorkspaceAction.REFRESH
         _emit_action_event(action, snapshot, source="fresh_workspace")
         return action, snapshot
 
-    if snapshot.has_attack_graph and snapshot.domain_auth == "unauth":
-        # Graph contains only synthetic nodes from the unauthenticated entry-vector
-        # phase (LDAPAnonymousBind, ASREPRoasting). The four panel options are all
-        # misleading: Resume keeps the cached junk, Replay re-runs analysis on it,
-        # Refresh is the only sensible action. Skip the prompt and default to it.
+    if snapshot.domain_auth == "unauth" or (
+        snapshot.has_attack_graph and not snapshot.phase1_complete
+    ):
+        # The graph has NOT had a completed authenticated collection. Two shapes
+        # reach here: an entry-vectors-only graph (synthetic nodes from the
+        # unauthenticated phase — LDAPAnonymousBind, ASREPRoasting), which reads
+        # as domain_auth='unauth'; and a graph promoted from unauth by a first
+        # credential, whose real-SID entry nodes (Anonymous Logon, a recovered
+        # service account) now read as domain_auth='auth' but where collection
+        # never ran (phase1_complete False). In both, Resume keeps a partial
+        # graph and Replay re-runs analysis on it — Refresh (re-collect) is the
+        # only sensible action. Skip the prompt and default to it, so the
+        # interactive path matches the auto/CI phase1_complete gate.
         print_info_debug(
-            f"[workspace] entry-vectors-only graph for {domain}; "
-            f"skipping panel and defaulting to REFRESH"
+            f"[workspace] graph without completed authenticated collection for "
+            f"{domain}; skipping panel and defaulting to REFRESH"
         )
         action = WorkspaceAction.REFRESH
         _emit_action_event(action, snapshot, source="entry_vectors_only")
@@ -105,22 +120,50 @@ def resolve_workspace_action(
 # ---------------------------------------------------------------------------
 
 
+def _env_override_action() -> WorkspaceAction | None:
+    """Return the explicit ``ADSCAN_WORKSPACE_ACTION`` override, or ``None``.
+
+    An invalid value is ignored (logged under ``--debug``) and treated as
+    unset, so a typo never silently forces the wrong action.
+    """
+    override = (os.environ.get(_ENV_OVERRIDE_VAR) or "").strip().lower()
+    if not override:
+        return None
+    try:
+        return WorkspaceAction(override)
+    except ValueError:
+        print_info_debug(f"[workspace] ignored invalid {_ENV_OVERRIDE_VAR}={override!r}")
+        return None
+
+
 def _resolve_auto_action(shell: Any, snapshot: WorkspaceSnapshot) -> WorkspaceAction | None:
     """Return a deterministic action when auto/CI mode applies, else ``None``.
 
     Precedence:
         1. ``ADSCAN_WORKSPACE_ACTION`` env var (explicit operator override).
-        2. ``shell.auto`` flag — defaults to RESUME (cached, fastest).
+        2. ``shell.auto`` flag — RESUME only when authenticated collection has
+           genuinely completed (``phase1_complete``); otherwise REFRESH.
+
+    Resume only makes sense when phase-1 / authenticated collection ALREADY
+    ran. When it has not — the unauth→auth promotion case, where a first
+    credential turns a graph that held only unauthenticated entry vectors into
+    one whose real-SID nodes now read as ``domain_auth='auth'`` — RESUME would
+    silently skip the authenticated collection and leave the graph unbuilt. The
+    decision keys on the FLOW FACT (did collection run?), not on the
+    node-synthetic heuristic behind ``domain_auth`` (which the real-SID nodes
+    from the share-credential-source fix defeat).
     """
-    override = (os.environ.get(_ENV_OVERRIDE_VAR) or "").strip().lower()
-    if override:
-        try:
-            return WorkspaceAction(override)
-        except ValueError:
-            print_info_debug(
-                f"[workspace] ignored invalid {_ENV_OVERRIDE_VAR}={override!r}"
-            )
+    override = _env_override_action()
+    if override is not None:
+        return override
     if getattr(shell, "auto", False):
+        if not snapshot.phase1_complete:
+            # Authenticated collection never completed — never skip it.
+            print_info_debug(
+                "[workspace] auto mode: phase1 not complete; REFRESH to run "
+                "authenticated collection (not RESUME)"
+            )
+            return WorkspaceAction.REFRESH
         return WorkspaceAction.RESUME
     return None
 

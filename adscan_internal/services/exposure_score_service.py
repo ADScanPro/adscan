@@ -58,8 +58,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
+from adscan_core.reporting.unauthenticated_reach import (
+    REACHED_VIA_NULL_SESSION,
+    is_unauthenticated_entry_label,
+    reached_via_from_entry_label,
+)
 from adscan_internal.services.attack_step_support_registry import (
     classify_relation_support,
+)
+from adscan_internal.services.compromise_class import (
+    is_proven_unauthenticated_domain_breaker,
 )
 from adscan_internal.services.path_state import (
     _PROVEN_STATUSES,
@@ -142,12 +150,12 @@ _CONFIRMED_DESTRUCTIVE_BASE: float = 0.9
 #: deterministic rate high is what keeps the independent-product assumption from
 #: over-penalizing correlated same-technique chains.
 _EFFORT_TO_EXPLOITABILITY: dict[str, float] = {
-    "none": 1.0,       # you already ARE the principal (pure membership terminal)
+    "none": 1.0,  # you already ARE the principal (pure membership terminal)
     "immediate": 1.0,  # single deterministic control edge to compromise
-    "low": 0.95,       # GenericAll / GenericWrite / DCSync / ForceChangePassword
-    "medium": 0.6,     # needs a condition (coercion target present, config)
-    "high": 0.3,       # Kerberoast / ASREPRoast — offline crack required
-    "other": 0.5,      # unknown technique — neutral prior
+    "low": 0.95,  # GenericAll / GenericWrite / DCSync / ForceChangePassword
+    "medium": 0.6,  # needs a condition (coercion target present, config)
+    "high": 0.3,  # Kerberoast / ASREPRoast — offline crack required
+    "other": 0.5,  # unknown technique — neutral prior
 }
 
 #: Per-technique exploitability, authored SPECIFICALLY for the exposure score
@@ -174,7 +182,7 @@ _RELATION_EXPLOITABILITY: dict[str, float] = {
     "owns": 0.9,
     "writeaccountrestrictions": 0.85,
     "addkeycredentiallink": 0.85,  # shadow creds — needs a PKINIT-capable KDC
-    "writespn": 0.35,              # targeted Kerberoast — still needs an offline crack
+    "writespn": 0.35,  # targeted Kerberoast — still needs an offline crack
     # DCSync (replication rights) — deterministic domain-secret extraction.
     "dcsync": 0.97,
     "getchanges": 0.9,
@@ -194,7 +202,7 @@ _RELATION_EXPLOITABILITY: dict[str, float] = {
     "adcsesc5": 0.85,
     "adcsesc6": 0.85,
     "adcsesc7": 0.85,
-    "adcsesc8": 0.7,   # relay-dependent
+    "adcsesc8": 0.7,  # relay-dependent
     "adcsesc9": 0.7,
     "adcsesc10": 0.7,
     "adcsesc13": 0.9,
@@ -202,7 +210,7 @@ _RELATION_EXPLOITABILITY: dict[str, float] = {
     "readlapspassword": 0.95,
     "synclapspassword": 0.9,
     "readgmsapassword": 0.95,
-    "dumplsa": 0.85,   # needs a local-admin session first, then deterministic
+    "dumplsa": 0.85,  # needs a local-admin session first, then deterministic
     # Crack-dependent — PROBABILISTIC (offline crack required). NOTE the live
     # relation spellings are `Kerberoasting` / `ASREPRoasting` (the `-ing` form);
     # both spellings kept so neither falls through to the coarse effort default.
@@ -218,7 +226,7 @@ _RELATION_EXPLOITABILITY: dict[str, float] = {
     "canpsremote": 0.7,
     "executedcom": 0.7,
     "sqladmin": 0.6,
-    "sqlaccess": 0.5,   # DB session, usually no host code-exec
+    "sqlaccess": 0.5,  # DB session, usually no host code-exec
     # Coercion — needs a reachable relay target.
     "coerce": 0.75,
     "coercetorelay": 0.75,
@@ -793,9 +801,38 @@ def _serialize_affected_accounts_detail(
     so the per-account tiers always fold back onto ``tier_breakdown``.
     """
     return [
-        {"sam": account, "tier": tier_map.get(account, "tier2")}
-        for account in accounts
+        {"sam": account, "tier": tier_map.get(account, "tier2")} for account in accounts
     ]
+
+
+def _coarse_breakdown_for_population(
+    population_tier_breakdown: Mapping[str, Any] | None,
+    accounts: set[str],
+    tier_map: Mapping[str, str],
+) -> dict[str, int]:
+    """Return a coarse ``{tier0,tier1,tier2}`` split reconciled to ``accounts``.
+
+    Used ONLY for the maximum-exposure saturation of a proven no-credential
+    domain breaker, whose affected set IS the whole enabled population. The split
+    MUST sum to ``len(accounts)`` or the PRO blast-radius gate (sum == count)
+    suppresses it. Prefers the authoritative population tier breakdown (the
+    denominator's own split) when it reconciles; otherwise derives the split from
+    the per-account fine-tier map (defaulting an ungraded account to ``tier2``),
+    which reconciles to ``len(accounts)`` by construction.
+    """
+    target = len(accounts)
+    if isinstance(population_tier_breakdown, Mapping):
+        coarse = {
+            "tier0": max(0, int(population_tier_breakdown.get("tier0", 0) or 0)),
+            "tier1": max(0, int(population_tier_breakdown.get("tier1", 0) or 0)),
+            "tier2": max(0, int(population_tier_breakdown.get("tier2", 0) or 0)),
+        }
+        if coarse["tier0"] + coarse["tier1"] + coarse["tier2"] == target:
+            return coarse
+    derived = {"tier0": 0, "tier1": 0, "tier2": 0}
+    for account in accounts:
+        derived[_COARSE_TIER_BUCKET.get(tier_map.get(account, "tier2"), "tier2")] += 1
+    return derived
 
 
 #: Canonical reconciliation of any sidecar ``path_state`` value (which may use
@@ -837,6 +874,14 @@ def _record_affected_users(
 
     Reads ``meta.affected_users`` (the resolved per-path principal set, already
     broad-group-expanded by ``attack_graph_service``).
+
+    For the synthetic ``Unauthenticated`` entry the affected set is the enabled
+    Tier-2 USER principals actually on the proven no-credential path (stamped by
+    ``attack_paths_core.apply_affected_user_metadata``) — NOT a numeric ceiling.
+    The maximum-exposure ceiling stays on ``meta.affected_principal_count`` for
+    attack-path severity / containment; it is deliberately NOT fed into the
+    ordinary-account population numerator, which would otherwise read an
+    impossible "largest-group + 1 of <domain user count>".
 
     The broad-group "all enabled domain users" decision flows from the EXPLICIT
     boolean ``meta.affected_users_all_enabled`` the materializer stamps from the
@@ -1136,12 +1181,34 @@ def compute_exposure_kpis(
     any_tier_map: dict[str, dict[str, str]] = {
         cls: {} for cls in _KPI_COMPROMISE_CLASSES
     }
+    # Domain-level proven-no-credential signal (the zero-cred headline lead the
+    # report/web consume). Set when any record is a proven ``domain_breaker`` path
+    # whose source is the synthetic Unauthenticated entry node — i.e. a full
+    # domain compromise that starts with no credential at all.
+    unauth_domain_breaker_present = False
+    unauth_domain_breaker_reached_via = REACHED_VIA_NULL_SESSION
 
     for index, record in enumerate(records):
         cls = str(record.get("compromise_class") or "").strip().lower()
         if cls not in path_axis:
             continue
         status = _reconcile_status(record, has_exec_by_index[index])
+
+        record_nodes = record.get("nodes")
+        source_label = (
+            str(record_nodes[0] or "").strip()
+            if isinstance(record_nodes, list) and record_nodes
+            else ""
+        )
+        if is_proven_unauthenticated_domain_breaker(
+            compromise_class=cls,
+            status=status,
+            is_unauthenticated_entry=is_unauthenticated_entry_label(source_label),
+        ):
+            unauth_domain_breaker_present = True
+            unauth_domain_breaker_reached_via = reached_via_from_entry_label(
+                source_label
+            )
 
         path_axis[cls][status] = path_axis[cls].get(status, 0) + 1
         path_axis[cls]["total"] = path_axis[cls].get("total", 0) + 1
@@ -1182,10 +1249,11 @@ def compute_exposure_kpis(
         broad-group path whose membership could not be resolved at all, where
         the alternative is printing 0 for a population known to be domain-wide.
 
-        The count is also what the Tier 0/1/2 breakdown has to reconcile
-        against before either surface may show the tier split, so an inflated
-        count does not merely overstate — it silently suppresses the
-        non-circular ordinary-account headline both documents lead with.
+        The ordinary-account numerator is ALWAYS a count of named principals —
+        never a maximum-exposure ceiling. The synthetic Unauthenticated entry
+        carries its ceiling on ``meta.affected_principal_count`` for attack-path
+        severity / containment only; its KPI contribution is the enabled Tier-2
+        users actually on the path, exactly like any other record.
         """
         resolved = len(users)
         if resolved:
@@ -1199,12 +1267,25 @@ def compute_exposure_kpis(
             return 0.0
         return min(100.0, round(count / user_total * 100.0, 1))
 
+    # A PROVEN no-credential DOMAIN BREAKER has the broadest exposure there is:
+    # it needs no account, and owning the domain owns every account. So that
+    # class's blast radius is the WHOLE measured population — saturate its ``any``
+    # bucket to the population the denominator itself enumerates, which makes the
+    # numerator the real enabled count, IMPOSSIBLE to exceed the denominator, and
+    # reconciled with its Tier split. Gated tightly so every other class / domain
+    # is byte-identical. Needs the enumerated population (and its count) to state
+    # "N of N".
+    saturate_classes: set[str] = set()
+    if unauth_domain_breaker_present and population and user_total > 0:
+        saturate_classes.add("domain_breaker")
+
     user_axis: dict[str, dict[str, Any]] = {}
     for cls in _KPI_COMPROMISE_CLASSES:
         per_status: dict[str, Any] = {}
         for status, users in per_status_users[cls].items():
             status_count, status_all = _resolve_population(
-                users, per_status_all_users[cls].get(status, False)
+                users,
+                per_status_all_users[cls].get(status, False),
             )
             per_status[status] = {
                 "count": status_count,
@@ -1213,9 +1294,23 @@ def compute_exposure_kpis(
         any_count, any_covers_domain = _resolve_population(
             any_users[cls], any_all_users[cls]
         )
-        accounts, accounts_truncated = _serialize_affected_accounts(any_users[cls])
+        any_accounts_set = any_users[cls]
+        any_breakdown = dict(any_tier_breakdown[cls])
+        any_account_tier_map: Mapping[str, str] = any_tier_map[cls]
+        if cls in saturate_classes:
+            # Maximum-exposure saturation: the affected set IS the full population.
+            any_accounts_set = set(population)
+            any_count = len(any_accounts_set)
+            any_covers_domain = True
+            any_account_tier_map = {
+                user: any_tier_map[cls].get(user, "tier2") for user in any_accounts_set
+            }
+            any_breakdown = _coarse_breakdown_for_population(
+                population_tier_breakdown, any_accounts_set, any_account_tier_map
+            )
+        accounts, accounts_truncated = _serialize_affected_accounts(any_accounts_set)
         unaffected, unaffected_truncated = _serialize_affected_accounts(
-            population - any_users[cls]
+            population - any_accounts_set
         )
         per_status["any"] = {
             "count": any_count,
@@ -1229,13 +1324,13 @@ def compute_exposure_kpis(
             # which is the product delta the deliverable headlines.
             "affected_accounts": accounts,
             "affected_accounts_truncated": accounts_truncated,
-            "tier_breakdown": dict(any_tier_breakdown[cls]),
+            "tier_breakdown": any_breakdown,
             # Per-account fine Privilege Tier (additive; backward-compatible with
             # the string ``affected_accounts`` above). Aligned 1:1 with that list
             # (same sort + cap) so each drill-down row can carry its own tier
             # badge. The fine tiers fold back onto ``tier_breakdown`` exactly.
             "affected_accounts_detail": _serialize_affected_accounts_detail(
-                accounts, any_tier_map[cls]
+                accounts, any_account_tier_map
             ),
             # The complement: enabled accounts that hold NO path of this class.
             # Named because a negative fact stated well is a positive result —
@@ -1272,6 +1367,15 @@ def compute_exposure_kpis(
     )
 
     block["hardening_avenue_count"] = count_distinct_hardening_avenues(records)
+    if unauth_domain_breaker_present:
+        # The zero-credential headline lead: a PROVEN full-domain-compromise path
+        # that begins at the synthetic Unauthenticated entry (no credential at
+        # all). Stamped for the report/web to LEAD with; this engine only records
+        # the fact and the bind mechanism (null / guest).
+        block["unauthenticated_domain_breaker"] = {
+            "present": True,
+            "reached_via": unauth_domain_breaker_reached_via,
+        }
     if excluded:
         # Why the denominator reads as it does. A reader who counts the accounts
         # in the appendix and lands one short is owed the reason, and the reason
@@ -1743,7 +1847,12 @@ def compute_exposure_score(
 
     # Per-compromise-class breakdown (union restricted to each class).
     by_class: dict[str, float] = {}
-    for cls in ("domain_breaker", "tier0_foothold", "privileged_escalator", "compromise_enabler"):
+    for cls in (
+        "domain_breaker",
+        "tier0_foothold",
+        "privileged_escalator",
+        "compromise_enabler",
+    ):
         cls_weights = [
             w
             for w, _, rec in weighted
@@ -1813,7 +1922,11 @@ def _build_explanation(
             "a low-privilege foothold to any Tier-0 / Domain Admin target was "
             "found in this scan."
         )
-    start_label = "an already-compromised principal" if scope == "owned" else "a low-privilege user"
+    start_label = (
+        "an already-compromised principal"
+        if scope == "owned"
+        else "a low-privilege user"
+    )
     tier0_label = (
         f"{reachable_tier0} of {total_tier0} Tier-0 targets"
         if total_tier0

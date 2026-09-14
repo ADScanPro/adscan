@@ -45,6 +45,143 @@ BOUNDED_CAVEAT: str = (
 CHOKEPOINT_MAX_ROWS: int = 10
 
 
+#: Well-known principals a client cannot action as a structural fix. A node
+#: total-cut that lands on one of these ("remove BUILTIN\\Administrators",
+#: "delete Everyone") is not a remediation, so it is structural noise in a
+#: client-facing choke-point section (the node total-cut is a durability signal,
+#: not a lead). The SID set is primary and precise; the name set is the fallback
+#: when only a display label is in hand. These SIDs are Microsoft constants and
+#: never change, so a small self-contained set keeps this module engine-free.
+NONACTIONABLE_WELLKNOWN_CHOKE_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-1-0",  # Everyone
+        "S-1-5-7",  # Anonymous Logon
+        "S-1-5-11",  # Authenticated Users
+        "S-1-5-32-544",  # BUILTIN\Administrators
+        "S-1-5-32-545",  # BUILTIN\Users
+        "S-1-5-32-546",  # BUILTIN\Guests
+    }
+)
+
+#: Non-actionable well-known RIDs on a domain SID (S-1-5-21-<auth>-<RID>).
+_NONACTIONABLE_WELLKNOWN_RIDS: frozenset[str] = frozenset({"501", "513", "515"})
+
+NONACTIONABLE_WELLKNOWN_CHOKE_NAMES: frozenset[str] = frozenset(
+    {
+        "everyone",
+        "authenticated users",
+        "anonymous",
+        "anonymous logon",
+        "guest",
+        "guests",
+        "users",
+        "administrators",
+        "builtin\\administrators",
+        "builtin\\users",
+        "builtin\\guests",
+        "domain users",
+        "domain computers",
+    }
+)
+
+#: Severity label -> ordering rank (lower = more severe), so structural node
+#: chokes and identity chokes order together on one scale.
+CHOKE_SEVERITY_ORDER: dict[str, int] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "informational": 4,
+    "info": 4,
+}
+
+_CHOKE_SEVERITY_LABELS: dict[str, str] = {
+    "critical": "Critical",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+    "info": "Informational",
+    "informational": "Informational",
+}
+
+
+def is_nonactionable_structural_choke(
+    node_id: str | None, object_label: str | None
+) -> bool:
+    """Whether a node choke lands on a well-known principal a client cannot remove.
+
+    Pure (``__future__``/typing only), so the PRO renderer, the LITE report and
+    the web CTEM share ONE definition. Detected by well-known SID (precise: the
+    named set, any ``S-1-5-32-*`` BUILTIN local group, and the non-actionable
+    domain RIDs 501/513/515) and by canonical display name (fallback).
+    Generalized over every well-known principal, not a per-engagement filter.
+    """
+    raw = str(node_id or "").strip()
+    bare = raw.split("name:", 1)[-1].strip() if raw.lower().startswith("name:") else raw
+    sid = bare.upper()
+    if sid in NONACTIONABLE_WELLKNOWN_CHOKE_SIDS:
+        return True
+    if sid.startswith("S-1-5-32-"):
+        return True
+    if sid.startswith("S-1-5-21-"):
+        rid = sid.rsplit("-", 1)[-1]
+        if rid in _NONACTIONABLE_WELLKNOWN_RIDS:
+            return True
+    short = str(object_label or "").strip().lower().split("@", 1)[0].strip()
+    return short in NONACTIONABLE_WELLKNOWN_CHOKE_NAMES
+
+
+def build_identity_choke_rows(identity_choke_points: object) -> list[dict]:
+    """Build actionable choke rows from a per-domain identity-choke snapshot.
+
+    An identity choke is a membership articulation that puts many accounts one
+    step from a privileged group (e.g. ``DEV SUPPORT -> BACKUP OPERATORS``) — the
+    kind of choke a client can actually fix, unlike a well-known node total-cut.
+    Surfaces only the MATERIAL ones (critical/high) whose source is itself
+    actionable. ``accounts_affected`` is how many accounts lose the exposure once
+    the membership is corrected. Pure and shared, so the deliverable and the web
+    CTEM select the same chokes.
+    """
+    if not isinstance(identity_choke_points, list):
+        return []
+    rows: list[dict] = []
+    for cp in identity_choke_points:
+        if not isinstance(cp, dict):
+            continue
+        sev = str(cp.get("severity") or "").strip().lower()
+        rank = CHOKE_SEVERITY_ORDER.get(sev, 9)
+        if rank > 1:  # material chokes only — critical / high
+            continue
+        src = str(cp.get("source_label") or "").strip()
+        tgt = str(cp.get("target_label") or "").strip()
+        if not src or not tgt:
+            continue
+        if is_nonactionable_structural_choke("", src):
+            continue
+        affected = 0
+        for key in ("affected_user_count", "blast_radius"):
+            try:
+                candidate = int(cp.get(key) or 0)
+            except (TypeError, ValueError):
+                candidate = 0
+            if candidate:
+                affected = candidate
+                break
+        rows.append(
+            {
+                "object": f"{src} → {tgt}",
+                "protected_target": tgt,
+                "severity": _CHOKE_SEVERITY_LABELS.get(sev, sev.title() or "High"),
+                "severity_rank": rank,
+                "routes_severed": affected,
+                "accounts_affected": affected,
+                "kind": "identity",
+                "_node_id": "",
+            }
+        )
+    return rows
+
+
 def is_structural_choke(
     choke_point_id: str | None, node_cardinality: Mapping[str, int]
 ) -> bool:
@@ -350,3 +487,29 @@ def remediation_start_here_headline(
             f"({top_paths_broken:,} of {total_validated_paths:,})."
         )
     return f"{lead} ({top_paths_broken:,} of {total_validated_paths:,})."
+
+
+def remediation_chain_note(tied_count: int) -> str:
+    """Return the note for a "Start here" lead ranked entirely by one chain.
+
+    When ADscan's validated attack paths in scope form a single kill chain,
+    every fix on it eliminates the SAME path count — the item line above
+    would otherwise repeat "Eliminates N of N validated attack paths" on
+    every one of the leading rows, which reads as either a duplicate or a
+    coincidence rather than the real reason: there is only one route, and
+    each of these rows is a different place to cut it.
+
+    Args:
+        tied_count: How many leading rows share the identical paths-broken
+            count (always >= 2 when this note is shown).
+
+    Returns:
+        A single human-grade English sentence naming the tie and pointing the
+        client at the ordering rule this module applies in that case
+        (cheapest fix first). No percentage, no em-dash.
+    """
+    return (
+        f"The top {tied_count} fixes below sit on the same attack chain, so "
+        f"each one alone breaks every path it covers. They are ordered by "
+        f"how much effort each takes to apply, cheapest first."
+    )

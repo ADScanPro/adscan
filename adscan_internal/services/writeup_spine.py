@@ -64,6 +64,7 @@ into a site by accident. Nothing in this module publishes, uploads or shares.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import shutil
 from dataclasses import dataclass
@@ -72,6 +73,14 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
+from adscan_core.reporting.unauthenticated_reach import (
+    REACHED_VIA_NULL_SESSION,
+    UNAUTHENTICATED_REACH_BADGE,
+    is_unauthenticated_entry_label,
+    notes_are_unauthenticated_reachable,
+    reached_via_from_notes,
+    unauthenticated_reach_view,
+)
 from adscan_core.rich_output import print_error, print_exception, print_info
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.services import cleanup_taxonomy
@@ -445,6 +454,29 @@ class SpineStep:
     #: that needed no credential at all to reach — read straight from the graph,
     #: never inferred.
     discovered_unauth: bool = False
+    #: True when the graph edge's own ``notes.unauthenticated_reachable`` records
+    #: this edge's read as PROVEN over an SMB null session (no credential at all).
+    #: Stamped by the share-credential provenance service ONLY for a read
+    #: genuinely proven over the null-session phase — never inferred from a broad
+    #: source SID. This is the path's severity multiplier: when the ENTRY step
+    #: carries it, the whole run began with no credential, and the writeup's entry
+    #: framing and a per-step badge say so. Distinct from ``discovered_unauth``
+    #: (which tracks only the weaker ``notes.origin`` provenance marker).
+    unauthenticated_reachable: bool = False
+    #: Which bind performed the proven no-credential read — ``null_session`` (the
+    #: default) or ``guest_session``. Carried from the edge's ``notes.reached_via``
+    #: so the entry badge states the real mechanism (a null-session read and a
+    #: guest-session read are honestly different), never a hardcoded "null session".
+    reached_via: str = REACHED_VIA_NULL_SESSION
+    #: Extra read-capable source principals for this edge, beyond ``source``.
+    #: Populated ONLY when several graph edges describe the SAME attack — one
+    #: technique, one recovered secret, one artifact — reachable from MORE THAN
+    #: one principal (e.g. a GPP cpassword in SYSVOL readable by both ``Everyone``
+    #: and ``Domain Users``). The teaching prose is then narrated ONCE and names
+    #: every reader parenthetically; the raw per-principal edges stay intact in
+    #: ``chain_steps`` for the route map and the mermaid diagram, so the graph
+    #: never loses a principal. Empty for an ordinary single-source step.
+    sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +569,30 @@ class FlagRow:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagramHop:
+    """One hop of the connected teaching diagram ("The chain" mermaid).
+
+    The diagram renders the CONNECTED materialized path (every node source-to-
+    target, including the ``MemberOf`` pivots that bridge the proven edges),
+    NOT the raw per-principal proven edges — those stay in ``chain_steps`` for
+    the route map and the per-step prose. Without the pivots the proven edges
+    are sourced from well-known groups (Everyone / Authenticated Users) and draw
+    as disconnected fragments; the connected spine starts at the run's real
+    entry (the synthetic ``Unauthenticated`` node for a no-credential path) and
+    reads as one linear story.
+
+    ``solid`` drives the arrow style: a proven technique hop or a structural
+    membership pivot is solid (a fact), an unproven hop dashed (present in the
+    graph, not walked).
+    """
+
+    source: str
+    target: str
+    label: str
+    solid: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AltRoute:
     """Another chain the graph carried to a comparable target.
 
@@ -580,8 +636,21 @@ class SpineInputs:
     terminal_proven: bool = False
     start_principal: str | None = None
     start_principal_note: str | None = None
+    #: True when the chain's ENTRY edge was proven executable with NO credential
+    #: (a share/file read over an SMB null session — ``notes.unauthenticated_
+    #: reachable``). The run did not START with ``start_principal`` as a handed
+    #: credential; it reached the entry point unauthenticated and DERIVED that
+    #: principal from what it read. The target card and the entry framing say so
+    #: rather than listing the derived principal as a "Starting credential".
+    started_unauthenticated: bool = False
     chain_nodes: tuple[str, ...] = ()
     chain_steps: tuple[SpineStep, ...] = ()
+    #: The connected teaching diagram ("The chain" mermaid): the materialized
+    #: path source-to-target, starting at the run's real entry node, with the
+    #: ``MemberOf`` pivots that bridge the proven edges. Empty when no connected
+    #: materialized path matches the narrated chain — the mermaid then falls back
+    #: to ``chain_steps`` (the raw proven edges), preserving prior behaviour.
+    diagram_hops: tuple[DiagramHop, ...] = ()
     #: ``(shown, proven_total)`` — how many of the edges the run PROVED appear in
     #: the chain below, out of every proven edge. ``None`` when the run proved
     #: nothing (the chain, if any, is the theoretical fallback). Drives the
@@ -1257,9 +1326,93 @@ def _build_steps(
                 catalog_step={"action": relation, "details": catalog_details},
                 discovered_unauth=str(details.get("origin") or "").strip().lower()
                 == "unauth_enrichment",
+                unauthenticated_reachable=notes_are_unauthenticated_reachable(details),
+                reached_via=reached_via_from_notes(details),
             )
         )
     return steps
+
+
+def _step_artifact(step: SpineStep) -> str:
+    """Return the on-disk artifact a step's credential was read from, if any.
+
+    The artifact (the SYSVOL file holding a GPP cpassword, a share path) is the
+    third axis of the de-dup key below: two edges that recovered the SAME secret
+    from the SAME file by the SAME technique are the SAME attack, narrated once.
+    Read from the raw step ``details`` so it is the exact value the graph carried,
+    not the already-labelled evidence string.
+    """
+    details = (step.catalog_step or {}).get("details")
+    if not isinstance(details, dict):
+        return ""
+    for key in ("artifact", "share_path", "share"):
+        value = details.get(key)
+        if value:
+            return _flatten_detail(value).strip()
+    return ""
+
+
+def _read_collapse_key(step: SpineStep) -> tuple[str, str, str] | None:
+    """Return the ``(technique, recovered-secret, artifact)`` key a read step folds on.
+
+    The recovered-secret proxy is the target account: a credential READ (not a
+    modification) that lands on one account, by one technique, from one artifact,
+    recovers that account's one secret — so two such edges differing only in their
+    SOURCE principal describe the SAME recovered secret. ``None`` for a step that
+    is not a credential read (no target account, or a membership/context edge):
+    those never collapse, because distinct sources mean distinct attacks there.
+    """
+    if step.is_context or not step.target_is_account:
+        return None
+    artifact = _step_artifact(step)
+    if not artifact:
+        return None
+    return (
+        _technique_key(step.technique.relation),
+        step.target.strip().lower(),
+        artifact,
+    )
+
+
+def _collapse_multi_source_read_steps(steps: list[SpineStep]) -> list[SpineStep]:
+    """Fold edges that narrate the SAME read (technique × secret × artifact) into one.
+
+    Several principals can be able to read one credential — a GPP cpassword in
+    SYSVOL is readable by ``Everyone`` AND ``Domain Users`` — and the graph
+    records one edge per reader. They are the SAME attack: narrating the full
+    teaching step once per reader is duplicated prose, the NOT-PREMIUM defect.
+
+    So the first edge of each ``(technique, recovered-secret, artifact)`` group is
+    kept and its ``sources`` tuple gains every OTHER reader; the duplicate edges
+    are dropped from the teaching view. Completeness is preserved on two axes: the
+    merged step still names every reader (rendered parenthetically), and the RAW
+    per-principal edges are untouched in ``chain_steps``, which is what the route
+    map and the mermaid diagram read — so the graph never loses a principal. Order
+    is preserved; a step with no collapse key (a modification, a membership hop, or
+    a read with no artifact) passes through unchanged.
+    """
+    first_by_key: dict[tuple[str, str, str], int] = {}
+    extra_sources: dict[int, list[str]] = {}
+    kept: list[SpineStep] = []
+    for step in steps:
+        key = _read_collapse_key(step)
+        if key is not None and key in first_by_key:
+            anchor = first_by_key[key]
+            bucket = extra_sources.setdefault(anchor, [])
+            if step.source and step.source not in bucket:
+                bucket.append(step.source)
+            continue
+        if key is not None:
+            first_by_key[key] = len(kept)
+        kept.append(step)
+    if not extra_sources:
+        return steps
+    return [
+        dataclasses.replace(step, sources=tuple(extra_sources.get(i, ())))
+        if i in extra_sources
+        else step
+        for i, step in enumerate(kept)
+    ]
 
 
 def _lookup_ci(mapping: dict[str, Any] | None, key: str) -> Any:
@@ -1479,7 +1632,9 @@ def _collect_credentials(domain_data: dict[str, Any]) -> tuple[CredentialRow, ..
         else:
             origin = None
         rows.append(
-            CredentialRow(principal=principal, secret_kind=kind, origin=origin, value=secret)
+            CredentialRow(
+                principal=principal, secret_kind=kind, origin=origin, value=secret
+            )
         )
     return tuple(rows)
 
@@ -1982,9 +2137,34 @@ def collect_spine_inputs(
         if primary
         else []
     )
+    # Stages narrate the TEACHING prose, so they fold several edges that describe
+    # the same read (one technique, one recovered secret, one artifact — readable
+    # by more than one principal) into one step that lists every reader. The raw
+    # ``chain_steps`` below are left intact, so the mermaid diagram and the route
+    # map still carry one edge per principal and the graph loses nobody.
+    teaching_steps = _collapse_multi_source_read_steps(chain_steps)
     stages, terminal_steps = _split_into_stages(
-        chain_steps, credential_meta=credential_meta, credentials=credentials
+        teaching_steps, credential_meta=credential_meta, credentials=credentials
     )
+    # The teaching DIAGRAM ("The chain") renders the CONNECTED materialized path
+    # (with the MemberOf pivots that bridge the proven edges, starting at the
+    # run's real entry node), not the raw per-principal proven edges — those
+    # would draw as disconnected fragments whenever a well-known group sources an
+    # edge. chain_steps stays the raw edges for the route map and per-step prose.
+    # When no canonical path matches the proven chain's terminal, diagram_hops is
+    # empty and the mermaid falls back to chain_steps (prior behaviour).
+    diagram_hops: tuple[DiagramHop, ...] = ()
+    if primary and chain_steps:
+        diagram_path = _canonical_diagram_path(ordered, primary)
+        if diagram_path is not None:
+            diagram_hops, diagram_coverage = _build_diagram_hops(
+                diagram_path, chain_steps, accounts=accounts, domain=domain
+            )
+            # The coverage line sits under the diagram, so it must count what the
+            # diagram shows (distinct proven attacks, well-known-source duplicates
+            # folded) rather than the raw proven-edge tally.
+            if diagram_hops and diagram_coverage is not None:
+                chain_coverage = diagram_coverage
     chain_nodes = tuple(
         display_node(str(n), accounts=accounts, domain=domain)
         for n in (primary.get("nodes") or [])
@@ -2059,7 +2239,21 @@ def collect_spine_inputs(
         ),
         None,
     )
-    if start_row is None or not start_row.origin:
+    # The path's ENTRY edge is the foothold. When it was proven executable with
+    # NO credential (a null-session share read), the run did not START with
+    # ``start_principal`` as a handed credential — it reached the entry point
+    # unauthenticated and DERIVED that principal. The first non-context chain
+    # step is the entry; a purely-theoretical chain with no such step leaves this
+    # False (no fabrication). This drives both the target-card framing and the
+    # entry-section line, correcting a Target table that otherwise reads
+    # "Starting credential: <derived-principal>" as if it were supplied.
+    started_unauthenticated = next(
+        (step.unauthenticated_reachable for step in chain_steps if not step.is_context),
+        False,
+    )
+    if started_unauthenticated:
+        start_principal_note = "derived — no starting credential"
+    elif start_row is None or not start_row.origin:
         start_principal_note = None
     elif start_row.origin == _ORIGIN_SUPPLIED:
         start_principal_note = "supplied"
@@ -2103,8 +2297,10 @@ def collect_spine_inputs(
         terminal_proven=terminal_proven,
         start_principal=start_principal or None,
         start_principal_note=start_principal_note,
+        started_unauthenticated=started_unauthenticated,
         chain_nodes=chain_nodes,
         chain_steps=tuple(chain_steps),
+        diagram_hops=diagram_hops,
         chain_coverage=chain_coverage,
         alt_routes=tuple(alt_routes),
         dead_ends=_collect_dead_ends(
@@ -2136,6 +2332,113 @@ def _mermaid_label(value: str) -> str:
     return str(value or "").replace('"', "#quot;").replace("\n", " ").strip()
 
 
+def _diagram_node_label(raw: str, *, accounts: frozenset[str], domain: str) -> str:
+    """Return a diagram node label, preserving the synthetic entry label verbatim.
+
+    A real principal is written the operator's way (``display_node`` lower-cases
+    accounts and strips the realm). The synthetic ``Unauthenticated (null
+    session)`` entry node is NOT a directory principal, so it keeps its exact
+    minted casing — the diagram has to start at a node a reader recognises as
+    "no credential", not a lower-cased mangling of it.
+    """
+    if is_unauthenticated_entry_label(raw):
+        return str(raw).strip()
+    return display_node(raw, accounts=accounts, domain=domain)
+
+
+def _canonical_diagram_path(
+    ordered: list[dict[str, Any]], primary: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return the canonical materialized path to draw as the connected spine.
+
+    The proven-edge chain (``primary``) is correct for the per-step prose but its
+    edges do not join into one picture when they are sourced from well-known
+    groups bridged by ``MemberOf`` pivots (the Active case: Everyone/Users read a
+    GPP cpassword, Authenticated Users roasts, all disconnected). The canonical
+    domain-scoped path carries the SAME journey WITH those pivots, connected
+    source-to-target and starting at the run's real entry node.
+
+    Matched by TERMINAL: the first canonical path whose last node is the proven
+    chain's terminal. Returns ``None`` when no canonical path reaches that
+    terminal (a theoretical / unmatched chain), so the caller falls back to the
+    raw ``chain_steps`` diagram and nothing regresses.
+    """
+    terminal = _group_token(str(primary.get("target") or ""))
+    if not terminal:
+        return None
+    for path in ordered:
+        if not isinstance(path, dict):
+            continue
+        nodes = path.get("nodes")
+        steps = path.get("steps")
+        if not isinstance(nodes, list) or not nodes or not isinstance(steps, list):
+            continue
+        if _group_token(str(nodes[-1])) == terminal:
+            return path
+    return None
+
+
+def _build_diagram_hops(
+    path: dict[str, Any],
+    chain_steps: list[SpineStep],
+    *,
+    accounts: frozenset[str],
+    domain: str,
+) -> tuple[tuple[DiagramHop, ...], tuple[int, int] | None]:
+    """Build the connected diagram hops from a canonical path + the proven set.
+
+    The SKELETON (nodes, order, relation labels, the ``MemberOf`` pivots) comes
+    from the canonical materialized ``path``; whether a technique hop is PROVEN
+    comes from ``chain_steps`` (which already merged the run's execution events
+    and the credential store), NOT from the canonical path's own step status —
+    so a hop proven only at run time still draws solid.
+
+    Coverage is counted over DISTINCT proven attacks (``(technique, target)``),
+    so two well-known-source edges that recovered the same secret by the same
+    technique (Everyone + Users reading one GPP file) count as ONE, and the
+    diagram's edge count matches what a reader sees.
+    """
+    steps = path.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return (), None
+
+    proven_keys = {
+        (_technique_key(s.technique.relation), _node_account(s.target).strip().upper())
+        for s in chain_steps
+        if s.outcome == "success" and not s.is_context
+    }
+
+    hops: list[DiagramHop] = []
+    shown_keys: set[tuple[str, str]] = set()
+    for raw in steps:
+        if not isinstance(raw, dict):
+            continue
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        relation = str(raw.get("action") or raw.get("relation") or "")
+        src_raw = str(details.get("from") or "")
+        dst_raw = str(details.get("to") or "")
+        if not src_raw or not dst_raw:
+            continue
+        structural = normalize_relation(relation) in _STRUCTURAL_RELATIONS
+        dst_label = _diagram_node_label(dst_raw, accounts=accounts, domain=domain)
+        key = (_technique_key(relation), _node_account(dst_label).strip().upper())
+        proven = (not structural) and key in proven_keys
+        if proven:
+            shown_keys.add(key)
+        hops.append(
+            DiagramHop(
+                source=_diagram_node_label(src_raw, accounts=accounts, domain=domain),
+                target=dst_label,
+                label="member of" if structural else technique_for(relation).name,
+                solid=structural or proven,
+            )
+        )
+
+    total = len(proven_keys)
+    coverage = (len(shown_keys), total) if total else None
+    return tuple(hops), coverage
+
+
 def _render_mermaid(inputs: SpineInputs) -> list[str]:
     """Return the chain as a mermaid flowchart.
 
@@ -2144,25 +2447,46 @@ def _render_mermaid(inputs: SpineInputs) -> list[str]:
     Proven hops get a solid arrow, graph-only hops a dashed one, so the picture
     states what was proven without a caption claiming it. A membership hop is
     solid: it is a fact read out of the directory, not a step that was skipped.
+
+    When a connected materialized spine is available (``diagram_hops``) it is
+    drawn — one linear story from the run's real entry node through the
+    ``MemberOf`` pivots to the terminal. Otherwise the raw proven ``chain_steps``
+    are drawn (the theoretical / unmatched-terminal fallback).
     """
-    if not inputs.chain_steps:
+    if inputs.diagram_hops:
+        edges: list[tuple[str, str, str, bool]] = [
+            (h.source, h.target, h.label, h.solid)
+            for h in inputs.diagram_hops
+            if h.source and h.target
+        ]
+    elif inputs.chain_steps:
+        edges = [
+            (
+                step.source,
+                step.target,
+                step.technique.name,
+                step.outcome == "success" or step.is_context,
+            )
+            for step in inputs.chain_steps
+            if step.source and step.target
+        ]
+    else:
+        return []
+    if not edges:
         return []
     lines = ["```mermaid", "flowchart TD"]
     nodes: list[str] = []
-    for step in inputs.chain_steps:
-        for endpoint in (step.source, step.target):
+    for source, target, _label, _solid in edges:
+        for endpoint in (source, target):
             if endpoint and endpoint not in nodes:
                 nodes.append(endpoint)
     ids = {node: f"n{i}" for i, node in enumerate(nodes)}
     for node in nodes:
         lines.append(f'    {ids[node]}["{_mermaid_label(node)}"]')
-    for step in inputs.chain_steps:
-        if not step.source or not step.target:
-            continue
-        arrow = "-->" if step.outcome == "success" or step.is_context else "-.->"
+    for source, target, label, solid in edges:
+        arrow = "-->" if solid else "-.->"
         lines.append(
-            f"    {ids[step.source]} {arrow}|{_mermaid_label(step.technique.name)}| "
-            f"{ids[step.target]}"
+            f"    {ids[source]} {arrow}|{_mermaid_label(label)}| {ids[target]}"
         )
     lines.append("```")
     lines.append("")
@@ -2272,6 +2596,84 @@ def _render_step_command_block(catalog_step: dict[str, Any]) -> list[str]:
     return ["```text", command, "```", ""]
 
 
+#: The one extra sentence a Kerberoasting step earns when its roasted account is
+#: itself a domain-admin-equivalent (``to_control_level == "direct_domain_control"``).
+#: Kerberoasting normally lands on a low-privileged service account that then needs
+#: further pivoting, so roasting straight onto the control plane with no intermediate
+#: hop is the unusual, quotable part of the chain, and a reader learns why it matters.
+#: Two phrasings, because the gate is broader than the built-in Administrator: ANY
+#: Tier-0 account (a Domain-Admin-member service account included) trips
+#: direct_domain_control, so the SPECIFIC "built-in Administrator" claim is only true
+#: when the roasted target really is RID 500. For any other Tier-0 target use the
+#: honest generic phrasing — either way the no-intermediate-pivot point stays.
+_KERBEROAST_BUILTIN_ADMIN_TWIST: str = (
+    "Kerberoasting usually targets a low-privileged service account, but here the "
+    "SPN sits on the built-in Administrator itself, so the roast lands straight on "
+    "a domain-admin-equivalent account with no intermediate pivot."
+)
+_KERBEROAST_DA_EQUIVALENT_TWIST: str = (
+    "Kerberoasting usually targets a low-privileged service account, but here the "
+    "SPN sits on a domain-admin-equivalent account, so the roast lands straight on "
+    "domain-admin-equivalent control with no intermediate pivot."
+)
+
+
+def _roasted_target_is_builtin_administrator(
+    step: SpineStep, details: dict[str, Any]
+) -> bool:
+    """Return whether the roasted target is the built-in Administrator (RID 500).
+
+    Checks, dependency-free, both signals available on the step: a target SID
+    ending in ``-500`` (the canonical built-in Administrator RID), or the target
+    account name resolving to ``administrator`` (its reserved sAMAccountName).
+    A DA-member SERVICE account (Tier 0, so it trips the direct-domain-control
+    gate) is NOT the built-in Administrator, so it returns ``False`` and the
+    caller uses the honest generic phrasing.
+    """
+    for key in ("target_sid", "to_sid", "objectid", "object_id", "sid"):
+        sid = str(details.get(key) or "").strip().upper()
+        if sid.startswith("S-1-5-21-") and sid.endswith("-500"):
+            return True
+    candidates = [
+        details.get("to"),
+        details.get("target_label"),
+        details.get("target"),
+        step.target,
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            if _node_account(value).strip().lower() == "administrator":
+                return True
+    return False
+
+
+def _kerberoast_direct_domain_twist(step: SpineStep) -> str:
+    """Return the twist sentence for a Kerberoast that lands on the control plane.
+
+    Gated to a Kerberoasting step whose roasted target directly controls the
+    domain (``to_control_level == "direct_domain_control"``). That gate is
+    broader than the built-in Administrator — any Tier-0 account (a Domain-Admin
+    member service account included) trips it — so the SPECIFIC "built-in
+    Administrator" wording is used only when the target really is RID 500;
+    otherwise the honest generic "domain-admin-equivalent account" phrasing. For
+    an ordinary roast onto a low-privileged service account there is no twist, so
+    this returns ``""`` and the step renders unchanged.
+    """
+    if normalize_relation(step.technique.relation) != "kerberoasting":
+        return ""
+    details = (step.catalog_step or {}).get("details")
+    if not isinstance(details, dict):
+        return ""
+    if (
+        str(details.get("to_control_level") or "").strip().lower()
+        != "direct_domain_control"
+    ):
+        return ""
+    if _roasted_target_is_builtin_administrator(step, details):
+        return _KERBEROAST_BUILTIN_ADMIN_TWIST
+    return _KERBEROAST_DA_EQUIVALENT_TWIST
+
+
 def _render_step(step: SpineStep) -> list[str]:
     """Return one step as a single dense line plus whatever evidence it carries.
 
@@ -2290,7 +2692,21 @@ def _render_step(step: SpineStep) -> list[str]:
         ]
 
     lead: list[str] = []
-    if step.discovered_unauth:
+    if step.unauthenticated_reachable:
+        # The strongest initial-access fact: this read was PROVEN over an SMB
+        # null session — no credential at all. Stated ahead of the step's own
+        # line, with the honest mechanism (the server's null-session access, NOT
+        # an Anonymous permission on the share), so an auditor who looks for an
+        # Anonymous entry in the permissions and does not find one still trusts
+        # the finding. The HOW matches the real bind (null vs guest session) via
+        # the shared SSOT view keyed on the step's reached_via — never a hardcoded
+        # "null session". Supersedes the weaker discovered_unauth line below.
+        unauth_how = unauthenticated_reach_view(reached_via=step.reached_via)["how"]
+        lead = [
+            f"**{UNAUTHENTICATED_REACH_BADGE}.** {unauth_how}",
+            "",
+        ]
+    elif step.discovered_unauth:
         # This is the initial-access fact a graph-edge-only writeup otherwise
         # skips: the credential below was not found by an authenticated
         # technique at all, it turned up in an anonymous SMB sweep before the
@@ -2303,9 +2719,17 @@ def _render_step(step: SpineStep) -> list[str]:
             "",
         ]
 
+    # When several principals could read the same credential (one GPP cpassword
+    # readable by Everyone AND Domain Users), name every reader on the one line
+    # rather than repeating the whole teaching step per reader.
+    if step.sources:
+        readers = _join_names((step.source, *step.sources))
+        endpoints = f"{readers} to `{step.target}`"
+    else:
+        endpoints = f"`{step.source}` to `{step.target}`"
     facts: list[str] = [
         f"**{step.technique.name}**",
-        f"`{step.source}` to `{step.target}`",
+        endpoints,
     ]
     if step.outcome == "success":
         facts.append(_success_phrase(step))
@@ -2336,6 +2760,10 @@ def _render_step(step: SpineStep) -> list[str]:
         if narrative:
             lines.append(narrative)
             lines.append("")
+        twist = _kerberoast_direct_domain_twist(step)
+        if twist:
+            lines.append(twist)
+            lines.append("")
         lines.extend(_render_step_command_block(step.catalog_step))
     if step.evidence:
         lines.append("```text")
@@ -2355,12 +2783,18 @@ def _summary_step_phrase(step: SpineStep) -> str:
     entry, e.g. GPP cpassword at the time of writing) has nothing to render, so
     the chain falls back to the technique's public display name rather than a
     blank link — the reader still sees every hop that happened.
+
+    The catalog narrative is authored as a standalone sentence (trailing
+    period included), but here it is one link in a " → " chain that the
+    caller closes with its own clause (", ending in ..."). A trailing period
+    carried into the middle of that sentence prints as a stray ``.,`` — so the
+    period is dropped here, once, for every caller of this chain link.
     """
     if step.catalog_step is not None:
         narrative = render_step_narrative(step.catalog_step, short=True)
         if narrative:
-            return narrative
-    return step.technique.name
+            return narrative.removesuffix(".")
+    return step.technique.name.removesuffix(".")
 
 
 def _render_summary(inputs: SpineInputs) -> list[str]:
@@ -2381,12 +2815,16 @@ def _render_summary(inputs: SpineInputs) -> list[str]:
     only, no path discovered) falls back to the plainest true sentence: what
     was scanned and what came of it.
     """
+    # The headline counts the ATTACK, so it counts the teaching view: several
+    # edges describing one read (same technique, secret and artifact, different
+    # reader) are one step here, exactly as the stages below narrate them once.
+    teaching_steps = _collapse_multi_source_read_steps(list(inputs.chain_steps))
     proven_steps = [
         step
-        for step in inputs.chain_steps
+        for step in teaching_steps
         if not step.is_context and step.outcome == "success"
     ]
-    discovered_steps = [step for step in inputs.chain_steps if not step.is_context]
+    discovered_steps = [step for step in teaching_steps if not step.is_context]
     if not proven_steps and not discovered_steps:
         return [f"`{inputs.domain}` was enumerated; the graph found no route to walk."]
     if not proven_steps:
@@ -2403,9 +2841,7 @@ def _render_summary(inputs: SpineInputs) -> list[str]:
         if inputs.terminal_proven
         else "a route that did not close"
     )
-    return [
-        f"`{inputs.domain}` falls in {step_count}: {chain}, ending in {outcome}."
-    ]
+    return [f"`{inputs.domain}` falls in {step_count}: {chain}, ending in {outcome}."]
 
 
 def _render_frontmatter(inputs: SpineInputs, *, today: str) -> list[str]:
@@ -2479,16 +2915,27 @@ def _render_target_table(inputs: SpineInputs) -> list[str]:
     else:
         controller = inputs.dc_ip or ""
     start = ""
-    if inputs.start_principal:
+    if inputs.started_unauthenticated:
+        # The run began with NO credential: say that plainly, and name the
+        # derived principal as what the unauthenticated entry YIELDED, not as a
+        # handed starting credential.
+        if inputs.start_principal:
+            start = f"None — unauthenticated start; derived `{inputs.start_principal}`"
+        else:
+            start = "None — unauthenticated start"
+    elif inputs.start_principal:
         start = f"`{inputs.start_principal}`"
         if inputs.start_principal_note:
             start += f" ({inputs.start_principal_note})"
+    start_label = (
+        "Starting access" if inputs.started_unauthenticated else "Starting credential"
+    )
     rows = [
         ("Domain", f"`{inputs.domain}`"),
         ("Domain controller", controller),
         ("Operating system", inputs.operating_system or ""),
         ("Platform", inputs.platform or ""),
-        ("Starting credential", start),
+        (start_label, start),
         ("First step executed", inputs.first_seen or ""),
         ("Last step executed", inputs.last_seen or ""),
     ]
@@ -2726,7 +3173,9 @@ def _terminal_outcome_statement(inputs: SpineInputs) -> str:
     target = last.target
     if not secrets:
         return f"`{technique}` against `{target}` succeeded, confirming {outcome}."
-    kinds = sorted({secret_kind_label(row.secret_kind) or row.secret_kind for row in secrets})
+    kinds = sorted(
+        {secret_kind_label(row.secret_kind) or row.secret_kind for row in secrets}
+    )
     kind_phrase = _join_bare(kinds)
     return (
         f"`{technique}` against `{target}` succeeded, returning "
@@ -2905,7 +3354,7 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
         lines.append(
             f"This is the one chain the run walked end to end. The graph carried "
             f"{_count_phrase(len(inputs.alt_routes), 'other route')} to a "
-            "comparable target — see \"Other routes in the graph\" under Domain "
+            'comparable target — see "Other routes in the graph" under Domain '
             "enumeration for how far each one was verified."
         )
         lines.append("")

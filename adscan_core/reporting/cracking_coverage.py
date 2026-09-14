@@ -47,6 +47,41 @@ AUDIT_BASE_LABEL = "ADscan AD Audit Wordlist"
 #: the advertised audit claim.
 FAST_BASE_WORDLIST = "rockyou.txt"
 
+#: Map an internal base-wordlist filename to the ONE client-facing name the
+#: deliverable brands its cracking corpus with. Both house bases fold to the
+#: audit label: the per-finding line and the methodology note must agree, and a
+#: recovery the fast base made is a recovery the audit corpus (which contains it)
+#: also makes. A genuinely custom/targeted wordlist is NOT one of these and is
+#: returned unchanged (already client-meaningful).
+_CLIENT_WORDLIST_LABELS: dict[str, str] = {
+    AUDIT_BASE_WORDLIST.lower(): AUDIT_BASE_LABEL,
+    AUDIT_BASE_LABEL.lower(): AUDIT_BASE_LABEL,
+    FAST_BASE_WORDLIST.lower(): AUDIT_BASE_LABEL,
+}
+
+
+def client_wordlist_label(name: Any) -> str:
+    """Return the ONE client-facing name for a cracking wordlist.
+
+    The deliverable's methodology note brands its corpus as :data:`AUDIT_BASE_LABEL`;
+    a per-finding line that instead printed the raw base filename (``rockyou.txt``)
+    read as a different, lesser wordlist than the note advertised. This folds the
+    internal base-wordlist names to that one client-facing name so every surface
+    agrees. A non-base (custom/targeted) name is returned unchanged.
+
+    Args:
+        name: The recorded wordlist name (a filename or label). Empty / non-string
+            yields ``""``.
+
+    Returns:
+        The branded audit label for a house base, the trimmed name otherwise.
+    """
+
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    return _CLIENT_WORDLIST_LABELS.get(raw.lower(), raw)
+
 _FULL_STATEMENT = (
     "Password recovery ran at full strength: every recovered hash was tested "
     f"against the {AUDIT_BASE_LABEL}."
@@ -392,6 +427,7 @@ def merge_cracking_coverage(domain_entries: Any) -> dict[str, Any]:
 
 __all__ = [
     "AUDIT_BASE_LABEL",
+    "client_wordlist_label",
     "AUDIT_BASE_WORDLIST",
     "CRACKING_COVERAGE_KEY",
     "FAST_BASE_WORDLIST",

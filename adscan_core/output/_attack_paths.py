@@ -23,6 +23,10 @@ from adscan_core.output._tables import print_table
 from adscan_core.smb_exclusion_policy import (
     is_globally_excluded_smb_share,
 )
+from adscan_core.reporting.unauthenticated_reach import (
+    UNAUTHENTICATED_ENTRY_AFFECTED_SCOPE_PHRASE,
+    UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE,
+)
 
 
 _SHARE_ACCESS_RELATION_KEYS = {
@@ -1874,7 +1878,24 @@ def print_attack_path_detail(
         affected_count = meta.get("affected_principal_count")
         if not isinstance(affected_count, int):
             affected_count = meta.get("affected_user_count")
-        if affected_source:
+        if affected_source == UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE:
+            # Synthetic no-credential entry: the affected set is not a list of
+            # named principals (there is none to enumerate) — it is anyone on the
+            # network with no account. Render the honest scope phrase plus the
+            # max-exposure magnitude, never "N principal(s) via unauthenticated_entry".
+            affected_summary = Text()
+            affected_summary.append("Affected Scope: ", style="bold white")
+            affected_summary.append(
+                UNAUTHENTICATED_ENTRY_AFFECTED_SCOPE_PHRASE,
+                style=BRAND_COLORS["warning"],
+            )
+            if isinstance(affected_count, int) and affected_count > 0:
+                affected_summary.append(
+                    f" (maximum exposure — exceeds any group; up to {affected_count} principals)",
+                    style="dim",
+                )
+            _state._get_console().print(affected_summary)
+        elif affected_source:
             affected_summary = Text()
             affected_summary.append("Affected Scope: ", style="bold white")
             if isinstance(affected_count, int) and affected_count >= 0:

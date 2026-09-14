@@ -191,6 +191,20 @@ class _ShareInfo:
     # broad-group edge ``self_mxac`` with the real effective mask instead of the
     # over-reported raw share grant. ``None`` when not probed / no access.
     self_effective_mask: int | None = None
+    # NTFS-verification tier + the REAL NTFS read-set, finalized by
+    # ``_finalize_share_verification`` once every collection stage above has
+    # run. Mirrors ``share_ntfs_verification.VERIFICATION_*`` (kept as plain
+    # strings here to avoid a module-level import cycle — see that module for
+    # the canonical constants). ``ntfs_computed`` requires BOTH the share SD
+    # and the NTFS folder-root SD to have been readable (READ_CONTROL held on
+    # both) — never left as ``share_acl_only`` when the NTFS SD is obtainable.
+    graph_verification: str = "share_acl_only"
+    # (sid, mask) ALLOW-ACE pairs parsed from the REAL NTFS folder-root SD —
+    # populated only when ``ntfs_sd_bytes`` was actually read. This is the
+    # verified read-set a caller should prefer over the raw share-level
+    # ``aces`` when reporting "who can access this share", since the NTFS
+    # layer can independently narrow (or deny) a share-level grant.
+    ntfs_read_set: list[tuple[str, int]] = field(default_factory=list)
 
 
 def _sd_object_to_bytes(sd_object: object) -> bytes:
@@ -547,7 +561,38 @@ async def collect_shares_for_host(
                     mask |= _FULL
                 share.self_effective_mask = mask
 
+    _finalize_share_verification(shares)
+
     return shares, error_reason
+
+
+def _finalize_share_verification(shares: list[_ShareInfo]) -> None:
+    """Tag each share's NTFS-verification tier and populate its REAL read-set.
+
+    Run once, after every collection stage above (SRVSVC 502, the SMB2 root
+    SD fallback, the NTFS enrich pass, and the MxAc probe) has had a chance to
+    populate ``share_sd_bytes`` / ``ntfs_sd_bytes`` — regardless of WHICH
+    stage supplied the bytes.
+
+    A share-level ACL grant alone over-reports access: the file-system (NTFS)
+    folder-root DACL can independently DENY the same principal (the Cicada
+    DEV/NETLOGON/SYSVOL guest-session over-report — BUG B). Whenever BOTH the
+    share-level SD and the NTFS folder-root SD were actually obtainable (i.e.
+    READ_CONTROL was held on both), the share is tagged ``ntfs_computed`` and
+    its ``ntfs_read_set`` is populated from the REAL NTFS ACEs (BUG A) —
+    never left tagged ``share_acl_only`` (an honest but unverified lead) when
+    the NTFS SD is right there to read. When either SD is unreadable, the
+    share stays ``share_acl_only`` and ``ntfs_read_set`` stays empty — the raw
+    ``aces``/``share_sd_bytes`` are untouched either way, so every existing
+    consumer of the raw share-ACL edge is unaffected.
+    """
+    for share in shares:
+        if share.share_sd_bytes and share.ntfs_sd_bytes:
+            share.graph_verification = "ntfs_computed"
+            share.ntfs_read_set = parse_sd_aces(share.ntfs_sd_bytes)
+        else:
+            share.graph_verification = "share_acl_only"
+            share.ntfs_read_set = []
 
 
 async def _enrich_ntfs_root_sds(

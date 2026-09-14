@@ -228,6 +228,41 @@ _TIER_ZERO_RID_TO_FOLLOWUP_KEY: dict[int, str] = {
 }
 
 
+def is_builtin_or_well_known_group_sid(value: str) -> bool:
+    """Return True when a SID is a BUILTIN local group or a well-known default group.
+
+    These principals' authority over directory objects comes from **built-in
+    default ACLs and membership privileges baked into the schema**, NOT from a
+    delegated ACE an administrator granted (Account Operators can write user and
+    group objects by default, no delegation involved). A report that describes
+    their control as "a single delegated right" is inaccurate, so a client-facing
+    renderer uses this to phrase built-in control as "built-in group privileges"
+    and reserves "delegated right" for a genuinely delegated grant.
+
+    Signal (no directory lookup, pure SID shape):
+
+    * ``S-1-5-32-*`` — the BUILTIN domain (Administrators, Account/Server/Print/
+      Backup Operators, ...): always a built-in local group.
+    * a domain SID (``S-1-5-21-...``) with a RID below 1000: the schema-default
+      objects (Domain Admins, Cert Publishers, ...). Administrator-created
+      principals, the ones a delegated ACE is granted to, start at RID 1000.
+    * a recognized well-known privileged group created with a RID at or above
+      1000 (DnsAdmins, the Exchange groups), from
+      :data:`_TIER_ZERO_RID_TO_FOLLOWUP_KEY`.
+    """
+    sid = normalize_sid(value)
+    if not sid:
+        return False
+    if sid.startswith("S-1-5-32-"):
+        return True
+    rid = sid_rid(sid)
+    if rid is None:
+        return False
+    if rid < 1000:
+        return True
+    return rid in _TIER_ZERO_RID_TO_FOLLOWUP_KEY
+
+
 def classification_basis(
     *, rid: int | None = None, sid: str | None = None
 ) -> str:

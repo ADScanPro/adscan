@@ -39,6 +39,12 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, Literal
 
+from adscan_core.reporting.unauthenticated_reach import (
+    REACHED_VIA_GUEST_SESSION,
+    notes_are_unauthenticated_reachable,
+    reached_via_from_notes,
+)
+
 
 SupportKind = Literal["supported", "unsupported", "policy_blocked", "context"]
 ExecutionTargetAccessRequirement = Literal["none", "computer_reachable"]
@@ -83,15 +89,15 @@ CompromiseEffort = Literal[
     "other",
 ]
 SourceContextRequirement = Literal[
-    "user_credentials",      # DEFAULT — any authenticated principal (most edges)
-    "none",                  # No auth needed (coercion, ASREPRoasting, Timeroasting)
-    "local_admin_session",   # Admin shell on host required (dump-type edges)
-    "machine_credential",    # Machine account TGT/hash required (AllowedToDelegate, RBCD)
-    "mssql_rce_session",     # OS-command RCE channel on the SQL host (XpCmdshell)
-                             # established. Required by the MSSQL SYSTEM-escalation
-                             # follow-ups (SeImpersonate / token-theft), which run
-                             # THROUGH that channel and are recorded only after it
-                             # (mssql.py:run_xpcmdshell_system_escalation_followup).
+    "user_credentials",  # DEFAULT — any authenticated principal (most edges)
+    "none",  # No auth needed (coercion, ASREPRoasting, Timeroasting)
+    "local_admin_session",  # Admin shell on host required (dump-type edges)
+    "machine_credential",  # Machine account TGT/hash required (AllowedToDelegate, RBCD)
+    "mssql_rce_session",  # OS-command RCE channel on the SQL host (XpCmdshell)
+    # established. Required by the MSSQL SYSTEM-escalation
+    # follow-ups (SeImpersonate / token-theft), which run
+    # THROUGH that channel and are recorded only after it
+    # (mssql.py:run_xpcmdshell_system_escalation_followup).
 ]
 
 _COMPLEXITY_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "very_high": 3}
@@ -1011,8 +1017,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description=(
             "The SQL Server service can execute operating-system commands on its host "
             "when a session holds sysadmin. Any principal that reaches sysadmin on the "
-            "instance — a direct sysadmin login, or a linked-server login mapping that "
-            "lands as a sysadmin login on the remote instance — can therefore run "
+            "instance (a direct sysadmin login, or a linked-server login mapping that "
+            "lands as a sysadmin login on the remote instance) can therefore run "
             "commands on the host as the SQL Server service account, a full host "
             "code-execution capability."
         ),
@@ -1056,9 +1062,9 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "SQL Server can read the raw content of any file the SQL Server "
             "service account can access on its host, without executing a "
             "single operating-system command. Any principal holding ADMINISTER "
-            "BULK OPERATIONS — sysadmin, the bulkadmin fixed server role, an "
+            "BULK OPERATIONS (sysadmin, the bulkadmin fixed server role, an "
             "explicit grant, or a linked-server login mapping that lands on the "
-            "same permission remotely — can pull configuration files, backup "
+            "same permission remotely) can pull configuration files, backup "
             "files, and scripts off the host and recover any credentials or "
             "connection strings stored in them."
         ),
@@ -1642,10 +1648,10 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="medium",
         remediation_effort=(
             "Remove the GenericAll ACE from the target object's ACL: inspect it with "
-            "`dsacls \"<targetDN>\"` (or `(Get-Acl \"AD:\\<targetDN>\").Access`), then strip the "
-            "offending entry with `dsacls \"<targetDN>\" /R \"<DOMAIN\\principal>\"`. Audit AD ACLs "
+            '`dsacls "<targetDN>"` (or `(Get-Acl "AD:\\<targetDN>").Access`), then strip the '
+            'offending entry with `dsacls "<targetDN>" /R "<DOMAIN\\principal>"`. Audit AD ACLs '
             "regularly with the native `Get-Acl`/`dsacls` tooling and enforce least-privilege "
-            "delegation — grant only the specific rights required (Delegation of Control wizard or "
+            "delegation: grant only the specific rights required (Delegation of Control wizard or "
             "scoped ACEs), never full control."
         ),
         can_fully_mitigate=True,
@@ -1667,10 +1673,10 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="medium",
         remediation_effort=(
             "Remove the GenericWrite ACE from the target object's ACL: inspect it with "
-            "`dsacls \"<targetDN>\"` (or `(Get-Acl \"AD:\\<targetDN>\").Access`), then strip the "
-            "offending entry with `dsacls \"<targetDN>\" /R \"<DOMAIN\\principal>\"`. Grant back "
+            '`dsacls "<targetDN>"` (or `(Get-Acl "AD:\\<targetDN>").Access`), then strip the '
+            'offending entry with `dsacls "<targetDN>" /R "<DOMAIN\\principal>"`. Grant back '
             "only the specific attributes the delegation needs (`dsacls ... /G "
-            "\"<DOMAIN\\group>:WP;<attribute>\"`), never write access to the whole object — "
+            '"<DOMAIN\\group>:WP;<attribute>"`), never write access to the whole object: '
             "msDS-KeyCredentialLink, servicePrincipalName and "
             "msDS-AllowedToActOnBehalfOfOtherIdentity each hand over the account on their own. "
             "Clear anything already written to those three attributes before removing the ACE, "
@@ -2014,7 +2020,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "to reach into {source}, collapsing the boundary between the two forests."
         ),
         short_narrative_template=(
-            "Forest trust forwards Kerberos TGTs — {target} can escalate into {source}"
+            "Forest trust forwards Kerberos TGTs: {target} can escalate into {source}"
         ),
     ),
     _entry(
@@ -2040,7 +2046,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         vuln_key="raise_child_forest_root",
         remediation_complexity="high",
         remediation_effort=(
-            "Treat every domain in the forest as a single Tier-0 security boundary — "
+            "Treat every domain in the forest as a single Tier-0 security boundary: "
             "a child domain compromise is a forest compromise, so it cannot be fixed "
             "by a per-domain control. Enable SID filtering / quarantine only on "
             "EXTERNAL trusts (it cannot be applied to intra-forest trusts), confirm "
@@ -2063,10 +2069,10 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "Because every child shares the forest trust key with its parent, a "
             "compromise of {source} can forge an inter-realm ticket with the forest "
             "root's privileged SID history and take over {target} as an Enterprise "
-            "Admin — the forest is one security boundary."
+            "Admin: the forest is one security boundary."
         ),
         short_narrative_template=(
-            "Child domain {source} shares the forest key — can escalate to root {target}"
+            "Child domain {source} shares the forest key: can escalate to root {target}"
         ),
     ),
     _entry(
@@ -2284,7 +2290,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="Credential extraction from LSA secrets",
         remediation_complexity="medium",
         remediation_effort=(
-            "Restrict local admin / SYSTEM access to the host — LSA secrets live in the "
+            "Restrict local admin / SYSTEM access to the host: LSA secrets live in the "
             "HKLM\\SECURITY registry hive, so any SYSTEM-level principal can read them and "
             "RunAsPPL/LSA Protection does NOT apply here (it guards LSASS process memory, not "
             "the registry). Devalue what is stored: use gMSA instead of privileged service "
@@ -2918,26 +2924,28 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
 
 _SEMANTICS_TO_PROVIDES: dict[str, str] = {
     "direct_target_compromise": "credential_recovered",
-    "access_capability_only":   "local_admin_session",
-    "context_only":             "none",
-    "credential_access_only":   "credential_recovered",
-    "other":                    "none",
+    "access_capability_only": "local_admin_session",
+    "context_only": "none",
+    "credential_access_only": "credential_recovered",
+    "other": "none",
 }
 
 _CONTEXT_COMPAT: dict[str, frozenset[str]] = {
     # user_credentials intentionally does NOT satisfy local_admin_session:
     # AdminTo / CanPSRemote produce a session, not credentials, so they
     # cannot chain directly into dump-type edges (DumpLSASS, DumpLSA, DumpDPAPI etc.).
-    "user_credentials":     frozenset({"user_credentials", "none"}),
-    "credential_recovered": frozenset({"user_credentials", "none", "machine_credential"}),
-    "local_admin_session":  frozenset({"local_admin_session", "none"}),
+    "user_credentials": frozenset({"user_credentials", "none"}),
+    "credential_recovered": frozenset(
+        {"user_credentials", "none", "machine_credential"}
+    ),
+    "local_admin_session": frozenset({"local_admin_session", "none"}),
     # An established XpCmdshell RCE channel on the SQL host. Only the MSSQL
     # SYSTEM-escalation follow-ups require it; nothing "credential-recovered" is
     # produced by the RCE alone, so it satisfies only its own requirement (plus
     # the always-satisfiable "none"). Mirrors the local_admin_session pattern:
     # a session, not credentials.
-    "mssql_rce_session":    frozenset({"mssql_rce_session", "none"}),
-    "none":                 frozenset({"none"}),
+    "mssql_rce_session": frozenset({"mssql_rce_session", "none"}),
+    "none": frozenset({"none"}),
 }
 
 
@@ -2966,7 +2974,9 @@ def edges_chain_compatible(
     if prev_compromise_semantics is None:
         provides = "user_credentials"
     else:
-        provides = _SEMANTICS_TO_PROVIDES.get(str(prev_compromise_semantics or ""), "none")
+        provides = _SEMANTICS_TO_PROVIDES.get(
+            str(prev_compromise_semantics or ""), "none"
+        )
     allowed = _CONTEXT_COMPAT.get(provides, frozenset())
     return next_source_context_requirement in allowed
 
@@ -3626,7 +3636,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "Confirm {target} is exposed to Kerberoasting by listing its service "
-            "principal names — any non-empty result means the account can be "
+            "principal names: any non-empty result means the account can be "
             "roasted:\n"
             "Get-ADUser -Identity {target} -Properties servicePrincipalName, "
             "msDS-SupportedEncryptionTypes |\n"
@@ -3661,17 +3671,16 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Drives.xml) stored in SYSVOL. The password is placed in a "
             "cpassword field and encrypted with AES-256, but Microsoft "
             "published the static encryption key in its documentation, so the "
-            "value decrypts with no brute-forcing required. SYSVOL is readable "
-            "by every authenticated domain user by design, so any account with "
-            "domain credentials — in this path {source} — can retrieve and "
-            "decrypt the value stored for {target}. Microsoft's MS14-025 "
+            "value decrypts with no brute-forcing required. {gpp_access_clause} "
+            "Microsoft's MS14-025 "
             "update (2014) stopped GPP from being used to set NEW passwords, "
             "but it did not remove or invalidate files created before the "
             "patch, so an old Groups.xml left in SYSVOL stays exploitable "
             "indefinitely."
         ),
         "manual": (
-            "# Find and pull GPP XML files from SYSVOL (any authenticated user has read access):\n"
+            "# Find and pull GPP XML files from SYSVOL (normally requires an authenticated "
+            "domain user; an unauthenticated null/guest SMB session can expose it too):\n"
             "nxc smb <dc_ip> -u <user> -p <pass> -M gpp_password\n"
             "#   (or manually) browse \\\\<domain>\\SYSVOL\\<domain>\\Policies\\...\\ "
             "for Groups.xml / Services.xml / ScheduledTasks.xml / DataSources.xml / "
@@ -3681,7 +3690,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "Enumerate SYSVOL for leftover GPP files carrying a cpassword "
-            "attribute — any match means a credential is still exposed:\n"
+            "attribute: any match means a credential is still exposed:\n"
             "Get-ChildItem \\\\<domain>\\SYSVOL -Recurse -Include Groups.xml,"
             "Services.xml,ScheduledTasks.xml,DataSources.xml,Printers.xml,"
             "Drives.xml -ErrorAction SilentlyContinue | Select-String cpassword\n"
@@ -3697,8 +3706,56 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "remediation": (
             "Find and remove every GPP XML file in SYSVOL that carries a cpassword field (Groups.xml, Services.xml, ScheduledTasks.xml, DataSources.xml, Printers.xml, Drives.xml).",
             "Confirm MS14-025 (KB2962486) is installed on all domain controllers so Group Policy Preferences can no longer be used to set a new password.",
-            "Rotate every account whose password was ever stored in a GPP file — the exposed value must be treated as permanently compromised, not just removed from SYSVOL.",
+            "Rotate every account whose password was ever stored in a GPP file: the exposed value must be treated as permanently compromised, not just removed from SYSVOL.",
             "Audit Group Policy Objects for any remaining GPP-based credential deployment (scheduled tasks, mapped drives, data sources) and migrate those to Group Managed Service Accounts or LAPS-managed local passwords.",
+        ),
+    },
+    "passwordinshare": {
+        "short": (
+            "{source} recovered a stored credential from a file on an SMB "
+            "share. {share_secret_access_clause}"
+        ),
+        "long": (
+            "Files placed on network shares, such as configuration exports, "
+            "deployment scripts, backup copies, and old documentation, "
+            "commonly carry plaintext credentials, API keys, or connection "
+            "strings left behind during provisioning or troubleshooting. "
+            "Unlike a managed secrets store, a share is rarely audited for "
+            "what it accumulates over time, so a credential dropped there "
+            "years ago can still be live and usable today. "
+            "{share_secret_access_clause}"
+        ),
+        "manual": (
+            "# Hunt shares for files that look like they carry credentials:\n"
+            "nxc smb <dc_ip> -u <user> -p <pass> -M spider_plus --pattern "
+            "'*pass*,*cred*,*.kdbx,*.config,*.xml'\n"
+            "#   (or, where allowed, an unauthenticated null/guest session) "
+            "smbclient -N //<dc_ip>/<share>\n"
+            "# Read the matching file directly once located, e.g.:\n"
+            "smbclient //<dc_ip>/<share> -c 'get <path>'"
+        ),
+        "verify_windows": (
+            "List who currently holds read on the share and on the "
+            "underlying folder, and confirm the credential-less grantees "
+            "ADscan reported are gone:\n"
+            "Get-SmbShareAccess -Name <ShareName>\n"
+            'Get-Acl "<SharePath>" | Format-List\n'
+            "# Confirm the null-session policy is hardened:\n"
+            "Get-ItemProperty -Path "
+            "'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters' "
+            "-Name RestrictNullSessAccess,NullSessionShares"
+        ),
+        "verify_linux": (
+            "Read-only confirmation that the file is no longer reachable "
+            "with no credential:\n"
+            "smbclient -N //<dc_ip>/<share> -c 'get <path>'\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping"
+        ),
+        "remediation": (
+            "{share_secret_access_removal}",
+            "{share_secret_account_hardening}",
+            "{share_secret_file_removal}",
+            "{share_secret_rotation}",
         ),
     },
     "backupoperatorescalation": {
@@ -3755,7 +3812,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/ntds"
         ),
         "remediation": (
-            "Audit Backup Operators membership with Get-ADGroupMember -Identity 'Backup Operators' -Recursive, then remove every account that is not a dedicated, monitored backup service identity — interactive admins and user accounts do not belong in this group.",
+            "Audit Backup Operators membership with Get-ADGroupMember -Identity 'Backup Operators' -Recursive, then remove every account that is not a dedicated, monitored backup service identity: interactive admins and user accounts do not belong in this group.",
             "If backup software genuinely needs SeBackupPrivilege, scope it to a single dedicated service account running only on the backup host, never to a shared or interactive administrator, and document that account as Tier-0-equivalent.",
             "Constrain the 'Back up files and directories' user right through Group Policy (Computer Configuration > Policies > Windows Settings > Security Settings > Local Policies > User Rights Assignment) so only the intended service principal is granted SeBackupPrivilege on domain controllers.",
             "Alert on privileged-use of this right: monitor Event ID 4672 (special privileges assigned at logon) for the Backup Operators identity and Event ID 4663 for access to the NTDS directory and the SAM/SECURITY/SYSTEM hives, so any hive or ntds.dit read outside the scheduled backup window is investigated.",
@@ -3818,13 +3875,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Enforce a strong password policy and ban common and seasonal passwords: where Azure AD Password Protection (or an on-prem banned-password list) is available, deploy it to reject values like Welcome1 and Summer2024!, and audit the current baseline with Get-ADDefaultDomainPasswordPolicy.",
             "Set a sane Account Lockout Policy via GPO (Computer Configuration > Policies > Windows Settings > Security Settings > Account Policies > Account Lockout Policy): a lockout threshold with an observation window long enough to blunt spraying, tuned against lockout-denial-of-service so a spray cannot trivially lock the whole directory.",
             "Require multi-factor authentication on every externally reachable service (VPN, webmail, remote access, federation endpoints), so a guessed password alone does not grant access.",
-            "Monitor Security event 4625 (failed logon) and 4771 (Kerberos pre-authentication failure) for the spray signature — many distinct target accounts, a single source, one password, all inside one observation window — and alert on that pattern rather than on per-account failure counts.",
+            "Monitor Security event 4625 (failed logon) and 4771 (Kerberos pre-authentication failure) for the spray signature (many distinct target accounts, a single source, one password, all inside one observation window), and alert on that pattern rather than on per-account failure counts.",
         ),
     },
     "useraspass": {
         "short": (
             "The account {target} uses its own username as its password, so a "
-            "single guess — the sAMAccountName itself — authenticates as the "
+            "single guess (the sAMAccountName itself) authenticates as the "
             "account."
         ),
         "long": (
@@ -3877,13 +3934,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Run a credential audit to find accounts whose password equals their username and force a reset with Set-ADAccountPassword followed by Set-ADUser -ChangePasswordAtLogon $true, prioritizing service, test, and default accounts, which carry this pattern most often.",
             "Set an Account Lockout Policy via GPO (Computer Configuration > Policies > Windows Settings > Security Settings > Account Policies > Account Lockout Policy): a lockout threshold with an observation window long enough to blunt a spaced spray, tuned so a spray cannot trivially lock the whole directory.",
             "Require multi-factor authentication on every externally reachable service (VPN, webmail, remote access, federation endpoints) so a guessed name-as-password does not by itself grant access.",
-            "Monitor Security event 4625 (failed logon) and 4771 (Kerberos pre-authentication failure) for the spray signature — many distinct target accounts from a single source inside one observation window — and alert on that pattern rather than on per-account failure counts.",
+            "Monitor Security event 4625 (failed logon) and 4771 (Kerberos pre-authentication failure) for the spray signature (many distinct target accounts from a single source inside one observation window), and alert on that pattern rather than on per-account failure counts.",
         ),
     },
     "userdescription": {
         "short": (
             "A plaintext credential is stored in {target}'s LDAP description or "
-            "info attribute, which any authenticated — and often any anonymous — "
+            "info attribute, which any authenticated (and often any anonymous) "
             "directory read returns, so the password is disclosed directly with "
             "no cracking needed."
         ),
@@ -3906,7 +3963,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "look for anything password-shaped:\n"
             "nxc ldap <dc_ip> -u <user> -p <pass> -M user-desc\n"
             "#   (or a raw LDAP read of the same attributes):\n"
-            "ldapsearch -x -H ldap://<dc_ip> -b \"<baseDN>\" \"(description=*)\" "
+            'ldapsearch -x -H ldap://<dc_ip> -b "<baseDN>" "(description=*)" '
             "sAMAccountName description info\n"
             "# Then authenticate with any recovered value to confirm it works:\n"
             "nxc smb <dc_ip> -u <recovered_user> -p <recovered_pass>"
@@ -3914,7 +3971,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_windows": (
             "Enumerate accounts carrying a description or info value and review "
             "each for anything password-shaped:\n"
-            "Get-ADUser -Filter {Description -like \"*\"} "
+            'Get-ADUser -Filter {Description -like "*"} '
             "-Properties Description, info |\n"
             "  Select-Object SamAccountName, Description, info"
         ),
@@ -3925,8 +3982,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/recon/ldap"
         ),
         "remediation": (
-            "Audit every account's description and info attribute for stored secrets with Get-ADUser -Filter {Description -like \"*\"} -Properties Description, info | Select-Object SamAccountName, Description, info, and review each result by hand for anything password-shaped.",
-            "For every credential found, clear the attribute (Set-ADUser -Identity <account> -Clear Description, info) and rotate the exposed password immediately with Set-ADAccountPassword — the value must be treated as compromised, not merely hidden.",
+            'Audit every account\'s description and info attribute for stored secrets with Get-ADUser -Filter {Description -like "*"} -Properties Description, info | Select-Object SamAccountName, Description, info, and review each result by hand for anything password-shaped.',
+            "For every credential found, clear the attribute (Set-ADUser -Identity <account> -Clear Description, info) and rotate the exposed password immediately with Set-ADAccountPassword: the value must be treated as compromised, not merely hidden.",
             "Train administrators never to store passwords in directory attributes, and document an approved secrets store (a privileged-access or secrets-management system) as the only place service credentials belong.",
             "Where feasible, tighten read access on sensitive attributes: remove anonymous LDAP read (dsHeuristics), and review the default authenticated-users read ACL on accounts that carry sensitive descriptive data.",
             "Schedule the description/info audit to run on a recurring basis so a newly added secret is caught quickly, and alert on directory reads of these attributes via Event ID 4662 where object auditing is enabled.",
@@ -3951,7 +4008,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "hashcat -m 18200 asrep.txt wordlist.txt"
         ),
         "verify_windows": (
-            "Confirm {target} has pre-authentication disabled — bit 0x400000 "
+            "Confirm {target} has pre-authentication disabled: bit 0x400000 "
             "(DONT_REQ_PREAUTH) set on userAccountControl:\n"
             "Get-ADUser -Identity {target} -Properties DoesNotRequirePreAuth |\n"
             "  Select-Object SamAccountName, DoesNotRequirePreAuth\n"
@@ -3992,7 +4049,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "then read the ACL and filter to the principal:\n"
             "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
             ".DistinguishedName\n"
-            "(Get-Acl \"AD:$dn\").Access |\n"
+            '(Get-Acl "AD:$dn").Access |\n'
             "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
             "$_.ActiveDirectoryRights -match 'GenericAll' }\n"
             "# A row with ActiveDirectoryRights=GenericAll, AccessControlType=Allow "
@@ -4008,20 +4065,20 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "remediation": (
             "Remove the GenericAll ACE that {source} holds over {target}. Resolve the object's "
             "distinguished name with `Get-ADObject -LDAPFilter '(sAMAccountName=<target>)'`, list "
-            "what {source} currently holds on it with `(Get-Acl \"AD:\\<targetDN>\").Access | "
+            'what {source} currently holds on it with `(Get-Acl "AD:\\<targetDN>").Access | '
             "Where-Object IdentityReference -like '*<principal>*'`, then delete those entries "
-            "with `dsacls \"<targetDN>\" /R \"<DOMAIN>\\<principal>\"`. Before: the entry reads "
+            'with `dsacls "<targetDN>" /R "<DOMAIN>\\<principal>"`. Before: the entry reads '
             "ActiveDirectoryRights=GenericAll, AccessControlType=Allow. After: the same query "
             "returns nothing for that principal.",
             "Grant back only the rights the delegation actually needs, never full control. "
             "GenericAll carries password reset, key-credential write, servicePrincipalName write "
             "and script-path write in one ACE, so any one of them left in place restores the "
-            "takeover — which is why narrowing it is the fix and auditing it is not. Use the "
+            "takeover: which is why narrowing it is the fix and auditing it is not. Use the "
             "Delegation of Control wizard, or a scoped ACE such as "
-            "`dsacls \"<targetDN>\" /G \"<DOMAIN>\\<helpdeskGroup>:CA;Reset Password\"` when "
+            '`dsacls "<targetDN>" /G "<DOMAIN>\\<helpdeskGroup>:CA;Reset Password"` when '
             "password reset is genuinely required.",
             "Confirm no other principal holds equivalent control over the same object: "
-            "`(Get-Acl \"AD:\\<targetDN>\").Access | Where-Object { $_.ActiveDirectoryRights "
+            '`(Get-Acl "AD:\\<targetDN>").Access | Where-Object { $_.ActiveDirectoryRights '
             "-match 'GenericAll|WriteDacl|WriteOwner' -and $_.AccessControlType -eq 'Allow' }`. "
             "Anything returned other than Domain Admins, Enterprise Admins or SYSTEM is the same "
             "finding under a different principal.",
@@ -4056,7 +4113,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "read the ACL and filter to the principal:\n"
             "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
             ".DistinguishedName\n"
-            "(Get-Acl \"AD:$dn\").Access |\n"
+            '(Get-Acl "AD:$dn").Access |\n'
             "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
             "$_.ActiveDirectoryRights -match 'GenericWrite|WriteProperty' }\n"
             "# An Allow row with GenericWrite (or broad WriteProperty) confirms it."
@@ -4071,26 +4128,26 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "remediation": (
             "Remove the GenericWrite ACE that {source} holds on {target}. Resolve the object's "
             "distinguished name with `Get-ADObject -LDAPFilter '(sAMAccountName=<target>)'`, list "
-            "what {source} currently holds on it with `(Get-Acl \"AD:\\<targetDN>\").Access | "
+            'what {source} currently holds on it with `(Get-Acl "AD:\\<targetDN>").Access | '
             "Where-Object IdentityReference -like '*<principal>*'`, then delete those entries "
-            "with `dsacls \"<targetDN>\" /R \"<DOMAIN>\\<principal>\"`. Before: the entry reads "
+            'with `dsacls "<targetDN>" /R "<DOMAIN>\\<principal>"`. Before: the entry reads '
             "ActiveDirectoryRights=GenericWrite (or WriteProperty covering every attribute). "
             "After: the same query returns nothing for that principal.",
             "Grant back only the specific attributes the delegation needs, rather than write "
             "access to the object. GenericWrite is a takeover because three of the attributes it "
-            "covers each hand over the account on their own — msDS-KeyCredentialLink (a "
+            "covers each hand over the account on their own: msDS-KeyCredentialLink (a "
             "certificate the account can then authenticate with), servicePrincipalName (which "
             "exposes the account's password hash to offline cracking), and "
             "msDS-AllowedToActOnBehalfOfOtherIdentity (which lets another host impersonate any "
             "user to this one). A scoped grant such as "
-            "`dsacls \"<targetDN>\" /G \"<DOMAIN>\\<group>:WP;description\"` gives the delegation "
+            '`dsacls "<targetDN>" /G "<DOMAIN>\\<group>:WP;description"` gives the delegation '
             "its attribute and none of those.",
             "Clear anything already written through the ACE before removing it, or the takeover "
             "survives the fix. Check the three attributes on {target}: "
-            "`Get-ADObject \"<targetDN>\" -Properties msDS-KeyCredentialLink, servicePrincipalName, "
+            '`Get-ADObject "<targetDN>" -Properties msDS-KeyCredentialLink, servicePrincipalName, '
             "msDS-AllowedToActOnBehalfOfOtherIdentity`. A key credential nobody deliberately "
             "enrolled, an unexpected service principal name, or a populated delegation attribute "
-            "should be cleared with `Set-ADObject \"<targetDN>\" -Clear <attribute>`.",
+            'should be cleared with `Set-ADObject "<targetDN>" -Clear <attribute>`.',
             "Sweep for the same exposure elsewhere: "
             "`Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties "
             "msDS-KeyCredentialLink | Select-Object DistinguishedName` lists every object "
@@ -4121,7 +4178,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Confirm {source} can rewrite {target}'s ACL (WriteDacl):\n"
             "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
             ".DistinguishedName\n"
-            "(Get-Acl \"AD:$dn\").Access |\n"
+            '(Get-Acl "AD:$dn").Access |\n'
             "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
             "$_.ActiveDirectoryRights -match 'WriteDacl' }"
         ),
@@ -4155,7 +4212,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Confirm {source} can take ownership of {target} (WriteOwner):\n"
             "$dn = (Get-ADObject -LDAPFilter '(sAMAccountName={target})')"
             ".DistinguishedName\n"
-            "(Get-Acl \"AD:$dn\").Access |\n"
+            '(Get-Acl "AD:$dn").Access |\n'
             "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
             "$_.ActiveDirectoryRights -match 'WriteOwner' }"
         ),
@@ -4193,10 +4250,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "(rightsGuid 00299570-246d-11d0-a768-00aa006e0529) granted to "
             "{source}. A matching ACE means the reset right is real and no "
             "password is changed by this check:\n"
-            "dsacls \"<target DN>\"   # look for 'CONTROL ACCESS ... Reset "
+            'dsacls "<target DN>"   # look for \'CONTROL ACCESS ... Reset '
             "Password' granted to {source}\n"
             "# Or, with the RSAT ActiveDirectory module:\n"
-            "(Get-Acl \"AD:\\<target DN>\").Access |\n"
+            '(Get-Acl "AD:\\<target DN>").Access |\n'
             "  Where-Object { $_.ObjectType -eq "
             "'00299570-246d-11d0-a768-00aa006e0529' -and "
             "$_.IdentityReference -match '{source}' }"
@@ -4360,7 +4417,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Confirm {source} holds the two replication rights on the domain head "
             "that make DCSync possible (GUIDs 1131f6aa- and 1131f6ad-):\n"
             "$dn = (Get-ADDomain).DistinguishedName\n"
-            "(Get-Acl \"AD:$dn\").Access |\n"
+            '(Get-Acl "AD:$dn").Access |\n'
             "  Where-Object { $_.IdentityReference -like '*{source}*' -and "
             "$_.ObjectType -in "
             "'1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',"
@@ -4460,7 +4517,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "A SQL Server linked server is configured from {source} to {target}, "
             "so a login authenticated to {source} can run Transact-SQL statements "
             "on {target} through the linked-server login mapping. The mapping runs "
-            "those statements on {target} as {execution_identity} — so the "
+            "those statements on {target} as {execution_identity}: the "
             "effective operator on {target} is that account, not the user who "
             "reached {source}. Where that account is privileged on {target}, this "
             "provides a lateral-movement path onto {target}, and where outbound "
@@ -4482,13 +4539,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "short": (
             "Sysadmin on the SQL Server hosted by {target} allows running "
             "operating-system commands on {target} as the SQL Server service "
-            "account — {xp_cmdshell_plan}."
+            "account: {xp_cmdshell_plan}."
         ),
         "long": (
             "The SQL Server instance on {target} can execute operating-system "
             "commands when a session holds sysadmin. Having reached sysadmin on "
             "that instance, an attacker runs commands on {target} as "
-            "{execution_identity} — a full host code-execution capability. In "
+            "{execution_identity}: a full host code-execution capability. In "
             "this path, {xp_cmdshell_plan}. When the sysadmin session was "
             "obtained through a linked-server login mapping, that account is the "
             "effective operator on {target} rather than the originating user."
@@ -4512,9 +4569,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "ADCS ESC2 abuses a certificate template whose extended key usage is "
             "either the Any Purpose OID (2.5.29.37.0) or empty. A certificate "
             "with no usage restriction can be presented for client authentication, "
-            "so {source_type} {source} — who holds enrollment rights on {template} "
+            "so {source_type} {source} (who holds enrollment rights on {template} "
             "and faces no manager approval and no enrollment-agent signature "
-            "requirement — can request a certificate and then use it to log in as "
+            "requirement) can request a certificate and then use it to log in as "
             "another identity. Unlike ESC1 the subject is not supplied by the "
             "requester; the escalation instead depends on how the certificate is "
             "later mapped to an account (for example paired with a weak "
@@ -4539,8 +4596,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "'msPKI-Enrollment-Flag', 'msPKI-RA-Signature'\n"
             "# List the enrollment ACL on the template object:\n"
             "Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
-            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,"
-            "$((Get-ADRootDSE).configurationNamingContext)\" -Properties nTSecurityDescriptor"
+            '"CN=Certificate Templates,CN=Public Key Services,CN=Services,'
+            '$((Get-ADRootDSE).configurationNamingContext)" -Properties nTSecurityDescriptor'
         ),
         "verify_linux": (
             "Read-only ADCS enumeration; confirm {template} is flagged ESC2 "
@@ -4574,9 +4631,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "long": (
             "ADCS ESC3 abuses a certificate template that carries the Certificate "
             "Request Agent EKU (1.3.6.1.4.1.311.20.2.1). The attack has two halves. "
-            "First, {source_type} {source} enrolls in the agent template — it has "
+            "First, {source_type} {source} enrolls in the agent template (it has "
             "enrollment rights, no manager approval, and no enrollment-agent "
-            "signature requirement — and receives an enrollment-agent certificate. "
+            "signature requirement) and receives an enrollment-agent certificate. "
             "Second, the attacker uses that agent certificate to co-sign a request "
             "on a second template that permits enrollment-on-behalf-of, minting a "
             "client-authentication certificate for a privileged target. "
@@ -4605,8 +4662,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "'msPKI-RA-Signature'\n"
             "# Check which templates accept an enrollment-agent co-signature "
             "(msPKI-RA-Application-Policies references the agent EKU):\n"
-            "Get-ADObject -SearchBase \"CN=Certificate Templates,CN=Public Key "
-            "Services,CN=Services,$((Get-ADRootDSE).configurationNamingContext)\" "
+            'Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key '
+            'Services,CN=Services,$((Get-ADRootDSE).configurationNamingContext)" '
             "-LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties "
             "msPKI-RA-Application-Policies"
         ),
@@ -4642,10 +4699,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "ADCS ESC4 is a control-plane weakness: {source_type} {source} holds a "
             "write-equivalent right (GenericAll, GenericWrite, WriteDacl, "
             "WriteOwner, or Owns) over the certificate template object {template}. "
-            "Any of these lets the attacker modify the template's attributes — for "
+            "Any of these lets the attacker modify the template's attributes (for "
             "example enabling ENROLLEE_SUPPLIES_SUBJECT, adding a client "
             "authentication EKU, granting itself enrollment rights, and clearing "
-            "the manager-approval flag — which turns the template into the ESC1 "
+            "the manager-approval flag), which turns the template into the ESC1 "
             "condition. The attacker then enrolls, supplies a privileged subject, "
             "and authenticates with the issued certificate to compromise {target}. "
             "Write access on the template alone is sufficient; no pre-existing "
@@ -4670,8 +4727,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "/ WriteOwner):\n"
             "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
             "$tmpl = Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
-            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg\"\n"
-            "(Get-Acl \"AD:$($tmpl.DistinguishedName)\").Access |\n"
+            '"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"\n'
+            '(Get-Acl "AD:$($tmpl.DistinguishedName)").Access |\n'
             "  Where-Object { $_.ActiveDirectoryRights -match "
             "'GenericAll|GenericWrite|WriteDacl|WriteOwner' } |\n"
             "  Format-Table IdentityReference, ActiveDirectoryRights"
@@ -4684,7 +4741,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/access-controls"
         ),
         "remediation": (
-            "Remove the excessive write rights on {template} — using dsacls or "
+            "Remove the excessive write rights on {template}: using dsacls or "
             "Set-Acl on the template object, revoke GenericAll / GenericWrite / "
             "WriteDacl / WriteOwner from any non-Tier-0 principal so only PKI "
             "administrators can modify it.",
@@ -4730,8 +4787,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "List the ACL on the PKI object and confirm a non-Tier-0 principal "
             "holds write access. For the NTAuth store:\n"
             "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
-            "(Get-Acl \"AD:CN=NTAuthCertificates,CN=Public Key Services,"
-            "CN=Services,$cfg\").Access |\n"
+            '(Get-Acl "AD:CN=NTAuthCertificates,CN=Public Key Services,'
+            'CN=Services,$cfg").Access |\n'
             "  Where-Object { $_.ActiveDirectoryRights -match "
             "'GenericAll|GenericWrite|WriteDacl|WriteOwner' } |\n"
             "  Format-Table IdentityReference, ActiveDirectoryRights\n"
@@ -4831,7 +4888,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "ADCS ESC7 covers a principal with CA administrative rights on the "
             "Enterprise CA object. {source_type} {source} holds ManageCA and/or "
             "ManageCertificates over {target}. With ManageCA the attacker can "
-            "change CA policy — for example enabling EDITF_ATTRIBUTESUBJECTALTNAME2 "
+            "change CA policy: for example enabling EDITF_ATTRIBUTESUBJECTALTNAME2 "
             "(turning the whole CA into ESC6) or re-adding a vulnerable template. "
             "With ManageCertificates (certificate manager / officer) the attacker "
             "can approve a request that was left pending, so it can submit a "
@@ -4867,7 +4924,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Remove Manage CA and Issue and Manage Certificates rights from every "
-            "non-Tier-0 principal on {target} — set them from the CA Security tab "
+            "non-Tier-0 principal on {target}: set them from the CA Security tab "
             "in certsrv.msc (or certutil -setreg CA\\Security) so only PKI "
             "administrators retain them.",
             "Separate the certificate-manager (officer) role from ordinary users "
@@ -4884,14 +4941,14 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "short": (
             "ADCS ESC8: the CA exposes an HTTP web-enrollment endpoint, so a "
             "coerced machine's authentication can be relayed to it to obtain a "
-            "certificate for that machine — including a domain controller."
+            "certificate for that machine (including a domain controller)."
         ),
         "long": (
             "ADCS ESC8 abuses the CA's HTTP web-enrollment interface "
             "(certsrv / the certificate enrollment web service), which by default "
             "accepts NTLM authentication with no channel binding. Any principal "
-            "who can capture or coerce a victim's NTLM authentication — commonly a "
-            "domain controller coerced via a printer-bug / EFSRPC trigger — relays "
+            "who can capture or coerce a victim's NTLM authentication (commonly a "
+            "domain controller coerced via a printer-bug / EFSRPC trigger) relays "
             "that authentication to the web-enrollment endpoint and requests a "
             "client authentication certificate as the victim. A certificate for a "
             "domain controller's machine account can then be used to authenticate "
@@ -4976,7 +5033,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "msPKI-Enrollment-Flag) and grants client authentication:\n"
             "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
             "Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
-            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg\" "
+            '"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg" '
             "-Properties msPKI-Enrollment-Flag, pKIExtendedKeyUsage |\n"
             "  Format-List cn, msPKI-Enrollment-Flag, pKIExtendedKeyUsage\n"
             "# Confirm StrongCertificateBindingEnforcement is enforced on DCs "
@@ -5013,7 +5070,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "long": (
             "ADCS ESC10 abuses weak certificate-to-account mapping configured on "
-            "domain controllers — either the UPN mapping registry value "
+            "domain controllers: either the UPN mapping registry value "
             "(CertificateMappingMethods including the UPN bit) or "
             "StrongCertificateBindingEnforcement left below Full. When mapping is "
             "weak, a DC authenticates a certificate by matching a name field "
@@ -5021,7 +5078,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "enroll in the client authentication template {template} and to control "
             "or set a victim's userPrincipalName (or set it to a privileged "
             "account's UPN), obtains a certificate the DC then maps to that "
-            "victim — authenticating as them and compromising {target}. ESC10 is "
+            "victim, authenticating as them and compromising {target}. ESC10 is "
             "the DC-side mapping analogue of ESC9's template-side flag."
         ),
         "manual": (
@@ -5034,7 +5091,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "certipy auth -pfx <victim>.pfx -dc-ip <dc_ip>"
         ),
         "verify_windows": (
-            "Confirm the DC uses weak certificate mapping — the UPN mapping method "
+            "Confirm the DC uses weak certificate mapping: the UPN mapping method "
             "is enabled and strong binding is not enforced:\n"
             "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Kdc' "
             "-Name StrongCertificateBindingEnforcement\n"
@@ -5078,7 +5135,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "a certificate on the victim's behalf. As with ESC8, coercing a "
             "domain controller's authentication and relaying it to the CA yields a "
             "certificate for the DC machine account, which then authenticates and "
-            "replicates the directory — full domain compromise of {target}. The "
+            "replicates the directory: full domain compromise of {target}. The "
             "relay only needs any valid domain credential, so it is cross-forest "
             "capable."
         ),
@@ -5093,7 +5150,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "certipy auth -pfx dc.pfx -dc-ip <dc_ip>"
         ),
         "verify_windows": (
-            "Confirm the CA enforces RPC encryption for enrollment requests — the "
+            "Confirm the CA enforces RPC encryption for enrollment requests: the "
             "IF_ENFORCEENCRYPTICERTREQUEST interface flag should be set:\n"
             "certutil -config '<ca_host>\\<ca_name>' -getreg CA\\InterfaceFlags |\n"
             "  Select-String -Pattern 'ENFORCEENCRYPTICERTREQUEST'\n"
@@ -5132,7 +5189,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Directory group through the msDS-OIDToGroupLink attribute. When a "
             "certificate template carries such an issuance-policy OID, a "
             "certificate issued from it makes the authenticating account a member "
-            "of the linked group for the duration of that logon — the group SID is "
+            "of the linked group for the duration of that logon: the group SID is "
             "injected into the Kerberos PAC even though the account is not a real "
             "member. {source_type} {source}, holding enrollment rights on "
             "{template} with no manager approval, enrolls and authenticates via "
@@ -5155,7 +5212,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Find issuance-policy OIDs that are linked to a group, then confirm "
             "{template} references one:\n"
             "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
-            "Get-ADObject -SearchBase \"CN=OID,CN=Public Key Services,CN=Services,"
+            'Get-ADObject -SearchBase "CN=OID,CN=Public Key Services,CN=Services,'
             "$cfg\" -LDAPFilter '(msDS-OIDToGroupLink=*)' -Properties "
             "msPKI-Cert-Template-OID, msDS-OIDToGroupLink |\n"
             "  Format-List cn, msPKI-Cert-Template-OID, msDS-OIDToGroupLink\n"
@@ -5193,8 +5250,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "ADCS ESC14 abuses weak explicit certificate mapping via the "
             "altSecurityIdentities attribute together with a template that requires "
             "a SAN-based (UPN or email) subject. When a victim account has a weak "
-            "altSecurityIdentities mapping — or when an attacker who can write that "
-            "attribute adds one pointing at a certificate it can obtain — a "
+            "altSecurityIdentities mapping (or when an attacker who can write that "
+            "attribute adds one pointing at a certificate it can obtain), a "
             "certificate is mapped to that account without the strong SID binding. "
             "{source_type} {source}, able to enroll in {template} (which requires "
             "SAN-based mapping, has no manager approval, and is enrollable by a "
@@ -5256,7 +5313,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "request. {source_type} {source}, holding enrollment rights on "
             "{template} with no manager approval, requests a certificate supplying "
             "both a privileged subject and a Client Authentication application "
-            "policy — even if the template's own EKU would not normally allow "
+            "policy, even if the template's own EKU would not normally allow "
             "authentication. The resulting certificate authenticates as the "
             "privileged victim via PKINIT (or as a server for a Schannel path), "
             "compromising {target}."
@@ -5277,7 +5334,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "supply the subject:\n"
             "$cfg = (Get-ADRootDSE).configurationNamingContext\n"
             "Get-ADObject -LDAPFilter '(cn={template})' -SearchBase "
-            "\"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg\" "
+            '"CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg" '
             "-Properties msPKI-Template-Schema-Version, msPKI-Certificate-Name-Flag |\n"
             "  Format-List cn, msPKI-Template-Schema-Version, "
             "msPKI-Certificate-Name-Flag\n"
@@ -5316,7 +5373,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "extension out of every certificate it issues (the extension OID "
             "1.3.6.1.4.1.311.25.2 is present in the CA's DisableExtensionList). "
             "Without that extension a domain controller cannot bind a certificate "
-            "to an account by SID and falls back to weaker name-based mapping — for "
+            "to an account by SID and falls back to weaker name-based mapping: for "
             "the whole CA, not a single template. {source_type} {source} can then "
             "obtain a certificate (from any enrollable authentication template) "
             "and, combined with a controllable name attribute or weak DC mapping, "
@@ -5336,7 +5393,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "certipy auth -pfx <victim>.pfx -dc-ip <dc_ip>"
         ),
         "verify_windows": (
-            "Confirm the CA suppresses the SID security extension — the OID "
+            "Confirm the CA suppresses the SID security extension: the OID "
             "1.3.6.1.4.1.311.25.2 present in DisableExtensionList disables it (run "
             "against the CA):\n"
             "certutil -config '<ca_host>\\<ca_name>' -getreg "
@@ -5380,7 +5437,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "for server identity. That certificate can then be used to impersonate "
             "infrastructure clients authenticate to, to stand up a rogue TLS or "
             "LDAPS endpoint for an adversary-in-the-middle position, or to support "
-            "relay chains — capturing or replaying authentication material and "
+            "relay chains, capturing or replaying authentication material and "
             "pivoting toward {target}. Unlike the client-auth ESCs this is a "
             "server-identity abuse, so its impact is machine impersonation and "
             "credential interception rather than direct PKINIT logon."
@@ -5440,9 +5497,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "{source} calls the coercion method against {target} (originally over "
             "the \\PIPE\\lsarpc named pipe, reachable even unauthenticated on early "
             "unpatched hosts) and captures the incoming authentication. That "
-            "machine-account authentication is then relayed — classically to an "
+            "machine-account authentication is then relayed: classically to an "
             "ADCS web-enrollment endpoint (ESC8) to obtain a certificate for the "
-            "victim, most damagingly a domain controller — turning a coercion "
+            "victim, most damagingly a domain controller, turning a coercion "
             "primitive into domain compromise."
         ),
         "manual": (
@@ -5605,7 +5662,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "short": (
             "Coerce-and-relay to ADCS: {source} forces {target} to authenticate, "
             "relays that authentication to the CA's enrollment endpoint, and "
-            "obtains a certificate for the victim — up to a domain controller."
+            "obtains a certificate for the victim, up to a domain controller."
         ),
         "long": (
             "This is the full coercion-plus-relay chain against Active Directory "
@@ -5618,7 +5675,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "authentication is relayed straight to the CA and used to request a "
             "client authentication certificate as the victim. When the coerced "
             "victim is a domain controller, the resulting certificate authenticates "
-            "the DC machine account and permits directory replication — a direct "
+            "the DC machine account and permits directory replication: a direct "
             "path to compromise of {target}. The relay needs only a valid domain "
             "identity, so it is cross-forest capable."
         ),
@@ -5677,7 +5734,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "trusted for unconstrained delegation, any account that authenticates "
             "to it via Kerberos leaves a forwardable TGT cached in that host's "
             "memory. The attacker uses a coercion trigger (PetitPotam / PrinterBug "
-            "/ DFSCoerce) to force {target} — ideally a domain controller — to "
+            "/ DFSCoerce) to force {target} (ideally a domain controller) to "
             "authenticate to the delegation-trusted host, then extracts the "
             "victim's TGT from the ticket cache. With a DC's TGT the attacker can "
             "act as the domain controller and replicate directory secrets, "
@@ -5743,8 +5800,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "value in Active Directory. With the DC account effectively taken over, "
             "the attacker replicates directory secrets (including the krbtgt hash) "
             "and compromises the entire domain of {target}. Resetting a DC's "
-            "machine password is destructive — it desynchronizes the DC from AD and "
-            "can break authentication domain-wide if not carefully restored — so "
+            "machine password is destructive: it desynchronizes the DC from AD and "
+            "can break authentication domain-wide if not carefully restored, so "
             "ADscan reports the exposure but does not execute the reset."
         ),
         "manual": (
@@ -5800,7 +5857,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "controller's name but without the trailing '$'. It requests a TGT for "
             "that name, then deletes or renames the account. When it presents the "
             "TGT for an S4U2self service ticket, the KDC cannot find the exact name "
-            "and falls back to appending '$', resolving to the real DC — so it "
+            "and falls back to appending '$', resolving to the real DC, so it "
             "issues a service ticket whose PAC identifies the caller as the domain "
             "controller. The attacker uses that ticket to act with DC privileges "
             "against {target}, typically replicating directory secrets. Because the "
@@ -5857,7 +5914,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "vulnerabilities in Microsoft's SMBv1 server. A crafted sequence of "
             "SMBv1 packets triggers a pool memory corruption in srv.sys, letting an "
             "unauthenticated attacker on the network execute arbitrary code in "
-            "kernel context — SYSTEM — on the target {target}. {source_type} "
+            "kernel context (SYSTEM) on the target {target}. {source_type} "
             "{source} needs only network access to TCP 445 with SMBv1 enabled; no "
             "credentials are required. It is the exploit behind WannaCry and "
             "NotPetya. Because the exploit corrupts kernel memory it can crash the "
@@ -5888,7 +5945,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "remediation": (
             "Disable and remove SMBv1 on every host (Disable-WindowsOptionalFeature "
             "-Online -FeatureName SMB1Protocol; Set-SmbServerConfiguration "
-            "-EnableSMB1Protocol $false) — this removes the vulnerable protocol "
+            "-EnableSMB1Protocol $false): this removes the vulnerable protocol "
             "rather than only patching it.",
             "Apply the MS17-010 security update (KB4013389 and its rollups) on any "
             "system that must retain SMBv1 temporarily.",
@@ -5911,7 +5968,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "required privilege, so an authenticated user can direct the spooler to "
             "load an arbitrary DLL 'driver' from a local or remote path. Because "
             "the spooler runs as SYSTEM, the loaded code executes with full local "
-            "privileges — local privilege escalation on the host, and remote code "
+            "privileges: local privilege escalation on the host, and remote code "
             "execution when the vulnerable spooler is targeted over the network. "
             "{source_type} {source} exploits {target}'s spooler to run code as "
             "SYSTEM; on a domain controller that is immediate domain compromise. "
@@ -5976,7 +6033,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "service, schedule a task, or invoke WMI/DCOM to execute commands as "
             "NT AUTHORITY\\SYSTEM. From SYSTEM it can read the SAM and LSA secrets, "
             "dump credentials cached in LSASS, and steal the tokens of any other "
-            "user currently logged on — turning one admin relationship into a "
+            "user currently logged on, turning one admin relationship into a "
             "foothold for lateral movement across the domain. The right is granted "
             "either by explicit membership in the host's local Administrators group "
             "or by a domain group nested into it (often through a widely-scoped "
@@ -6001,7 +6058,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "  Select-Object name, objectClass"
         ),
         "verify_linux": (
-            "Confirm the admin relationship without dumping anything — the 'Pwn3d!' "
+            "Confirm the admin relationship without dumping anything: the 'Pwn3d!' "
             "marker is printed only when the account is a local administrator:\n"
             "nxc smb {target} -u <user> -p <pass> -d <domain>\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
@@ -6027,7 +6084,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "cached in LSASS for the life of the session, and any other user "
             "already logged on interactively has their tokens and cached secrets "
             "exposed to anyone who reaches SYSTEM on that box. RDP is a sanctioned "
-            "administration channel, so the traffic itself blends in — the risk is "
+            "administration channel, so the traffic itself blends in: the risk is "
             "who can reach it and what privilege they land with. If Restricted "
             "Admin mode is not enforced, the interactive credentials are recoverable, "
             "making a single RDP foothold a pivot for credential theft and onward "
@@ -6040,7 +6097,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "xfreerdp /v:{target} /u:<user> /p:<pass> /d:<domain> /cert:ignore"
         ),
         "verify_windows": (
-            "List who may log on via RDP — the local Remote Desktop Users group "
+            "List who may log on via RDP: the local Remote Desktop Users group "
             "plus anyone in local Administrators:\n"
             "Invoke-Command -ComputerName {target} -ScriptBlock "
             "{{ Get-LocalGroupMember -Group 'Remote Desktop Users' }}\n"
@@ -6072,7 +6129,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "{source_type} {source} open a remote PowerShell session on {target} "
             "and run commands there. Access is granted by membership in the Remote "
             "Management Users group or by local administrator rights, and the code "
-            "runs with the privilege of the connecting account — full SYSTEM-capable "
+            "runs with the privilege of the connecting account: full SYSTEM-capable "
             "control when that account is a local admin. Because WinRM is the "
             "sanctioned remote-administration protocol (ports 5985/5986), the "
             "activity looks like normal operations, which is exactly why it is a "
@@ -6089,7 +6146,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "evil-winrm -i {target} -u <user> -p <pass>"
         ),
         "verify_windows": (
-            "List who may connect over WinRM — the local Remote Management Users "
+            "List who may connect over WinRM: the local Remote Management Users "
             "group plus local Administrators:\n"
             "Invoke-Command -ComputerName {target} -ScriptBlock "
             "{{ Get-LocalGroupMember -Group 'Remote Management Users' }}\n"
@@ -6122,7 +6179,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "another. Several shipped objects (for example the MMC20.Application "
             "class or the ShellWindows/ShellBrowserWindow objects) expose methods "
             "that ultimately spawn a process, so an account with local administrator "
-            "rights on {target} — here {source} — can call one of those methods "
+            "rights on {target} (here {source}) can call one of those methods "
             "over the DCE/RPC endpoint and have it launch a command for it. DCOM "
             "execution does not install a service (unlike the classic PsExec route) "
             "and its RPC signatures are less widely alerted on, which makes it a "
@@ -6167,7 +6224,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "When a privileged user logs on to a member server or workstation, their "
             "logon session and cached credentials live on that host for the life of "
             "the session. If an attacker already holds administrator rights on "
-            "{target} — the host where {target} maintains a session — it can "
+            "{target} (the host where {target} maintains a session), it can "
             "impersonate that user without ever knowing their password: it registers "
             "a scheduled task whose principal is the target user's interactive logon "
             "session, and when the task runs it executes as that user. This turns a "
@@ -6217,7 +6274,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "an existing interactive logon session. An attacker holding "
             "administrator rights on {target} uses this as an impersonation "
             "primitive: it creates a task bound to the logon session of a user who "
-            "is currently signed in — for example a privileged operator — and when "
+            "is currently signed in (for example a privileged operator) and when "
             "the task fires it executes with that user's token and privileges, "
             "without the attacker ever recovering a password or hash. It is the "
             "concrete abuse behind an observed high-value session on a host: local "
@@ -6233,7 +6290,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "#    task with that session's principal once admin is established)"
         ),
         "verify_windows": (
-            "Inspect scheduled tasks on the host and the principal each runs as — "
+            "Inspect scheduled tasks on the host and the principal each runs as: "
             "a task bound to a user session that no admin created is suspicious:\n"
             "Invoke-Command -ComputerName {target} -ScriptBlock "
             "{{ Get-ScheduledTask | Select-Object TaskName, "
@@ -6266,7 +6323,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "the replication control-access rights can ask a DC to replicate "
             "account data as if it were another DC, receiving credential material "
             "without touching the ntds.dit file directly. DS-Replication-Get-Changes "
-            "is the FIRST of the two rights that combine to make this possible — by "
+            "is the FIRST of the two rights that combine to make this possible: by "
             "itself it authorises replication of standard object attributes but not "
             "the secret attributes. It becomes dangerous when {source_type} {source} "
             "ALSO holds DS-Replication-Get-Changes-All on {target} (the domain "
@@ -6283,8 +6340,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "Read the domain head's ACL and list every principal granted the "
-            "Get-Changes replication right — only DCs/DA/EA should appear:\n"
-            "(Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access |\n"
+            "Get-Changes replication right: only DCs/DA/EA should appear:\n"
+            '(Get-Acl "AD:$((Get-ADDomain).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ObjectType -eq "
             "'1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' }} |\n"
             "  Select-Object IdentityReference, ActiveDirectoryRights\n"
@@ -6299,14 +6356,14 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "List every principal holding the replication rights on the domain object and remove any that is not a Domain Controller: (Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access | Where-Object { $_.ObjectType -in '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2','1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' }.",
-            "Revoke the delegated ACE with dsacls on the domain head (dsacls \"<domain-DN>\" /R \"<principal>\") so only the built-in Domain Controllers group, Domain Admins, and Enterprise Admins retain Get-Changes / Get-Changes-All.",
+            'Revoke the delegated ACE with dsacls on the domain head (dsacls "<domain-DN>" /R "<principal>") so only the built-in Domain Controllers group, Domain Admins, and Enterprise Admins retain Get-Changes / Get-Changes-All.',
             "Investigate how the right was delegated (a misconfigured GPO, an over-broad delegation wizard run, or a legacy sync account) and correct the source so it is not re-applied.",
-            "Enable directory-service-access auditing and alert on Event ID 4662 with the replication access mask from any principal that is not a domain controller — that is the DCSync signature.",
+            "Enable directory-service-access auditing and alert on Event ID 4662 with the replication access mask from any principal that is not a domain controller: that is the DCSync signature.",
         ),
     },
     "getchangesall": {
         "short": (
-            "{source} holds DS-Replication-Get-Changes-All on {target} — the right "
+            "{source} holds DS-Replication-Get-Changes-All on {target}: the right "
             "that unlocks SECRET attributes in replication, so paired with "
             "Get-Changes it enables full DCSync of password hashes."
         ),
@@ -6314,8 +6371,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "DS-Replication-Get-Changes-All is the SECOND and decisive replication "
             "control-access right in the DCSync pair. Where plain Get-Changes "
             "authorises replication of ordinary attributes, Get-Changes-All is what "
-            "authorises replication of the SECRET attributes — unicodePwd, the NTLM "
-            "and Kerberos keys, supplemental credentials — for any account in the "
+            "authorises replication of the SECRET attributes: unicodePwd, the NTLM "
+            "and Kerberos keys, supplemental credentials, for any account in the "
             "domain, including krbtgt. When {source_type} {source} holds this right "
             "on {target} (the domain object) together with Get-Changes, it can issue "
             "a replication request over MS-DRSR and receive every credential hash in "
@@ -6333,8 +6390,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "List principals granted the Get-Changes-All replication right on the "
-            "domain head — only DCs/DA/EA should appear:\n"
-            "(Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access |\n"
+            "domain head: only DCs/DA/EA should appear:\n"
+            '(Get-Acl "AD:$((Get-ADDomain).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ObjectType -eq "
             "'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' }} |\n"
             "  Select-Object IdentityReference, ActiveDirectoryRights\n"
@@ -6349,7 +6406,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Enumerate every principal holding Get-Changes-All on the domain object and remove any that is not a Domain Controller: (Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access | Where-Object { $_.ObjectType -eq '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' }.",
-            "Revoke the offending ACE with dsacls (dsacls \"<domain-DN>\" /R \"<principal>\") so replication of secret attributes is restricted to Domain Controllers, Domain Admins, and Enterprise Admins.",
+            'Revoke the offending ACE with dsacls (dsacls "<domain-DN>" /R "<principal>") so replication of secret attributes is restricted to Domain Controllers, Domain Admins, and Enterprise Admins.',
             "Because this right permits krbtgt extraction, treat any past exposure as full domain compromise: after removing the ACE, rotate the krbtgt account password twice (with the replication interval between resets) to invalidate any forged Golden Tickets.",
             "Alert on Event ID 4662 carrying the replication access mask from any non-DC principal, and correct the delegation source (GPO / delegation wizard / legacy account) that granted the right.",
         ),
@@ -6366,9 +6423,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Controllers, and that plain DCSync (Get-Changes + Get-Changes-All) does "
             "not necessarily return. DS-Replication-Get-Changes-In-Filtered-Set is "
             "the extra control-access right that authorises replication of that "
-            "filtered set. It matters because confidential secrets — notably the "
+            "filtered set. It matters because confidential secrets (notably the "
             "LAPS local-admin password attribute and other sensitive custom "
-            "attributes — can live in the FAS. When {source_type} {source} holds "
+            "attributes) can live in the FAS. When {source_type} {source} holds "
             "this right on {target} in addition to the standard replication rights, "
             "its DCSync can also pull the filtered attributes, widening the secret "
             "exposure beyond ordinary account hashes. Like the other two "
@@ -6384,8 +6441,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "List who holds the Get-Changes-In-Filtered-Set right on the domain "
-            "head — only Domain Controllers should:\n"
-            "(Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access |\n"
+            "head: only Domain Controllers should:\n"
+            '(Get-Acl "AD:$((Get-ADDomain).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ObjectType -eq "
             "'89e95b76-444d-4c62-991a-0facbeda640c' }} |\n"
             "  Select-Object IdentityReference, ActiveDirectoryRights\n"
@@ -6460,7 +6517,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "long": (
             "The Local Security Authority Subsystem Service (lsass.exe) holds, in "
             "memory, the credential material of every session on the host: NTLM "
-            "hashes, Kerberos TGTs and keys, and — depending on configuration — "
+            "hashes, Kerberos TGTs and keys, and (depending on configuration) "
             "cleartext passwords. An attacker who reaches SYSTEM on {target} can "
             "read that process memory and extract those credentials, immediately "
             "harvesting the secrets of any privileged user who has logged on there. "
@@ -6480,8 +6537,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "Confirm the account is a local admin (the prerequisite) and check "
-            "whether LSASS is protected (RunAsPPL) and Credential Guard is enabled "
-            "— both harden this path:\n"
+            "whether LSASS is protected (RunAsPPL) and Credential Guard is enabled: "
+            "both harden this path:\n"
             "Get-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa' "
             "-Name RunAsPPL -ErrorAction SilentlyContinue\n"
             "Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "
@@ -6502,7 +6559,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
     "dumpdpapi": {
         "short": (
             "With admin on {target}, an attacker recovers DPAPI master keys and "
-            "decrypts the user secrets DPAPI protects — saved browser and RDP "
+            "decrypts the user secrets DPAPI protects: saved browser and RDP "
             "passwords, credentials in Credential Manager, and more."
         ),
         "long": (
@@ -6514,7 +6571,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "recoverable via the domain's DPAPI backup key held on the DC). An "
             "attacker with administrative access on {target} can harvest the "
             "encrypted master keys and credential blobs from the user profile and "
-            "decrypt them — either by knowing the user's password, by extracting the "
+            "decrypt them, either by knowing the user's password, by extracting the "
             "master key from LSASS while the user is logged on, or, most powerfully, "
             "by using the domain DPAPI backup key to decrypt ANY domain user's DPAPI "
             "secrets. This yields cleartext application and service credentials that "
@@ -6533,7 +6590,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Confirm the account is a local admin (the prerequisite) and locate the "
             "DPAPI master keys and credential blobs in a user profile:\n"
             "Invoke-Command -ComputerName {target} -ScriptBlock {{ Get-ChildItem "
-            "\"$env:APPDATA\\Microsoft\\Protect\" -Recurse -Force }}\n"
+            '"$env:APPDATA\\Microsoft\\Protect" -Recurse -Force }}\n'
             "# The domain DPAPI backup key lives on the DC and is DA-protected."
         ),
         "verify_linux": (
@@ -6544,7 +6601,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Protect the domain DPAPI backup key: it is stored on the domain controllers and decrypts every domain user's DPAPI secrets, so treat its exposure as domain-wide credential compromise and restrict DA-level access to DCs.",
-            "Discourage storing recoverable secrets in DPAPI-protected stores where possible — disable browser password saving via policy and prefer an enterprise secret manager for service credentials.",
+            "Discourage storing recoverable secrets in DPAPI-protected stores where possible: disable browser password saving via policy and prefer an enterprise secret manager for service credentials.",
             "Enforce tier separation and Protected Users so a privileged user's DPAPI master key is not present in LSASS on member servers a local-admin compromise can reach.",
             "Monitor Event ID 4662 for reads of the domain DPAPI backup key object (BCKUPKEY) and Event 4663 for access to the Protect\\ profile folders; alert on backup-key export outside change windows.",
         ),
@@ -6558,14 +6615,14 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "long": (
             "The Local Administrator Password Solution (LAPS) stores each domain-"
             "joined computer's randomised local administrator password in a "
-            "directory attribute on the computer object — ms-Mcs-AdmPwd for legacy "
+            "directory attribute on the computer object: ms-Mcs-AdmPwd for legacy "
             "LAPS, or the msLAPS-Password / msLAPS-EncryptedPassword attributes for "
             "Windows LAPS. Read access to that confidential attribute is meant to be "
             "restricted to a small set of administrators, but a misconfigured ACL "
             "can grant it to a broader principal. When {source_type} {source} can "
             "read (or replicate) the LAPS attribute of {target}, it recovers that "
             "host's current local administrator password in cleartext and can log on "
-            "with full local admin rights — from there dumping cached credentials "
+            "with full local admin rights, from there dumping cached credentials "
             "and pivoting onward. Because the password is stored in the directory, "
             "no code execution on the target is needed: a single over-permissive "
             "read ACE turns directory access into host compromise."
@@ -6578,8 +6635,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "List which principals can READ the LAPS password attribute on the "
-            "computer object — only sanctioned admins should:\n"
-            "(Get-Acl \"AD:$((Get-ADComputer {target}).DistinguishedName)\").Access |\n"
+            "computer object: only sanctioned admins should:\n"
+            '(Get-Acl "AD:$((Get-ADComputer {target}).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ActiveDirectoryRights -match 'ReadProperty' }} |\n"
             "  Select-Object IdentityReference, ActiveDirectoryRights, ObjectType\n"
             "# Or confirm the attribute is populated:\n"
@@ -6610,7 +6667,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "RODC. The Kerberos Key List attack then abuses a legitimate protocol "
             "feature: presenting that ticket, {source_type} {source} sends a Key "
             "List request (a KERB-KEY-LIST-REQ) to a writable domain controller, "
-            "which returns the long-term key — the NT hash — of the target account "
+            "which returns the long-term key (the NT hash) of the target account "
             "{target}. This recovers credential material without a directory-"
             "replication (DCSync) request, so it can succeed where the replication "
             "rights are not held, and it works only when AES key material exists for "
@@ -6626,7 +6683,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "#   (the RODC-scoped ticket must already be present, e.g. KRB5CCNAME set)"
         ),
         "verify_windows": (
-            "Inspect the RODC's password-replication policy — which accounts' "
+            "Inspect the RODC's password-replication policy: which accounts' "
             "secrets the RODC is allowed to cache is what bounds this attack:\n"
             "Get-ADDomainControllerPasswordReplicationPolicy -Identity <RODC> "
             "-Allowed\n"
@@ -6658,12 +6715,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "owner can always read and rewrite the object's own permissions. So when "
             "{source_type} {source} owns {target}, it can grant itself any explicit "
             "right it wants (FullControl / GenericAll) by editing the DACL, and from "
-            "there run whatever technique that right enables — resetting a user's "
+            "there run whatever technique that right enables: resetting a user's "
             "password, configuring RBCD on a computer, adding a key credential for "
             "PKINIT, or, if the target is the domain object, granting itself the "
             "replication rights for DCSync. Ownership is therefore functionally "
             "equivalent to GenericAll, but it is easy to overlook because it is not "
-            "listed as an ACE in the DACL — it is the owner field of the security "
+            "listed as an ACE in the DACL: it is the owner field of the security "
             "descriptor. Unexpected ownership of a sensitive object (a privileged "
             "user, a computer, an OU, or the domain head) is a direct control "
             "finding."
@@ -6676,10 +6733,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "-principal <user> -target {target} <domain>/<user>:<pass>"
         ),
         "verify_windows": (
-            "Read the owner of the object's security descriptor — an unexpected "
+            "Read the owner of the object's security descriptor: an unexpected "
             "owner is the finding:\n"
-            "(Get-Acl \"AD:$((Get-ADObject -Filter \"Name -eq '{target}'\")."
-            "DistinguishedName)\").Owner\n"
+            '(Get-Acl "AD:$((Get-ADObject -Filter "Name -eq \'{target}\'").'
+            'DistinguishedName)").Owner\n'
             "# Or, directly:\n"
             "Get-ADObject -LDAPFilter '(name={target})' -Properties nTSecurityDescriptor |\n"
             "  ForEach-Object {{ $_.nTSecurityDescriptor.Owner }}"
@@ -6692,7 +6749,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Read the object's owner and, where it is wrong, reset it to the correct administrative principal: Set-Acl on the AD path after building an owner with $acl.SetOwner([System.Security.Principal.NTAccount]'DOMAIN\\Domain Admins'), or dsacls \"<object-DN>\" /takeownership.",
-            "Investigate how ownership was acquired — an object created by a low-privileged account is owned by that account by default, and a Creator Owner ACE or a delegated create right on the parent OU is the usual source; correct the delegation so new objects are owned by an administrative group.",
+            "Investigate how ownership was acquired: an object created by a low-privileged account is owned by that account by default, and a Creator Owner ACE or a delegated create right on the parent OU is the usual source; correct the delegation so new objects are owned by an administrative group.",
             "For sensitive containers, set the default owner on the parent OU and enable inheritance so newly created objects are owned by the intended administrative group, not by whoever ran the wizard.",
             "Audit ownership of privileged users, computers, OUs, and the domain head periodically, and alert on Event ID 5136 modifications to the owner field of Tier-0 objects.",
         ),
@@ -6701,7 +6758,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "short": (
             "{source} holds All-Extended-Rights over {target}, a superset of the "
             "control-access rights that includes password reset, LAPS read, and "
-            "DCSync — so it can fully control {target}."
+            "DCSync: so it can fully control {target}."
         ),
         "long": (
             "Extended rights are the special control-access rights AD defines beyond "
@@ -6711,8 +6768,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "the WHOLE set at once. So when {source_type} {source} holds "
             "AllExtendedRights over {target}, it holds every one of those rights "
             "simultaneously: it can reset the target user's password, read the "
-            "target computer's LAPS password, or — if the target is the domain "
-            "object — perform DCSync. It is one of the most powerful ACEs to find on "
+            "target computer's LAPS password, or (if the target is the domain "
+            "object) perform DCSync. It is one of the most powerful ACEs to find on "
             "a sensitive object because it collapses many distinct escalation "
             "techniques into a single grant, and it is often introduced by an "
             "over-broad delegation (a help-desk delegation applied at too high a "
@@ -6733,7 +6790,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "List the ACEs that grant All-Extended-Rights (ObjectType all-zeros GUID "
             "with the ExtendedRight bit) over the object:\n"
             "(Get-Acl \"AD:$((Get-ADObject -LDAPFilter '(name={target})')."
-            "DistinguishedName)\").Access |\n"
+            'DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ActiveDirectoryRights -match 'ExtendedRight' -and "
             "$_.ObjectType -eq '00000000-0000-0000-0000-000000000000' }} |\n"
             "  Select-Object IdentityReference, ActiveDirectoryRights"
@@ -6746,8 +6803,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Enumerate the ACEs granting All-Extended-Rights over the object and remove any that is not a required administrator: (Get-Acl \"AD:<object-DN>\").Access | Where-Object { $_.ActiveDirectoryRights -match 'ExtendedRight' -and $_.ObjectType -eq '00000000-0000-0000-0000-000000000000' }.",
-            "Revoke the over-broad ACE with dsacls (dsacls \"<object-DN>\" /R \"<principal>\") and replace it, where a delegation is genuinely needed, with the single specific extended right required (e.g. only Reset Password) rather than the whole set.",
-            "Find the delegation source — an AllExtendedRights ACE applied at an OU or the domain root usually comes from a delegation wizard run at too high a scope — and re-scope it to the narrowest OU and the least-privilege right.",
+            'Revoke the over-broad ACE with dsacls (dsacls "<object-DN>" /R "<principal>") and replace it, where a delegation is genuinely needed, with the single specific extended right required (e.g. only Reset Password) rather than the whole set.',
+            "Find the delegation source (an AllExtendedRights ACE applied at an OU or the domain root usually comes from a delegation wizard run at too high a scope) and re-scope it to the narrowest OU and the least-privilege right.",
             "Audit Event ID 5136 for ACL changes on Tier-0 objects and alert on any new AllExtendedRights grant to a non-administrative principal.",
         ),
     },
@@ -6765,7 +6822,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "arbitrary SPN to that account, then request a service ticket (TGS-REP) "
             "for it. Because the ticket is encrypted with the target account's "
             "password-derived key, the attacker cracks it offline to recover the "
-            "password — and afterwards can remove the SPN it added to cover its "
+            "password, and afterwards can remove the SPN it added to cover its "
             "tracks. This converts a benign-looking attribute-write ACE into "
             "credential theft against any account whose password is crackable, "
             "including service and even privileged accounts. The write is usually "
@@ -6786,7 +6843,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_windows": (
             "List which principals can WRITE the servicePrincipalName property of "
             "the target account:\n"
-            "(Get-Acl \"AD:$((Get-ADUser {target}).DistinguishedName)\").Access |\n"
+            '(Get-Acl "AD:$((Get-ADUser {target}).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ActiveDirectoryRights -match 'WriteProperty' -and\n"
             "    ($_.ObjectType -eq 'f3a64788-5306-11d1-a9c5-0000f80367c1' -or\n"
             "     $_.ObjectType -eq '00000000-0000-0000-0000-000000000000') }} |\n"
@@ -6801,7 +6858,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Enumerate who can write the servicePrincipalName attribute of the account and remove non-administrative principals: (Get-Acl \"AD:<account-DN>\").Access | Where-Object { $_.ActiveDirectoryRights -match 'WriteProperty' -and $_.ObjectType -eq 'f3a64788-5306-11d1-a9c5-0000f80367c1' }.",
-            "Revoke the offending ACE with dsacls (dsacls \"<account-DN>\" /R \"<principal>\") so only intended administrators can modify SPNs, closing the targeted-Kerberoasting avenue.",
+            'Revoke the offending ACE with dsacls (dsacls "<account-DN>" /R "<principal>") so only intended administrators can modify SPNs, closing the targeted-Kerberoasting avenue.',
             "Enforce strong (25+ character) passwords on any account that could be given an SPN, or migrate service identities to gMSA, so an added SPN yields an uncrackable ticket.",
             "Audit Event ID 5136 for changes to the servicePrincipalName attribute and Event ID 4769 with RC4 encryption for the roast itself, and alert on an SPN added then removed within a short window.",
         ),
@@ -6815,7 +6872,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "long": (
             "The Account Restrictions property set groups several account-control "
             "attributes, and write access to it over a COMPUTER object includes "
-            "write access to msDS-AllowedToActOnBehalfOfOtherIdentity — the "
+            "write access to msDS-AllowedToActOnBehalfOfOtherIdentity: the "
             "attribute that configures Resource-Based Constrained Delegation (RBCD). "
             "When {source_type} {source} can write account restrictions on {target}, "
             "it can point that attribute at a computer account it already controls, "
@@ -6841,7 +6898,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_windows": (
             "List who can write the account-restrictions property set on the "
             "computer object, and read the current RBCD attribute:\n"
-            "(Get-Acl \"AD:$((Get-ADComputer {target}).DistinguishedName)\").Access |\n"
+            '(Get-Acl "AD:$((Get-ADComputer {target}).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ObjectType -eq "
             "'4c164200-20c0-11d0-a768-00aa006e0529' }}\n"
             "Get-ADComputer {target} -Properties "
@@ -6857,7 +6914,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "remediation": (
             "Enumerate who can write the account-restrictions property set on the computer and remove non-administrative principals: (Get-Acl \"AD:<computer-DN>\").Access | Where-Object { $_.ObjectType -eq '4c164200-20c0-11d0-a768-00aa006e0529' }.",
             "Read and, where unexpected, clear the RBCD attribute: Get-ADComputer <host> -Properties msDS-AllowedToActOnBehalfOfOtherIdentity then Set-ADComputer <host> -Clear msDS-AllowedToActOnBehalfOfOtherIdentity.",
-            "Set ms-DS-MachineAccountQuota to 0 (Set-ADDomain -Identity <domain> -Replace @{'ms-DS-MachineAccountQuota'=0}) so an attacker cannot create a new computer account to use as the delegate — note this does not stop RBCD via an already-owned computer, so the ACE fix above is the primary control.",
+            "Set ms-DS-MachineAccountQuota to 0 (Set-ADDomain -Identity <domain> -Replace @{'ms-DS-MachineAccountQuota'=0}) so an attacker cannot create a new computer account to use as the delegate. Note this does not stop RBCD via an already-owned computer, so the ACE fix above is the primary control.",
             "Audit Event ID 5136 for changes to msDS-AllowedToActOnBehalfOfOtherIdentity and Event ID 4769 for S4U2Proxy ticket requests, and alert on delegation configured to a non-service computer account.",
         ),
     },
@@ -6873,8 +6930,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "When {source_type} {source} can write scriptPath on {target}, it points "
             "the attribute at a script it controls (placed on the NETLOGON share, "
             "which authenticated users can read, or at a reachable UNC path). The "
-            "next time {target} logs on, that script runs with {target}'s privileges "
-            "— giving the attacker code execution as the victim without knowing their "
+            "next time {target} logs on, that script runs with {target}'s privileges, "
+            "giving the attacker code execution as the victim without knowing their "
             "password. It is a wait-for-logon primitive: the payload fires on the "
             "user's schedule, not the attacker's, so it is patient rather than "
             "immediate, and it depends on the target actually logging on and on the "
@@ -6893,7 +6950,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "scriptPath attribute:\n"
             "Get-ADUser {target} -Properties scriptPath | "
             "Select-Object SamAccountName, scriptPath\n"
-            "(Get-Acl \"AD:$((Get-ADUser {target}).DistinguishedName)\").Access |\n"
+            '(Get-Acl "AD:$((Get-ADUser {target}).DistinguishedName)").Access |\n'
             "  Where-Object {{ $_.ActiveDirectoryRights -match 'WriteProperty' }} |\n"
             "  Select-Object IdentityReference, ObjectType"
         ),
@@ -6905,7 +6962,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "List who can write the scriptPath attribute of the user object and remove non-administrative principals: (Get-Acl \"AD:<user-DN>\").Access | Where-Object { $_.ActiveDirectoryRights -match 'WriteProperty' }.",
-            "Revoke the offending write ACE with dsacls (dsacls \"<user-DN>\" /R \"<principal>\") so only administrators can set logon scripts, and prefer Group Policy logon scripts over per-user scriptPath so the attribute is not a per-object write target.",
+            'Revoke the offending write ACE with dsacls (dsacls "<user-DN>" /R "<principal>") so only administrators can set logon scripts, and prefer Group Policy logon scripts over per-user scriptPath so the attribute is not a per-object write target.',
             "Lock down the logon-script locations: restrict write access to the NETLOGON share (and any UNC path referenced by scriptPath) to administrators, and audit its contents for unexpected files.",
             "Audit Event ID 5136 for changes to the scriptPath attribute and monitor NETLOGON for new/modified script files; alert on a scriptPath set by a non-administrative principal.",
         ),
@@ -6918,11 +6975,11 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "long": (
             "The msDS-KeyCredentialLink attribute holds public key credentials used "
-            "for certificate-based (PKINIT) Kerberos authentication — the mechanism "
+            "for certificate-based (PKINIT) Kerberos authentication: the mechanism "
             "behind Windows Hello for Business. When an object already has a shadow "
             "credential entry on {target}, whoever controls the matching private key "
             "can authenticate as {target} over PKINIT and, via the U2U / UnPAC-the-"
-            "hash technique, recover {target}'s NT hash — all without ever knowing "
+            "hash technique, recover {target}'s NT hash, all without ever knowing "
             "or resetting the account's password, and without leaving a password-"
             "reset trace. Legitimate WHfB entries are written by a domain controller; "
             "a key credential added by any non-DC principal, or present where WHfB is "
@@ -6942,7 +6999,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "List every object carrying a key credential and confirm which "
-            "principal set it — entries from a non-DC principal are suspicious:\n"
+            "principal set it: entries from a non-DC principal are suspicious:\n"
             "Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties "
             "msDS-KeyCredentialLink |\n"
             "  Select-Object DistinguishedName, msDS-KeyCredentialLink\n"
@@ -6959,7 +7016,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Enumerate every object carrying a key credential and audit each entry against your Windows Hello for Business rollout: Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties msDS-KeyCredentialLink.",
-            "Remove unexpected entries — anything set by a non-DC principal or present where WHfB is not deployed: Set-ADObject -Identity <DN> -Clear msDS-KeyCredentialLink; then reset the affected account's password, as the shadow credential was an alternate authentication path.",
+            "Remove unexpected entries, anything set by a non-DC principal or present where WHfB is not deployed: Set-ADObject -Identity <DN> -Clear msDS-KeyCredentialLink; then reset the affected account's password, as the shadow credential was an alternate authentication path.",
             "Restrict who can write msDS-KeyCredentialLink on user and computer objects to the DCs / WHfB provisioning service, and remove any delegated write ACE that a non-DC principal holds on the attribute.",
             "Enable DS-Access auditing on msDS-KeyCredentialLink (Event ID 5136) in the Default Domain Controllers policy and alert on any write originating from a principal that is not a domain controller.",
         ),
@@ -6971,14 +7028,14 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "further technique required."
         ),
         "long": (
-            "Some group memberships ARE the compromise — no exploitation step "
+            "Some group memberships ARE the compromise: no exploitation step "
             "remains once you are in the group. When {source_type} {source} belongs "
             "to a terminal privileged control group (Domain Admins, Enterprise "
             "Admins, BUILTIN\\Administrators, or another group whose rights directly "
             "control {target}), the membership itself grants control: a Domain Admin "
             "can already act against any object in the domain, so there is no "
             "separate attack to run. This edge exists in the graph to make that "
-            "control explicit rather than implied — it records that the path has "
+            "control explicit rather than implied: it records that the path has "
             "reached a principal whose group membership already owns the target. The "
             "risk is not a technique to detect but a membership to justify: every "
             "member of such a group is effectively Tier-0-equivalent for the scope "
@@ -7016,7 +7073,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
     },
     "spnjack": {
         "short": (
-            "{source} hijacks a delegated SPN — moving the SPN it can delegate to "
+            "{source} hijacks a delegated SPN: moving the SPN it can delegate to "
             "onto {target}, then abusing constrained delegation with protocol "
             "transition (S4U) to impersonate any user to {target}."
         ),
@@ -7026,7 +7083,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "access to service principal names. {source_type} {source} holds "
             "msDS-AllowedToDelegateTo entries plus TrustedToAuthForDelegation, which "
             "lets it request tickets, via S4U2Self then S4U2Proxy, to the specific "
-            "services named in its delegation list — and, crucially, it can request "
+            "services named in its delegation list, and, crucially, it can request "
             "them as ANY user (protocol transition). The 'jack' is that an SPN is "
             "not permanently bound to one host: by moving the SPN that appears in "
             "the delegation list from its legitimate owner onto {target}, the "
@@ -7051,7 +7108,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "'(&(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216))' "
             "-Properties msDS-AllowedToDelegateTo, servicePrincipalName |\n"
             "  Select-Object Name, msDS-AllowedToDelegateTo\n"
-            "# Confirm SPN uniqueness — a duplicate SPN is the jack:\n"
+            "# Confirm SPN uniqueness: a duplicate SPN is the jack:\n"
             "setspn -Q cifs/{target}"
         ),
         "verify_linux": (
@@ -7082,7 +7139,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "controller in the TRUSTING forest to authenticate to a service whose "
             "key it holds, captures the forwarded TGT that the coerced "
             "authentication carries, and then uses that ticket to act as the "
-            "trusting-forest DC — including replicating its directory (DCSync). The "
+            "trusting-forest DC, including replicating its directory (DCSync). The "
             "result collapses the boundary between the two forests: a compromise "
             "confined to one forest becomes control of the other. This is a "
             "high-severity cross-forest escalation because forest trusts are widely "
@@ -7127,7 +7184,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "long": (
             "Within a single forest, a child domain and its parent share the "
-            "inter-realm trust key, and the forest is a single security boundary — "
+            "inter-realm trust key, and the forest is a single security boundary: "
             "so a full compromise of a child domain yields the material to take over "
             "the forest root. {source}, having compromised the child domain (holding "
             "its krbtgt key), forges an inter-realm ticket-granting ticket and, "
@@ -7137,8 +7194,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Enterprise Admins, granting control of the forest root and thereby the "
             "whole forest. This is the canonical child-to-parent / SID-history "
             "escalation: it is not a misconfiguration to patch but a structural "
-            "property of the forest trust model, which is precisely why the forest — "
-            "not the domain — is the true security boundary, and why every child "
+            "property of the forest trust model, which is precisely why the forest, "
+            "not the domain, is the true security boundary, and why every child "
             "domain must be administered to the same standard as the root. The "
             "prerequisite is full compromise of the child domain (its krbtgt key)."
         ),
@@ -7151,7 +7208,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_windows": (
             "Confirm the forest topology and that intra-forest trusts do not (and "
-            "structurally cannot) SID-filter — every child is inside the boundary:\n"
+            "structurally cannot) SID-filter: every child is inside the boundary:\n"
             "Get-ADForest | Select-Object Name, RootDomain, Domains\n"
             "Get-ADTrust -Filter 'IntraForest -eq $true' |\n"
             "  Select-Object Name, Direction, SIDFilteringForestAware"
@@ -7163,7 +7220,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/trusts"
         ),
         "remediation": (
-            "Administer every child domain to the same Tier-0 standard as the forest root — the forest, not the domain, is the security boundary, so a child-domain compromise is a forest compromise; there is no ACL or trust setting that separates them.",
+            "Administer every child domain to the same Tier-0 standard as the forest root: the forest, not the domain, is the security boundary, so a child-domain compromise is a forest compromise; there is no ACL or trust setting that separates them.",
             "After any suspected child-domain compromise, reset the child domain's krbtgt password twice and treat the forest root as potentially compromised: rotate forest-root Tier-0 credentials and the root krbtgt as well.",
             "Minimise the number of domains in the forest; each additional child domain is an additional path to the root. Consider consolidating to a single domain where the multi-domain model is not required.",
             "Monitor forest-root DCs for Event ID 4768/4769 inter-realm tickets carrying SID history for Enterprise Admins and for replication (Event 4662) originating from a child-domain principal.",
@@ -7185,7 +7242,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "privileged token from a logon session shared on the host (the "
             "Forshaw 2020 shared-logon-session token approach) and impersonates it "
             "to reach NT AUTHORITY\\SYSTEM. SYSTEM on the database server means full "
-            "control of the host — reading its LSA secrets, dumping cached "
+            "control of the host: reading its LSA secrets, dumping cached "
             "credentials, and using its machine account for onward domain actions. "
             "It is a distinct escalation path precisely because it survives the "
             "common 'we removed SeImpersonate from the SQL service' hardening. The "
@@ -7235,7 +7292,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "default, which permits impersonating a token handed to it. Once "
             "{source} holds sysadmin on the MSSQL instance on {target}, it can load "
             "a CLR (.NET) assembly directly into SQL Server memory as a hexadecimal "
-            "literal — no file is written to disk, which sidesteps write-time AV — "
+            "literal (no file is written to disk, which sidesteps write-time AV) "
             "and use it to run a 'potato' coercion (for example RPCSS or DCOM/BITS "
             "local coercion) that yields a SYSTEM token, which SeImpersonate then "
             "lets it assume. The outcome is NT AUTHORITY\\SYSTEM on the database "
@@ -7309,9 +7366,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "#   SQL> EXEC sp_addsrvrolemember '<your_login>','sysadmin';"
         ),
         "verify_windows": (
-            "Find databases that are both TRUSTWORTHY and owned by a sysadmin login "
-            "— the two conditions that create the escalation:\n"
-            "Invoke-Sqlcmd -ServerInstance {target} -Query \"SELECT d.name, "
+            "Find databases that are both TRUSTWORTHY and owned by a sysadmin login: "
+            "the two conditions that create the escalation:\n"
+            'Invoke-Sqlcmd -ServerInstance {target} -Query "SELECT d.name, '
             "d.is_trustworthy_on, sp.name AS owner FROM sys.databases d JOIN "
             "sys.server_principals sp ON d.owner_sid = sp.sid WHERE "
             "d.is_trustworthy_on = 1 AND IS_SRVROLEMEMBER('sysadmin', sp.name) = 1;\""
@@ -7320,12 +7377,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Read-only query for TRUSTWORTHY databases owned by a sysadmin (no "
             "escalation performed):\n"
             "impacket-mssqlclient -k <domain>/<user>@{target} -windows-auth "
-            "-command \"SELECT name, is_trustworthy_on FROM sys.databases WHERE "
-            "is_trustworthy_on = 1;\"\n"
+            '-command "SELECT name, is_trustworthy_on FROM sys.databases WHERE '
+            'is_trustworthy_on = 1;"\n'
             "# Reference: https://www.thehacker.recipes/ad/movement/mssql"
         ),
         "remediation": (
-            "Turn off TRUSTWORTHY on every database that does not strictly require it (ALTER DATABASE <db> SET TRUSTWORTHY OFF;) — this alone breaks the escalation, and most databases never need it.",
+            "Turn off TRUSTWORTHY on every database that does not strictly require it (ALTER DATABASE <db> SET TRUSTWORTHY OFF;): this alone breaks the escalation, and most databases never need it.",
             "Where TRUSTWORTHY is genuinely required, change the database owner to a low-privileged login that is NOT a member of the sysadmin role (ALTER AUTHORIZATION ON DATABASE::<db> TO <low_priv_login>;) so impersonating dbo confers no server-level rights.",
             "Audit the two conditions together across the instance: SELECT d.name, d.is_trustworthy_on, sp.name FROM sys.databases d JOIN sys.server_principals sp ON d.owner_sid = sp.sid WHERE d.is_trustworthy_on = 1; and remediate every row.",
             "Keep xp_cmdshell disabled and minimise db_owner grants; monitor SQL error-log and Extended Events for ALTER SERVER ROLE / sp_addsrvrolemember calls that would signal the escalation being used.",
@@ -7339,15 +7396,15 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "long": (
             "SQL Server sysadmin is total control of the database instance: read and "
-            "write every database, reconfigure the server, and — decisively for "
-            "domain compromise — enable and run xp_cmdshell, which executes OS "
+            "write every database, reconfigure the server, and (decisively for "
+            "domain compromise) enable and run xp_cmdshell, which executes OS "
             "commands on {target} in the context of the SQL Server service account. "
             "When {source_type} {source} is a sysadmin on the instance (directly, "
             "through a Windows group mapped to a sysadmin login, or via a linked-"
             "server chain), it can turn database control into host code execution and "
-            "from there escalate to SYSTEM. Sysadmin is often granted too broadly — "
-            "an application account, a Windows group, or BUILTIN\\Administrators "
-            "mapped in — so this access frequently exists without anyone intending a "
+            "from there escalate to SYSTEM. Sysadmin is often granted too broadly "
+            "(an application account, a Windows group, or BUILTIN\\Administrators "
+            "mapped in), so this access frequently exists without anyone intending a "
             "domain-reachable admin to hold it. The follow-on escalations "
             "(SeImpersonate potato, token theft, TRUSTWORTHY-db abuse) all start from "
             "this foothold. The prerequisite is a sysadmin login on the SQL Server "
@@ -7364,12 +7421,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_windows": (
             "List the members of the SQL sysadmin server role and the Windows "
             "principals mapped to sysadmin logins:\n"
-            "Invoke-Sqlcmd -ServerInstance {target} -Query \"SELECT p.name, p.type_desc "
+            'Invoke-Sqlcmd -ServerInstance {target} -Query "SELECT p.name, p.type_desc '
             "FROM sys.server_role_members r JOIN sys.server_principals p ON "
             "r.member_principal_id = p.principal_id WHERE r.role_principal_id = "
             "SUSER_ID('sysadmin');\"\n"
             "# Confirm xp_cmdshell state:\n"
-            "Invoke-Sqlcmd -ServerInstance {target} -Query \"SELECT name, value_in_use "
+            'Invoke-Sqlcmd -ServerInstance {target} -Query "SELECT name, value_in_use '
             "FROM sys.configurations WHERE name = 'xp_cmdshell';\""
         ),
         "verify_linux": (
@@ -7380,7 +7437,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/mssql"
         ),
         "remediation": (
-            "Audit the SQL sysadmin server role and remove every principal that does not require it — especially application logins, Windows groups, and any BUILTIN\\Administrators mapping: SELECT p.name FROM sys.server_role_members r JOIN sys.server_principals p ON r.member_principal_id = p.principal_id WHERE r.role_principal_id = SUSER_ID('sysadmin');.",
+            "Audit the SQL sysadmin server role and remove every principal that does not require it, especially application logins, Windows groups, and any BUILTIN\\Administrators mapping: SELECT p.name FROM sys.server_role_members r JOIN sys.server_principals p ON r.member_principal_id = p.principal_id WHERE r.role_principal_id = SUSER_ID('sysadmin');.",
             "Keep xp_cmdshell disabled (EXEC sp_configure 'xp_cmdshell',0; RECONFIGURE;) so a sysadmin foothold cannot execute OS commands, and grant applications the least database role they need rather than sysadmin.",
             "Run the SQL Server service under a low-privileged gMSA and enforce tier separation on the database host so that even OS execution as the service account does not reach privileged credentials.",
             "Monitor SQL logins to the sysadmin role and Event ID 4688 on the host for xp_cmdshell child processes; alert on sp_addsrvrolemember calls adding a login to sysadmin.",
@@ -7441,6 +7498,267 @@ def _infer_node_type(display: str) -> str:
     if any(h in lower for h in group_hints):
         return "group"
     return "user"
+
+
+def _first_share_name(details: dict[str, Any]) -> str:
+    """Return the first share name the credential read came from, or ``""``."""
+    for key in ("shares_list", "shares", "share"):
+        value = details.get(key) if isinstance(details, dict) else None
+        if isinstance(value, list):
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    return text
+        elif isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _gpp_access_clause(details: dict[str, Any], *, source: str, target: str) -> str:
+    """Return the honest WHO-could-read-this clause for a GPP cpassword read.
+
+    The GPP narrative has two truthful framings for how the SYSVOL file was
+    reachable, and the wrong one is a client-facing honesty defect:
+
+    * For a read PROVEN over an unauthenticated null/guest session
+      (``notes.unauthenticated_reachable``), there were no credentials at all,
+      so the clause must NOT claim a domain account was required. It states the
+      severity amplifier: normally SYSVOL needs an authenticated domain user,
+      but here the file sat on a share reachable with no credential, so the
+      value was recovered before any authentication.
+    * For the ordinary authenticated case, SYSVOL is readable by every
+      authenticated domain user by design, so any domain account (here
+      ``source``) can retrieve and decrypt it.
+
+    The bind kind (null vs guest) is read from the shared ``unauthenticated_
+    reach`` SSOT so the clause never hardcodes "null session" for a guest read.
+    """
+    if notes_are_unauthenticated_reachable(details):
+        share = _first_share_name(details)
+        where = f"the {share} share" if share else "a non-standard SMB share"
+        if reached_via_from_notes(details) == REACHED_VIA_GUEST_SESSION:
+            return (
+                "Normally SYSVOL needs an authenticated domain user to read, but "
+                f"here the file sat on {where}, reachable over an SMB guest "
+                "session that required no real domain credential, so the value "
+                f"stored for {target} was recovered with no account at all."
+            )
+        return (
+            "Normally SYSVOL needs an authenticated domain user to read, but "
+            f"here the file sat on {where}, exposed to an anonymous SMB null "
+            f"session, so the value stored for {target} was recovered before any "
+            "authentication, with no credential at all."
+        )
+    return (
+        "SYSVOL is readable by every authenticated domain user by design, so "
+        f"any account with domain credentials, in this path {source}, can "
+        f"retrieve and decrypt the value stored for {target}."
+    )
+
+
+def _share_secret_access_clause(
+    details: dict[str, Any], *, source: str, target: str
+) -> str:
+    """Return the honest WHO-could-read-this clause for a share-secret read.
+
+    Mirrors :func:`_gpp_access_clause` for the generic credential-in-a-share
+    technique (``PasswordInShare``): a read proven over an unauthenticated
+    null/guest session carried no credential at all, so the clause must not
+    understate that fact by claiming "any authenticated user" could read the
+    file. The guest framing is explicit that the session was granted for an
+    unknown username with a blank password mapped to the built-in Guest
+    account, never a real domain credential. The null framing is explicit that
+    no username was presented at all. The ordinary authenticated case keeps the
+    credentialed framing, since the read genuinely required a domain account
+    there.
+
+    The bind kind (null vs guest) is read from the shared ``unauthenticated_
+    reach`` SSOT so the clause never hardcodes "null session" for a guest read.
+    """
+    # A password recovered from a share is NOT necessarily the target account's
+    # own stored secret. The common case (and Cicada's) is a shared/default
+    # password sitting in the file that was then CONFIRMED against the account by
+    # spraying it. Saying "the value stored for X was recovered" overstates that
+    # into X's personal secret. Exposure-Validation framing: name the source (the
+    # share) and the confirmation (spraying), never imply a personally-stored
+    # secret. When the read was spray-confirmed, say so; otherwise the neutral
+    # "authenticated as X" is true whether the secret belonged to X or merely
+    # matched it.
+    verified_via = str(details.get("verified_via") or "").strip().lower()
+    sprayed = verified_via == "spraying" or bool(details.get("spray_type"))
+    confirm = (
+        f"was confirmed against {target} by spraying it"
+        if sprayed
+        else f"authenticated as {target}"
+    )
+    if notes_are_unauthenticated_reachable(details):
+        share = _first_share_name(details)
+        where = f"the {share} share" if share else "a network share"
+        if reached_via_from_notes(details) == REACHED_VIA_GUEST_SESSION:
+            return (
+                f"The file sat on {where}, reachable over an SMB guest "
+                "session: an unknown username with a blank password that the "
+                f"target mapped to the built-in Guest account, so a password read "
+                f"there with no valid domain credential {confirm}."
+            )
+        return (
+            f"The file sat on {where}, reachable over an anonymous SMB null "
+            "session, so a password read there before any authentication, with "
+            f"no credential at all, {confirm}."
+        )
+    return (
+        f"{source} located the file while browsing SMB shares it already had "
+        f"authenticated access to, and the password read there {confirm}, "
+        "readable to any account holding the same share permission."
+    )
+
+
+def _share_secret_rotation_bullet(target: str) -> str:
+    return (
+        f"Rotate {target} immediately and treat it as compromised: it was "
+        "exposed for an unknown length of time with no way to confirm who "
+        "else read it."
+    )
+
+
+def _share_secret_remediation_clauses(
+    details: dict[str, Any], *, target: str
+) -> tuple[str, str, str, str]:
+    """Return the four reached-via-aware remediation bullets for a share-secret read.
+
+    The fix is mechanism-specific, not a generic "restrict the ACL" line:
+
+    * A proven GUEST-session read means the file was reachable with the
+      built-in Guest account. Closing it means removing BOTH the ``Everyone``
+      AND the explicit ``Guest``/``Guests`` READ grant, on BOTH the share ACL
+      and the underlying NTFS DACL (either one left in place still lets the
+      guest logon through), and disabling the Guest account itself so guest
+      logon cannot be re-enabled as a workaround.
+    * A proven NULL-session read means the file was reachable with no logon at
+      all. That is a server-level null-session policy, not an ACE the share
+      ACL carries, so closing it means the ``RestrictNullSessAccess`` /
+      ``NullSessionShares`` / ``EveryoneIncludesAnonymous`` registry settings,
+      not an ACL edit.
+    * An ordinary authenticated read is closed the conventional way: tighten
+      the share and NTFS ACLs to the accounts that actually need access.
+
+    The trailing two bullets (remove the file, rotate the secret) are
+    identical across mechanisms, since the exposed credential itself must
+    always be treated as compromised once it has been found. The concrete
+    share name ADscan discovered is woven into the PowerShell so the client
+    gets a command they can paste as written, rather than a template with a
+    blank to fill in; when no share name was captured, the sentence degrades
+    to a plain description of the affected share instead of a broken command.
+    """
+    share = _first_share_name(details)
+    share_ref = f"the {share} share" if share else "the affected share"
+    remove_bullet = (
+        f"Remove the credential-bearing file from {share_ref}, or replace it "
+        "with a version that carries no secret, once the access path below "
+        "is closed."
+    )
+    rotate_bullet = _share_secret_rotation_bullet(target)
+    if notes_are_unauthenticated_reachable(details):
+        if reached_via_from_notes(details) == REACHED_VIA_GUEST_SESSION:
+            if share:
+                access_bullet = (
+                    f"Remove the credential-less grant on {share_ref}: run "
+                    f"Get-SmbShareAccess -Name '{share}' to list the "
+                    "current grantees, then revoke both broad entries with "
+                    f"Revoke-SmbShareAccess -Name '{share}' -AccountName "
+                    f"'Everyone' -Force and Revoke-SmbShareAccess -Name "
+                    f"'{share}' -AccountName 'Guest' -Force (repeat for "
+                    "'Guests' if that group carries the grant instead), so "
+                    "neither principal keeps read. Apply the same removal "
+                    "on the underlying NTFS folder: "
+                    f"$Path = (Get-SmbShare -Name '{share}').Path; "
+                    "icacls $Path /remove:g Everyone; icacls $Path "
+                    "/remove:g Guest; Get-Acl $Path | Format-List, "
+                    "confirming that neither Everyone nor Guest/Guests "
+                    "remains on either ACL."
+                )
+            else:
+                access_bullet = (
+                    "Remove the credential-less grant on the affected "
+                    "share: revoke both the 'Everyone' and the 'Guest' (or "
+                    "'Guests') entries from the share ACL with "
+                    "Revoke-SmbShareAccess, and from the underlying NTFS "
+                    "folder's DACL with icacls /remove:g, since either one "
+                    "left in place still lets the guest logon through. "
+                    "Confirm with Get-SmbShareAccess and Get-Acl that "
+                    "neither principal remains on either ACL."
+                )
+            account_bullet = (
+                "Disable the built-in Guest account so guest logon cannot "
+                "be used as a workaround for the removed grant: "
+                "Get-LocalUser -Name Guest | Disable-LocalUser, then "
+                "confirm with Get-LocalUser -Name Guest that Enabled reads "
+                "False."
+            )
+            return access_bullet, account_bullet, remove_bullet, rotate_bullet
+        access_bullet = (
+            "Close the null-session read at the server, not the individual "
+            "share: set the registry value HKLM:\\SYSTEM\\"
+            "CurrentControlSet\\Services\\LanmanServer\\Parameters\\"
+            "RestrictNullSessAccess to 1 with Set-ItemProperty, and remove "
+            f"{share or 'this share'}'s name from the NullSessionShares "
+            "multi-string value under the same key. Where "
+            "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\"
+            "EveryoneIncludesAnonymous is enabled, set it back to 0 as "
+            "well, then confirm with Get-SmbServerConfiguration | "
+            "Select-Object RestrictNullSessAccess."
+        )
+        if share:
+            account_bullet = (
+                f"If {share_ref} is not required for unauthenticated "
+                f"access, remove it entirely with Remove-SmbShare -Name "
+                f"'{share}' -Force; where it must remain reachable, "
+                f"restrict it to named accounts with Grant-SmbShareAccess "
+                f"-Name '{share}' -AccountName 'CORP\\FileShareAdmins' "
+                "-AccessRight Read -Force (substituting the group that "
+                "actually needs it) after revoking the broad grant."
+            )
+        else:
+            account_bullet = (
+                "If the affected share is not required for unauthenticated "
+                "access, remove it entirely with Remove-SmbShare; where it "
+                "must remain reachable, restrict it to named accounts with "
+                "Grant-SmbShareAccess after revoking the broad grant."
+            )
+        return access_bullet, account_bullet, remove_bullet, rotate_bullet
+    if share:
+        access_bullet = (
+            f"Restrict {share_ref} to the accounts that actually need it: "
+            f"review the current grants with Get-SmbShareAccess -Name "
+            f"'{share}', revoke the broad grant with Revoke-SmbShareAccess "
+            f"-Name '{share}' -AccountName 'Everyone' -Force (and "
+            "'Authenticated Users' if present), then grant only the "
+            f"specific group that needs it with Grant-SmbShareAccess -Name "
+            f"'{share}' -AccountName 'CORP\\FileShareAdmins' -AccessRight "
+            "Read -Force (substituting the group that actually needs it)."
+        )
+        account_bullet = (
+            "Apply the matching restriction on the underlying NTFS "
+            f"folder: $Path = (Get-SmbShare -Name '{share}').Path; icacls "
+            "$Path /remove:g Everyone; then grant read to the same named "
+            "group on that path, and confirm with Get-Acl $Path that only "
+            "the intended accounts remain."
+        )
+    else:
+        access_bullet = (
+            "Restrict the affected share to the accounts that actually "
+            "need it: review the current grants with Get-SmbShareAccess, "
+            "revoke the broad grant to Everyone (and Authenticated Users, "
+            "if present) with Revoke-SmbShareAccess, then grant only the "
+            "specific group that needs it with Grant-SmbShareAccess."
+        )
+        account_bullet = (
+            "Apply the matching restriction on the underlying NTFS folder "
+            "with icacls, removing the broad Everyone grant and adding "
+            "read for the same named group, then confirm with Get-Acl "
+            "that only the intended accounts remain."
+        )
+    return access_bullet, account_bullet, remove_bullet, rotate_bullet
 
 
 def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
@@ -7558,11 +7876,43 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     else:
         xp_cmdshell_plan = "commands run through the SQL Server service"
 
+    # The GPP narrative's access clause is honest about WHO could read the
+    # SYSVOL file: for a read proven over an unauthenticated null/guest session
+    # there were no credentials at all, so the clause must not claim a domain
+    # account was required (a client-facing honesty defect against the proven
+    # null-session read). Unused by every other relation's template.
+    gpp_access_clause = _gpp_access_clause(
+        details if isinstance(details, dict) else {}, source=source, target=target
+    )
+
+    # The PasswordInShare narrative's access clause and remediation both need
+    # to know HOW the file was reached (guest session / null session /
+    # authenticated) so a proven credential-less read is neither understated
+    # ("any authenticated user") nor closed with the wrong fix (an ACL edit
+    # for a null session, a registry edit for a guest-session ACE). Unused by
+    # every other relation's template.
+    _share_secret_details = details if isinstance(details, dict) else {}
+    share_secret_access_clause = _share_secret_access_clause(
+        _share_secret_details, source=source, target=target
+    )
+    (
+        share_secret_access_removal,
+        share_secret_account_hardening,
+        share_secret_file_removal,
+        share_secret_rotation,
+    ) = _share_secret_remediation_clauses(_share_secret_details, target=target)
+
     return {
         "source": source,
         "target": target,
         "source_type": _infer_node_type(source),
         "target_type": _infer_node_type(target),
+        "gpp_access_clause": gpp_access_clause,
+        "share_secret_access_clause": share_secret_access_clause,
+        "share_secret_access_removal": share_secret_access_removal,
+        "share_secret_account_hardening": share_secret_account_hardening,
+        "share_secret_file_removal": share_secret_file_removal,
+        "share_secret_rotation": share_secret_rotation,
         # Degrade to a neutral phrase so an ADCS step remediation never renders a
         # blank "on template , ..." slot when the name could not be resolved.
         "template": template or "the affected certificate template",
@@ -7831,7 +8181,7 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
         # with the edge-specific remediation_steps.
         text = str(value).strip()
         if text.lower().startswith("[bullet]"):
-            text = text[len("[bullet]"):].strip()
+            text = text[len("[bullet]") :].strip()
         return text
 
     def _technique_remediation() -> list[str]:
@@ -7916,6 +8266,169 @@ def render_step_verify(step: dict[str, Any]) -> dict[str, str]:
         "windows": _render_verify_template(entry.verify_windows, placeholders),
         "linux": _render_verify_template(entry.verify_linux, placeholders),
     }
+
+
+# ---------------------------------------------------------------------------
+# LSASS-dump defensive-posture context (DumpLSASS step) — EXPOSURE VALIDATION.
+#
+# ADscan proves whether the credentials in LSASS were RECOVERABLE. It does NOT
+# test the client's defensive stack, so a posture line NEVER attributes a
+# non-completion to an endpoint-protection product. The matrix keys on
+# (outcome x observed endpoint posture) and states facts, never a cause:
+#   - A SUCCEEDED cell asserts the proven positive about OUR attack ("recovered
+#     regardless of active endpoint protection ...").
+#   - A DID_NOT_COMPLETE cell states two observed facts SIDE BY SIDE with the
+#     explicit "not conclusively determined; recorded as context, not as the
+#     cause" disclaimer, and uses NO causation verb (blocked/prevented/stopped/
+#     detected).
+#   - A POSTURE_UNKNOWN cell says NOTHING about defense (an incomplete
+#     fingerprint is NOT "no endpoint protection" — the absence-trap guard).
+# ``{product}`` is the client's OWN detected security product name (their
+# asset, like the abused certificate-template name) — never an ADscan tool.
+# One authored SSOT; both the PDF report and the web CTEM read it verbatim.
+# See CLAUDE.md § "Exposure Validation, NOT Security Validation".
+# ---------------------------------------------------------------------------
+
+# Outcome half of a DID_NOT_COMPLETE cell, stated identically everywhere so the
+# disclaimer phrase is one string a test can assert against.
+_LSASS_DID_NOT_COMPLETE_LEAD = (
+    "The LSASS credential read did not complete on this host; the cause was "
+    "not conclusively determined."
+)
+
+_LSASS_POSTURE_PHRASES: dict[str, str] = {
+    # ── SUCCEEDED × observed posture — assert the PROVEN positive fact ──────
+    "succeeded__edr_av_active": (
+        "Endpoint protection was active on this host — endpoint detection and "
+        "response ({product}) alongside antivirus — and the credentials in "
+        "LSASS were recovered regardless."
+    ),
+    "succeeded__edr_only": (
+        "Endpoint detection and response ({product}) was active on this host, "
+        "and the credentials in LSASS were recovered regardless."
+    ),
+    "succeeded__av_only": (
+        "Antivirus ({product}) was active on this host with no endpoint "
+        "detection and response observed, and the credentials in LSASS were "
+        "recovered."
+    ),
+    "succeeded__none_observed": (
+        "No endpoint protection was observed on this host, and the credentials "
+        "in LSASS were recovered."
+    ),
+    # SUCCEEDED × POSTURE_UNKNOWN emits NO sentence (see the render helper) —
+    # endpoint posture was not assessed, so there is nothing honest to state.
+    # ── DID_NOT_COMPLETE × observed posture — two facts side by side, ZERO cause ─
+    # NOTE: these are plain (non-f) strings — ``{product}`` MUST survive as a
+    # literal placeholder for ``str.format`` at render time. The disclaimer lead
+    # is concatenated in, not f-interpolated (an f-string would try to resolve
+    # ``{product}`` at definition time -> NameError).
+    "attempted__edr_av_active": (
+        _LSASS_DID_NOT_COMPLETE_LEAD + " Endpoint protection was active here — "
+        "endpoint detection and response ({product}) alongside antivirus — "
+        "recorded as context, not as the cause."
+    ),
+    "attempted__edr_only": (
+        _LSASS_DID_NOT_COMPLETE_LEAD + " Endpoint detection and response "
+        "({product}) was active here, recorded as context, not as the cause."
+    ),
+    "attempted__av_only": (
+        _LSASS_DID_NOT_COMPLETE_LEAD + " Antivirus ({product}) was active here, "
+        "recorded as context, not as the cause."
+    ),
+    "attempted__none_observed": (
+        _LSASS_DID_NOT_COMPLETE_LEAD + " No endpoint protection was observed here."
+    ),
+    # DID_NOT_COMPLETE × POSTURE_UNKNOWN — the neutral outcome-only fallback:
+    # no posture claim at all.
+    "attempted__posture_unknown": _LSASS_DID_NOT_COMPLETE_LEAD,
+}
+
+
+def _lsass_posture_state_key(
+    edr_active: bool, av_active: bool, posture_assessed: bool
+) -> str:
+    """Map the stamped posture booleans to a matrix posture-state key.
+
+    ``posture_assessed`` is the absence-trap gate: when the fingerprint did not
+    complete (``False``), the posture is UNKNOWN regardless of the product
+    lists — an incomplete fingerprint is NOT "no endpoint protection".
+    """
+    if not posture_assessed:
+        return "posture_unknown"
+    if edr_active and av_active:
+        return "edr_av_active"
+    if edr_active:
+        return "edr_only"
+    if av_active:
+        return "av_only"
+    return "none_observed"
+
+
+def render_lsass_posture_context(step: dict[str, Any]) -> str:
+    """Render the defensive-posture context sentence for a DumpLSASS step.
+
+    Reads the posture fields stamped onto the step's ``details`` at the LSASS
+    dump seam (``lsass_dump_outcome`` / ``edr_active`` / ``av_active`` /
+    ``endpoint_products`` / ``posture_assessed``), computes the matrix cell, and
+    returns the authored client-safe sentence — or ``""`` when the step carries
+    no posture (a posture-unblind step never emits a claim).
+
+    Honesty invariants (locked by ``tests/unit/services/test_lsass_posture_narrative.py``):
+      - SUCCEEDED × POSTURE_UNKNOWN → ``""`` (nothing to say about defense).
+      - DID_NOT_COMPLETE cells never use a causation verb and always carry the
+        "not conclusively determined" disclaimer.
+      - ``posture_assessed`` false forces the UNKNOWN branch regardless of the
+        product lists.
+
+    Best-effort: returns ``""`` on any missing/malformed field so a step that
+    was never stamped renders nothing rather than a bogus claim.
+    """
+    if not isinstance(step, dict):
+        return ""
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    if not isinstance(details, dict):
+        return ""
+    outcome_raw = str(details.get("lsass_dump_outcome") or "").strip().lower()
+    if outcome_raw not in ("succeeded", "attempted"):
+        # Not a stamped DumpLSASS step (or an unexpected token) — no claim.
+        return ""
+    posture_assessed = bool(details.get("posture_assessed"))
+    edr_active = bool(details.get("edr_active"))
+    av_active = bool(details.get("av_active"))
+    posture_key = _lsass_posture_state_key(edr_active, av_active, posture_assessed)
+
+    # SUCCEEDED × POSTURE_UNKNOWN: the base narrative stands alone, no posture
+    # claim (endpoint posture was not assessed on this host).
+    if outcome_raw == "succeeded" and posture_key == "posture_unknown":
+        return ""
+
+    cell_key = f"{outcome_raw}__{posture_key}"
+    template = _LSASS_POSTURE_PHRASES.get(cell_key)
+    if not template:
+        return ""
+
+    if "{product}" not in template:
+        # NONE_OBSERVED / UNKNOWN cells carry no product token.
+        return template
+
+    products = details.get("endpoint_products")
+    names = [
+        str(name).strip()
+        for name in (products if isinstance(products, (list, tuple)) else [])
+        if str(name).strip()
+    ]
+    if not names:
+        # A product-bearing cell with no product name to fill would leave a
+        # literal placeholder — never emit that. Degrade to a neutral,
+        # product-free phrase so the sentence stays honest and complete.
+        product_display = "endpoint protection"
+    else:
+        product_display = ", ".join(names)
+    try:
+        return template.format(product=product_display)
+    except (KeyError, IndexError):
+        return template.replace("{product}", product_display)
 
 
 def resolve_technique_prose(vuln_key: str | None) -> dict[str, Any]:
@@ -8013,9 +8526,7 @@ def build_step_knowledge(step: dict[str, Any]) -> dict[str, Any] | None:
     """
     if not isinstance(step, dict):
         return None
-    relation_raw = (
-        step.get("action") or step.get("relation") or step.get("type") or ""
-    )
+    relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
     entry = get_attack_step_entry(str(relation_raw))
     if entry is None:
         return None
@@ -8040,6 +8551,13 @@ def build_step_knowledge(step: dict[str, Any]) -> dict[str, Any] | None:
         knowledge["verify_windows"] = _verify["windows"]
     if _verify.get("linux"):
         knowledge["verify_linux"] = _verify["linux"]
+    # Defensive-posture context for a DumpLSASS step (endpoint posture observed
+    # at dump time). Omitted when empty — a non-LSASS step, or an LSASS step with
+    # no stamped posture, carries no claim. Exposure-Validation honesty is baked
+    # into the authored matrix, not this call site.
+    _posture_context = render_lsass_posture_context(step)
+    if _posture_context:
+        knowledge["defensive_posture_context"] = _posture_context
     # Surface the remaining canonical prose fields when VULN_CATALOG carries
     # them — absent fields are omitted so the shape stays clean.
     for field_name in ("impact", "remediation", "remediation_options", "references"):
@@ -8063,8 +8581,7 @@ _STATUS_PHRASE: dict[str, str] = {
     # a step of this chain ran successfully against the live environment, which
     # is materially stronger evidence than an attempt that went nowhere.
     "partial": (
-        "had part of its chain validated by live execution, but was not run "
-        "end-to-end"
+        "had part of its chain validated by live execution, but was not run end-to-end"
     ),
     # No reachable surface to test the avenue, so its exposure is unknown
     # rather than mapped. Deliberately NOT "a viable route": that claimed more
@@ -8117,13 +8634,16 @@ def render_path_summary(path: dict[str, Any]) -> str:
     if target_is_placeholder:
         target = "the target principal"
 
-    # Collect unique technique labels in path order
+    # Collect unique technique labels in path order. This is client-facing
+    # narrative prose, so it uses the BUSINESS phrase ("Credentials in a
+    # Network Share") via the shared label SSOT — never a raw CamelCase edge
+    # slug ("PasswordInShare"), which reads as jargon to an executive reader.
     try:
         from adscan_internal.services.attack_relation_labels import (
-            format_relation_label,
+            business_relation_phrase,
         )
 
-        label_fn = format_relation_label
+        label_fn = business_relation_phrase
     except Exception:
 
         def label_fn(s: str) -> str:  # type: ignore[misc]

@@ -61,6 +61,7 @@ _FLAT_TYPE_BY_ENTITY_TYPE: dict[str, str] = {
     "share": "share",
     "artifact": "artifact",
     "credential": "credential",
+    "access_vector": "access_vector",
 }
 
 #: Entity types whose flat string carries a ``Template: ``-style prefix that
@@ -472,6 +473,22 @@ def _looks_like_artifact(value: str) -> bool:
     )
 
 
+def _artifact_is_client_asset(value: str) -> bool:
+    """Whether an ``artifact`` detail value is a client-facing affected asset.
+
+    A concrete file/path-like artifact (a share path, a SYSVOL XML, a UNC path)
+    IS an affected asset. A scan-methodology provenance marker — "automated
+    share content scan", "AI share loot analysis", "CIFS mounted share scan" —
+    describes HOW ADscan looked, not an asset the finding affects, and must
+    never surface in the client asset list. The file/path shape is the
+    discriminator: a methodology phrase carries no path separator or file
+    extension, so :func:`_looks_like_artifact` returns False for it. Generalized
+    against any tool/methodology string reaching the ``artifact`` detail, not a
+    per-name blocklist.
+    """
+    return _looks_like_artifact(str(value or "").strip())
+
+
 def classify_asset_type(value: str) -> str:
     """Guess an asset's type from its display string alone.
 
@@ -498,6 +515,8 @@ def classify_asset_type(value: str) -> str:
         return "share"
     if lower.startswith("artifact: "):
         return "artifact"
+    if lower.startswith("reachable over an unauthenticated"):
+        return "access_vector"
     if _looks_like_artifact(text):
         return "artifact"
     if lower.endswith("$"):
@@ -839,8 +858,36 @@ def _path_relation_tokens(path: dict[str, Any]) -> set[str]:
     return tokens
 
 
+def _path_entry_vector_keys(path: dict[str, Any]) -> set[str]:
+    """Return the finding keys whose weakness IS this path's unauthenticated entry.
+
+    A path that begins from a synthetic ``Unauthenticated`` entry node (an SMB
+    guest or null session) carries its entry-vector finding as step 0 via the
+    SOURCE NODE, not an edge relation, so the relation-alias join below cannot see
+    it. This credits it from the shared entry-vector SSOT. Best-effort; never
+    raises (a decoder failure degrades to no entry-vector credit).
+    """
+    try:
+        from adscan_core.reporting.unauthenticated_reach import (
+            entry_vector_finding_keys_for_path,
+        )
+
+        return {str(k).strip().lower() for k in entry_vector_finding_keys_for_path(path)}
+    except Exception:  # noqa: BLE001 — entry-vector enrichment is never fatal
+        return set()
+
+
 def _path_matches_vulnerability(path: dict[str, Any], vuln_name: str) -> bool:
-    """Return True when a path contains a step tied to the vulnerability."""
+    """Return True when a path contains a step tied to the vulnerability.
+
+    Relation-only by design: this drives affected-ASSET extraction, which reads
+    assets off the matching relation STEP. The unauthenticated ENTRY vector
+    (guest/null session) is credited only for the on-path COUNT (see
+    :func:`count_findings_on_paths` / :func:`_path_entry_vector_keys`), never for
+    asset extraction — the entry is a source node with no step to read an asset
+    from, and matching it here would pull the path terminal in as a spurious
+    affected asset.
+    """
     relation_aliases = _relation_aliases_for_vulnerability(vuln_name)
     if not relation_aliases:
         return False
@@ -880,15 +927,25 @@ def count_findings_on_paths(
         ``(findings_on_path, findings_total)``. A finding that matches several
         paths counts once.
     """
+    dict_paths = [path for path in paths if isinstance(path, dict)]
     path_tokens = [
-        _path_relation_tokens(path) for path in paths if isinstance(path, dict)
+        tokens for tokens in (_path_relation_tokens(path) for path in dict_paths) if tokens
     ]
-    path_tokens = [tokens for tokens in path_tokens if tokens]
+    # The entry-vector finding of each path (guest/null session) is carried as the
+    # path's SOURCE NODE, not an edge relation — credit it too, or the guest-entry
+    # finding that begins a validated chain never counts as "on the path".
+    entry_keys: set[str] = set()
+    for path in dict_paths:
+        entry_keys |= _path_entry_vector_keys(path)
 
     findings_total = 0
     findings_on_path = 0
     for key in finding_keys:
         findings_total += 1
+        normalized = str(key or "").strip().lower()
+        if normalized and normalized in entry_keys:
+            findings_on_path += 1
+            continue
         aliases = _relation_aliases_for_vulnerability(str(key or ""))
         if not aliases:
             continue
@@ -957,7 +1014,16 @@ def _extract_assets_from_matching_step(step: dict[str, Any]) -> list[str]:
                 _extend_unique(tokens, _split_joined_display_tokens(value))
             _extend_unique(assets, [f"Share: {token}" for token in tokens])
         elif key in _ARTIFACT_KEYS:
-            _extend_unique(assets, [f"Artifact: {value}" for value in values])
+            # Only a concrete file/path-like artifact is a client-facing asset;
+            # a scan-methodology marker is dropped (see _artifact_is_client_asset).
+            _extend_unique(
+                assets,
+                [
+                    f"Artifact: {value}"
+                    for value in values
+                    if _artifact_is_client_asset(value)
+                ],
+            )
         else:
             _extend_unique(assets, values)
 
@@ -1101,12 +1167,63 @@ def _extract_registry_extras_from_details(vuln_name: str, vuln_data: Any) -> lis
             [f"Share: {location}" for location in extract_share_locations(details)],
         )
     if Extra.ARTIFACT in rule.extras:
-        for key in ("artifact", "source_xml"):
+        for key in ("artifact", "source_xml", "unc_path"):
             values = _extract_strings(details.get(key))
-            _extend_unique(assets, [f"Artifact: {value}" for value in values])
+            _extend_unique(
+                assets,
+                [
+                    f"Artifact: {value}"
+                    for value in values
+                    if _artifact_is_client_asset(value)
+                ],
+            )
     if Extra.PASSWORD_REDACTED in rule.extras:
         _extend_unique(assets, _password_redacted_assets(details))
+    if Extra.READ_SET in rule.extras:
+        _extend_unique(assets, _read_set_assets(details))
+    if Extra.NULL_SESSION_VECTOR in rule.extras:
+        _extend_unique(assets, _null_session_vector_assets(details))
     return assets
+
+
+def _read_set_assets(details: Mapping[str, Any]) -> list[str]:
+    """Flat display strings for the measured READ-set (who can read the file).
+
+    Reads ``details.read_set`` (the mxac/read-set SSOT's ``{"sid","label"}``
+    records). Never fabricated — an absent read-set yields no assets.
+    """
+    raw = details.get("read_set")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        label = str(entry.get("label") or entry.get("sid") or "").strip()
+        if label:
+            _extend_unique(out, [label])
+    return out
+
+
+def _null_session_vector_assets(details: Mapping[str, Any]) -> list[str]:
+    """Flat display for the null/guest access VECTOR, honesty-gated.
+
+    Surfaced ONLY when the finding carries a PROVEN ``unauthenticated_reachable``
+    + a known ``reached_via`` token (never from a broad SID alone). Worded from
+    the ONE SSOT so the PDF flat list matches the structured entity.
+    """
+    from adscan_core.reporting.unauthenticated_reach import (  # noqa: PLC0415
+        REACHED_VIA_GUEST_SESSION,
+        REACHED_VIA_NULL_SESSION,
+        unauthenticated_vector_display,
+    )
+
+    if details.get("unauthenticated_reachable") is not True:
+        return []
+    reached_via = str(details.get("reached_via") or "").strip()
+    if reached_via.lower() not in {REACHED_VIA_NULL_SESSION, REACHED_VIA_GUEST_SESSION}:
+        return []
+    return [unauthenticated_vector_display(reached_via)]
 
 
 def _flat_assets_from_structured_entities(vuln_data: Any) -> list[str]:
@@ -1606,6 +1723,8 @@ def extract_affected_notes(finding_key: str, details: Any) -> dict[str, Any]:
         artifacts: list[str] = []
         for key in ("artifact", "source_xml"):
             _extend_unique(artifacts, _extract_strings(view.get(key)))
+        # Drop scan-methodology markers; only a file/path-like artifact is shown.
+        artifacts = [a for a in artifacts if _artifact_is_client_asset(a)]
         if artifacts:
             notes["artifact"] = artifacts[0]
     if Extra.PASSWORD_REDACTED in extras:
@@ -1636,10 +1755,28 @@ def build_affected_notes_display_entries(
     if ca:
         entries.append(("bullet", "Certification authority: " + ", ".join(ca)))
     if notes.get("wordlist_cracked"):
-        entries.append(("bullet", f"Cracked with wordlist: {notes['wordlist_cracked']}"))
-    elif notes.get("wordlists_tried"):
+        from adscan_core.reporting.cracking_coverage import (  # noqa: PLC0415
+            client_wordlist_label,
+        )
+
         entries.append(
-            ("bullet", "Wordlists tried: " + ", ".join(notes["wordlists_tried"]))
+            (
+                "bullet",
+                f"Cracked with wordlist: {client_wordlist_label(notes['wordlist_cracked'])}",
+            )
+        )
+    elif notes.get("wordlists_tried"):
+        from adscan_core.reporting.cracking_coverage import (  # noqa: PLC0415
+            client_wordlist_label,
+        )
+
+        _tried: list[str] = []
+        for _wl in notes["wordlists_tried"]:
+            _label = client_wordlist_label(_wl)
+            if _label and _label not in _tried:
+                _tried.append(_label)
+        entries.append(
+            ("bullet", "Wordlists tried: " + ", ".join(_tried))
         )
     if notes.get("host"):
         entries.append(("bullet", f"Host: {notes['host']}"))

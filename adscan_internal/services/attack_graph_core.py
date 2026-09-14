@@ -26,6 +26,14 @@ from adscan_core.reporting.attack_path_memory_gate import (
     DfsMemoryBudget,
     _AttackPathMemoryBudgetExceeded,
 )
+from adscan_core.reporting.unauthenticated_reach import (
+    UNAUTHENTICATED_ENTRY_KIND,
+    entry_label_for_reached_via,
+    is_unauthenticated_entry_label,  # noqa: F401  (re-exported for existing importers)
+    notes_are_unauthenticated_reachable,
+    reached_via_from_entry_label,
+    reached_via_from_notes,
+)
 from adscan_internal.services import attack_path_progress
 from adscan_internal.services.domain_controller_classifier import (
     RID_DOMAIN_CONTROLLERS,
@@ -1347,6 +1355,27 @@ def _record_affected_principal_count(record: dict[str, Any]) -> int:
     return val if isinstance(val, int) else 0
 
 
+def _record_is_unauthenticated_reachable(record: dict[str, Any]) -> bool:
+    """Return True when any of a display record's steps is a proven no-cred read.
+
+    Belt-and-suspenders guard for the containment filter: a path whose entry was
+    PROVEN executable with no credential (the synthetic Unauthenticated foothold)
+    is never redundant to an authenticated subpath, so it must never be dropped in
+    favour of a twin that LACKS the flag. Reads each step's ``details`` (where the
+    SSOT spreads the edge notes) for ``unauthenticated_reachable``. Best-effort:
+    an odd-shaped record yields ``False`` (byte-identical to the un-guarded path).
+    """
+    steps = record.get("steps")
+    if not isinstance(steps, list):
+        return False
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if notes_are_unauthenticated_reachable(step.get("details")):
+            return True
+    return False
+
+
 def filter_contained_paths_for_domain_listing(
     records: list[dict[str, Any]],
     *,
@@ -1592,6 +1621,17 @@ def filter_contained_paths_for_domain_listing(
                                 > _record_affected_principal_count(kept_rec)
                             ):
                                 continue
+                            # Belt-and-suspenders: never collapse a PROVEN
+                            # no-credential foothold (the Unauthenticated entry)
+                            # into an authenticated subpath that lacks the flag. A
+                            # no-cred path is never redundant to a credentialed twin
+                            # — the MAXIMUM-EXPOSURE affected count already wins the
+                            # carveout above; this is the safety net for any
+                            # topology where the count did not dominate.
+                            if _record_is_unauthenticated_reachable(
+                                record
+                            ) and not _record_is_unauthenticated_reachable(kept_rec):
+                                continue
                             is_super_path = True
                             break
                         if is_super_path:
@@ -1665,6 +1705,12 @@ def filter_contained_paths_for_domain_listing(
                         attack_core_is_prefix(a_core, b_core)
                         or attack_core_is_subsequence(a_core, b_core)
                     ):
+                        continue
+                    # Belt-and-suspenders: a PROVEN no-credential foothold is never
+                    # dominated by an authenticated super-path that lacks the flag.
+                    if _record_is_unauthenticated_reachable(
+                        record
+                    ) and not _record_is_unauthenticated_reachable(other):
                         continue
                     b_tier = tiers_by_id[id(other)]
                     if rec_is_hv:
@@ -4966,6 +5012,190 @@ def compute_perterminal_attack_paths(
     return paths
 
 
+# ── Synthetic "Unauthenticated" entry node (path step 0) ───────────────────────
+# When a credential-read edge was PROVEN executable with no credential (its notes
+# carry ``unauthenticated_reachable == True``), the attack PATH must begin at the
+# attacker's real starting POSITION — no account — not mid-chain at the credential
+# owner and not at the well-known read-set group (Everyone / Users). The read-set
+# groups answer "who the ACL allows", which is a fact carried on the entry edge's
+# ``authorized_by_acl`` note; the synthetic node answers "who actually read it (no
+# credential)". The two are one read, so one foothold path is emitted — never a
+# parallel Everyone-as-start path.
+#
+# These nodes exist ONLY in the materialized/displayed paths (the prepend mutates
+# the working graph inside ``compute_maximal_attack_paths``); the raw
+# ``attack_graph.json`` is never changed. Everyone / Users / Guests / Anonymous are
+# NEVER made DFS starts — only the synthetic node is, and only gated on the proven
+# flag (see the start-carve in ``compute_maximal_attack_paths``).
+_UNAUTH_ENTRY_ID_PREFIX = "synthetic:unauthenticated:"
+# The node ``kind`` token, the entry labels and the label↔reached_via decoder now
+# live in the client-copy SSOT ``adscan_core.reporting.unauthenticated_reach``
+# (imported above), so the web backend can recognize the synthetic entry node
+# without importing the engine across the tier boundary. ``UNAUTHENTICATED_ENTRY_KIND``
+# is re-exported from that import; it stays a shared contract
+# (``attack_paths_core.apply_affected_user_metadata`` keys the MAXIMUM-EXPOSURE
+# affected-count on it).
+
+# Kept name for existing engine consumers (``attack_path_execution.py``): a thin
+# alias onto the SSOT decoder so there is ONE producer of the label and ONE decoder.
+unauthenticated_entry_reached_via_from_label = reached_via_from_entry_label
+
+
+def _node_is_synthetic_unauthenticated_entry(node: dict[str, Any]) -> bool:
+    """Return True when ``node`` is the synthetic ``Unauthenticated`` entry node.
+
+    The entry node is the ONLY node the start-selection loop admits past the
+    ``_node_is_enabled_user`` gate. It is identified by its ``kind`` marker plus
+    the synthetic flag, never by label, so no real directory principal can be
+    mistaken for it.
+    """
+    if not isinstance(node, dict):
+        return False
+    kind = node.get("kind")
+    if isinstance(kind, list):
+        kind = str(kind[0]) if kind else ""
+    if str(kind or "").strip() != UNAUTHENTICATED_ENTRY_KIND:
+        return False
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return bool(props.get("synthetic"))
+
+
+def _unauth_entry_reached_via(notes: dict[str, Any]) -> str:
+    """Return the ``reached_via`` token from an edge's notes (null/guest).
+
+    Thin wrapper over the shared SSOT reader so the prepend and every render
+    surface resolve the bind token the same way.
+    """
+    return reached_via_from_notes(notes)
+
+
+def _prepend_unauthenticated_entry_nodes(graph: dict[str, Any]) -> set[str]:
+    """Prepend synthetic ``Unauthenticated`` entry nodes for proven no-cred reads.
+
+    Scans the graph for credential-read edges whose notes carry the PROVEN
+    ``unauthenticated_reachable`` flag, groups them by the foothold they yield —
+    ``(to, relation, secret, artifact)`` — and, for each group, synthesizes ONE
+    ``Unauthenticated (<null|guest> session)`` node plus ONE synthetic edge
+    ``entry -> <relation> -> <credential owner>`` carrying a copy of the read
+    edge's notes PLUS ``authorized_by_acl`` (the read-set group labels, e.g.
+    ``["Everyone", "Users"]``). The raw read-set edges are left in place — their
+    well-known-group sources are never DFS starts — so the ONLY new start is the
+    synthetic node.
+
+    Mutates ``graph["nodes"]`` / ``graph["edges"]`` in place. Returns the set of
+    synthetic entry node ids (empty when no proven edge exists, so every other
+    graph is byte-identical).
+    """
+    nodes_map = graph.get("nodes")
+    edges = graph.get("edges")
+    if not isinstance(nodes_map, dict) or not isinstance(edges, list):
+        return set()
+
+    # Group proven-unauth read edges by the foothold they prove: same owner, same
+    # technique, same secret, same artifact = ONE foothold read with N allowed
+    # readers. The read-set labels are accumulated per group as authorized_by_acl.
+    groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        notes = edge.get("notes")
+        if not isinstance(notes, dict) or not notes_are_unauthenticated_reachable(notes):
+            continue
+        to_id = str(edge.get("to") or "").strip()
+        relation = str(edge.get("relation") or "").strip()
+        if not to_id or not relation:
+            continue
+        secret = str(notes.get("secret") or "").strip()
+        artifact = str(notes.get("artifact") or "").strip()
+        key = (to_id, relation, secret, artifact)
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = {"notes": dict(notes), "acl": [], "via": _unauth_entry_reached_via(notes)}
+            groups[key] = bucket
+        from_node = nodes_map.get(str(edge.get("from") or ""))
+        reader_label = _unauth_entry_reader_label(from_node)
+        if reader_label and reader_label not in bucket["acl"]:
+            bucket["acl"].append(reader_label)
+
+    if not groups:
+        return set()
+
+    synthetic_domain = _unauth_entry_domain(graph)
+    synthetic_start_ids: set[str] = set()
+    for (to_id, relation, _secret, _artifact), bucket in groups.items():
+        via = bucket["via"]
+        entry_label = entry_label_for_reached_via(via)
+        entry_id = f"{_UNAUTH_ENTRY_ID_PREFIX}{synthetic_domain}:{via}"
+        if entry_id not in nodes_map:
+            nodes_map[entry_id] = {
+                "label": entry_label,
+                "kind": UNAUTHENTICATED_ENTRY_KIND,
+                "objectId": entry_id,
+                "compromise_class": "unauthenticated_principal",
+                "privilege_tier": "tier2",
+                "properties": {
+                    "name": entry_label,
+                    "domain": synthetic_domain,
+                    "synthetic": True,
+                    "synthetic_source": "unauthenticated_entry",
+                    "compromise_class": "unauthenticated_principal",
+                    "privilege_tier": "tier2",
+                    # Persist the bind used for the proven read so the executor
+                    # (Task 5) reads it directly — never re-derives it by parsing
+                    # the node id / label string.
+                    "reached_via": via,
+                },
+            }
+        entry_notes = dict(bucket["notes"])
+        if bucket["acl"]:
+            entry_notes["authorized_by_acl"] = list(bucket["acl"])
+        edges.append(
+            {
+                "from": entry_id,
+                "to": to_id,
+                "relation": relation,
+                "status": "success",
+                "notes": entry_notes,
+            }
+        )
+        synthetic_start_ids.add(entry_id)
+
+    return synthetic_start_ids
+
+
+def _unauth_entry_reader_label(node: dict[str, Any] | None) -> str:
+    """Return a short, client-facing read-set label for a well-known reader node.
+
+    Maps the well-known group node label (``Everyone@WELLKNOWN``,
+    ``USERS@ACTIVE.HTB``) to the bare group name (``Everyone`` / ``Users``) that
+    the ``authorized_by_acl`` note carries. A missing node yields an empty string.
+    """
+    if not isinstance(node, dict):
+        return ""
+    label = str(node.get("label") or "").strip()
+    if not label:
+        return ""
+    return label.split("@", 1)[0].strip().title()
+
+
+def _unauth_entry_domain(graph: dict[str, Any]) -> str:
+    """Return the upper-cased domain used to key the synthetic entry node id.
+
+    Reads the domain of the first proven-unauth edge's owner node so the id is
+    stable per domain; falls back to an empty string (still a valid, unique id
+    suffix) when no domain is resolvable.
+    """
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    for node in nodes_map.values():
+        if not isinstance(node, dict):
+            continue
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        dom = str(props.get("domain") or "").strip().upper()
+        if dom and dom != "WELLKNOWN":
+            return dom
+    return ""
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
@@ -5009,6 +5239,15 @@ def compute_maximal_attack_paths(
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return []
 
+    # Materialize a synthetic ``Unauthenticated`` entry node as path step 0 for any
+    # credential-read edge PROVEN executable with no credential. This mutates the
+    # working graph (node + synthetic ``entry -> owner`` edge) BEFORE the expansion
+    # view is built, so the new edge participates in adjacency and the entry node
+    # is reachable to the high-value terminal. Gated strictly on the proven flag:
+    # with no proven-unauth edge this returns an empty set and the graph is
+    # byte-identical. Only these synthetic ids are made start-eligible below.
+    unauthenticated_entry_ids = _prepend_unauthenticated_entry_nodes(graph)
+
     # Concern 1 — pre-materialise the graph-shape layer (adjacency + degrees +
     # local-reuse + implicit overlays + the gen-time collapse). OFF-by-default
     # gentime collapse walks only ONE representative pivot per interchangeable
@@ -5047,6 +5286,18 @@ def compute_maximal_attack_paths(
         if reachable_node_ids
         else set()
     )
+    # The synthetic Unauthenticated entry is admitted past BOTH restrictive
+    # allow-sets: when either set is non-empty the caller restricted starts to a
+    # specific id set (enabled low-priv users) / reachable set (the HV-reverse-
+    # reachable set, computed upstream from the RAW graph that does not yet hold the
+    # synthetic node). The synthetic node genuinely reaches the HV terminal through
+    # the graph, so admitting it here is correct; it is the ONLY non-enabled-user
+    # start the source loop accepts (the proven-flag carve below).
+    if unauthenticated_entry_ids:
+        if allowed_start_ids:
+            allowed_start_ids |= unauthenticated_entry_ids
+        if allowed_reachable_ids:
+            allowed_reachable_ids |= unauthenticated_entry_ids
     sources: list[str] = []
     for node_id, node in nodes_map.items():
         if not isinstance(node, dict):
@@ -5056,6 +5307,14 @@ def compute_maximal_attack_paths(
         if allowed_reachable_ids and node_id not in allowed_reachable_ids:
             continue
         if outgoing.get(node_id, 0) <= 0:
+            continue
+        # Narrow, proven-flag-gated carve: the synthetic Unauthenticated entry node
+        # is a valid DFS start even though it is not an enabled USER. Everyone /
+        # Users / Guests / Anonymous stay excluded — only this synthetic node is
+        # admitted, and only when ``_prepend_unauthenticated_entry_nodes`` created
+        # it from a PROVEN no-credential read.
+        if _node_is_synthetic_unauthenticated_entry(node):
+            sources.append(node_id)
             continue
         if not _node_is_enabled_user(node):
             continue

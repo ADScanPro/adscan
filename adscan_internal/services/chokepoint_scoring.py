@@ -34,6 +34,9 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from adscan_core.reporting.well_known_principals import (
+    is_structural_well_known_principal,
+)
 from adscan_internal.services.compromise_class import (
     CompromiseClass,
     derive_compromise_class_from_path,
@@ -129,6 +132,68 @@ def _is_builtin_local_group(node: Mapping[str, Any]) -> bool:
     return ",CN=BUILTIN," in dn.upper()
 
 
+def _resolve_label_from_bare_id(raw_id: str) -> str:
+    """Best-effort readable label for a choke identifier with NO matching node.
+
+    A choke's node id can outlive the node it names — the id is derived
+    purely from edge endpoints (:mod:`chokepoint_cardinality`'s set-algebra
+    over the edge list), while ``nodes_map`` is built from the persisted
+    ``nodes`` array, and the two can disagree (a well-known-SID or
+    graph-normalization node-id mismatch — see ``CLAUDE.md`` § "Group
+    membership / group closure / SIDs" on mixed id formats). Falling back to
+    the raw graph key (``name:S-1-5-32-544``, ``name:guest``) in that case
+    ships an internal identifier straight into the client "Structural Choke
+    Points" table. This never raises and never returns something worse than
+    the input — it only ever improves on the raw id.
+
+    Two ladder rungs, both keyed by the SAME shared well-known-SID SSOT the
+    collector uses to inject the synthetic node in the first place
+    (:func:`well_known_sids.well_known_sid_display_name`), so a resolver here
+    can never disagree with the node it would otherwise have named:
+
+    1. The id (bare, or ``name:<value>``) IS a well-known SID — resolve to
+       its canonical display name (BUILTIN-qualified when applicable).
+    2. Otherwise, strip the canonical ``name:`` graph-key prefix (the exact
+       convention ``attack_graph_service._node_id`` writes) and title-case
+       the remaining label, so at minimum ``name:guest`` reads ``Guest``
+       instead of the internal key verbatim. An id NOT shaped like a
+       ``name:`` graph key (a caller's own synthetic identifier, an edge
+       key, ...) is left untouched — this rung only understands the one
+       prefix convention, never a generic ``:`` split.
+
+    Args:
+        raw_id: The choke's node id / fallback string (e.g. ``"name:
+            S-1-5-32-544"``, ``"name:guest"``, or an unprefixed SID).
+
+    Returns:
+        The best available readable label; ``raw_id`` unchanged when neither
+        rung applies (e.g. an empty string, or an id with no recognized
+        shape).
+    """
+    from adscan_internal.services.collector.well_known_sids import (  # noqa: PLC0415
+        well_known_sid_display_name,
+    )
+
+    candidate = str(raw_id or "").strip()
+    if not candidate:
+        return raw_id
+    bare = candidate
+    _NAME_PREFIX = "name:"
+    has_name_prefix = candidate.lower().startswith(_NAME_PREFIX)
+    if has_name_prefix:
+        bare = candidate[len(_NAME_PREFIX) :].strip()
+    if not bare:
+        return raw_id
+    well_known = well_known_sid_display_name(bare)
+    if well_known:
+        return well_known
+    if not has_name_prefix:
+        # Nothing recognizable to improve on — leave the id exactly as the
+        # caller passed it.
+        return raw_id
+    return bare.split("@", 1)[0].strip().title() or raw_id
+
+
 def _node_label(node: Mapping[str, Any] | None, fallback: str) -> str:
     """Return a node's display label, falling back to name then id.
 
@@ -139,6 +204,11 @@ def _node_label(node: Mapping[str, Any] | None, fallback: str) -> str:
     word (``Users``, ``Administrators``, ``Guests``, ``Power Users``), which a
     reader cannot distinguish from ``Domain Users`` or a container.
 
+    When ``node`` is absent altogether — the choke id has no matching entry
+    in ``nodes_map`` — :func:`_resolve_label_from_bare_id` makes one more
+    attempt to turn the raw graph key into something readable before it ever
+    reaches a client-facing row.
+
     Args:
         node: A node dict, or ``None``.
         fallback: The value to return when no label/name is present (the id).
@@ -147,7 +217,7 @@ def _node_label(node: Mapping[str, Any] | None, fallback: str) -> str:
         The best available display label.
     """
     if not isinstance(node, Mapping):
-        return fallback
+        return _resolve_label_from_bare_id(fallback)
     if _is_builtin_local_group(node):
         props = node.get("properties")
         props = props if isinstance(props, Mapping) else {}
@@ -158,6 +228,29 @@ def _node_label(node: Mapping[str, Any] | None, fallback: str) -> str:
         name_part = bare.split("@", 1)[0]
         return f"BUILTIN\\{name_part.title()}"
     return str(node.get("label") or node.get("name") or fallback)
+
+
+def _node_is_structural_well_known(node: Mapping[str, Any] | None) -> bool:
+    """Return whether a choke node is a structural well-known / built-in principal.
+
+    Such a node (Everyone, Authenticated Users, every ``BUILTIN\\*`` alias, the
+    reserved domain groups/accounts such as Domain Admins / Domain Users /
+    Administrator) is NOT a removable object, so it must never be offered as a
+    choke-point "object to remove". Classified by SID/RID CLASS through the shared
+    SSOT — never by a per-name special case (no ``BUILTIN\\Users`` carve-out). The
+    actionable fix for these paths leads via the separate remediation ranking
+    (``remediation_start_here``), where the node total-cut is a durability badge,
+    not the lead. Reads the node's SID and, as a fallback, its label/name.
+    """
+    if not isinstance(node, Mapping):
+        return False
+    props = node.get("properties")
+    props = props if isinstance(props, Mapping) else {}
+    sid = str(
+        node.get("objectId") or node.get("objectid") or props.get("objectid") or ""
+    )
+    name = str(props.get("name") or node.get("label") or node.get("name") or "")
+    return is_structural_well_known_principal(sid, name)
 
 
 def _resolve_target_compromise_class(
@@ -476,6 +569,9 @@ def rank_chokepoints(
         _enrich_node_choke(entry, nodes_map=nodes_map, forward=forward)
         for entry in node_entries
         if isinstance(entry, Mapping)
+        and not _node_is_structural_well_known(
+            nodes_map.get(str(entry.get("node_id") or ""))
+        )
     ]
     ranked_nodes.sort(key=lambda r: (r["severity_rank"], -r["cardinality"]))
 

@@ -61,6 +61,7 @@ from adscan_internal.services.severity import (
     EdgeSeverityInput,
     Severity,
     compute_edge_severity,
+    edge_proven_unauthenticated_reachable,
     severity_rank,
 )
 
@@ -130,6 +131,10 @@ class FanoutInput:
             Reused verbatim for the collapsed step's client label — not
             recomputed.
         target_is_domain: True when the target node is the Domain object itself.
+        proven_unauthenticated_reachable: True when the terminal edge's reach
+            was PROVEN over the unauthenticated (null-session) phase (read from
+            the edge's ``notes.unauthenticated_reachable``). Fed to the severity
+            SSOT so a proven no-credential path into Tier 0 uplifts to CRITICAL.
     """
 
     source_principal_id: str
@@ -141,6 +146,7 @@ class FanoutInput:
     target_compromise_class: CompromiseClass | None = None
     path_compromise_class: CompromiseClass | None = None
     target_is_domain: bool = False
+    proven_unauthenticated_reachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,6 +246,61 @@ def resolve_fanout_target_tier(
     return privilege_tier_for_node(node, is_tier0_asset=is_tier0_asset)
 
 
+#: Severity floor per TARGET tier for the blast-radius display. Reaching a Tier-0
+#: object is a containment-boundary event, so a grant that reaches Tier-0 targets
+#: must never rank below one that reaches only Tier-2 targets (CLAUDE § "graded
+#: target criticality"). The floor RAISES a computed severity up to the tier's
+#: minimum; it never lowers one (never understate a blast radius) and never
+#: touches INFO / STRUCTURAL — those are the Domain-Breaker-source tautologies the
+#: HTB Forest guard suppresses, and flooring them would resurface the 444 false
+#: criticals. Applied once in :func:`_build_step`.
+_TARGET_TIER_SEVERITY_FLOOR: dict[PrivilegeTier, Severity] = {
+    PrivilegeTier.TIER0_DIRECT: Severity.CRITICAL,
+    PrivilegeTier.TIER0_ESCALATION_CAPABLE: Severity.HIGH,
+    PrivilegeTier.TIER1: Severity.MEDIUM,
+}
+
+
+def _apply_target_tier_floor(severity: Severity, tier: PrivilegeTier) -> Severity:
+    """Raise ``severity`` to the target tier's floor; never lower it, never touch INFO.
+
+    A reach onto a Tier-0 object is graded at least as severe as the tier warrants
+    so the blast-radius table cannot invert the tier boundary (a Tier-2-reaching
+    grant out-ranking a Tier-0-reaching one). INFO / STRUCTURAL pass through
+    untouched so the Domain-Breaker-source HTB-Forest suppression is preserved.
+    """
+    if severity in (Severity.INFO, Severity.STRUCTURAL):
+        return severity
+    floor = _TARGET_TIER_SEVERITY_FLOOR.get(tier)
+    if floor is not None and severity_rank(floor) < severity_rank(severity):
+        return floor
+    return severity
+
+
+def _reconcile_target_compromise_class(
+    tier: PrivilegeTier, cc: CompromiseClass | None
+) -> CompromiseClass | None:
+    """Drop a compromise class that CONTRADICTS the authoritative target tier.
+
+    The target tier is resolved by :func:`privilege_tier_for_node` from the
+    RID-based group classifier (``classify_principal_by_groups`` — the locale-
+    independent SSOT). A name-based compromise class can disagree with it: the
+    Tactical-Findings node classifier substring-matches "Cloneable Domain
+    Controllers" to ``DOMAIN_BREAKER`` while its RID (522) grades Tier 2. Left
+    alone, that false breaker drives the Tier-2 fan-out bucket to a CRITICAL that
+    out-ranks a genuine Tier-0 bucket — the exact tier-boundary inversion the
+    blast-radius table must not show. So when the authoritative tier is NOT Tier 0,
+    a ``DOMAIN_BREAKER`` / ``PRIVILEGED_ESCALATOR`` class is a contradiction and is
+    dropped (the tier wins); a non-privileged class is kept. Tier-0 targets keep
+    their class (the tier floor handles their severity).
+    """
+    if tier.is_tier0:
+        return cc
+    if cc in (CompromiseClass.DOMAIN_BREAKER, CompromiseClass.PRIVILEGED_ESCALATOR):
+        return None
+    return cc
+
+
 def _coerce_compromise_class(value: Any) -> CompromiseClass | None:
     """Return a :class:`CompromiseClass` for a raw string / enum, else ``None``."""
     if isinstance(value, CompromiseClass):
@@ -323,8 +384,9 @@ def fanout_input_from_path(
         source_compromise_class=_coerce_compromise_class(
             (node_index.get(source_principal_id) or {}).get("compromise_class")
         ),
-        target_compromise_class=_coerce_compromise_class(
-            (target_node or {}).get("compromise_class")
+        target_compromise_class=_reconcile_target_compromise_class(
+            target_tier,
+            _coerce_compromise_class((target_node or {}).get("compromise_class")),
         ),
         path_compromise_class=_coerce_compromise_class(
             path.get("compromise_class") or path.get("outcome_class")
@@ -379,19 +441,23 @@ def fanout_input_from_edge(
     source_label = str(from_node.get("label") or from_node.get("name") or from_id)
     target_label = str(to_node.get("label") or to_node.get("name") or to_id)
     target_is_domain = str(to_node.get("kind") or "").strip().lower() == "domain"
+    target_tier = resolve_fanout_target_tier(
+        to_node, is_tier0_asset=_node_is_tier0_asset(to_node)
+    )
 
     return FanoutInput(
         source_principal_id=from_id,
         source_label=source_label,
         edge_relation=relation,
         target_label=target_label,
-        target_tier=resolve_fanout_target_tier(
-            to_node, is_tier0_asset=_node_is_tier0_asset(to_node)
-        ),
+        target_tier=target_tier,
         source_compromise_class=_coerce_compromise_class(from_node.get("compromise_class")),
-        target_compromise_class=_coerce_compromise_class(to_node.get("compromise_class")),
+        target_compromise_class=_reconcile_target_compromise_class(
+            target_tier, _coerce_compromise_class(to_node.get("compromise_class"))
+        ),
         path_compromise_class=derive_compromise_class_from_path([dict(edge)], to_node),
         target_is_domain=target_is_domain,
+        proven_unauthenticated_reachable=edge_proven_unauthenticated_reachable(edge),
     )
 
 
@@ -420,6 +486,7 @@ def _severity_for_input(inp: FanoutInput, kind: EdgeKind) -> Severity:
             edge_control_strength=edge_control_strength(inp.edge_relation),
             target_is_tier0_asset=inp.target_tier.is_tier0,
             target_is_domain=inp.target_is_domain,
+            proven_unauthenticated_reachable=inp.proven_unauthenticated_reachable,
         )
     )
 
@@ -437,6 +504,13 @@ def _build_step(bucket: _Bucket) -> FanoutStep:
         sev = _severity_for_input(inp, kind)
         if severity_rank(sev) < severity_rank(best_sev):
             best_sev, best_input = sev, inp
+
+    # Grade the bucket's severity by the TARGET tier so a Tier-0-reaching blast
+    # radius is never ranked below a Tier-2 one (the tier-boundary inversion the
+    # blast-radius table must not show). Raises up to the tier floor only; never
+    # lowers, and never touches the INFO/STRUCTURAL Domain-Breaker-source
+    # tautologies the genuine-fan-out filter drops.
+    best_sev = _apply_target_tier_floor(best_sev, tier)
 
     # Distinct target labels, first-seen order. A Tier-0-direct bucket names
     # every target (headline); other tiers cap the evidence sample.
@@ -528,8 +602,15 @@ def rollup_fanout(
         else:
             passthrough.extend(bucket.inputs)
 
-    # Most-severe first, then highest count — the headline order.
-    collapsed.sort(key=lambda s: (severity_rank(s.severity), -s.count))
+    # Worst-first: most-severe, then target tier (Tier 0 ahead of Tier 2 on a
+    # severity tie), then highest count — NOT by object count. The target-tier
+    # severity floor above guarantees a Tier-0-reaching bucket is graded at least
+    # as severe as any Tier-2 one, so worst-first ordering can never invert the
+    # tier boundary (a Tier-2 CRITICAL above a Tier-0 HIGH). Mirrored in
+    # adscan_web/frontend/lib/attack-fanout.ts.
+    collapsed.sort(
+        key=lambda s: (severity_rank(s.severity), -s.target_tier_class.rank, -s.count)
+    )
 
     return FanoutRollup(collapsed=tuple(collapsed), passthrough=tuple(passthrough))
 

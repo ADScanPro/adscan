@@ -8,6 +8,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- When an attack path is executable with no credential — a share or file ADscan read over an anonymous SMB null session, before holding any account — the report, the writeup and the web platform now say so prominently: the path now begins at an explicit "Unauthenticated (null session)" entry step, so the kill chain reads from the no-credential start through the account it derived all the way to full domain compromise, instead of silently starting mid-chain as if the attacker were already logged in. It is flagged "Executable without credentials — confirmed", and a proven no-credential path to full domain compromise sorts to the top of the attack-path list. ADscan can now execute such a path end to end straight from that entry — the no-credential read runs over the same null or guest session that first proved it, then the chain continues with the account it recovered — instead of stalling with "no starting point you control". The recovered-credential finding behind that entry is now rated by its proven context — Critical when the no-credential chain reaches full domain compromise — rather than a flat Medium, so a run that proves a zero-credential takeover no longer reports zero critical findings; it carries the MITRE mapping and the native remediation in the report. The explanation is honest about the mechanism — the file is reachable because the server permits null-session access to that share, not because an anonymous permission is on it — and the remediation is native (restrict null-session shares, tighten the share permission, remove the exposed secret and rotate the account). The finding's affected-assets section now names, alongside the file and the recovered credential, the principals with measured read access (who to remove from the share and NTFS permissions) and — when the read needed no account — the null/guest session as an access vector, so the full remediable picture is in the finding itself, not only in the attack path.
+- On hosts where the scan account is a local administrator, collection now reads six host-local credential-protection registry settings over the same authenticated session and flags the weak ones: LSASS not running as a protected process (RunAsPPL), WDigest cleartext credential caching, LM hash storage, a weak LAN Manager authentication level, weak minimum NTLM session security, and custom Security Support Providers allowed into LSASS. Each finding carries native GPO / registry remediation and a `Get-ItemProperty` validation step; a non-admin host is skipped at no cost.
+- A new low-privilege configuration check, read with no extra queries during collection: the audit now flags a domain (or fine-grained password policy) that stores passwords with reversible encryption — recoverable to cleartext. It carries native remediation and validation steps and maps to the CIS Microsoft Windows Server Benchmark (1.1.7).
+- The compliance scorecard now shows verified-good controls, not only broken ones: when ADscan reads a hardening setting and observes it correctly configured — passwords not stored with reversible encryption, a machine-account quota of zero (no standard user can join a computer), and hosts that refuse SMBv1 to an active negotiate probe — the mapped control is marked conformant across all six frameworks, with the reading as evidence. Only a definitive observation greens a control; a setting ADscan could not read, or a host the probe could not reach, stays "not assessed" rather than being assumed compliant.
 - Compliance reports can now map findings to the CIS Microsoft Windows Server
   Benchmark, selectable alongside ENS, NIS2, ISO 27001, DORA and PCI DSS. Each
   executed attack path or validated finding is tied to the specific CIS control
@@ -75,7 +79,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   measured share-ACL and file-NTFS read set — instead of the account that
   happened to recover it. Every such finding now reads the same way, whether
   ADscan reached it unauthenticated or with credentials, so the report and the
-  platform agree on who could reach the exposed secret.
+  platform agree on who could reach the exposed secret. The report and the
+  platform now also state the verification level of that attribution next to the
+  principal: read access confirmed live, share and file NTFS permissions both
+  evaluated, or share-level access only with the file's NTFS permissions
+  unverified. An auditor can see at a glance which attributions are proven and
+  which are a lead, rather than reading every one as equally certain.
 - Member servers are now tiered from what they actually do, not just their
   operating system. A Remote Desktop or Citrix host where ordinary users log on
   is classified Tier 2 (a user workstation) rather than Tier 1; a server that
@@ -160,6 +169,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   credential was rejected when only the Kerberos step failed but the scan
   continued over NTLM (a common case for machine accounts). A genuine bad
   credential is still reported clearly by the credential check.
+- A readable share reached over a null or guest SMB session now reports its actual authorized-reader list, read straight from the folder's own security descriptor, instead of a lower-confidence inferred placeholder, whenever the session already held the right needed to read it. Findings sourced from such a share (a recovered GPP password, a leaked credential file) now cite the real principals with measured read access.
 
 - The free and paid reports now report the same "attack surface reduced" number.
   Both lead with the count of distinct attacker avenues the environment's own

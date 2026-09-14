@@ -85,42 +85,58 @@ _SMB1_NEGOTIATE_REQUEST = bytes([
 ])
 
 
-async def smb1_probe(ip: str, port: int = 445, timeout: float = 3.0) -> bool:
-    """Return True if the host responds positively to a raw SMBv1 negotiate.
+async def smb1_probe(ip: str, port: int = 445, timeout: float = 3.0) -> bool | None:
+    """Probe SMBv1 support with a raw ``NT LM 0.12`` negotiate — TRI-STATE.
 
     Sends a minimal NT LM 0.12 negotiate packet and checks whether the server
-    returns a valid SMBv1 response (\\xFFSMB magic with status 0x00000000).
+    returns a valid SMBv1 response (``\\xFFSMB`` magic with status 0x00000000).
     This is the same probe NXC uses for its SMBv1 detection.
+
+    Returns:
+        ``True``  — host answered with a valid SMBv1 negotiate (SMBv1 ENABLED).
+        ``False`` — host answered but the response was NOT a valid SMBv1
+                    negotiate (SMBv1 refused with certainty — an observed-good
+                    fact, the twin the positive-control evidence greens).
+        ``None``  — the probe was inconclusive (connect/read error or timeout):
+                    we did NOT observe the host's SMBv1 posture. This is the
+                    ``NOT_ASSESSED`` state — it must NEVER be read as "SMBv1 off"
+                    (the INFERRED_BY_ABSENCE falsehood), so callers persist a
+                    positive only on an explicit ``False``.
     """
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port), timeout=timeout
         )
-        try:
-            writer.write(_SMB1_NEGOTIATE_REQUEST)
-            await asyncio.wait_for(writer.drain(), timeout=timeout)
-            # Read NetBIOS header (4 bytes) to get body length
-            header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
-            body_len = struct.unpack(">I", header)[0] & 0x00FFFFFF
-            if body_len < 4:
-                return False
-            body = await asyncio.wait_for(
-                reader.readexactly(min(body_len, 256)), timeout=timeout
-            )
-            # SMBv1 success: magic \xFFSMB + NT Status 0x00000000
-            return (
-                len(body) >= 9
-                and body[:4] == b"\xff\x53\x4d\x42"
-                and body[5:9] == b"\x00\x00\x00\x00"
-            )
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
     except Exception:
-        return False
+        return None  # never reached the host: inconclusive, not "refused"
+    try:
+        writer.write(_SMB1_NEGOTIATE_REQUEST)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        # Read NetBIOS header (4 bytes) to get body length
+        header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+        body_len = struct.unpack(">I", header)[0] & 0x00FFFFFF
+        if body_len < 4:
+            # Host answered but the reply is not a usable SMBv1 negotiate.
+            return False
+        body = await asyncio.wait_for(
+            reader.readexactly(min(body_len, 256)), timeout=timeout
+        )
+        # SMBv1 success: magic \xFFSMB + NT Status 0x00000000
+        return (
+            len(body) >= 9
+            and body[:4] == b"\xff\x53\x4d\x42"
+            and body[5:9] == b"\x00\x00\x00\x00"
+        )
+    except Exception:
+        # Connected but the exchange failed part-way: we cannot state the SMBv1
+        # posture either way -> inconclusive.
+        return None
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 async def negotiate_only(ip: str, port: int, timeout: int) -> dict[str, Any]:
@@ -160,12 +176,19 @@ async def negotiate_only(ip: str, port: int, timeout: int) -> dict[str, Any]:
                 dialect_val = getattr(dr, "name", str(dr))
         except Exception:
             pass
-        return {
+        out: dict[str, Any] = {
             "smb_signing_enabled": bool(sign_en),
             "smb_signing_required": bool(sign_req),
             "smb_dialect": dialect_val,
-            "smb_v1": smb_v1,
         }
+        # smb_v1 is tri-state (True/False/None). Only stamp the property when the
+        # probe was CONCLUSIVE: True (enabled) or False (refused-with-certainty).
+        # None (error/timeout) leaves the key ABSENT so downstream never reads an
+        # inconclusive probe as "SMBv1 off" — the finding stays silent AND no
+        # positive is greened (third-state / NOT_ASSESSED discipline).
+        if smb_v1 is not None:
+            out["smb_v1"] = smb_v1
+        return out
     except Exception:
         return {}
 

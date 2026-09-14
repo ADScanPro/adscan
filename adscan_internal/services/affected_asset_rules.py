@@ -93,6 +93,16 @@ class Extra(str, Enum):
     ARTIFACT = "artifact"
     WORDLIST = "wordlist"
     PASSWORD_REDACTED = "password_redacted"
+    # The measured objects with effective READ access to the affected file (the
+    # mxac/read-set SSOT, carried on the finding's ``details.read_set``). Lets a
+    # credential-in-file finding name WHO can read it — directly actionable
+    # (tighten the share/NTFS ACL). Measured only; never a guessed set.
+    READ_SET = "read_set"
+    # An "reachable over an unauthenticated null/guest session" access vector,
+    # surfaced only when the finding carries a PROVEN ``unauthenticated_reachable``
+    # + ``reached_via`` (never from a broad SID alone — the Everyone != Anonymous
+    # guard). Reuses the existing null-session-asset concept at the finding level.
+    NULL_SESSION_VECTOR = "null_session_vector"
 
 
 class RecordEntityType(str, Enum):
@@ -319,11 +329,27 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         record_containers=("findings",),
         record_qualifier="field",
     ),
-    # --- GPP passwords: the SYSVOL artifact + redacted secret ----------------
+    # --- GPP passwords: the SYSVOL artifact + redacted secret, plus the
+    # two-axis unauthenticated-reach context -----------------------------------
+    # One canonical GPP-cpassword finding. Beyond the SYSVOL artifact and the
+    # redacted recovered secret, the affected assets carry the two facts the
+    # client needs to remediate, both honesty-gated on the finding's own details:
+    #   * READ_SET — the measured objects with effective READ access to the file
+    #     (``details.read_set``, from the mxac/read-set SSOT); the client tightens
+    #     the share/NTFS ACL. Present only when the read-set was measured.
+    #   * NULL_SESSION_VECTOR — an "reachable over an unauthenticated null/guest
+    #     session" access vector, surfaced only when the finding carries
+    #     ``unauthenticated_reachable`` + a proven ``reached_via`` (an
+    #     authenticated-only GPP finding shows the read-set but NOT this vector).
     "gpp_passwords": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.KEEP,
-        extras=(Extra.ARTIFACT, Extra.PASSWORD_REDACTED),
+        extras=(
+            Extra.ARTIFACT,
+            Extra.PASSWORD_REDACTED,
+            Extra.READ_SET,
+            Extra.NULL_SESSION_VECTOR,
+        ),
         scope=Scope.PER_PRINCIPAL,
     ),
     # --- DCSync: domain-wide (the breaker target is dropped) -----------------
@@ -458,6 +484,9 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         target=TargetMode.NONE,
         scope=Scope.HOST_SCOPED,
     ),
+    # The verdict is per-host (the SAMR stage runs against each computer), so the
+    # affected asset is the host(s) whose SAM-RPC interface answered a non-admin
+    # session — resolved from the direct host keys, like smb_signing_disabled.
     "smbv1_enabled": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,
@@ -473,6 +502,41 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.HOST_SCOPED,
     ),
     "smb_guest_shares": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+    ),
+    # --- Host-local registry credential-protection posture --------------------
+    # Admin-gated \winreg reads (audit_analyzer._registry_hardening_findings). The
+    # verdict is per-host, so the affected asset is the host(s) whose HKLM value
+    # was observed insecure — resolved from the direct host keys, exactly like
+    # smb_signing_disabled.
+    "lsa_protection_disabled": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+    ),
+    "wdigest_enabled": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+    ),
+    "lm_hash_storage_enabled": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+    ),
+    "weak_lm_compatibility_level": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+    ),
+    "ntlm_min_session_security_weak": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+    ),
+    "lsass_custom_ssp_allowed": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,
         scope=Scope.HOST_SCOPED,
@@ -589,6 +653,14 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.DOMAIN_WIDE,
     ),
     "weak_password_policy": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.DOMAIN_WIDE,
+    ),
+    # Reversible password storage is a policy of the domain (pwdProperties 0x10)
+    # or of a PSO — a domain-wide weakness, not a per-host one. The finding is
+    # resolved to the domain controller(s), like weak_password_policy.
+    "reversible_encryption_enabled": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,
         scope=Scope.DOMAIN_WIDE,

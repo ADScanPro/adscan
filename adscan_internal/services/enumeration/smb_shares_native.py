@@ -19,6 +19,14 @@ we fall back to the share-level ``maximal_access`` labels, so a server without
 MxAc support never regresses. ACCESS_DENIED on the root open is a definitive
 "no access" signal, not a fallback trigger.
 
+Separately, when the connecting identity's own ``maximal_access`` already
+includes ``READ_CONTROL`` — the exact right needed to read a security
+descriptor — the probe also reads the folder's REAL security descriptor and
+records the measured authorized-reader list (real access-control entries,
+tagged ``ntfs_computed``) instead of leaving that reader list at the
+inferred, NTFS-unverified ``share_acl_only`` default. See
+:func:`_resolve_measured_read_set`.
+
 Public surface:
 
 * :class:`NativeShareEntry`  — one share with translated permissions.
@@ -31,7 +39,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
@@ -90,6 +98,48 @@ _GENERIC_ALL = 0x10000000
 _GENERIC_EXECUTE = 0x20000000
 _GENERIC_WRITE = 0x40000000
 _GENERIC_READ = 0x80000000
+
+
+# ---------------------------------------------------------------------------
+# Measured (real security-descriptor) reader-set constants
+# ---------------------------------------------------------------------------
+#
+# ``VERIFICATION_SHARE_ACL_ONLY`` / ``VERIFICATION_NTFS_COMPUTED`` mirror the
+# tier constants in ``share_ntfs_verification.py`` (the authenticated
+# collector's SSOT). The literal string is duplicated here — not imported at
+# module level — because that module lives inside the ``collector`` package,
+# whose ``__init__`` pulls in the full collector stack (orchestrator,
+# persistence, host/ldap collectors); this module stays a light,
+# import-cheap probe used from the guest/null-session sweep, which can run
+# before any authenticated collection ever happens. The real tier constant
+# is imported lazily (deferred, inside :func:`_resolve_measured_read_set`)
+# when it is actually used to compute a value, so the two never disagree.
+_DEFAULT_VERIFICATION = "share_acl_only"
+
+# Placeholder SID handed to ``resolve_share_access`` as the "queried"
+# principal. At this probe's privilege level there is only ONE genuinely
+# readable security descriptor over SMB2 (SRVSVC ``NetrShareGetInfo`` level
+# 502 — the true share-ACL source — requires admin rights we do not have in
+# a guest/null-session sweep), so this call never needs a real identity: the
+# two fields this probe actually consumes (``graph_verification`` and the
+# unfiltered ``read_set``) do not depend on which SID was queried — see
+# :func:`_resolve_measured_read_set`.
+_READ_SET_PROBE_SID_PLACEHOLDER = "S-1-1-0"
+
+# Small, offline SID -> friendly-name lookup for the handful of well-known
+# principals that commonly appear on a share's folder DACL. This module has
+# no LDAP/graph context (by design — it must work before any authenticated
+# collection), so a SID outside this set is reported with an empty label;
+# downstream consumers already fall back to the SID itself when no label is
+# known (never fabricate a name we cannot prove).
+_WELL_KNOWN_READ_SET_LABELS: Dict[str, str] = {
+    "S-1-1-0": "Everyone",
+    "S-1-5-7": "Anonymous Logon",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-32-544": "Administrators",
+    "S-1-5-32-545": "Users",
+    "S-1-5-32-546": "Guests",
+}
 
 
 def _translate_maximal_access(mask: Any) -> List[str]:
@@ -194,6 +244,14 @@ class NativeShareEntry:
     permissions: List[str] = field(default_factory=list)
     accessible: bool = True
     probe_error: Optional[str] = None
+    # The MEASURED authorized-reader list — real ALLOW access-control entries
+    # parsed from the folder's own security descriptor, populated only when
+    # the connecting identity already held READ_CONTROL and the descriptor
+    # was actually read + parsed (see :func:`_resolve_measured_read_set`).
+    # Each entry is ``{"sid": str, "label": str, "mask": int}``. Empty when
+    # the tier stays the INFERRED ``share_acl_only`` default.
+    read_set: List[Dict[str, Any]] = field(default_factory=list)
+    verification: str = _DEFAULT_VERIFICATION
 
     @property
     def is_writable(self) -> bool:
@@ -211,6 +269,8 @@ class NativeShareEntry:
             "permissions": list(self.permissions),
             "accessible": self.accessible,
             "probe_error": self.probe_error,
+            "read_set": [dict(entry) for entry in self.read_set],
+            "verification": self.verification,
         }
 
 
@@ -256,9 +316,93 @@ class NativeSharesResult:
 _SKIP_PROBE_NAMES = {"IPC$"}
 
 
+async def _resolve_measured_read_set(
+    *, machine: Any, host: str, share_name: str, maximal_access: Any
+) -> tuple[List[Dict[str, Any]], str]:
+    """Read the folder's real security descriptor and return the measured
+    authorized-reader list, when the connecting identity already holds the
+    right needed to read it.
+
+    ``READ_CONTROL`` — already present in ``maximal_access`` whenever the
+    caller can read a security descriptor at all — is the gate: only then is
+    the folder root's real ACL worth attempting. Reuses the SAME live
+    connection ``_probe_share_access`` already holds, sequentially (never a
+    second pipe operation in flight — see the aiosmb single-connection
+    concurrency rule).
+
+    At this probe's privilege level (no SRVSVC ``NetrShareGetInfo`` level 502
+    — admin-only) there is exactly ONE security descriptor reachable over
+    SMB2: the share root / NTFS folder root are the same underlying
+    directory object, so both ``resolve_share_access`` operands are the same
+    bytes — an honest reflection of there being one readable descriptor here,
+    not two. ``resolve_share_access`` (the collector's own share ∩ NTFS SSOT,
+    see ``share_ntfs_verification.py``) is reused as-is so the tier and the
+    reader-list semantics never diverge between the authenticated collector
+    and this light, credential-less probe.
+
+    Strictly BEST-EFFORT: any failure (the right absent, a transport error,
+    an unparseable descriptor) falls back to the honest, NTFS-unverified
+    ``share_acl_only`` tier with an empty reader set. Never raises — a
+    failure here must never abort share enumeration.
+    """
+    try:
+        mask = int(maximal_access) if maximal_access is not None else 0
+    except (TypeError, ValueError):
+        mask = 0
+    if not (mask & _READ_CONTROL):
+        return [], _DEFAULT_VERIFICATION
+
+    from adscan_internal.services.collector.share_collector import (
+        _read_ntfs_root_sd,
+    )
+    from adscan_internal.services.collector.share_ntfs_verification import (
+        VERIFICATION_SHARE_ACL_ONLY,
+        resolve_share_access,
+    )
+
+    try:
+        ntfs_sd_bytes = await _read_ntfs_root_sd(machine, host, share_name)
+    except Exception as exc:  # noqa: BLE001 — best-effort descriptor read
+        print_info_debug(
+            "[native-shares] NTFS root SD read failed: "
+            f"share={share_name} error={exc}"
+        )
+        return [], VERIFICATION_SHARE_ACL_ONLY
+
+    if not ntfs_sd_bytes:
+        return [], VERIFICATION_SHARE_ACL_ONLY
+
+    try:
+        result = resolve_share_access(
+            share_sd_bytes=ntfs_sd_bytes,
+            ntfs_sd_bytes=ntfs_sd_bytes,
+            principal_sid=_READ_SET_PROBE_SID_PLACEHOLDER,
+            group_sids=(),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort descriptor evaluation
+        print_info_debug(
+            "[native-shares] descriptor evaluation failed: "
+            f"share={share_name} error={exc}"
+        )
+        return [], VERIFICATION_SHARE_ACL_ONLY
+
+    if not result.read_set:
+        return [], VERIFICATION_SHARE_ACL_ONLY
+
+    read_set: List[Dict[str, Any]] = [
+        {
+            "sid": sid,
+            "label": _WELL_KNOWN_READ_SET_LABELS.get(str(sid).strip().upper(), ""),
+            "mask": mask_val,
+        }
+        for sid, mask_val in result.read_set
+    ]
+    return read_set, result.graph_verification
+
+
 async def _probe_share_access(
     machine: Any, share_obj: Any, host: str
-) -> tuple[List[str], Optional[str]]:
+) -> tuple[List[str], Optional[str], List[Dict[str, Any]], str]:
     """Tree-connect to ``share_obj`` and resolve its EFFECTIVE root access.
 
     First tree-connects (share-level ``maximal_access``), then opens the share
@@ -267,8 +411,15 @@ async def _probe_share_access(
     current token. Falls back to the share-level labels when MxAc is
     undetermined (see :func:`resolve_effective_share_permissions`).
 
-    Returns ``(permissions, error)``. An error here is per-share (one denied
-    share does not abort the sweep) and surfaces in :class:`NativeShareEntry`.
+    When ``maximal_access`` already includes ``READ_CONTROL`` — the exact
+    right needed to read a security descriptor — this also reads the folder's
+    REAL descriptor and returns the measured authorized-reader list instead
+    of leaving it at the inferred, NTFS-unverified default (see
+    :func:`_resolve_measured_read_set`).
+
+    Returns ``(permissions, error, read_set, verification)``. An error here
+    is per-share (one denied share does not abort the sweep) and surfaces in
+    :class:`NativeShareEntry`.
     """
     from adscan_internal.services.smb_effective_access_service import (
         query_effective_root_access_on_machine,
@@ -277,11 +428,12 @@ async def _probe_share_access(
     try:
         ok, err = await share_obj.connect(machine.connection)
         if err is not None:
-            return [], str(err)
+            return [], str(err), [], _DEFAULT_VERIFICATION
         if not ok:
-            return [], "tree_connect returned False"
+            return [], "tree_connect returned False", [], _DEFAULT_VERIFICATION
 
-        maximal_labels = _translate_maximal_access(share_obj.maximal_access)
+        maximal_access_raw = share_obj.maximal_access
+        maximal_labels = _translate_maximal_access(maximal_access_raw)
 
         share_name = str(share_obj.name or "")
         effective = await query_effective_root_access_on_machine(
@@ -297,11 +449,18 @@ async def _probe_share_access(
                 f"[native-shares] share={share_name} access source={note} "
                 f"(maximal={maximal_labels} effective_ok={effective.succeeded})"
             )
-        return labels, None
+
+        read_set, verification = await _resolve_measured_read_set(
+            machine=machine,
+            host=host,
+            share_name=share_name,
+            maximal_access=maximal_access_raw,
+        )
+        return labels, None, read_set, verification
     except Exception as exc:  # noqa: BLE001 — boundary; re-emit as soft error
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
-        return [], str(exc)
+        return [], str(exc), [], _DEFAULT_VERIFICATION
 
 
 def _is_access_denied(exc: BaseException | str | None) -> bool:
@@ -365,10 +524,12 @@ async def enumerate_shares_native(
                     permissions: List[str] = []
                     probe_err: Optional[str] = None
                     accessible = True
+                    read_set: List[Dict[str, Any]] = []
+                    verification = _DEFAULT_VERIFICATION
 
                     if probe_access and name not in _SKIP_PROBE_NAMES:
-                        permissions, probe_err = await _probe_share_access(
-                            machine, share_obj, host
+                        permissions, probe_err, read_set, verification = (
+                            await _probe_share_access(machine, share_obj, host)
                         )
                         if probe_err is not None:
                             accessible = False
@@ -381,6 +542,8 @@ async def enumerate_shares_native(
                             permissions=permissions,
                             accessible=accessible,
                             probe_error=probe_err,
+                            read_set=read_set,
+                            verification=verification,
                         )
                     )
 

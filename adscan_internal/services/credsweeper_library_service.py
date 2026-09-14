@@ -16,6 +16,7 @@ from adscan_internal import print_warning, print_warning_debug, telemetry
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.credsweeper_service import (
     CREDSWEEPER_RULES_PROFILE_DEFAULT,
+    drive_credsweeper_scan,
     get_credsweeper_rules_paths,
     resolve_credsweeper_drop_ml_none_for_ruleset,
 )
@@ -281,8 +282,7 @@ class CredSweeperLibraryService(BaseService):
             )
             for target in targets
         ]
-        analyzer.scan(providers)
-        analyzer.post_processing()
+        drive_credsweeper_scan(analyzer, providers)
         return self._normalize_candidates(
             candidates=list(analyzer.credential_manager.get_credentials()),
             drop_ml_none=drop_ml_none,

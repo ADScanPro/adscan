@@ -744,6 +744,9 @@ def run_native_collection(
         _print_collection_summary_from_graph(shell, target_domain, elapsed)
         _print_collector_enrichment_panel(collector_result, target_domain, shell=shell)
         _persist_collector_findings(shell, target_domain, collector_result)
+        _persist_defensive_posture_inventory(
+            shell, target_domain, collector_result, _workspace_root
+        )
         _persist_machine_pwd_rotation_interval(shell, target_domain, collector_result)
         _populate_adcs_metadata(shell, target_domain, collector_result)
         # Unified Phase-2 reachability: now that the graph (and enabled_computers)
@@ -1122,6 +1125,77 @@ def _ensure_shell_domain_context(shell: Any, target_domain: str) -> None:
     ensure_shell_domain_context(shell, target_domain)
 
 
+def _persist_defensive_posture_inventory(
+    shell: Any,
+    domain: str,
+    result: Any,
+    workspace_root: Any,
+) -> None:
+    """Write ``domains/<domain>/inventory/defensive_posture.json`` for the web CTEM.
+
+    Reconstructs one :class:`HostFingerprint` per admin-assessed Computer node
+    from the ``endpoint_products`` / ``edr_active`` / ``av_active`` /
+    ``endpoint_posture_assessed`` properties the Fase-2b registry stage stamps
+    (see ``services/collector/host_collector.py::_do_endpoint_protection_inventory``)
+    and hands them to :func:`write_defensive_posture_inventory` — the SSOT
+    writer the web backend's Defensive Posture surface already ingests
+    (``asset_ingestion_service.py`` / ``defensive_posture_parser.py`` /
+    ``defensive_posture_service.py``). Only assessed hosts are included; an
+    unassessed host is simply absent from the file (never a false "no
+    protection" record). Best-effort: never breaks collection persistence.
+    """
+    if result is None or not workspace_root:
+        return
+    try:
+        from adscan_internal.services.host_intelligence.inventory_writer import (
+            write_defensive_posture_inventory,
+        )
+        from adscan_internal.services.host_intelligence.models import (
+            DetectedProduct,
+            HostFingerprint,
+        )
+
+        fingerprints: dict[str, Any] = {}
+        dns_names: dict[str, str] = {}
+        for node in getattr(result, "nodes", {}).values():
+            props = getattr(node, "properties", None) or {}
+            if props.get("endpoint_posture_assessed") is not True:
+                continue
+            host_object_id = str(getattr(node, "object_id", "") or "").strip()
+            if not host_object_id:
+                continue
+            products = [
+                DetectedProduct(
+                    name=str(p.get("name") or ""),
+                    category=str(p.get("category") or ""),
+                    installed=bool(p.get("active")),
+                    running=bool(p.get("active")),
+                    svc_start=-1,
+                    realtime_protection=bool(p.get("active")),
+                )
+                for p in (props.get("endpoint_products") or [])
+                if isinstance(p, dict) and p.get("name")
+            ]
+            fingerprints[host_object_id] = HostFingerprint(
+                target_ip="",
+                products=products,
+            )
+            host_name = str(getattr(node, "name", "") or "").strip()
+            if host_name:
+                dns_names[host_object_id] = host_name
+        if not fingerprints:
+            return
+        write_defensive_posture_inventory(
+            workspace_root, domain, fingerprints, dns_name_lookup=dns_names
+        )
+    except Exception as exc:  # noqa: BLE001 — inventory write never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] defensive posture inventory write failed: {exc}")
+
+
 def _persist_collector_findings(
     shell: Any,
     domain: str,
@@ -1144,6 +1218,79 @@ def _persist_collector_findings(
             _tel.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(f"[intelligence] technical finding persist failed: {exc}")
+
+    # ── Registry-hardening POSITIVE evidence (OBSERVED-GOOD → conformant) ──
+    # The Fase-2b admin-gated registry stage emits the insecure values as
+    # findings above; the OBSERVED-GOOD values are positive-control evidence for
+    # the SAME controls (third-state doctrine). Emitted per-host, aggregated to a
+    # domain-level control_evidence entry with the coverage denominator.
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_registry_positives,
+        )
+
+        emit_registry_positives(
+            shell, domain, list(getattr(result, "nodes", {}).values())
+        )
+    except Exception as exc:  # noqa: BLE001 — positive emit never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] registry positives emit failed: {exc}")
+
+    # ── Endpoint-protection POSITIVE evidence (defensive-posture inventory) ─
+    # The same Fase-2b admin-gated stage inventories installed AV/EDR products;
+    # emitted as domain-level control_evidence with the coverage denominator,
+    # mirroring the registry-hardening positives immediately above.
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_endpoint_protection_positive,
+        )
+
+        emit_endpoint_protection_positive(
+            shell, domain, list(getattr(result, "nodes", {}).values())
+        )
+    except Exception as exc:  # noqa: BLE001 — positive emit never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] endpoint protection positives emit failed: {exc}")
+
+    # ── SMBv1 POSITIVE evidence (active NT LM 0.12 negotiate probe) ────────
+    # The SMB negotiate stage probes SMBv1 per host; a host that answered and
+    # REFUSED SMBv1 is an observed-good twin of the smb_v1_enabled finding.
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_smbv1_positive,
+        )
+
+        emit_smbv1_positive(shell, domain, list(getattr(result, "nodes", {}).values()))
+    except Exception as exc:  # noqa: BLE001 — positive emit never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] SMBv1 positive emit failed: {exc}")
+
+    # ── Domain-policy POSITIVE evidence (reversible encryption off, MAQ == 0) ──
+    # Both verdicts are definitive directory reads on the default domain policy
+    # (result.domain_policy) — the observed-good twins of reversible_encryption_enabled
+    # and machine_account_quota_risk. Standalone controls (not folded into the
+    # composite password-policy positive) so one passing knob greens on its own.
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_domain_policy_positives,
+        )
+
+        emit_domain_policy_positives(shell, domain, getattr(result, "domain_policy", None))
+    except Exception as exc:  # noqa: BLE001 — positive emit never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] domain policy positives emit failed: {exc}")
 
     # ── Shadow credentials ────────────────────────────────────────────────
     shadow = getattr(result, "shadow_credential_findings", None) or []
@@ -1261,6 +1408,16 @@ def _persist_collector_findings(
         "smb_signing_disabled": "smb_signing_disabled",
         "rc4_only": "rc4_only_accounts",
         "weak_password_policy": "weak_password_policy",
+        "reversible_encryption_enabled": "reversible_encryption_enabled",
+        # Host-local registry credential-protection posture (admin-gated \winreg
+        # reads; audit_analyzer._registry_hardening_findings). Identity maps — the
+        # AuditFinding category equals the canonical vuln_catalog key.
+        "lsa_protection_disabled": "lsa_protection_disabled",
+        "wdigest_enabled": "wdigest_enabled",
+        "lm_hash_storage_enabled": "lm_hash_storage_enabled",
+        "weak_lm_compatibility_level": "weak_lm_compatibility_level",
+        "ntlm_min_session_security_weak": "ntlm_min_session_security_weak",
+        "lsass_custom_ssp_allowed": "lsass_custom_ssp_allowed",
     }
 
     for category, findings in by_cat.items():
@@ -2054,8 +2211,17 @@ def _compute_finding_severity(
     source_node: dict[str, Any],
     target_node: dict[str, Any],
     relation: str,
+    edge: dict[str, Any] | None = None,
 ) -> tuple[str, str | None, bool, bool]:
     """Compute the canonical severity for one tactical finding.
+
+    Args:
+        source_node: The finding's source node dict.
+        target_node: The finding's target node dict.
+        relation: The raw relation label of the edge.
+        edge: The raw graph edge dict, when available — carries
+            ``notes.unauthenticated_reachable`` (a proven no-credential reach),
+            which uplifts an unauthenticated-source finding into Tier 0.
 
     Returns:
         (severity_value, target_role, target_is_tier0_asset,
@@ -2066,6 +2232,7 @@ def _compute_finding_severity(
     from adscan_internal.services.severity import (
         EdgeSeverityInput,
         compute_edge_severity,
+        edge_proven_unauthenticated_reachable,
     )
 
     src_cls = _node_compromise_class(source_node)
@@ -2085,6 +2252,7 @@ def _compute_finding_severity(
             edge_control_strength=edge_control_strength(relation),
             target_is_tier0_asset=target_is_t0_asset,
             target_is_domain=target_is_domain,
+            proven_unauthenticated_reachable=edge_proven_unauthenticated_reachable(edge),
         )
     )
     src_unauth = src_cls is CompromiseClass.UNAUTHENTICATED_PRINCIPAL
@@ -2128,6 +2296,7 @@ def _build_tactical_findings(
                 source_node=from_node,
                 target_node=to_node,
                 relation=relation,
+                edge=edge,
             )
             findings.append(
                 TacticalFinding(
@@ -2165,6 +2334,7 @@ def _build_tactical_findings(
             source_node=from_node,
             target_node=to_node,
             relation=relation,
+            edge=edge,
         )
         from adscan_internal.services.edge_kind import classify_edge_kind
 

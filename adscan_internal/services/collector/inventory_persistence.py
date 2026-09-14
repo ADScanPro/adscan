@@ -744,6 +744,9 @@ def _write_domain_policy_file(
             # ``None`` distinguishes "attribute unreadable" from "explicitly
             # disabled"; downstream renderers must treat None as unknown.
             "complexity_enabled": policy.complexity_enabled,
+            # DOMAIN_PASSWORD_STORE_CLEARTEXT (pwdProperties 0x10). None when
+            # ``pwdProperties`` was unreadable.
+            "reversible_encryption_enabled": policy.reversible_encryption_enabled,
             # ISO timestamp of the most recent password-policy attribute
             # change, derived from msDS-ReplAttributeMetaData. None when
             # the attribute was unreadable.

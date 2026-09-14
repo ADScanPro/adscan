@@ -39,12 +39,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
+from adscan_core.reporting.well_known_principals import is_broad_logon_principal
 from adscan_internal.services.edge_kind import (
     ControlStrength,
     EdgeKind,
     classify_edge_kind,
     edge_control_strength,
 )
+from adscan_internal.services.path_state import _PROVEN_STATUSES
 
 
 class CompromiseClass(str, Enum):
@@ -1336,41 +1338,27 @@ def _node_group_tokens_for_kind(node: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-#: Well-known SIDs whose membership is the ENTIRE authenticated / user population
-#: (RDS/Citrix downgrade signal). Mirrors the collector-side
-#: ``inventory_persistence._BROAD_LOGON_WELL_KNOWN_SIDS``. Domain Users is matched
-#: by its ``-513`` RID suffix; a scoped group (Remote Desktop Users) is NOT broad.
-_BROAD_LOGON_WELL_KNOWN_SIDS: frozenset[str] = frozenset(
-    {"S-1-1-0", "S-1-5-11", "S-1-5-32-545"}
-)
-#: Names of the broad populations, for graphs that key the source by name only.
-_BROAD_LOGON_NAMES: frozenset[str] = frozenset(
-    {"everyone", "authenticated users", "users", "domain users"}
-)
-
-
 def _graph_node_is_broad_logon_source(node: Mapping[str, Any] | None) -> bool:
     """Return whether a node is the whole authenticated / standard-user population.
 
     ``True`` for Everyone / Authenticated Users / BUILTIN\\Users / Domain Users —
     the broad populations whose ``CanRDP`` right marks an RDS / Citrix server. Reads
     the node's SID (``objectid`` / ``objectId``) and, as a fallback, its name/label.
+
+    The broad-logon classification itself is the shared SSOT
+    :func:`adscan_core.reporting.well_known_principals.is_broad_logon_principal` — a
+    STRICT SUBSET of the structural well-known set, so a built-in ADMIN group
+    (Domain Admins, ``BUILTIN\\Administrators``) that can ``CanRDP`` does NOT mark a
+    server as an RDS/Citrix host. This node wrapper only extracts the SID/name.
     """
     if not isinstance(node, Mapping):
         return False
     props = (
         node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
     )
-    sid = str((props or {}).get("objectid") or node.get("objectId") or "").strip().upper()
-    if sid:
-        if sid in _BROAD_LOGON_WELL_KNOWN_SIDS or sid.endswith("-513"):
-            return True
-    name = str(
-        (props or {}).get("name") or node.get("label") or node.get("name") or ""
-    ).strip().lower()
-    # Strip a trailing @domain to match "domain users@corp.local".
-    name = name.split("@", 1)[0].strip()
-    return name in _BROAD_LOGON_NAMES
+    sid = str((props or {}).get("objectid") or node.get("objectId") or "").strip()
+    name = str((props or {}).get("name") or node.get("label") or node.get("name") or "")
+    return is_broad_logon_principal(sid, name)
 
 
 def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
@@ -1849,8 +1837,8 @@ def tier_glossary() -> list[dict[str, str]]:
             "groups": "Standard user accounts and workstations.",
             "meaning": (
                 "Standard user plane. No granted privilege over servers or "
-                "the domain by membership alone — where an intrusion begins and "
-                "what ADscan measures reach FROM."
+                "the domain by membership alone. This is where an intrusion "
+                "begins and what ADscan measures reach from."
             ),
         },
     ]
@@ -1883,8 +1871,8 @@ def tier_model_notes() -> list[dict[str, str]]:
                 "ADscan applies Microsoft's AD DS tier model. Tier 0 (the "
                 "identity control plane) and Tier 1 (server and application "
                 "administration) follow Microsoft's definitions directly. For "
-                "Tier 2, ADscan uses the attack-path convention — every standard "
-                "user account — because that is where an intrusion begins and what "
+                "Tier 2, ADscan uses the attack-path convention (every standard "
+                "user account), because that is where an intrusion begins and what "
                 "ADscan measures reach FROM. Microsoft's tier model is an "
                 "administration framework; ADscan is an exposure framework, so the "
                 "two describe the same boundary from different sides."
@@ -2542,6 +2530,55 @@ def resolve_record_compromise_class(record: Mapping[str, Any]) -> CompromiseClas
         fallback = details.get("outcome_class")
     resolved = compromise_class_from_outcome_class(fallback)
     return resolved if resolved is not None else CompromiseClass.NONE
+
+
+def is_proven_unauthenticated_domain_breaker(
+    *,
+    compromise_class: Any,
+    status: Any,
+    is_unauthenticated_entry: bool,
+) -> bool:
+    """Return whether a path is a PROVEN full-domain-compromise path that
+    started from the synthetic ``Unauthenticated`` entry (a no-credential
+    foothold).
+
+    This is the single definition of the three-part predicate — proven status
+    (the :data:`_PROVEN_STATUSES` SSOT) AND ``compromise_class`` resolving to
+    :attr:`CompromiseClass.DOMAIN_BREAKER` AND an unauthenticated-entry source
+    — that two independent consumers gate on:
+
+    * ``attack_paths_core._record_is_proven_domain_breaker`` — widens the
+      synthetic entry's affected set to the entire enabled domain population
+      only for a proven no-credential domain breaker.
+    * ``exposure_score_service``'s ``unauth_domain_breaker_present`` detection
+      — the domain-level zero-credential headline KPI.
+
+    Both call sites keep their OWN extraction of each signal (a record dict
+    shape differs between the two, and the unauthenticated-entry detection
+    itself uses a different mechanism per caller — node ``kind`` vs. entry
+    label), and pass the already-extracted values in here so the actual gating
+    logic can never silently desync between the two consumers.
+
+    Args:
+        compromise_class: The record's resolved compromise class — either a
+            :class:`CompromiseClass` member or the equivalent lower-cased
+            string (``CompromiseClass`` is a ``str`` ``Enum``, so both compare
+            equal to ``CompromiseClass.DOMAIN_BREAKER``).
+        status: The record's resolved display/canonical status string.
+        is_unauthenticated_entry: Whether the record's source is the
+            synthetic ``Unauthenticated`` entry node — the caller resolves
+            this itself (e.g. via the node ``kind`` or
+            :func:`adscan_core.reporting.unauthenticated_reach.is_unauthenticated_entry_label`).
+
+    Returns:
+        ``True`` only when all three conditions hold.
+    """
+    if not is_unauthenticated_entry:
+        return False
+    status_token = str(status or "").strip().lower()
+    if status_token not in _PROVEN_STATUSES:
+        return False
+    return compromise_class == CompromiseClass.DOMAIN_BREAKER
 
 
 def _record_path_edges(record: dict[str, Any]) -> list[dict[str, Any]]:

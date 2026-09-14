@@ -52,6 +52,7 @@ from adscan_core.reporting.technical_report import (
     _utc_now_iso,
     finding_catalog,
 )
+from adscan_core.reporting.unauthenticated_reach import reached_via_from_notes
 from adscan_core.rich_output import (
     mark_sensitive,
     print_info_debug,
@@ -62,13 +63,22 @@ from adscan_internal.services.attack_step_catalog import (
     classify_edge_relation,
     finding_basis_for_relation,
 )
-from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
+from adscan_internal.services.compromise_class import (
+    CompromiseClass,
+    is_direct_domain_breaker_target,
+)
 from adscan_internal.services.destructive_action_policy import non_execution_statement
 from adscan_internal.services.domain_controller_classifier import (
     classify_computer_node_role,
 )
+from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.path_state import carries_client_exposure
 from adscan_internal.services.relay_status_constants import CONFIGURATION_CLOSE_STATUS
+from adscan_internal.services.severity import (
+    EdgeSeverityInput,
+    Severity,
+    compute_edge_severity,
+)
 
 #: Directory (relative to a workspace root) holding the per-domain artifacts.
 #: Mirrors the default ``shell.domains_dir`` and the report-path convention in
@@ -597,6 +607,505 @@ def _weave_specifics(
     return weave(vuln_key, knowledge, details)
 
 
+#: Finding-severity rank (lowercase report labels). Higher = more severe. Used
+#: to uplift a finding's catalog base severity with an edge-derived severity
+#: without ever downgrading it (the edge-severity SSOT can only raise the floor).
+_FINDING_SEVERITY_RANK: dict[str, int] = {
+    "info": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+
+
+def _uplift_finding_severity(catalog_base: str, edge_severity: Severity) -> str:
+    """Return the more severe of the catalog base and the edge-derived severity.
+
+    The edge-severity SSOT (:func:`compute_edge_severity`) expresses the
+    CONTEXTUAL exposure of the materialized entry (e.g. CRITICAL for a proven
+    no-credential chain onto a Tier-0 terminal). A credential-leak finding also
+    has an intrinsic catalog base (HIGH for a GPP cpassword). The finding's
+    severity is the maximum of the two — the context can only uplift, never
+    downgrade a real finding below what it warrants on its own.
+    """
+    base_label = str(catalog_base or "medium").lower()
+    edge_label = edge_severity.value.lower()
+    base_rank = _FINDING_SEVERITY_RANK.get(base_label, 2)
+    edge_rank = _FINDING_SEVERITY_RANK.get(edge_label, 2)
+    return edge_label if edge_rank >= base_rank else base_label
+
+
+#: Loose finding keys that link to the materialized attack graph through their
+#: ``details._affected_assets_struct[].node_id`` rather than through an
+#: ``exploitation`` edge carrying a ``vuln_key`` (the credential-read edge is
+#: classified ``relationship`` — it shapes the path but is not itself a reportable
+#: exploitation edge). These findings are recorded with their affected-asset
+#: struct at scan time; this module links them to the proven-unauthenticated
+#: credential edge so they inherit ``from_attack_graph`` and a contextual
+#: severity derived from the edge-severity SSOT.
+#:
+#: ``gpp_passwords`` (GPP cpassword / autologon over SYSVOL) already stamps
+#: ``unauthenticated_reachable``/``reached_via`` on its own details at record
+#: time (``scan.py``'s unauth-enrichment path). ``smb_share_secrets`` (any
+#: other credential found in a readable share file, ``cli/creds.py``'s
+#: CredSweeper path) does NOT — its details only carry ``unc_path``/
+#: ``username``, so the link below must PROPAGATE both from the matched edge.
+_UNAUTH_ENTRY_LINK_FINDING_KEYS: frozenset[str] = frozenset(
+    {"gpp_passwords", "smb_share_secrets"}
+)
+
+
+def _node_is_tier0(node: Any) -> bool:
+    """Return whether a graph node is a Tier-0 / high-value / domain target.
+
+    Reuses the metadata the graph builder already stamped (``isTierZero`` /
+    ``highvalue``) plus the DC-role classifier — never re-tiers.
+    """
+    if not isinstance(node, dict):
+        return False
+    if bool(node.get("isTierZero")) or bool(node.get("highvalue")):
+        return True
+    if str(node.get("kind") or "") == "Domain":
+        return True
+    return classify_computer_node_role(node) in ("writable_dc", "rodc")
+
+
+#: Forward-walk depth cap for the success-edge reachability from a credential
+#: owner to a Tier-0 terminal. AD attack chains from a harvested credential to
+#: the domain are short (svc_tgs → roast → DCSync → domain is 3 hops); a generous
+#: cap keeps the walk bounded on a large/pathological graph without truncating a
+#: real chain.
+_TIER0_FORWARD_WALK_MAX_DEPTH = 64
+
+
+def _forward_chain_edge_traversable(edge: dict[str, Any]) -> bool:
+    """Return whether the forward chain-reachability walk may cross this edge.
+
+    The walk proves "does the no-credential chain from the harvested credential
+    owner actually reach Tier-0". Two edge kinds may be crossed:
+
+    * A ``MEMBERSHIP`` edge (``MemberOf``) — structural directory TRUTH, not an
+      executed action. Its status is ``discovered``, never ``success``, so a
+      success-only gate would sever the chain at the first group hop (the owned
+      principal → its group, through which the proven attack actually fires).
+      Membership is a valid connector regardless of status.
+    * Any OTHER edge (an attack/action edge) ONLY when ``status == "success"`` —
+      the action must be PROVEN-executed. A merely-theoretical onward attack never
+      elevates the finding (an Exposure-Validation overclaim otherwise).
+
+    This keeps the honesty guarantee (every ACTION in the chain is proven) while
+    modelling the chain exactly as the attack graph does: owned principal →
+    (membership) → group → (proven attack) → Tier-0.
+    """
+    relation = str(edge.get("relation") or "")
+    if classify_edge_kind(relation) is EdgeKind.MEMBERSHIP:
+        return True
+    return str(edge.get("status") or "").strip().lower() == "success"
+
+
+def _proven_tier0_terminal_labels_from(
+    start_node_id: str,
+    edges: list[Any],
+    nodes_map: dict[str, Any],
+) -> list[str]:
+    """Return Tier-0 terminals reachable FORWARD from *start_node_id* over the
+    PROVEN chain (structural membership + executed attack edges).
+
+    This is the CAUSAL scope for the no-credential severity uplift: it answers
+    "does the chain that STARTS at this credential owner actually reach a Tier-0
+    terminal", NOT "does the graph contain a Tier-0 compromise ANYWHERE". A global
+    scan would falsely stamp the credential-leak finding CRITICAL whenever the
+    domain is compromised by a COMPLETELY UNRELATED authenticated path — an
+    Exposure-Validation overclaim (asserting a no-credential path to Domain Admin
+    the graph does not show). Edge admission is :func:`_forward_chain_edge_traversable`
+    (membership = structural connector; every other edge must be ``success``), so a
+    merely-theoretical onward attack never elevates. A non-empty result lifts the
+    finding to CRITICAL and its labels are stamped as the finding's Tier-0 context
+    so the shared CVSS engine (the SSOT both the PDF report and the web CTEM read)
+    elevates it identically; an empty result leaves the finding at its HIGH base
+    (a real credential leak, not proven to reach Tier-0 from this entry).
+    Cycle-safe (visited set) and depth-capped.
+    """
+    start = str(start_node_id or "").strip()
+    if not start:
+        return []
+
+    # Forward adjacency over the PROVEN chain: from-node → [to-node, ...].
+    chain_adjacency: dict[str, list[str]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if not _forward_chain_edge_traversable(edge):
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if from_id and to_id:
+            chain_adjacency.setdefault(from_id, []).append(to_id)
+
+    labels: list[str] = []
+    visited: set[str] = {start}
+    # BFS with an explicit depth so a pathological graph cannot run unbounded.
+    frontier: list[str] = [start]
+    depth = 0
+    while frontier and depth < _TIER0_FORWARD_WALK_MAX_DEPTH:
+        next_frontier: list[str] = []
+        for current in frontier:
+            for neighbor in chain_adjacency.get(current, ()):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                next_frontier.append(neighbor)
+                node = nodes_map.get(neighbor)
+                if _node_is_tier0(node):
+                    label = str(
+                        (node or {}).get("label")
+                        or (node or {}).get("name")
+                        or neighbor
+                        or ""
+                    ).strip()
+                    if label:
+                        _append_unique(labels, label)
+        frontier = next_frontier
+        depth += 1
+    return labels
+
+
+def _affected_node_ids(finding: dict[str, Any]) -> set[str]:
+    """Return the ``node_id`` link hooks carried on a finding's affected assets.
+
+    The affected-assets stamper records each resolved principal/host with a
+    ``node_id`` (the attack-graph node key). Retained as an ADDITIONAL fallback
+    hook for the unauthenticated-entry linker; the authoritative match is by the
+    shared artifact (see :func:`_link_unauthenticated_reach_findings`).
+    """
+    details = finding.get("details")
+    if not isinstance(details, dict):
+        return set()
+    struct = details.get("_affected_assets_struct")
+    if not isinstance(struct, list):
+        return set()
+    ids: set[str] = set()
+    for entry in struct:
+        if isinstance(entry, dict):
+            node_id = str(entry.get("node_id") or "").strip()
+            if node_id:
+                ids.add(node_id)
+    return ids
+
+
+def _normalize_artifact_path(raw: Any) -> str:
+    """Canonicalize a UNC/file artifact path for cross-reference matching.
+
+    The GPP finding's ``details.unc_path`` and the proven-unauthenticated edge's
+    ``notes.artifact`` are the SAME file, stamped from the same source value at
+    record time — so they normally match byte-for-byte. This normalizer makes
+    the match robust to the separator/case/whitespace drift that an FQDN-vs-IP
+    host rewrite or a later re-stamp could introduce: it lowercases, collapses
+    both separators to a single ``/``, and strips trailing separators, so
+    ``\\\\HOST\\Replication\\...\\Groups.xml`` and
+    ``//host/replication/.../groups.xml`` compare equal. Returns ``""`` for an
+    empty/non-string value (never matches).
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    collapsed = text.replace("\\", "/").lower()
+    while "//" in collapsed.lstrip("/"):
+        # Collapse interior doubled separators but keep a single leading marker.
+        head = "/" if collapsed.startswith("/") else ""
+        collapsed = head + "/".join(part for part in collapsed.split("/") if part)
+        break
+    return collapsed.rstrip("/")
+
+
+def _sam_account_name(raw: Any) -> str:
+    """Extract a lowercase sAMAccountName from a principal reference.
+
+    Accepts the forms the finding and the graph carry for the SAME owner:
+    ``DOMAIN\\user`` / ``domain.local\\user`` (finding ``details.username``),
+    ``user@domain.local`` (UPN), a bare ``user``, a node id ``name:user``, and a
+    node label ``USER@DOMAIN``. Returns the bare account name, lowercased, so the
+    owner-consistency reinforcement compares like for like. Returns ``""`` when
+    no account name can be extracted.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("name:"):
+        text = text[len("name:"):].strip()
+    # DOMAIN\\user -> user
+    if "\\" in text:
+        text = text.rsplit("\\", 1)[-1].strip()
+    # user@domain / USER@DOMAIN -> user
+    if "@" in text:
+        text = text.split("@", 1)[0].strip()
+    return text.lower()
+
+
+def _finding_owner_sam(finding: dict[str, Any]) -> str:
+    """Return the lowercase sAMAccountName of the GPP credential's owner.
+
+    The owner is the account the leaked credential belongs to, recorded as
+    ``details.username`` (e.g. ``active.htb\\SVC_TGS``). Used as the reinforcing
+    confirmation for the artifact match so two distinct GPP credentials from
+    different files for the same owner never cross-link.
+    """
+    details = finding.get("details")
+    if not isinstance(details, dict):
+        return ""
+    return _sam_account_name(details.get("username"))
+
+
+def _match_unauth_edge_for_finding(
+    finding: dict[str, Any],
+    unauth_edges_by_artifact: dict[str, list[dict[str, Any]]],
+    unauth_edges_by_target: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """Resolve the proven-unauthenticated edge a loose finding links to.
+
+    PRIMARY: the shared artifact. The finding's ``details.unc_path`` is
+    normalized and looked up against the by-artifact index; the owner
+    (``details.username`` ↔ the edge ``to`` node's account name) is a reinforcing
+    check so two GPP credentials from different files for the same owner never
+    cross-link. The match requires the artifact AND (owner-consistent OR the
+    finding carries no owner). When multiple edges share the artifact (e.g. the
+    same file readable by Everyone and by Users), an owner-consistent edge wins;
+    otherwise the first artifact edge is used (they all reference the same read).
+
+    FALLBACK: the legacy ``_affected_assets_struct[].node_id`` → edge-target hook,
+    kept for any finding whose struct still carries the owner's node id.
+    """
+    finding_artifact = ""
+    details = finding.get("details")
+    if isinstance(details, dict):
+        finding_artifact = _normalize_artifact_path(details.get("unc_path"))
+
+    if finding_artifact:
+        artifact_edges = unauth_edges_by_artifact.get(finding_artifact)
+        if artifact_edges:
+            owner_sam = _finding_owner_sam(finding)
+            if owner_sam:
+                for edge in artifact_edges:
+                    if _sam_account_name(edge.get("to")) == owner_sam:
+                        return edge
+                # Artifact matched but NO edge is owner-consistent: a different
+                # GPP credential on the same file — do not cross-link.
+                return None
+            # Owner absent on the finding: the artifact identity is sufficient.
+            return artifact_edges[0]
+
+    # Fallback: the affected-assets struct node_id → edge target hook.
+    for node_id in _affected_node_ids(finding):
+        candidates = unauth_edges_by_target.get(node_id)
+        if candidates:
+            return candidates[0]
+
+    return None
+
+
+def _link_unauthenticated_reach_findings(
+    graph: dict[str, Any],
+    findings: list[Any],
+    findings_by_key: dict[str, Any],
+    catalog_by_key: dict[str, dict[str, Any]],
+    *,
+    now: str,
+) -> bool:
+    """Link a loose credential-leak finding to its proven-unauthenticated edge.
+
+    The GPP credential-read edge is a ``relationship`` edge (no ``vuln_key``), so
+    the exploitation-edge derivation never touches it. But the recovered
+    credential is a real, graph-backed foothold whose severity is CONTEXTUAL: a
+    read proven over a null/guest session onto a chain that reaches a Tier-0
+    terminal is a no-credential path to full domain compromise — the
+    highest-severity case — while the same read not proven to reach Tier-0 is a
+    HIGH-grade credential leak.
+
+    The link is resolved by the SHARED ARTIFACT — the finding's
+    ``details.unc_path`` (the leaked ``\\host\\...\\Groups.xml``) matched against a
+    proven-unauthenticated edge's ``notes.artifact`` (the identical file),
+    normalized on both sides (:func:`_normalize_artifact_path`). This is the
+    FUNDAMENTAL fact ("the same file was the finding AND the proven read"), stamped
+    at record time on both sides (the emitter stamps ``unc_path`` at
+    ``scan.py``; the provenance service stamps ``notes.artifact`` on the edge),
+    so the match resolves at CI time — it does NOT depend on the deliver-time
+    ``_affected_assets_struct``, which carries the READ-SET group node ids (the
+    edge FROMs) rather than the credential owner (the edge TO) and so would never
+    match the edge target. The owner (``details.username`` ↔ the edge ``to`` node)
+    is a REINFORCING confirmation: the match requires the artifact AND either an
+    owner-consistent edge or an owner-absent finding, so two distinct GPP
+    credentials from different files for the same owner never cross-link. The
+    ``_affected_assets_struct[].node_id`` → edge-target path is kept only as an
+    additional fallback; the artifact match is authoritative.
+
+    On a match the finding inherits ``from_attack_graph=True``, the catalog
+    knowledge block, and a severity derived from the edge-severity SSOT
+    (``compute_edge_severity``) — never a static per-finding constant and never
+    independently of the materialized edge. Idempotent.
+
+    Returns:
+        True when the report was modified.
+    """
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not edges:
+        return False
+
+    # Index proven-unauthenticated edges by (a) their normalized artifact path
+    # (the authoritative link key — the same file was the finding AND the read)
+    # and (b) their target node id (the fallback struct-node_id hook). Two edges
+    # can share ONE artifact (the same Groups.xml readable by Everyone AND Users),
+    # so each index bucket is a list.
+    unauth_edges_by_artifact: dict[str, list[dict[str, Any]]] = {}
+    unauth_edges_by_target: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        notes = edge.get("notes")
+        if not isinstance(notes, dict) or not notes.get("unauthenticated_reachable"):
+            continue
+        artifact_key = _normalize_artifact_path(notes.get("artifact"))
+        if artifact_key:
+            unauth_edges_by_artifact.setdefault(artifact_key, []).append(edge)
+        target = str(edge.get("to") or "").strip()
+        if target:
+            unauth_edges_by_target.setdefault(target, []).append(edge)
+    if not unauth_edges_by_artifact and not unauth_edges_by_target:
+        return False
+
+    updated = False
+    for key in _UNAUTH_ENTRY_LINK_FINDING_KEYS:
+        finding = findings_by_key.get(key)
+        if not isinstance(finding, dict):
+            continue
+
+        matched_edge = _match_unauth_edge_for_finding(
+            finding,
+            unauth_edges_by_artifact,
+            unauth_edges_by_target,
+        )
+        if matched_edge is None:
+            continue
+
+        # Scope the Tier-0 signal to THIS chain: the Tier-0 terminals reachable
+        # FORWARD over executed edges from the matched edge's own target (the
+        # harvested credential owner), NOT any Tier-0 compromise elsewhere in the
+        # graph. A global scan would falsely elevate the finding whenever the
+        # domain is compromised by an UNRELATED authenticated path — an
+        # Exposure-Validation overclaim the forward walk prevents.
+        chain_start = str(matched_edge.get("to") or "").strip()
+        tier0_terminals = _proven_tier0_terminal_labels_from(
+            chain_start, edges, nodes_map
+        )
+        reaches_tier0 = bool(tier0_terminals)
+
+        # Derive the finding's severity from the materialized edge via the
+        # edge-severity SSOT. Source = Unauthenticated Principal (the proven
+        # no-credential position). The entry edge's OWN target is the harvested
+        # account (not Tier-0), so the Tier-0 signal flows through the dedicated
+        # ``proven_unauth_reaches_tier0`` field (the forward-chain reachability),
+        # NOT by repurposing the node-kind ``target_is_domain`` booleans. The edge
+        # severity can only UPLIFT the finding's catalog base — a proven GPP
+        # credential leak is already HIGH on its own — so the result is
+        # max(base, edge-derived): HIGH when the chain does not reach Tier-0,
+        # CRITICAL when it does.
+        relation = str(matched_edge.get("relation") or "")
+        edge_severity = compute_edge_severity(
+            EdgeSeverityInput(
+                source_compromise_class=CompromiseClass.UNAUTHENTICATED_PRINCIPAL,
+                target_compromise_class=None,
+                edge_kind=classify_edge_kind(relation),
+                proven_unauthenticated_reachable=True,
+                proven_unauth_reaches_tier0=reaches_tier0,
+            )
+        )
+        catalog = catalog_by_key.get(key, {})
+        catalog_base = str(catalog.get("severity") or "medium")
+        severity_label = _uplift_finding_severity(catalog_base, edge_severity)
+
+        if finding.get("from_attack_graph") is not True:
+            finding["from_attack_graph"] = True
+            updated = True
+        if finding.get("severity") != severity_label:
+            finding["severity"] = severity_label
+            updated = True
+        if "discovered_at" not in finding:
+            finding["discovered_at"] = finding.get("first_seen") or now
+            updated = True
+
+        # Attach the catalog knowledge block so the honest SSOT copy (the native
+        # remediation, the MITRE mapping) reaches the report and the web CTEM.
+        catalog_knowledge = catalog.get("knowledge")
+        existing_knowledge = finding.get("knowledge")
+        if (
+            (not isinstance(existing_knowledge, dict) or not existing_knowledge)
+            and isinstance(catalog_knowledge, dict)
+            and catalog_knowledge
+        ):
+            finding["knowledge"] = catalog_knowledge
+            updated = True
+
+        # Record the linking edge + the unauthenticated-reach marker onto the
+        # finding's details, so the render surfaces (and the shared CVSS context
+        # extractor) see the materialized edge behind the severity.
+        details = finding.get("details")
+        if not isinstance(details, dict):
+            details = {}
+            finding["details"] = details
+        existing_edges = details.get("attack_graph_edges")
+        if not isinstance(existing_edges, list):
+            existing_edges = []
+        edge_entry = {
+            "relation": relation,
+            "source": str(matched_edge.get("source") or matched_edge.get("from") or ""),
+            "target": str(matched_edge.get("target") or matched_edge.get("to") or ""),
+        }
+        note_summary = _summarize_attack_graph_edge_notes(matched_edge.get("notes"))
+        if note_summary:
+            edge_entry["notes"] = note_summary
+        _append_unique(existing_edges, edge_entry)
+        details["attack_graph_edges"] = existing_edges
+        if details.get("unauthenticated_reachable") is not True:
+            details["unauthenticated_reachable"] = True
+            updated = True
+
+        # Carry the HOW-was-this-reached vector forward from the matched edge.
+        # ``gpp_passwords`` already stamps it at record time (the unauth-
+        # enrichment emitter knows the mechanism directly); other linked keys
+        # (``smb_share_secrets``) do not — their emitter never observes the
+        # null/guest bind that actually produced the read. The matched edge is
+        # the SSOT for the mechanism either way (it is what
+        # ``unauthenticated_reachable`` above is derived from), so a matched
+        # finding always inherits the edge's ``reached_via`` when its own
+        # details do not already carry one, keeping the reached_via-aware
+        # narrative and affected-assets renderers fed regardless of which
+        # emitter produced the finding.
+        if "reached_via" not in details:
+            edge_reached_via = reached_via_from_notes(matched_edge.get("notes"))
+            if edge_reached_via:
+                details["reached_via"] = edge_reached_via
+                updated = True
+
+        # Stamp the Tier-0 / exploitation context keys the shared CVSS engine
+        # reads (``extract_context_from_details``), so the CONTEXTUAL severity
+        # the PDF report AND the web CTEM both render from that ONE SSOT matches
+        # the ``severity`` field set above — the proven no-credential chain into
+        # a Tier-0 terminal elevates ``gpp_passwords`` to its CRITICAL rule.
+        # A success read always confirms exploitation; the Tier-0 terminals are
+        # stamped only when the chain was proven to reach them.
+        if details.get("exploitation_confirmed") is not True:
+            details["exploitation_confirmed"] = True
+            updated = True
+        if tier0_terminals:
+            if details.get("tier_zero_accounts") != tier0_terminals:
+                details["tier_zero_accounts"] = list(tier0_terminals)
+                updated = True
+        finding["last_seen"] = now
+
+    return updated
+
+
 def sync_attack_graph_findings(
     shell: ReportShell,
     domain: str,
@@ -655,7 +1164,17 @@ def sync_attack_graph_findings(
             _append_unique(entries, entry)
         edges_by_key[vuln_key] = entries
 
-    if not edges_by_key and not gated_keys:
+    # A loose credential-leak finding (the canonical gpp_passwords) links to a proven
+    # unauthenticated relationship edge, not a reportable exploitation edge, so
+    # the presence of such an edge must keep this sync running even when there is
+    # no exploitation-edge work to do.
+    has_unauth_link_edge = any(
+        isinstance(edge, dict)
+        and isinstance(edge.get("notes"), dict)
+        and edge["notes"].get("unauthenticated_reachable")
+        for edge in edges
+    )
+    if not edges_by_key and not gated_keys and not has_unauth_link_edge:
         return False
 
     catalog_by_key = _resolve_finding_catalog()
@@ -781,6 +1300,14 @@ def sync_attack_graph_findings(
             if personalized != finding.get("knowledge"):
                 finding["knowledge"] = personalized
                 updated = True
+
+    # Link loose credential-leak findings to their proven-unauthenticated entry
+    # edge (node-id hook, not vuln_key) and derive their contextual severity from
+    # the edge-severity SSOT.
+    if _link_unauthenticated_reach_findings(
+        graph, findings, findings_by_key, catalog_by_key, now=now
+    ):
+        updated = True
 
     if updated:
         _save_technical_report(shell, report)

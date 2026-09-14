@@ -1635,6 +1635,8 @@ def _persist_and_record_spray_hits(
             spray_type=spray_type,
             secret=None,
             verified_via="spraying",
+            domain=domain,
+            shell=shell,
         )
     )
     hits_sorted = sorted(hits, key=lambda item: str(item.get("username", "")).lower())

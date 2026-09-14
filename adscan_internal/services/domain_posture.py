@@ -294,6 +294,7 @@ class PasswordPolicySnapshot:
     lockout_duration_minutes: Optional[int] = None
     password_history_length: Optional[int] = None  # None when not read; from pwdHistoryLength
     minimum_password_age_days: Optional[int] = None  # None when not read; from minPwdAge
+    store_cleartext_passwords: Optional[bool] = None  # None when not read; pwdProperties bit 4 (DOMAIN_PASSWORD_STORE_CLEARTEXT = 0x10)
 
     @property
     def lockout_enabled(self) -> bool:
@@ -684,6 +685,7 @@ def persist_password_policy(
             "lockout_duration_minutes": snapshot.lockout_duration_minutes,
             "password_history_length": snapshot.password_history_length,
             "minimum_password_age_days": snapshot.minimum_password_age_days,
+            "store_cleartext_passwords": snapshot.store_cleartext_passwords,
         }
         print_info_debug(
             f"[domain_posture] password_policy persisted: domain={domain_key} "
@@ -740,6 +742,7 @@ def _hydrate_password_policy(
         lockout_duration_raw = raw.get("lockout_duration_minutes")
         history_length_raw = raw.get("password_history_length")
         min_age_raw = raw.get("minimum_password_age_days")
+        store_cleartext_raw = raw.get("store_cleartext_passwords")
 
         posture.password_policy = PasswordPolicySnapshot(
             min_length=int(min_length),
@@ -759,6 +762,9 @@ def _hydrate_password_policy(
             ),
             minimum_password_age_days=(
                 int(min_age_raw) if min_age_raw is not None else None
+            ),
+            store_cleartext_passwords=(
+                bool(store_cleartext_raw) if store_cleartext_raw is not None else None
             ),
         )
     except Exception as exc:  # noqa: BLE001 - defensive

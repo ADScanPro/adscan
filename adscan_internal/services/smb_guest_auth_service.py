@@ -20,6 +20,42 @@ def is_guest_alias(username: str | None) -> bool:
     return lowered in _GUEST_ALIAS_VALUES
 
 
+def is_credential_less_reader_identity(
+    username: str | None,
+    *,
+    shell: Any | None = None,
+    domain: str | None = None,
+) -> bool:
+    """Return True when ``username`` names a credential-less (guest/null) reader.
+
+    The reading identity of a scan is what actually authenticated the SMB bind
+    that read a file — it is NOT the same thing as "an ambient credential-less
+    scope happens to be open somewhere above on the call stack" (a scope that
+    can legitimately outlive the guest read it was opened for, when the
+    downstream credential-hunt chain re-authenticates as a newly-recovered
+    domain user and reads further shares synchronously inside it).
+
+    A reader identity is credential-less when it is one of:
+
+    * Empty/blank/``None`` — a null/anonymous SMB session carries no username.
+    * A literal guest alias (:func:`is_guest_alias`: ``"guest"``/``"anonymous"``).
+    * The resolved guest transport username for this domain
+      (:func:`resolve_smb_guest_username` — the made-up identity ADscan itself
+      uses for its guest-session bind, e.g. the built-in ``"ADscan"`` default
+      or a per-domain/shell/env override).
+
+    Any other value is a real, authenticated domain (or local) principal, so
+    it returns ``False``.
+    """
+    text = str(username or "").strip()
+    if not text:
+        return True
+    if is_guest_alias(text):
+        return True
+    guest_username = resolve_smb_guest_username(shell=shell, domain=domain)
+    return text.lower() == guest_username.strip().lower()
+
+
 def resolve_smb_guest_username(
     *,
     shell: Any | None = None,

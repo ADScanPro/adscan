@@ -70,7 +70,7 @@ from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.ldap_transport_service import (
     async_connect_with_ldap_fallback,
 )
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_info_debug
 
 
 _USAGE = (
@@ -436,6 +436,44 @@ async def _run_async(
         report_holder["report"] = report
 
     persist_report(persist_target_dir, report)
+    _emit_cve_positive_control_evidence(shell, report, targets, ctx)
+
+
+def _emit_cve_positive_control_evidence(
+    shell: Any,
+    report: Any,
+    targets: tuple[ScanTarget, ...],
+    ctx: ScanContext,
+) -> None:
+    """Record positive control evidence for definitive NOT_VULNERABLE CVE results.
+
+    A patched DC / host that returns a definitive not-vulnerable verdict for
+    Zerologon / NoPac / MS17-010 becomes a green patch-state control in the
+    compliance scorecard (OBSERVED-GOOD; skipped/errored checks never emit).
+    Best-effort — never breaks the scan flow.
+    """
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_cve_not_vulnerable_positives,
+        )
+
+        host_to_domain: dict[str, str] = {}
+        for target in targets or ():
+            domain = str(getattr(target, "domain", "") or "").strip()
+            host = str(getattr(target, "host", "") or "").strip()
+            if host and domain:
+                host_to_domain[host] = domain
+
+        emit_cve_not_vulnerable_positives(
+            shell,
+            getattr(report, "results", ()),
+            host_to_domain=host_to_domain,
+            default_domain=str(getattr(ctx, "domain", "") or "").strip() or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort, never break the scan
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[cves] positive control evidence emit failed: {exc}")
 
 
 def _print_persistent_summary(*, report: Any) -> None:

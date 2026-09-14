@@ -352,8 +352,8 @@ def _krbtgt_obligation(domains: Sequence[str]) -> Obligation:
         proof=(
             f"This assessment recovered the krbtgt account's key material in {scope}. "
             "That key signs every Kerberos ticket the domain issues, so anyone holding "
-            "it can mint a ticket for any account — including accounts that do not "
-            "exist — and every domain controller will accept it."
+            "it can mint a ticket for any account, including accounts that do not "
+            "exist, and every domain controller will accept it."
         ),
         rationale=(
             "Reset it twice. A domain controller keeps the previous krbtgt key and "
@@ -366,8 +366,8 @@ def _krbtgt_obligation(domains: Sequence[str]) -> Obligation:
         steps=(
             ObligationStep(
                 text=(
-                    "Reset the password once. The value you type is discarded — the "
-                    "domain replaces it with a random key — so any long random string "
+                    "Reset the password once. The value you type is discarded and the "
+                    "domain replaces it with a random key, so any long random string "
                     "will do."
                 ),
                 commands=(
@@ -390,8 +390,8 @@ def _krbtgt_obligation(domains: Sequence[str]) -> Obligation:
             ),
             ObligationStep(
                 text=(
-                    "Wait out the maximum ticket lifetime — ten hours under the default "
-                    "Kerberos policy — so tickets issued under the old key have expired "
+                    "Wait out the maximum ticket lifetime, ten hours under the default "
+                    "Kerberos policy, so tickets issued under the old key have expired "
                     "on their own. Resetting twice inside that window forces every "
                     "session in the domain to re-authenticate at once, which is what "
                     "turns a contained incident into an outage."
@@ -439,7 +439,7 @@ def _credential_obligation(
         f"The assessment recovered credential material for {count} "
         f"{_plural(count, 'account')} in {_domains_phrase(domains)}: "
         f"{_join_names(principals)}. Each is compromised, whatever was recovered "
-        "for it — a password hash and a Kerberos key authenticate as the account "
+        "for it: a password hash and a Kerberos key authenticate as the account "
         "just as a password does."
     )
     if full_replication_domains:
@@ -516,7 +516,7 @@ def _credential_obligation(
     steps.append(
         ObligationStep(
             text=(
-                "Check whether any of these passwords is in use anywhere else — a "
+                "Check whether any of these passwords is in use anywhere else: a "
                 "local administrator account, a scheduled task, an application "
                 "configuration file, a second directory. A recovered password is "
                 "compromised everywhere it was ever used, not only where it was found."
@@ -582,8 +582,8 @@ def _certificate_obligation(
                 text=(
                     "Revoke each certificate on the issuing CA, as a member of its "
                     "Certificate Managers group: locate the record by request ID, "
-                    "revoke it with reason code 1 (key compromise) — the private key "
-                    "was generated outside your control — publish a fresh revocation "
+                    "revoke it with reason code 1 (key compromise) because the private key "
+                    "was generated outside your control, publish a fresh revocation "
                     "list, then confirm the record's disposition reads 21."
                 ),
             ),

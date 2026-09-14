@@ -20,6 +20,7 @@ from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from contextlib import nullcontext
+import inspect
 import logging
 import os
 import re
@@ -65,6 +66,55 @@ CREDSWEEPER_RULES_PROFILE_FILESYSTEM = "filesystem"
 CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT = "filesystem_text"
 CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC = "filesystem_doc"
 CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION = "ldap_description"
+
+
+# ---------------------------------------------------------------------------
+# CredSweeper analyzer driving — SSOT, version-tolerant
+# ---------------------------------------------------------------------------
+# credsweeper 1.18 made ``progress_callback`` a REQUIRED positional argument on
+# ``CredSweeper.scan`` and ``CredSweeper.post_processing`` (``run`` carries it
+# with a default). A call built for the pre-1.18 signature raises
+# ``TypeError: ... missing 1 required positional argument: 'progress_callback'``,
+# which the caller swallows -> the whole in-memory ruleset returns ZERO
+# candidates. That silently broke LDAP-description credential extraction (and any
+# other in-memory scan) on the 1.18.3 bump. To make this impossible to
+# reintroduce on a future credsweeper bump (in EITHER direction), every place
+# that drives a CredSweeper analyzer routes through the two SSOT helpers below,
+# which inspect the installed method's signature and pass ``progress_callback``
+# only when it is accepted.
+
+
+def _credsweeper_method_takes_progress_callback(method: Callable[..., Any]) -> bool:
+    """Return True when a bound CredSweeper analyzer method accepts the
+    ``progress_callback`` parameter (credsweeper >= 1.18)."""
+    try:
+        return "progress_callback" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_credsweeper_method(method: Callable[..., Any], *args: Any) -> Any:
+    """Invoke a CredSweeper analyzer method, supplying ``progress_callback=None``
+    only when the installed credsweeper's signature accepts/requires it."""
+    if _credsweeper_method_takes_progress_callback(method):
+        return method(*args, None)
+    return method(*args)
+
+
+def drive_credsweeper_scan(analyzer: Any, content_providers: Any) -> None:
+    """SSOT for the in-memory two-phase CredSweeper API: ``scan`` then
+    ``post_processing``. The ONLY place allowed to call those two methods, so a
+    credsweeper signature change is absorbed here once rather than breaking every
+    in-memory scan silently (see the module note above)."""
+    _call_credsweeper_method(analyzer.scan, content_providers)
+    _call_credsweeper_method(analyzer.post_processing)
+
+
+def drive_credsweeper_run(analyzer: Any, content_provider: Any) -> Any:
+    """SSOT for the single-shot CredSweeper ``run`` API (filesystem-path scan),
+    version-tolerant for the same reason as :func:`drive_credsweeper_scan`."""
+    return _call_credsweeper_method(analyzer.run, content_provider)
+
 
 # Generic keyword-only rules are useful for targeted code/config analysis, but
 # they create disproportionate noise in large Windows filesystem crawls.
@@ -741,7 +791,7 @@ class CredSweeperService(BaseService):
             doc=doc,
             thrifty=False,
         )
-        analyzer.run(FilesProvider([path_to_scan]))
+        drive_credsweeper_run(analyzer, FilesProvider([path_to_scan]))
         return self._normalize_candidates(
             list(analyzer.credential_manager.get_credentials()),
             drop_ml_none=drop_ml_none,

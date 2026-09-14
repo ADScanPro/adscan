@@ -161,6 +161,29 @@ def _is_category_fresh(state) -> bool:  # type: ignore[no-untyped-def]
     return True
 
 
+def _emit_positive_control_evidence(shell: Any, domain: str) -> None:
+    """Record positive control evidence for the domain's OBSERVED-GOOD posture.
+
+    Best-effort: an OBSERVED hardened+HIGH constraint (LDAP signing, LDAP channel
+    binding, SMB signing, LDAPS availability, AES-only Kerberos) and a strong default
+    domain password policy become green controls in the compliance scorecard. Never
+    raises into the freshness guard. Emitted on the probed / already-fresh paths so
+    the positive is recorded whenever posture is finalized for the domain and a shell
+    is in scope.
+    """
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_password_policy_positive,
+            emit_posture_positives,
+        )
+
+        emit_posture_positives(shell, domain)
+        emit_password_policy_positive(shell, domain)
+    except Exception as exc:  # noqa: BLE001 - best effort, never break the guard
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 async def ensure_posture_fresh(
     shell: Any,
     *,
@@ -245,6 +268,7 @@ async def ensure_posture_fresh(
 
         if not force and posture is not None:
             if all(_is_category_fresh(posture.get(cat)) for cat in relevant):
+                _emit_positive_control_evidence(shell, domain_str)
                 return PostureFreshness(
                     domain=domain_str,
                     phase=effective_phase,
@@ -298,6 +322,7 @@ async def ensure_posture_fresh(
             f"[posture_orchestration] probed domain={domain_str} "
             f"phase={effective_phase.value} results={len(results_tuple)}"
         )
+        _emit_positive_control_evidence(shell, domain_str)
         return PostureFreshness(
             domain=domain_str,
             phase=effective_phase,

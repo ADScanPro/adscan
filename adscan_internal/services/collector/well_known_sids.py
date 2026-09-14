@@ -120,6 +120,38 @@ _TIER_ZERO_WELL_KNOWN: frozenset[str] = frozenset(
 )
 
 
+def well_known_sid_display_name(sid: str) -> str | None:
+    """Return the client-readable display name for a well-known Windows SID.
+
+    Single source of truth for "what does this fixed OS/NT-authority SID mean
+    to a reader": the same :data:`_WELL_KNOWN` table used to inject the
+    synthetic collector nodes, so a resolver can never disagree with the
+    node it names. A BUILTIN local-group SID (``S-1-5-32-*``) is qualified as
+    ``BUILTIN\\<Name>`` — the same convention
+    :func:`chokepoint_scoring._node_label` applies for a node found in the
+    graph — so a reader never confuses ``BUILTIN\\Users`` with ``Domain
+    Users``. Any other well-known SID (Everyone, Authenticated Users,
+    Anonymous Logon, ...) returns its bare display name.
+
+    Args:
+        sid: The candidate SID, any case.
+
+    Returns:
+        The display name, or ``None`` when ``sid`` is not a recognized
+        well-known SID.
+    """
+    sid_upper = str(sid or "").strip().upper()
+    if not sid_upper:
+        return None
+    entry = _WELL_KNOWN.get(sid_upper)
+    if entry is None:
+        return None
+    name, _kind = entry
+    if sid_upper.startswith("S-1-5-32-"):
+        return f"BUILTIN\\{name}"
+    return name
+
+
 def _make_well_known_node(sid_upper: str) -> "CollectorNode | None":
     from adscan_internal.services.collector.models import CollectorNode
 

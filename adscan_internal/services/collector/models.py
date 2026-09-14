@@ -120,6 +120,13 @@ class DomainPolicy:
     # requirements". ``None`` when the attribute is unreadable / absent so
     # callers can distinguish "not collected" from "explicitly disabled".
     complexity_enabled: bool | None = None
+    # DOMAIN_PASSWORD_STORE_CLEARTEXT (0x10) bit of ``pwdProperties`` on the
+    # domain root object — when set, the Default Domain Password Policy stores
+    # passwords using reversible (recoverable) encryption, which is equivalent
+    # to storing them in cleartext. ``None`` when ``pwdProperties`` is
+    # unreadable / absent so callers can distinguish "not collected" from
+    # "explicitly disabled".
+    reversible_encryption_enabled: bool | None = None
     # Per-attribute replication metadata from msDS-ReplAttributeMetaData, filtered
     # to password-policy-relevant attributes only. Each entry is a 3-tuple:
     #   (ldap_attr_name, iso_timestamp, version)
@@ -217,6 +224,7 @@ class AuditFinding:
 
     # stale_user | pwd_never_expires | krbtgt_age | machine_quota_risk
     # obsolete_os | rc4_only | pwd_predates_policy | pwd_policy_never_modified
+    # reversible_encryption_enabled
     category: str
     samaccountname: str
     object_id: str

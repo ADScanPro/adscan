@@ -37,6 +37,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from adscan_core.reporting.unauthenticated_reach import (
+    path_is_unauthenticated_reachable,
+)
 from adscan_internal.services.attack_step_support_registry import (
     build_path_priority_key,
 )
@@ -80,21 +83,40 @@ def _reach_rank(record: dict[str, Any]) -> int:
     )
 
 
+# No-credential uplift: within a proof tier, a path whose ENTRY edge was PROVEN
+# executable with NO credential (a null-session read) leads an otherwise-equal
+# path that needs a starting credential — needing nothing is strictly more
+# severe and the most sellable fact. 0 = proven no-credential, 1 = ordinary.
+_UNAUTH_UPLIFT_NO_CREDENTIAL = 0
+_UNAUTH_UPLIFT_ORDINARY = 1
+
+
+def _unauth_uplift_rank(record: dict[str, Any]) -> int:
+    """Return the no-credential uplift rank (0 = proven no-credential, else 1)."""
+    return (
+        _UNAUTH_UPLIFT_NO_CREDENTIAL
+        if path_is_unauthenticated_reachable(record)
+        else _UNAUTH_UPLIFT_ORDINARY
+    )
+
+
 def client_presentation_sort_key(record: dict[str, Any]) -> tuple:
     """Return the PROVEN-first client-presentation sort key for one path record.
 
     Args:
-        record: A single attack-path summary dict (carries ``status`` and,
-            for live records, an engine-stamped ``compromise_class``).
+        record: A single attack-path summary dict (carries ``status``, ``steps``
+            and, for live records, an engine-stamped ``compromise_class``).
 
     Returns:
-        A tuple ``(proof_tier, reach_rank, *execution_priority_key)`` that sorts
-        proven paths first, then partially-validated, then the rest — with the
-        canonical execution-priority key as the deterministic tiebreak.
+        A tuple ``(proof_tier, reach_rank, unauth_uplift, *execution_priority_key)``
+        that sorts proven paths first, then by compromise reach, then lifts a
+        proven no-credential path above an otherwise-equal credentialed one —
+        with the canonical execution-priority key as the deterministic tiebreak.
     """
     return (
         _proof_tier(record),
         _reach_rank(record),
+        _unauth_uplift_rank(record),
         *build_path_priority_key(record),
     )
 
@@ -118,5 +140,9 @@ def order_paths_for_client_presentation(
         list(paths or []),
         key=lambda p: client_presentation_sort_key(p)
         if isinstance(p, dict)
-        else (_PROOF_TIER_UNPROVEN + 1, _REACH_RANK_DEFAULT + 1),
+        else (
+            _PROOF_TIER_UNPROVEN + 1,
+            _REACH_RANK_DEFAULT + 1,
+            _UNAUTH_UPLIFT_ORDINARY + 1,
+        ),
     )

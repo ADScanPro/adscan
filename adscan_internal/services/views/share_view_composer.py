@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from adscan_internal.services.enumeration.smb_shares_native import (
     NativeSharesResult,
@@ -141,6 +141,13 @@ class ShareView:
     live_accessible: bool = True
     live_probe_error: Optional[str] = None
     live_present: bool = False
+    # The MEASURED authorized-reader list read directly off the folder's own
+    # security descriptor by the live probe (populated only when the
+    # connecting identity held READ_CONTROL and the descriptor was actually
+    # read + parsed — see ``smb_shares_native._resolve_measured_read_set``).
+    # Each entry is ``{"sid": str, "label": str, "mask": int}``.
+    live_read_set: List[Dict[str, Any]] = field(default_factory=list)
+    live_read_set_verification: str = VERIFICATION_SHARE_ACL_ONLY
 
     # Graph perspective (collector ACL view, frozen at collection time)
     graph_acl: Optional[GraphShareACL] = None
@@ -194,6 +201,8 @@ class ShareView:
                 "accessible": self.live_accessible,
                 "permissions": list(self.live_permissions),
                 "probe_error": self.live_probe_error,
+                "read_set": [dict(entry) for entry in self.live_read_set],
+                "read_set_verification": self.live_read_set_verification,
             },
             "graph": self.graph_acl.to_dict() if self.graph_acl else None,
             "graph_verification": self.graph_verification,
@@ -336,6 +345,10 @@ def _compose_one(
         view.live_accessible = live_entry.accessible
         view.live_probe_error = live_entry.probe_error
         view.live_present = True
+        view.live_read_set = list(getattr(live_entry, "read_set", None) or [])
+        view.live_read_set_verification = str(
+            getattr(live_entry, "verification", None) or VERIFICATION_SHARE_ACL_ONLY
+        )
 
     if graph_acl is not None:
         view.graph_acl = graph_acl

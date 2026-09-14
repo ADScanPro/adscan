@@ -115,6 +115,37 @@ def _normalize_origin(origin: str) -> str:
     return str(origin or "").strip().lower().replace("-", "").replace("_", "")
 
 
+# Method-identity aliases: distinct origin tokens that name the SAME acquisition
+# method. ``passwordspray`` is the attack-step catalog join key; ``spraying`` and
+# the generic ``spray`` are the slugs the spray flow and the share-verification
+# path record for the identical action. Collapsing them means one spray
+# acquisition is counted as ONE route, never two "independent" routes for a
+# single acquisition. This is METHOD-identity only: it never merges two
+# genuinely different methods that recovered the same secret — a password found
+# in a share AND later confirmed by spraying stays two honest routes (the share
+# and the spray), because those slugs are not aliases of each other. Keyed in
+# normalized form.
+_ORIGIN_METHOD_ALIASES: dict[str, str] = {
+    "spraying": ORIGIN_PASSWORD_SPRAY,
+    "spray": ORIGIN_PASSWORD_SPRAY,
+}
+
+
+def _canonical_origin_slug(origin: str) -> str:
+    """Resolve an origin slug to its canonical method token (alias-aware).
+
+    Returns the canonical slug when the input is a known method alias (e.g.
+    ``spraying`` -> ``passwordspray``), otherwise the input unchanged. Used as
+    the de-duplication identity in :func:`build_method_set` so the same method
+    recorded under two tokens is one route.
+    """
+    text = str(origin or "").strip()
+    if not text:
+        return text
+    canonical = _ORIGIN_METHOD_ALIASES.get(_normalize_origin(text))
+    return canonical if canonical else text
+
+
 # ---------------------------------------------------------------------------
 # Per-ESC display labels (ESC1..ESC17), built once.
 # ---------------------------------------------------------------------------
@@ -408,7 +439,10 @@ def build_method_set(primary_origin: str, recorded_origins: Any) -> list[dict[st
     acquisitions: dict[str, str] = {}
 
     def _remember(slug: Any, acquisition: Any) -> None:
-        text = str(slug or "").strip()
+        # Canonicalize method aliases first, so the same acquisition recorded
+        # under two tokens (``spraying`` and ``passwordspray``) collapses to one
+        # route instead of reading as two independent executed routes.
+        text = _canonical_origin_slug(slug)
         if not text:
             return
         key = text.lower()

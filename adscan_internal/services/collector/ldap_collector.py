@@ -1265,8 +1265,16 @@ class ADscanLDAPCollector:
         pwd_props_raw = _int_attr(attrs, "pwdProperties")
         if pwd_props_raw is None:
             complexity_enabled: bool | None = None
+            # ``pwdProperties`` unreadable — cannot prove reversible encryption
+            # either way. ``None`` keeps "not collected" distinct from "disabled".
+            reversible_encryption_enabled: bool | None = None
         else:
             complexity_enabled = bool(pwd_props_raw & 0x1)
+            # Bit 0x10 = DOMAIN_PASSWORD_STORE_CLEARTEXT: the Default Domain
+            # Password Policy stores passwords with reversible encryption
+            # (recoverable to cleartext). CIS Microsoft Windows Server
+            # Benchmark 1.1.7 requires this Disabled.
+            reversible_encryption_enabled = bool(pwd_props_raw & 0x10)
         result.domain_policy = DomainPolicy(
             min_pwd_length=_int_attr(attrs, "minPwdLength"),
             lockout_threshold=_int_attr(attrs, "lockoutThreshold"),
@@ -1277,6 +1285,7 @@ class ADscanLDAPCollector:
             pwd_history_length=_int_attr(attrs, "pwdHistoryLength"),
             machine_account_quota=_int_attr(attrs, "ms-DS-MachineAccountQuota"),
             complexity_enabled=complexity_enabled,
+            reversible_encryption_enabled=reversible_encryption_enabled,
             pwd_attrs_when_changed=pwd_attrs,
             pwd_policy_last_changed=pwd_attrs[0][1] if pwd_attrs else None,
         )

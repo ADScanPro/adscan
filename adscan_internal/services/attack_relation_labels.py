@@ -112,6 +112,38 @@ def format_relation_label(relation: str) -> str:
         "ntlmv1relayrbcd": "NTLMv1 Relay → RBCD",
         "ntlmv1relayshadowcreds": "NTLMv1 Relay → Shadow Credentials",
         "crackntlmv1": "NTLMv1 Offline Crack",
+        "backupoperatorescalation": "BackupOperatorEscalation",
+        "allextendedrights": "AllExtendedRights",
+        "allowedtoact": "AllowedToAct",
+        "blankpassword": "BlankPassword",
+        "coerceandrelayntlmtoadcs": "CoerceAndRelayNTLMToADCS",
+        "computerpre2k": "ComputerPre2k",
+        "fullcontrolshare": "FullControlShare",
+        "getchangesinfilteredset": "GetChangesInFilteredSet",
+        "guestsession": "GuestSession",
+        "hasshadowcredentials": "HasShadowCredentials",
+        "ms17010": "MS17010",
+        "mssqlimpersonatelogin": "MssqlImpersonateLogin",
+        "mssqlntlmv2theft": "MssqlNtlmv2Theft",
+        "mssqlopenrowsetbulkread": "MssqlOpenRowsetBulkRead",
+        "mssqlseimpersonateescalation": "MssqlSeImpersonateEscalation",
+        "mssqltokentheftescalation": "MssqlTokenTheftEscalation",
+        "mssqltrustworthydbescalation": "MssqlTrustworthyDbEscalation",
+        "passwordspray": "PasswordSpray",
+        "poisoncapturentlmv2crack": "PoisonCaptureNtlmv2Crack",
+        "readshare": "ReadShare",
+        "spnjack": "SPNJack",
+        "synclapspassword": "SyncLAPSPassword",
+        "useraspass": "UserAsPass",
+        "writeaccountrestrictions": "WriteAccountRestrictions",
+        "writeshare": "WriteShare",
+        "dnsadminabuse": "DnsAdminAbuse",
+        "extractrodckrbtgtsecret": "ExtractRODCKrbtgtSecret",
+        "forgerodcgoldenticket": "ForgeRODCGoldenTicket",
+        "kerberoskeylist": "KerberosKeyList",
+        "preparerodccredentialcaching": "PrepareRODCCredentialCaching",
+        "printoperatorabuse": "PrintOperatorAbuse",
+        "privilegedgroupcontrol": "PrivilegedGroupControl",
     }
     return label_map.get(normalized, rel)
 
@@ -225,6 +257,46 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     # Trust abuse ──────────────────────────────────────────────────────────
     "crossorgtgtdelegation": "Cross-Forest Kerberos Ticket Delegation",
     "raisechild": "Child-to-Forest-Root Escalation",
+    # Backup-privilege escalation ─────────────────────────────────────────
+    "backupoperatorescalation": "Backup Operators Escalation to Domain Secrets",
+    # Additional object-control / ACL edges ───────────────────────────────
+    "allextendedrights": "Full Extended-Rights Control of the Target Object",
+    "allowedtoact": "Resource-Based Constrained Delegation Abuse",
+    "getchangesinfilteredset": "Directory Replication Right",
+    "hasshadowcredentials": "Shadow Credential Authentication Key",
+    "writeaccountrestrictions": "Modify Delegation Settings via Account Restrictions",
+    # Share access ─────────────────────────────────────────────────────────
+    "readshare": "Read Access to a Network Share",
+    "writeshare": "Write Access to a Network Share",
+    "fullcontrolshare": "Full Control of a Network Share",
+    "guestsession": "Anonymous Guest Session Access",
+    # Credential-recovery / weak-secret findings ──────────────────────────
+    "blankpassword": "Authentication with a Blank Password",
+    "computerpre2k": "Legacy Pre-Windows-2000 Computer Password",
+    "useraspass": "Username Used as the Account Password",
+    "passwordspray": "Password Spraying Across Many Accounts",
+    "poisoncapturentlmv2crack": "Network Authentication Poisoning and Credential Recovery",
+    "synclapspassword": "Replicate the Local Administrator Password",
+    "spnjack": "Service Principal Name Hijack for Delegation Abuse",
+    # Named CVEs / coercion ────────────────────────────────────────────────
+    "ms17010": "Remote Code Execution via SMBv1",
+    "coerceandrelayntlmtoadcs": "Certificate Enrollment via Coerced Authentication Relay",
+    # Privileged-group escalation ──────────────────────────────────────────
+    "dnsadminabuse": "DNS Administrators Escalation to Domain Controller Compromise",
+    "printoperatorabuse": "Print Operators Escalation to Domain Controller Compromise",
+    "privilegedgroupcontrol": "Control of a Privileged Group",
+    # RODC credential-theft chain ──────────────────────────────────────────
+    "preparerodccredentialcaching": "Read-Only Domain Controller Credential Caching Setup",
+    "extractrodckrbtgtsecret": "Read-Only Domain Controller Credential Extraction",
+    "forgerodcgoldenticket": "Forged Golden Ticket via a Read-Only Domain Controller",
+    "kerberoskeylist": "Kerberos Key List Credential Recovery",
+    # MSSQL escalation / lateral movement ──────────────────────────────────
+    "mssqlimpersonatelogin": "SQL Login Impersonation Escalation",
+    "mssqltrustworthydbescalation": "Privilege Escalation via a Trusted SQL Database",
+    "mssqlntlmv2theft": "Credential Theft via SQL Server-Coerced Authentication",
+    "mssqlseimpersonateescalation": "Privilege Escalation to SYSTEM via SQL Service Impersonation",
+    "mssqltokentheftescalation": "Privilege Escalation to SYSTEM via SQL Session Token Theft",
+    "mssqlopenrowsetbulkread": "Arbitrary File Read via the SQL Server",
 }
 
 
@@ -249,7 +321,27 @@ def format_business_relation_label(relation: str) -> str:
     return f"{business} ({technical})"
 
 
+def business_relation_phrase(relation: str) -> str:
+    """Plain-language phrase for a relation, with no parenthetical token.
+
+    Like :func:`format_business_relation_label` but returns ONLY the business
+    headline (``"Credentials in a Network Share"``) without the trailing
+    ``"(<Token>)"``. Intended for flowing prose — a narrative sentence that
+    lists several techniques reads cleanly without a CamelCase slug or a
+    parenthetical on each item. When no business phrase is defined, falls back
+    to the normalized technical label (``format_relation_label``), which is
+    still title-cased and never a raw lowercase slug.
+    """
+    if not relation:
+        return format_relation_label(relation)
+    business = _BUSINESS_RELATION_HEADLINES.get(str(relation).strip().lower())
+    if business:
+        return business
+    return format_relation_label(relation)
+
+
 __all__ = [
+    "business_relation_phrase",
     "format_business_relation_label",
     "format_relation_label",
 ]

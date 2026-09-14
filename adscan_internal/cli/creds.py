@@ -4639,6 +4639,25 @@ def process_cpassword_text(
             try:
                 from adscan_internal.services.share_credential_provenance_service import (
                     ShareCredentialProvenanceService,
+                    resolve_ambient_share_read_provenance,
+                )
+
+                # A share enumerated over a genuinely credential-less (guest/null)
+                # SMB bind (``run_null_shares`` / ``run_guest_shares``) marks the
+                # ambient scope, several stack frames above this call. Folding it in
+                # here means: the edge is token-filtered + stamped
+                # unauthenticated_reachable (never sourced from the scanner's own
+                # guest-transport identity), and the no-read-set fallback resolves to
+                # the honest ANONYMOUS LOGON / GUESTS node — not "adscan".
+                (
+                    effective_origin,
+                    reached_via,
+                    ambient_perspective,
+                ) = resolve_ambient_share_read_provenance(
+                    provenance_origin,
+                    reader_username=auth_username,
+                    shell=shell,
+                    domain=domain,
                 )
 
                 provenance_service = ShareCredentialProvenanceService()
@@ -4650,7 +4669,7 @@ def process_cpassword_text(
                     hosts=source_hosts,
                     shares=source_shares,
                     artifact=source or None,
-                    origin=provenance_origin,
+                    origin=effective_origin,
                     # Source the edge from the MEASURED read-capable set for the share
                     # when one exists (uniform with the unauth path, scan.py) — threading
                     # the workspace + share so the resolver fires on
@@ -4662,6 +4681,8 @@ def process_cpassword_text(
                     domain=domain,
                     share=source_shares[0] if source_shares else None,
                     auth_username=auth_username,
+                    perspective=ambient_perspective,
+                    reached_via=reached_via,
                 )
                 if source_hosts or source_shares:
                     marked_hosts = (
@@ -4740,6 +4761,22 @@ def _store_recovered_securestring_credential(
     try:
         from adscan_internal.services.share_credential_provenance_service import (
             ShareCredentialProvenanceService,
+            resolve_ambient_share_read_provenance,
+        )
+
+        # See process_cpassword_text: fold the ambient credential-less scope
+        # (set by run_null_shares / run_guest_shares) into the provenance
+        # decision so a genuinely guest/null-bind read is never attributed to
+        # the ordinary "share_spidering" authenticated default.
+        (
+            effective_origin,
+            reached_via,
+            ambient_perspective,
+        ) = resolve_ambient_share_read_provenance(
+            provenance_origin,
+            reader_username=auth_username,
+            shell=shell,
+            domain=domain,
         )
 
         provenance_service = ShareCredentialProvenanceService()
@@ -4751,7 +4788,7 @@ def _store_recovered_securestring_credential(
             hosts=source_hosts,
             shares=source_shares,
             artifact=source or None,
-            origin=provenance_origin,
+            origin=effective_origin,
             # Consistent with the unauth path and the GPP caller: the edge source is
             # the measured read-capable set for the share when one exists. When NO
             # read-set is available, pass auth_username so the fallback sources from
@@ -4761,6 +4798,8 @@ def _store_recovered_securestring_credential(
             domain=domain,
             share=source_shares[0] if source_shares else None,
             auth_username=auth_username,
+            perspective=ambient_perspective,
+            reached_via=reached_via,
         )
         add_credential(
             shell,
@@ -6474,6 +6513,23 @@ def handle_found_credentials(
 
         from adscan_internal.services.share_credential_provenance_service import (
             ShareCredentialProvenanceService,
+            resolve_ambient_share_read_provenance,
+        )
+
+        # A share enumerated over a genuinely credential-less (guest/null) SMB
+        # bind marks the ambient scope several stack frames above this call
+        # (``run_null_shares`` / ``run_guest_shares`` in ``cli/smb.py``). Fold
+        # it into the spraying source_context so a later password-validation
+        # sweep that attributes this credential to specific accounts
+        # (``build_password_artifact_source_steps``) carries the same
+        # session-origin fact ``build_credential_source_steps`` already
+        # carries, instead of silently sourcing the edge from the scanner's
+        # own probe account.
+        _, ambient_reached_via, _ = resolve_ambient_share_read_provenance(
+            provenance_origin,
+            reader_username=auth_username,
+            shell=shell,
+            domain=domain,
         )
 
         provenance_service = ShareCredentialProvenanceService()
@@ -6485,6 +6541,7 @@ def handle_found_credentials(
             origin=provenance_origin,
             access_vector=access_vector or None,
             include_origin_without_fields=False,
+            reached_via=ambient_reached_via,
         )
         shell.spraying_with_passwords(
             domain,

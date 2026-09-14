@@ -9468,19 +9468,44 @@ def _personalize_edge_knowledge(
         except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
             telemetry.capture_exception(exc)
 
+    # Bake the LSASS defensive-posture context onto the edge so the web CTEM
+    # renders the SAME authored sentence the PDF reads from the step details.
+    # Built from THIS edge's posture notes (stamped at the dump seam), through
+    # the SAME catalog SSOT (render_lsass_posture_context) — one authored string,
+    # two render seams, zero drift. Empty for any edge without posture notes (a
+    # non-LSASS edge, or a DumpLSASS edge scanned before the dump ran), so it
+    # never fabricates a claim. Best-effort: any failure leaves the base clean.
+    posture_context = ""
+    if edge_notes:
+        try:
+            from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
+                render_lsass_posture_context,
+            )
+
+            posture_context = render_lsass_posture_context(
+                {"relation": relation_norm, "details": dict(edge_notes)}
+            )
+        except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
+            telemetry.capture_exception(exc)
+
     def _with_verify(result: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Overlay the re-rendered verify commands onto a knowledge dict.
+        """Overlay the re-rendered verify commands + posture context onto a
+        knowledge dict.
 
         Copies before mutating so the cached base is never touched. A no-op when
-        there is no override (no coordinates, or the base had no verify block).
+        there is nothing to overlay (no verify override AND no posture context).
         """
-        if not verify_override or not isinstance(result, dict):
+        if not isinstance(result, dict):
+            return result
+        if not verify_override and not posture_context:
             return result
         merged = dict(result)
         merged.update(verify_override)
+        if posture_context:
+            merged["defensive_posture_context"] = posture_context
         return merged
 
-    if not edge_notes and not verify_override:
+    if not edge_notes and not verify_override and not posture_context:
         return base
     try:
         from adscan_internal.pro.reporting.finding_specifics import (

@@ -1698,6 +1698,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
     # ``process_cpassword_text`` does for share-spidered cpasswords. Manual
     # ``domains_data["credentials"][user] = pwd`` insertion silently bypassed
     # all of that and left the credential invisible to the auth flow.
+    from adscan_core.reporting.unauthenticated_reach import REACHED_VIA_NULL_SESSION
     from adscan_internal.cli.creds import add_credential as _add_credential
     from adscan_internal.cli.creds import (
         credential_verdict_is_verified as _description_credential_was_verified,
@@ -1754,6 +1755,9 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 domain=domain,
                 shares=[leak.source_share] if leak.source_share else None,
                 perspective="anonymous",
+                # GPP/SYSVOL harvesting runs over the shared null SMB session
+                # (unauth_enrichment_service), so the read is a null-session read.
+                reached_via=REACHED_VIA_NULL_SESSION,
             )
             _add_credential(
                 self,
@@ -1777,17 +1781,56 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 record_technical_finding,
             )
 
+            # A GPP cpassword in a share is ONE vulnerability — the canonical
+            # ``gpp_passwords`` finding. HOW it was discovered (this null/guest
+            # session) and WHO can read it (the measured read-set) are CONTEXT of
+            # that one finding, not a second finding. Stamp the two-axis context
+            # into the unified key's details:
+            #   * ``reached_via`` / ``unauthenticated_reachable`` — the PROVEN
+            #     no-credential position (axis 2); these are the higher-value
+            #     signal and must survive a later authenticated emit of the same
+            #     key (``record_technical_finding`` merges details, so keys the
+            #     authenticated emit does not set are never clobbered).
+            #   * ``read_set`` — the measured objects with effective READ access
+            #     to the file (axis 1), from the same mxac/read-set SSOT the edge
+            #     carries as ``authorized_by_acl``. Measured only — never guessed.
+            gpp_details: dict[str, Any] = {
+                "source": "unauth_enrichment_service",
+                "username": leak.username,
+                "unc_path": leak.unc_path,
+                "xml_type": leak.xml_type,
+                "unauthenticated_reachable": True,
+                "reached_via": REACHED_VIA_NULL_SESSION,
+            }
+            try:
+                read_set = provenance.resolve_share_read_capable_sources(
+                    artifact=leak.unc_path,
+                    share=leak.source_share or None,
+                    domain=domain,
+                    shell=self,
+                )
+            except Exception:  # noqa: BLE001 — read-set is best-effort context
+                read_set = []
+            if read_set:
+                gpp_details["read_set"] = [
+                    {"sid": entry["sid"], "label": entry.get("label") or entry["sid"]}
+                    for entry in read_set
+                    if entry.get("sid")
+                ]
             record_technical_finding(
                 self,
                 domain,
-                key="gpp_cpassword_leak",
+                key="gpp_passwords",
                 value=True,
-                details={
-                    "source": "unauth_enrichment_service",
-                    "username": leak.username,
-                    "unc_path": leak.unc_path,
-                    "xml_type": leak.xml_type,
-                },
+                # The recovered credential is materialized as an attack-graph
+                # edge (the share-credential provenance edge to its owner), so
+                # the finding is graph-backed. The attack-graph reconciler
+                # (sync_attack_graph_findings) links it to that edge and, when
+                # the proven no-credential chain reaches a Tier-0 terminal,
+                # derives its contextual CRITICAL severity from the edge-severity
+                # SSOT — never a static per-finding constant.
+                from_attack_graph=True,
+                details=gpp_details,
                 evidence=[
                     {
                         "type": "file",
@@ -1836,6 +1879,8 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 domain=domain,
                 shares=[autologin.source_share] if autologin.source_share else None,
                 perspective="anonymous",
+                # Same shared null SMB session as the cpassword loop.
+                reached_via=REACHED_VIA_NULL_SESSION,
             )
             _add_credential(
                 self,
@@ -1985,6 +2030,50 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+
+    # ── SMB null-session finding (coverage ↔ findings reconciliation) ─────
+    # The AD Control Coverage report renders the anonymous-account-enumeration
+    # control as NEEDS ATTENTION the moment an anonymous null session succeeds.
+    # Emit the matching Security Assessment finding from the SAME evidence so
+    # the two surfaces never disagree — a needs-attention coverage row with no
+    # finding peer was the contradiction this closes. The null session itself
+    # is the observed exposure (the DC accepted an anonymous session); the SAMR
+    # account count is its evidence, so the finding is emitted whenever the null
+    # session is open, regardless of how many accounts SAMR returned.
+    if bool(domain_data.get("smb_null_session")):
+        samr_count = len(results.samr_users)
+        null_summary = (
+            "Anonymous SMB null session accepted by the domain controller; "
+            f"{samr_count} domain account(s) enumerated over MS-SAMR"
+            if samr_count
+            else "Anonymous SMB null session accepted by the domain controller"
+        )
+        try:
+            from adscan_core.reporting.technical_report import (
+                record_technical_finding,
+            )
+
+            record_technical_finding(
+                self,
+                domain,
+                key="smb_null_domain",
+                value=True,
+                details={
+                    "source": "unauth_enrichment_service.smb_null_session",
+                    "samr_users_enumerated": samr_count,
+                },
+                evidence=[
+                    {
+                        "type": "probe",
+                        "summary": null_summary,
+                        "artifact_path": "users.json",
+                    }
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[unauth-enrich] smb_null_domain record skipped: {exc}")
 
     # Store per-task capability flags in domain_data so the Phase 3 followup
     # menu can show independent status for shares vs SAMR vs GPP vs LDAP users

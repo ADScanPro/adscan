@@ -127,6 +127,16 @@ ACTOR_SOURCE_CARRY_FORWARD: Final[str] = "carry_forward"
 ACTOR_SOURCE_MACHINE_ACCOUNT: Final[str] = "machine_account"
 ACTOR_SOURCE_SOURCE_OWNED: Final[str] = "source_owned"
 ACTOR_SOURCE_GENERIC_HOST: Final[str] = "generic_host"
+#: A step whose SOURCE is the synthetic ``Unauthenticated`` entry node — its
+#: "credential" is a credential-less bind (an SMB null session or guest session),
+#: the SAME bind that proved the no-credential read during enrichment. This is the
+#: fifth actionable route alongside the four above; it carries NO password/hash.
+ACTOR_SOURCE_UNAUTHENTICATED: Final[str] = "unauthenticated"
+
+#: The two credential-less bind kinds the unauthenticated actor can carry. Keyed
+#: off the synthetic entry's ``reached_via`` token, never string-parsed from a label.
+BIND_KIND_NULL: Final[str] = "null"
+BIND_KIND_GUEST: Final[str] = "guest"
 
 
 @dataclass(frozen=True)
@@ -149,12 +159,17 @@ class StepExecutionActor:
       operator log and for ranking (see the ``ACTOR_SOURCE_*`` constants). A
       scoped-ticket / capability-bearing ccache flows through as-is and is NEVER
       re-minted (credential-storage doctrine, second axis).
+    * ``bind_kind`` is set ONLY for ``source == ACTOR_SOURCE_UNAUTHENTICATED``:
+      the credential-less SMB bind (``BIND_KIND_NULL`` / ``BIND_KIND_GUEST``) that
+      proved the no-credential read. For that actor ``username``/``secret`` are
+      empty — the "credential" is the bind itself, not a principal.
     """
 
     username: str
     secret: str
     islocal: str = "false"
     source: str = ""
+    bind_kind: str | None = None
 
     @property
     def is_ccache(self) -> bool:

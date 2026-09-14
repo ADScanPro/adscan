@@ -80,6 +80,11 @@ TYPE_CA = "ca"
 TYPE_SHARE = "share"
 TYPE_ARTIFACT = "artifact"
 TYPE_CREDENTIAL = "credential"
+# A pre-authentication ACCESS VECTOR (e.g. a null/guest session that reached the
+# affected file with no credential). Not a directory principal — it is how the
+# exposure was reached, surfaced as an affected asset so the client remediates
+# the null-session gate, not a non-existent Anonymous ACE.
+TYPE_ACCESS_VECTOR = "access_vector"
 
 ROLE_SOURCE = "source"
 ROLE_TARGET = "target"
@@ -813,7 +818,7 @@ def build_affected_asset_entities(
                 )
             )
     if Extra.ARTIFACT in rule.extras:
-        for key in ("artifact", "source_xml"):
+        for key in ("artifact", "source_xml", "unc_path"):
             for value in _extract_strings(view.get(key)):
                 entities.append(
                     AffectedAssetEntity(
@@ -835,8 +840,81 @@ def build_affected_asset_entities(
                     )
                 )
                 break
+    if Extra.READ_SET in rule.extras:
+        # The measured objects with effective READ access to the affected file —
+        # WHO the client must remove from the share/NTFS ACL. Sourced ONLY from
+        # the finding's measured ``details.read_set`` (the mxac/read-set SSOT);
+        # never guessed. Each entry is ``{"sid", "label"}``; resolve the principal
+        # through the asset index so a well-known SID still reads honestly.
+        for entry in _read_set_records(view):
+            sid = str(entry.get("sid") or "").strip()
+            label = str(entry.get("label") or "").strip() or sid
+            if not sid and not label:
+                continue
+            entity = _entity_for_principal(
+                label or sid,
+                role=ROLE_AFFECTED,
+                index=index,
+                sid_hint=sid or None,
+                domain_hint=domain_hint,
+            )
+            if entity is not None:
+                entities.append(entity)
+    if Extra.NULL_SESSION_VECTOR in rule.extras:
+        # The null/guest-session access VECTOR — surfaced ONLY when the finding
+        # carries a PROVEN no-credential read (``unauthenticated_reachable`` + a
+        # known ``reached_via``), never from a broad SID alone. It states the
+        # exposure needs NO credential at the vulnerability level, so the client
+        # remediates the null-session gate. An authenticated-only finding (no
+        # ``unauthenticated_reachable``) never reaches here.
+        if _view_is_unauthenticated_reachable(view):
+            from adscan_core.reporting.unauthenticated_reach import (  # noqa: PLC0415
+                unauthenticated_vector_display,
+            )
+
+            reached_via = str(view.get("reached_via") or "").strip()
+            entities.append(
+                AffectedAssetEntity(
+                    type=TYPE_ACCESS_VECTOR,
+                    identifier="unauthenticated-session",
+                    display=unauthenticated_vector_display(reached_via),
+                    role=ROLE_AFFECTED,
+                )
+            )
 
     return _dedupe(entities)
+
+
+def _read_set_records(details: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return the measured read-set records on a finding's details.
+
+    The measured objects with effective READ access to the affected file, from
+    the mxac/read-set SSOT (``ShareCredentialProvenanceService``), carried as
+    ``details.read_set`` — a list of ``{"sid", "label"}``. Never fabricated.
+    """
+    raw = details.get("read_set")
+    if not isinstance(raw, list):
+        return []
+    return [entry for entry in raw if isinstance(entry, Mapping)]
+
+
+def _view_is_unauthenticated_reachable(details: Mapping[str, Any]) -> bool:
+    """Return whether a finding's details carry a PROVEN no-credential read.
+
+    Honesty gate for the null/guest access-vector asset: the finding must carry
+    ``unauthenticated_reachable == True`` AND a known ``reached_via`` token. A
+    broad SID (Everyone/Users) in the read-set alone is NOT proof of an
+    anonymous read (the Everyone != Anonymous guard), so it does not qualify.
+    """
+    from adscan_core.reporting.unauthenticated_reach import (  # noqa: PLC0415
+        REACHED_VIA_GUEST_SESSION,
+        REACHED_VIA_NULL_SESSION,
+    )
+
+    if details.get("unauthenticated_reachable") is not True:
+        return False
+    token = str(details.get("reached_via") or "").strip().lower()
+    return token in {REACHED_VIA_NULL_SESSION, REACHED_VIA_GUEST_SESSION}
 
 
 def _typed_entities_from_flat_strings(

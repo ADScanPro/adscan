@@ -296,6 +296,10 @@ def analyze_audit_findings(
         if wpp is not None:
             findings.append(wpp)
 
+    rev = _analyze_reversible_encryption(result, domain_policy)
+    if rev is not None:
+        findings.append(rev)
+
     findings.extend(_password_compliance_findings(result))
 
     return findings
@@ -396,10 +400,11 @@ def _analyze_weak_password_policy(
     # Capture the concrete observed knobs (structured) alongside the human
     # ``detail`` string. Keys mirror the ``recommended`` block in the
     # ``weak_password_policy`` catalog entry exactly so report/web can compare
-    # observed-vs-recommended per knob. ``reversible_encryption_enabled`` is
-    # intentionally NOT captured here — it requires an additional LDAP probe
-    # (pwdProperties bit 0x10 / per-PSO attribute) the domain-root collection
-    # does not currently read; deferred as a follow-up.
+    # observed-vs-recommended per knob. Reversible encryption
+    # (pwdProperties bit 0x10 / the per-PSO attribute) is NOT a knob of this
+    # consolidated finding — it is a hard cleartext-storage weakness with its
+    # own dedicated finding (``reversible_encryption_enabled``, see
+    # ``_analyze_reversible_encryption``).
     observed: dict[str, Any] = {
         "min_pwd_length": domain_policy.min_pwd_length,
         "complexity_enabled": domain_policy.complexity_enabled,
@@ -419,6 +424,301 @@ def _analyze_weak_password_policy(
     )
 
 
+def _analyze_reversible_encryption(
+    result: CollectionResult,
+    domain_policy: DomainPolicy | None,
+) -> AuditFinding | None:
+    """Flag reversible-encryption password storage (CIS 1.1.7).
+
+    Storing passwords with reversible encryption is equivalent to cleartext:
+    any principal that can read the stored form recovers the plaintext. Two
+    places can enable it, both read with zero extra I/O off data already
+    collected:
+
+    * The Default Domain Password Policy - the ``DOMAIN_PASSWORD_STORE_CLEARTEXT``
+      (0x10) bit of ``pwdProperties`` on the domain root object
+      (``domain_policy.reversible_encryption_enabled``).
+    * Any Fine-Grained Password Policy (PSO) with
+      ``msDS-PasswordReversibleEncryptionEnabled == True``
+      (``result.psos[*].reversible_encryption_enabled``).
+
+    Returns a single consolidated finding when EITHER source enables it. When
+    ``pwdProperties`` was unreadable (``None``) the domain default is treated
+    as "not observed" (we do not claim it is enabled) - a PSO can still trigger
+    the finding on its own. Returns ``None`` when reversible encryption is not
+    observed anywhere.
+    """
+    scopes: list[str] = []
+    domain_default_on = (
+        domain_policy is not None
+        and domain_policy.reversible_encryption_enabled is True
+    )
+    if domain_default_on:
+        scopes.append("the Default Domain Password Policy")
+
+    enabling_psos = [
+        pso.name or pso.distinguished_name
+        for pso in result.psos
+        if pso.reversible_encryption_enabled is True
+    ]
+    for pso_name in enabling_psos:
+        scopes.append(f"PSO '{pso_name}'")
+
+    if not scopes:
+        return None
+
+    detail = (
+        "Reversible password encryption is enabled on "
+        + " and ".join(scopes)
+        + " - passwords are stored in a recoverable (cleartext-equivalent) form."
+    )
+    return AuditFinding(
+        category="reversible_encryption_enabled",
+        samaccountname="(domain)",
+        object_id="",
+        detail=detail,
+        # HIGH: cleartext-equivalent storage of every affected principal's
+        # password. Any read of the stored credential yields the plaintext
+        # directly, removing the offline-cracking step entirely.
+        severity="high",
+        observed={
+            "reversible_encryption_enabled": True,
+            "default_domain_policy": domain_default_on,
+            "psos_enabling": list(enabling_psos),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Host-local registry credential-protection posture (admin-gated \winreg reads)
+# ---------------------------------------------------------------------------
+#
+# The remote-registry collection stage (host_collector._do_registry) reads six
+# HKLM values on every host where the scan principal is a local admin and stamps
+# each onto the Computer node's properties as ``<prop_key>`` (the decoded int, when
+# present) plus ``<prop_key>_state`` (``present`` / ``absent`` / ``error``). Below
+# we turn those raw reads into config-posture findings, mirroring how
+# ``smb_signing_disabled`` is emitted from ``smb_signing_required``.
+#
+# A finding is emitted ONLY when the value was actually observed with certainty to
+# be insecure (present-and-bad, or — for RunAsPPL/NoLmHash — provably absent). An
+# ``error`` state (denied / transport) is NOT_ASSESSED: never a finding, never a
+# false positive. The observed-good value is noted per finding for a follow-up
+# positive-evidence emit (a separate concern, not built here).
+#
+# NTLMMinClientSec / NTLMMinServerSec are bitmasks; the 128-bit-encryption bit is
+# NTLM_128BIT_ENCRYPTION (0x20000000). "NTLMv2 session security + 128-bit" is the
+# hardened bar; anything missing the 128-bit bit is weak.
+_NTLM_128BIT_ENCRYPTION = 0x20000000
+
+
+def _reg_state(node: Any, prop_key: str) -> str | None:
+    """Return the persisted per-key read state (present/absent/error) or None."""
+    val = node.properties.get(f"{prop_key}_state")
+    return str(val) if val is not None else None
+
+
+def _registry_hardening_findings(node: Any) -> list[AuditFinding]:
+    """Six credential-protection config-posture findings from HKLM registry reads.
+
+    Emits per-host findings only for a CERTAIN-observed insecure value. DC /
+    high-value hosts elevate the medium NTLM-policy findings to high (a hardened
+    baseline matters most on the identity control plane). Returns ``[]`` when the
+    registry stage did not run on this host (no ``reg_admin_gate`` property).
+    """
+    # The stage only ran (as an admin) when it stamped the gate flag True. When it
+    # was skipped, or the principal was not a local admin, nothing was assessed.
+    if node.properties.get("reg_admin_gate") is not True:
+        return []
+
+    findings: list[AuditFinding] = []
+    is_hv = bool(node.highvalue)
+
+    def _elevate(base: str) -> str:
+        return "high" if is_hv else base
+
+    # 1) LSASS protection (RunAsPPL) — absent OR 0 is insecure. Observed-good = 1.
+    ppl_state = _reg_state(node, "reg_lsa_runasppl")
+    ppl_val = node.properties.get("reg_lsa_runasppl")
+    if ppl_state == "present" and ppl_val in (0, None):
+        _ppl_insecure = True
+    elif ppl_state == "absent":
+        _ppl_insecure = True
+    else:
+        _ppl_insecure = False
+    if _ppl_insecure:
+        findings.append(
+            AuditFinding(
+                category="lsa_protection_disabled",
+                samaccountname=node.samaccountname,
+                object_id=node.object_id,
+                detail=(
+                    "LSASS is not running as a protected process (RunAsPPL is "
+                    + ("not set" if ppl_state == "absent" else "0")
+                    + "). LSASS memory is readable by any local-admin process, so "
+                    "credential material (hashes, tickets, cleartext) can be "
+                    "harvested from it."
+                ),
+                # HIGH: LSASS PPL is a primary credential-theft mitigation. Its
+                # absence directly enables offline credential dumping.
+                severity="high",
+                highvalue=is_hv,
+            )
+        )
+
+    # 2) WDigest cleartext credentials — UseLogonCredential == 1 is insecure.
+    #    Absent is SECURE (WDigest cleartext caching is off by default on modern
+    #    Windows). Observed-good = 0 or absent.
+    wdigest_state = _reg_state(node, "reg_wdigest_uselogoncredential")
+    wdigest_val = node.properties.get("reg_wdigest_uselogoncredential")
+    if wdigest_state == "present" and wdigest_val == 1:
+        findings.append(
+            AuditFinding(
+                category="wdigest_enabled",
+                samaccountname=node.samaccountname,
+                object_id=node.object_id,
+                detail=(
+                    "WDigest credential caching is enabled (UseLogonCredential = "
+                    "1). Windows stores the cleartext password of every "
+                    "interactive logon in LSASS memory, so a local-admin memory "
+                    "read recovers plaintext credentials directly."
+                ),
+                # HIGH: cleartext credentials in memory — removes the offline
+                # cracking step entirely.
+                severity="high",
+                highvalue=is_hv,
+            )
+        )
+
+    # 3) LM hash storage (NoLmHash) — absent OR 0 is insecure. Observed-good = 1.
+    lm_state = _reg_state(node, "reg_lsa_nolmhash")
+    lm_val = node.properties.get("reg_lsa_nolmhash")
+    if lm_state == "present" and lm_val in (0, None):
+        _lm_insecure = True
+    elif lm_state == "absent":
+        _lm_insecure = True
+    else:
+        _lm_insecure = False
+    if _lm_insecure:
+        findings.append(
+            AuditFinding(
+                category="lm_hash_storage_enabled",
+                samaccountname=node.samaccountname,
+                object_id=node.object_id,
+                detail=(
+                    "The host stores LM password hashes (NoLmHash is "
+                    + ("not set" if lm_state == "absent" else "0")
+                    + "). The LM hash is a weak, fast-to-crack representation of "
+                    "the password; storing it undermines every account with a "
+                    "password of 14 characters or fewer."
+                ),
+                # HIGH: LM hashes are trivially crackable and should never be
+                # stored on a modern estate.
+                severity="high",
+                highvalue=is_hv,
+            )
+        )
+
+    # 4) LAN Manager authentication level — < 5 permits LM/NTLMv1 on the wire.
+    #    Observed-good = 5 (send NTLMv2 only, refuse LM & NTLM).
+    lmcompat_state = _reg_state(node, "reg_lsa_lmcompatibilitylevel")
+    lmcompat_val = node.properties.get("reg_lsa_lmcompatibilitylevel")
+    if lmcompat_state == "present" and isinstance(lmcompat_val, int) and lmcompat_val < 5:
+        findings.append(
+            AuditFinding(
+                category="weak_lm_compatibility_level",
+                samaccountname=node.samaccountname,
+                object_id=node.object_id,
+                detail=(
+                    f"NTLM/LM authentication level is {lmcompat_val} (below the "
+                    "recommended baseline of 5) — a configuration read from the "
+                    "host registry. At this level the host MAY send or accept "
+                    "legacy LM / NTLMv1 responses, which are crackable offline and "
+                    "relayable. This is the configuration root cause; NTLMv1 "
+                    "acceptance was not empirically confirmed for this host in this "
+                    "scan (that requires the coercion-based NTLM capture check)."
+                ),
+                # MEDIUM baseline; HIGH on a DC / Tier-0 host, where weak NTLM
+                # levels widen the relay and offline-crack surface most.
+                severity=_elevate("medium"),
+                highvalue=is_hv,
+            )
+        )
+
+    # 5) NTLM SSP minimum session security — the client/server minimums must both
+    #    require NTLMv2 session security AND 128-bit encryption. The 128-bit bit
+    #    (0x20000000) missing on EITHER side is weak. A value present-but-0, or a
+    #    value missing the bit, is insecure. Observed-good = both include the bit.
+    client_state = _reg_state(node, "reg_msv1_0_ntlmminclientsec")
+    server_state = _reg_state(node, "reg_msv1_0_ntlmminserversec")
+    client_val = node.properties.get("reg_msv1_0_ntlmminclientsec")
+    server_val = node.properties.get("reg_msv1_0_ntlmminserversec")
+
+    def _min_sec_weak(state: str | None, val: Any) -> bool:
+        # Insecure when the value is absent (default does not require 128-bit) or
+        # present without the 128-bit-encryption bit. An ``error`` read is not
+        # assessed here (returns False so it never manufactures a finding).
+        if state == "absent":
+            return True
+        if state == "present" and isinstance(val, int):
+            return (val & _NTLM_128BIT_ENCRYPTION) == 0
+        return False
+
+    client_weak = _min_sec_weak(client_state, client_val)
+    server_weak = _min_sec_weak(server_state, server_val)
+    # Only assert weakness when at least one side was actually assessed (present or
+    # absent) — a pair of pure ``error`` reads stays NOT_ASSESSED.
+    _assessed = {client_state, server_state} & {"present", "absent"}
+    if _assessed and (client_weak or server_weak):
+        weak_sides = []
+        if client_weak:
+            weak_sides.append("client (NTLMMinClientSec)")
+        if server_weak:
+            weak_sides.append("server (NTLMMinServerSec)")
+        findings.append(
+            AuditFinding(
+                category="ntlm_min_session_security_weak",
+                samaccountname=node.samaccountname,
+                object_id=node.object_id,
+                detail=(
+                    "Minimum NTLM SSP session security does not require NTLMv2 "
+                    "session security with 128-bit encryption on the "
+                    + " and ".join(weak_sides)
+                    + " side. NTLM sessions may be negotiated without message "
+                    "integrity / 128-bit encryption, weakening them against "
+                    "downgrade and relay."
+                ),
+                # MEDIUM baseline; HIGH on a DC / Tier-0 host.
+                severity=_elevate("medium"),
+                highvalue=is_hv,
+            )
+        )
+
+    # 6) Custom Security Support Providers allowed into LSASS — 1 is insecure.
+    #    Observed-good = 0 or absent.
+    ssp_state = _reg_state(node, "reg_lsa_allowcustomsspsaps")
+    ssp_val = node.properties.get("reg_lsa_allowcustomsspsaps")
+    if ssp_state == "present" and ssp_val == 1:
+        findings.append(
+            AuditFinding(
+                category="lsass_custom_ssp_allowed",
+                samaccountname=node.samaccountname,
+                object_id=node.object_id,
+                detail=(
+                    "Custom Security Support Providers / Authentication Packages "
+                    "are allowed to load into LSASS (AllowCustomSSPsAPs = 1). An "
+                    "attacker with local admin can register a malicious SSP to "
+                    "capture credentials as they authenticate."
+                ),
+                # MEDIUM baseline; HIGH on a DC / Tier-0 host.
+                severity=_elevate("medium"),
+                highvalue=is_hv,
+            )
+        )
+
+    return findings
+
+
 def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:
     """Hygiene findings that require SMB host-collection data.
 
@@ -427,9 +727,13 @@ def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:
     negotiate phase. Safe to call even if host collection was skipped — nodes
     will simply lack the relevant properties and no findings are emitted.
 
-    Note on SMBv1: the current smb_collector.py negotiate only offers SMB2+
-    dialects (SMB202…SMB311). SMBv1 detection would require adding the legacy
-    NT LM 0.12 dialect code to the offered list — tracked as a future change.
+    Note on SMBv1: SMBv1 is actively probed by ``smb_collector.smb1_probe`` — a
+    raw ``NT LM 0.12`` negotiate sent alongside the SMB2+ ``protocol_test`` (the
+    same probe NXC uses). The node property ``smb_v1`` is a tri-state:
+    ``True`` (host accepted the SMBv1 negotiate) fires this finding, ``False``
+    (host answered but refused SMBv1) is an observed-good positive, and the
+    property is ABSENT when the probe was inconclusive (error/timeout) — never
+    assumed either way.
     """
     if result.collection_scope != "audit":
         return []
@@ -439,6 +743,11 @@ def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:
     for node in result.nodes.values():
         if node.kind != "Computer":
             continue
+
+        # Registry credential-protection posture (admin-gated \winreg reads). Runs
+        # per host regardless of the SMB-signing property below, since a host may
+        # answer the registry stage without exposing a signing verdict.
+        findings.extend(_registry_hardening_findings(node))
 
         # smb_signing_required is only present when host collection ran.
         signing_required = node.properties.get("smb_signing_required")

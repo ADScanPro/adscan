@@ -113,6 +113,7 @@ from adscan_internal.services.exploitation.lsass_orchestrator import (
     LsassMethod,
     LsassMethodSelector,
     LsassDumpOrchestrator,
+    derive_lsass_posture_notes,
     _ALL_METHODS,
 )
 from adscan_internal.workspaces.edr_intelligence import EdrIntelligence
@@ -6377,6 +6378,27 @@ async def run_intelligent_lsass_dump(
 
     if result.catch_detected and result.catch_product:
         _render_catch_alert(result.method_used, result.catch_product)
+
+    # Stamp the defensive-posture context onto the DumpLSASS attack-step edge, at
+    # the ONE join point where the dump outcome and the observed endpoint posture
+    # coexist (the OrchestratorResult). ``_update_active_attack_graph_step_status``
+    # merges the notes into the step details ONLY when a DumpLSASS attack-step is
+    # active — so this is a no-op for a standalone ``adscan dumps`` run (which
+    # writes no attack-graph edge) and the narrative stays attack-path-scoped by
+    # construction. Best-effort: never let posture stamping break the dump flow.
+    try:
+        posture_notes = derive_lsass_posture_notes(result)
+        updater = getattr(shell, "_update_active_attack_graph_step_status", None)
+        if callable(updater):
+            updater(
+                domain=domain,
+                status="success" if result.success else "attempted",
+                notes=posture_notes,
+            )
+    except Exception as exc:  # noqa: BLE001 — posture stamping must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[lsass] posture-context stamp skipped: {exc}")
 
     # ── Phase 3: Results ──────────────────────────────────────────────────────
     if result.success and result.dump_result:

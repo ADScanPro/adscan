@@ -1040,9 +1040,20 @@ def run_null_shares(shell: Any, *, domain: str) -> None:
                 f"Null session readable shares: "
                 f"{', '.join(mark_sensitive(v.name, 'text') for v in readable)}"
             )
-    _offer_share_credential_hunt(
-        shell, domain=domain, username="", credential="", view_set=view_set
+    from adscan_core.reporting.unauthenticated_reach import REACHED_VIA_NULL_SESSION
+    from adscan_internal.services.share_credential_provenance_service import (
+        credential_less_share_read_scope,
     )
+
+    # Every credential the post-enum hunt below finds/stores was read over
+    # THIS null session — mark the ambient scope so the share-secret
+    # provenance producers (CredSweeper/rclone hunt, AI triage) source their
+    # edge from the token-filtered read-set and stamp reached_via, instead of
+    # silently defaulting to the ordinary authenticated attribution.
+    with credential_less_share_read_scope(REACHED_VIA_NULL_SESSION):
+        _offer_share_credential_hunt(
+            shell, domain=domain, username="", credential="", view_set=view_set
+        )
 
 
 def _resolve_guest_smb_targets(shell: Any, *, domain: str) -> tuple[list[str], str]:
@@ -1360,9 +1371,26 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
                     f"No readable shares found on {mark_sensitive(host_ip, 'hostname')} "
                     "with guest credentials."
                 )
-        _offer_share_credential_hunt(
-            shell, domain=domain, username=guest_transport_username, credential="", view_set=view_set
+        from adscan_core.reporting.unauthenticated_reach import (
+            REACHED_VIA_GUEST_SESSION,
         )
+        from adscan_internal.services.share_credential_provenance_service import (
+            credential_less_share_read_scope,
+        )
+
+        # Every credential the post-enum hunt below finds/stores was read over
+        # THIS guest session — mark the ambient scope so the share-secret
+        # provenance producers source their edge from the token-filtered
+        # read-set and stamp reached_via, instead of silently attributing it
+        # to the guest transport identity itself (e.g. the default "ADscan").
+        with credential_less_share_read_scope(REACHED_VIA_GUEST_SESSION):
+            _offer_share_credential_hunt(
+                shell,
+                domain=domain,
+                username=guest_transport_username,
+                credential="",
+                view_set=view_set,
+            )
 
 
 def run_auth_shares(
@@ -8241,7 +8269,7 @@ def _try_reuse_cached_rclone_credential_phase(
             source_hosts=hosts,
             source_shares=shares,
             auth_username=username,
-            source_artifact="rclone deterministic share scan (cached)",
+            source_artifact="automated share content scan (cached)",
         )
     loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
     ntlm_hash_findings = structured_stats.get("ntlm_hash_findings")
@@ -8417,7 +8445,7 @@ def _finalize_rclone_credential_phase(
             source_hosts=hosts,
             source_shares=shares,
             auth_username=username,
-            source_artifact="rclone deterministic share scan",
+            source_artifact="automated share content scan",
             analysis_origin=(
                 "mixed"
                 if analysis_engine == _SMB_LOOT_ANALYSIS_ENGINE_BOTH
@@ -10652,6 +10680,26 @@ def _handle_prioritized_findings_actions(
             )
             source_steps = []
             if provenance_service is not None:
+                from adscan_internal.services.share_credential_provenance_service import (
+                    resolve_ambient_share_read_provenance,
+                )
+
+                # AI-triage shares the same producer surface as the deterministic
+                # CredSweeper hunt (both reachable from run_null_shares /
+                # run_guest_shares) — fold the ambient credential-less scope in the
+                # same way, or a guest/null-bind AI finding is silently attributed
+                # to "share_spidering" (authenticated).
+                (
+                    effective_origin,
+                    reached_via,
+                    ambient_perspective,
+                ) = resolve_ambient_share_read_provenance(
+                    "share_spidering",
+                    reader_username=auth_username,
+                    shell=shell,
+                    domain=domain,
+                )
+
                 source_steps = provenance_service.build_credential_source_steps(
                     relation="PasswordInShare",
                     edge_type="share_password",
@@ -10660,7 +10708,7 @@ def _handle_prioritized_findings_actions(
                     hosts=[host] if host else None,
                     shares=[share] if share else None,
                     artifact=path or None,
-                    origin="share_spidering",
+                    origin=effective_origin,
                     # Consistent with the unauth path: the edge source is the measured
                     # read-capable set for the share when one exists. Thread the
                     # workspace + share so the resolver fires; pass auth_username so the
@@ -10670,6 +10718,8 @@ def _handle_prioritized_findings_actions(
                     domain=domain,
                     share=share or None,
                     auth_username=auth_username,
+                    perspective=ambient_perspective,
+                    reached_via=reached_via,
                 )
             try:
                 shell.add_credential(
@@ -10705,12 +10755,27 @@ def _handle_prioritized_findings_actions(
         ):
             source_context = None
             if provenance_service is not None:
+                from adscan_internal.services.share_credential_provenance_service import (
+                    resolve_ambient_share_read_provenance,
+                )
+
+                # Same ambient-scope fold as the credential-candidates branch
+                # above: a guest/null-bind read must not be silently
+                # attributed to "share_spidering" (authenticated) once
+                # spraying attributes it to specific accounts.
+                _, spray_reached_via, _ = resolve_ambient_share_read_provenance(
+                    "share_spidering",
+                    reader_username=auth_username,
+                    shell=shell,
+                    domain=domain,
+                )
                 source_context = provenance_service.build_source_context(
                     hosts=[host] if host else None,
                     shares=[share] if share else None,
                     artifact=path or None,
                     auth_username=auth_username,
                     origin="share_spidering",
+                    reached_via=spray_reached_via,
                 )
             try:
                 shell.spraying_with_password(

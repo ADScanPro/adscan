@@ -78,21 +78,21 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.8,
                 reason=(
-                    "Kerberoastable Tier-0/high-value accounts detected — "
-                    "successful cracking would expose privileged credentials"
+                    "Kerberoastable Tier-0/high-value accounts detected. "
+                    "Successful cracking would expose privileged credentials"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.0,
-                reason="Hash cracking confirmed — plaintext credential recovered",
+                reason="Hash cracking confirmed: plaintext credential recovered",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.5,
                 reason=(
-                    "Kerberoastable DC-related service accounts detected — "
-                    "credential compromise materially improves DC attack paths"
+                    "Kerberoastable DC-related service accounts detected. "
+                    "Credential compromise materially improves DC attack paths"
                 ),
             ),
         ],
@@ -108,22 +108,22 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.1,
                 reason=(
-                    "AS-REP roastable Tier-0/high-value accounts detected — "
-                    "unauthenticated credential material retrieval affects "
+                    "AS-REP roastable Tier-0/high-value accounts detected. "
+                    "Unauthenticated credential material retrieval affects "
                     "privileged identities"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.8,
-                reason="Hash cracking confirmed — plaintext credential recovered",
+                reason="Hash cracking confirmed: plaintext credential recovered",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.0,
                 reason=(
-                    "DC-related accounts are AS-REP roastable — "
-                    "unauthenticated credential material retrieval impacts "
+                    "DC-related accounts are AS-REP roastable. "
+                    "Unauthenticated credential material retrieval impacts "
                     "critical identities"
                 ),
             ),
@@ -143,14 +143,14 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "Unconstrained delegation reachable by Tier-0 principals — "
-                    "TGT capture path can yield immediate privileged compromise"
+                    "Unconstrained delegation reachable by Tier-0 principals. "
+                    "The TGT capture path can yield immediate privileged compromise"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.8,
-                reason="TGT capture confirmed — pass-the-ticket path is viable",
+                reason="TGT capture confirmed: pass-the-ticket is viable",
             ),
         ],
     ),
@@ -165,16 +165,16 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.5,
                 reason=(
-                    "Constrained delegation reaches Tier-0 services — "
-                    "effective privileged impersonation path exists"
+                    "Constrained delegation reaches Tier-0 services. "
+                    "An effective privileged impersonation path exists"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.0,
                 reason=(
-                    "Constrained delegation reaches DC services — "
-                    "effective DC lateral movement path exists"
+                    "Constrained delegation reaches DC services. "
+                    "An effective DC lateral movement path exists"
                 ),
             ),
         ],
@@ -193,7 +193,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "DCs are relayable SMB targets — relay to DC meaningfully "
+                    "DCs are relayable SMB targets. Relaying to a DC meaningfully "
                     "raises privilege-escalation potential"
                 ),
             ),
@@ -201,14 +201,14 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.0,
                 reason=(
-                    "Tier-0 assets are relayable SMB targets — "
-                    "captured authentication can yield privileged access"
+                    "Tier-0 assets are relayable SMB targets. "
+                    "Captured authentication can yield privileged access"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="SMB relay confirmed — authenticated session obtained",
+                reason="SMB relay confirmed: authenticated session obtained",
             ),
         ],
     ),
@@ -220,8 +220,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.5,
                 reason=(
-                    "Null session accepted on DCs — "
-                    "unauthenticated domain enumeration expands attack surface"
+                    "Null session accepted on DCs. "
+                    "Unauthenticated domain enumeration expands the attack surface"
                 ),
             ),
         ],
@@ -259,7 +259,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=6.5,
                 reason=(
-                    "SMBv1 enabled on DCs — legacy protocol surface; not equivalent "
+                    "SMBv1 enabled on DCs. Legacy protocol surface; not equivalent "
                     "to a confirmed CVE such as EternalBlue (MS17-010)"
                 ),
             ),
@@ -267,7 +267,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=6.5,
                 reason=(
-                    "SMBv1 enabled on Tier-0 assets — legacy protocol surface; "
+                    "SMBv1 enabled on Tier-0 assets. Legacy protocol surface; "
                     "confirm a concrete CVE before treating as critical"
                 ),
             ),
@@ -283,13 +283,13 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=9.5,
                 reason=(
                     "Credentials found in shares belong to or enable Tier-0 "
-                    "access — direct privileged path exists"
+                    "access. A direct privileged path exists"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="Exposed credentials verified — valid account access confirmed",
+                reason="Exposed credentials verified: valid account access confirmed",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
@@ -310,8 +310,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.5,
                 reason=(
-                    "Anonymous LDAP bind accepted on DCs — "
-                    "directory enumeration is available without authentication"
+                    "Anonymous LDAP bind accepted on DCs. "
+                    "Directory enumeration is available without authentication"
                 ),
             ),
         ],
@@ -327,8 +327,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "LDAP protections not enforced on DCs — "
-                    "relay to LDAP can enable privileged directory operations"
+                    "LDAP protections not enforced on DCs. "
+                    "Relaying to LDAP can enable privileged directory operations"
                 ),
             ),
             CvssElevationRule(
@@ -345,7 +345,11 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
     "gpp_passwords": VulnCvssDefinition(
         # Direct issue is credential disclosure to any authenticated domain user.
         # Do not mark integrity impact in the Base vector just because the
-        # recovered credential might later be used to modify things.
+        # recovered credential might later be used to modify things. The contextual
+        # overlay reaches Critical ONLY on a proven chain into a Tier-0 terminal —
+        # a recovery/decryption alone stays High, so the render matches the
+        # edge-severity verdict (CRITICAL only when the forward chain reaches
+        # Tier-0, else HIGH) and never overclaims domain compromise.
         finding_type=FindingType.VULNERABILITY,
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         elevation_rules=[
@@ -353,13 +357,13 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "GPP credentials grant Tier-0 access — "
-                    "trivial decryption yields privileged credential material"
+                    "GPP credentials grant Tier-0 access. "
+                    "Trivial decryption yields privileged credential material"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
-                elevated_score=9.0,
+                elevated_score=8.5,
                 reason="GPP credentials decrypted and verified",
             ),
         ],
@@ -372,8 +376,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "Autologin credentials enable Tier-0 access — "
-                    "credential disclosure directly affects privileged identities"
+                    "Autologin credentials enable Tier-0 access. "
+                    "Credential disclosure directly affects privileged identities"
                 ),
             ),
             CvssElevationRule(
@@ -401,8 +405,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.0,
                 reason=(
-                    "LAPS not deployed on Domain Controllers — static local "
-                    "admin credentials on DCs widen blast radius of any "
+                    "LAPS not deployed on Domain Controllers. Static local "
+                    "admin credentials on DCs widen the blast radius of any "
                     "credential leak; no exposure confirmed yet"
                 ),
             ),
@@ -410,7 +414,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=7.0,
                 reason=(
-                    "LAPS not deployed on Tier-0 assets — privileged hosts "
+                    "LAPS not deployed on Tier-0 assets. Privileged hosts "
                     "rely on a static local admin secret"
                 ),
             ),
@@ -424,15 +428,15 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "LAPS attributes readable for DCs — "
-                    "non-admin principals can retrieve DC local admin secrets"
+                    "LAPS attributes readable for DCs. "
+                    "Non-admin principals can retrieve DC local admin secrets"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.8,
                 reason=(
-                    "LAPS attributes readable for Tier-0 assets — "
+                    "LAPS attributes readable for Tier-0 assets: "
                     "privileged local admin credential exposure"
                 ),
             ),
@@ -451,8 +455,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.5,
                 reason=(
-                    "Tier-0 accounts do not require a password — "
-                    "privileged account takeover risk is extreme"
+                    "Tier-0 accounts do not require a password. "
+                    "Privileged account takeover risk is extreme"
                 ),
             ),
             CvssElevationRule(
@@ -471,8 +475,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=6.5,
                 reason=(
-                    "Tier-0 accounts have non-expiring passwords — "
-                    "stale privileged credentials persist indefinitely"
+                    "Tier-0 accounts have non-expiring passwords. "
+                    "Stale privileged credentials persist indefinitely"
                 ),
             ),
         ],
@@ -502,7 +506,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=6.0,
                 reason=(
                     "Privileged accounts carry credentials that predate the last "
-                    "policy hardening — stale high-value credentials persist under "
+                    "policy hardening. Stale high-value credentials persist under "
                     "weaker historical requirements"
                 ),
             ),
@@ -518,7 +522,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.8,
                 reason=(
-                    "MAQ abuse confirmed — attacker added a machine account and "
+                    "MAQ abuse confirmed: an attacker added a machine account and "
                     "used it for RBCD or ADCS-ESC8 privilege escalation"
                 ),
             ),
@@ -535,14 +539,14 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.0,
                 reason=(
-                    "Domain Controller with SMBv1 enabled — EternalBlue on a DC "
+                    "Domain Controller with SMBv1 enabled. EternalBlue on a DC "
                     "yields direct OS-level access to the Kerberos trust root"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.8,
-                reason="SMBv1 exploit confirmed — remote code execution achieved",
+                reason="SMBv1 exploit confirmed: remote code execution achieved",
             ),
         ],
     ),
@@ -557,7 +561,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.0,
                 reason=(
-                    "Domain Controller with SMB signing not required — ideal relay "
+                    "Domain Controller with SMB signing not required. An ideal relay "
                     "target; successful relay against a DC yields LDAP/SMB access "
                     "as the DC machine account"
                 ),
@@ -566,7 +570,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
                 reason=(
-                    "NTLM relay via unsigned SMB confirmed — credential relayed "
+                    "NTLM relay via unsigned SMB confirmed: credential relayed "
                     "and used to authenticate to a target service"
                 ),
             ),
@@ -583,7 +587,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=6.0,
                 reason=(
-                    "Privileged account with PASSWD_NOTREQD — a blank or absent "
+                    "Privileged account with PASSWD_NOTREQD set. A blank or absent "
                     "credential on a Tier-0 identity is a direct domain threat"
                 ),
             ),
@@ -591,8 +595,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
                 reason=(
-                    "Blank password confirmed via spray — account has no credential, "
-                    "authentication succeeds with empty string"
+                    "Blank password confirmed via spray: the account has no credential "
+                    "and authentication succeeds with an empty string"
                 ),
             ),
         ],
@@ -609,8 +613,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.8,
                 reason=(
-                    "krbtgt hash recovered or Golden Ticket usage confirmed — "
-                    "indefinite domain persistence available until rotation"
+                    "krbtgt hash recovered or Golden Ticket usage confirmed. "
+                    "Indefinite domain persistence is available until rotation"
                 ),
             ),
         ],
@@ -641,7 +645,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.5,
-                reason="DA session actively harvested — privileged credential confirmed",
+                reason="DA session actively harvested: privileged credential confirmed",
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
@@ -663,7 +667,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.8,
                 reason=(
-                    "KRBTGT secret material was recovered or validated — "
+                    "KRBTGT secret material was recovered or validated. "
                     "Golden Ticket persistence is available"
                 ),
             ),
@@ -733,7 +737,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 reason=(
                     "PetitPotam coercion + a vulnerable relay target was "
                     "identified in this workspace (e.g. ADCS Web Enrollment "
-                    "without EPA, or LDAP without signing/CB) — full chain "
+                    "without EPA, or LDAP without signing/CB). The full chain "
                     "is materially viable"
                 ),
             ),
@@ -741,8 +745,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=6.5,
                 reason=(
-                    "PetitPotam coercion primitive against a Domain Controller — "
-                    "no vulnerable relay target was confirmed in this workspace; "
+                    "PetitPotam coercion primitive against a Domain Controller. "
+                    "No vulnerable relay target was confirmed in this workspace; "
                     "chain to ADCS ESC8 or LDAP-no-signing required for impact"
                 ),
             ),
@@ -765,7 +769,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=8.5,
                 reason=(
                     "DFSCoerce + a vulnerable relay target was identified "
-                    "in this workspace — chain to ADCS or LDAP-no-signing "
+                    "in this workspace. A chain to ADCS or LDAP-no-signing "
                     "is materially viable"
                 ),
             ),
@@ -773,7 +777,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=6.5,
                 reason=(
-                    "DFSCoerce primitive against a Domain Controller — no "
+                    "DFSCoerce primitive against a Domain Controller. No "
                     "vulnerable relay target was confirmed in this workspace; "
                     "chain to ADCS ESC8 or LDAP-no-signing required for impact"
                 ),
@@ -797,7 +801,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=8.5,
                 reason=(
                     "MS-EFSRPC coercion + a vulnerable relay target was "
-                    "identified in this workspace — chain to ADCS or "
+                    "identified in this workspace. A chain to ADCS or "
                     "LDAP-no-signing is materially viable"
                 ),
             ),
@@ -805,8 +809,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=6.5,
                 reason=(
-                    "MS-EFSRPC coercion primitive against a Domain Controller — "
-                    "no vulnerable relay target was confirmed in this workspace; "
+                    "MS-EFSRPC coercion primitive against a Domain Controller. "
+                    "No vulnerable relay target was confirmed in this workspace; "
                     "chain to ADCS ESC8 or LDAP-no-signing required for impact"
                 ),
             ),
@@ -828,7 +832,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=8.5,
                 reason=(
                     "PrinterBug + a vulnerable relay target was identified "
-                    "in this workspace — chain to ADCS or LDAP-no-signing "
+                    "in this workspace. A chain to ADCS or LDAP-no-signing "
                     "is materially viable"
                 ),
             ),
@@ -836,8 +840,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=6.5,
                 reason=(
-                    "PrinterBug coercion primitive against a Domain Controller — "
-                    "no vulnerable relay target was confirmed in this workspace; "
+                    "PrinterBug coercion primitive against a Domain Controller. "
+                    "No vulnerable relay target was confirmed in this workspace; "
                     "chain to ADCS ESC8 or LDAP-no-signing required for impact"
                 ),
             ),
@@ -1159,7 +1163,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.8,
-                reason="gMSA password readable on a Domain Controller — direct privileged access",
+                reason="gMSA password readable on a Domain Controller: direct privileged access",
             ),
         ],
     ),
@@ -1180,7 +1184,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
-                reason="DCSync rights assigned to a non-Tier-0 principal — full domain replication possible",
+                reason="DCSync rights assigned to a non-Tier-0 principal: full domain replication possible",
             ),
         ],
     ),
@@ -1196,12 +1200,12 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.0,
-                reason="RBCD writeable on a Tier-0 computer — direct path to privileged impersonation",
+                reason="RBCD writeable on a Tier-0 computer: direct path to privileged impersonation",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
-                reason="RBCD writeable on a Domain Controller object — full DC takeover possible",
+                reason="RBCD writeable on a Domain Controller object: full DC takeover possible",
             ),
         ],
     ),
@@ -1217,7 +1221,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
-                reason="Shadow Credentials writeable on a Tier-0 principal — PKINIT impersonation path",
+                reason="Shadow Credentials writeable on a Tier-0 principal: PKINIT impersonation path",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
@@ -1254,7 +1258,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.8,
-                reason="All-extended-rights granted over a Tier-0 object — full control of the principal",
+                reason="All-extended-rights granted over a Tier-0 object: full control of the principal",
             ),
         ],
     ),
@@ -1270,7 +1274,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.5,
-                reason="NTLMv1 accepted by Domain Controllers — challenge/response is trivially crackable",
+                reason="NTLMv1 accepted by Domain Controllers: challenge/response is trivially crackable",
             ),
         ],
     ),

@@ -157,10 +157,61 @@ def compute_remediation_priorities(
             -x["paths_affected"],
         )
     )
+
+    _break_ties_by_remediation_effort(results)
+
     for i, item in enumerate(results, 1):
         item["rank"] = i
 
     return results
+
+
+def _break_ties_by_remediation_effort(results: list[dict[str, Any]]) -> None:
+    """Re-order a self-cancelling tie run by remediation effort, cheapest first.
+
+    A single LINEAR attack chain (every fix on it severs the exact same set of
+    paths) is a genuine tie the ``impact_score`` ranking cannot break with any
+    signal a client can act on: severity/blast/status are identical across the
+    chain by construction, so the leading rows end up in an order that reads
+    as arbitrary — and the per-row copy repeats "Eliminates N of N validated
+    attack paths" on every one of them with zero differentiation.
+
+    This scans the ALREADY-sorted list for maximal RUNS of adjacent rows that
+    share the exact same ``(exploited_paths, paths_affected)`` pair — the
+    literal "breaks the identical count" condition — and, ONLY within such a
+    run, re-orders by ascending remediation complexity (:data:`_COMPLEXITY_RANK`,
+    lowest effort first) with ``impact_score`` as the final tie-break for
+    determinism. A run of length 1 (the overwhelming majority of reports,
+    where different fixes break different numbers of paths) is untouched, so
+    this never changes ordering outside the exact self-cancelling case.
+    Mutates ``results`` in place; ``rank`` is stamped by the caller afterward.
+
+    Each row that participates in a run of length > 1 is stamped
+    ``chain_tie_size`` (the run's length) so the render model can surface the
+    "these fixes are on the same chain" note (:func:`adscan_core.reporting.
+    chokepoint_copy.remediation_chain_note`) without recomputing this scan.
+    """
+    i = 0
+    n = len(results)
+    while i < n:
+        j = i + 1
+        while j < n and (
+            results[j]["exploited_paths"] == results[i]["exploited_paths"]
+            and results[j]["paths_affected"] == results[i]["paths_affected"]
+        ):
+            j += 1
+        run_length = j - i
+        if run_length > 1:
+            results[i:j] = sorted(
+                results[i:j],
+                key=lambda x: (
+                    -_COMPLEXITY_RANK.get(x["complexity"], 2),
+                    -x["impact_score"],
+                ),
+            )
+            for item in results[i:j]:
+                item["chain_tie_size"] = run_length
+        i = j
 
 
 def _resolve_row_choke_identifier(top_choke_point: Any) -> str | None:
@@ -240,14 +291,19 @@ def build_remediation_start_here(
             the headline.
 
     Returns:
-        A JSON/Jinja-safe render model ``{headline, total_executed_paths,
-        total_mapped_paths, rows, kpi_card}`` where each row is ``{label,
-        item_line, badge, badge_label, paths_affected, exploited_paths,
-        executed}``; or ``None`` when there are no priorities to lead with.
+        A JSON/Jinja-safe render model ``{headline, chain_note,
+        total_executed_paths, total_mapped_paths, rows, kpi_card}`` where each
+        row is ``{label, item_line, badge, badge_label, paths_affected,
+        exploited_paths, executed, chain_tie_size}``. ``chain_note`` is a
+        client-safe sentence explaining a self-cancelling tie (see
+        :func:`_break_ties_by_remediation_effort`), or ``""`` when the
+        leading rows are not tied. Returns ``None`` when there are no
+        priorities to lead with.
     """
     from adscan_core.reporting.chokepoint_copy import (  # noqa: PLC0415
         STRUCTURAL_CHOKE_BADGE,
         is_structural_choke,
+        remediation_chain_note,
         remediation_item_line,
         remediation_kpi_lines,
         remediation_start_here_headline,
@@ -284,6 +340,10 @@ def build_remediation_start_here(
         )
         choke_id = _resolve_row_choke_identifier(entry.get("top_choke_point"))
         badge = bool(is_structural_choke(choke_id, card_map))
+        try:
+            chain_tie_size = int(entry.get("chain_tie_size") or 0)
+        except (TypeError, ValueError):
+            chain_tie_size = 0
         rows.append(
             {
                 "label": str(entry.get("action_label") or entry.get("action") or ""),
@@ -293,6 +353,7 @@ def build_remediation_start_here(
                 "paths_affected": paths_affected,
                 "exploited_paths": exploited_paths,
                 "executed": row_executed,
+                "chain_tie_size": chain_tie_size,
             }
         )
 
@@ -327,8 +388,19 @@ def build_remediation_start_here(
         mapped=not top_executed,
         bounded=bounded,
     )
+    # A single linear attack chain leaves the leading rows tied on the exact
+    # same paths-broken count — the ranking already reorders that tie by
+    # remediation effort (cheapest first, see ``_break_ties_by_remediation_
+    # effort``), and this note tells the client WHY, instead of letting the
+    # per-row copy repeat an identical count with no explanation.
+    chain_note = (
+        remediation_chain_note(rows[0]["chain_tie_size"])
+        if rows[0]["chain_tie_size"] > 1
+        else ""
+    )
     return {
         "headline": headline,
+        "chain_note": chain_note,
         "total_executed_paths": total_executed_paths,
         "total_mapped_paths": total_mapped_paths,
         "rows": rows,

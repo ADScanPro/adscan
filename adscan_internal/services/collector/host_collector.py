@@ -552,6 +552,10 @@ class HostCollectorConfig:
     # ~2k-host scale. Env override mirrors the ``concurrency`` knob.
     collect_samr: bool = True  # gates _do_samr per host (sessions + builtin groups)
     collect_shares: bool = True  # gates _do_shares per host
+    # Gates _do_registry per host (admin-gated HKLM credential-protection reads over
+    # \winreg). Only reads on hosts where the scan principal is a local admin; a
+    # non-admin host short-circuits at the ADMIN$ gate at ~zero cost.
+    collect_registry: bool = True
     # Optional observability hook for the DETERMINATE host-phase progress (hosts
     # done / total + rolling ETA). Invoked throttled during the fan-out and once
     # at completion with a :class:`HostPhaseProgress`. None (default) is a no-op,
@@ -631,6 +635,7 @@ class HostPhaseTiming:
     negotiate: float = 0.0
     samr: float = 0.0
     shares: float = 0.0
+    registry: float = 0.0
     # Count of Computer nodes excluded from SMB collection specifically because
     # they are disabled accounts (cannot authenticate). Surfaced for telemetry;
     # other exclusion reasons (gMSA, non-SMB) are not counted here.
@@ -699,7 +704,7 @@ class HostPhaseTiming:
 
     @property
     def total(self) -> float:
-        return self.negotiate + self.samr + self.shares
+        return self.negotiate + self.samr + self.shares + self.registry
 
     @property
     def shares_reached_hosts(self) -> int:
@@ -905,7 +910,7 @@ def _format_stage_breakdown_lines(timing: HostPhaseTiming) -> list[str]:
     # event-loop scheduling. If overhead dominates → the bottleneck is the
     # connection layer (setup/teardown — where the abort/leak lived), NOT the RPC
     # enumeration; if `shares` (or `samr`) dominates → that stage is the cost.
-    stage_sum = timing.negotiate + timing.samr + timing.shares
+    stage_sum = timing.negotiate + timing.samr + timing.shares + timing.registry
     durations = timing.per_host_durations
     if durations:
         wall_sum = sum(durations)
@@ -913,14 +918,16 @@ def _format_stage_breakdown_lines(timing: HostPhaseTiming) -> list[str]:
         lines.append(
             "collector-timing stage time (host-work sums): "
             f"negotiate={timing.negotiate:.0f}s samr={timing.samr:.0f}s "
-            f"shares={timing.shares:.0f}s · connection-overhead≈{overhead:.0f}s "
+            f"shares={timing.shares:.0f}s registry={timing.registry:.0f}s "
+            f"· connection-overhead≈{overhead:.0f}s "
             f"· total host-work={wall_sum:.0f}s"
         )
     else:
         lines.append(
             "collector-timing stage time (host-work sums): "
             f"negotiate={timing.negotiate:.0f}s samr={timing.samr:.0f}s "
-            f"shares={timing.shares:.0f}s · stage-sum={stage_sum:.0f}s"
+            f"shares={timing.shares:.0f}s registry={timing.registry:.0f}s "
+            f"· stage-sum={stage_sum:.0f}s"
         )
     # Per-stage outcomes (live-connection hosts only). `denied` = permission
     # (normal, nothing to fix); `abort` = connection dropped (the recoverable
@@ -1063,6 +1070,328 @@ async def _do_samr(
         await _collect_builtin_stage()
     finally:
         timing.samr += time.monotonic() - t
+
+
+# ---------------------------------------------------------------------------
+# Registry hardening stage (admin-gated remote-registry read over \winreg)
+# ---------------------------------------------------------------------------
+#
+# HKLM registry values that record host-local credential-protection posture. Each
+# is read over the SAME authenticated SMB connection via the native aiosmb
+# ``\winreg`` DCE-RPC pipe (``RRPRPC.from_smbconnection``), AFTER the SAMR/SRVSVC
+# stages and SEQUENTIALLY (never gathered — one op in flight per connection).
+#
+# The read is ADMIN-GATED: the RemoteRegistry pipe and these HKLM keys require
+# local administrator on the target, so the stage first proves the SSOT admin
+# signal (an ADMIN$ tree-connect, the same probe the privilege sweep uses) and
+# short-circuits at ~zero cost on a non-admin host.
+#
+# Each raw read produces one of three states, persisted per-key onto the Computer
+# node's properties so the audit analyzer can derive both the weakness AND (for a
+# follow-up positive-evidence emit) the observed-good state:
+#   * ``present`` — value read; the decoded int is stored under ``<prop_key>``.
+#   * ``absent``  — the value does not exist (ERROR_FILE_NOT_FOUND); some findings
+#                   treat absence as insecure (RunAsPPL / NoLmHash), others as
+#                   secure (WDigest UseLogonCredential).
+#   * ``error``   — open/query failed for any other reason (NOT admin's fault of
+#                   the value): the key is NOT_ASSESSED (never green, never a
+#                   false weakness).
+# The ``<prop_key>_state`` companion carries which of the three it was.
+_REG_HKLM_LSA = r"SYSTEM\CurrentControlSet\Control\Lsa"
+_REG_HKLM_WDIGEST = r"SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest"
+_REG_HKLM_MSV1_0 = r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0"
+
+#: Registry-read spec: (property_key, subkey_path, value_name). The property_key
+#: is the ``smb_props`` namespace the Computer node carries into the audit stage.
+_REGISTRY_READS: tuple[tuple[str, str, str], ...] = (
+    ("reg_lsa_runasppl", _REG_HKLM_LSA, "RunAsPPL"),
+    ("reg_wdigest_uselogoncredential", _REG_HKLM_WDIGEST, "UseLogonCredential"),
+    ("reg_lsa_nolmhash", _REG_HKLM_LSA, "NoLmHash"),
+    ("reg_lsa_lmcompatibilitylevel", _REG_HKLM_LSA, "LmCompatibilityLevel"),
+    ("reg_msv1_0_ntlmminclientsec", _REG_HKLM_MSV1_0, "NTLMMinClientSec"),
+    ("reg_msv1_0_ntlmminserversec", _REG_HKLM_MSV1_0, "NTLMMinServerSec"),
+    ("reg_lsa_allowcustomsspsaps", _REG_HKLM_LSA, "AllowCustomSSPsAPs"),
+)
+
+#: The per-key read state written alongside each value (see the docstring above).
+REG_STATE_PRESENT = "present"
+REG_STATE_ABSENT = "absent"
+REG_STATE_ERROR = "error"
+
+
+def _reg_value_absent(err: Any) -> bool:
+    """True when a registry-value read failed because the value does not exist.
+
+    The vendor ``RRPRPC`` surfaces a not-found as an ``OSError`` whose ``errno`` is
+    ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3). Anything else is a real
+    read error (denied / transport), which must NOT be conflated with absence — an
+    absent value can be a *secure* verdict (WDigest) or an *insecure* one
+    (RunAsPPL), whereas an error is simply NOT_ASSESSED.
+    """
+    errno = getattr(err, "errno", None)
+    if errno in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+        return True
+    text = str(err).upper()
+    return "NOT_FOUND" in text or "FILE_NOT_FOUND" in text or "ERROR_FILE_NOT" in text
+
+
+async def _do_registry(
+    machine: Any,
+    target_ip: str,
+    host_label: str,
+    per_host_timeout: int,
+    out: HostCollectionResult,
+    timing: HostPhaseTiming,
+    enum_timeout: int | None = None,
+    smb_config: Any = None,
+) -> None:
+    """Admin-gated read of the host-local credential-protection registry values.
+
+    Runs AFTER the SAMR/SRVSVC stages, over the SAME authenticated ``machine``
+    connection, and STRICTLY SEQUENTIALLY — the ``\\winreg`` pipe is opened and
+    every value read one-op-in-flight (never ``asyncio.gather``, per the
+    single-connection multi-pipe limitation documented on ``_do_samr``).
+
+    Best-effort throughout: a failed admin probe, a ``\\winreg`` open failure, or a
+    per-value read error never raises and never aborts host collection; the stage
+    simply records what it could observe. Concurrency across hosts is provided by
+    the caller's per-host semaphore, exactly as for SAMR/SRVSVC.
+
+    ``smb_config`` (optional) is the :class:`SMBConfig` for THIS host, forwarded
+    to the defensive-posture-inventory sub-stage (see
+    ``_do_endpoint_protection_inventory``). When ``None`` (e.g. a caller that
+    predates this parameter), the sub-stage is skipped — byte-for-byte the
+    registry-only legacy behaviour.
+    """
+    timeout = enum_timeout if enum_timeout is not None else per_host_timeout
+    t = time.monotonic()
+    try:
+        conn = getattr(machine, "connection", None)
+        if conn is None:
+            out.errors["registry"] = "no_connection"
+            return
+
+        # SSOT admin gate — an ADMIN$ tree-connect (the same signal the SMB
+        # privilege sweep uses). RemoteRegistry + these HKLM keys are
+        # admin-only, so a non-admin session short-circuits here at ~zero cost.
+        try:
+            unc = f"\\\\{host_label}\\ADMIN$"
+            tree, tc_err = await asyncio.wait_for(conn.tree_connect(unc), timeout=timeout)
+        except asyncio.TimeoutError:
+            out.errors["registry"] = "admin_probe_timeout"
+            return
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            out.errors["registry"] = f"admin_probe:{type(exc).__name__}: {exc}"
+            return
+        if tc_err is not None or tree is None:
+            # Not a local admin here — expected on most hosts; not a failure.
+            out.smb_props["reg_admin_gate"] = False
+            print_info_debug(
+                f"[host-collector] registry stage skipped on {target_ip}: "
+                "not a local admin (ADMIN$ denied) — expected, no findings."
+            )
+            return
+        out.smb_props["reg_admin_gate"] = True
+
+        # Open the \winreg pipe on the SAME connection (Kerberos-native, reuses
+        # the SMB gssapi context) and read every value sequentially.
+        await _read_registry_values(conn, target_ip, out, timeout)
+
+        # Defensive-posture inventory (endpoint protection products) — admin-gated
+        # on the SAME ADMIN$ proof as the registry reads above, run AFTER them so
+        # the registry pipe is fully closed first (it opens its OWN fresh SMB
+        # sessions, never the shared ``machine``/``conn`` — see the docstring on
+        # ``_do_endpoint_protection_inventory``).
+        if smb_config is not None:
+            await _do_endpoint_protection_inventory(
+                smb_config, target_ip, out, timeout
+            )
+    except asyncio.TimeoutError:
+        out.errors["registry"] = "timeout"
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        out.errors["registry"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        timing.registry += time.monotonic() - t
+
+
+async def _do_endpoint_protection_inventory(
+    smb_config: Any,
+    target_ip: str,
+    out: HostCollectionResult,
+    timeout: int,
+) -> None:
+    """Record installed AV/EDR products on this host as a DEFENSIVE-POSTURE fact.
+
+    This is inventory, not an attack: it reuses the existing
+    :class:`HostFingerprintService` (LSARPC / service-registry / IPC$ pipe
+    detection, already used by the remote-exec cascade and dump orchestrators)
+    to record which endpoint-protection products are present, so the compliance
+    deliverable can evidence anti-malware controls (ISO A.8.7, PCI Req 5,
+    DORA art. 10) with an OBSERVED fact rather than silence.
+
+    Gated on ``reg_admin_gate`` having already been proven ``True`` by the
+    caller — the fingerprint probes (LSARPC lookups, service-registry reads,
+    IPC$ pipe enumeration) work for any authenticated user, but the RTP toggle
+    read needs RemoteRegistry, and restricting this stage to admin-proven hosts
+    keeps its cost bounded and its semantics symmetric with the registry stage
+    it rides alongside.
+
+    ``HostFingerprintService.fingerprint()`` opens its OWN fresh, isolated SMB
+    sessions per probe (never the shared ``machine``/``conn`` used by the
+    registry reads) — so running it here does not violate the
+    single-connection-no-concurrent-pipes rule: it is separate connections,
+    not concurrent operations on the connection already in use.
+
+    Best-effort: any failure (import, connect, probe) leaves
+    ``endpoint_posture_assessed`` unset so the analyzer treats the host as
+    NOT_ASSESSED rather than manufacturing a false "no protection" signal.
+    """
+    try:
+        from adscan_internal.services.host_intelligence.fingerprint_service import (
+            HostFingerprintService,
+        )
+
+        fp = await asyncio.wait_for(
+            HostFingerprintService().fingerprint(smb_config), timeout=timeout * 4
+        )
+        if fp.error:
+            print_info_debug(
+                f"[host-collector] endpoint-protection inventory on {target_ip} "
+                f"errored: {fp.error} — leaving endpoint_posture_assessed unset."
+            )
+            return
+        detected = fp.detected_products
+        out.smb_props["endpoint_products"] = [
+            {"name": p.name, "category": p.category, "active": p.active}
+            for p in detected
+        ]
+        out.smb_props["edr_active"] = any(
+            p.category == "edr" and p.active for p in detected
+        )
+        out.smb_props["av_active"] = any(
+            p.category == "av" and p.active for p in detected
+        )
+        out.smb_props["endpoint_posture_assessed"] = True
+        print_info_debug(
+            f"[host-collector] endpoint-protection inventory on {target_ip}: "
+            f"{len(detected)} product(s) detected "
+            f"(edr_active={out.smb_props['edr_active']}, "
+            f"av_active={out.smb_props['av_active']})"
+        )
+    except asyncio.TimeoutError:
+        print_info_debug(
+            f"[host-collector] endpoint-protection inventory on {target_ip} timed out"
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort inventory, never aborts collection
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[host-collector] endpoint-protection inventory on {target_ip} failed: {exc}"
+        )
+
+
+async def _read_registry_values(
+    conn: Any,
+    target_ip: str,
+    out: HostCollectionResult,
+    timeout: int,
+) -> None:
+    """Open ``\\winreg`` and read every value in ``_REGISTRY_READS`` sequentially.
+
+    The registry-service class is imported from the native aiosmb stack. On a
+    failed pipe open every key is left as its default (absent → NOT_ASSESSED via
+    the analyzer), so the finding logic never manufactures a false weakness from a
+    connection problem.
+    """
+    from aiosmb.dcerpc.v5.interfaces.remoteregistry import HKEY, RRPRPC
+
+    rrp_service, open_err = await asyncio.wait_for(
+        RRPRPC.from_smbconnection(conn), timeout=timeout
+    )
+    if open_err is not None or rrp_service is None:
+        # \winreg not reachable (RemoteRegistry service disabled / stopped). Admin
+        # was proven, but the values could not be assessed — leave them unset.
+        out.errors["registry"] = f"winreg_open:{open_err}"
+        print_info_debug(
+            f"[host-collector] registry stage on {target_ip}: \\winreg open failed "
+            f"({open_err}) — RemoteRegistry likely disabled; values NOT_ASSESSED."
+        )
+        return
+    try:
+        for prop_key, subkey_path, value_name in _REGISTRY_READS:
+            await _read_one_registry_value(
+                rrp_service, HKEY, prop_key, subkey_path, value_name, out, timeout
+            )
+    finally:
+        try:
+            await asyncio.wait_for(rrp_service.close(), timeout=timeout)
+        except Exception:  # noqa: BLE001 — best-effort close; connection discarded regardless
+            pass
+
+
+async def _read_one_registry_value(
+    rrp_service: Any,
+    hkey_enum: Any,
+    prop_key: str,
+    subkey_path: str,
+    value_name: str,
+    out: HostCollectionResult,
+    timeout: int,
+) -> None:
+    """Read a single HKLM value; store ``<prop_key>`` + ``<prop_key>_state``.
+
+    Best-effort per key (a failure on one value never blocks the others). The
+    subkey handle is opened and closed per read so one denied/absent key cannot
+    strand a handle. Kept SEQUENTIAL over the one connection.
+    """
+    key_handle = None
+    try:
+        key_handle, open_err = await asyncio.wait_for(
+            rrp_service.OpenKey(hkey_enum.LOCAL_MACHINE, subkey_path), timeout=timeout
+        )
+        if open_err is not None or key_handle is None:
+            # The whole subkey is missing → the value is absent by extension.
+            if _reg_value_absent(open_err):
+                out.smb_props[f"{prop_key}_state"] = REG_STATE_ABSENT
+            else:
+                out.smb_props[f"{prop_key}_state"] = REG_STATE_ERROR
+            return
+
+        _val_type, value, q_err = await asyncio.wait_for(
+            rrp_service.QueryValue(key_handle, value_name), timeout=timeout
+        )
+        if q_err is not None:
+            if _reg_value_absent(q_err):
+                out.smb_props[f"{prop_key}_state"] = REG_STATE_ABSENT
+            else:
+                out.smb_props[f"{prop_key}_state"] = REG_STATE_ERROR
+            return
+
+        out.smb_props[f"{prop_key}_state"] = REG_STATE_PRESENT
+        # QueryValue returns the decoded value (unpack_vals=True): an int for
+        # DWORD. Store the int when possible; fall back to the raw value.
+        try:
+            out.smb_props[prop_key] = int(value)
+        except (TypeError, ValueError):
+            out.smb_props[prop_key] = value
+    except asyncio.TimeoutError:
+        out.smb_props[f"{prop_key}_state"] = REG_STATE_ERROR
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        out.smb_props[f"{prop_key}_state"] = REG_STATE_ERROR
+    finally:
+        if key_handle is not None:
+            try:
+                await asyncio.wait_for(
+                    rrp_service.CloseKey(key_handle), timeout=timeout
+                )
+            except Exception:  # noqa: BLE001 — best-effort handle close
+                pass
 
 
 async def _do_shares(
@@ -1298,6 +1627,21 @@ async def collect_one_host(
                     config.connect_timeout,
                     out,
                     timing,
+                )
+            if config.collect_registry:
+                # Admin-gated HKLM credential-protection reads over \winreg — LAST
+                # stage on the shared connection, run SEQUENTIALLY after shares
+                # (one op in flight per connection; never gathered).
+                _stage("registry")
+                await _do_registry(
+                    machine,
+                    target_ip,
+                    target_hostname or target_ip,
+                    config.per_host_timeout,
+                    out,
+                    timing,
+                    enum_timeout=_adaptive_enum_timeout(rtt_ms, config.per_host_timeout),
+                    smb_config=smb_config,
                 )
         finally:
             # Hard-bound teardown so a wedged host cannot hold the worker slot with

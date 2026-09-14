@@ -104,6 +104,34 @@ class EdgeSeverityInput:
         target_is_domain: True when the target node is the Domain object
             (kind == "Domain") — the canonical "Domain Compromised"
             terminal.
+        proven_unauthenticated_reachable: True when the edge's reach was
+            PROVEN over the unauthenticated (null-session) phase — not merely
+            a potential unauthenticated source. Set from the edge's
+            ``notes.unauthenticated_reachable`` (stamped by Task 1.1 only when
+            the read was genuinely proven via ``origin == "unauth_enrichment"``).
+            Consulted ONLY inside Rule 4b: when the source is an
+            ``UNAUTHENTICATED_PRINCIPAL`` reaching a Tier-0 / domain-compromise
+            target, this lifts the conservative HIGH cap to ``CRITICAL``
+            (proven > potential — zero credentials to the control plane is the
+            worst case, not a hardening-maybe). ``False`` leaves the existing
+            conservative cap untouched, so every caller that does not supply it
+            is byte-identical.
+        proven_unauth_reaches_tier0: True when the edge's OWN target is NOT the
+            Tier-0 terminal (e.g. a credential-read entry edge landing on the
+            harvested account), but the PROVEN no-credential CHAIN forward from
+            that target reaches a Tier-0 / domain-compromise terminal. This is
+            the honest input for an unauthenticated credential-read finding whose
+            severity reflects its DOWNSTREAM chain, not the edge's immediate
+            target. It is the causally-scoped Tier-0 signal (a forward walk over
+            executed edges), NOT "the graph has a Tier-0 compromise somewhere".
+            Consulted ONLY inside Rule 4b, and ONLY for an
+            ``UNAUTHENTICATED_PRINCIPAL`` source — it lifts that entry to
+            ``CRITICAL`` exactly as a direct terminal reach would. Never
+            repurpose ``target_is_domain`` / ``target_is_tier0_asset`` for this:
+            those describe the edge's OWN target node's kind/tier, and the entry
+            edge's real target is a regular account, not the domain. ``False``
+            keeps the conservative cap; every caller that does not supply it is
+            byte-identical.
     """
 
     source_compromise_class: CompromiseClass | None
@@ -113,6 +141,8 @@ class EdgeSeverityInput:
     edge_control_strength: ControlStrength = ControlStrength.NOT_APPLICABLE
     target_is_tier0_asset: bool = False
     target_is_domain: bool = False
+    proven_unauthenticated_reachable: bool = False
+    proven_unauth_reaches_tier0: bool = False
 
     @property
     def is_target_tier0_asset(self) -> bool:
@@ -141,6 +171,33 @@ class EdgeSeverityInput:
         if self.target_privilege_tier is not None:
             return False
         return bool(self.target_is_domain)
+
+
+def edge_proven_unauthenticated_reachable(edge: object) -> bool:
+    """Return the proven-unauthenticated-reachable flag from an edge's notes.
+
+    The flag is stamped on the edge's ``notes`` dict (key
+    ``unauthenticated_reachable``) by the share-credential provenance service,
+    and ONLY when the read was genuinely proven over the unauthenticated
+    (null-session) enrichment phase. This reads it back so the three
+    :class:`EdgeSeverityInput` builders all consult the same canonical signal
+    rather than each re-deriving it. Best-effort: a missing/odd-shaped edge or
+    notes dict yields ``False`` (the conservative, byte-identical default).
+
+    Args:
+        edge: A raw attack-graph edge dict (or any mapping with ``notes``).
+
+    Returns:
+        ``True`` only when ``edge["notes"]["unauthenticated_reachable"]`` is
+        truthy.
+    """
+    try:
+        notes = edge.get("notes") if hasattr(edge, "get") else None
+    except Exception:
+        return False
+    if not isinstance(notes, dict):
+        return False
+    return bool(notes.get("unauthenticated_reachable"))
 
 
 def _is_low_priv_source(cls: CompromiseClass | None) -> bool:
@@ -300,15 +357,39 @@ def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
     # enabled — uncertain without runtime validation. Cap at HIGH so the
     # panel does not raise CRITICAL alarms for what may be a hardened
     # environment.
+    #
+    # PROVEN > POTENTIAL: when the reach was actually PROVEN over the
+    # unauthenticated (null-session) phase (``proven_unauthenticated_reachable``),
+    # the "null sessions might be enabled" uncertainty is gone — an attacker
+    # needing ZERO credentials to reach the control plane is the worst case, so
+    # a proven no-credential path onto a Tier-0 / domain-compromise target
+    # uplifts to CRITICAL, above the conservative cap. A merely-potential
+    # unauthenticated source keeps the existing HIGH cap.
     if inp.source_compromise_class is CompromiseClass.UNAUTHENTICATED_PRINCIPAL:
         if target_is_terminal and kind in (
             EdgeKind.CONTROL,
             EdgeKind.ESCALATION,
             EdgeKind.DERIVED,
         ):
+            if inp.proven_unauthenticated_reachable:
+                return Severity.CRITICAL
             return Severity.HIGH
         if target_is_t0_asset and kind is EdgeKind.AUTH:
+            if inp.proven_unauthenticated_reachable:
+                return Severity.CRITICAL
             return Severity.HIGH
+        # The edge's own target is NOT Tier-0 (e.g. a credential-read entry edge
+        # landing on a harvested account), but the PROVEN no-credential chain
+        # forward from it reaches a Tier-0 / domain-compromise terminal. That is
+        # the same worst case — zero credentials to the control plane — so it
+        # uplifts to CRITICAL. Requires the proven-reachable flag too, so a
+        # merely-potential unauthenticated source never gets here.
+        if (
+            inp.proven_unauthenticated_reachable
+            and inp.proven_unauth_reaches_tier0
+            and kind in (EdgeKind.CONTROL, EdgeKind.ESCALATION, EdgeKind.DERIVED)
+        ):
+            return Severity.CRITICAL
         if kind in (EdgeKind.CONTROL, EdgeKind.ESCALATION, EdgeKind.DERIVED):
             return Severity.MEDIUM
         return Severity.LOW

@@ -3332,7 +3332,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         # "extra_specs": ["python-magic==0.4.27"],
     },
     "credsweeper": {
-        "spec": "credsweeper==1.17.0",
+        "spec": "credsweeper==1.18.3",
         "check_target": "credsweeper",
         "check_type": "executable",
         "exe_name": "credsweeper",

@@ -113,6 +113,7 @@ from adscan_core.reporting.chokepoint_copy import (
     STRUCTURAL_CHOKE_BADGE,
     chokepoint_headline,
     is_structural_choke,
+    remediation_chain_note,
     remediation_item_line,
     remediation_kpi_lines,
     remediation_start_here_headline,
@@ -126,7 +127,18 @@ from adscan_core.reporting.domain_scope import (
 )
 from adscan_core.reporting.finding_aliases import collapse_finding_aliases
 from adscan_core.reporting.finding_vuln_map import is_reportable_finding
+from adscan_core.reporting.share_credential_verification import (
+    source_verification_label_for_step,
+)
 from adscan_core.reporting.technical_report import _get_technical_report_path
+from adscan_core.reporting.unauthenticated_reach import (
+    UNAUTHENTICATED_REACH_BADGE,
+    UNAUTHENTICATED_REACH_SO_WHAT,
+    path_is_unauthenticated_reachable,
+    step_is_unauthenticated_reachable,
+    unauthenticated_domain_breaker_present,
+    unauthenticated_headline,
+)
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 from adscan_core.rich_output import (
     print_error,
@@ -407,6 +419,12 @@ class ChokePointRemediation:
     #: only removing the object closes the routes. Empty otherwise.
     edge_note: str
     bounded: bool
+    #: ``True`` when at least one row resolved a protected target. When every
+    #: row is unresolved (an older persisted block, or a genuinely
+    #: indeterminate terminal), the template omits the whole "Protected
+    #: target" column instead of rendering a column of debug-looking
+    #: placeholders — mirrors the PRO deliverable's ``has_protected_targets``.
+    has_protected_targets: bool = False
 
 
 @dataclass(frozen=True)
@@ -461,6 +479,11 @@ class LiteRemediationStartHere:
     kpi_big: str
     kpi_ratio: str
     kpi_context: str
+    #: A client-safe sentence when the leading rows sit on one linear attack
+    #: chain (every fix breaks the identical path count), explaining the tie
+    #: instead of letting the per-row copy repeat an unexplained "N of N" —
+    #: mirrors the PRO deliverable's ``chain_note``. ``""`` when not tied.
+    chain_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -636,6 +659,12 @@ class LiteReportModel:
     #: and the figure a CISO repeats. Empty when the artifact carries no KPI
     #: block, in which case the document says nothing rather than a bare zero.
     verdict_reach: str
+    #: The zero-credential LEAD, set ONLY when the engine proved a path to full
+    #: domain compromise that began from an unauthenticated foothold (no account).
+    #: It sits ABOVE the verdict because "no credentials needed" outranks any
+    #: count. Empty otherwise, and the line is then omitted. SSOT copy:
+    #: :func:`adscan_core.reporting.unauthenticated_reach.unauthenticated_headline`.
+    verdict_unauthenticated_lead: str
     # Ledger figures — the finding load and the paths to full domain
     # compromise. The score is a SUPPORTING figure beside them, never the hero
     # (the PRO report deliberately demoted it and this mirrors that decision).
@@ -1063,7 +1092,38 @@ def _strip_relation_prefix(text: str, relation: str) -> str:
     return body
 
 
+def _with_source_verification(narrative: str, step: dict[str, Any]) -> str:
+    """Append the share-credential source verification level, when the step has one.
+
+    A share-file-credential step (GPP password/autologon, or a password recovered
+    from a share or file) carries a verification tag recording how the read that
+    exposed the secret was established. The client sentence for that level comes
+    from the shared SSOT, so the level reads identically in the report and the web
+    platform. A step with no tag (or an out-of-scope relation) is returned
+    unchanged: no label is fabricated.
+    """
+    label = source_verification_label_for_step(step)
+    if label:
+        narrative = label if not narrative else f"{narrative.rstrip()} {label}"
+    # The SO-WHAT for a CISO: this step needed NO credential (proven over a null
+    # session). Gated to the proven attribute only; absent => unchanged.
+    if step_is_unauthenticated_reachable(step):
+        badge = f"{UNAUTHENTICATED_REACH_BADGE}. {UNAUTHENTICATED_REACH_SO_WHAT}"
+        narrative = badge if not narrative else f"{narrative.rstrip()} {badge}"
+    return narrative
+
+
 def _step_narrative(step: dict[str, Any]) -> str:
+    """Resolve a client-safe step narrative, with the source verification level.
+
+    Thin wrapper over :func:`_step_narrative_base` that appends the share-credential
+    source verification sentence (from the shared SSOT) when the step carries one,
+    so every LITE narrative fallback path inherits the label uniformly.
+    """
+    return _with_source_verification(_step_narrative_base(step), step)
+
+
+def _step_narrative_base(step: dict[str, Any]) -> str:
     """Resolve a client-safe narrative for one step, LITE fallbacks in order.
 
     1. short catalog narrative template, 2. full catalog narrative template,
@@ -1573,9 +1633,26 @@ def build_lite_remediation_start_here(
         mapped=not top_executed,
         bounded=bounded,
     )
+    # A single linear attack chain leaves the leading rows tied on the exact
+    # same paths-broken count. LITE's ranking (``compute_technique_priorities``)
+    # already breaks that tie by ascending remediation-complexity rank (cheapest
+    # first) as its OWN sort key, so no reordering happens here — this only
+    # explains the tie to the client instead of repeating an unexplained "N of
+    # N" across every leading row, mirroring the PRO deliverable's chain_note.
+    tie_size = 0
+    for row in rows:
+        if (
+            row.paths_affected == top.paths_affected
+            and row.exploited_paths == top.exploited_paths
+        ):
+            tie_size += 1
+        else:
+            break
+    chain_note = remediation_chain_note(tie_size) if tie_size > 1 else ""
     return LiteRemediationStartHere(
         present=True,
         headline=headline,
+        chain_note=chain_note,
         total_executed_paths=int(total_executed_paths),
         total_mapped_paths=int(total_mapped_paths),
         rows=tuple(rows),
@@ -1670,6 +1747,8 @@ def build_chokepoint_remediation(
     if not rows:
         return _empty
 
+    has_protected_targets = any(row.protected_target for row in rows)
+
     # The leading choke owns the caveat and the honest edge-note. The block that
     # produced the top gathered row is the second tuple element's source.
     _top_entry, _top_domain, top_block = gathered[0]
@@ -1696,6 +1775,7 @@ def build_chokepoint_remediation(
         rows=tuple(rows),
         edge_note=edge_note,
         bounded=bounded,
+        has_protected_targets=has_protected_targets,
     )
 
 
@@ -1954,9 +2034,11 @@ def build_verdict(*, paths_to_da: int, paths_total: int) -> tuple[str, str, str]
             "ok",
         )
     plural = "" if paths_total == 1 else "s"
+    # Verb agrees with the figure (the subject): "1 ... reaches", "3 ... reach".
+    verb = "reaches" if paths_to_da == 1 else "reach"
     return (
         str(paths_to_da),
-        f"of {paths_total} identified attack path{plural} reach full domain "
+        f"of {paths_total} identified attack path{plural} {verb} full domain "
         "compromise.",
         "critical",
     )
@@ -1993,7 +2075,7 @@ def _build_sprawl_lead(sprawl: Mapping[str, Any], reach: DomainUserReach) -> str
     holds = "holds" if count == 1 else "hold"
     lead = (
         f"{count} of {total} domain user {accounts} ({pct}%) already "
-        f"{holds} Tier 0 privilege by group membership — none of them needs an "
+        f"{holds} Tier 0 privilege by group membership: none of them needs an "
         f"attack path; each one is the destination."
     )
     if sprawl.get("degenerate") or ordinary_total <= 0:
@@ -2093,13 +2175,14 @@ def build_verdict_reach(
         return ""
     if reach.ordinary_available and reach.ordinary_affected > 0:
         accounts = "account" if reach.ordinary_total == 1 else "accounts"
+        has_or_have = "has" if reach.ordinary_affected == 1 else "have"
         lead = (
             f"{reach.ordinary_affected} of {reach.ordinary_total} ordinary "
-            f"(non-administrative) domain user {accounts} have a validated path "
-            f"to full domain compromise"
+            f"(non-administrative) domain user {accounts} {has_or_have} a "
+            f"validated path to full domain compromise"
         )
         if reach.ordinary_affected >= reach.ordinary_total:
-            sentence = f"{lead}: every account outside the administrative tier."
+            sentence = f"{lead}."
         else:
             sentence = f"{lead} ({reach.ordinary_pct:g}% of them)."
         return f"{sentence}{_build_sprawl_tail(sprawl)}"
@@ -2458,6 +2541,22 @@ def build_report_model(
     verdict_figure, verdict_text, verdict_tone = build_verdict(
         paths_to_da=inputs.paths_to_da, paths_total=paths_total
     )
+    # Zero-credential LEAD: set only when the engine proved a path to full domain
+    # compromise that began from an unauthenticated foothold. It leads the verdict
+    # because "no account needed" outranks any count. The route figure is the
+    # count of proven no-credential entry routes; the domain-level present flag
+    # (any domain's exposure_kpis) is the gate. SSOT copy: unauthenticated_reach.
+    _unauth_present = any(
+        unauthenticated_domain_breaker_present(entry.get("exposure_kpis"))
+        for entry in domains.values()
+        if isinstance(entry, dict)
+    )
+    verdict_unauthenticated_lead = ""
+    if _unauth_present:
+        _unauth_routes = sum(
+            1 for p in raw_paths if path_is_unauthenticated_reachable(p)
+        )
+        verdict_unauthenticated_lead = unauthenticated_headline(_unauth_routes)
     # Two figures off one artifact: how many ordinary accounts REACH Tier 0,
     # and how many are already IN it. The second is what makes excluding the
     # administrators from the first defensible, and where it is pathological it
@@ -2487,6 +2586,7 @@ def build_report_model(
         verdict_figure=verdict_figure,
         verdict_text=verdict_text,
         verdict_tone=verdict_tone,
+        verdict_unauthenticated_lead=verdict_unauthenticated_lead,
         verdict_reach=verdict_reach,
         priority_findings=counts.get("critical", 0) + counts.get("high", 0),
         paths_to_domain_compromise=inputs.paths_to_da,
@@ -3417,7 +3517,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ADscan Exposure Report — {{ m.domain_label }} — {{ m.generated_at }}</title>
+<title>ADscan Exposure Report - {{ m.domain_label }} - {{ m.generated_at }}</title>
 <meta name="description" content="Active Directory exposure report for {{ m.domain_label }}, generated {{ m.generated_at }} with ADscan.">
 {% if m.favicon_data_uri %}<link rel="icon" href="{{ m.favicon_data_uri }}">{% endif %}
 <style>
@@ -3538,6 +3638,15 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
 /* ── Lede: the verdict, then the ledger ─────────────────────────────────── */
 .lede { page-break-inside: avoid; }
+/* The zero-credential lead, when present: the single most severe fact, set above
+   the verdict in the critical colour. It takes the 12mm top margin so the verdict
+   below tucks in under it rather than both claiming the gap. */
+.lede .ds-verdict-lead {
+  max-width: 40ch; margin-top: 12mm; margin-bottom: 0;
+  font-family: var(--font-serif); font-weight: 800; font-size: 13.5pt;
+  line-height: 1.3; letter-spacing: -0.2px; color: var(--critical);
+}
+.lede .ds-verdict-lead + .ds-verdict { margin-top: 4mm; }
 .lede .ds-verdict { max-width: 30ch; margin-top: 12mm; }
 .lede .ds-cols { margin-top: 12mm; }
 .lede .ds-col { padding-top: 5mm; }
@@ -3867,6 +3976,10 @@ ol.oblig-steps > li {
   {% endif %}
 
   <section class="lede">
+    {# The zero-credential lead: the single most severe fact, when a path to full
+       domain compromise was proven from an unauthenticated foothold. It leads the
+       verdict because "no account needed" outranks any count. Omitted otherwise. #}
+    {% if m.verdict_unauthenticated_lead %}<p class="ds-verdict-lead">{{ m.verdict_unauthenticated_lead }}</p>{% endif %}
     <p class="ds-verdict">
       <span class="ds-verdict-n{% if m.verdict_tone == 'ok' %} ds-tone-ok{% endif %}">{{ m.verdict_figure }}</span>
       {{ m.verdict_text }}
@@ -4060,6 +4173,9 @@ ol.oblig-steps > li {
       </p>
     </div>
     <p class="ds-headline">{{ m.remediation_start_here.headline }}</p>
+    {% if m.remediation_start_here.chain_note %}
+    <p class="ds-section-lead">{{ m.remediation_start_here.chain_note }}</p>
+    {% endif %}
     <table class="adscan-table remediation-table">
       <thead>
         <tr>
@@ -4111,7 +4227,7 @@ ol.oblig-steps > li {
         <tr>
           <th class="col-rank">#</th>
           <th class="col-object">Object to remove</th>
-          <th class="col-target">Protected target</th>
+          {% if m.chokepoint_remediation.has_protected_targets %}<th class="col-target">Protected target</th>{% endif %}
           <th class="col-rsev">Severity</th>
           <th class="col-routes">Routes severed</th>
         </tr>
@@ -4121,7 +4237,7 @@ ol.oblig-steps > li {
         <tr>
           <td class="ds-rank">{{ c.rank }}</td>
           <td><div class="choke-tech">{{ c.object_label }}</div></td>
-          <td>{{ c.protected_target or '—' }}</td>
+          {% if m.chokepoint_remediation.has_protected_targets %}<td>{{ c.protected_target or 'Not yet identified' }}</td>{% endif %}
           <td><span class="chip {{ c.severity | lower }}">{{ c.severity }}</span></td>
           <td class="choke-n">{{ c.routes_severed }}</td>
         </tr>
@@ -4272,7 +4388,7 @@ ol.oblig-steps > li {
           <td><span class="chip {{ f.severity }}">{{ f.severity }}</span></td>
           <td>
             {% for t in f.mitre %}<span class="attck" title="{{ t.name }}">{{ t.id }}</span>{% endfor %}
-            {% if not f.mitre %}<span class="ds-muted">&mdash;</span>{% endif %}
+            {% if not f.mitre %}<span class="ds-muted">-</span>{% endif %}
           </td>
           {% if f.domain %}<td class="ds-muted">{{ f.domain }}</td>{% endif %}
         </tr>
@@ -4349,11 +4465,11 @@ ol.oblig-steps > li {
     <p class="empty">No attack paths were materialised for this scan.</p>
     {% endif %}
     <div class="ds-fineprint">
-      <b>Status legend.</b> Validated &mdash; proven end to end. Partially Validated &mdash; at
-      least one step proven. Attempted &mdash; tried, did not complete. Not Executed for Safety
-      &mdash; deliberately not run to avoid disruption. Attack Surface Reduced &mdash; an avenue
-      observed closed by configuration. Not Assessed &mdash; outside this scan's coverage.
-      Theoretical &mdash; derived from configuration, not executed.
+      <b>Status legend.</b> Validated: proven end to end. Partially Validated: at
+      least one step proven. Attempted: tried, did not complete. Not Executed for Safety:
+      deliberately not run to avoid disruption. Attack Surface Reduced: an avenue
+      observed closed by configuration. Not Assessed: outside this scan's coverage.
+      Theoretical: derived from configuration, not executed.
     </div>
   </section>
 
@@ -4492,7 +4608,7 @@ ol.oblig-steps > li {
   </section>
 
   <footer class="colophon">
-    Generated with ADscan LITE, the free Active Directory exposure scanner &mdash;
+    Generated with ADscan LITE, the free Active Directory exposure scanner:
     <a href="{{ m.repo_url }}">{{ m.repo_url }}</a>
     <div class="colophon-upsell">
       <a href="{{ m.pro_url }}">ADscan PRO</a> turns this into the document you hand a client:

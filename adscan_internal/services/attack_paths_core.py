@@ -13,14 +13,26 @@ import os
 import re
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
+from adscan_core.reporting.unauthenticated_reach import (
+    UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE,
+    is_unauthenticated_entry_label,
+    step_is_unauthenticated_reachable,
+)
+from adscan_core.reporting.well_known_principals import (
+    is_structural_well_known_principal,
+)
 from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services import attack_graph_core
 from adscan_internal.services import attack_path_progress
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
+)
+from adscan_internal.services.compromise_class import (
+    is_proven_unauthenticated_domain_breaker,
+    resolve_record_compromise_class,
 )
 from adscan_internal.services.path_state import (
     _PROVEN_STATUSES,
@@ -1206,6 +1218,23 @@ def build_group_member_index(
     return result
 
 
+def _record_leading_step_is_unauthenticated(record: dict[str, Any]) -> bool:
+    """Return True when a record's FIRST step is a proven no-credential entry.
+
+    Evidence-preservation guard (mirrors the ``partial`` doctrine): the proven
+    no-credential foothold — the synthetic ``Unauthenticated`` entry materialized
+    as step 0 — is the headline of the path. The leading-``MemberOf`` /
+    group-collapse minimizations MUST NOT strip or relabel it away. Reads the
+    first step's ``details`` for the ``unauthenticated_reachable`` attribute the
+    materialization stamps on the entry edge. Best-effort: a missing/odd-shaped
+    record yields ``False`` (byte-identical to the un-guarded default).
+    """
+    steps = record.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return False
+    return step_is_unauthenticated_reachable(steps[0])
+
+
 def _strip_leading_relations(
     record: dict[str, Any],
     *,
@@ -1421,7 +1450,16 @@ def collapse_memberof_prefixes(
         collapse_leading_memberof = False
         sample_users: list[str] = []
         strip_count = 0
-        if rels and rels[0] == "MemberOf" and len(nodes) > 1 and counts:
+        # Evidence-preservation: never collapse away a proven no-credential entry
+        # (the synthetic ``Unauthenticated`` step 0). Gated on the flag, so every
+        # other record is byte-identical.
+        if (
+            rels
+            and rels[0] == "MemberOf"
+            and len(nodes) > 1
+            and counts
+            and not _record_leading_step_is_unauthenticated(record)
+        ):
             raw_group_label = str(nodes[1])
             group_label = group_label_cache.get(raw_group_label)
             if group_label is None:
@@ -1466,6 +1504,108 @@ def collapse_memberof_prefixes(
             grouped[key] = record
 
     return list(grouped.values())
+
+
+def suppress_wellknown_start_duplicates_of_unauthenticated_entry(
+    records: list[dict[str, Any]],
+    graph: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Drop a record that duplicates a proven no-credential path under a
+    well-known-group start.
+
+    Invariant (see ``attack_graph_core.py`` start-node carve): a broad
+    well-known group (Everyone / Users / Guests / Authenticated Users /
+    Anonymous) is NEVER an attack-path START node. When a credential-less
+    foothold is proven, the ONLY start for that chain is the synthetic
+    ``Unauthenticated (...)`` entry record. The DFS start-selection enforces
+    this correctly, but ``collapse_memberof_prefixes`` can manufacture a
+    violation AFTER the DFS: an enabled principal that happens to be a member
+    of a broad well-known group (e.g. a guest credential-less read stamps
+    ``Everyone`` on the reader's token) collapses its
+    ``<member> -MemberOf-> <group> -> ...`` prefix into a record rooted at the
+    group itself — reproducing, under the well-known group's label, the exact
+    downstream chain the synthetic entry record already proves.
+
+    This pass removes that manufactured duplicate: a record is dropped ONLY
+    when its downstream chain (every relation plus every node after the
+    source) is an EXACT match of a synthetic-entry record's downstream chain
+    AND its own source node is a structural well-known / built-in principal.
+    That double condition guarantees the dropped record differs from the
+    surviving synthetic path ONLY in its start node — a shorter well-known
+    sub-path, or a well-known-rooted finding with no synthetic twin, is left
+    untouched.
+
+    Strictly gated to a no-op when ``records`` carries no synthetic entry
+    record at all (the overwhelming majority of graphs, which never prove a
+    credential-less foothold), so this pass never changes output there.
+
+    Identification of "is this record the synthetic entry" is by the SOURCE
+    NODE'S LABEL (:func:`is_unauthenticated_entry_label`), never by whether the
+    leading step carries ``unauthenticated_reachable`` — that attribute lives
+    on the underlying proven-read EDGE and is copied onto every record whose
+    leading hop reuses that edge, including a well-known-group-rooted twin. A
+    label-based check is required to tell the true synthetic entry apart from
+    the duplicate this pass exists to remove.
+    """
+    if not records:
+        return records
+
+    def _is_synthetic_entry_record(record: dict[str, Any]) -> bool:
+        nodes = record.get("nodes")
+        if not isinstance(nodes, list) or not nodes:
+            return False
+        return is_unauthenticated_entry_label(nodes[0])
+
+    synthetic_twin_keys: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    for record in records:
+        if not _is_synthetic_entry_record(record):
+            continue
+        nodes = record.get("nodes")
+        rels = record.get("relations")
+        if not isinstance(nodes, list) or not isinstance(rels, list) or len(nodes) < 2:
+            continue
+        synthetic_twin_keys.add((_string_tuple(rels), _string_tuple(nodes[1:])))
+
+    if not synthetic_twin_keys:
+        # No proven credential-less foothold in this record set: strict no-op,
+        # byte-identical to a run with this pass removed.
+        return records
+
+    wellknown_source_cache: dict[str, bool] = {}
+
+    def _source_is_wellknown(label: str) -> bool:
+        cached = wellknown_source_cache.get(label)
+        if cached is not None:
+            return cached
+        result = False
+        node_id = _find_node_id_by_label(graph, label)
+        if node_id is not None:
+            node = (graph.get("nodes") or {}).get(node_id)
+            if isinstance(node, dict):
+                sid = str(node.get("objectId") or "")
+                name = str(node.get("label") or label)
+                result = is_structural_well_known_principal(sid, name)
+        wellknown_source_cache[label] = result
+        return result
+
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        if _is_synthetic_entry_record(record):
+            # Never touch a synthetic-entry record: it is the surviving
+            # representative of the chain, notes and all.
+            filtered.append(record)
+            continue
+        nodes = record.get("nodes")
+        rels = record.get("relations")
+        if not isinstance(nodes, list) or not isinstance(rels, list) or len(nodes) < 2:
+            filtered.append(record)
+            continue
+        key = (_string_tuple(rels), _string_tuple(nodes[1:]))
+        if key in synthetic_twin_keys and _source_is_wellknown(str(nodes[0])):
+            continue
+        filtered.append(record)
+
+    return filtered
 
 
 #: Bounded evidence sample of interchangeable pivot accounts shown on a collapsed
@@ -1995,6 +2135,31 @@ def retarget_collapsed_summary_to_pivot(
     return new_summary
 
 
+def _record_is_proven_domain_breaker(record: Mapping[str, Any]) -> bool:
+    """Return whether a record is a PROVEN full-domain-compromise path.
+
+    The gate for widening a synthetic ``Unauthenticated`` entry's affected set to
+    the ENTIRE enabled population: only a PROVEN domain breaker owns every account.
+    Reads the engine-stamped ``compromise_class`` (already set by
+    ``apply_path_based_classification`` during light-record materialization, before
+    this stage runs) via the shared resolver, and the display ``status`` stamped
+    at record-build time, tested against the proven-status SSOT. A theoretical or
+    non-breaker path returns ``False`` and keeps the concrete on-path affected set.
+
+    Only extracts this record's own signals; the actual three-part gate (proven
+    status + domain breaker + unauthenticated entry) is the shared predicate
+    :func:`compromise_class.is_proven_unauthenticated_domain_breaker`, which
+    ``exposure_score_service``'s ``unauth_domain_breaker_present`` detection also
+    delegates to — see that function's docstring.
+    """
+    status = str(record.get("status") or "").strip().lower()
+    return is_proven_unauthenticated_domain_breaker(
+        compromise_class=resolve_record_compromise_class(record),
+        status=status,
+        is_unauthenticated_entry=True,
+    )
+
+
 def apply_affected_user_metadata(
     records: list[dict[str, Any]],
     *,
@@ -2009,6 +2174,11 @@ def apply_affected_user_metadata(
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     label_kind_map: dict[str, str] = {}
     label_sid_map: dict[str, str] = {}
+    # Canonical label -> full node dict, so the synthetic Unauthenticated entry can
+    # resolve the enabled Tier-2 USER principals actually ON its proven path (for
+    # the honest affected set). Kept alongside the kind/sid maps built here rather
+    # than re-indexing the graph a second time.
+    label_node_map: dict[str, dict[str, Any]] = {}
     if isinstance(nodes_map, dict):
         for node in nodes_map.values():
             if not isinstance(node, dict):
@@ -2018,6 +2188,7 @@ def apply_affected_user_metadata(
                 continue
             canonical_label = _canonical_membership_label(domain, label)
             label_kind_map[canonical_label] = _node_kind(node)
+            label_node_map.setdefault(canonical_label, node)
             props = (
                 node.get("properties")
                 if isinstance(node.get("properties"), dict)
@@ -2060,6 +2231,167 @@ def apply_affected_user_metadata(
         group_affected_cache[group_label] = result
         return result
 
+    def _affected_tier2_users_on_path(path_nodes: list[Any]) -> list[str]:
+        """Enabled Tier-2 USER principals ON a synthetic Unauthenticated path.
+
+        The HONEST affected set for a no-credential entry: the named enabled
+        Tier-2 users the proven path actually traverses. It EXCLUDES the synthetic
+        entry node itself and every structural well-known / built-in principal —
+        the group waypoints (Authenticated Users, Domain Admins) and the reserved
+        Tier-0 accounts (Administrator, krbtgt). This is a count of named
+        principals, never the maximum-exposure ceiling (that stays on the count
+        for attack-path severity). Per-node tier is read from the graph's own
+        ``privilege_tier`` stamp — the membership-aware tier SSOT's output — so
+        the affected set and its Tier breakdown never disagree.
+        """
+        seen: set[str] = set()
+        result: list[str] = []
+        for raw_label in path_nodes:
+            label = str(raw_label or "").strip()
+            if not label or is_unauthenticated_entry_label(label):
+                continue
+            canonical = _canonical_membership_label(domain, label)
+            if label_kind_map.get(canonical) != "User":
+                continue
+            node = label_node_map.get(canonical)
+            if not isinstance(node, dict):
+                continue
+            props = (
+                node.get("properties")
+                if isinstance(node.get("properties"), dict)
+                else {}
+            )
+            enabled = props.get("enabled")
+            if enabled is None:
+                enabled = node.get("enabled")
+            if enabled is False:
+                continue
+            fine_tier = (
+                str(props.get("privilege_tier") or node.get("privilege_tier") or "")
+                .strip()
+                .lower()
+            )
+            if fine_tier != "tier2":
+                continue
+            sid = label_sid_map.get(canonical) or str(
+                props.get("objectid") or node.get("objectId") or ""
+            )
+            if is_structural_well_known_principal(sid, label):
+                continue
+            name = _membership_label_to_name(label)
+            key = name.strip().lower()
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            result.append(name)
+        return result
+
+    _all_enabled_users_cache: list[tuple[list[str], dict[str, str], dict[str, int]]] = []
+
+    def _all_enabled_domain_users() -> tuple[list[str], dict[str, str], dict[str, int]]:
+        """Every enabled REAL domain USER account (the full no-credential blast radius).
+
+        An unauthenticated attacker who reaches FULL domain compromise owns the
+        ENTIRE user population: it is broader than Authenticated Users or Domain
+        Users, because it needs no account at all. So the honest affected set for a
+        PROVEN unauthenticated DOMAIN_BREAKER path is every enabled domain User
+        node, ALL tiers (the Tier-0 Administrator included — a domain takeover owns
+        it too).
+
+        "Real domain account" means a node whose SID is a domain SID
+        (``S-1-5-21-<dom>-<RID>``); this INCLUDES the built-in Administrator
+        (RID 500) while excluding the well-known pseudo-users the graph also carries
+        as ``kind == "User"`` (Anonymous Logon, System, Creator Owner, Local/Network
+        Service …), whose SIDs are NOT domain SIDs. Disabled accounts (krbtgt,
+        Guest) are excluded. This is exactly the enabled-account population the KPI
+        denominator measures, so the numerator can never exceed it.
+
+        Returns ``(names, fine_tier_map, coarse_breakdown)``. The per-account fine
+        tier and its coarse fold come from the graph's own ``privilege_tier`` stamp
+        (the membership-aware tier SSOT) so the set and its breakdown never
+        disagree. Memoised — the population is domain-wide, identical for every
+        record.
+        """
+        if _all_enabled_users_cache:
+            return _all_enabled_users_cache[0]
+        names: list[str] = []
+        tier_map: dict[str, str] = {}
+        breakdown = {"tier0": 0, "tier1": 0, "tier2": 0}
+        seen: set[str] = set()
+        for canonical, node in label_node_map.items():
+            if label_kind_map.get(canonical) != "User":
+                continue
+            props = (
+                node.get("properties")
+                if isinstance(node.get("properties"), dict)
+                else {}
+            )
+            enabled = props.get("enabled")
+            if enabled is None:
+                enabled = node.get("enabled")
+            # EXPLICITLY enabled only — reject ``None`` as well as ``False``. The
+            # well-known pseudo-users the graph carries as User nodes (Anonymous
+            # Logon, System, IUSR, Creator Owner, Local/Network Service, Principal
+            # Self, Default Account) all carry ``enabled=None``, so requiring a
+            # definite ``True`` drops every one of them (a loose ``!= False`` walk
+            # would count them and reintroduce the "10 of 2" over-count bug).
+            if enabled is not True:
+                continue
+            sid = label_sid_map.get(canonical) or str(
+                props.get("objectid") or node.get("objectId") or ""
+            )
+            # Real domain account only — a domain SID (S-1-5-21-…) with a RID. This
+            # admits the built-in Administrator (RID 500, a real enabled account the
+            # founder wants counted) and rejects every well-known pseudo-user whose
+            # SID is NOT a domain SID. Note the Brief-A ``is_structural_well_known_
+            # principal`` predicate is deliberately NOT used as the sole filter: it
+            # treats every domain RID < 1000 as well-known, which would wrongly drop
+            # the built-in Administrator the blast radius must include.
+            if not sid.upper().startswith("S-1-5-21-"):
+                continue
+            name = _membership_label_to_name(str(node.get("label") or canonical))
+            key = name.strip().lower()
+            if not name or key in seen:
+                continue
+            fine = (
+                str(props.get("privilege_tier") or node.get("privilege_tier") or "")
+                .strip()
+                .lower()
+            )
+            if fine not in {
+                "tier0_direct",
+                "tier0_escalation_capable",
+                "tier1",
+                "tier2",
+            }:
+                fine = "tier2"
+            coarse = (
+                "tier0"
+                if fine.startswith("tier0")
+                else ("tier1" if fine == "tier1" else "tier2")
+            )
+            seen.add(key)
+            names.append(name)
+            tier_map[name] = fine
+            breakdown[coarse] += 1
+        result = (names, tier_map, breakdown)
+        _all_enabled_users_cache.append(result)
+        return result
+
+    # MAXIMUM EXPOSURE ceiling for a synthetic ``Unauthenticated`` entry source.
+    # A no-credential foothold is reachable by the broadest possible population —
+    # ANYONE, authenticated or not — so its blast radius must DOMINATE any group in
+    # the domain, never read as "affects 1". Computed ONCE as (largest domain group
+    # population) + 1 so it strictly exceeds every real competitor (the containment
+    # widening carveout rescues the longer path only on strict ``>``); a domain with
+    # no groups still yields a floor of 1 so the value is never below a real count.
+    _max_group_population = 0
+    for _members in user_group_members.values():
+        _max_group_population = max(_max_group_population, len(_members))
+    for _members in computer_group_members.values():
+        _max_group_population = max(_max_group_population, len(_members))
+    _unauthenticated_exposure_ceiling = max(_max_group_population + 1, 1)
+
     annotated: list[dict[str, Any]] = []
     for record in records:
         current = record
@@ -2081,10 +2413,41 @@ def apply_affected_user_metadata(
             #   affected_computers — for display only (computer accounts have no stored creds)
             affected_users: list[str] = []
             affected_computers: list[str] = []
+            # Fine per-account tier map + coarse breakdown for the synthetic entry.
+            # For a proven no-credential DOMAIN BREAKER these describe the ENTIRE
+            # enabled population (every tier); otherwise they stay the tier2-on-path
+            # convention. Default to the tier2-on-path shape; overwritten below when
+            # the path is a proven domain breaker.
+            unauth_domain_wide = False
+            unauth_tier_map: dict[str, str] = {}
+            unauth_breakdown: dict[str, int] = {}
+            is_unauthenticated_entry = (
+                kind == attack_graph_core.UNAUTHENTICATED_ENTRY_KIND
+            )
             if kind == "Group":
                 affected_users, affected_computers = _affected_for_group(
                     canonical_source
                 )
+            elif is_unauthenticated_entry:
+                # Synthetic Unauthenticated entry (proven no-credential foothold):
+                # execution uses the null/guest bind, not a stored credential.
+                #
+                # A PROVEN full-domain-compromise path from here is the BROADEST
+                # exposure possible: no account at all, and owning the domain owns
+                # every account. Its affected set is therefore the ENTIRE enabled
+                # domain-user population (all tiers, the Administrator included), not
+                # just the named principals on the chain. A non-breaker foothold (or
+                # an unproven path) keeps the honest concrete set — the enabled
+                # Tier-2 users the proven path actually traverses. Either way the
+                # maximum-exposure ceiling stays on the COUNT below for attack-path
+                # severity / containment only.
+                if _record_is_proven_domain_breaker(current):
+                    affected_users, unauth_tier_map, unauth_breakdown = (
+                        _all_enabled_domain_users()
+                    )
+                    unauth_domain_wide = True
+                else:
+                    affected_users = _affected_tier2_users_on_path(nodes)
             elif source_label:
                 # Individual principal (User or Computer) — single affected entry.
                 affected_users = [source_label]
@@ -2092,6 +2455,11 @@ def apply_affected_user_metadata(
             affected_user_count = len(affected_users)
             affected_computer_count = len(affected_computers)
             affected_principal_count = affected_user_count + affected_computer_count
+            if is_unauthenticated_entry:
+                # Factually the broadest vector (anyone, no credential): dominate
+                # any group population so it wins the containment widening carveout
+                # by merit and the report/CTEM/KPIs read the real exposure.
+                affected_principal_count = _unauthenticated_exposure_ceiling
 
             if filter_empty and kind == "Group" and affected_principal_count == 0:
                 source_sid = label_sid_map.get(canonical_source)
@@ -2145,6 +2513,48 @@ def apply_affected_user_metadata(
                     meta.setdefault("affected_computer_count", affected_computer_count)
                 # Combined count used by display layer (Affected column).
                 meta.setdefault("affected_principal_count", affected_principal_count)
+                if is_unauthenticated_entry:
+                    # Stamp the scope SOURCE so the LIST-shaped client surfaces
+                    # recognize the synthetic entry: the CLI "Affected Scope" line
+                    # gates on this non-empty source, and the exposure-KPI
+                    # aggregator reads it to mark the path non-broad. The later
+                    # attack_graph_service enrichment's should_override guard
+                    # short-circuits a record whose affected_principal_count is
+                    # already positive, so the Tier breakdown below is stamped HERE
+                    # (it would otherwise never be computed for a non-group source).
+                    meta.setdefault(
+                        "affected_users_source", UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE
+                    )
+                    if unauth_domain_wide:
+                        # Proven no-credential DOMAIN BREAKER: the affected set IS
+                        # every enabled domain user (all tiers). The per-account map
+                        # and coarse breakdown come straight from the graph's own
+                        # ``privilege_tier`` stamp, so the count and its split always
+                        # reconcile (Tier-0 Administrator included). ``all_enabled``
+                        # tells the aggregator this path's scope is the whole
+                        # measured population.
+                        meta.setdefault(
+                            "affected_users_tier_breakdown", dict(unauth_breakdown)
+                        )
+                        meta.setdefault(
+                            "affected_users_tier_map", dict(unauth_tier_map)
+                        )
+                        meta.setdefault("affected_users_all_enabled", True)
+                        meta.setdefault("affected_users_domain_wide", True)
+                    else:
+                        # Non-breaker foothold (or unproven path): the affected set
+                        # is the enabled Tier-2 users the proven path traverses, so
+                        # the Tier breakdown is tier2:N and the per-account map
+                        # grades each as tier2 — read from the same
+                        # ``privilege_tier`` stamp, so count and split reconcile.
+                        meta.setdefault(
+                            "affected_users_tier_breakdown",
+                            {"tier0": 0, "tier1": 0, "tier2": affected_user_count},
+                        )
+                        meta.setdefault(
+                            "affected_users_tier_map",
+                            {name: "tier2" for name in affected_users},
+                        )
             annotated.append(current)
             break
 
@@ -2933,6 +3343,10 @@ def _minimize_display_record_by_leading_memberof(
         and rels
         and len(nodes) >= 3
         and str(rels[0] or "").strip().lower() == "memberof"
+        # Evidence-preservation: never relabel away a proven no-credential entry
+        # (the synthetic ``Unauthenticated`` step 0 is the path's headline). Gated
+        # on the flag — byte-identical for every other record.
+        and not _record_leading_step_is_unauthenticated(record)
     ):
         return _strip_display_record_prefix(
             record, start_node_index=1, reason="leading_memberof"
@@ -3327,6 +3741,16 @@ def compute_display_paths_for_domain(
         scope="domain",
         phase="collapse_memberof_prefixes",
         started_at=collapsed_started_at,
+        records=collapsed,
+    )
+    wellknown_dedup_started_at = time.monotonic()
+    collapsed = suppress_wellknown_start_duplicates_of_unauthenticated_entry(
+        collapsed, runtime_graph
+    )
+    _log_phase_timing(
+        scope="domain",
+        phase="suppress_wellknown_start_duplicates_of_unauthenticated_entry",
+        started_at=wellknown_dedup_started_at,
         records=collapsed,
     )
     minimized_started_at = time.monotonic()

@@ -3926,6 +3926,7 @@ async def probe_password_policy(
         min_pwd_len = _first_int("minPwdLength", 7)
         pwd_props = _first_int("pwdProperties", 0)
         require_complexity = bool(pwd_props & 0x01)  # DOMAIN_PASSWORD_COMPLEX
+        store_cleartext_passwords = bool(pwd_props & 0x10)  # DOMAIN_PASSWORD_STORE_CLEARTEXT (reversible encryption)
 
         raw_max_age = attrs.get("maxPwdAge")
         if isinstance(raw_max_age, (list, tuple)):
@@ -3974,6 +3975,7 @@ async def probe_password_policy(
             lockout_duration_minutes=lockout_duration_minutes,
             password_history_length=password_history_length,
             minimum_password_age_days=min_age_days,
+            store_cleartext_passwords=store_cleartext_passwords,
         )
         print_info_debug(
             f"[posture] Password policy detected: domain={domain} "

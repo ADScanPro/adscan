@@ -78,6 +78,9 @@ from adscan_internal.services.execution_credential_scope import (
     ACTOR_SOURCE_MACHINE_ACCOUNT,
     ACTOR_SOURCE_SCOPED_TICKET,
     ACTOR_SOURCE_SOURCE_OWNED,
+    ACTOR_SOURCE_UNAUTHENTICATED,
+    BIND_KIND_GUEST,
+    BIND_KIND_NULL,
     CarriedCredential,
     StepExecutionActor,
     derive_carried_credential,
@@ -1073,16 +1076,46 @@ def rematerialize_attack_path_snapshot(
 
 
 def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
-    """Re-materialize the attack-path snapshot for every in-scope domain at scan end.
+    """Finalize graph-backed artifacts for every in-scope domain at scan end.
 
     Single scan-finalization seam — called once from ``run_start_auth`` /
     ``run_start_unauth`` (which BOTH ``adscan ci`` and ``adscan start`` pass
     through), AFTER all attack-step execution and graph reconciliation, BEFORE the
-    loot card / web handoff. Iterating here once, from the reconciled on-disk
-    graph, keeps the web-consumed snapshot in lockstep with reality without
-    scattering per-step incremental writes (the scattered-writer pattern that
-    produced the stale-status bug). Best-effort: never raises.
+    loot card / web handoff. It runs two finalization passes over the FINAL,
+    reconciled on-disk graph:
+
+    1. ``reconcile_workspace_attack_graph_findings`` — the guaranteed final
+       finding reconciliation. The per-save sync only runs inside
+       ``save_attack_graph``; a finding recorded AFTER the last graph save of the
+       run (e.g. a GPP cpassword leak that lands ~seconds after the collector's
+       last save) is never seen together with the complete Tier-0 chain by any
+       per-save sync, so the graph-backed severity uplift (HIGH→CRITICAL) is
+       missed. This final pass re-runs the SAME causal forward-walk on the
+       complete graph, so every graph-backed finding inherits its true severity.
+       Idempotent + honesty-preserving. It fixes the whole class of graph-backed
+       findings recorded after the last save, not just GPP.
+    2. ``rematerialize_attack_path_snapshot`` per domain — keeps the web-consumed
+       snapshot in lockstep with reality without scattering per-step incremental
+       writes (the scattered-writer pattern that produced the stale-status bug).
+
+    Findings are reconciled first so the technical report reflects the final
+    graph before the snapshot projection is rebuilt. Best-effort: never raises.
     """
+    try:
+        workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+        if workspace_dir:
+            from adscan_internal.services.attack_graph_findings import (
+                reconcile_workspace_attack_graph_findings,
+            )
+
+            reconcile_workspace_attack_graph_findings(workspace_dir)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[attack_paths] scan-end finding reconciliation failed: {exc}"
+        )
+
     try:
         domains_data = getattr(shell, "domains_data", {}) or {}
         if not isinstance(domains_data, dict):
@@ -2655,6 +2688,20 @@ def _attack_path_step_source_is_actionable_in_domain(
 
     if str(step.get("status") or "").strip().lower() == CONFIGURATION_CLOSE_STATUS:
         return False, "closed by configuration (hardening observed)"
+
+    # A step sourced at the synthetic Unauthenticated entry is actionable with NO
+    # controlled principal: its access was PROVEN over a credential-less SMB bind
+    # (a null session or a guest session), the same bind that read the credential.
+    # Gated strictly on the proven synthetic source (via the actor SSOT), so a real
+    # principal can never be mistaken for it — this is the fifth actionable route,
+    # NOT a loosening of the anti-wrong-principal guard for any other source.
+    if _resolve_unauthenticated_step_bind_kind(
+        shell,
+        domain=domain,
+        from_label=from_label,
+        summary={**details, **({"steps": steps} if steps else {})},
+    ) is not None:
+        return True, "no credential required (null/guest session)"
 
     # Unauthenticated AS-REP roasting needs no controlled source principal.
     if key in {"asreproasting", "asreproast"}:
@@ -6446,6 +6493,226 @@ def _resolve_actor_secret(
     )
 
 
+def _resolve_unauthenticated_step_bind_kind(
+    shell: Any,
+    *,
+    domain: str,
+    from_label: str,
+    summary: dict[str, Any],
+) -> str | None:
+    """Return the credential-less bind kind for a synthetic Unauthenticated source.
+
+    The FIFTH actionable route: a step whose SOURCE is the synthetic
+    ``Unauthenticated`` entry node (Task 1-3) has no directory principal — its
+    access was PROVEN over the SAME credential-less SMB bind the enrichment phase
+    used to read the credential (a null session, or a guest session). This
+    resolves that bind kind, or ``None`` when the source is not the proven
+    synthetic entry (so the route is never fabricated for a real principal).
+
+    The source is recognized ONLY when BOTH hold (honesty invariant — materialize
+    the route ONLY for a PROVEN no-credential read):
+
+    * ``from_label`` is a synthetic entry label this module MINTS (the SSOT
+      detector :func:`attack_graph_core.is_unauthenticated_entry_label`), AND
+    * the read was PROVEN unauthenticated-reachable — the ``summary`` carries the
+      ``unauthenticated_reachable`` flag, or the in-graph source node is the
+      synthetic entry (``_node_is_synthetic_unauthenticated_entry``).
+
+    ``bind_kind`` derives from the authoritative ``reached_via`` token — the
+    ``summary`` note first (the step's ``details`` carry it at runtime), else the
+    synthetic node's persisted ``properties["reached_via"]`` — and NEVER by
+    string-parsing the id/label (the label decode is only a last-resort fallback).
+    """
+    from adscan_internal.services.attack_graph_core import (  # noqa: PLC0415
+        _node_is_synthetic_unauthenticated_entry,
+        is_unauthenticated_entry_label,
+        unauthenticated_entry_reached_via_from_label,
+    )
+    from adscan_core.reporting.unauthenticated_reach import (  # noqa: PLC0415
+        REACHED_VIA_GUEST_SESSION,
+    )
+
+    if not is_unauthenticated_entry_label(from_label):
+        return None
+
+    # Confirm the PROVEN flag: either the summary carries it, or the in-graph
+    # source node is the synthetic entry. A label that merely looks like the entry
+    # but is neither proven nor a real synthetic node is NOT granted the route.
+    proven = bool(summary.get("unauthenticated_reachable"))
+    source_node: dict[str, Any] | None = None
+    if not proven:
+        try:
+            source_node = get_node_by_label(shell, domain, label=from_label)
+        except Exception as exc:  # noqa: BLE001 — best-effort; a miss means not proven
+            telemetry.capture_exception(exc)
+            source_node = None
+        if isinstance(source_node, dict) and _node_is_synthetic_unauthenticated_entry(
+            source_node
+        ):
+            proven = True
+    if not proven:
+        return None
+
+    # reached_via is authoritative (summary note → synthetic node property);
+    # the label decode is only the last-resort fallback, never the primary source.
+    reached_via = str(summary.get("reached_via") or "").strip().lower()
+    if not reached_via:
+        if source_node is None:
+            try:
+                source_node = get_node_by_label(shell, domain, label=from_label)
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                telemetry.capture_exception(exc)
+                source_node = None
+        if isinstance(source_node, dict):
+            props = (
+                source_node.get("properties")
+                if isinstance(source_node.get("properties"), dict)
+                else {}
+            )
+            reached_via = str(props.get("reached_via") or "").strip().lower()
+    if not reached_via:
+        reached_via = unauthenticated_entry_reached_via_from_label(from_label)
+
+    return BIND_KIND_GUEST if reached_via == REACHED_VIA_GUEST_SESSION else BIND_KIND_NULL
+
+
+def _execute_unauthenticated_entry_step(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    action: str,
+    from_label: str,
+    to_label: str,
+    bind_kind: str,
+    step_index: int,
+    total_steps: int,
+    executable_step_position: int,
+    last_executable_idx: int,
+    set_carried: Any,
+) -> bool:
+    """Execute the synthetic Unauthenticated entry read (step 0) and hand off.
+
+    The read-owner's credential was PROVEN recoverable over a credential-less SMB
+    bind (``bind_kind`` = ``null``/``guest``) during enrichment, so it is already
+    in the credential store. This makes the foothold EXECUTABLE end to end:
+
+    * confirm the credential-less read by resolving the derived OWNER credential
+      (``to_label``) from the store — the SAME credential the enrichment bind
+      recovered;
+    * hand it to the chain via ``set_carried`` so the next step authenticates as
+      the owner (exactly as any prior step hands off a recovered credential);
+    * mark the entry edge / step a proven success and record the event.
+
+    Returns ``True`` on success (credential carried), ``False`` when the derived
+    credential is not recoverable (the path cannot continue past the entry read).
+    No secret is fabricated — a missing derived credential is an honest stop.
+    """
+    owner = _normalize_account(to_label)
+    marked_owner = mark_sensitive(to_label or "?", "node")
+    session_label = "guest" if bind_kind == BIND_KIND_GUEST else "null"
+
+    _record_attack_path_execution_event(
+        shell,
+        domain=domain,
+        summary=summary,
+        event_stage="step_attempting",
+        message=(
+            f"Reading {to_label} over an unauthenticated SMB {session_label} session "
+            "(no credential required)."
+        ),
+        step_index=step_index,
+        total_steps=total_steps,
+        executable_step_index=executable_step_position,
+        last_executable_idx=last_executable_idx,
+        action=action,
+        from_label=from_label,
+        to_label=to_label,
+        step_status="attempted",
+    )
+
+    recovered = (
+        _get_stored_domain_credential_for_user(shell, domain=domain, username=owner)
+        if owner
+        else None
+    )
+    if not recovered:
+        _record_attack_path_execution_event(
+            shell,
+            domain=domain,
+            summary=summary,
+            event_stage="step_failed",
+            message=(
+                f"The unauthenticated read did not yield a usable credential for {to_label}."
+            ),
+            step_index=step_index,
+            total_steps=total_steps,
+            executable_step_index=executable_step_position,
+            last_executable_idx=last_executable_idx,
+            action=action,
+            from_label=from_label,
+            to_label=to_label,
+            step_status="failed",
+            reason="unauthenticated_read_no_credential",
+        )
+        print_warning(
+            f"The unauthenticated {session_label} session did not yield a credential for "
+            f"{marked_owner}. Stopping this path."
+        )
+        return False
+
+    carried = set_carried(username=owner, secret=recovered, source_action=action)
+    print_info_debug(
+        f"[attack_paths] unauthenticated entry read handed off credential: "
+        f"owner={marked_owner} bind={mark_sensitive(session_label, 'detail')} "
+        f"credential_scope={mark_sensitive(carried.describe() if carried else 'unknown', 'detail')}"
+    )
+
+    try:
+        update_edge_status_by_labels(
+            shell,
+            domain,
+            from_label=from_label,
+            relation=action,
+            to_label=to_label,
+            status="success",
+            notes={"reached_via": bind_kind, "unauthenticated_reachable": True},
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    if hasattr(shell, "_update_active_attack_graph_step_status"):
+        try:
+            shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                domain=domain,
+                status="success",
+                notes={"reached_via": bind_kind},
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    _record_attack_path_execution_event(
+        shell,
+        domain=domain,
+        summary=summary,
+        event_stage="step_succeeded",
+        message=(
+            f"Recovered the credential for {to_label} over an unauthenticated "
+            f"{session_label} session — no credential was required to read it."
+        ),
+        step_index=step_index,
+        total_steps=total_steps,
+        executable_step_index=executable_step_position,
+        last_executable_idx=last_executable_idx,
+        action=action,
+        from_label=from_label,
+        to_label=to_label,
+        step_status="success",
+        actor=owner,
+    )
+    return True
+
+
 def resolve_step_execution_actor(
     shell: Any,
     *,
@@ -6494,6 +6761,30 @@ def resolve_step_execution_actor(
     Returns a :class:`StepExecutionActor`, or ``None`` when no material exists.
     """
     key = str(relation or "").strip().lower()
+
+    # --- Step 0: synthetic Unauthenticated entry source (credential-less bind) ---
+    # The FIFTH actionable route, BEFORE the owned-principal ladder: a step sourced
+    # at the synthetic ``Unauthenticated`` entry has no directory principal. Its
+    # "credential" is the SAME credential-less SMB bind (null/guest) that proved the
+    # no-credential read — honest and genuinely executable. Resolved only for the
+    # PROVEN synthetic source, so a real principal is never granted this route.
+    unauth_bind_kind = _resolve_unauthenticated_step_bind_kind(
+        shell, domain=domain, from_label=from_label, summary=summary
+    )
+    if unauth_bind_kind is not None:
+        print_info_debug(
+            f"attack_paths {key}: source is the synthetic Unauthenticated entry — "
+            f"executing over a credential-less {mark_sensitive(unauth_bind_kind, 'detail')} "
+            "SMB session (no directory principal)"
+        )
+        return StepExecutionActor(
+            username="",
+            secret="",
+            islocal="false",
+            source=ACTOR_SOURCE_UNAUTHENTICATED,
+            bind_kind=unauth_bind_kind,
+        )
+
     is_host_read = relation_is_host_execution_read(key)
     resolved_host = _resolve_step_execution_host(
         shell, domain=domain, relation=key, from_label=from_label, to_label=to_label
@@ -9640,6 +9931,61 @@ def execute_selected_attack_path(
                     f"from={marked_source} reason={mark_sensitive(_source_reason, 'detail')}"
                 )
                 return execution_started
+
+            # Step 0 — synthetic Unauthenticated entry source. The credential-read
+            # was PROVEN over a credential-less SMB bind (null/guest) during
+            # enrichment, so the derived credential for the read's owner is already
+            # in the credential store. This dispatch makes that foothold EXECUTABLE
+            # end to end: it confirms the credential-less read (the same bind the
+            # actor carries), hands the derived owner credential to the chain as the
+            # carried credential, and records the proven step — instead of falling
+            # to "unknown supported step". Handled BEFORE the relation branches
+            # because the acting material is the bind, not a directory principal.
+            # The step's own ``details`` carry the authoritative step-specific
+            # ``reached_via`` / ``unauthenticated_reachable`` notes, so they win over
+            # the path-level ``summary`` keys.
+            _unauth_actor = resolve_step_execution_actor(
+                shell,
+                domain=domain,
+                relation=key,
+                from_label=from_label,
+                to_label=to_label,
+                summary={**summary, **details},
+                context_username=context_username,
+                context_password=context_password,
+                steps=steps,
+                step_index=idx,
+                strict_source=True,
+                interactive=False,
+            )
+            if _unauth_actor is not None and _unauth_actor.source == ACTOR_SOURCE_UNAUTHENTICATED:
+                execution_started = True
+                if _execute_unauthenticated_entry_step(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    bind_kind=_unauth_actor.bind_kind or BIND_KIND_NULL,
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_position=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    set_carried=_set_carried_execution_credential,
+                ):
+                    continue
+                # The derived owner credential was not recoverable — nothing to
+                # carry forward, so this path cannot continue past the entry read.
+                _halt_path_after_failed_step(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_index=idx,
+                    executable_step_position=executable_step_position,
+                    actor="",
+                )
+                break
 
             if key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
                 if not to_label:

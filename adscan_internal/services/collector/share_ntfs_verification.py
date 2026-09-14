@@ -22,6 +22,11 @@ without touching the live SMB/winacl path:
 * :func:`hunt_gate_decision` — the share-hunting READ-gate decision: should a
   share be offered for credential hunting, and should it be deprioritized as
   NTFS-unverified.
+* :func:`resolve_share_access` — the single source of truth for "is this
+  share genuinely accessible to THIS principal, and what real ACL entries
+  prove it". Computes the EFFECTIVE (share ∩ NTFS) grant whenever both SDs
+  are readable; never reports accessible from the share-level ACL alone or
+  from an unconfirmed MaximalAccess probe mask.
 
 The actual winacl ``EvaluateSidAgainstDescriptor`` intersection lives in
 :func:`compute_effective_file_mask`, which is a thin wrapper over the offline
@@ -32,7 +37,14 @@ pure-logic helpers above remain importable in environments without winacl.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional
+
+from adscan_core.reporting.well_known_principals import (
+    credential_less_readset_sids,
+    is_domain_guest_account_sid,
+)
+from adscan_internal.services.collector.share_collector import parse_sd_aces
 
 # ---------------------------------------------------------------------------
 # Verification tiers (metadata tag on the share-access edge — never an edge
@@ -55,20 +67,88 @@ VERIFICATION_SELF_MXAC = "self_mxac"
 #: Default tag for back-compat when nothing else applies.
 DEFAULT_VERIFICATION = VERIFICATION_SHARE_ACL_ONLY
 
-#: SIDs every authenticated domain principal provably belongs to. For share
-#: edges sourced from one of these, the scanning identity's MxAc self-effective
-#: access is a valid effective floor — so we (a) trigger the MxAc probe when a
-#: share grants one of them, and (b) tag the resulting edge ``self_mxac`` with
-#: the server-confirmed mask instead of the over-reported raw share grant. These
-#: principals never have a confident group-closure (they are OS-computed, not in
-#: the membership snapshot), so their edges otherwise stay share_acl_only forever.
-_BROAD_AUTH_SIDS = frozenset({"S-1-5-11", "S-1-1-0", "S-1-5-32-545"})
+
+def is_everyone_sid(sid: str) -> bool:
+    """True for Everyone / World (S-1-1-0)."""
+    return (sid or "").strip().upper() == "S-1-1-0"
+
+
+def is_authenticated_users_sid(sid: str) -> bool:
+    """True for Authenticated Users (S-1-5-11) or Domain Users (RID 513).
+
+    Domain Users is included because, like Authenticated Users, its
+    membership is implicit (the OS-computed primary group) rather than a
+    confident, enumerable closure — see the module docstring on
+    :func:`build_sid_group_closure`.
+    """
+    s = (sid or "").strip().upper()
+    return s == "S-1-5-11" or s.endswith("-513")
+
+
+def is_users_sid(sid: str) -> bool:
+    """True for BUILTIN\\Users (S-1-5-32-545)."""
+    return (sid or "").strip().upper() == "S-1-5-32-545"
 
 
 def is_broad_auth_sid(sid: str) -> bool:
-    """True for Authenticated Users / Everyone / Users / Domain Users (RID 513)."""
-    s = (sid or "").strip().upper()
-    return s in _BROAD_AUTH_SIDS or s.endswith("-513")
+    """True for Authenticated Users / Everyone / Users / Domain Users (RID 513).
+
+    The UNION of :func:`is_everyone_sid`, :func:`is_authenticated_users_sid`
+    and :func:`is_users_sid` — kept, byte-identical to before the split, for
+    the existing authenticated-broad-source callers (the MxAc trigger in
+    ``share_collector.py`` and the self_mxac tag in ``host_collector.py``).
+    Those callers ask "does this share/edge grant a broad AUTHENTICATED
+    population?" — a different question from
+    :func:`filter_readset_to_token`'s "can a CREDENTIAL-LESS token use this
+    grant?" (Authenticated Users / BUILTIN\\Users answer the first question
+    True and the second False). Do not change what this returns.
+    """
+    return is_everyone_sid(sid) or is_authenticated_users_sid(sid) or is_users_sid(sid)
+
+
+def filter_readset_to_token(
+    read_set: Iterable[Mapping[str, object]],
+    reached_via: str,
+    everyone_includes_anonymous: bool = False,
+) -> list[Mapping[str, object]]:
+    """Drop read-set entries a credential-less (guest/null) token cannot use.
+
+    A read-set record (``{"sid", "label", ...}``, the mxac/read-set SSOT
+    shape — see ``affected_assets_struct.py``) authorizes a real domain
+    principal or a broad AUTHENTICATED population. Neither is provable for a
+    guest/null-session foothold: the token that session actually carries only
+    holds the fixed well-known set from
+    :func:`~adscan_core.reporting.well_known_principals.credential_less_readset_sids`
+    (plus, for a guest token, the domain Guest account itself, matched
+    separately since it is domain-specific). Crucially, an entry that is
+    Authenticated-Users-only (S-1-5-11) is DROPPED — it does not authorize a
+    credential-less read even though it authorizes nearly every real user.
+
+    Args:
+        read_set: The measured read-set records, each carrying at least a
+            ``"sid"`` key.
+        reached_via: ``"guest_session"`` or ``"null_session"`` — which
+            credential-less token reached this read-set. An unrecognized
+            value drops every entry (fail-closed).
+        everyone_includes_anonymous: Passed through to
+            :func:`~adscan_core.reporting.well_known_principals.credential_less_readset_sids`
+            — whether the DC's anonymous-Everyone policy applies.
+
+    Returns:
+        The subset of ``read_set`` entries whose SID the token can actually
+        use, in original order, with every field preserved.
+    """
+    allowed = credential_less_readset_sids(reached_via, everyone_includes_anonymous)
+    is_guest = reached_via == "guest_session"
+    kept: list[Mapping[str, object]] = []
+    for entry in read_set:
+        sid = str(entry.get("sid") or "").strip().upper()
+        if sid in allowed:
+            kept.append(entry)
+        elif is_guest and is_domain_guest_account_sid(sid):
+            kept.append(entry)
+    return kept
+
 
 # File-access mask bits (winacl FILE_ACCESS_MASK / generic mapping). Mirrors
 # the constants in share_collector.py; duplicated here to keep this module
@@ -396,6 +476,107 @@ def compute_effective_file_mask(
     return masks[2]
 
 
+@dataclass
+class ShareAccessResult:
+    """The verified answer to "can this principal read this share" — and why.
+
+    ``accessible`` is the single field a caller should trust for "is this
+    share genuinely usable by this principal". It is computed EFFECTIVE
+    (share ∩ NTFS) whenever both layers were readable — never from the
+    share-level ACL alone, and never from a MaximalAccess probe mask that was
+    not itself confirmed against the real NTFS security descriptor.
+    """
+
+    accessible: bool
+    read_set: list[tuple[str, int]] = field(default_factory=list)
+    graph_verification: str = VERIFICATION_SHARE_ACL_ONLY
+
+
+def _mask_for_principal(
+    aces: Iterable[tuple[str, int]],
+    principal_sid: str,
+    group_sids: Iterable[str],
+) -> int:
+    """OR together the ALLOW-ACE masks that apply to a principal.
+
+    Matches by the principal's own SID or any of its group SIDs — the raw,
+    un-intersected share-level (or NTFS-level) grant for that principal.
+    """
+    candidates = {str(principal_sid or "").strip().upper()}
+    candidates.update(str(g or "").strip().upper() for g in group_sids)
+    candidates.discard("")
+    mask = 0
+    for sid, ace_mask in aces:
+        if str(sid or "").strip().upper() in candidates:
+            mask |= int(ace_mask or 0)
+    return mask
+
+
+def resolve_share_access(
+    *,
+    share_sd_bytes: Optional[bytes],
+    ntfs_sd_bytes: Optional[bytes],
+    principal_sid: str,
+    group_sids: Iterable[str] = (),
+) -> ShareAccessResult:
+    """Resolve a principal's REAL effective access to a share (share ∩ NTFS).
+
+    This is the single source of truth for "is this share genuinely
+    accessible to this principal, and what real ACL entries prove it" — it
+    replaces two shortcuts that over-report access:
+
+    * trusting the SHARE-level ACL alone, which says nothing about the NTFS
+      folder DACL independently DENYING the same principal (the Cicada
+      DEV/NETLOGON/SYSVOL guest-session over-report);
+    * trusting a MaximalAccess probe mask on its own, without confirming it
+      against the real NTFS security descriptor.
+
+    Args:
+        share_sd_bytes: The share-level security descriptor, or ``None``/empty
+            when unreadable.
+        ntfs_sd_bytes: The NTFS folder-root security descriptor, or
+            ``None``/empty when unreadable.
+        principal_sid: The connecting identity's SID.
+        group_sids: The principal's known group SIDs. May be empty (e.g. a
+            credential-less guest/null token) — the winacl evaluator still
+            injects the well-known Everyone / Authenticated Users / BUILTIN
+            groups on top of whatever is passed here.
+
+    Returns:
+        A :class:`ShareAccessResult`. When BOTH security descriptors are
+        readable and the winacl intersection succeeds, ``accessible``
+        reflects the EFFECTIVE (share ∩ NTFS) grant, ``read_set`` is the real
+        NTFS ACEs, and ``graph_verification`` is ``ntfs_computed``. Otherwise
+        it falls back to the raw share-level ACL for that principal — the
+        honest, NTFS-unverified ``share_acl_only`` tier — and never claims
+        more access than the share layer alone actually shows.
+    """
+    if share_sd_bytes and ntfs_sd_bytes:
+        masks = compute_effective_file_masks(
+            share_sd_bytes,
+            ntfs_sd_bytes,
+            principal_sid=principal_sid,
+            group_sids=group_sids,
+        )
+        if masks is not None:
+            _share_mask, _ntfs_mask, effective_mask = masks
+            return ShareAccessResult(
+                accessible=effective_mask_has_read(effective_mask),
+                read_set=parse_sd_aces(ntfs_sd_bytes),
+                graph_verification=VERIFICATION_NTFS_COMPUTED,
+            )
+    # NTFS unreadable, or the intersection could not be evaluated (parse
+    # error / evaluator unavailable) — honest share-level-only fallback.
+    # Never claim NTFS-confirmed access when NTFS was never actually read.
+    share_aces = parse_sd_aces(share_sd_bytes) if share_sd_bytes else []
+    share_mask = _mask_for_principal(share_aces, principal_sid, group_sids)
+    return ShareAccessResult(
+        accessible=effective_mask_has_read(share_mask),
+        read_set=share_aces,
+        graph_verification=VERIFICATION_SHARE_ACL_ONLY,
+    )
+
+
 __all__ = [
     "VERIFICATION_NTFS_COMPUTED",
     "VERIFICATION_SHARE_ACL_ONLY",
@@ -411,4 +592,6 @@ __all__ = [
     "hunt_gate_decision",
     "compute_effective_file_mask",
     "compute_effective_file_masks",
+    "ShareAccessResult",
+    "resolve_share_access",
 ]
