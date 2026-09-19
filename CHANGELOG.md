@@ -8,6 +8,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+## [13.0.0] - 2026-09-19
+
+### Added
+
 - Zero-credential attack paths now begin at an explicit "Unauthenticated (null session)" entry
   step. The kill chain reads from the no-credential start, through the account it derived, all the
   way to full domain compromise, instead of silently starting mid-chain as if the attacker were
@@ -886,7 +896,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v12.0.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v13.0.0...HEAD
+[13.0.0]: https://github.com/ADScanPro/adscan/compare/v12.0.0...v13.0.0
 [12.0.0]: https://github.com/ADScanPro/adscan/compare/v11.3.0...v12.0.0
 [11.3.0]: https://github.com/ADScanPro/adscan/compare/v11.2.0...v11.3.0
 [11.2.0]: https://github.com/ADScanPro/adscan/compare/v11.1.0...v11.2.0
