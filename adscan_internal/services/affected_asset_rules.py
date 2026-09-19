@@ -150,6 +150,17 @@ class AssetRule:
             deliberately so: it is what turned detector rule names into
             "affected assets" in a client report. Turn it on only for a finding
             whose asset list genuinely has no stable key, and say why.
+        collapse_exchange_system_targets: Collapse Exchange health/system mailbox
+            targets (HealthMailbox*, SM_*, SystemMailbox, DiscoverySearchMailbox,
+            FederatedEmail, Migration.*) into a SINGLE annotated inline row on the
+            deliverable PDF, instead of dumping 30+ individual mailbox rows. An
+            ACL-over-user finding (ForceChangePassword) on an Exchange domain is
+            dominated by the Exchange management groups resetting their own system
+            mailboxes, which is expected self-management. Left flat, an
+            Exchange-savvy reader dismisses the whole finding; the collapse keeps
+            the genuinely over-scoped human/service-account grants itemized and
+            de-emphasizes the by-design noise. Display-only: the machine-readable
+            appendix and the structured entities keep every mailbox.
     """
 
     source: SourceMode = SourceMode.PRINCIPALS
@@ -161,6 +172,7 @@ class AssetRule:
     record_name_field: str = ""
     record_entity_type: str = ""
     scan_details_lists: bool = False
+    collapse_exchange_system_targets: bool = False
 
 
 # Fallback for a finding key with no rule. Source principals + non-breaker
@@ -359,10 +371,15 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.DOMAIN_WIDE,
     ),
     # --- ACL abuse: principals + the controlled target -----------------------
+    # On an Exchange domain this finding's target set is dominated by the
+    # Exchange management groups resetting their own health/system mailboxes
+    # (by-design self-management). Collapse those into one annotated row on the
+    # PDF so the genuinely over-scoped human/service-account grants stay visible.
     "force_change_password": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
+        collapse_exchange_system_targets=True,
     ),
     # ``AllExtendedRights`` over an object grants every extended right on it —
     # the affected assets are the principal holding it and the object it holds

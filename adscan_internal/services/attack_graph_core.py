@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable, Mapping
@@ -57,6 +58,7 @@ from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
 from adscan_internal.services.path_state import COVERAGE_SAMPLE_STATUS
+from adscan_internal.services.technique_priority import path_technique_keys
 from adscan_internal.services.attack_step_catalog import (
     context_requirement_satisfied,
     derive_step_display_status,
@@ -1376,6 +1378,287 @@ def _record_is_unauthenticated_reachable(record: dict[str, Any]) -> bool:
     return False
 
 
+def _authenticated_collapse_key(record: Mapping[str, Any]) -> tuple[str, str, frozenset[str]]:
+    """The LOSS-ORACLE collapse key: (source class, terminal asset, remediable-fix SET).
+
+    Two display records may collapse ONLY when this key is equal. The fix SET
+    comes from the SAME ``path_technique_keys`` the remediation ranking uses, so
+    collapse and "Start Here" can never disagree on what "the fix" is. Status is
+    deliberately NOT in the key (handled by the executed-preferring representative
+    selected downstream by ``collapse_equivalent_authenticated_routes``).
+    """
+    source = str(record.get("source") or "")
+    terminal = str(record.get("terminal_target_label") or record.get("target") or "")
+    fixes = frozenset(path_technique_keys(record))
+    return (source, terminal, fixes)
+
+
+# DELIBERATELY includes "partial" and is scoped to collapse REPRESENTATIVE-PREFERENCE
+# only (which twin wins). It is NOT the canonical proven-status SSOT
+# `path_state._PROVEN_STATUSES` — do not "fix" this by importing that set, which
+# omits "partial": a partially-proven twin must still out-rank a purely theoretical
+# one when picking the surviving representative.
+_PROVEN_PATH_STATUSES = {"exploited", "domain_compromised", "success", "partial"}
+
+# Statuses that mean the route was walked END TO END — the full chain, not just
+# its entry step. DELIBERATELY excludes "partial": a partial route only proves
+# the entry step (see `attack_paths_core._derive_display_status_from_steps`), so
+# counting it as "executed" here is what let `executed_route_count` claim an
+# end-to-end walk that never happened (the false "executed 767 of 767 end to
+# end" overclaim on an all-`partial` domain-scope listing). Consumed ONLY for
+# the `executed_route_count` COUNT semantics — representative selection still
+# uses `_PROVEN_PATH_STATUSES` above (a partial twin must still out-rank a
+# purely theoretical one when picking which member survives the fold).
+_FULLY_EXECUTED_PATH_STATUSES = {"exploited", "domain_compromised", "success"}
+
+
+def _path_proof_rank(record: dict[str, Any]) -> int:
+    """Proof rank of a display record: 0 fully-executed, 1 partial, 2 else.
+
+    THREE levels, not a binary "proven vs not": a FULLY-EXECUTED status
+    (``_FULLY_EXECUTED_PATH_STATUSES`` — exploited / domain_compromised / success)
+    out-ranks ``partial`` which out-ranks anything theoretical. Lower rank == more
+    proof. This is the ONE proof-rank definition, consumed by BOTH the
+    executed-preferring representative pick in
+    :func:`collapse_equivalent_authenticated_routes` AND the proof-aware tiebreak
+    in :func:`filter_contained_paths_for_domain_listing` — so the fold and the
+    containment filter can never disagree on which twin carries more proof.
+    """
+    token = str(record.get("status") or "").strip().lower()
+    if token in _FULLY_EXECUTED_PATH_STATUSES:
+        return 0
+    if token == "partial":
+        return 1
+    return 2
+
+
+def _derive_via_alternatives(
+    members: list[dict[str, Any]], rep_src: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Structured fold sub-structure for the attack-graph diagrams (SSOT).
+
+    The flat ``via_interchangeable`` set loses two things a status-colored branch
+    render needs: (a) which STEP each alternative pivot branches at, and (b) each
+    alternative's own status. This derives, for every distinct interior pivot
+    node across the fold members, a structured entry relative to the chosen
+    representative chain:
+
+    ``node`` (label), ``branch_index`` / ``rejoin_index`` (the representative
+    node indices the pivot's detour branches from / rejoins into),
+    ``prev_node`` / ``next_node`` (the mainline neighbours), ``relation_in`` /
+    ``relation_out`` (the pivot's own in/out edge relations, for edge labels),
+    ``status`` (the strongest-proof route the pivot lies on — so a pivot proven
+    on ANY member draws proven), and ``in_representative`` (True when the pivot
+    is already a node in the representative chain — the renderer draws the
+    mainline ONCE and only ADDS the non-representative pivots as branch nodes).
+
+    Handles BOTH fold shapes uniformly (spec §4.3): parallel-alternatives
+    (Admin1/Admin2 at one step) and nesting-sequence (interchangeable interior
+    substitutes). Both reduce to "a set of (node, branch step, rejoin step,
+    status) tuples relative to the representative chain".
+    """
+    rep_nodes = [str(n) for n in (rep_src.get("nodes") or [])]
+    rep_node_set = set(rep_nodes)
+    rep_index: dict[str, int] = {}
+    for i, node in enumerate(rep_nodes):
+        rep_index.setdefault(node, i)  # first index wins on a repeated label
+
+    # Every distinct interior pivot across the fold, first-seen order.
+    distinct: list[str] = []
+    seen: set[str] = set()
+    for m in members:
+        for n in (m.get("nodes") or [])[1:-1]:
+            label = str(n)
+            if label not in seen:
+                seen.add(label)
+                distinct.append(label)
+
+    def _branch_context(member: dict[str, Any], node: str) -> dict[str, Any]:
+        m_nodes = [str(n) for n in (member.get("nodes") or [])]
+        m_relations = [str(r) for r in (member.get("relations") or [])]
+        try:
+            j = m_nodes.index(node)
+        except ValueError:
+            return {}
+        prev_node: str | None = None
+        for k in range(j - 1, -1, -1):
+            if m_nodes[k] in rep_node_set:
+                prev_node = m_nodes[k]
+                break
+        next_node: str | None = None
+        for k in range(j + 1, len(m_nodes)):
+            if m_nodes[k] in rep_node_set:
+                next_node = m_nodes[k]
+                break
+        relation_in = m_relations[j - 1] if 0 <= j - 1 < len(m_relations) else None
+        relation_out = m_relations[j] if 0 <= j < len(m_relations) else None
+        return {
+            "prev_node": prev_node,
+            "next_node": next_node,
+            "branch_index": rep_index.get(prev_node) if prev_node is not None else None,
+            "rejoin_index": rep_index.get(next_node) if next_node is not None else None,
+            "relation_in": relation_in,
+            "relation_out": relation_out,
+        }
+
+    alternatives: list[dict[str, Any]] = []
+    for node in distinct:
+        containing = [m for m in members if node in {str(n) for n in (m.get("nodes") or [])}]
+        if not containing:
+            continue
+        # Strongest-proof route the pivot lies on drives its status + branch context,
+        # so a pivot proven on ANY equivalent route draws proven (honest coloring).
+        chosen = min(containing, key=lambda m: (_path_proof_rank(m), members.index(m)))
+        ctx = _branch_context(chosen, node)
+        if not ctx:
+            continue
+        alternatives.append(
+            {
+                "node": node,
+                "status": str(chosen.get("status") or ""),
+                "in_representative": node in rep_node_set,
+                **ctx,
+            }
+        )
+
+    alternatives.sort(
+        key=lambda a: (
+            a["branch_index"] if a["branch_index"] is not None else -1,
+            a["rejoin_index"] if a["rejoin_index"] is not None else -1,
+            a["node"],
+        )
+    )
+    return alternatives
+
+
+def collapse_equivalent_authenticated_routes(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse near-duplicate authenticated routes to one representative per key.
+
+    Two display records that share an ``_authenticated_collapse_key`` differ only
+    in an interchangeable intermediate pivot (e.g. which group carried the
+    membership hop) and represent the SAME client-remediable exposure. This
+    folds each such group into ONE surviving record, lossless of distinct
+    exposures by construction: one key == one surviving record.
+
+    The representative is executed-preferring — among the group, the member
+    with the strongest proof (a proven status over a theoretical one, then the
+    shortest relation chain, then original order as a stable tie-break) is
+    promoted and annotated with ``equivalent_route_count`` (group size),
+    ``executed_route_count`` (how many members were walked FULLY end to end
+    — ``_FULLY_EXECUTED_PATH_STATUSES``, excludes ``partial``),
+    ``partial_route_count`` (how many members proved only the entry step,
+    ``status == "partial"``, without walking the rest of the chain),
+    ``affected`` (the UNION of every member's affected-principal list, with
+    the representative's own affected set as a floor), and
+    ``via_interchangeable`` (the sorted set of interior pivot node ids any
+    member routed through).
+
+    Records with an empty fix set (``path_technique_keys == []``, no
+    client-remediable exposure) are never collapsed — they carry no
+    remediation ranking signal to reconcile across duplicates, so each is
+    returned unchanged. A key with a single record is likewise returned
+    unchanged beyond stamping ``equivalent_route_count=1`` (no metadata
+    bloat for the common non-duplicated case).
+
+    ORDER-PRESERVING: the output keeps the input order — each group's
+    representative is emitted at the position of its FIRST member and
+    passthrough records stay in place. This matters because this collapse is
+    wired into the domain-listing filter AHEAD of the order-sensitive
+    contextual/prefix dedup stages (6c/6b); reordering the survivors would make
+    a downstream dedup keep a different (equivalent) rendering of the SAME core,
+    surfacing as a spurious add/drop that is not a true fold.
+    """
+    groups: dict[tuple[str, str, frozenset[str]], list[dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        _, _, fixes = _authenticated_collapse_key(r)
+        if not fixes:
+            continue  # no client-remediable exposure -> never collapse (emitted in place below)
+        groups[_authenticated_collapse_key(r)].append(r)
+
+    def _build_representative(members: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(members) == 1:
+            rep = dict(members[0])
+            # Idempotency: this collapse is wired into BOTH the core DFS
+            # domain-listing filter (attack_paths_core) AND the display
+            # post-pipeline's domain branch (attack_graph_service), so on the
+            # report / display_friendly path it runs TWICE. The first pass folds
+            # N interchangeable twins into one representative (stamped
+            # equivalent_route_count=N; the twins dropped), so the second pass
+            # sees that representative ALONE in its key group. A naive reset to 1
+            # here wiped the fold annotation the client report renders (the
+            # PRO SAR / LITE report showed "1 equivalent route" for a real fold).
+            # Preserve a prior multi-route fold verbatim instead of overwriting
+            # its equivalent_route_count / executed_route_count /
+            # partial_route_count / via_interchangeable.
+            prior_count = rep.get("equivalent_route_count")
+            if isinstance(prior_count, int) and prior_count > 1:
+                return rep
+            status = str(rep.get("status"))
+            rep["equivalent_route_count"] = 1
+            rep["executed_route_count"] = 1 if status in _FULLY_EXECUTED_PATH_STATUSES else 0
+            rep["partial_route_count"] = 1 if status == "partial" else 0
+            # A genuine singleton fold has no alternatives to draw.
+            rep["via_alternatives"] = []
+            return rep
+        # Representative rank — THREE levels, not two. A binary
+        # "proven vs not" (``_PROVEN_PATH_STATUSES``, which lumps ``partial`` in
+        # with ``exploited``) let the length tie-break decide between a
+        # fully-walked EXPLOITED twin and a merely-``partial`` one, so a SHORTER
+        # partial route buried the proven end-to-end compromise (the exact
+        # honesty inversion the ``--trace`` surfaced: 3 exploited routes to the
+        # domain folded to 0, the listing read "none walked" while krbtgt was
+        # extracted via DCSync). Rank FULLY-EXECUTED (exploited/domain_compromised/
+        # success) above ``partial`` above theoretical BEFORE length, so a proven
+        # compromise always wins its fold and surfaces as the representative.
+        def _representative_proof_rank(record: dict[str, Any]) -> int:
+            # Delegate to the module-level SSOT so the fold and the containment
+            # filter share ONE proof-rank definition (behaviour unchanged).
+            return _path_proof_rank(record)
+
+        rep_src = min(
+            members,
+            key=lambda r: (
+                _representative_proof_rank(r),
+                len(r.get("relations") or []),
+                records.index(r),
+            ),
+        )
+        rep = dict(rep_src)
+        rep["equivalent_route_count"] = len(members)
+        rep["executed_route_count"] = sum(
+            1 for r in members if str(r.get("status")) in _FULLY_EXECUTED_PATH_STATUSES
+        )
+        rep["partial_route_count"] = sum(1 for r in members if str(r.get("status")) == "partial")
+        affected: set[str] = set()
+        interchange: set[str] = set()
+        for r in members:
+            affected.update(r.get("affected") or [])
+            for n in (r.get("nodes") or [])[1:-1]:
+                interchange.add(str(n))
+        # Keep the representative's own affected set as a floor, then widen with the union.
+        rep["affected"] = sorted(affected.union(rep_src.get("affected") or []))
+        rep["via_interchangeable"] = sorted(interchange)
+        # Structured fold sub-structure for the status-colored diagram branches
+        # (the flat via_interchangeable above is kept as-is for the prose path).
+        rep["via_alternatives"] = _derive_via_alternatives(members, rep_src)
+        return rep
+
+    representatives = {key: _build_representative(members) for key, members in groups.items()}
+
+    result: list[dict[str, Any]] = []
+    emitted: set[tuple[str, str, frozenset[str]]] = set()
+    for r in records:
+        key = _authenticated_collapse_key(r)
+        if not key[2]:
+            result.append(r)  # passthrough, in place
+            continue
+        if key in emitted:
+            continue  # folded twin — its representative already emitted at first occurrence
+        emitted.add(key)
+        result.append(representatives[key])
+    return result
+
+
 def filter_contained_paths_for_domain_listing(
     records: list[dict[str, Any]],
     *,
@@ -1420,6 +1703,30 @@ def filter_contained_paths_for_domain_listing(
     if len(records) <= 1:
         return records, 0
 
+    def _finalize(
+        result: list[dict[str, Any]], removed: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Status-aware fold of interchangeable authenticated twins (domain listing only).
+
+        Runs ``collapse_equivalent_authenticated_routes`` over the containment
+        survivors so twins that share an ``_authenticated_collapse_key`` (same
+        source, terminal, and remediable fix-set) but differ only in an
+        interchangeable middle pivot fold to ONE executed-preferring
+        representative. This replaces the historical status-BLIND widest-affected
+        pick — the collapse prefers a PROVEN twin over a wider theoretical one and
+        widens ``affected`` to their union, closing the ``--trace`` gotcha where an
+        exploited narrow twin was dropped for a theoretical wider one.
+
+        Gated to the domain-listing SSOT (``affected_widening_carveout=True``, set
+        only by ``filter_domain_listing_paths`` for domain scope); the
+        owned/user/principals callers never pass it, so their output is untouched.
+        Non-authenticated / empty-fix records pass through the collapse unchanged.
+        """
+        if not affected_widening_carveout:
+            return result, removed
+        collapsed = collapse_equivalent_authenticated_routes(result)
+        return collapsed, removed + (len(result) - len(collapsed))
+
     normalized: list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]] = []
     for record in records:
         sig = _display_record_exact_signature(record)
@@ -1450,40 +1757,75 @@ def filter_contained_paths_for_domain_listing(
         # single-principal chain that merely PASSES THROUGH Domain Users (1
         # affected). Without the carve-out ``covered`` is a plain containment set
         # (legacy holistic behaviour, byte-identical).
-        covered: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+        # Value is ``(max_affected, best_proof_rank_at_that_affected)``: the MAX
+        # affected-principal count among the kept super-paths covering each
+        # signature, and — at that max-affected level — the BEST (lowest, i.e. most
+        # proven) proof rank among those covering supers. The proof rank feeds the
+        # proof-aware tiebreak below.
+        covered: dict[
+            tuple[tuple[str, ...], tuple[str, ...]], tuple[int, int]
+        ] = {}
+
+        def _mark_covered(
+            sub: tuple[tuple[str, ...], tuple[str, ...]], aff: int, rank: int
+        ) -> None:
+            prev = covered.get(sub)
+            if prev is None or aff > prev[0]:
+                covered[sub] = (aff, rank)
+            elif aff == prev[0]:
+                # Same max-affected level — keep the most-proven (lowest) rank.
+                covered[sub] = (aff, min(prev[1], rank))
+
         kept: list[dict[str, Any]] = []
         removed = 0
         for nodes_t, rels_t, record in normalized:
             sig = (nodes_t, rels_t)
             if sig in covered:
-                if not (
-                    affected_widening_carveout
-                    and _record_affected_principal_count(record) > covered[sig]
-                ):
+                cov_aff, cov_rank = covered[sig]
+                sub_aff = _record_affected_principal_count(record)
+                rescue = False
+                if affected_widening_carveout:
+                    if sub_aff > cov_aff:
+                        # Broader-origin sub-path (strictly more affected than every
+                        # kept super-path covering it) — strictly-more wins.
+                        rescue = True
+                    elif (
+                        sub_aff == cov_aff
+                        and _path_proof_rank(record) == 0
+                        and cov_rank != 0
+                    ):
+                        # Proof-aware tiebreak on an affected TIE: this sub-path is
+                        # FULLY-EXECUTED while the covering super at the max-affected
+                        # level is NOT — rescue it so a proven route is never buried
+                        # inside a longer non-executed chain. Fires ONLY on equality;
+                        # strictly-more still wins above, owned/principals never reach
+                        # here (flag off).
+                        rescue = True
+                if not rescue:
                     removed += 1
                     continue
-                # Broader-origin sub-path (strictly more affected than every kept
-                # super-path covering it) — fall through and keep it.
+                # Rescued — fall through and keep it.
             kept.append(record)
             rel_len = len(rels_t)
             if rel_len <= 0:
                 continue
             aff = _record_affected_principal_count(record)
+            rank = _path_proof_rank(record)
             if preserve_prefix_paths:
                 # O(L): only strict suffixes share the same terminal by definition.
                 # s=0 would be the full path itself — start from 1.
                 for s in range(1, rel_len):
-                    sub = (nodes_t[s:], rels_t[s:])
-                    covered[sub] = max(covered.get(sub, -1), aff)
+                    _mark_covered((nodes_t[s:], rels_t[s:]), aff, rank)
             else:
                 # O(L²): mark every strict contiguous sub-sequence as covered.
                 for start in range(0, rel_len):
                     for end in range(start + 1, rel_len + 1):
                         if end - start >= rel_len:
                             continue
-                        sub = (nodes_t[start : end + 1], rels_t[start:end])
-                        covered[sub] = max(covered.get(sub, -1), aff)
-        return kept, removed
+                        _mark_covered(
+                            (nodes_t[start : end + 1], rels_t[start:end]), aff, rank
+                        )
+        return _finalize(kept, removed)
     else:
         # Owned/principals multi-user mode: keep the most direct path within each
         # contained group, while never collapsing a higher domain-compromise tier
@@ -1621,6 +1963,22 @@ def filter_contained_paths_for_domain_listing(
                                 > _record_affected_principal_count(kept_rec)
                             ):
                                 continue
+                            # Proof-aware tiebreak on an affected TIE (mirrors the
+                            # broader-origin carve-out above, on EQUALITY): keep the
+                            # longer candidate when it is FULLY-EXECUTED while the
+                            # kept sub-path it would collapse into is NOT — so a
+                            # proven route is never buried by a shorter non-executed
+                            # twin of equal blast radius. The redundant non-executed
+                            # sub is dropped in Pass 2. Domain-listing scope only.
+                            if (
+                                affected_widening_carveout
+                                and cand_tier == kept_tier
+                                and _record_affected_principal_count(record)
+                                == _record_affected_principal_count(kept_rec)
+                                and _path_proof_rank(record) == 0
+                                and _path_proof_rank(kept_rec) != 0
+                            ):
+                                continue
                             # Belt-and-suspenders: never collapse a PROVEN
                             # no-credential foothold (the Unauthenticated entry)
                             # into an authenticated subpath that lacks the flag. A
@@ -1729,6 +2087,23 @@ def filter_contained_paths_for_domain_listing(
                         ):
                             dominated = True
                             break
+                        # Proof-aware tiebreak on an affected TIE (mirrors the
+                        # broader-origin carve-out above, on EQUALITY): drop this
+                        # non-executed HV twin in favour of a FULLY-EXECUTED super
+                        # of the same terminal/tier and equal blast radius, so the
+                        # proven route is the one that survives. Domain-listing
+                        # scope only — off, this branch never fires (byte-identical
+                        # to the legacy HV protection).
+                        if (
+                            affected_widening_carveout
+                            and b_tier == a_tier
+                            and kept_terminal_by_id.get(id(other)) == a_terminal
+                            and _record_affected_principal_count(other) == a_aff
+                            and _path_proof_rank(record) != 0
+                            and _path_proof_rank(other) == 0
+                        ):
+                            dominated = True
+                            break
                         continue
                     if b_tier >= a_tier:
                         dominated = True
@@ -1738,7 +2113,7 @@ def filter_contained_paths_for_domain_listing(
             else:
                 pass2_kept.append(record)
 
-        return pass2_kept, removed_multi + pass2_removed
+        return _finalize(pass2_kept, removed_multi + pass2_removed)
 
 
 # ── Domain-scope listing shortest/longest mode ─────────────────────────────────
@@ -5168,13 +5543,27 @@ def _unauth_entry_reader_label(node: dict[str, Any] | None) -> str:
 
     Maps the well-known group node label (``Everyone@WELLKNOWN``,
     ``USERS@ACTIVE.HTB``) to the bare group name (``Everyone`` / ``Users``) that
-    the ``authorized_by_acl`` note carries. A missing node yields an empty string.
+    the ``authorized_by_acl`` note carries. A reader referenced by a raw SID (a
+    collector artifact — the phantom Guest ``S-1-5-21-...-501`` node) is resolved
+    to its friendly name through the well-known-SID SSOT, so the read-set note
+    never carries a raw ``S-1-...`` token. A missing node yields an empty string.
     """
     if not isinstance(node, dict):
         return ""
     label = str(node.get("label") or "").strip()
     if not label:
         return ""
+    if label.split("@", 1)[0].strip().upper().startswith("S-1-"):
+        try:
+            from adscan_internal.services.well_known_principals import (
+                humanize_principal_label,
+            )
+
+            humanized = humanize_principal_label(label)
+            if humanized and not humanized.upper().startswith("S-1-"):
+                return humanized.split("@", 1)[0].strip()
+        except Exception:  # noqa: BLE001 - best-effort humanization
+            pass
     return label.split("@", 1)[0].strip().title()
 
 
@@ -5840,6 +6229,98 @@ def collect_source_step_signatures_on_high_value_paths(
     return results
 
 
+def _node_identity_from_node(node: Any) -> dict[str, str]:
+    """Return a graph node's REAL, machine-resolvable identifiers.
+
+    The display ``label`` is the humanized, realm-qualified name (e.g.
+    ``"EXCHANGE WINDOWS PERMISSIONS@HTB.LOCAL"``) — good for prose but NOT a
+    value any AD tool resolves: it is neither a real ``sAMAccountName`` (case
+    differs, the ``@REALM`` suffix is not part of the attribute), a
+    distinguished name, nor a DNS hostname. The per-step
+    independent-verification / remediation commands need the object's OWN
+    identifiers, sourced from the graph node's ``properties`` (populated by the
+    native collector), so a copy-pasted ``Get-ADObject``/``-ComputerName``
+    command in the client report actually resolves the finding instead of
+    silently matching nothing. Empty strings when a field is not carried on the
+    node (a Domain object has no ``sAMAccountName``; a Group/User has no
+    ``dNSHostName``) — that honest gap is what the verify renderer degrades to
+    an angle-bracket fill-in token, never a fabricated identifier.
+    """
+    props = (
+        node.get("properties")
+        if isinstance(node, dict) and isinstance(node.get("properties"), dict)
+        else {}
+    )
+    # The node's object class ("Group"/"User"/"Computer"/"Domain"/...) is a
+    # top-level graph-node key (``kind``), not a ``properties`` field. Stamped so
+    # the catalog can select an object-class-aware abuse (a group target is abused
+    # with AddMember, never with a user-only password reset / Shadow Credentials /
+    # SPN write). Empty string when the endpoint is a synthetic label with no node.
+    kind = ""
+    if isinstance(node, dict):
+        raw_kind = node.get("kind") or node.get("type") or node.get("labels")
+        if isinstance(raw_kind, (list, tuple)):
+            raw_kind = raw_kind[0] if raw_kind else ""
+        kind = str(raw_kind or "").strip()
+    # The object's SID (``objectId`` on a native node) — the invariant identifier
+    # a downstream renderer uses to decide, per instance, whether the endpoint is a
+    # DYNAMIC well-known identity with no manageable member list (Everyone /
+    # Authenticated Users / Domain Users), which changes the remediation from
+    # "remove principal X from it" (impossible) to "scope what it is granted".
+    sid = ""
+    if isinstance(node, dict):
+        sid = str(
+            node.get("objectId") or node.get("objectid") or props.get("objectsid") or ""
+        ).strip()
+    return {
+        "dn": str(
+            props.get("distinguishedname") or props.get("distinguishedName") or ""
+        ).strip(),
+        "samaccountname": str(
+            props.get("samaccountname") or props.get("sAMAccountName") or ""
+        ).strip(),
+        "dnshostname": str(
+            props.get("dnshostname") or props.get("dNSHostName") or ""
+        ).strip(),
+        "kind": kind,
+        "sid": sid,
+    }
+
+
+def _stamp_step_identity(
+    details: dict[str, Any],
+    source_node: Any,
+    target_node: Any,
+) -> None:
+    """Stamp the REAL source/target identifiers into a step's ``details``.
+
+    Baked here (never derived downstream from the display label) because this is
+    a layer that holds the graph NODES the step's endpoints resolve to — the
+    same reason ``source_privilege_tier`` is stamped here. Keeps the key order
+    consistent between the eager (``decorate=True``) build and the deferred
+    ``decorate_display_record`` seam so the two decoration modes stay
+    byte-identical.
+    """
+    src = _node_identity_from_node(source_node)
+    tgt = _node_identity_from_node(target_node)
+    details["source_dn"] = src["dn"]
+    details["target_dn"] = tgt["dn"]
+    details["source_samaccountname"] = src["samaccountname"]
+    details["target_samaccountname"] = tgt["samaccountname"]
+    details["source_dnshostname"] = src["dnshostname"]
+    details["target_dnshostname"] = tgt["dnshostname"]
+    details["source_kind"] = src["kind"]
+    details["target_kind"] = tgt["kind"]
+    # Fill the endpoint SIDs from the graph node only when the step does not
+    # already carry one (an edge's own notes may provide a more meaningful
+    # source_sid — e.g. the well-known reader SID on a synthetic unauth entry —
+    # which must win over the node's objectId).
+    if src["sid"] and not str(details.get("source_sid") or "").strip():
+        details["source_sid"] = src["sid"]
+    if tgt["sid"] and not str(details.get("target_sid") or "").strip():
+        details["target_sid"] = tgt["sid"]
+
+
 def path_to_display_record(
     graph: dict[str, Any], path: AttackPath, *, decorate: bool = True
 ) -> dict[str, Any]:
@@ -5879,6 +6360,43 @@ def path_to_display_record(
     context_relations = {
         str(rel).strip().lower() for rel in CONTEXT_ONLY_RELATIONS.keys()
     }
+
+    # Environment coordinates for the per-step remediation / verification
+    # commands (the catalog renders {dc_ip}/{domain}/{netbios_domain} into the
+    # copy-paste blocks). These are graph-level facts stamped by
+    # ``save_attack_graph`` — the DNS domain always, the DC/KDC IP via the
+    # ``resolve_dc_ip`` SSOT, and the NetBIOS (flat) domain from the workspace's
+    # persisted ``netbios`` field. Stamping them into every step's ``details``
+    # here means the report (which re-renders remediation/verify at PDF-build
+    # time) inherits real values instead of a literal <domain>/<dc_ip> token,
+    # and a dsacls/NTAccount principal is NetBIOS-qualified (HTB\...), never
+    # DNS-qualified (htb.local\...) which Windows rejects. Absent on an older
+    # graph → left unset and the catalog degrades honestly.
+    _graph_dc_ip = str(graph.get("dc_ip") or "").strip()
+    _graph_domain = str(graph.get("domain") or "").strip()
+    _graph_netbios = str(graph.get("netbios") or "").strip()
+
+    # NetBIOS (flat) domain for NT-account remediation (dsacls ``HTB\principal``).
+    # Prefer the persisted field, but an OLDER graph saved before that field
+    # existed (e.g. Forest) has none — and then the PDF render, which reads the
+    # PERSISTED step details, has no NetBIOS to fill and degrades a dsacls
+    # principal to a literal ``<domain>\`` token (the render-time DNS-derivation
+    # fallback only helps the live ``render_step_remediation`` path, not the
+    # persisted-details PDF path). So derive it here from the DNS domain (first
+    # label uppercased, htb.local -> HTB) — the same heuristic the render
+    # fallback uses — and stamp it so every consumer inherits a real value.
+    _stamp_netbios = _graph_netbios or (
+        _graph_domain.split(".", 1)[0].upper() if _graph_domain else ""
+    )
+
+    def _stamp_env(details: dict[str, Any]) -> None:
+        """Attach dc_ip/domain/netbios_domain to a step's details."""
+        if _graph_dc_ip:
+            details["dc_ip"] = _graph_dc_ip
+        if _graph_domain:
+            details["domain"] = _graph_domain
+        if _stamp_netbios:
+            details["netbios_domain"] = _stamp_netbios
 
     def label(node_id: str) -> str:
         node = nodes_map.get(node_id)
@@ -6063,7 +6581,19 @@ def path_to_display_record(
             step_details["source_privilege_tier"] = privilege_tier_for_node(
                 nodes_map.get(step.from_id)
             ).value
+            # REAL object identifiers (sAMAccountName / DN / dNSHostName) for the
+            # per-step independent-verification + remediation commands. Stamped
+            # here (not derived downstream from the display label) because this
+            # is the one place the graph nodes are in hand; the deferred build
+            # adds the same keys in ``decorate_display_record`` so both modes
+            # produce byte-identical details.
+            _stamp_step_identity(
+                step_details,
+                nodes_map.get(step.from_id),
+                nodes_map.get(step.to_id),
+            )
             step_details.update(step.notes or {})
+            _stamp_env(step_details)
         else:
             # Light build: fold the notes now (needed for the share-name signature
             # and carried by the index-slicing minimisation) but defer the two
@@ -6072,6 +6602,7 @@ def path_to_display_record(
             # re-walk. These private keys are ignored by every signature/slicing
             # stage and are removed by ``decorate_display_record``.
             step_details.update(step.notes or {})
+            _stamp_env(step_details)
             step_record["_decorate_from_id"] = step.from_id
             step_record["_decorate_to_id"] = step.to_id
         steps_for_ui.append(step_record)
@@ -6092,6 +6623,15 @@ def path_to_display_record(
             followup_details["source_privilege_tier"] = privilege_tier_for_node(
                 nodes_map.get(path.target_id)
             ).value
+            # Only the SOURCE (the escalation group) resolves to a node; the
+            # synthetic target is a rendered label with no node, so its identity
+            # honestly degrades to empty strings — the same result the deferred
+            # seam produces from the empty ``_decorate_to_id`` sentinel.
+            _stamp_step_identity(
+                followup_details,
+                nodes_map.get(path.target_id),
+                None,
+            )
         followup_details["reason"] = str(synthetic_followup.get("reason") or "")
         followup_details["synthetic_followup"] = True
         followup_details["followup_source_group"] = label(path.target_id)
@@ -6107,6 +6647,7 @@ def path_to_display_record(
                     "reason": str(synthetic_followup.get("reason") or ""),
                 }
             )
+        _stamp_env(followup_details)
         followup_record: dict[str, Any] = {
             "step": len(steps_for_ui) + 1,
             "action": str(synthetic_followup["relation"]),
@@ -6229,6 +6770,32 @@ def decorate_display_record(
             "to": old_details.get("to", ""),
         }
         new_details["source_privilege_tier"] = caches.tier(from_id)
+        # REAL object identifiers for the verify/remediation commands — the same
+        # keys, in the same position, the eager ``decorate=True`` build stamps
+        # (between ``source_privilege_tier`` and the folded notes), so the two
+        # decoration modes stay byte-identical. Resolved from the stamped
+        # endpoint node ids; an empty ``_decorate_to_id`` (a synthetic follow-up
+        # whose target is a rendered label) honestly degrades to empty strings.
+        src_identity = caches.identity(from_id)
+        tgt_identity = caches.identity(to_id)
+        new_details["source_dn"] = src_identity["dn"]
+        new_details["target_dn"] = tgt_identity["dn"]
+        new_details["source_samaccountname"] = src_identity["samaccountname"]
+        new_details["target_samaccountname"] = tgt_identity["samaccountname"]
+        new_details["source_dnshostname"] = src_identity["dnshostname"]
+        new_details["target_dnshostname"] = tgt_identity["dnshostname"]
+        new_details["source_kind"] = src_identity["kind"]
+        new_details["target_kind"] = tgt_identity["kind"]
+        # Endpoint SIDs — the invariant key a downstream renderer keys the
+        # dynamic-well-known-identity remediation on. Stamped here at the same
+        # position (after ``*_kind``, before the folded notes) the eager
+        # ``_stamp_step_identity`` uses, so the notes below still override a
+        # meaningful edge-notes ``source_sid`` and both decoration modes stay
+        # byte-identical.
+        if src_identity["sid"]:
+            new_details["source_sid"] = src_identity["sid"]
+        if tgt_identity["sid"]:
+            new_details["target_sid"] = tgt_identity["sid"]
         for key, value in old_details.items():
             if key in ("from", "to"):
                 continue
@@ -6274,6 +6841,14 @@ class _DecorationCaches:
         self._principal_facts_from_node = principal_facts_from_node
         self._facts_cache: dict[str, Any] = {}
         self._tier_cache: dict[str, Any] = {}
+        self._identity_cache: dict[str, dict[str, str]] = {}
+
+    def identity(self, node_id: str) -> dict[str, str]:
+        cached = self._identity_cache.get(node_id, _MISSING)
+        if cached is _MISSING:
+            cached = _node_identity_from_node(self._nodes_map.get(node_id))
+            self._identity_cache[node_id] = cached
+        return cached
 
     def _facts(self, node_id: str) -> Any:
         cached = self._facts_cache.get(node_id, _MISSING)

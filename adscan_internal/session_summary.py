@@ -203,6 +203,52 @@ def get_attack_path_summary_breakdown(shell: object) -> dict[str, int]:
     return get_attack_path_snapshot_metrics(shell).to_dict()
 
 
+def _client_path_totals_memo_key(
+    shell: object, domains: list[str] | None, fallback: int
+) -> tuple | None:
+    """Return a hashable memo key for the session path totals, or ``None``.
+
+    The key binds the RESOLVED (placeholder-free) domain set to each domain's
+    graph-epoch fingerprint — the SAME tokens the on-disk attack-path compute
+    cache keys on (:func:`attack_paths_epoch_fingerprint`) — so the memo
+    inherits that invalidation for free: any topology/graph change to a domain
+    changes its fingerprint and the memo misses. ``fallback`` is folded in so
+    the zero-path branch (which returns ``fallback``) can never serve a value
+    resolved under a different fallback.
+
+    Returns ``None`` on any failure, so the caller falls through to an uncached
+    compute rather than serving under a wrong key (best-effort).
+    """
+    try:
+        from adscan_internal.services.attack_graph_service import (
+            attack_paths_epoch_fingerprint,
+        )
+        from adscan_internal.services.attack_step_domain_resolution import (
+            is_placeholder_domain,
+        )
+
+        if domains is None:
+            loaded = getattr(shell, "domains_data", None)
+            names = list(loaded.keys()) if isinstance(loaded, dict) else []
+        else:
+            names = list(domains)
+
+        resolved: list[tuple[str, tuple]] = []
+        for name in names:
+            domain_name = str(name or "").strip()
+            if not domain_name or is_placeholder_domain(domain_name):
+                continue
+            epoch = tuple(attack_paths_epoch_fingerprint(shell, domain_name))
+            resolved.append((domain_name.lower(), epoch))
+
+        # Sort by domain name only (unique keys) so the key is order-stable and
+        # heterogeneous epoch tokens are never compared against each other.
+        ordered = tuple(sorted(resolved, key=lambda item: item[0]))
+        return (frozenset(name for name, _ in ordered), ordered, int(fallback))
+    except Exception:  # noqa: BLE001 - a bad key just disables the memo
+        return None
+
+
 def resolve_client_path_totals(
     shell: object,
     *,
@@ -223,6 +269,13 @@ def resolve_client_path_totals(
        fallback and never the preferred answer.
     3. ``fallback_count``, for a session with neither.
 
+    Source 1 recomputes the full domain-scope attack-path projection, which is
+    seconds of work on a large domain. At exit THREE consumers resolve these
+    totals (the session summary, the report CTA, the ``session_end`` telemetry
+    event), so the result is memoized on the shell keyed by the graph epoch —
+    computed once, shared across the three, and auto-invalidated the instant the
+    graph changes.
+
     Args:
         shell: The active shell (workspace context only).
         domains: Restrict to these domains; ``None`` counts every loaded domain.
@@ -233,12 +286,48 @@ def resolve_client_path_totals(
         Sources 2 and 3 populate only ``paths_total`` / ``paths_proven``, since
         a snapshot carries no exposure or hardening split.
     """
+    fallback = max(0, int(fallback_count or 0))
+
+    memo_key = _client_path_totals_memo_key(shell, domains, fallback)
+    if memo_key is not None:
+        memo = getattr(shell, "_client_path_totals_memo", None)
+        if isinstance(memo, dict):
+            cached = memo.get(memo_key)
+            if cached is not None:
+                return cached
+
+    result = _resolve_client_path_totals_uncached(
+        shell, domains=domains, fallback=fallback
+    )
+
+    if memo_key is not None:
+        try:
+            memo = getattr(shell, "_client_path_totals_memo", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                setattr(shell, "_client_path_totals_memo", memo)
+            memo[memo_key] = result
+        except Exception:  # noqa: BLE001 - memo is best-effort; never break a scan
+            pass
+    return result
+
+
+def _resolve_client_path_totals_uncached(
+    shell: object,
+    *,
+    domains: list[str] | None,
+    fallback: int,
+) -> "ClientPathTotals":
+    """Compute the client path totals without consulting the shell memo.
+
+    Split out from :func:`resolve_client_path_totals` so the memo wrapper owns
+    caching and this stays the pure three-source resolution.
+    """
     from adscan_internal.services.attack_path_counts import (
         ClientPathTotals,
         client_path_totals_for_session,
     )
 
-    fallback = max(0, int(fallback_count or 0))
     try:
         totals = client_path_totals_for_session(shell, domains=domains)
     except Exception as exc:  # pragma: no cover - defensive

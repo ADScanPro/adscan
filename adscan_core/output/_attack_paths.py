@@ -1686,7 +1686,18 @@ def _get_attack_path_narrative_formatters() -> tuple[
     Callable[..., str],
     Callable[..., str],
 ]:
-    """Resolve attack-path label formatters with a LITE-safe fallback."""
+    """Resolve attack-path label formatters with a LITE-safe fallback.
+
+    NODE labels always use the technical :func:`_fallback_format_attack_path_node_label`,
+    NEVER the reporting module's ``format_node_label``. The CLI/TUI attack-path
+    display stays BloodHound-technical (``DOMAIN USERS@ESSOS.LOCAL`` compacts to
+    ``DOMAIN USERS``), per the nomenclature standard: only the CLIENT report
+    surfaces (report graph / prose / writeup / web CTEM) humanize a principal, and
+    they call ``format_node_label`` directly. Pinning the CLI to the technical
+    formatter also keeps the CLI display byte-identical between LITE (fallback) and
+    PRO (reporting module present), instead of diverging by tier. RELATION
+    formatting still prefers the reporting module when present.
+    """
     global _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED
     try:
         import importlib
@@ -1694,20 +1705,18 @@ def _get_attack_path_narrative_formatters() -> tuple[
         module = importlib.import_module(
             "adscan_internal.reporting.attack_path_narratives"
         )
-        format_node_label = getattr(module, "format_node_label", None)
         format_relation_label = getattr(module, "format_relation_label", None)
         format_relation_display = getattr(module, "format_relation_display", None)
         format_relation_source_context = getattr(
             module, "format_relation_source_context", None
         )
         if (
-            callable(format_node_label)
-            and callable(format_relation_label)
+            callable(format_relation_label)
             and callable(format_relation_display)
             and callable(format_relation_source_context)
         ):
             return (
-                format_node_label,
+                _fallback_format_attack_path_node_label,
                 format_relation_label,
                 format_relation_display,
                 format_relation_source_context,

@@ -21,6 +21,7 @@ from adscan_internal.services.identity_risk_service import (
     load_or_build_identity_risk_snapshot,
 )
 from adscan_internal.services.membership_snapshot import load_membership_snapshot
+from adscan_internal.services.well_known_principals import humanize_principal_for_prose
 from adscan_internal.workspaces import (
     domain_subpath,
     read_json_file,
@@ -59,6 +60,22 @@ def _canonical_membership_label(domain: str, value: str) -> str:
         if left and right:
             return f"{left.strip().upper()}@{right.strip().upper()}"
     return f"{raw.upper()}@{str(domain or '').strip().upper()}"
+
+
+def _humanized_display_label(raw: str, kind: str) -> str:
+    """Return the client display form of a choke-point principal name.
+
+    The choke-point record's ``source_label`` / ``target_label`` / ``title`` /
+    ``choke_point_reason`` are client-facing (the "Start here" PDF section AND the
+    web CTEM), so a principal is named through the prose humanizer SSOT — an
+    all-caps user de-shouts (``SVC_TGS`` -> ``svc_tgs``), a well-known group
+    renders canonical (``Users`` / ``Backup Operators``). The uppercase
+    ``_canonical_membership_label`` stays the case-insensitive JOIN key; this is
+    only the DISPLAY. The dedup key downstream lower-cases these, so a humanized
+    label dedups identically.
+    """
+    name = str(raw or "").split("@", 1)[0].strip()
+    return humanize_principal_for_prose(label=name, kind=kind) or name
 
 
 def _normalize_username(value: str) -> str:
@@ -162,11 +179,13 @@ def build_identity_choke_point_snapshot(shell: object, domain: str) -> dict[str,
         for direct_group in direct_groups if isinstance(direct_groups, list) else []:
             target_label = _canonical_membership_label(domain, direct_group)
             target_meta = group_meta.get(target_label, {})
+            source_display = _humanized_display_label(username, "user")
+            target_display = _humanized_display_label(target_label, "group")
             record = classify_control_transition(
-                source_label=username,
+                source_label=source_display,
                 source_kind="user",
                 source_control_level=source_control_level,
-                target_label=target_label.split("@", 1)[0],
+                target_label=target_display,
                 target_kind="group",
                 target_control_level=str(
                     target_meta.get("control_level") or "standard"
@@ -184,8 +203,7 @@ def build_identity_choke_point_snapshot(shell: object, domain: str) -> dict[str,
                 },
                 target_semantics=target_meta,
                 reason=(
-                    f"{username} gains membership exposure to "
-                    f"{target_label.split('@', 1)[0]}"
+                    f"{source_display} gains membership exposure to {target_display}"
                 ),
             )
             if isinstance(record, dict):
@@ -195,15 +213,17 @@ def build_identity_choke_point_snapshot(shell: object, domain: str) -> dict[str,
         source_label = _canonical_membership_label(domain, child_group)
         source_meta = group_meta.get(source_label, {})
         source_control_level = str(source_meta.get("control_level") or "standard")
+        source_display = _humanized_display_label(source_label, "group")
         for parent in parent_groups if isinstance(parent_groups, list) else []:
             target_label = _canonical_membership_label(domain, parent)
             target_meta = group_meta.get(target_label, {})
             affected_users = users_by_group.get(source_label, set())
+            target_display = _humanized_display_label(target_label, "group")
             record = classify_control_transition(
-                source_label=source_label.split("@", 1)[0],
+                source_label=source_display,
                 source_kind="group",
                 source_control_level=source_control_level,
-                target_label=target_label.split("@", 1)[0],
+                target_label=target_display,
                 target_kind="group",
                 target_control_level=str(
                     target_meta.get("control_level") or "standard"
@@ -214,12 +234,14 @@ def build_identity_choke_point_snapshot(shell: object, domain: str) -> dict[str,
                 source_semantics=source_meta,
                 target_semantics=target_meta,
                 reason=(
-                    f"{source_label.split('@', 1)[0]} exposes its members to "
-                    f"{target_label.split('@', 1)[0]}"
+                    f"{source_display} exposes its members to {target_display}"
                 ),
             )
             if isinstance(record, dict):
-                samples = sorted(affected_users, key=str.lower)[:10]
+                samples = [
+                    _humanized_display_label(user, "user")
+                    for user in sorted(affected_users, key=str.lower)[:10]
+                ]
                 record["affected_user_samples"] = samples
                 choke_points.append(record)
 

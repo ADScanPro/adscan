@@ -48,10 +48,16 @@ from adscan_internal.services.xml_sanitization_service import (
 from adscan_internal import (
     print_info_verbose,
     print_info_debug,
+    print_instruction,
     print_warning,
     print_warning_debug,
 )
 from adscan_internal import telemetry
+from adscan_internal.services.numpy_baseline_diagnostic import (
+    is_numpy_baseline_failure,
+    numpy_baseline_instructions,
+    numpy_baseline_warning,
+)
 from adscan_core.rich_output import print_exception
 
 
@@ -845,6 +851,23 @@ class CredSweeperService(BaseService):
                     jobs=jobs,
                 )
             except Exception as exc:  # noqa: BLE001
+                if is_numpy_baseline_failure(str(exc)):
+                    # The CPU lacks the x86-64-v2 baseline NumPy 2.x needs (common in
+                    # a VM whose hypervisor exposes a generic virtual CPU). Name the
+                    # real cause + the fix ONCE (via the shared SSOT) instead of a
+                    # per-ruleset traceback that reads like a broken install, and skip
+                    # credential scanning cleanly: the scan continues, this tool is an
+                    # honest coverage gap, not a crash.
+                    telemetry.capture(
+                        "credsweeper_numpy_baseline_unsupported",
+                        properties={"ruleset": label},
+                    )
+                    if not getattr(self, "_numpy_baseline_warned", False):
+                        print_warning(numpy_baseline_warning("Credential scanning"))
+                        for line in numpy_baseline_instructions():
+                            print_instruction(line)
+                        self._numpy_baseline_warned = True
+                    continue
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 print_warning(f"Credential analysis failed for path ({label} rules).")

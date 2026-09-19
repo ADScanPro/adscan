@@ -337,6 +337,11 @@ def build_remediation_start_here(
             ),
             executed=row_executed,
             mapped=not row_executed,
+            # For an executed row, also state the broader mapped blast radius so
+            # a high-leverage fix (few executed, many mapped) does not read as
+            # narrower than a lower mapped row (MED-1).
+            mapped_breadth=paths_affected if row_executed else None,
+            total_mapped=total_mapped_paths if row_executed else None,
         )
         choke_id = _resolve_row_choke_identifier(entry.get("top_choke_point"))
         badge = bool(is_structural_choke(choke_id, card_map))
@@ -387,6 +392,11 @@ def build_remediation_start_here(
         executed=top_executed,
         mapped=not top_executed,
         bounded=bounded,
+        # For an executed top fix, also carry the broader all-status blast radius
+        # so the headline card states BOTH breadths (executed + total), matching
+        # the Start-Here row it summarises and never reading narrower than it.
+        mapped_breadth=rows[0]["paths_affected"] if top_executed else None,
+        total_mapped=total_mapped_paths if top_executed else None,
     )
     # A single linear attack chain leaves the leading rows tied on the exact
     # same paths-broken count — the ranking already reorders that tie by

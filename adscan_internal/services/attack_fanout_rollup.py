@@ -76,6 +76,165 @@ _FANOUT_COLLAPSE_FLOOR: int = 10
 # headline finding, never elided).
 _FANOUT_SAMPLE_MAX: int = 5
 
+# Well-known source-principal classification for the blast-radius view — the SSOT
+# both the PRODUCER (the non-executable-edge gate below) and the PDF display
+# (:mod:`adscan_internal.pro.reporting.html_pdf_generator`) reference, so a source
+# is classified in exactly ONE place.
+#
+# An UNAUTHENTICATED identity (Anonymous Logon, well-known SID ``S-1-5-7``) holds
+# NO credentials at all — it can only READ (the anonymous LDAP bind) and CANNOT
+# exercise a write ACE, so its control/escalation/derived edges are
+# non-executable (see :func:`_source_is_unauthenticated`). An IMPLICIT identity
+# (Everyone, Authenticated Users) IS an authenticated population that CAN write,
+# so its control edges are legitimate reach. Both read differently in the display
+# from a named privileged group whose membership a client can audit and remove.
+# SIDs are Microsoft constants; the name set is the fallback for a record that
+# carries only a display label (the collector labels Anonymous Logon by name).
+_UNAUTHENTICATED_SOURCE_SIDS: frozenset[str] = frozenset({"S-1-5-7"})
+_UNAUTHENTICATED_SOURCE_NAMES: frozenset[str] = frozenset({"anonymous logon", "anonymous"})
+_IMPLICIT_SOURCE_SIDS: frozenset[str] = frozenset({"S-1-1-0", "S-1-5-11"})
+_IMPLICIT_SOURCE_NAMES: frozenset[str] = frozenset({"everyone", "authenticated users"})
+
+# The write/exercise edge kinds an unauthenticated (no-credential) actor CANNOT
+# perform. A control ACE, an escalation primitive, or a proven-control derived
+# edge all require an authenticated session to exercise; from Anonymous Logon
+# they are non-executable and must not be counted as blast-radius reach. AUTH
+# edges (the anonymous LDAP bind / read exposure) are the only real
+# unauthenticated reach and are NEVER gated.
+_WRITE_EXERCISE_EDGE_KINDS: frozenset[EdgeKind] = frozenset(
+    {EdgeKind.CONTROL, EdgeKind.ESCALATION, EdgeKind.DERIVED}
+)
+
+
+def fanout_source_access_class(source_principal_id: Any, source_label: Any = "") -> str:
+    """Classify a blast-radius source as unauthenticated / implicit / named.
+
+    The single classifier for the source of a fan-out spoke, shared by the
+    producer gate and the PDF display so both agree by construction.
+
+    Returns ``"unauthenticated"`` for the Anonymous Logon identity (reach that
+    needs no credential at all), ``"implicit"`` for a population every account
+    already belongs to (Everyone, Authenticated Users), and ``""`` for a named
+    principal whose membership a client can audit and remove. Detected by
+    well-known SID first (precise), then by canonical display name (the
+    collector labels Anonymous Logon by name, not a SID). Accepts a raw
+    ``name:<label>`` node id and strips the prefix.
+
+    Args:
+        source_principal_id: The source node id / SID (may carry a ``name:``
+            prefix or a ``user@domain`` suffix).
+        source_label: The source display label, used as the name fallback.
+
+    Returns:
+        ``"unauthenticated"``, ``"implicit"``, or ``""``.
+    """
+    raw = str(source_principal_id or "").strip()
+    bare = raw.split("name:", 1)[-1].strip() if raw.lower().startswith("name:") else raw
+    sid = bare.upper()
+    name = str(source_label or bare or "").strip().lower().split("@", 1)[0].strip()
+    if sid in _UNAUTHENTICATED_SOURCE_SIDS or name in _UNAUTHENTICATED_SOURCE_NAMES:
+        return "unauthenticated"
+    if sid in _IMPLICIT_SOURCE_SIDS or name in _IMPLICIT_SOURCE_NAMES:
+        return "implicit"
+    return ""
+
+
+def _source_is_unauthenticated(source_principal_id: Any, source_label: Any = "") -> bool:
+    """Return True when the source is the unauthenticated (Anonymous Logon) identity."""
+    return fanout_source_access_class(source_principal_id, source_label) == "unauthenticated"
+
+
+@dataclass(frozen=True)
+class GroupActorIndex:
+    """Which groups have >=1 authenticated real actor (a transitive member).
+
+    Built by the caller from the membership SSOT
+    (:func:`attack_paths_core.build_group_member_index`, which already merges the
+    implicit primary-group / Domain Users membership and expands nested groups)
+    and threaded into :func:`fanout_input_from_edge` so the blast-radius gate can
+    drop an EMPTY group — one with 0 transitive real ``User`` / ``Computer``
+    members — whose control reach no actor could ever exercise. This keeps this
+    module pure and schema-agnostic: no membership import lives here.
+
+    Authoritative ONLY for its own domain. A source label from a DIFFERENT domain
+    (cross-forest / well-known) returns ``None`` (unknown), so the gate stays
+    conservative and never drops reach it cannot judge.
+
+    Attributes:
+        domain_suffix: The ``@DOMAIN`` suffix (upper-case) the index covers,
+            e.g. ``"@HTB.LOCAL"``.
+        populated_labels: Canonical (upper-case ``NAME@DOMAIN``) labels of every
+            group with >=1 transitive real actor member. A group absent from this
+            set — but within ``domain_suffix`` — is authoritatively empty.
+    """
+
+    domain_suffix: str
+    populated_labels: frozenset[str]
+
+    def status_for(self, source_label: Any) -> bool | None:
+        """Return ``True`` (has an actor) / ``False`` (empty) / ``None`` (unknown).
+
+        ``True`` when the group is in :attr:`populated_labels`; ``False`` when it
+        is within this index's domain but absent (authoritatively empty); ``None``
+        when the label belongs to a different domain (out of authority → keep).
+        """
+        raw = str(source_label or "").strip()
+        if raw.lower().startswith("name:"):
+            raw = raw.split("name:", 1)[-1].strip()
+        canonical = raw.upper()
+        if not canonical.endswith(self.domain_suffix):
+            return None
+        return canonical in self.populated_labels
+
+
+def blast_radius_source_is_exercisable(
+    relation: str,
+    source_principal_id: Any,
+    source_label: Any = "",
+    *,
+    group_actor_status: bool | None = None,
+) -> bool:
+    """Return True when a write/exercise edge's SOURCE could be exercised by an actor.
+
+    The principled blast-radius gate (honesty / Exposure-Validation): a
+    ``control`` / ``escalation`` / ``derived`` edge is EXERCISABLE reach only when
+    its source principal has >=1 AUTHENTICATED real actor that could exercise it.
+    It SUBSUMES the unauthenticated-source gate and adds the empty-group case:
+
+    * an ``auth`` / read edge (the anonymous bind, ``CanRDP`` …) is always real
+      reach — never gated here (returns ``True``);
+    * an UNAUTHENTICATED identity (Anonymous Logon) holds no credential and cannot
+      exercise a write ACE → ``False``;
+    * a broad IMPLICIT identity (Everyone / Authenticated Users) is populated by
+      every authenticated principal → ``True``;
+    * a group the caller resolved as EMPTY (``group_actor_status is False`` — 0
+      transitive real actors) has no actor to exercise its reach → ``False``;
+    * a real actor (User / Computer), a populated group, or an unknown/unjudgeable
+      source → ``True`` (conservative; never drop unproven reach).
+
+    Args:
+        relation: Raw terminal-edge relation (e.g. ``"GenericAll"``).
+        source_principal_id: The source node id / SID.
+        source_label: The source display label (name fallback for classification).
+        group_actor_status: For a GROUP source, ``True`` if it has >=1 transitive
+            real actor member, ``False`` if authoritatively empty, ``None`` if
+            unknown / not a group / no membership data. Resolved by the caller via
+            :meth:`GroupActorIndex.status_for` — pass ``None`` for non-group sources.
+
+    Returns:
+        ``True`` to keep the edge as blast-radius reach, ``False`` to drop it.
+    """
+    if classify_edge_kind(relation) not in _WRITE_EXERCISE_EDGE_KINDS:
+        return True
+    access = fanout_source_access_class(source_principal_id, source_label)
+    if access == "unauthenticated":
+        return False
+    if access == "implicit":
+        return True
+    if group_actor_status is False:
+        return False
+    return True
+
 
 def resolve_collapse_floor(floor: int | None = None) -> int:
     """Return the effective fan-out collapse floor.
@@ -368,6 +527,14 @@ def fanout_input_from_path(
     # single-edge path this is the path source.
     source_principal_id = nodes[-2] if len(nodes) >= 2 else str(path.get("source") or nodes[0])
 
+    # An unauthenticated actor (Anonymous Logon) cannot exercise a write ACE, so
+    # a control/escalation/derived terminus from it is non-executable and never a
+    # blast-radius finding (its read exposure stays via its auth edges). The path
+    # adapter has no membership index at this seam, so the empty-group case is not
+    # judged here (the edge adapter — the primary production path — handles it).
+    if not blast_radius_source_is_exercisable(edge_relation, source_principal_id, source_principal_id):
+        return None
+
     node_index = node_index or {}
     target_node = node_index.get(target_label)
     target_is_domain = str((target_node or {}).get("kind") or "").strip().lower() == "domain"
@@ -398,6 +565,8 @@ def fanout_input_from_path(
 def fanout_input_from_edge(
     edge: Mapping[str, Any],
     node_index: Mapping[str, Mapping[str, Any]] | None = None,
+    *,
+    group_actor_index: GroupActorIndex | None = None,
 ) -> FanoutInput | None:
     """Adapt one raw attack-graph edge into a :class:`FanoutInput`.
 
@@ -439,6 +608,25 @@ def fanout_input_from_edge(
         return None
 
     source_label = str(from_node.get("label") or from_node.get("name") or from_id)
+
+    # The membership-based blast-radius gate — keep this write/exercise edge only
+    # when its SOURCE has >=1 authenticated real actor that could exercise it. An
+    # unauthenticated actor (Anonymous Logon) cannot write; a GROUP with 0
+    # transitive real members has no actor to exercise its reach either — both are
+    # NON-EXECUTABLE and must not be counted as blast-radius reach (honesty /
+    # Exposure-Validation). A real User/Computer, a populated group, or a broad
+    # well-known identity (Everyone / Authenticated Users) stays; an auth/read edge
+    # (the anonymous LDAP bind) is real reach and is never gated. The empty-group
+    # verdict is resolved ONLY for GROUP sources against the per-domain membership
+    # index, so a real actor is never mistaken for an empty group.
+    group_actor_status: bool | None = None
+    if group_actor_index is not None and str(from_node.get("kind") or "").strip().lower() == "group":
+        group_actor_status = group_actor_index.status_for(source_label)
+    if not blast_radius_source_is_exercisable(
+        relation, from_id, source_label, group_actor_status=group_actor_status
+    ):
+        return None
+
     target_label = str(to_node.get("label") or to_node.get("name") or to_id)
     target_is_domain = str(to_node.get("kind") or "").strip().lower() == "domain"
     target_tier = resolve_fanout_target_tier(
@@ -698,8 +886,11 @@ __all__ = [
     "FanoutInput",
     "FanoutStep",
     "FanoutRollup",
+    "GroupActorIndex",
     "resolve_collapse_floor",
     "resolve_fanout_target_tier",
+    "fanout_source_access_class",
+    "blast_radius_source_is_exercisable",
     "fanout_input_from_path",
     "fanout_input_from_edge",
     "rollup_fanout",

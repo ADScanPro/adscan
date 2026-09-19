@@ -1106,6 +1106,129 @@ def _link_unauthenticated_reach_findings(
     return updated
 
 
+#: The catalog ``vuln_key`` a proven, credential-less anonymous LDAP bind lands
+#: under. The ``LDAPAnonymousBind`` graph relation is an ENTRY vector, not an
+#: exploitation edge (it owns no ``vuln_key``), so :func:`_group_reportable_edges_by_key`
+#: never turns it into a finding — yet a proven anonymous bind accepted on a DC is a
+#: first-class finding a client must see and remediate. Mirrors the same-named entry
+#: in ``pro/reporting/vuln_catalog.py`` (and the ``ldap_anonymous`` slice of
+#: ``VULN_CATALOG_META`` in LITE).
+_ANONYMOUS_LDAP_BIND_VULN_KEY = "ldap_anonymous"
+
+
+def _proven_anonymous_ldap_bind_edge(edges: list[Any]) -> dict[str, Any] | None:
+    """Return the proven credential-less anonymous LDAP bind edge, or ``None``.
+
+    The unauthenticated probe records a successful anonymous LDAP bind as an
+    ``LDAPAnonymousBind`` entry-vector edge (``kind="auth"``, notes
+    ``authentication="anonymous_bind"``). It carries no ``vuln_key``, so the
+    exploitation-edge derivation never materializes it — this locates it so the
+    anonymous-bind finding can be synthesized directly from the proof. Returns the
+    first such edge whose status is ``success`` (an unproven / attempted bind is
+    never rendered as a confirmed finding).
+    """
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip().lower()
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        is_anon = relation == "ldapanonymousbind" or (
+            str(notes.get("authentication") or "").strip().lower() == "anonymous_bind"
+        )
+        if not is_anon:
+            continue
+        if str(edge.get("status") or "").strip().lower() == "success":
+            return edge
+    return None
+
+
+def _stamp_anonymous_bind_dc_context(
+    finding: dict[str, Any], edge: dict[str, Any], *, now: str
+) -> bool:
+    """Stamp the DC-target context a proven anonymous bind carries onto the finding.
+
+    A successful anonymous LDAP bind is, by construction, accepted BY a domain
+    controller (the LDAP server it bound to). Recording the DC among the finding's
+    ``details`` lets the shared contextual-CVSS overlay (``ldap_anonymous`` ->
+    ``CONDITION_DC_TARGETS``) elevate the finding's ADscan Priority so it lands in
+    the immediate remediation window, matching the executive summary's "close first"
+    ranking. Honest: the DC is the host that accepted the credential-less bind, not
+    a claim of domain compromise. Idempotent — only writes when the value changes.
+    """
+    notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+    dc = str(notes.get("pdc") or notes.get("dc") or notes.get("dc_ip") or "").strip()
+    details = finding.get("details")
+    if not isinstance(details, dict):
+        details = {}
+    changed = False
+    if dc and details.get("dc_hosts") != [dc]:
+        details["dc_hosts"] = [dc]
+        changed = True
+    finding["details"] = details
+    if changed:
+        finding["last_seen"] = now
+    return changed
+
+
+def _materialize_anonymous_ldap_bind_finding(
+    anon_edge: dict[str, Any] | None,
+    findings: list[Any],
+    findings_by_key: dict[str, Any],
+    catalog_by_key: dict[str, dict[str, Any]],
+    *,
+    now: str,
+) -> bool:
+    """Synthesize the ``ldap_anonymous`` finding from a proven anonymous-bind edge.
+
+    The anonymous-bind entry vector owns no ``vuln_key``, so the exploitation-edge
+    derivation skips it. This materializes the finding directly from the proof
+    (mirroring the ``gpp_passwords`` unauthenticated-link path in
+    :func:`_link_unauthenticated_reach_findings`) so a proven, credential-less
+    directory read reaches the Technical Findings and the remediation roadmap
+    instead of surfacing only as a blast-radius row. Idempotent: an existing
+    finding is left in place and only its DC context is backfilled.
+
+    Args:
+        anon_edge: The proven ``LDAPAnonymousBind`` edge, or ``None`` when the graph
+            carries no successful anonymous bind (then this is a no-op).
+        findings: The domain's mutable findings list.
+        findings_by_key: The ``vuln_key`` -> finding index (kept in sync).
+        catalog_by_key: The resolved finding catalog.
+        now: The ISO timestamp to stamp on a freshly materialized finding.
+
+    Returns:
+        ``True`` when a finding was created or updated.
+    """
+    if anon_edge is None:
+        return False
+    existing = findings_by_key.get(_ANONYMOUS_LDAP_BIND_VULN_KEY)
+    if isinstance(existing, dict):
+        return _stamp_anonymous_bind_dc_context(existing, anon_edge, now=now)
+
+    catalog = catalog_by_key.get(_ANONYMOUS_LDAP_BIND_VULN_KEY, {})
+    catalog_knowledge = catalog.get("knowledge")
+    finding: dict[str, Any] = {
+        "id": uuid.uuid4().hex,
+        "key": _ANONYMOUS_LDAP_BIND_VULN_KEY,
+        "title": catalog.get("title", "LDAP Anonymous Bind Enabled"),
+        "severity": catalog.get("severity", "medium"),
+        "category": catalog.get("category", "LDAP"),
+        "status": "confirmed",
+        "from_attack_graph": True,
+        "details": {},
+        "evidence": [],
+        "discovered_at": now,
+        "first_seen": now,
+        "last_seen": now,
+    }
+    if isinstance(catalog_knowledge, dict) and catalog_knowledge:
+        finding["knowledge"] = catalog_knowledge
+    _stamp_anonymous_bind_dc_context(finding, anon_edge, now=now)
+    findings.append(finding)
+    findings_by_key[_ANONYMOUS_LDAP_BIND_VULN_KEY] = finding
+    return True
+
+
 def sync_attack_graph_findings(
     shell: ReportShell,
     domain: str,
@@ -1174,7 +1297,16 @@ def sync_attack_graph_findings(
         and edge["notes"].get("unauthenticated_reachable")
         for edge in edges
     )
-    if not edges_by_key and not gated_keys and not has_unauth_link_edge:
+    # A proven anonymous LDAP bind is an ENTRY vector (no vuln_key), so it never
+    # reaches ``edges_by_key`` — resolve it once here so its finding is synthesized
+    # even in a domain whose only exposure is the credential-less directory read.
+    anon_bind_edge = _proven_anonymous_ldap_bind_edge(edges)
+    if (
+        not edges_by_key
+        and not gated_keys
+        and not has_unauth_link_edge
+        and anon_bind_edge is None
+    ):
         return False
 
     catalog_by_key = _resolve_finding_catalog()
@@ -1300,6 +1432,13 @@ def sync_attack_graph_findings(
             if personalized != finding.get("knowledge"):
                 finding["knowledge"] = personalized
                 updated = True
+
+    # Synthesize the anonymous-bind finding from the proven entry-vector edge
+    # (owns no vuln_key, so the exploitation-edge derivation above skipped it).
+    if _materialize_anonymous_ldap_bind_finding(
+        anon_bind_edge, findings, findings_by_key, catalog_by_key, now=now
+    ):
+        updated = True
 
     # Link loose credential-leak findings to their proven-unauthenticated entry
     # edge (node-id hook, not vuln_key) and derive their contextual severity from

@@ -313,6 +313,38 @@ def origin_display_label(origin: str) -> str:
     return pretty.title() if pretty else raw
 
 
+# Client-safe label for a blank / anonymous logon credential. The built-in
+# Guest (and the anonymous session) authenticate with an EMPTY password, never a
+# recovered secret, so the credential TYPE is not "Password" — it is a blank /
+# anonymous logon with no secret at all. This is the ONE label both the
+# compromised-credentials provenance table (the credential-type column) and the
+# post-compromise containment obligations ("disable it, there is no password to
+# rotate") describe it with, so the two paid surfaces can never disagree on what
+# the same credential is.
+BLANK_ANONYMOUS_LOGON_LABEL = "Blank / anonymous logon (no secret)"
+
+
+def is_blank_anonymous_credential(origin: Any) -> bool:
+    """Return True when a compromised credential is a blank / anonymous logon.
+
+    The built-in Guest and the anonymous session authenticate with an EMPTY
+    password rather than a recovered secret; their credential-origin slug is
+    :data:`ORIGIN_BLANK_PASSWORD` (``blankpassword``). Deriving this fact here
+    ONCE lets the provenance table label the credential TYPE honestly (a blank /
+    anonymous logon, never "Password") AND the containment obligations tell the
+    client to DISABLE the account rather than rotate a password that does not
+    exist — both consuming the same source of truth, so they never contradict
+    each other.
+
+    Args:
+        origin: The raw ``credentials_meta[<user>]["credential_origin"]`` slug.
+
+    Returns:
+        ``True`` iff the origin is the blank-password acquisition.
+    """
+    return _normalize_origin(origin) == _normalize_origin(ORIGIN_BLANK_PASSWORD)
+
+
 def origin_slug_for_relation(relation: str) -> str:
     """Return the canonical credential-origin slug for an attack-graph relation.
 

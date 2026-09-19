@@ -1234,6 +1234,23 @@ def offer_updates_for_command(
         )
         return
 
+    # Offline / air-gapped runs must not hit the version probe either: it is an
+    # outbound PyPI + Docker Hub call, so "disable every external lookup"
+    # (--offline / ADSCAN_OFFLINE / ADSCAN_NO_EXTERNAL) has to cover it. The
+    # --offline flag is already applied to the launcher env by
+    # _apply_host_posture_env before this runs, so both the flag and the raw
+    # env-var form are caught here at the single SSOT. Truthiness is decided by
+    # the offline SSOT (never re-implemented), fed the ctx env accessor so it
+    # stays test-injectable.
+    from adscan_core.offline import OFFLINE_ENV_VARS, offline_mode_enabled
+
+    offline_env = {name: (ctx.os_getenv(name, "") or "") for name in OFFLINE_ENV_VARS}
+    if offline_mode_enabled(env=offline_env):
+        ctx.print_info_debug(
+            "[update] Offline mode active; skipping version probe (no PyPI / Docker Hub call)."
+        )
+        return
+
     # Maintainer dev channel should not show update checks/prompts.
     # CLI `--dev` and env-driven detection are unified here: either path
     # leads to the same skip.

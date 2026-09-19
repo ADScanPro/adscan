@@ -738,6 +738,54 @@ def _sampled_statement(exposure_source_count: int | None) -> str:
     )
 
 
+def exposure_population_reconciliation(
+    *,
+    exposure_source_count: int | None,
+    user_account_count: int | None,
+    ordinary_user_count: int | None,
+) -> str:
+    """Return one clause reconciling the three exposure-population figures.
+
+    The sampled-coverage note anchors on ``exposure_source_count`` (every
+    principal that reaches a high-value target, groups and computers included).
+    Two further figures appear elsewhere in the deliverable: the user accounts
+    among them and the non-administrative subset of those. A reader who meets all
+    three without a bridge reads them as competing totals. This clause states how
+    they nest, so the same three numbers read as one population broken down.
+
+    Rendered only when the counts nest coherently (``ordinary <= users <= total``)
+    and there is something to break down (either a non-user remainder or a
+    non-administrative subset). Any incoherent or missing input yields an empty
+    string, so a stale or partial artifact never prints a self-contradicting line.
+    """
+    try:
+        total = int(exposure_source_count)
+        users = int(user_account_count)
+        ordinary = int(ordinary_user_count)
+    except (TypeError, ValueError):
+        return ""
+    if not (0 <= ordinary <= users <= total) or users <= 0:
+        return ""
+    non_user = total - users
+    if non_user <= 0 and ordinary >= users:
+        # Nothing to reconcile: every reaching principal is a user account and
+        # every one of those is non-administrative, so the total already says it.
+        return ""
+    user_noun = "user account" if users == 1 else "user accounts"
+    lead = f"Of that total, {users} {'is a' if users == 1 else 'are'} {user_noun}"
+    if ordinary < users:
+        those = "it" if ordinary == 1 else "those"
+        lead += f" and {ordinary} of {those} {'is' if ordinary == 1 else 'are'} non-administrative"
+    if non_user > 0:
+        remainder = (
+            "1 is a group or a computer"
+            if non_user == 1
+            else f"{non_user} are groups and computers"
+        )
+        return f"{lead}. The remaining {remainder}."
+    return f"{lead}."
+
+
 def build_attack_path_coverage(
     *,
     bounded: bool = False,
@@ -952,4 +1000,5 @@ __all__ = [
     "build_attack_path_coverage",
     "attack_path_coverage_view",
     "merge_attack_path_coverage",
+    "exposure_population_reconciliation",
 ]

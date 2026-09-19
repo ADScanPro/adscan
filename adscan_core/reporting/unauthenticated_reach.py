@@ -249,7 +249,7 @@ def unauthenticated_headline(validated_routes: int = 1) -> str:
     noun = "route" if routes == 1 else "routes"
     verb = "begins" if routes == 1 else "begin"
     return (
-        "An attacker with no credentials reached full domain compromise. "
+        "A path to full domain compromise starts here with no credentials at all. "
         f"ADscan confirmed {routes} {noun} that {verb} with no account and no "
         "foothold to obtain first."
     )

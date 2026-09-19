@@ -191,6 +191,31 @@ _CLASSIFIERS: tuple[tuple[re.Pattern[str], PullFailureKind, bool], ...] = (
         "auth_or_rate_limit",
         False,
     ),
+    # GHCR (and other OCI registries) return a BARE `unauthorized` or
+    # `denied` on a manifest/HEAD failure, with NO "authentication
+    # required" / "requested access" suffix — e.g.
+    #   Head "https://ghcr.io/v2/.../manifests/latest": unauthorized
+    # so the two two-phrase patterns above miss it and it used to fall
+    # through to the generic "unclassified error" panel. Route it to the
+    # same auth panel, but stay CONSERVATIVE so an unrelated line merely
+    # containing the word never matches: require the token to either
+    #   (a) trail a `:` at end-of-line (the registry-response shape
+    #       `<request>: unauthorized`), or
+    #   (b) co-occur on its line with a registry API marker (`/v2/` or
+    #       `manifest`/`manifests`, as in the request URL that failed).
+    # Kept BELOW toomanyrequests and the two-phrase patterns so the more
+    # specific classifiers still win (top-down match order).
+    (
+        re.compile(
+            r"(?mi)("
+            r":\s*(?:unauthorized|denied)\s*$"
+            r"|\b(?:unauthorized|denied)\b[^\n]*(?:/v2/|\bmanifests?\b)"
+            r"|(?:/v2/|\bmanifests?\b)[^\n]*\b(?:unauthorized|denied)\b"
+            r")",
+        ),
+        "auth_or_rate_limit",
+        False,
+    ),
     (
         re.compile(r"\bno\s+space\s+left\s+on\s+device\b", re.IGNORECASE),
         "no_disk_space",

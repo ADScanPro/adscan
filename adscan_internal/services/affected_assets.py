@@ -38,6 +38,10 @@ from adscan_internal.services.affected_asset_rules import (
     rule_for,
 )
 from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
+from adscan_internal.services.well_known_principals import (
+    humanize_domain_for_display,
+    humanize_principal_for_prose,
+)
 
 #: Reserved key under a finding's ``details`` carrying the engine's typed,
 #: correlation-ready affected-asset entities. Declared here — the base module —
@@ -1308,14 +1312,72 @@ def extract_affected_assets(
     report details. This helper prefers explicit asset keys but also handles
     summarized lists stored under ``sample``.
     """
-    return prefer_precise_share_locators(
-        _extract_affected_assets_raw(
-            vuln_name,
-            vuln_data,
-            domain_name=domain_name,
-            attack_paths=attack_paths,
-        )
+    return _humanize_principal_assets(
+        prefer_precise_share_locators(
+            _extract_affected_assets_raw(
+                vuln_name,
+                vuln_data,
+                domain_name=domain_name,
+                attack_paths=attack_paths,
+            )
+        ),
+        vuln_data,
+        domain_name,
     )
+
+
+def _humanize_principal_assets(
+    assets: list[str], vuln_data: Any, domain_name: str | None
+) -> list[str]:
+    """Humanize every PRINCIPAL-typed asset string in place at the flat SSOT.
+
+    This is the ONE seam where the affected-assets flat list is made
+    client-ready, so EVERY consumer of :func:`extract_affected_assets` — the SAR
+    Affected Assets field, the machine-readable appendix and exports, the
+    Playbook, the compliance host scraper, the report builder — names a principal
+    exactly as the report graph, the writeup and the web CTEM do. A ``user`` /
+    ``group`` asset is routed through the prose humanizer SSOT
+    :func:`~adscan_internal.services.well_known_principals.humanize_principal_for_prose`
+    so an all-caps user account (``SVC_TGS``) reads ``svc_tgs``, a well-known
+    identity renders canonical (``Everyone`` / ``Users``), a ``@WELLKNOWN``
+    sentinel is stripped, and a bare SID resolves to a friendly name. A host, the
+    domain object, a template, a CA, a share and an artifact are not principals
+    and pass through untouched (keyed off the engine-resolved asset type, with
+    the string heuristic as the fallback). A trailing qualifier
+    (`` · attribute``) is preserved; only the principal name is humanized.
+    """
+    if not assets:
+        return assets
+    type_index = build_asset_type_index(vuln_data)
+    humanized: list[str] = []
+    for asset in assets:
+        asset_type = resolve_asset_type(asset, type_index)
+        name, sep, qualifier = str(asset).partition(ACCOUNT_QUALIFIER_SEPARATOR)
+        if asset_type in ("user", "group"):
+            display = humanize_principal_for_prose(
+                label=name.strip(),
+                kind="Group" if asset_type == "group" else "User",
+                report_domain=str(domain_name or ""),
+            )
+        elif asset_type in ("host", "domain") and "." in name:
+            # A host FQDN (``DC.ACTIVE.HTB``) and the domain object (``ACTIVE.HTB``)
+            # are case-insensitive DNS names the graph stores SHOUTING; the rest of
+            # the report renders them lower-case (``dc.active.htb`` / ``active.htb``).
+            # Route through the same domain SSOT the graph node labels use so the
+            # affected-assets list, the Playbook and the appendix name a host the
+            # SAME lower-case way as the attack-path diagram. Only a DOTTED token is
+            # a domain / FQDN; a bare NetBIOS host or a machine account (``BRAAVOS$``)
+            # is left untouched here (its FQDN display already lower-cases at the
+            # struct SSOT ``format_host_display``).
+            display = humanize_domain_for_display(name.strip())
+        else:
+            humanized.append(asset)
+            continue
+        if not display:
+            humanized.append(asset)
+            continue
+        humanized.append(f"{display}{sep}{qualifier}" if sep else display)
+    return humanized
 
 
 def _drop_machine_account_shadows(assets: list[str]) -> list[str]:
@@ -1519,7 +1581,7 @@ def affected_assets_overflow_line(remaining: int) -> str:
     """
     asset_word = "asset" if remaining == 1 else "assets"
     return (
-        f"… and {remaining} more {asset_word} — "
+        f"… and {remaining} more {asset_word}: "
         f"full list in {AFFECTED_ASSETS_APPENDIX_FILENAME}"
     )
 
@@ -1594,6 +1656,60 @@ def build_affected_asset_records(
     return records
 
 
+#: Name fragments (substring match, lowercased leaf) that identify an Exchange
+#: health / system mailbox — the accounts Exchange creates and manages for its
+#: own monitoring, discovery, migration and federation. A ForceChangePassword
+#: grant from an Exchange management group onto one of these is by-design
+#: self-management, not an over-scoped delegation.
+_EXCHANGE_SYSTEM_MAILBOX_SUBSTRINGS: tuple[str, ...] = (
+    "healthmailbox",
+    "systemmailbox",
+    "discoverysearchmailbox",
+    "federatedemail",
+    "migration.",
+    "exchange online-applicationaccount",
+)
+#: Name prefixes (lowercased leaf) that identify an Exchange-provisioned account:
+#: ``SM_*`` are the linked accounts Exchange creates for shared / room mailboxes.
+_EXCHANGE_SYSTEM_MAILBOX_PREFIXES: tuple[str, ...] = ("sm_",)
+
+
+def _exchange_mailbox_leaf(asset: str) -> str:
+    """Return the lowercased account leaf of an affected-asset display string."""
+    name = asset.strip().lower()
+    if "\\" in name:  # DOMAIN\sAMAccountName
+        name = name.rsplit("\\", 1)[-1]
+    # A display string may carry a ``account · qualifier`` suffix — the account
+    # is the part before the separator.
+    name = name.split(" · ", 1)[0]
+    return name.strip()
+
+
+def _is_exchange_system_mailbox(asset: str) -> bool:
+    """Return True when the affected asset is an Exchange health/system mailbox.
+
+    Matches on the account name only (HealthMailbox*, SM_*, SystemMailbox,
+    DiscoverySearchMailbox, FederatedEmail, Migration.*), so an Exchange source
+    principal (``Exchange Windows Permissions``, ``Exchange Servers``) is never
+    caught — only the by-design mailbox TARGETS are.
+    """
+    leaf = _exchange_mailbox_leaf(asset)
+    if not leaf:
+        return False
+    if any(leaf.startswith(prefix) for prefix in _EXCHANGE_SYSTEM_MAILBOX_PREFIXES):
+        return True
+    return any(fragment in leaf for fragment in _EXCHANGE_SYSTEM_MAILBOX_SUBSTRINGS)
+
+
+def _exchange_system_mailbox_collapse_line(count: int) -> str:
+    """Return the single annotated row that stands in for the Exchange mailboxes."""
+    noun = "mailbox" if count == 1 else "mailboxes"
+    return (
+        f"{count} Exchange system {noun} (HealthMailbox and SM_ accounts), "
+        "reset by Exchange as part of normal operation"
+    )
+
+
 def build_affected_assets_display_entries(
     vuln_name: str,
     vuln_data: Any,
@@ -1611,6 +1727,14 @@ def build_affected_assets_display_entries(
     that names the bundled appendix carrying the complete list. The render path
     therefore only ever materialises ``<= cap`` entries, so a finding with
     thousands of affected assets cannot bloat the PDF or the template loop.
+
+    A finding whose :class:`AssetRule` sets
+    ``collapse_exchange_system_targets`` (ForceChangePassword) folds every
+    Exchange health/system mailbox target into ONE annotated row, so the
+    genuinely over-scoped human/service-account grants stay itemized and the
+    by-design Exchange self-management does not drown them. Display-only: the
+    machine-readable appendix and the structured entities still carry every
+    mailbox.
     """
     summary = summarize_affected_assets(
         vuln_name,
@@ -1618,15 +1742,47 @@ def build_affected_assets_display_entries(
         domain_name=domain_name,
         attack_paths=attack_paths,
     )
-    total_assets = int(summary["total_assets"])
+    # Principals are already humanized at the flat SSOT (extract_affected_assets),
+    # so every consumer — this display list, the appendix/exports, the Playbook —
+    # names them identically. No per-surface humanization here.
     prioritized_assets = list(summary["prioritized_assets"])
 
+    if rule_for(vuln_name).collapse_exchange_system_targets:
+        return _build_display_entries_collapsing_exchange(prioritized_assets)
+
+    total_assets = int(summary["total_assets"])
     if total_assets <= INLINE_AFFECTED_ASSETS_CAP:
         return [("bullet", asset) for asset in prioritized_assets]
 
     shown = prioritized_assets[:INLINE_AFFECTED_ASSETS_CAP]
     entries: list[tuple[str, str]] = [("bullet", asset) for asset in shown]
     remaining = total_assets - len(shown)
+    if remaining > 0:
+        entries.append(("paragraph", affected_assets_overflow_line(remaining)))
+    return entries
+
+
+def _build_display_entries_collapsing_exchange(
+    prioritized_assets: list[str],
+) -> list[tuple[str, str]]:
+    """Render the affected-asset entries with Exchange system mailboxes folded.
+
+    Non-Exchange assets (source principals + genuinely over-scoped human/service
+    targets) are itemized in priority order, capped at
+    :data:`INLINE_AFFECTED_ASSETS_CAP` with the usual overflow line. The Exchange
+    health/system mailbox targets are replaced by ONE annotated row appended
+    last, so they are disclosed but de-emphasized.
+    """
+    exchange_mailboxes = [a for a in prioritized_assets if _is_exchange_system_mailbox(a)]
+    other_assets = [a for a in prioritized_assets if not _is_exchange_system_mailbox(a)]
+
+    shown = other_assets[:INLINE_AFFECTED_ASSETS_CAP]
+    entries: list[tuple[str, str]] = [("bullet", asset) for asset in shown]
+    if exchange_mailboxes:
+        entries.append(
+            ("bullet", _exchange_system_mailbox_collapse_line(len(exchange_mailboxes)))
+        )
+    remaining = len(other_assets) - len(shown)
     if remaining > 0:
         entries.append(("paragraph", affected_assets_overflow_line(remaining)))
     return entries

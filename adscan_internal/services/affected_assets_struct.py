@@ -14,7 +14,7 @@ The contract (one entity per affected asset)::
       "type":       "user" | "computer" | "group" | "domain" | "template"
                     | "ca" | "share" | "artifact" | "credential",
       "identifier": <stable join key>,   # sAMAccountName / FQDN / template name…
-      "display":    <human label>,       # "MEEREEN.ESSOS.LOCAL (192.168.180.12)"
+      "display":    <human label>,       # "meereen.essos.local (192.168.180.12)"
       "role":       "source" | "target" | "affected",
       "sid":        <SID if known>,
       "ip":         <IP if a host and known>,
@@ -23,8 +23,10 @@ The contract (one entity per affected asset)::
       "node_id":    <attack-graph node id if resolvable>,
     }
 
-Host entities ALWAYS carry both IP and FQDN when the inventory resolves them
-(the owner's mandatory rule: ``MEEREEN.ESSOS.LOCAL (192.168.180.12)``).
+Host entities ALWAYS carry both IP and FQDN when the inventory resolves them,
+rendered in canonical lower case for the client deliverable (a DNS host name is
+case-insensitive; the CLI keeps the technical casing): ``meereen.essos.local
+(192.168.180.12)``.
 
 The resolution from a bare sAMAccountName / SID to IP+FQDN+SID is done against an
 :class:`AssetIndex` built once from the workspace attack graph. The composition
@@ -69,6 +71,7 @@ from adscan_internal.services.affected_assets import (
     is_precise_share_locator,
     iter_account_records,
 )
+from adscan_internal.services.well_known_principals import humanize_principal_for_prose
 
 # Entity type constants — the typed axis the platform correlates on.
 TYPE_USER = "user"
@@ -371,16 +374,25 @@ def load_asset_index(workspace_dir: str | Path, domain: str) -> AssetIndex:
 def format_host_display(*, fqdn: str = "", ip: str = "", fallback: str = "") -> str:
     """Return the canonical host label carrying BOTH FQDN and IP when known.
 
-    Owner's mandatory rule: ``MEEREEN.ESSOS.LOCAL (192.168.180.12)``. Falls back
-    gracefully when only one identifier is available, and to ``fallback`` (the
-    bare account name) when neither resolves.
+    Format: ``meereen.essos.local (192.168.180.12)``. AD / DNS host names are
+    case-INSENSITIVE, so a host renders in the canonical LOWER case — the same
+    casing the attack-path diagram, the domain block and the rest of the report
+    use — instead of the graph's SHOUTING label. This closes the cross-surface
+    inconsistency where the findings / appendix shouted ``DC.ACTIVE.HTB`` while
+    every other surface read ``dc.active.htb`` (reverses the earlier uppercase
+    rule; client-facing display only, the CLI is untouched). Falls back gracefully
+    when only one identifier is available, and to ``fallback`` (the bare account
+    name) when neither resolves.
     """
-    name = (fqdn or fallback or "").strip()
+    # Lower-case the FQDN only (a case-insensitive DNS name); a bare fallback
+    # machine-account name (``CASTELBLACK$``) is a principal, not a domain/FQDN,
+    # so its casing is out of scope here and left as stored.
+    name = (fqdn or "").strip().lower() or (fallback or "").strip()
     ip = (ip or "").strip()
     if name and ip:
-        return f"{name.upper()} ({ip})"
+        return f"{name} ({ip})"
     if name:
-        return name.upper()
+        return name
     if ip:
         return ip
     return str(fallback or "").strip()
@@ -505,12 +517,20 @@ def _entity_for_principal(
     sam = (node.samaccountname if node else "") or _strip_realm(text)
     sid = (node.sid if node else "") or sid_hint
     upn = node.upn if node else ""
-    display = sam
+    is_group = node is not None and node.kind == TYPE_GROUP
+    # The DISPLAY is client-facing (web CTEM + the flat report), so name the
+    # principal the way the prose humanizer SSOT does — an all-caps user sam
+    # de-shouts (``SVC_TGS`` -> ``svc_tgs``), a well-known identity renders
+    # canonical (``Everyone`` / ``Users``). The IDENTIFIER stays the raw sam so
+    # correlation/joins are unchanged.
+    display = humanize_principal_for_prose(
+        label=sam, samaccountname=sam, kind=TYPE_GROUP if is_group else TYPE_USER
+    ) or sam
     if upn:
-        display = f"{sam} ({upn})"
+        display = f"{display} ({upn})"
     return _qualified_entity(
         AffectedAssetEntity(
-            type=TYPE_GROUP if node is not None and node.kind == TYPE_GROUP else TYPE_USER,
+            type=TYPE_GROUP if is_group else TYPE_USER,
             identifier=sam,
             display=display,
             role=role,

@@ -264,13 +264,20 @@ _TIER0_COMPROMISE_CLASSES: frozenset[str] = frozenset(
 #: * ``privileged_escalator``  → ``"T3"`` — Privilege-escalation enabler.
 #:   Reaches a privileged asset (e.g. an issuance-policy group via ESC13, or a
 #:   server via LSA dump) but does not constitute domain takeover on its own.
+#: * ``compromise_enabler``    → ``"T4"`` — Stepping stone to Tier 0. A
+#:   validated route that advances toward Tier 0 without landing on a Tier 0
+#:   asset or escalation group. Tracked as its own tier so the report's
+#:   Compromise Reach quartet sums to the domain's whole path total — folding
+#:   it into T3 (as the report used to) undercounted the executive headline
+#:   against the engine-stamped ``path_axis`` total.
 #:
-#: Any other / unknown class maps to ``None`` and is NOT counted in these three
-#: tiers (it is neither domain compromise nor a tracked enabler tier here).
+#: Any other / unknown class maps to ``None`` and is NOT counted in these four
+#: tiers (e.g. ``unauthenticated_principal``, ``""``).
 _COMPROMISE_CLASS_TO_REPORT_TIER: dict[str, str] = {
     "domain_breaker": "T1",
     "tier0_foothold": "T2",
     "privileged_escalator": "T3",
+    "compromise_enabler": "T4",
 }
 
 #: Legacy fallback ONLY — for records that predate ``compromise_class`` stamping
@@ -282,26 +289,27 @@ _OUTCOME_CLASS_TO_REPORT_TIER: dict[str, str] = {
     "direct_domain_control": "T1",
     "direct_compromise": "T1",
     "tier0_foothold": "T2",
-    "domain_compromise_enabler": "T3",
     "followup_terminal": "T3",
     "high_impact_privilege": "T3",
+    "domain_compromise_enabler": "T4",
 }
 
 
 def report_tier_for_class(compromise_class: str | None) -> str | None:
-    """Map a path ``compromise_class`` to its report tier (``T1``/``T2``/``T3``).
+    """Map a path ``compromise_class`` to its report tier (``T1``-``T4``).
 
-    This is the single source of truth for the report's 3-tier exposure
-    breakdown. Returns ``None`` for any class outside the three tracked tiers
-    (e.g. ``compromise_enabler``, ``unauthenticated_principal``, ``""``), so
-    callers can count only the three canonical tiers.
+    This is the single source of truth for the report's 4-tier exposure
+    breakdown (the Compromise Reach quartet). Returns ``None`` for any class
+    outside the four tracked tiers (e.g. ``unauthenticated_principal``,
+    ``""``), so callers can count only the four canonical tiers.
 
     Args:
         compromise_class: The engine's per-path ``compromise_class`` value.
 
     Returns:
         ``"T1"`` (full domain compromise), ``"T2"`` (Tier-0 host foothold),
-        ``"T3"`` (privilege-escalation enabler), or ``None`` if not tracked.
+        ``"T3"`` (privilege-escalation enabler), ``"T4"`` (stepping stone to
+        Tier 0), or ``None`` if not tracked.
     """
     return _COMPROMISE_CLASS_TO_REPORT_TIER.get(
         (compromise_class or "").strip().lower()
@@ -320,7 +328,7 @@ def report_tier_for_record(record: Mapping[str, Any]) -> str | None:
         record: An attack-path record mapping.
 
     Returns:
-        ``"T1"`` / ``"T2"`` / ``"T3"`` or ``None`` when untracked.
+        ``"T1"`` / ``"T2"`` / ``"T3"`` / ``"T4"`` or ``None`` when untracked.
     """
     tier = report_tier_for_class(record.get("compromise_class"))
     if tier is not None:
@@ -335,11 +343,15 @@ def count_report_tiers(
     *,
     exposure_only: bool = False,
 ) -> dict[str, int]:
-    """Tally attack-path records into the three canonical report tiers.
+    """Tally attack-path records into the four canonical report tiers.
 
     Reads each record's ``compromise_class`` and routes it through
-    :func:`report_tier_for_class`. Records whose class is outside the three
-    tracked tiers are ignored (not counted in any bucket).
+    :func:`report_tier_for_class`. Records whose class is outside the four
+    tracked tiers are ignored (not counted in any bucket). The four buckets
+    are the whole Compromise Reach quartet the executive summary renders —
+    summing them equals the domain's OPEN-exposure attack-path total (with
+    ``exposure_only=True``), which is what keeps the report's reach chips
+    from silently undercounting against the engine-stamped total.
 
     Args:
         records: Attack-path records, each a mapping carrying
@@ -355,9 +367,9 @@ def count_report_tiers(
 
     Returns:
         ``{"T1": <full domain compromise>, "T2": <Tier-0 footholds>,
-        "T3": <privilege-escalation enablers>}``.
+        "T3": <privilege-escalation enablers>, "T4": <stepping stones>}``.
     """
-    counts = {"T1": 0, "T2": 0, "T3": 0}
+    counts = {"T1": 0, "T2": 0, "T3": 0, "T4": 0}
     for record in records:
         if not isinstance(record, Mapping):
             continue
@@ -617,6 +629,12 @@ def derive_domain_user_reach(
         tiers = _coerce_tier_breakdown(domain_breakdown)
         if tiers is None or sum(tiers) != domain_affected or domain_affected <= 0:
             continue
+        # NOTE: this DomainUserReach.ordinary_total is a SEPARATE internal figure
+        # (the LITE report displays the sprawl's ``ordinary_count`` instead, so it
+        # never shows this denominator). It deliberately keeps the observed-tier0
+        # subtraction and does NOT pass ``population_tier0`` — the PRO PDF + web KPI
+        # are the surfaces that exclude the full Tier-0 population (they call
+        # derive_ordinary_breaker_stat with population_tier0 directly).
         stat = derive_ordinary_breaker_stat(
             tier0=tiers[0],
             tier1=tiers[1],

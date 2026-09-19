@@ -334,10 +334,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Skip the launcher/runtime version probe and update prompts (no "
-            "PyPI / Docker Hub call). Usable as a prefix before any command, "
-            "including container passthroughs. Mid-engagement / airgapped / "
-            "version-pinned use only."
+            "PyPI / Docker Hub call). Alias: --no-update. Usable as a prefix "
+            "before any command, including container passthroughs. "
+            "Mid-engagement / airgapped / version-pinned use only. Note: "
+            "--offline already skips the probe on its own."
         ),
+    )
+    # Alias for the flag above: --no-update is the exact name a user is likely to
+    # guess (issue #24). Hidden from --help (the canonical row already names it as
+    # an alias) so it does not widen the option column, and default=SUPPRESS so it
+    # never resets the canonical flag's value when absent. Same dest.
+    parser.add_argument(
+        "--no-update",
+        action="store_true",
+        dest="no_update_check",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     # ``metavar="command"`` keeps the usage synopsis to ``adscan ... command``
     # (follows the convention used by `git`, `gh`, `docker`) so subcommands
@@ -392,10 +404,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help=(
             "Skip the launcher/runtime version probe and update prompts for "
-            "this run. Use only when you intentionally want to stay on the "
-            "current version (mid-engagement, airgapped, pinned for a "
-            "customer requirement)."
+            "this run (alias: --no-update). Use when you intentionally stay on "
+            "the current version (mid-engagement, airgapped, pinned for a "
+            "customer requirement). --offline already skips the probe on its own."
         ),
+    )
+    # Hidden alias of --no-update-check on the same dest (issue #24: --no-update
+    # is the name users guess). SUPPRESS help so it does not widen the option
+    # column; SUPPRESS default so it never resets the value when absent.
+    update_check_parent.add_argument(
+        "--no-update",
+        action="store_true",
+        dest="no_update_check",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
 
     check = sub.add_parser(

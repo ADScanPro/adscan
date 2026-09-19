@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from adscan_core.reporting.principal_display import humanize_principal_for_prose
+
 #: Client-facing badge for a ranked remediation item that maps to a true
 #: structural choke point (an articulation point in the attack graph with no
 #: alternate route). Removing it closes routes that have no other way around, so
@@ -158,6 +160,18 @@ def build_identity_choke_rows(identity_choke_points: object) -> list[dict]:
             continue
         if is_nonactionable_structural_choke("", src):
             continue
+        # The record stores labels RAW (shouting, e.g. ``DEV SUPPORT`` /
+        # ``BACKUP OPERATORS``) by design — they are join-key data at persist time.
+        # Humanize ON EMIT, at this shared render SSOT, so BOTH the PDF and the web
+        # CTEM (which read these same rows) name the principal exactly as the rest
+        # of the report does. ``source_kind`` / ``target_kind`` are stamped by the
+        # classifier; pass them so a shouting GROUP reads as words, not lower-case.
+        src_display = humanize_principal_for_prose(
+            label=src, kind=str(cp.get("source_kind") or "")
+        )
+        tgt_display = humanize_principal_for_prose(
+            label=tgt, kind=str(cp.get("target_kind") or "")
+        )
         affected = 0
         for key in ("affected_user_count", "blast_radius"):
             try:
@@ -169,8 +183,8 @@ def build_identity_choke_rows(identity_choke_points: object) -> list[dict]:
                 break
         rows.append(
             {
-                "object": f"{src} → {tgt}",
-                "protected_target": tgt,
+                "object": f"{src_display} → {tgt_display}",
+                "protected_target": tgt_display,
                 "severity": _CHOKE_SEVERITY_LABELS.get(sev, sev.title() or "High"),
                 "severity_rank": rank,
                 "routes_severed": affected,
@@ -319,6 +333,8 @@ def remediation_kpi_lines(
     executed: bool,
     mapped: bool = False,
     bounded: bool = False,
+    mapped_breadth: int | None = None,
+    total_mapped: int | None = None,
 ) -> dict[str, str]:
     """Return the three KPI-card lines for the top prioritised remediation.
 
@@ -367,6 +383,20 @@ def remediation_kpi_lines(
         big_noun = "path" if top_paths_broken == 1 else "paths"
         ratio = "Top fix breaks validated attack paths ADscan executed"
         context = "Executed end to end, closed by one fix"
+        # State the WIDER blast radius too when the fix also breaks theoretical
+        # paths beyond the executed ones — so the headline card never reads
+        # narrower than the Start-Here row it summarises (the Forest
+        # "1 of 1 executed / 22 of 43 total" case).
+        if (
+            mapped_breadth is not None
+            and total_mapped is not None
+            and mapped_breadth > top_paths_broken
+        ):
+            breadth_noun = "attack path" if mapped_breadth == 1 else "attack paths"
+            context = (
+                f"Executed end to end; breaks {mapped_breadth:,} of "
+                f"{total_mapped:,} {breadth_noun} in total"
+            )
     elif mapped:
         big_noun = "path" if top_paths_broken == 1 else "paths"
         ratio = "Top fix breaks mapped attack paths"
@@ -390,6 +420,8 @@ def remediation_item_line(
     total_validated_paths: int,
     executed: bool,
     mapped: bool = False,
+    mapped_breadth: int | None = None,
+    total_mapped: int | None = None,
 ) -> str:
     """Return the per-item client line for a prioritised remediation.
 
@@ -417,6 +449,16 @@ def remediation_item_line(
             The wording avoids any execution/validation claim ("mapped attack
             paths ADscan has not yet executed"). Ignored when ``executed`` is
             set; the executed stance wins.
+        mapped_breadth: For an ``executed`` row, the fix's TOTAL blast radius
+            across all statuses (the technique's all-status ``paths_affected``).
+            When it exceeds ``paths_broken`` — i.e. the fix also breaks
+            theoretical paths beyond the executed ones — the line appends the
+            broader count so the highest-leverage fix (few executed, many
+            mapped) does not read as NARROWER than a lower row worded off its
+            mapped count. Ignored when ``executed`` is not set, or when it does
+            not exceed ``paths_broken`` (nothing wider to state).
+        total_mapped: The denominator for ``mapped_breadth`` (the all-status
+            total in scope). Required alongside ``mapped_breadth``.
 
     Returns:
         A single human-grade English sentence. No percentage, no em-dash.
@@ -425,10 +467,22 @@ def remediation_item_line(
         noun = (
             "validated attack path" if paths_broken == 1 else "validated attack paths"
         )
-        return (
+        line = (
             f"Eliminates {paths_broken:,} of {total_validated_paths:,} {noun} "
             f"ADscan executed."
         )
+        if (
+            mapped_breadth is not None
+            and total_mapped is not None
+            and mapped_breadth > paths_broken
+        ):
+            breadth_noun = "attack path" if mapped_breadth == 1 else "attack paths"
+            line = (
+                f"Eliminates {paths_broken:,} of {total_validated_paths:,} {noun} "
+                f"ADscan executed, and {mapped_breadth:,} of {total_mapped:,} "
+                f"{breadth_noun} in total."
+            )
+        return line
     if mapped:
         noun = "mapped attack path" if paths_broken == 1 else "mapped attack paths"
         return (

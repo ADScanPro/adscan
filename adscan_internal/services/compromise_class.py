@@ -2256,7 +2256,12 @@ def derive_tier0_population_stat(
 
 
 def derive_ordinary_breaker_stat(
-    *, tier0: int, tier1: int, tier2: int, domain_user_count: int
+    *,
+    tier0: int,
+    tier1: int,
+    tier2: int,
+    domain_user_count: int,
+    population_tier0: int | None = None,
 ) -> dict[str, Any]:
     """Derive the tier-aware, NON-CIRCULAR ordinary-account domain-compromise stat.
 
@@ -2275,16 +2280,21 @@ def derive_ordinary_breaker_stat(
     denominator both drop the Tier-0 population.
 
     Denominator. ``ordinary_total`` is the domain's non-Tier-0 user population,
-    ``domain_user_count - tier0``. When the whole domain is in scope (the broad
-    group case), the affected Tier-0 count equals the domain's Tier-0 count, so
-    ``domain_user_count - tier0`` equals the ordinary users that hold the path
-    and the stat reads X of X (100% of non-administrative accounts). In a
-    partial-scope case the affected Tier-0 count is a lower bound of the
-    domain's Tier-0 population, so the denominator is an upper bound of the true
-    ordinary total — a conservative percentage that never overstates the alarm.
-    The denominator is floored at ``ordinary_with_breaker`` so a degenerate
-    input (unknown / zero ``domain_user_count``) can never report more affected
-    than the population.
+    ``domain_user_count - population_tier0``. ``population_tier0`` is the count of
+    accounts that ARE Tier 0 by membership (from ``population_tier_breakdown``) —
+    the correct exclusion, because a Tier-0 account is never an ordinary account
+    whether or not it holds an outbound path. When ``population_tier0`` is not
+    supplied, the denominator falls back to the affected Tier-0 count (``tier0``):
+    correct in the broad-group case where every Tier-0 account also holds the path
+    (the two coincide), but WRONG when a Tier-0 account is a SINK, not a source —
+    the built-in Administrator (RID 500) holds full control and never needs an
+    outbound domain-compromise path, so it is absent from the affected ``tier0``
+    yet must still be excluded from the ordinary denominator. Passing
+    ``population_tier0`` is the robust path (it drops the RID-500 Administrator
+    from the ordinary population rather than counting it as "the one ordinary
+    account without a route"). The denominator is floored at
+    ``ordinary_with_breaker`` so a degenerate input (unknown / zero
+    ``domain_user_count``) can never report more affected than the population.
 
     Args:
         tier0: Tier-0 accounts with a validated domain-compromise path (the
@@ -2293,6 +2303,11 @@ def derive_ordinary_breaker_stat(
         tier2: Tier-2 accounts with a validated domain-compromise path.
         domain_user_count: Total enabled domain users (the population). ``0`` /
             unknown disables the percentage denominator gracefully.
+        population_tier0: Count of accounts that ARE Tier 0 by membership (from
+            ``population_tier_breakdown.tier0``). Used as the denominator's Tier-0
+            exclusion so a Tier-0 sink account (RID-500 Administrator) is dropped
+            from the ordinary population. ``None`` falls back to the affected
+            ``tier0`` count (the broad-group case where the two coincide).
 
     Returns:
         A flat dict both surfaces render directly:
@@ -2324,7 +2339,11 @@ def derive_ordinary_breaker_stat(
     t2 = max(0, int(tier2))
     total_users = max(0, int(domain_user_count))
     ordinary_with_breaker = t1 + t2
-    ordinary_total = max(total_users - t0, ordinary_with_breaker)
+    # Exclude the FULL Tier-0-by-membership population from the ordinary
+    # denominator, not merely the Tier-0 accounts that happen to hold an outbound
+    # path. Fall back to the affected count when the population figure is absent.
+    denom_tier0 = t0 if population_tier0 is None else max(t0, int(population_tier0))
+    ordinary_total = max(total_users - denom_tier0, ordinary_with_breaker)
     pct_non_admin = (
         round(ordinary_with_breaker / ordinary_total * 100.0, 1)
         if ordinary_total > 0

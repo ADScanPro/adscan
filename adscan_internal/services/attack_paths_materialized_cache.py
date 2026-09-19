@@ -238,7 +238,14 @@ def load_materialized_prepared_runtime_graph(
             edge_rows = pq.read_table(edges_path).to_pylist()
         except Exception:
             return None
+        # Restore the top-level graph metadata (domain/netbios/dc_ip/…) that the
+        # Parquet tables do not carry — see the persist side. Without this the
+        # report's ``_stamp_env`` sees an empty ``graph["domain"]`` and renders a
+        # literal ``<domain>`` in every container (pyarrow present); the host
+        # (JSON branch) is unaffected. ``nodes``/``edges`` from Parquet always win.
+        _top_level = meta.get("top_level")
         graph = {
+            **(_top_level if isinstance(_top_level, dict) else {}),
             "nodes": {
                 str(row.get("node_id") or ""): json.loads(str(row.get("node_json") or "{}"))
                 for row in node_rows
@@ -383,12 +390,33 @@ def persist_materialized_prepared_runtime_graph(
             encoding="utf-8",
         )
 
+    # Preserve the graph's top-level scalar metadata (domain, netbios, dc_ip,
+    # schema_version, generated_at, …) across the Parquet round-trip. Parquet
+    # stores only the ``nodes``/``edges`` tables, so without this the reloaded
+    # graph would lose ``domain``/``netbios`` and the report's per-step
+    # ``_stamp_env`` would render a literal ``<domain>`` instead of ``HTB\`` —
+    # a defect visible ONLY where pyarrow is present (every container: LITE,
+    # PRO, appliance), never on a host without pyarrow (which takes the JSON
+    # branch that already round-trips the full graph). Store the whole
+    # top-level block, not just ``domain``, so no future top-level field is
+    # silently dropped. JSON-safe by construction (it came from the on-disk
+    # attack graph); guarded so a non-serializable value never breaks persist.
+    try:
+        top_level = {
+            key: value
+            for key, value in graph.items()
+            if key not in ("nodes", "edges")
+        }
+        json.dumps(top_level)  # fail fast if anything is not serializable
+    except (TypeError, ValueError):
+        top_level = {"domain": domain}
     prepared_runtime_graph_metadata_path(shell, domain).write_text(
         json.dumps(
             {
                 "fingerprint": prepared_graph.fingerprint,
                 "storage_format": storage_format,
                 "domain": domain,
+                "top_level": top_level,
             },
             indent=2,
             sort_keys=True,

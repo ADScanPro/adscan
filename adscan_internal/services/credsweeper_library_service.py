@@ -12,7 +12,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
-from adscan_internal import print_warning, print_warning_debug, telemetry
+from adscan_internal import (
+    print_instruction,
+    print_warning,
+    print_warning_debug,
+    telemetry,
+)
+from adscan_internal.services.numpy_baseline_diagnostic import (
+    is_numpy_baseline_failure,
+    numpy_baseline_instructions,
+    numpy_baseline_warning,
+)
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.credsweeper_service import (
     CREDSWEEPER_RULES_PROFILE_DEFAULT,
@@ -115,6 +125,21 @@ class CredSweeperLibraryService(BaseService):
                     find_by_ext=find_by_ext,
                 )
             except Exception as exc:  # noqa: BLE001
+                if is_numpy_baseline_failure(str(exc)):
+                    # CPU lacks the x86-64-v2 baseline NumPy 2.x needs (typically a
+                    # VM with a generic virtual CPU). Name the cause + fix ONCE via
+                    # the shared SSOT instead of a per-ruleset traceback, and skip
+                    # credential scanning cleanly (the scan continues; honest gap).
+                    telemetry.capture(
+                        "credsweeper_numpy_baseline_unsupported",
+                        properties={"seam": "library_in_memory"},
+                    )
+                    if not getattr(self, "_numpy_baseline_warned", False):
+                        print_warning(numpy_baseline_warning("Credential scanning"))
+                        for line in numpy_baseline_instructions():
+                            print_instruction(line)
+                        self._numpy_baseline_warned = True
+                    continue
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 print_warning(

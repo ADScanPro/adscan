@@ -57,6 +57,7 @@ __all__ = [
     "StepDomains",
     "resolve_step_domains",
     "label_realm",
+    "is_placeholder_domain",
     "node_domain_raw",
     "normalize_domain_placeholder",
     "resolve_source_domain_and_kdc",
@@ -70,6 +71,19 @@ __all__ = [
 # case-insensitively; the collector writes ``"WELLKNOWN"`` on the node, ``_node_domain``
 # lowercases it to ``"wellknown"``.
 _PLACEHOLDER_DOMAINS: frozenset[str] = frozenset({"wellknown"})
+
+
+def is_placeholder_domain(name: str | None) -> bool:
+    """Return True when ``name`` is a synthetic placeholder, not a real domain.
+
+    The SSOT predicate for "should I skip this entry when iterating
+    ``domains_data``?". Well-known / global principals (Authenticated Users,
+    Everyone) carry the synthetic ``"wellknown"`` domain, for which there is no
+    ``domains_data["wellknown"]`` and no ``domains/wellknown/*.json`` on disk, so
+    any loop that reads per-domain files or computes paths for it wastes work and
+    logs spurious "file missing" warnings. Compared case-insensitively.
+    """
+    return str(name or "").strip().lower() in _PLACEHOLDER_DOMAINS
 
 
 @dataclass(frozen=True)

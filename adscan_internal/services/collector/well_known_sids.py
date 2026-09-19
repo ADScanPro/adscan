@@ -5,151 +5,34 @@ in Active Directory. When ACEs reference them (e.g. Authenticated Users → ADCS
 the LDAP collector has no node for the source SID, so persistence silently drops
 the edge. This module injects synthetic CollectorNode entries for every well-known
 SID that appears as a dangling edge endpoint in a CollectionResult.
+
+The SID DATA and the client-facing label helpers (display name, dynamic-identity
+predicate, humanizer) live in the LEAF module
+:mod:`adscan_internal.services.well_known_principals` — importable without the
+native collector stack (this package's ``__init__`` drags in aiosmb/badldap) so
+the report / writeup / web render surfaces can humanize a principal label. They
+are re-exported here for the collector's own use, so there is ONE data source.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+# Re-exported from the import-safe leaf SSOT (do not duplicate the tables here).
+from adscan_internal.services.well_known_principals import (  # noqa: F401
+    DYNAMIC_IDENTITY_SIDS,
+    NON_GRANTEE_SIDS,
+    _TIER_ZERO_WELL_KNOWN,
+    _WELL_KNOWN,
+    humanize_principal_label,
+    is_dynamic_identity,
+    principal_is_dynamic_identity,
+    resolve_sid_display_name,
+    well_known_sid_display_name,
+)
+
 if TYPE_CHECKING:
     from adscan_internal.services.collector.models import CollectionResult, CollectorNode
-
-# Non-grantee well-known SIDs: owner/creator ABSTRACTIONS, not fixed principals.
-# An ACE for one of these does NOT grant a usable principal access to the object —
-# it is an inheritance/owner template resolved at runtime (Creator Owner = whoever
-# creates a child object and the rights they get ON THAT CHILD; Owner Rights =
-# whatever the current owner is granted). You cannot authenticate as them, so an
-# access edge (share-access, ACL control) sourced FROM these is a false capability
-# — e.g. a "Creator Owner: Full Control" ACE on a read-only share must NOT yield a
-# WriteShare edge. Edge emission excludes them.
-NON_GRANTEE_SIDS: frozenset[str] = frozenset(
-    {
-        "S-1-3-0",  # Creator Owner
-        "S-1-3-1",  # Creator Group
-        "S-1-3-4",  # Owner Rights
-    }
-)
-
-# Well-known SID → (display_name, kind)
-# Stable across all Windows/AD environments — no LDAP lookup needed.
-_WELL_KNOWN: dict[str, tuple[str, str]] = {
-    # Universal
-    "S-1-1-0": ("Everyone", "Group"),
-    "S-1-2-0": ("Local", "Group"),
-    "S-1-2-1": ("Console Logon", "Group"),
-    "S-1-3-0": ("Creator Owner", "User"),
-    "S-1-3-1": ("Creator Group", "Group"),
-    "S-1-3-4": ("Owner Rights", "Group"),
-    # NT Authority
-    "S-1-5-1": ("Dialup", "Group"),
-    "S-1-5-2": ("Network", "Group"),
-    "S-1-5-3": ("Batch", "Group"),
-    "S-1-5-4": ("Interactive", "Group"),
-    "S-1-5-6": ("Service", "Group"),
-    "S-1-5-7": ("Anonymous Logon", "User"),
-    "S-1-5-8": ("Proxy", "Group"),
-    "S-1-5-9": ("Enterprise Domain Controllers", "Group"),
-    "S-1-5-10": ("Principal Self", "User"),
-    "S-1-5-11": ("Authenticated Users", "Group"),
-    "S-1-5-12": ("Restricted Code", "Group"),
-    "S-1-5-13": ("Terminal Server User", "Group"),
-    "S-1-5-14": ("Remote Interactive Logon", "Group"),
-    "S-1-5-15": ("This Organization", "Group"),
-    "S-1-5-17": ("IUSR", "User"),
-    "S-1-5-18": ("System", "User"),
-    "S-1-5-19": ("Local Service", "User"),
-    "S-1-5-20": ("Network Service", "User"),
-    # BUILTIN local groups
-    "S-1-5-32-544": ("Administrators", "Group"),
-    "S-1-5-32-545": ("Users", "Group"),
-    "S-1-5-32-546": ("Guests", "Group"),
-    "S-1-5-32-547": ("Power Users", "Group"),
-    "S-1-5-32-548": ("Account Operators", "Group"),
-    "S-1-5-32-549": ("Server Operators", "Group"),
-    "S-1-5-32-550": ("Print Operators", "Group"),
-    "S-1-5-32-551": ("Backup Operators", "Group"),
-    "S-1-5-32-552": ("Replicators", "Group"),
-    "S-1-5-32-554": ("Pre-Windows 2000 Compatible Access", "Group"),
-    "S-1-5-32-555": ("Remote Desktop Users", "Group"),
-    "S-1-5-32-556": ("Network Configuration Operators", "Group"),
-    "S-1-5-32-557": ("Incoming Forest Trust Builders", "Group"),
-    "S-1-5-32-558": ("Performance Monitor Users", "Group"),
-    "S-1-5-32-559": ("Performance Log Users", "Group"),
-    "S-1-5-32-560": ("Windows Authorization Access Group", "Group"),
-    "S-1-5-32-561": ("Terminal Server License Servers", "Group"),
-    "S-1-5-32-562": ("Distributed COM Users", "Group"),
-    "S-1-5-32-568": ("IIS_IUSRS", "Group"),
-    "S-1-5-32-569": ("Cryptographic Operators", "Group"),
-    "S-1-5-32-573": ("Event Log Readers", "Group"),
-    "S-1-5-32-574": ("Certificate Service DCOM Access", "Group"),
-    "S-1-5-32-575": ("RDS Remote Access Servers", "Group"),
-    "S-1-5-32-576": ("RDS Endpoint Servers", "Group"),
-    "S-1-5-32-577": ("RDS Management Servers", "Group"),
-    "S-1-5-32-578": ("Hyper-V Administrators", "Group"),
-    "S-1-5-32-579": ("Access Control Assistance Operators", "Group"),
-    "S-1-5-32-580": ("Remote Management Users", "Group"),
-    "S-1-5-32-581": ("Default Account", "User"),
-    "S-1-5-32-582": ("Storage Replica Administrators", "Group"),
-    "S-1-5-32-583": ("Device Owners", "Group"),
-    # Other NT Authority
-    "S-1-5-64-10": ("NTLM Authentication", "Group"),
-    "S-1-5-64-14": ("SChannel Authentication", "Group"),
-    "S-1-5-64-21": ("Digest Authentication", "Group"),
-    "S-1-5-80-0": ("All Services", "Group"),
-    "S-1-16-0": ("Untrusted Mandatory Level", "Group"),
-    "S-1-16-4096": ("Low Mandatory Level", "Group"),
-    "S-1-16-8192": ("Medium Mandatory Level", "Group"),
-    "S-1-16-8448": ("Medium Plus Mandatory Level", "Group"),
-    "S-1-16-12288": ("High Mandatory Level", "Group"),
-    "S-1-16-16384": ("System Mandatory Level", "Group"),
-    "S-1-16-20480": ("Protected Process Mandatory Level", "Group"),
-    "S-1-16-28672": ("Secure Process Mandatory Level", "Group"),
-}
-
-# Tier-0 well-known SIDs — mark highvalue so the attack graph treats them correctly
-_TIER_ZERO_WELL_KNOWN: frozenset[str] = frozenset(
-    {
-        "S-1-5-9",  # Enterprise Domain Controllers
-        "S-1-5-18",  # System
-        "S-1-5-32-544",  # Administrators
-        "S-1-5-32-548",  # Account Operators
-        "S-1-5-32-549",  # Server Operators
-        "S-1-5-32-550",  # Print Operators
-        "S-1-5-32-551",  # Backup Operators
-    }
-)
-
-
-def well_known_sid_display_name(sid: str) -> str | None:
-    """Return the client-readable display name for a well-known Windows SID.
-
-    Single source of truth for "what does this fixed OS/NT-authority SID mean
-    to a reader": the same :data:`_WELL_KNOWN` table used to inject the
-    synthetic collector nodes, so a resolver can never disagree with the
-    node it names. A BUILTIN local-group SID (``S-1-5-32-*``) is qualified as
-    ``BUILTIN\\<Name>`` — the same convention
-    :func:`chokepoint_scoring._node_label` applies for a node found in the
-    graph — so a reader never confuses ``BUILTIN\\Users`` with ``Domain
-    Users``. Any other well-known SID (Everyone, Authenticated Users,
-    Anonymous Logon, ...) returns its bare display name.
-
-    Args:
-        sid: The candidate SID, any case.
-
-    Returns:
-        The display name, or ``None`` when ``sid`` is not a recognized
-        well-known SID.
-    """
-    sid_upper = str(sid or "").strip().upper()
-    if not sid_upper:
-        return None
-    entry = _WELL_KNOWN.get(sid_upper)
-    if entry is None:
-        return None
-    name, _kind = entry
-    if sid_upper.startswith("S-1-5-32-"):
-        return f"BUILTIN\\{name}"
-    return name
 
 
 def _make_well_known_node(sid_upper: str) -> "CollectorNode | None":

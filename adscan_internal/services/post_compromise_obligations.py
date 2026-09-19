@@ -54,6 +54,9 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from adscan_internal.principal_utils import is_machine_account
 from adscan_internal.services import cleanup_taxonomy as _tax
+from adscan_internal.services.credentials.credential_origin import (
+    is_blank_anonymous_credential,
+)
 from adscan_internal.services.session_compromise_state_service import (
     NON_COMPROMISE_ORIGINS,
 )
@@ -99,6 +102,27 @@ NO_ENVIRONMENT_CHANGES = _NoEnvironmentChanges()
 
 #: The account whose key signs every Kerberos ticket the domain issues.
 KRBTGT_PRINCIPAL = "krbtgt"
+
+#: The built-in Guest account (sAMAccountName always ``Guest``, RID 501). Its
+#: "recovered credential" is a blank/anonymous logon mapped to Guest, not a real
+#: secret, so telling the client to ROTATE its password is wrong — a blank
+#: password cannot be rotated into safety, and the correct action is to DISABLE
+#: it (which finding F-001 already prescribes). Handled as its own containment
+#: step, excluded from the rotate-every-account list.
+GUEST_PRINCIPAL = "guest"
+
+
+def _is_builtin_guest(name: str) -> bool:
+    """Return True when ``name`` is the built-in Guest account.
+
+    Matches the invariant sAMAccountName (``Guest``), case-insensitively, and its
+    domain-suffixed profile form (``guest.CICADA``). The built-in Guest name is
+    stable across every Windows/AD install, so a name match is reliable here.
+    """
+    token = str(name or "").strip().lower()
+    if not token:
+        return False
+    return token == GUEST_PRINCIPAL or token.startswith(f"{GUEST_PRINCIPAL}.")
 
 #: Ledger change kinds that leave a certificate able to authenticate after the
 #: engagement ends. Both are sourced from the cleanup taxonomy SSOT.
@@ -259,6 +283,35 @@ def recovered_principals(domain_store: Any) -> tuple[str, ...]:
         out.append(name)
     out.sort(key=str.lower)
     return tuple(out)
+
+
+def _blank_anonymous_principal_names(domain_store: Any) -> set[str]:
+    """Return the lower-cased names whose credential is a blank / anonymous logon.
+
+    A blank / anonymous logon (the built-in Guest, the anonymous session) has no
+    secret to rotate — it must be DISABLED. The carve-out that separates these
+    from the rotate-every-account list keys on the credential-representation SSOT
+    (:func:`is_blank_anonymous_credential`), the SAME fact the compromised-
+    credentials provenance table uses to label the credential TYPE, so the two
+    surfaces can never disagree about which accounts hold a rotatable secret.
+    """
+    if not isinstance(domain_store, Mapping):
+        return set()
+    credentials = domain_store.get("credentials")
+    if not isinstance(credentials, Mapping):
+        return set()
+    meta_map = domain_store.get("credentials_meta")
+    meta_map = meta_map if isinstance(meta_map, Mapping) else {}
+    out: set[str] = set()
+    for principal in credentials:
+        name = str(principal or "").strip()
+        if not name:
+            continue
+        meta = meta_map.get(principal)
+        origin = meta.get("credential_origin") if isinstance(meta, Mapping) else None
+        if is_blank_anonymous_credential(origin):
+            out.add(name.lower())
+    return out
 
 
 def _directory_replicated(domain_store: Any) -> bool:
@@ -432,17 +485,32 @@ def _credential_obligation(
     principals: Sequence[str],
     machine_accounts: Sequence[str],
     full_replication_domains: Sequence[str],
+    guest_accounts: Sequence[str] = (),
 ) -> Obligation:
-    """Build the credential-rotation obligation for the recovered accounts."""
+    """Build the credential-rotation obligation for the recovered accounts.
+
+    The built-in Guest (``guest_accounts``) is carved out of the rotate list and
+    gets its own "disable, do not rotate" step: its blank anonymous logon is not a
+    rotatable secret, so telling the client to reset its password would be wrong.
+    """
     count = len(principals)
-    proof = (
-        f"The assessment recovered credential material for {count} "
-        f"{_plural(count, 'account')} in {_domains_phrase(domains)}: "
-        f"{_join_names(principals)}. Each is compromised, whatever was recovered "
-        "for it: a password hash and a Kerberos key authenticate as the account "
-        "just as a password does."
-    )
-    if full_replication_domains:
+    if count:
+        proof = (
+            f"The assessment recovered credential material for {count} "
+            f"{_plural(count, 'account')} in {_domains_phrase(domains)}: "
+            f"{_join_names(principals)}. Each is compromised, whatever was "
+            "recovered for it: a password hash and a Kerberos key authenticate as "
+            "the account just as a password does."
+        )
+    else:
+        # Only the built-in Guest was reached — the proof is about disabling it,
+        # not rotating a secret that does not exist.
+        proof = (
+            f"The assessment reached {_domains_phrase(domains)} through the "
+            "built-in Guest account, which authenticated with a blank, anonymous "
+            "logon rather than a recovered secret."
+        )
+    if count and full_replication_domains:
         proof += (
             " A full replication of the directory database also completed in "
             f"{_domains_phrase(full_replication_domains)}, which means every "
@@ -450,47 +518,70 @@ def _credential_obligation(
             "accounts named above. Treat the list as the confirmed minimum."
         )
 
-    steps: list[ObligationStep] = [
-        ObligationStep(
-            text=(
-                "Reset the password on every account named above. Disabling, "
-                "renaming or moving an account does not help: the recovered "
-                "material is derived from the password, so only a password change "
-                "invalidates it."
-            ),
-            commands=(
-                "Set-ADAccountPassword -Identity <account> -Reset "
-                "-NewPassword (Read-Host -AsSecureString 'New password')",
-                "Set-ADUser -Identity <account> -ChangePasswordAtLogon $true",
-            ),
-        ),
-        ObligationStep(
-            text=(
-                "Handle the service accounts first and separately. An account with "
-                "a registered service principal name is running something, and "
-                "resetting it without updating wherever that service stores the "
-                "password takes the service down. Find them, schedule the change, "
-                "update the service configuration and the reset together."
-            ),
-            commands=(
-                "Get-ADUser -LDAPFilter '(servicePrincipalName=*)' "
-                "-Properties servicePrincipalName, PasswordLastSet | "
-                "Select-Object SamAccountName, PasswordLastSet, servicePrincipalName",
-            ),
-        ),
-        ObligationStep(
-            text=(
-                "Where a service account can move to a group managed service "
-                "account, move it. The directory then rotates the password on its "
-                "own every thirty days and this class of exposure stops recurring."
-            ),
-            commands=(
-                "New-ADServiceAccount -Name <gmsa-name> -DNSHostName <service-host-fqdn> "
-                "-PrincipalsAllowedToRetrieveManagedPassword '<HOST$>'",
-                "Install-ADServiceAccount -Identity <gmsa-name>",
-            ),
-        ),
-    ]
+    steps: list[ObligationStep] = []
+    if count:
+        steps.extend(
+            (
+                ObligationStep(
+                    text=(
+                        "Reset the password on every account named above. Disabling, "
+                        "renaming or moving an account does not help: the recovered "
+                        "material is derived from the password, so only a password "
+                        "change invalidates it."
+                    ),
+                    commands=(
+                        "Set-ADAccountPassword -Identity <account> -Reset "
+                        "-NewPassword (Read-Host -AsSecureString 'New password')",
+                        "Set-ADUser -Identity <account> -ChangePasswordAtLogon $true",
+                    ),
+                ),
+                ObligationStep(
+                    text=(
+                        "Handle the service accounts first and separately. An account "
+                        "with a registered service principal name is running something, "
+                        "and resetting it without updating wherever that service stores "
+                        "the password takes the service down. Find them, schedule the "
+                        "change, update the service configuration and the reset together."
+                    ),
+                    commands=(
+                        "Get-ADUser -LDAPFilter '(servicePrincipalName=*)' "
+                        "-Properties servicePrincipalName, PasswordLastSet | "
+                        "Select-Object SamAccountName, PasswordLastSet, servicePrincipalName",
+                    ),
+                ),
+                ObligationStep(
+                    text=(
+                        "Where a service account can move to a group managed service "
+                        "account, move it. The directory then rotates the password on "
+                        "its own every thirty days and this class of exposure stops "
+                        "recurring."
+                    ),
+                    commands=(
+                        "New-ADServiceAccount -Name <gmsa-name> -DNSHostName <service-host-fqdn> "
+                        "-PrincipalsAllowedToRetrieveManagedPassword '<HOST$>'",
+                        "Install-ADServiceAccount -Identity <gmsa-name>",
+                    ),
+                ),
+            )
+        )
+
+    if guest_accounts:
+        steps.append(
+            ObligationStep(
+                text=(
+                    f"The built-in Guest account ({_join_names(guest_accounts)}) "
+                    "authenticated with a blank, anonymous logon rather than a "
+                    "recovered secret, so there is no password to rotate. Disable it "
+                    "instead (the fix the corresponding finding already prescribes) "
+                    "and confirm it stays disabled."
+                ),
+                commands=(
+                    "Disable-ADAccount -Identity Guest",
+                    "Get-ADUser -Identity Guest -Properties Enabled | "
+                    "Select-Object SamAccountName, Enabled",
+                ),
+            )
+        )
 
     if machine_accounts:
         machine_count = len(machine_accounts)
@@ -513,20 +604,27 @@ def _credential_obligation(
             )
         )
 
-    steps.append(
-        ObligationStep(
-            text=(
-                "Check whether any of these passwords is in use anywhere else: a "
-                "local administrator account, a scheduled task, an application "
-                "configuration file, a second directory. A recovered password is "
-                "compromised everywhere it was ever used, not only where it was found."
-            ),
+    if count:
+        steps.append(
+            ObligationStep(
+                text=(
+                    "Check whether any of these passwords is in use anywhere else: a "
+                    "local administrator account, a scheduled task, an application "
+                    "configuration file, a second directory. A recovered password is "
+                    "compromised everywhere it was ever used, not only where it was "
+                    "found."
+                ),
+            )
         )
-    )
 
+    title = (
+        "Treat every recovered credential as compromised and rotate it"
+        if count
+        else "Disable the built-in Guest account reached during the assessment"
+    )
     return Obligation(
         key=OBLIGATION_CREDENTIALS,
-        title="Treat every recovered credential as compromised and rotate it",
+        title=title,
         proof=proof,
         rationale=(
             "How each account was reached is a separate question from what to do "
@@ -536,10 +634,14 @@ def _credential_obligation(
         ),
         steps=tuple(steps),
         caveat=(
-            "Rotate in order of privilege, not alphabetically: an account that can "
-            "reach a domain controller matters more than one that cannot, and a "
-            "partial rotation that leaves the privileged accounts for last leaves "
-            "the compromise intact."
+            (
+                "Rotate in order of privilege, not alphabetically: an account that "
+                "can reach a domain controller matters more than one that cannot, "
+                "and a partial rotation that leaves the privileged accounts for last "
+                "leaves the compromise intact."
+            )
+            if count
+            else ""
         ),
         domains=tuple(domains),
         accounts=tuple(principals),
@@ -660,6 +762,7 @@ def build_post_compromise_obligations(
     replicated_domains: list[str] = []
     principals: list[str] = []
     machine_accounts: list[str] = []
+    guest_accounts: list[str] = []
 
     for display in ordered_keys:
         domain_data = store.get(display)
@@ -670,25 +773,44 @@ def build_post_compromise_obligations(
         if any(n.strip().lower() == KRBTGT_PRINCIPAL for n in names) or replicated:
             krbtgt_domains.append(display)
         # krbtgt carries its own obligation; listing it again under "rotate
-        # these accounts" would read as a second, weaker instruction.
-        rotatable = [n for n in names if n.strip().lower() != KRBTGT_PRINCIPAL]
-        if rotatable:
+        # these accounts" would read as a second, weaker instruction. A blank /
+        # anonymous logon (the built-in Guest, the anonymous session) is likewise
+        # carved out of the rotate list: it has no secret to rotate, so it gets
+        # its own "disable, do not rotate" step. The carve-out keys on the
+        # credential-representation SSOT (the SAME fact the provenance table's
+        # credential-type column uses), with the built-in-Guest NAME kept as a
+        # backstop for a store that recorded the account without its origin slug.
+        blank_anon = _blank_anonymous_principal_names(domain_data)
+        disable_not_rotate = {
+            n for n in names if n.strip().lower() in blank_anon or _is_builtin_guest(n)
+        }
+        rotatable = [
+            n
+            for n in names
+            if n.strip().lower() != KRBTGT_PRINCIPAL and n not in disable_not_rotate
+        ]
+        guests_here = [n for n in names if n in disable_not_rotate]
+        for name in guests_here:
+            if name not in guest_accounts:
+                guest_accounts.append(name)
+        if rotatable or guests_here:
             credential_domains.append(display)
-            for name in rotatable:
-                if name not in principals:
-                    principals.append(name)
-                if is_machine_account(name) and name not in machine_accounts:
-                    machine_accounts.append(name)
+        for name in rotatable:
+            if name not in principals:
+                principals.append(name)
+            if is_machine_account(name) and name not in machine_accounts:
+                machine_accounts.append(name)
 
     obligations: list[Obligation] = []
     if krbtgt_domains:
         obligations.append(_krbtgt_obligation(krbtgt_domains))
-    if principals:
+    if principals or guest_accounts:
         obligations.append(
             _credential_obligation(
                 domains=credential_domains,
                 principals=principals,
                 machine_accounts=machine_accounts,
+                guest_accounts=guest_accounts,
                 full_replication_domains=replicated_domains,
             )
         )

@@ -733,6 +733,12 @@ async def _render_assessment_async(
             renderer="cytoscape",
             template="premium",
             theme=report_theme,
+            # The workspace ROOT (holds technical_report.json) so the compliance
+            # snapshot reconciles the verified-clear (positive-evidence) controls
+            # with the AD Control Coverage Report. Without it the deliver-kit SAR
+            # renders "0 conformant" and drops the observed-good assurance the
+            # standalone `report` output already shows.
+            workspace_dir=workspace_dir,
         )
         output_path.write_bytes(pdf_bytes)
         return len(pdf_bytes)

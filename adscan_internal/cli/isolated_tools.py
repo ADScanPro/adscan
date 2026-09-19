@@ -19,6 +19,11 @@ import time
 from typing import Any, Dict
 from adscan_core.pal.process import current_user_name, effective_user_is_root
 from adscan_core.rich_output import print_exception
+from adscan_internal.services.numpy_baseline_diagnostic import (
+    is_numpy_baseline_failure,
+    numpy_baseline_instructions,
+    numpy_baseline_warning,
+)
 
 
 @dataclass(frozen=True)
@@ -319,6 +324,23 @@ def check_executable_help_works(
         Keep messaging user-safe: do not print raw traceback lines (paths/domains).
         """
         lowered = (output_text or "").lower()
+
+        # NumPy 2.x refuses to import on a CPU that lacks its build-time baseline
+        # (x86-64-v2). This bites any tool that imports numpy/pandas (credsweeper,
+        # and others), typically inside a VM with a generic virtual CPU. Diagnose
+        # it via the shared SSOT BEFORE the generic traceback handling below (and
+        # before the traceback guard, since the RuntimeError line alone suffices).
+        # Reported by a user, 2026-09.
+        if is_numpy_baseline_failure(output_text):
+            deps.print_warning(numpy_baseline_warning(tool_name))
+            for line in numpy_baseline_instructions():
+                deps.print_instruction(line)
+            deps.telemetry_capture(
+                "tool_help_probe_numpy_baseline_unsupported",
+                properties={"tool": tool_name},
+            )
+            return
+
         if "traceback (most recent call last)" not in lowered:
             return
 

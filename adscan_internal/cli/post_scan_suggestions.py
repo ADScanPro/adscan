@@ -240,6 +240,29 @@ def build_recap_fanout_steps(
     if not isinstance(nodes, dict) or not isinstance(edges, list):
         return ()
 
+    # Build the per-domain membership index so the blast-radius gate can drop an
+    # EMPTY group (0 transitive real actors) whose control reach no actor could
+    # exercise — reusing the membership SSOT (never hand-rolled). Authoritative
+    # only when the snapshot actually holds principals; otherwise pass ``None`` so
+    # the empty-group gate stays conservative (never drops reach it cannot judge).
+    group_actor_index = None
+    try:
+        from adscan_internal.services.attack_fanout_rollup import GroupActorIndex
+        from adscan_internal.services.attack_paths_core import build_group_member_index
+        from adscan_internal.services.membership_snapshot import load_membership_snapshot
+
+        _snapshot = load_membership_snapshot(shell, domain)
+        _user_members, _computer_members, _has_principals = build_group_member_index(
+            _snapshot, domain
+        )
+        if _has_principals:
+            group_actor_index = GroupActorIndex(
+                domain_suffix="@" + str(domain or "").strip().upper(),
+                populated_labels=frozenset(_user_members) | frozenset(_computer_members),
+            )
+    except Exception:  # noqa: BLE001 - never break the scan success path
+        group_actor_index = None
+
     # Stamp a best-effort compromise class onto each node so the rollup's
     # severity grading (and the Domain-Breaker suppression) can classify the
     # fan-out source/target. Failures per node are non-fatal.
@@ -256,7 +279,7 @@ def build_recap_fanout_steps(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        adapted = fanout_input_from_edge(edge, nodes)
+        adapted = fanout_input_from_edge(edge, nodes, group_actor_index=group_actor_index)
         if adapted is not None:
             inputs.append(adapted)
 

@@ -2084,9 +2084,60 @@ def _load_workspace_names_from_dir(workspace_dir: Path) -> list[str]:
     return workspace_names
 
 
+_LAST_WORKSPACE_REFRESH_SIG: "tuple | None" = None
+
+
+def _workspace_refresh_signature(workspace_dir: Path) -> "tuple | None":
+    """Cheap change-signature of the workspace files the refresh reads.
+
+    Returns a tuple of (name, mtime_ns, size) for every source file the
+    ``_load_workspace_*_from_dir`` helpers read (root + per-domain
+    ``variables.json`` and the per-domain ``.txt`` / ``.json`` under
+    ``domains/``), plus the parent directory's mtime (the sibling listing that
+    feeds workspace names). Any real change to a source flips the signature.
+    Returns ``None`` on any error so the caller falls back to always refreshing
+    (fail-safe toward coverage: the guard only SKIPS a refresh when it can
+    positively prove nothing the loaders read has changed).
+    """
+    try:
+        parts: list = [str(workspace_dir)]
+        try:
+            parts.append(("__parent_mtime__", workspace_dir.parent.stat().st_mtime_ns))
+        except OSError:
+            parts.append(("__parent_mtime__", None))
+        candidates = [workspace_dir / "variables.json"]
+        domains_dir = workspace_dir / "domains"
+        try:
+            candidates.extend(sorted(domains_dir.glob("*/*.txt")))
+            candidates.extend(sorted(domains_dir.glob("*/*.json")))
+        except OSError:
+            pass
+        for path in candidates:
+            try:
+                st = path.stat()
+                parts.append((path.name, st.st_mtime_ns, st.st_size))
+            except OSError:
+                parts.append((path.name, None))
+        return tuple(parts)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _refresh_workspace_cache_if_needed() -> None:
     """Refresh known domains/users/hosts/passwords from workspace files."""
     workspace_dir = Path.cwd()
+    # "if_needed": skip the (multi-megabyte) file re-read + parse when the
+    # workspace source files are byte-for-byte unchanged since the last refresh.
+    # This runs from every known-value getter, i.e. on every _sanitize_rich_output
+    # call; re-reading enabled_users.txt / enabled_computers.txt (megabytes) per
+    # log line was the dominant workspace-load cost under --debug. Fail-safe: a
+    # None signature (any error) or a changed signature falls through and
+    # refreshes, so a newly-written value is always picked up.
+    _refresh_sig = _workspace_refresh_signature(workspace_dir)
+    global _LAST_WORKSPACE_REFRESH_SIG
+    if _refresh_sig is not None and _refresh_sig == _LAST_WORKSPACE_REFRESH_SIG:
+        return
+    _LAST_WORKSPACE_REFRESH_SIG = _refresh_sig
     workspace_names = _load_workspace_names_from_dir(workspace_dir)
     if workspace_names:
         set_workspace_names(workspace_names)
@@ -2537,6 +2588,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "container_runtime_launcher_contract_missing",
         "cracking_started",
         "creds_save_requires_start_auth",
+        "credsweeper_numpy_baseline_unsupported",
         "ctf_flags.collection",
         "ctf_pre2k_followup_accepted",
         "ctf_pre2k_followup_declined",
@@ -3866,6 +3918,361 @@ def _strip_known_domain_suffix(value: str, domains: list[str]) -> Optional[str]:
     return short or None
 
 
+# PERFORMANCE — cache compiled per-known-VALUE sanitizer patterns.
+#
+# The per-value redaction loops in ``_sanitize_rich_output`` (known users,
+# hostnames, base DNs, NetBIOS names, passwords, workspaces) each used to call
+# ``re.compile`` once PER VALUE, PER LOG LINE. Python's own ``re`` cache holds
+# only 512 entries, so a large domain (Sifi: 1172 users + 1463 hosts) overruns
+# it and every line re-compiles thousands of patterns from scratch — measured at
+# ~413 ms PER LOG LINE, which starves the foreground console (the workspace-open
+# "output drips" bug). ``_sanitize_rich_output`` runs from the logging formatter
+# on EVERY record, so this is O(known_values) per line, O(n^2) per session.
+#
+# This cache keys the COMPILED pattern by its exact pattern STRING, so a value
+# compiles once and is reused for the rest of the process. It is BEHAVIOUR-
+# PRESERVING BY CONSTRUCTION: ``_cached_pattern(s)`` returns exactly what
+# ``re.compile(s)`` would (same object semantics), only memoized — the redaction
+# patterns, their order, and every ``.sub`` callback are unchanged, so the
+# sanitized output is byte-identical. Keying by the pattern string (not by the
+# known-value SET) means a value learned mid-run simply compiles on first use;
+# there is NO set-version to invalidate and NO way to serve a stale pattern for a
+# value, so coverage cannot be lost. The dict is bounded by the number of
+# distinct known values in the session (a few thousand small patterns).
+_SANITIZE_PATTERN_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _cached_pattern(pattern: str) -> "re.Pattern[str]":
+    """Return ``re.compile(pattern)``, memoized by the pattern string.
+
+    Drop-in, behaviour-preserving replacement for ``re.compile`` on the hot
+    per-known-value redaction loops in :func:`_sanitize_rich_output`. The
+    returned object is identical to what ``re.compile(pattern)`` produces; only
+    the compilation is cached. Do NOT route fixed/one-off patterns through here
+    (they already hit ``re``'s own cache); this exists for patterns built per
+    known value, where the value count overruns ``re``'s 512-entry cache.
+    """
+    compiled = _SANITIZE_PATTERN_CACHE.get(pattern)
+    if compiled is None:
+        compiled = re.compile(pattern)
+        _SANITIZE_PATTERN_CACHE[pattern] = compiled
+    return compiled
+
+
+# PERFORMANCE (layer B, on top of the per-value compile cache above).
+#
+# Even with compilation cached, a per-known-value loop still runs one ``.sub``
+# PER VALUE over the content: O(values) passes per call. On the SHORT log lines
+# the formatter sanitizes that is ~14 ms/line; on the WHOLE-BUFFER string the
+# session streamer re-sanitizes every 32 KiB it is O(values x buffer) and
+# dominates (a large --debug session buffer x 2600 values). Collapsing a value
+# set into ONE alternation regex makes each pass O(1) sub over the content
+# (~370x fewer passes), which is what the streamer needs.
+#
+# SAFETY — this must never lose redaction coverage (a leaked value is a data-
+# protection incident). Two guarantees:
+#   * The cache is keyed by the EXACT tuple of values (deduped, order-normalized),
+#     so it can never serve a regex for a stale/smaller value set — a value
+#     learned mid-run (including the in-place ``_KNOWN_HOSTNAMES.append``) is a
+#     different tuple and rebuilds. Tuple identity (not a hash) means no
+#     collision can substitute a wrong regex.
+#   * Alternatives are sorted LONGEST-FIRST, so the combined regex matches the
+#     longest registered value at any position (leftmost-longest), i.e. it
+#     redacts a SUPERSET of the per-value loop — it can never redact LESS.
+#   * On any build failure (``re.error``) the builder returns ``None`` and the
+#     caller falls back to the per-value cached-compile loop, so coverage is
+#     preserved by construction.
+# Locked by tests/unit/core/test_telemetry_sanitizer_caching_coverage.py, which
+# asserts the coverage property at scale against the REAL sanitizer.
+_COMBINED_SANITIZE_CACHE: dict[tuple, "re.Pattern[str]"] = {}
+
+
+def _trie_alternation(values: "list[str]") -> str:
+    """Build a regex-trie fragment matching any of ``values`` (chars escaped).
+
+    A flat ``v1|v2|...|vN`` alternation is O(N) for Python's ``re`` to match at
+    each text position, so a large known-value set makes even a short line slow
+    to sanitize. Collapsing the values into a shared-prefix trie
+    (``(?:admin(?:istrator)?|svc)``) lets the engine fail fast on a shared prefix
+    and makes matching nearly independent of the value count. It is
+    match-equivalent to the flat alternation: the greedy optional groups give
+    longest-match, i.e. the same leftmost-longest behaviour as the longest-first
+    flat alternation. Characters are escaped per edge (``re.escape(ch)`` composes
+    to ``re.escape(value)``), so escaping is identical.
+    """
+    root: dict = {}
+    for value in values:
+        node = root
+        for ch in value:
+            node = node.setdefault(ch, {})
+        node["_end"] = True
+
+    def _build(node: dict) -> str:
+        # Fragment matching the (possibly empty) continuation from this node.
+        child_keys = sorted(k for k in node if k != "_end")
+        branches = [re.escape(ch) + _build(node[ch]) for ch in child_keys]
+        if not branches:
+            return ""
+        cont = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
+        # A node that both terminates a value AND has continuations makes the
+        # continuation optional (greedy -> prefers the longer match).
+        return "(?:" + cont + ")?" if node.get("_end") else cont
+
+    top = sorted(k for k in root if k != "_end")
+    fragments = [re.escape(ch) + _build(root[ch]) for ch in top]
+    if not fragments:
+        return ""
+    return fragments[0] if len(fragments) == 1 else "(?:" + "|".join(fragments) + ")"
+
+
+def _combined_value_regex(
+    tag: str,
+    values: "list[str]",
+    prefix: str,
+    suffix: str,
+    fragment=None,
+) -> "re.Pattern[str] | None":
+    """Compile ONE alternation regex over ``values``, cached by exact content.
+
+    ``prefix``/``suffix`` are the (constant) boundary/group text wrapped around
+    the ``value1|value2|...`` alternation; ``fragment`` turns one value into its
+    escaped alternation fragment (defaults to ``re.escape``; the base-DN pass
+    passes a comma-flexible variant). Returns ``None`` for an empty set or if the
+    combined pattern fails to compile, so the caller can fall back to the
+    per-value loop. Alternatives are deduped and sorted longest-first.
+    """
+    cleaned = sorted(
+        {v.strip() for v in values if v and v.strip()},
+        key=lambda s: (-len(s), s),
+    )
+    if not cleaned:
+        return None
+    key = (tag, prefix, suffix, tuple(cleaned))
+    compiled = _COMBINED_SANITIZE_CACHE.get(key)
+    if compiled is None:
+        if fragment is None:
+            # Char-based values: build a shared-prefix regex-trie so matching is
+            # near-independent of the value count (match-equivalent to the flat
+            # longest-first alternation).
+            alternation = _trie_alternation(cleaned)
+        else:
+            # Custom per-value fragment (e.g. base-DN comma-flexibility) cannot be
+            # trie-collapsed char-by-char; keep the flat longest-first join.
+            alternation = "|".join(fragment(v) for v in cleaned)
+        try:
+            compiled = re.compile(prefix + alternation + suffix)
+        except re.error:
+            return None
+        _COMBINED_SANITIZE_CACHE[key] = compiled
+    return compiled
+
+
+# PERFORMANCE (layer C, the domain-size-independence layer). Even with the
+# combined regexes cached, building the derived hostname/short/NetBIOS lists and
+# re-deriving each combined regex's content cache key (sorted tuple of values)
+# is O(known_values) PER _sanitize_rich_output CALL — so a per-log-line call on a
+# large domain is still slower than on a small one. This precomputes ALL combined
+# regexes + derived lists ONCE and reuses them until a known-value set changes,
+# so the per-line cost is O(1) in the domain size (only the substitutions over
+# the LINE content remain, which are O(line length), never O(domain)).
+#
+# Invalidation is O(1) and cannot go stale: the cache key is the IDENTITY of the
+# seven known-value list objects plus their lengths. Every producer REASSIGNS the
+# global (``_KNOWN_x = deduped`` -> identity changes) except the mid-run hostname
+# add, which APPENDS (``_KNOWN_HOSTNAMES.append`` -> length changes); the (id,
+# len) pair captures both. The source lists are held in the cache entry so an id
+# cannot be reused while cached. A value learned mid-run therefore rebuilds the
+# state on the very next call, so redaction coverage can never lag the known set.
+# Locked by tests/unit/core/test_telemetry_sanitizer_caching_coverage.py.
+_REDACTION_STATE: "tuple | None" = None
+
+# (tag, prefix, suffix, category, fragment) for each single-shape known-value set
+# whose regex the redaction state precompiles. The multi-group hostname / domain
+# / NetBIOS passes are built explicitly in ``_build_redaction_state`` because
+# their substitution callbacks span several capture groups.
+
+
+def _build_redaction_state() -> dict:
+    """Precompute every per-known-value combined regex + derived list.
+
+    Returns a dict with ``rx`` (type -> compiled combined regex or ``None`` for
+    an empty set / build failure) and ``fb`` (type -> longest-first value list
+    used by the per-value fallback loop when ``rx`` is ``None``). Rebuilt only
+    when a known-value set object changes identity or length.
+    """
+    known_users = _get_known_users()
+    known_hostnames = _get_known_hostnames()
+    known_domains = _get_known_domains()
+    known_base_dns = _get_known_base_dns()
+    known_passwords = _get_known_passwords()
+    known_workspaces = _get_known_workspaces()
+
+    # Derived hostname FQDN + short-label lists (dedup, composition-tolerant).
+    domain_suffixes = list(known_domains) if known_domains else []
+    hostnames_clean: list[str] = []
+    short_labels: list[str] = []
+    seen_short: set[str] = set()
+    for hostname in known_hostnames:
+        hostname_clean = hostname.strip().rstrip(".")
+        if not hostname_clean:
+            continue
+        hostnames_clean.append(hostname_clean)
+        short = _strip_known_domain_suffix(hostname_clean, domain_suffixes)
+        if short is None and "." not in hostname_clean:
+            short = hostname_clean
+        if short and short.casefold() not in seen_short:
+            seen_short.add(short.casefold())
+            short_labels.append(short)
+
+    # Derived NetBIOS list: registered names + the first DNS label of each known
+    # domain (length-floored; a derived label is an inference, so it earns the
+    # same floor the known-user loop applies).
+    known_netbios = list(_get_known_netbios())
+    seen_netbios = {v.strip().casefold() for v in known_netbios if v.strip()}
+    for domain in known_domains:
+        label = (domain or "").strip().rstrip(".").split(".", 1)[0]
+        if len(label) < _MIN_KNOWN_USER_LEN:
+            continue
+        if label.casefold() not in seen_netbios:
+            seen_netbios.add(label.casefold())
+            known_netbios.append(label)
+
+    def _sorted_unique(values, fragment=None):
+        # fragment is only relevant to the regex build; the fallback list is the
+        # raw longest-first values (the fallback re-applies the fragment itself).
+        return sorted(
+            {v.strip() for v in values if v and v.strip()}, key=lambda s: (-len(s), s)
+        )
+
+    base_dn_fragment = lambda v: re.escape(v).replace(r"\,", r"\s*,\s*")  # noqa: E731
+
+    rx = {
+        "domain": _combined_value_regex(
+            "domain_fqdn", known_domains, r"(?i)(?<![A-Za-z0-9-])(", r")(\.)?"
+        ),
+        "hostname_fqdn": _combined_value_regex(
+            "hostname_fqdn", hostnames_clean, r"(?i)(?<![A-Za-z0-9-])(", r")(\.)?"
+        ),
+        "short_hostname": _combined_value_regex(
+            "short_hostname", short_labels,
+            r"(?i)(?<![A-Za-z0-9._$\\-])(", r")(?![A-Za-z0-9._])",
+        ),
+        "user": _combined_value_regex(
+            "user", known_users, r"(?i)(?<![A-Za-z0-9._-])(", r")(?![A-Za-z0-9._-])"
+        ),
+        "base_dn": _combined_value_regex(
+            "base_dn", known_base_dns, r"(?i)(", r")", base_dn_fragment
+        ),
+        "netbios_user": _combined_value_regex(
+            "netbios_user", known_netbios, r"(?i)(", r")(\\+)([A-Za-z0-9._-]+)"
+        ),
+        "netbios_short": _combined_value_regex(
+            "netbios_short", known_netbios,
+            r"(?i)(?<![A-Za-z0-9._$\\-])(", r")(?![A-Za-z0-9._])",
+        ),
+        "password": _combined_value_regex(
+            "password", known_passwords,
+            r"(?<![A-Za-z0-9._@/-])(", r")(?![A-Za-z0-9._@/-])",
+        ),
+        "workspace": _combined_value_regex(
+            "workspace", known_workspaces,
+            r"(?i)(?<![A-Za-z0-9._-])(", r")(?![A-Za-z0-9._-])",
+        ),
+    }
+    fb = {
+        "domain": _sorted_unique(known_domains),
+        "hostname_fqdn": _sorted_unique(hostnames_clean),
+        "short_hostname": _sorted_unique(short_labels),
+        "user": _sorted_unique(known_users),
+        "base_dn": _sorted_unique(known_base_dns),
+        "netbios": _sorted_unique(known_netbios),
+        "password": _sorted_unique(known_passwords),
+        "workspace": _sorted_unique(known_workspaces),
+    }
+    return {"rx": rx, "fb": fb}
+
+
+def _redaction_state() -> dict:
+    """Return the cached redaction state, rebuilding only on a set change.
+
+    O(1) on the hot path: it validates the cache by the identity + length of the
+    seven known-value list objects and rebuilds only when one changed.
+    """
+    def _snapshot():
+        srcs = (
+            _KNOWN_USERS,
+            _KNOWN_HOSTNAMES,
+            _KNOWN_DOMAINS,
+            _KNOWN_BASE_DNS,
+            _KNOWN_NETBIOS,
+            _KNOWN_PASSWORDS,
+            _KNOWN_WORKSPACES,
+        )
+        return srcs, tuple(len(s) for s in srcs)
+
+    sources, lens = _snapshot()
+    global _REDACTION_STATE
+    cached = _REDACTION_STATE
+    if (
+        cached is not None
+        and cached[1] == lens
+        and all(a is b for a, b in zip(cached[0], sources))
+    ):
+        # Hot path: no getters called, so the workspace-cache refresh does not
+        # run and the known-value globals keep their identity -> stable hit.
+        return cached[2]
+    # Miss: building calls the getters, whose ``_refresh_workspace_cache_if_needed``
+    # may REASSIGN the known-value globals. Snapshot the key AFTER the build so it
+    # matches the post-refresh globals the next hot-path call will read; otherwise
+    # every call would miss and rebuild.
+    state = _build_redaction_state()
+    sources, lens = _snapshot()
+    _REDACTION_STATE = (sources, lens, state)
+    return state
+
+
+def _redact_known_values(
+    content: str,
+    values: "list[str]",
+    prefix: str,
+    suffix: str,
+    category: str,
+    *,
+    force: bool = False,
+    fragment=None,
+) -> str:
+    """Redact a set of known values that share ONE boundary shape + one group.
+
+    SSOT for the single-capture-group per-known-value redaction passes (users,
+    passwords, workspaces, base DNs). Builds one combined alternation regex
+    (cached, longest-first) wrapped as ``prefix + (v1|v2|...) + suffix`` and does
+    a SINGLE substitution; the matched value is group 1 and is pseudonymized
+    under ``category``. On any build failure it falls back to the per-value
+    cached-compile loop, so redaction coverage is preserved by construction.
+
+    ``prefix``/``suffix`` carry the constant boundary text (and the capture
+    parenthesis); ``fragment`` maps a value to its escaped alternation fragment
+    (default ``re.escape``; base DNs pass a comma-flexible variant).
+    """
+    cleaned = [v.strip() for v in values if v and v.strip()]
+    if not cleaned:
+        return content
+
+    def _repl(match: "re.Match[str]") -> str:
+        return _record_pseudonym(match.group(1), category, force=force)
+
+    combined = _combined_value_regex(category, cleaned, prefix, suffix, fragment)
+    if combined is not None:
+        return combined.sub(_repl, content)
+
+    # Fallback — per-value cached-compile loop (behaviour-identical to the
+    # pre-combine implementation). Longest-first to match the combined ordering.
+    frag = fragment or re.escape
+    for value in sorted(set(cleaned), key=lambda s: (-len(s), s)):
+        content = _cached_pattern(prefix + frag(value) + suffix).sub(_repl, content)
+    return content
+
+
 def _known_short_name_pattern(value: str) -> "re.Pattern[str]":
     """Compile the boundary pattern used for a bare short / NetBIOS label.
 
@@ -3882,7 +4289,7 @@ def _known_short_name_pattern(value: str) -> "re.Pattern[str]":
     end inside a longer alphanumeric word, which is what keeps the match off
     ordinary prose.
     """
-    return re.compile(
+    return _cached_pattern(
         rf"(?i)(?<![A-Za-z0-9._$\\-])({re.escape(value)})(?![A-Za-z0-9._])"
     )
 
@@ -4257,6 +4664,98 @@ def _mask_ipv4_run(run: str) -> str:
         return rebuilt
 
     return _IPV4_QUAD_ANYWHERE_PATTERN.sub(_replace, run)
+
+
+def _streaming_safe_prefix_len(text: str) -> int:
+    """Largest offset at which ``text`` can be split so that sanitizing the two
+    halves independently equals sanitizing the whole.
+
+    A BLANK LINE is a universal safe split point: it resets EVERY sanitizer's
+    state. The stateful table / credential-section sanitizers all terminate a
+    region on a blank line (`_mask_credential_sections` resets its mask mode; a
+    box-drawing table never contains a blank line, so none is open across one),
+    and value/native-secret redaction is line-local, so nothing a sanitizer does
+    spans a blank line. Therefore `sanitize(text[:cut]) + sanitize(text[cut:]) ==
+    sanitize(text)` when `cut` is right after a blank line. We finalize up to the
+    LAST blank line and re-sanitize everything after it (a possibly-open table or
+    section, plus the growing tail). No blank line yet -> finalize nothing (the
+    whole tail is re-sanitized, correct but not yet cheaper). Conservative by
+    construction: it never splits inside a section/table, so it cannot leak.
+    """
+    pos = text.rfind("\n\n")
+    if pos < 0:
+        return 0
+    return pos + 2
+
+
+def _known_values_version() -> tuple:
+    """Cheap identity of the current known-value set. Changes (retroactively
+    redacting earlier content) force the streaming sanitizer to re-do the whole
+    buffer; a stable set lets it finalize a growing prefix."""
+    srcs = (
+        _KNOWN_USERS,
+        _KNOWN_HOSTNAMES,
+        _KNOWN_DOMAINS,
+        _KNOWN_BASE_DNS,
+        _KNOWN_NETBIOS,
+        _KNOWN_PASSWORDS,
+        _KNOWN_WORKSPACES,
+    )
+    return tuple((id(s), len(s)) for s in srcs)
+
+
+class _StreamingSanitizer:
+    """Sanitize a monotonically-growing buffer incrementally, byte-identical to
+    ``_sanitize_rich_output(whole_buffer)``.
+
+    The session streamer re-sanitizes the whole record buffer every flush
+    (O(n^2)). This finalizes a growing safe PREFIX (`_stable_out` = the sanitized
+    output of `raw[:_stable_raw_len]`, where `_stable_raw_len` is always a safe
+    boundary) and only re-sanitizes the UNSTABLE tail each call — bounded by the
+    recent output since the last safe boundary, i.e. O(1) amortized while the
+    known-value set is stable. When the set changes (a credential learned
+    mid-scan) it resets and re-does the whole buffer so the new value is applied
+    retroactively. Correctness rests entirely on `_streaming_safe_prefix_len`
+    returning boundaries at which sanitization decomposes; the byte-identity test
+    is the gate.
+    """
+
+    def __init__(self) -> None:
+        self._stable_raw_len = 0
+        self._stable_out = ""
+        self._version: "tuple | None" = None
+
+    def sanitize(self, raw_html: str) -> str:
+        version = _known_values_version()
+        if version != self._version or self._stable_raw_len > len(raw_html):
+            # Known-value set changed (retroactive redaction) or the buffer was
+            # reset/shrank — re-do from scratch.
+            self._version = version
+            self._stable_raw_len = 0
+            self._stable_out = ""
+
+        tail = raw_html[self._stable_raw_len :]
+        tail_out = _sanitize_rich_output(tail) if tail else ""
+        full = self._stable_out + tail_out
+
+        safe = _streaming_safe_prefix_len(tail)
+        if safe > 0:
+            seg = tail[:safe]
+            seg_out = _sanitize_rich_output(seg)
+            # The table sanitizers `splitlines()` + `"\n".join()`, which strips
+            # the trailing newline(s) of their input. Internal newlines are
+            # preserved, but the boundary newline between this finalized segment
+            # and the still-growing tail would be lost — restore exactly the
+            # trailing newlines the sanitize dropped so `_stable_out` equals the
+            # corresponding prefix of a whole-buffer sanitize.
+            lost = (len(seg) - len(seg.rstrip("\n"))) - (
+                len(seg_out) - len(seg_out.rstrip("\n"))
+            )
+            if lost > 0:
+                seg_out += "\n" * lost
+            self._stable_out += seg_out
+            self._stable_raw_len += safe
+        return full
 
 
 def _sanitize_rich_output(content: str) -> str:
@@ -5441,199 +5940,135 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
-    # Redact known workspace domains (from variables.json / domains dir).
-    known_domains = _get_known_domains()
-    if known_domains:
-        for domain in known_domains:
-            escaped = re.escape(domain)
-            domain_pattern = re.compile(rf"(?i)(?<![A-Za-z0-9-])({escaped})(\.)?")
-            content = domain_pattern.sub(
-                lambda m: _record_pseudonym(m.group(1), "domain") + (m.group(2) or ""),
-                content,
-            )
+    # Redact every known-value class (domains, hostnames, users, base DNs,
+    # NetBIOS names, passwords, workspaces). The redaction state -- one combined
+    # regex per class plus the derived hostname / short-label / NetBIOS lists --
+    # is precomputed ONCE per known-value-set version (see _redaction_state), so
+    # this whole block is O(1) in the domain size on the hot path; only the
+    # substitutions over the LINE content remain (O(line length), never
+    # O(domain)). Order is preserved and matters: for each name class the longer
+    # form is consumed before its own prefix can match inside it (domain and
+    # hostname FQDN before their short labels). A ``None`` regex means an empty
+    # set (skip) or a build failure, in which case the per-value fallback loop
+    # runs from the precomputed longest-first list -- redaction coverage is
+    # preserved either way.
+    _rs = _redaction_state()
+    _rx = _rs["rx"]
+    _fb = _rs["fb"]
 
-    # Redact known workspace hostnames (from enabled_computers.txt plus anything
-    # registered mid-run via add_known_hostname).
-    #
-    # The FQDN pass runs FIRST for every hostname, then the short-label pass, so
-    # a long name is always consumed before its own prefix can match inside it.
-    # Short labels are collected across all hostnames and deduplicated, because
-    # a forest routinely registers the same short name under several suffixes.
-    known_hostnames = _get_known_hostnames()
-    if known_hostnames:
-        domain_suffixes = list(known_domains) if known_domains else []
-        short_labels: list[str] = []
-        seen_short: set[str] = set()
-        for hostname in known_hostnames:
-            hostname_clean = hostname.strip().rstrip(".")
-            if not hostname_clean:
-                continue
-            fqdn_pattern = re.compile(
-                rf"(?i)(?<![A-Za-z0-9-])({re.escape(hostname_clean)})(\.)?"
-            )
-            content = fqdn_pattern.sub(
-                lambda m: _record_pseudonym(m.group(1), "hostname")
-                + (m.group(2) or ""),
-                content,
-            )
-            # The short label of an FQDN is the bare NetBIOS name the tooling
-            # actually prints, and it is ALSO what AD composes CA names and
-            # machine accounts from -- so it is registered as a first-class
-            # known value matched with the composition-tolerant boundary, not
-            # with the FQDN's stricter one.
-            short = _strip_known_domain_suffix(hostname_clean, domain_suffixes)
-            if short is None and "." not in hostname_clean:
-                # A single-label registration (a CA common name, a DC short
-                # name learned mid-run) is already the short label.
-                short = hostname_clean
-            if short and short.casefold() not in seen_short:
-                seen_short.add(short.casefold())
-                short_labels.append(short)
-        for short_label in short_labels:
+    def _domain_repl(m: "re.Match[str]") -> str:
+        return _record_pseudonym(m.group(1), "domain") + (m.group(2) or "")
+
+    def _hostname_repl(m: "re.Match[str]") -> str:
+        return _record_pseudonym(m.group(1), "hostname") + (m.group(2) or "")
+
+    def _netbios_user_repl(m: "re.Match[str]") -> str:
+        return (
+            _record_pseudonym(m.group(1), "domain")
+            + m.group(2)
+            + _record_pseudonym(m.group(3), "user")
+        )
+
+    # Domains (from variables.json / domains dir).
+    if _rx["domain"] is not None:
+        content = _rx["domain"].sub(_domain_repl, content)
+    elif _fb["domain"]:
+        for domain in _fb["domain"]:
+            content = _cached_pattern(
+                rf"(?i)(?<![A-Za-z0-9-])({re.escape(domain)})(\.)?"
+            ).sub(_domain_repl, content)
+
+    # Hostnames -- FQDN pass FIRST, then the composition-tolerant short-label
+    # pass, so a long name is consumed before its own prefix can match inside it.
+    if _rx["hostname_fqdn"] is not None:
+        content = _rx["hostname_fqdn"].sub(_hostname_repl, content)
+    elif _fb["hostname_fqdn"]:
+        for host in _fb["hostname_fqdn"]:
+            content = _cached_pattern(
+                rf"(?i)(?<![A-Za-z0-9-])({re.escape(host)})(\.)?"
+            ).sub(_hostname_repl, content)
+    if _rx["short_hostname"] is not None:
+        content = _rx["short_hostname"].sub(
+            lambda m: _record_pseudonym(m.group(1), "hostname"), content
+        )
+    elif _fb["short_hostname"]:
+        for short_label in _fb["short_hostname"]:
             content = _known_short_name_pattern(short_label).sub(
-                lambda m: _record_pseudonym(m.group(1), "hostname"),
-                content,
+                lambda m: _record_pseudonym(m.group(1), "hostname"), content
             )
 
-    # Redact known workspace users (from enabled_users.txt per domain).
-    known_users = _get_known_users()
-    if known_users:
-        for user in known_users:
-            user_clean = user.strip()
-            if not user_clean:
-                continue
-            # Boundaried, case-insensitive match. A registered username is
-            # redacted ONLY as a standalone token; the boundaries stop it from
-            # rewriting occurrences inside unrelated words (the over-greediness
-            # fix). There is NO value-skip-list: a username that equals a common
-            # word (e.g. "admin") is a registered secret and MUST be redacted
-            # everywhere it appears as that bounded token -- leaking it is the
-            # legal risk; corrupting the prose word is the acceptable lesser evil.
-            #
-            # force=True: a value registered in the workspace known-user set is an
-            # explicit "this is the operation's account" declaration, so it
-            # overrides the well-known-principal debugging passthrough. Otherwise
-            # an engagement whose actual account is literally "administrator"
-            # would leak in cleartext. (The well-known passthrough still applies
-            # to UNREGISTERED, shape-detected names elsewhere in this function.)
-            user_pattern = re.compile(
-                rf"(?i)(?<![A-Za-z0-9._-])({re.escape(user_clean)})(?![A-Za-z0-9._-])"
-            )
-            content = user_pattern.sub(
-                lambda m: _record_pseudonym(m.group(1), "user", force=True),
-                content,
+    # Users (from enabled_users.txt). Boundaried, case-insensitive; force=True so
+    # a registered known-user value overrides the well-known-principal passthrough
+    # (an engagement whose account is literally "administrator" must not leak). A
+    # registered username is redacted ONLY as a standalone token; the boundaries
+    # stop it from rewriting occurrences inside unrelated words. There is NO
+    # value-skip-list -- a username that equals a common word is a registered
+    # secret and MUST be redacted (leaking it is the legal risk).
+    if _rx["user"] is not None:
+        content = _rx["user"].sub(
+            lambda m: _record_pseudonym(m.group(1), "user", force=True), content
+        )
+    elif _fb["user"]:
+        for user in _fb["user"]:
+            content = _cached_pattern(
+                rf"(?i)(?<![A-Za-z0-9._-])({re.escape(user)})(?![A-Za-z0-9._-])"
+            ).sub(lambda m: _record_pseudonym(m.group(1), "user", force=True), content)
+
+    # Base DNs (comma-flexible: ``\s*,\s*`` between RDNs).
+    if _rx["base_dn"] is not None:
+        content = _rx["base_dn"].sub(
+            lambda m: _record_pseudonym(m.group(1), "domain"), content
+        )
+    elif _fb["base_dn"]:
+        for base_dn in _fb["base_dn"]:
+            flexible = re.escape(base_dn).replace(r"\,", r"\s*,\s*")
+            content = _cached_pattern(rf"(?i)({flexible})").sub(
+                lambda m: _record_pseudonym(m.group(1), "domain"), content
             )
 
-    # Redact known workspace base DNs (from variables.json).
-    known_base_dns = _get_known_base_dns()
-    if known_base_dns:
-        for base_dn in known_base_dns:
-            base_dn_clean = base_dn.strip()
-            if not base_dn_clean:
-                continue
-            escaped = re.escape(base_dn_clean)
-            flexible = escaped.replace(r"\,", r"\s*,\s*")
-            base_dn_pattern = re.compile(rf"(?i){flexible}")
-            content = base_dn_pattern.sub(
-                lambda m: _record_pseudonym(m.group(0), "domain"),
-                content,
+    # NetBIOS -- registered names plus the first DNS label of each known domain
+    # (length-floored). ``NETBIOS\\user`` pass (redacts the org label AND the
+    # account), then the bare-label pass with the composition-tolerant boundary
+    # (AD builds default CA common names / machine accounts from the label).
+    if _rx["netbios_user"] is not None:
+        content = _rx["netbios_user"].sub(_netbios_user_repl, content)
+    elif _fb["netbios"]:
+        for netbios in _fb["netbios"]:
+            content = _cached_pattern(
+                rf"(?i)({re.escape(netbios)})(\\+)([A-Za-z0-9._-]+)"
+            ).sub(_netbios_user_repl, content)
+    if _rx["netbios_short"] is not None:
+        content = _rx["netbios_short"].sub(
+            lambda m: _record_pseudonym(m.group(1), "domain"), content
+        )
+    elif _fb["netbios"]:
+        for netbios in _fb["netbios"]:
+            content = _known_short_name_pattern(netbios).sub(
+                lambda m: _record_pseudonym(m.group(1), "domain"), content
             )
 
-    # Redact known workspace NetBIOS names.
-    #
-    # Two sources, and the DERIVED one is what makes this net work at all on a
-    # real scan. The registered set comes from ``domains_data[<domain>]
-    # ["netbios"]`` read at workspace-ACTIVATION time, and nothing in the
-    # product ever WRITES that key -- every consumer reads it with a
-    # ``domain.split(".")[0].upper()`` fallback. So on a real engagement the
-    # registered set is empty, and a net that depended on it protected nothing.
-    #
-    # The NetBIOS name is by construction the domain's first DNS label, and the
-    # domain registry IS populated on every scan, so deriving the label from
-    # each known domain gives this net the same reach the registered set was
-    # supposed to provide -- without depending on a key nobody sets.
-    #
-    # A label that happens to equal an ordinary word (``corp.local`` ->
-    # ``corp``) is redacted as that bounded token, on the same reasoning the
-    # known-user loop below already documents: it is a registered customer
-    # identifier, leaking it is the legal risk, and corrupting the prose word is
-    # the acceptable lesser evil. The full domain was already masked anyway.
-    known_netbios = list(_get_known_netbios())
-    seen_netbios = {value.strip().casefold() for value in known_netbios if value.strip()}
-    for domain in known_domains:
-        label = (domain or "").strip().rstrip(".").split(".", 1)[0]
-        # Same floor the known-user / known-password loops apply: a one- or
-        # two-character value cannot be substring-redacted safely under ANY
-        # boundary, because it hits every standalone "a" / "I" in the buffer.
-        # An EXPLICITLY registered NetBIOS name is trusted at any length; a
-        # DERIVED label is an inference from a domain, so it earns the floor.
-        if len(label) < _MIN_KNOWN_USER_LEN:
-            continue
-        if label.casefold() not in seen_netbios:
-            seen_netbios.add(label.casefold())
-            known_netbios.append(label)
-    if known_netbios:
-        for netbios in known_netbios:
-            netbios_clean = netbios.strip()
-            if not netbios_clean:
-                continue
-            netbios_user_pattern = re.compile(
-                rf"(?i)({re.escape(netbios_clean)})(\\+)([A-Za-z0-9._-]+)"
-            )
-            content = netbios_user_pattern.sub(
-                lambda m: (
-                    _record_pseudonym(m.group(1), "domain")
-                    + m.group(2)
-                    + _record_pseudonym(m.group(3), "user")
-                ),
-                content,
-            )
-            # Composition-tolerant boundary: a NetBIOS name is what AD builds
-            # its default CA common name from (``<NETBIOS>-CA``,
-            # ``<HOST>-ISSUING-CA``) and what it suffixes for machine accounts
-            # (``HOST$``). Excluding "-" from the boundary meant the customer's
-            # organisation name shipped in cleartext with every ADCS run.
-            content = _known_short_name_pattern(netbios_clean).sub(
-                lambda m: _record_pseudonym(m.group(1), "domain"),
-                content,
-            )
+    # Passwords -- CASE-SENSITIVE (no ``(?i)``): password casing is significant,
+    # and the boundaries stop a value matching inside an unrelated word.
+    if _rx["password"] is not None:
+        content = _rx["password"].sub(
+            lambda m: _record_pseudonym(m.group(1), "password"), content
+        )
+    elif _fb["password"]:
+        for password in _fb["password"]:
+            content = _cached_pattern(
+                rf"(?<![A-Za-z0-9._@/-])({re.escape(password)})(?![A-Za-z0-9._@/-])"
+            ).sub(lambda m: _record_pseudonym(m.group(1), "password"), content)
 
-    # Redact known workspace passwords (from variables.json domains_data).
-    known_passwords = _get_known_passwords()
-    if known_passwords:
-        for password in known_passwords:
-            password_clean = password.strip()
-            if not password_clean:
-                continue
-            # Boundaried, CASE-SENSITIVE match. Mirrors the known-user loop's
-            # alnum/credential-char boundaries so a registered password no
-            # longer rewrites occurrences inside unrelated words or log-level
-            # tokens (e.g. a password "Inform" must not match inside
-            # "Information"). Case is preserved deliberately: password casing is
-            # significant, and case-folding here is what let a value match a
-            # differently-cased ordinary word.
-            password_pattern = re.compile(
-                rf"(?<![A-Za-z0-9._@/-])({re.escape(password_clean)})(?![A-Za-z0-9._@/-])"
-            )
-            content = password_pattern.sub(
-                lambda m: _record_pseudonym(m.group(1), "password"),
-                content,
-            )
-
-    # Redact known workspace names (current workspace and sibling workspaces).
-    known_workspaces = _get_known_workspaces()
-    if known_workspaces:
-        for workspace_name in known_workspaces:
-            workspace_clean = workspace_name.strip()
-            if not workspace_clean:
-                continue
-            workspace_pattern = re.compile(
-                rf"(?i)(?<![A-Za-z0-9._-])({re.escape(workspace_clean)})(?![A-Za-z0-9._-])"
-            )
-            content = workspace_pattern.sub(
-                lambda m: _record_pseudonym(m.group(1), "workspace"),
-                content,
-            )
+    # Workspaces (current workspace and sibling workspaces).
+    if _rx["workspace"] is not None:
+        content = _rx["workspace"].sub(
+            lambda m: _record_pseudonym(m.group(1), "workspace"), content
+        )
+    elif _fb["workspace"]:
+        for workspace in _fb["workspace"]:
+            content = _cached_pattern(
+                rf"(?i)(?<![A-Za-z0-9._-])({re.escape(workspace)})(?![A-Za-z0-9._-])"
+            ).sub(lambda m: _record_pseudonym(m.group(1), "workspace"), content)
 
     # Apply structured redaction for credential tables and lists
     content = _mask_credential_sections(content)
@@ -7699,7 +8134,12 @@ def make_session_streamer(
         started_at=started_at,
         upload_fn=lambda payload: _upload_chunk(trace_id, payload),
         enqueue_fn=lambda payload: _enqueue_chunk_failure(trace_id, payload),
-        sanitize_fn=_sanitize_rich_output,
+        # Streaming sanitizer: byte-identical to _sanitize_rich_output on the
+        # growing buffer (proven by tests/unit/core/test_telemetry_streaming_sanitize.py)
+        # but finalizes a growing prefix at blank-line boundaries and only
+        # re-sanitizes the recent tail per flush -> kills the per-flush
+        # whole-buffer O(n^2). One stateful instance per streamer.
+        sanitize_fn=_StreamingSanitizer().sanitize,
         export_html_fn=export_html_fn,
         version_payload_fn=version_payload_fn,
     )

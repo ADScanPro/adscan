@@ -514,10 +514,20 @@ def client_path_totals_for_session(
     else:
         names = list(domains)
 
+    from adscan_internal.services.attack_step_domain_resolution import (
+        is_placeholder_domain,
+    )
+
     totals = ClientPathTotals()
     for name in names:
         domain_name = str(name or "").strip()
         if not domain_name:
+            continue
+        # Skip the synthetic ``wellknown`` placeholder: well-known / global
+        # principals carry it, but there is no ``domains/wellknown/*.json`` to
+        # read and no real graph to compute — iterating it only wastes a full
+        # per-domain compute and logs "enabled users file missing for wellknown".
+        if is_placeholder_domain(domain_name):
             continue
         totals = totals.merged_with(client_path_totals(workspace_dir, domain_name))
     return totals

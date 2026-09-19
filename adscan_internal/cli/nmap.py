@@ -19,6 +19,7 @@ from adscan_core.pal.process import effective_user_is_root
 from adscan_core.pal.platform import is_windows
 from adscan_internal.services.network_probe_service import (
     ScanPacing,
+    _env_int,
     connect_scan_open_ports_sync,
     expand_host_expression,
 )
@@ -80,6 +81,56 @@ MassdnsReportFilter = Literal["resolved", "unresolved"]
 MassdnsReportSort = Literal["hostname", "ip-count", "status"]
 _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD = 10
 _MEDIUM_IMPORTANT_PORT_SCAN_IP_THRESHOLD = 100
+
+# --- Nmap timing (SSOT) ------------------------------------------------------
+# Rate-neutral, polite-by-default timing shared by every Linux nmap command.
+# On a large AD domain a big fraction of the DNS-resolved ENABLED computer
+# objects are stale/offline, and nmap's default 10 retransmits per DEAD host
+# dominate wall-clock (measured ~37 min for 40% of ~1000 hosts). These flags
+# bound only the give-up COST on dead hosts (retransmits + per-host wall-clock);
+# they do NOT raise the send rate against live hosts. The default deliberately
+# carries NO -T4/-T5, NO --min-rate, NO --max-rate and NO --scan-delay — those
+# raise aggression and are rejected as a default by the AD OPSEC constraints
+# (adscan-ad-constraints § 11). Speed is strictly OPT-IN via env for an operator
+# who owns the network.
+_NMAP_DEFAULT_MAX_RETRIES = 3
+_NMAP_MAX_RETRIES_CEILING = 10
+_NMAP_DEFAULT_HOST_TIMEOUT = "15m"
+# nmap accepts a bare number (seconds) or <num>[smh]; validate that shape.
+_NMAP_HOST_TIMEOUT_RE = re.compile(r"^\d+(?:\.\d+)?[smh]?$")
+_NMAP_TIMING_TEMPLATE_RE = re.compile(r"^-T[0-5]$")
+
+
+def _nmap_timing_flags() -> str:
+    """Return the shared Linux nmap timing flags (rate-neutral defaults + env opt-in).
+
+    Defaults are polite-by-default and rate-neutral: ``--max-retries 3`` (down
+    from nmap's 10) and ``--host-timeout 15m`` bound how long nmap wastes on a
+    DEAD host without changing the send rate against a live one. The optional
+    timing TEMPLATE is the ONLY thing that ever appends a ``-T<n>`` and it is the
+    sanctioned "operator owns the network" speed override — unset by default.
+
+    Env overrides (all safe-fallback on a missing/bad value):
+      - ``ADSCAN_PORTSCAN_NMAP_MAX_RETRIES`` — int, clamped to 1..10 (default 3).
+      - ``ADSCAN_PORTSCAN_NMAP_HOST_TIMEOUT`` — nmap ``<num>[smh]`` form (default "15m").
+      - ``ADSCAN_PORTSCAN_NMAP_TIMING`` — ``-T0``..``-T5``; unset => nothing added.
+
+    Returns:
+        The timing flags as a single space-joined string (no leading/trailing
+        space), e.g. ``"--max-retries 3 --host-timeout 15m"``.
+    """
+    retries = min(
+        _env_int("ADSCAN_PORTSCAN_NMAP_MAX_RETRIES", _NMAP_DEFAULT_MAX_RETRIES, minimum=1),
+        _NMAP_MAX_RETRIES_CEILING,
+    )
+    host_timeout = os.environ.get("ADSCAN_PORTSCAN_NMAP_HOST_TIMEOUT", "").strip()
+    if not host_timeout or not _NMAP_HOST_TIMEOUT_RE.match(host_timeout):
+        host_timeout = _NMAP_DEFAULT_HOST_TIMEOUT
+    flags = f"--max-retries {retries} --host-timeout {host_timeout}"
+    timing = os.environ.get("ADSCAN_PORTSCAN_NMAP_TIMING", "").strip()
+    if timing and _NMAP_TIMING_TEMPLATE_RE.match(timing):
+        flags = f"{timing} {flags}"
+    return flags
 
 
 class NmapShell(Protocol):
@@ -256,7 +307,7 @@ def discover_dc_candidates_with_nmap_details(
             return _report_dc_candidates(open_ports_by_host, marked_ports=marked_ports)
 
         scan_cmd = (
-            f"nmap --open -n -Pn -sS -p{port_list} "
+            f"nmap --open -n {_nmap_timing_flags()} -Pn -sS -p{port_list} "
             f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
         )
         print_info_debug(f"[nmap][dc-discovery] {scan_cmd}")
@@ -278,7 +329,7 @@ def discover_dc_candidates_with_nmap_details(
             return {}
         if _nmap_output_indicates_missing_privileges(output_text):
             sudo_scan_cmd = (
-                f"sudo -n nmap --open -n -Pn -sS -p{port_list} "
+                f"sudo -n nmap --open -n {_nmap_timing_flags()} -Pn -sS -p{port_list} "
                 f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
             )
             print_warning(
@@ -296,7 +347,7 @@ def discover_dc_candidates_with_nmap_details(
                     "sudo -n failed or is not permitted; falling back to TCP connect scan."
                 )
                 scan_cmd = (
-                    f"nmap --open -n -Pn -sT -p{port_list} "
+                    f"nmap --open -n {_nmap_timing_flags()} -Pn -sT -p{port_list} "
                     f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
                 )
                 print_warning(
@@ -428,12 +479,12 @@ def probe_host_reachability_with_nmap(
     else:
         if output_path:
             scan_cmd = (
-                f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
+                f"nmap --open -n {_nmap_timing_flags()} -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
                 f"-oG {shlex.quote(output_path)} {shlex.quote(target_host)}"
             )
         else:
             scan_cmd = (
-                f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
+                f"nmap --open -n {_nmap_timing_flags()} -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
                 f"{shlex.quote(target_host)}"
             )
 
@@ -3056,7 +3107,7 @@ def convert_hostnames_to_ips_and_scan(
                     f"nmap -sS -PS{important_ports_csv} "
                     f"-PA{important_ports_csv} "
                     f"-p{important_ports_csv} "
-                    f"-n -vvv --stats-every 2s -iL {shlex.quote(str(ip_file))} "
+                    f"-n {_nmap_timing_flags()} -vvv --stats-every 2s -iL {shlex.quote(str(ip_file))} "
                     f"-oN {shlex.quote(str(scan_output_path))} "
                     f"-oG {shlex.quote(str(scan_output_path))}.gnmap"
                 )

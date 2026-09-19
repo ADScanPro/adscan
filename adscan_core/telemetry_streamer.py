@@ -130,6 +130,11 @@ class SessionStreamer:
         self._config = config
         self._seq: int = 0
         self._sent_chars: int = 0  # length of the sanitized text already shipped
+        # Length of the raw exported HTML at the last flush that actually
+        # sanitized. The record buffer is append-only (export_html(clear=False)),
+        # so an unchanged length means no new content since the last flush -- we
+        # then skip the (whole-buffer, O(n)) sanitize entirely. -1 = never flushed.
+        self._last_flush_raw_len: int = -1
         self._lock = threading.Lock()
         self._event_wake = threading.Event()
         self._stop_event = threading.Event()
@@ -254,7 +259,24 @@ class SessionStreamer:
         # already shipped. Sanitization runs INSIDE the lock-free
         # section because the sanitizer is pure.
         raw_html = self._safe_export_html()
+
+        # Skip the whole-buffer sanitize when there is NOTHING new to ship. The
+        # record buffer is append-only, so an unchanged raw length means no new
+        # content since the last flush; sanitizing it again would just recompute
+        # the same output and the existing "nothing changed" guard below would
+        # discard it anyway. A timer flush during a quiet scan phase (waiting on a
+        # tool / the network) hits this and avoids a wasted O(buffer) sanitize.
+        # A pending lifecycle event or the final flush must always proceed.
+        raw_len = len(raw_html)
+        if (
+            not force_final
+            and not lifecycle_batch
+            and raw_len == self._last_flush_raw_len
+        ):
+            return
+
         sanitized = self._config.sanitize_fn(raw_html) if raw_html else ""
+        self._last_flush_raw_len = raw_len
 
         # Defensive cursor recovery: if the sanitized buffer is SHORTER
         # than our cursor, the upstream Rich console was reset / cleared

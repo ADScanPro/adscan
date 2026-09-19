@@ -175,7 +175,7 @@ def evaluate_findings(
         )
 
     try:
-        from impacket.ldap import ldaptypes  # noqa: WPS433
+        from impacket.ldap import ldaptypes
     except ImportError as exc:
         return BadSuccessorFindings(
             functional_level=functional_level,

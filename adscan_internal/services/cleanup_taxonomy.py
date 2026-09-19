@@ -242,11 +242,70 @@ MANUAL_SHADOW_CREDS = (
 )
 
 MANUAL_DACL_ACE = (
-    "Remove the access control entry added during the engagement:\n"
-    "  $acl = Get-Acl 'AD:TARGET'\n"
-    "  # remove the ACE granting rights to TRUSTEE, then:\n"
-    "  Set-Acl -Path 'AD:TARGET' -AclObject $acl"
+    "Remove the access control entry added during the engagement. RIGHTS_NOTEThis "
+    "removes every ACE the trustee holds on the object, so confirm the trustee has "
+    "no legitimate rights on it before running it:\n"
+    '  dsacls "OBJECT_DN" /R "TRUSTEE"\n'
+    "  # verify it is gone (should return nothing):\n"
+    "  (Get-Acl \"AD:OBJECT_DN\").Access | "
+    "Where-Object { $_.IdentityReference -like '*TRUSTEE_NAME*' }"
 )
+
+
+def _object_reference_to_dn(obj: str | None, domain: str | None) -> str:
+    """Best-effort distinguished name for a client-facing cleanup command.
+
+    An already-DN reference is returned unchanged; a domain-like token
+    (``htb.local``) becomes its ``DC=htb,DC=local`` DN; a bare name is left as
+    is (the client substitutes the object's DN). Falls back to the domain DN
+    when no object reference is available.
+    """
+    ref = str(obj or "").strip()
+    if "=" in ref:
+        return ref
+    if ref and "." in ref and " " not in ref:
+        return ",".join(f"DC={part}" for part in ref.lower().split("."))
+    if not ref and domain:
+        return ",".join(f"DC={part}" for part in str(domain).strip().lower().split("."))
+    return ref
+
+
+def dacl_ace_remediation(
+    *,
+    object_dn: str | None = None,
+    trustee: str | None = None,
+    rights_type: str | None = None,
+    domain: str | None = None,
+) -> str:
+    """Render the cleanup for an ACE ADscan added, with this engagement's values.
+
+    Fills the object DN and the NetBIOS-qualified trustee into a runnable
+    ``dsacls /R`` command (the same native form the attack-path remediation
+    renders), instead of leaving the ``OBJECT_DN``/``TRUSTEE`` template tokens
+    for the client to guess. Names the rights that were granted (e.g. DCSync)
+    so the reader knows what the ACE did.
+    """
+    dn = _object_reference_to_dn(object_dn, domain)
+    trustee_name = str(trustee or "").strip()
+    netbios = ""
+    if domain:
+        first_label = str(domain).strip().split(".", 1)[0]
+        netbios = first_label.upper()
+    principal = f"{netbios}\\{trustee_name}" if netbios and trustee_name else (trustee_name or "TRUSTEE")
+    rights_note = ""
+    if rights_type:
+        raw = str(rights_type).strip().lower()
+        label = {
+            "dcsync": "directory-replication (DCSync)",
+            "writedacl": "write-DACL",
+            "genericall": "full-control (GenericAll)",
+        }.get(raw, raw)
+        rights_note = f"This ACE granted {label} rights. "
+    body = MANUAL_DACL_ACE.replace("OBJECT_DN", dn or "TARGET")
+    body = body.replace("TRUSTEE_NAME", trustee_name or "the trustee")
+    body = body.replace("TRUSTEE", principal)
+    body = body.replace("RIGHTS_NOTE", rights_note)
+    return body
 
 MANUAL_OWNER = (
     "Restore the original owner of the object manually:\n"
@@ -597,6 +656,7 @@ __all__ = [
     "forged_certificate_remediation",
     "ca_backup_service_remediation",
     "ca_backup_temp_pfx_remediation",
+    "dacl_ace_remediation",
     "KIND_REMEDIATION_TEMPLATE",
     "remediation_template_for_kind",
 ]

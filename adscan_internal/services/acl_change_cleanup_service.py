@@ -682,9 +682,31 @@ def _manual_instructions(kind: str, action: dict[str, Any]) -> str:
     if kind == "shadow_credentials_added":
         return _MANUAL_SHADOW_CREDS
     if kind == "dacl_ace_added":
-        return _MANUAL_DACL_ACE
+        # Fill the real object DN + NetBIOS-qualified trustee (and the rights the
+        # ACE granted, e.g. DCSync) into a runnable dsacls command — never leave
+        # the OBJECT_DN/TRUSTEE template tokens for the client to guess.
+        return _tax.dacl_ace_remediation(
+            object_dn=str(
+                action.get("target_dn")
+                or action.get("object_dn")
+                or action.get("dn")
+                or action.get("target_object")
+                or target
+            ),
+            trustee=str(
+                action.get("trustee")
+                or action.get("added_user")
+                or action.get("exec_username")
+                or action.get("executor_username")
+                or ""
+            ),
+            rights_type=str(action.get("rights_type") or ""),
+            domain=str(action.get("target_domain") or action.get("domain") or ""),
+        )
     if kind == "owner_changed":
-        return _MANUAL_OWNER
+        return _MANUAL_OWNER.replace("TARGET", target).replace(
+            "ORIGINAL_OWNER", str(action.get("original_owner") or "the original owner")
+        )
     if kind == "spn_added":
         return _MANUAL_SPN.replace("TARGET", target).replace("SPN", spn)
     if kind == "password_changed":

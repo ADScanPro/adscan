@@ -34,9 +34,11 @@ from adscan_internal.services.credentials.privilege_role import (
     set_credential_secret_kind,
 )
 from adscan_internal.services.credentials.credential_origin import (
+    BLANK_ANONYMOUS_LOGON_LABEL,
     CredentialAcquisition,
     build_method_set,
     classify_origin_acquisition,
+    is_blank_anonymous_credential,
     origin_display_label,
     origin_slug_for_relation,
 )
@@ -45,9 +47,11 @@ from adscan_internal.services.credentials.provenance_context import (
 )
 
 __all__ = [
+    "BLANK_ANONYMOUS_LOGON_LABEL",
     "ROLE_PRIORITY",
     "CredentialAcquisition",
     "CredentialKind",
+    "is_blank_anonymous_credential",
     "CredentialMetadata",
     "CredentialPrivilegeRole",
     "append_credential_origin",

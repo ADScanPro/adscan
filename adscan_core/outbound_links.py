@@ -53,8 +53,15 @@ here only ever emit ``[link=...]`` (an opening tag) and escape their label.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from rich.markup import escape
+
+if TYPE_CHECKING:
+    # Type-only import so the ``"CtaLane"`` forward-ref annotation resolves for
+    # linters/checkers without a runtime import cycle (the enum is imported
+    # lazily inside ``cta_placement_for_lane`` at call time).
+    from adscan_core.operator_role import CtaLane
 
 __all__ = [
     "ADSCAN_SITE_HOST",

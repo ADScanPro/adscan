@@ -208,6 +208,10 @@ class PrincipalFacts:
 
     #: Display label, used ONLY to compose the remediation sentence.
     label: str = ""
+    #: Real sAMAccountName from the node, when the collector resolved it. Carries
+    #: the correct human casing (``michael.wrightson`` / ``Backup Operators``) the
+    #: prose helper prefers over the (usually shouting) label.
+    samaccountname: str = ""
     #: ``objectId`` — a SID for a security principal, a GUID for a container.
     object_id: str = ""
     #: Lower-cased node kind (``user`` / ``computer`` / ``group`` / ``domain`` …).
@@ -241,8 +245,27 @@ class PrincipalFacts:
 
     @property
     def display(self) -> str:
-        """The name to put in a remediation sentence."""
-        return self.label or self.object_id
+        """The name to put in a remediation sentence.
+
+        Runs the raw label through the client-prose SSOT so a remediation verb
+        reads as a consultant writes it (``Remove emily.oscars from Backup
+        Operators.``), never with the collector's shouting UPN (``Remove
+        EMILY.OSCARS@CICADA.HTB from BACKUP OPERATORS@CICADA.HTB.``). Best-effort:
+        any failure falls back to the raw label. A cross-forest object is not
+        disambiguated here (the short verb has no report-domain context); the
+        report/writeup narrative that surrounds it carries that qualification.
+        """
+        raw = self.label or self.object_id
+        try:
+            from adscan_internal.services.well_known_principals import (  # noqa: PLC0415
+                humanize_principal_for_prose,
+            )
+
+            return humanize_principal_for_prose(
+                label=raw, samaccountname=self.samaccountname, kind=self.kind
+            )
+        except Exception:  # pragma: no cover - humanization is best-effort
+            return raw
 
 
 def _rid_of(object_id: str) -> int | None:
@@ -350,6 +373,7 @@ def principal_facts_from_node(node: Mapping[str, Any] | None) -> PrincipalFacts 
 
     return PrincipalFacts(
         label=label,
+        samaccountname=str(props.get("samaccountname") or props.get("sAMAccountName") or "").strip(),
         object_id=sid,
         kind=kind,
         rid=_rid_of(sid),

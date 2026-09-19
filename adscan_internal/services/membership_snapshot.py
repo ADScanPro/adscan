@@ -823,6 +823,17 @@ def load_membership_snapshot(
     domain_key = str(domain or "").strip().lower()
     if not domain_key:
         return None
+    # Synthetic placeholder pseudo-domains ("wellknown") never have a
+    # domains/<d>/memberships.json on disk — they are graph-structural, not
+    # collected domains. Short-circuit before the file-stat + the noisy
+    # "snapshot cache miss: domain=wellknown" line on every per-domain
+    # resolution inside a compute. Returns None, identical to the miss path.
+    from adscan_internal.services.attack_step_domain_resolution import (
+        is_placeholder_domain,
+    )
+
+    if is_placeholder_domain(domain_key):
+        return None
     if domain_key in _MEMBERSHIP_SNAPSHOT_CACHE:
         increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "hits")
         cached = _MEMBERSHIP_SNAPSHOT_CACHE[domain_key]

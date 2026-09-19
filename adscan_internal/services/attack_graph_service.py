@@ -46,6 +46,7 @@ from adscan_internal.services.attack_path_explosion_predictor import predicts_ex
 # (and any consumer catching it via this module) are unchanged.
 from adscan_core.reporting.attack_path_memory_gate import (
     _AttackPathMemoryBudgetExceeded,
+    _read_max_dfs_states,
 )
 from adscan_internal.services.attack_graph_findings import sync_attack_graph_findings
 from adscan_internal.services.privileged_group_classifier import (
@@ -505,6 +506,18 @@ def _maintenance_key(version: int) -> str:
 
 def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
     """Load enabled users list for a domain if available."""
+    # Synthetic placeholder pseudo-domains ("wellknown", where well-known SIDs
+    # such as Authenticated Users / Everyone live) are graph-structural, not
+    # collected domains: there is never a domains/<d>/enabled_users.txt for them.
+    # Short-circuit before the file-stat + the noisy "enabled users file missing
+    # for wellknown" debug line that otherwise fires on every per-domain
+    # resolution inside a compute. Returns None, identical to the miss path.
+    from adscan_internal.services.attack_step_domain_resolution import (
+        is_placeholder_domain,
+    )
+
+    if is_placeholder_domain(domain):
+        return None
     try:
         workspace_cwd = resolve_workspace_cwd(shell)
         domains_dir = getattr(shell, "domains_dir", "domains")
@@ -2587,13 +2600,27 @@ def _attack_paths_cache_base_key(
     function is in — legacy mtime (flag off) or structural (flag on). This is why
     a status-only write no longer colds the compute cache under the structural
     epoch, while a topology change still does.
+
+    The key ALSO folds in the memory-gate BUDGET (the absolute DFS-state cap and
+    the memory ceiling). When a run hits the gate, its recovered coverage-bounded
+    result is cached under this key (see :func:`_recover_from_memory_abort`); the
+    operator remedy is "raise the state limit or the analysis host's memory and
+    re-run", so the budget MUST be part of the key — otherwise a raised-budget
+    re-run would be served the stale bounded result instead of recomputing a
+    fuller set. Both knobs are STABLE within a deployment (the state cap is an env
+    value; ``limit_bytes`` is the cgroup/container cap or host total RAM, not the
+    volatile ``available_bytes``), so folding them in does not cause spurious cache
+    misses on the normal, non-aborting path.
     """
     graph_epoch, snapshot_epoch = attack_paths_epoch_fingerprint(shell, domain)
+    limit_bytes, _available_bytes = _read_memory_ceiling()
+    budget = (int(_read_max_dfs_states()), limit_bytes)
     return (
         str(domain or "").strip().lower(),
         str(scope or "").strip().lower(),
         graph_epoch,
         snapshot_epoch,
+        budget,
         params,
     )
 
@@ -2806,13 +2833,139 @@ def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...
         return _mtime_epoch_fingerprint(shell, domain)
 
 
+# Fully-proven EDGE statuses (a real execution succeeded), ranked strongest-last.
+# These are EDGE statuses only — "partial" is a PATH status a chain earns from a
+# proven step and is never an edge status, so it is deliberately absent here.
+_PROVEN_EXECUTION_EDGE_STATUS_RANK: dict[str, int] = {
+    "success": 1,
+    "exploited": 2,
+    "domain_compromised": 3,
+}
+
+
+def _edge_hop_label_key(
+    edge: Mapping[str, Any], label_for: Callable[[str], str]
+) -> tuple[str, str, str] | None:
+    """Return the label-space ``(from, relation, to)`` identity for one edge.
+
+    LABEL-space (not node-id) so two edges that model the SAME logical hop through
+    DIFFERENT node representations of one principal (e.g. the collector's
+    SID-keyed ``Domain Users`` node and an execution recorder's label-keyed
+    ``Domain Users`` entry node) collapse to the same key. Returns ``None`` for a
+    malformed edge.
+    """
+    from_id = str(edge.get("from") or edge.get("source") or "")
+    to_id = str(edge.get("to") or edge.get("target") or "")
+    relation = str(edge.get("relation") or "").strip().lower()
+    if not from_id or not to_id or not relation:
+        return None
+    return (
+        _normalize_account(label_for(from_id)),
+        relation,
+        _normalize_account(label_for(to_id)),
+    )
+
+
+def reconcile_proven_execution_edge_status(graph: dict[str, Any]) -> int:
+    """Fold a proven execution's status onto the traversable twin of the same hop.
+
+    A single logical hop (``<principal> --relation--> <target>``) can be present
+    in the graph as TWO edges: the collector's discovered/theoretical edge that
+    the domain-listing DFS actually traverses (keyed on the principal's canonical
+    SID node) and a separate execution-recorded edge carrying the PROVEN
+    ``success`` (keyed on a label-only entry node the DFS never sources from).
+    The recompute-from-graph path then loses the proof — the traversed edge is
+    ``discovered`` — so a route whose root step ADscan genuinely executed renders
+    ``theoretical`` instead of ``partial``. (Warm serves masked this because the
+    status re-derivation matches by LABEL and could pick up the proven twin; a
+    cold recompute cannot, which is why the same finding set rendered
+    ``theoretical`` in one artifact and ``partial`` in another.)
+
+    This makes the two agree at the graph level: every edge whose logical hop
+    (LABEL-space ``from``/``relation``/``to``) also carries a fully-proven
+    execution edge is upgraded to that proven status, so the DFS-traversed edge
+    reflects the execution. Copy-on-write — an upgraded edge is REPLACED by a
+    shallow copy so a shared/cached prepared-graph edge dict is never mutated;
+    idempotent (re-running over an already-reconciled graph changes nothing).
+
+    Exposure-Validation safe: a status is only PROPAGATED from a real proven
+    execution edge that exists in the graph — never invented. A workspace with no
+    successful execution has no proven edge, so nothing is upgraded and the routes
+    stay ``theoretical``.
+
+    Args:
+        graph: A runtime graph ``{"nodes": {id: node}, "edges": [edge, ...]}``.
+            Mutated in place (``graph["edges"]`` is rebound to the reconciled list).
+
+    Returns:
+        The number of edges upgraded.
+    """
+    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    if not edges:
+        return 0
+
+    def _label_for(node_id: str) -> str:
+        node = nodes.get(node_id) if isinstance(nodes, dict) else None
+        if isinstance(node, dict):
+            return str(node.get("label") or node.get("name") or node_id)
+        return node_id
+
+    # Strongest proven status observed per logical hop.
+    proven_by_hop: dict[tuple[str, str, str], str] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        rank = _PROVEN_EXECUTION_EDGE_STATUS_RANK.get(
+            str(edge.get("status") or "").strip().lower()
+        )
+        if rank is None:
+            continue
+        key = _edge_hop_label_key(edge, _label_for)
+        if key is None:
+            continue
+        current = proven_by_hop.get(key)
+        if current is None or rank > _PROVEN_EXECUTION_EDGE_STATUS_RANK[current]:
+            proven_by_hop[key] = str(edge.get("status") or "").strip().lower()
+    if not proven_by_hop:
+        return 0
+
+    upgraded = 0
+    new_edges: list[Any] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            new_edges.append(edge)
+            continue
+        status = str(edge.get("status") or "").strip().lower()
+        if status in _PROVEN_EXECUTION_EDGE_STATUS_RANK:
+            new_edges.append(edge)
+            continue
+        key = _edge_hop_label_key(edge, _label_for)
+        proven_status = proven_by_hop.get(key) if key is not None else None
+        if proven_status is None:
+            new_edges.append(edge)
+            continue
+        promoted = dict(edge)
+        promoted["status"] = proven_status
+        new_edges.append(promoted)
+        upgraded += 1
+    if upgraded:
+        graph["edges"] = new_edges
+    return upgraded
+
+
 def _build_current_edge_status_index(graph: dict[str, Any]) -> dict[tuple[str, str, str], str]:
     """Index the warm graph's CURRENT edge statuses by ``(from, relation, to)`` label.
 
     Endpoints are resolved node-id -> label and normalized with
     :func:`_normalize_account` so they compare against a cached step's
-    ``details.from``/``details.to`` labels. Relation is lower-cased. Best-effort:
-    a malformed graph yields an empty index (no re-derivation, cached serve).
+    ``details.from``/``details.to`` labels. Relation is lower-cased. When two
+    edges share one label-space hop (an alias/entry-node twin of the same
+    principal), the PROVEN status wins over a discovered/theoretical one — the
+    same reconciliation :func:`reconcile_proven_execution_edge_status` applies to
+    the DFS graph, so a warm-served status can never disagree with a cold
+    recompute. Best-effort: a malformed graph yields an empty index (no
+    re-derivation, cached serve).
     """
     index: dict[tuple[str, str, str], str] = {}
     nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -2838,8 +2991,24 @@ def _build_current_edge_status_index(graph: dict[str, Any]) -> dict[tuple[str, s
             relation,
             _normalize_account(_label_for(to_id)),
         )
+        existing = index.get(key)
+        if existing is not None and _edge_status_rank(existing) >= _edge_status_rank(status):
+            # Keep the stronger-proof status: a proven execution twin must not be
+            # overwritten by a later discovered/theoretical edge of the same hop.
+            continue
         index[key] = status
     return index
+
+
+def _edge_status_rank(status: str) -> int:
+    """Rank an edge status by proof strength (proven > attempted > discovered)."""
+    normalized = str(status or "").strip().lower()
+    proven = _PROVEN_EXECUTION_EDGE_STATUS_RANK.get(normalized)
+    if proven is not None:
+        return 10 + proven
+    if normalized in {"attempted", "failed", "error"}:
+        return 2
+    return 1
 
 
 def _rederive_cached_record_statuses(
@@ -8741,6 +8910,14 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
             resolved_dc_ip = resolve_dc_ip(domain_entry)
             if resolved_dc_ip:
                 graph["dc_ip"] = resolved_dc_ip
+            # NetBIOS (flat) domain for the NT-account form of a client-facing
+            # remediation command (dsacls / NTAccount principals must be
+            # NetBIOS-qualified, e.g. HTB\Account Operators). Prefer the real
+            # persisted flat name; the catalog derives it from the DNS domain
+            # when the graph carries none.
+            netbios = str(domain_entry.get("netbios") or "").strip()
+            if netbios:
+                graph["netbios"] = netbios
     except Exception:  # noqa: BLE001 — never break the graph write over an enrichment
         pass
     # Edges are baked during collection, BEFORE the dc_ip/domain stamps above
@@ -11140,13 +11317,16 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     # catalog degrades to the literal ``<dc_ip>``/``<domain>`` token.
     _graph_dc_ip = str(graph.get("dc_ip") or "").strip()
     _graph_domain = str(graph.get("domain") or "").strip()
+    _graph_netbios = str(graph.get("netbios") or "").strip()
 
     def _stamp_env(details: dict[str, Any]) -> dict[str, Any]:
-        """Attach dc_ip/domain to a step's details when the graph carries them."""
+        """Attach dc_ip/domain/netbios_domain to a step's details when known."""
         if _graph_dc_ip:
             details.setdefault("dc_ip", _graph_dc_ip)
         if _graph_domain:
             details.setdefault("domain", _graph_domain)
+        if _graph_netbios:
+            details.setdefault("netbios_domain", _graph_netbios)
         return details
 
     def label(node_id: str) -> str:
@@ -11154,6 +11334,39 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         if isinstance(node, dict):
             return str(node.get("label") or node_id)
         return node_id
+
+    def _node_identity(node_id: str) -> dict[str, str]:
+        """Return this node's REAL, machine-resolvable identifiers.
+
+        ``label()`` above returns the humanized, realm-qualified display name
+        (e.g. ``"EXCHANGE WINDOWS PERMISSIONS@HTB.LOCAL"``) — good for prose,
+        but not a value any AD tool actually resolves: it is neither a real
+        ``sAMAccountName`` (case differs, and the ``@REALM`` suffix is not
+        part of the attribute), a distinguished name, nor a DNS hostname. The
+        per-step independent-verification commands need the OBJECT'S OWN
+        identifiers, sourced from graph node ``properties`` (populated by the
+        native collector), so a copy-pasted ``Get-ADObject``/``-ComputerName``
+        command in the client report actually resolves the finding instead of
+        silently matching nothing. Empty strings when a field is not carried
+        on this node (e.g. a Domain object has no ``sAMAccountName``).
+        """
+        node = nodes_map.get(node_id)
+        props = (
+            node.get("properties")
+            if isinstance(node, dict) and isinstance(node.get("properties"), dict)
+            else {}
+        )
+        return {
+            "dn": str(
+                props.get("distinguishedname") or props.get("distinguishedName") or ""
+            ).strip(),
+            "samaccountname": str(
+                props.get("samaccountname") or props.get("sAMAccountName") or ""
+            ).strip(),
+            "dnshostname": str(
+                props.get("dnshostname") or props.get("dNSHostName") or ""
+            ).strip(),
+        }
 
     def _resolve_membership_followup_step(
         target_node: dict[str, Any] | None,
@@ -11288,6 +11501,8 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         # statuses are preserved unchanged (see ``derive_step_display_status``).
         step_status = derive_step_display_status(step.relation, step.status)
         relation_key = str(step.relation or "").strip().lower()
+        _source_identity = _node_identity(step.from_id)
+        _target_identity = _node_identity(step.to_id)
         step_details = {
             "from": label(step.from_id),
             "to": label(step.to_id),
@@ -11304,6 +11519,16 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             "source_privilege_tier": privilege_tier_for_node(
                 nodes_map.get(step.from_id)
             ).value,
+            # REAL object identifiers (sAMAccountName / DN / dNSHostName) for
+            # the independent-verification commands — see ``_node_identity``.
+            # Stamped here (not derived downstream from the display label)
+            # because this is the one place the graph node is in hand.
+            "source_dn": _source_identity["dn"],
+            "target_dn": _target_identity["dn"],
+            "source_samaccountname": _source_identity["samaccountname"],
+            "target_samaccountname": _target_identity["samaccountname"],
+            "source_dnshostname": _source_identity["dnshostname"],
+            "target_dnshostname": _target_identity["dnshostname"],
             **(step.notes or {}),
         }
         if relation_key.startswith("adcs") or relation_key in {
@@ -16378,60 +16603,97 @@ def compute_display_paths_for_user(
             principal_node_ids=candidate_to_ids,
             skip_tier0_principals=True,
         )
-    _dfs_t0 = time.monotonic()
-    records = _sort_display_paths(
-        attack_paths_core.compute_display_paths_for_start_node(
-            runtime_graph,
-            domain=domain,
-            snapshot=snapshot,
-            start_node_id=start_node_id,
-            max_depth=effective_depth,
-            max_paths=max_paths,
-            target=target,
-            target_mode=target_mode,
-            expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
-            filter_shortest_paths=False,
-            materialized_artifacts=(
-                {
-                    "node_id_by_label": materialized_artifacts.node_id_by_label,
-                    "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
-                }
-                if materialized_artifacts is not None
-                else None
-            ),
-            force_perterminal=force_perterminal,
-        )
-    )
-    _dfs_elapsed = time.monotonic() - _dfs_t0
-    print_info_debug(
-        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=user)"
-    )
-    records = _filter_zero_length_display_paths(records, domain=domain, scope="user")
-    # Populate owned_labels so the owned-terminal filter can drop paths whose
-    # final node is already a compromised principal (e.g. an attack path from
-    # audit2020 → ... → SUPPORT when SUPPORT is already owned — that path has
-    # zero operational value, we already control SUPPORT).
     try:
-        _user_scope_owned = frozenset(
-            _normalize_account(label)
-            for label in get_attack_path_owned_principal_labels(shell, domain)
+        _dfs_t0 = time.monotonic()
+        records = _sort_display_paths(
+            attack_paths_core.compute_display_paths_for_start_node(
+                runtime_graph,
+                domain=domain,
+                snapshot=snapshot,
+                start_node_id=start_node_id,
+                max_depth=effective_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+                filter_shortest_paths=False,
+                materialized_artifacts=(
+                    {
+                        "node_id_by_label": materialized_artifacts.node_id_by_label,
+                        "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
+                    }
+                    if materialized_artifacts is not None
+                    else None
+                ),
+                force_perterminal=force_perterminal,
+            )
         )
-    except Exception:  # noqa: BLE001
-        _user_scope_owned = frozenset()
-    records = _apply_local_postprocessing_pipeline(
-        records,
-        shell=shell,
-        domain=domain,
-        scope="user",
-        target=target,
-        snapshot=snapshot,
-        principal_count=1,
-        owned_labels=_user_scope_owned or None,
-        allow_owned_terminal_target=allow_owned_terminal_target,
-        target_mode=target_mode,
-        display_friendly=display_friendly,
-        runtime_graph=runtime_graph,
-    )
+        _dfs_elapsed = time.monotonic() - _dfs_t0
+        print_info_debug(
+            f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=user)"
+        )
+        records = _filter_zero_length_display_paths(records, domain=domain, scope="user")
+        # Populate owned_labels so the owned-terminal filter can drop paths whose
+        # final node is already a compromised principal (e.g. an attack path from
+        # audit2020 → ... → SUPPORT when SUPPORT is already owned — that path has
+        # zero operational value, we already control SUPPORT).
+        try:
+            _user_scope_owned = frozenset(
+                _normalize_account(label)
+                for label in get_attack_path_owned_principal_labels(shell, domain)
+            )
+        except Exception:  # noqa: BLE001
+            _user_scope_owned = frozenset()
+        records = _apply_local_postprocessing_pipeline(
+            records,
+            shell=shell,
+            domain=domain,
+            scope="user",
+            target=target,
+            snapshot=snapshot,
+            principal_count=1,
+            owned_labels=_user_scope_owned or None,
+            allow_owned_terminal_target=allow_owned_terminal_target,
+            target_mode=target_mode,
+            display_friendly=display_friendly,
+            runtime_graph=runtime_graph,
+        )
+    except _AttackPathMemoryBudgetExceeded as exc:
+        # The memory gate stopped discovery cleanly (mid-DFS or in the O(N²)
+        # post-DFS projection). Mirror the domain-scope self-recovery so the
+        # bounded result is CACHED under this function's outer (force_perterminal
+        # =False) key — otherwise every caller re-runs the aborting full DFS.
+        # ``force_perterminal`` already set means THIS run was the bounded fallback;
+        # re-raise so the shared helper's nested-abort branch degrades to empty.
+        if force_perterminal:
+            raise
+
+        def _recompute_bounded_user() -> list[dict[str, Any]]:
+            return compute_display_paths_for_user(
+                shell,
+                domain,
+                username=str(username or "").strip(),
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                # Freshness: never serve/store a cached DFS result for the bounded
+                # re-run; the recovered RESULT is cached under the outer key below.
+                no_cache=True,
+                allow_owned_terminal_target=allow_owned_terminal_target,
+                display_friendly=display_friendly,
+                force_perterminal=True,
+            )
+
+        return _recover_from_memory_abort(
+            shell,
+            domain,
+            exc,
+            recompute_bounded=_recompute_bounded_user,
+            cache_key=cache_key,
+            scope="user",
+            no_cache=no_cache,
+        )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
         f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
@@ -16554,6 +16816,15 @@ def compute_display_paths_for_domain(
         if isinstance(prepared_graph.get("edges"), list)
         else []
     )
+    # Fold a PROVEN execution onto the traversable twin of the same logical hop
+    # BEFORE the DFS reads adjacency, so a route whose root step ADscan actually
+    # executed (recorded as a separate label-keyed entry edge the DFS never
+    # sources from) renders ``partial`` on the cold recompute — not ``theoretical``
+    # — matching the warm-served status. Applied to whatever graph this call built
+    # or loaded (like the foreign-DC enrichment above) so a stale prepared-graph
+    # cache can never bypass it; copy-on-write, so the shared prepared graph is
+    # untouched; a no-execution workspace has no proven edge and is unchanged.
+    reconcile_proven_execution_edge_status(runtime_graph)
     start_node_ids = _resolve_domain_enabled_low_priv_user_start_ids(
         shell, domain, runtime_graph
     )
@@ -16656,7 +16927,13 @@ def compute_display_paths_for_domain(
             )
 
         return _recover_from_memory_abort(
-            shell, domain, exc, recompute_bounded=_recompute_bounded_domain
+            shell,
+            domain,
+            exc,
+            recompute_bounded=_recompute_bounded_domain,
+            cache_key=cache_key,
+            scope="domain",
+            no_cache=no_cache,
         )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
@@ -17363,6 +17640,9 @@ def _recover_from_memory_abort(
     exc: "_AttackPathMemoryBudgetExceeded",
     *,
     recompute_bounded: "Callable[[], list[dict[str, Any]]]",
+    cache_key: tuple[Any, ...] | None = None,
+    scope: str | None = None,
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Recover from a memory-gate abort by re-running the BOUNDED fallback (SSOT).
 
@@ -17378,8 +17658,18 @@ def _recover_from_memory_abort(
     3. re-runs the computation ONCE through the caller-supplied ``recompute_bounded``
        closure, which must engage the bounded per-terminal fallback
        (``force_perterminal=True``) so the deliverable carries a real
-       coverage-floored route set instead of an empty one; and
-    4. overwrites the hard-abort record with the SAMPLED coverage declaration
+       coverage-floored route set instead of an empty one;
+    4. **caches the recovered coverage-bounded result under the caller's OUTER
+       cache key** (when ``cache_key`` is provided), so a REPEAT call for the same
+       ``(domain, params, graph epoch, budget)`` HITS the compute cache and returns
+       the bounded result immediately, WITHOUT re-running the aborting full DFS. The
+       outer key is the ``force_perterminal=False`` key the caller actually used, so
+       the top-of-function ``_attack_paths_cache_get`` short-circuits the next call.
+       The bounded recompute closure itself runs with ``no_cache=True`` (it must not
+       serve/store under the DISTINCT ``force_perterminal=True`` key), so caching the
+       RESULT here under the outer key is what closes the "re-run + re-abort every
+       call" waste (the ~15s x N-at-exit regression); and
+    5. overwrites the hard-abort record with the SAMPLED coverage declaration
        (:func:`_handle_attack_path_sampled_coverage`), since discovery ultimately
        DID return a floored set covering every reachable target.
 
@@ -17387,14 +17677,18 @@ def _recover_from_memory_abort(
     fallback is bounded), the hard-abort ("bounded") record stands and an empty
     list is returned, exactly as before this recovery was centralized.
 
-    This is the ONE implementation of the recovery, consumed by both the public
-    summaries entry point (:func:`get_attack_path_summaries`) and the service-layer
-    domain compute (:func:`compute_display_paths_for_domain`), so the recovery
-    logic can never drift across the two seams (CLAUDE.md § "A bounded computation
-    is a data gap").
+    This is the ONE implementation of the recovery, consumed by the service-layer
+    scope computes (:func:`compute_display_paths_for_domain`,
+    :func:`compute_display_paths_for_user`,
+    :func:`compute_display_paths_for_principals` — each passing its OWN outer
+    ``cache_key``) and, as a cheap pre-DFS-gate backstop with no key, the public
+    summaries entry point (:func:`get_attack_path_summaries`), so the recovery
+    logic can never drift across the seams (CLAUDE.md § "A bounded computation is a
+    data gap").
     """
     _handle_attack_path_memory_abort(shell, domain, exc)
     _record_attack_path_engine_used(shell, engine="fallback", reason="dfs_aborted")
+    _recompute_started_at = time.monotonic()
     try:
         result = recompute_bounded()
     except _AttackPathMemoryBudgetExceeded:
@@ -17402,6 +17696,22 @@ def _recover_from_memory_abort(
         # record stands and the result is empty, exactly as before.
         return []
     _handle_attack_path_sampled_coverage(shell, domain)
+    if cache_key is not None:
+        # Cache the recovered bounded result under the caller's OUTER key so the
+        # next call for the same key short-circuits via _attack_paths_cache_get
+        # instead of re-running the full DFS-until-abort + recovering again. The
+        # budget is folded into the key (_attack_paths_cache_base_key), so a
+        # raised state-limit / memory-ceiling re-run naturally misses and recomputes
+        # a fuller set — never served this bounded result.
+        _attack_paths_cache_put(
+            cache_key,
+            result,
+            domain=domain,
+            scope=str(scope or "").strip().lower(),
+            compute_seconds=max(0.0, time.monotonic() - _recompute_started_at),
+            shell=shell,
+            no_cache=no_cache,
+        )
     return result
 
 
@@ -18403,43 +18713,81 @@ def compute_display_paths_for_principals(
         scope="principals",
         materialized_artifacts=materialized_artifacts,
     )
-    _dfs_t0 = time.monotonic()
-    records = _sort_display_paths(
-        attack_paths_core.compute_display_paths_for_principals(
-            runtime_graph,
-            domain=domain,
-            snapshot=snapshot,
-            principals=unique_principals,
-            max_depth=effective_depth,
-            max_paths=max_paths,
-            target=target,
-            membership_sample_max=membership_sample_max,
-            target_mode=target_mode,
-            filter_shortest_paths=False,
-            force_perterminal=force_perterminal,
+    try:
+        _dfs_t0 = time.monotonic()
+        records = _sort_display_paths(
+            attack_paths_core.compute_display_paths_for_principals(
+                runtime_graph,
+                domain=domain,
+                snapshot=snapshot,
+                principals=unique_principals,
+                max_depth=effective_depth,
+                max_paths=max_paths,
+                target=target,
+                membership_sample_max=membership_sample_max,
+                target_mode=target_mode,
+                filter_shortest_paths=False,
+                force_perterminal=force_perterminal,
+            )
         )
-    )
-    _dfs_elapsed = time.monotonic() - _dfs_t0
-    print_info_debug(
-        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=principals)"
-    )
-    records = _filter_zero_length_display_paths(
-        records, domain=domain, scope="principals"
-    )
-    records = _apply_local_postprocessing_pipeline(
-        records,
-        shell=shell,
-        domain=domain,
-        scope="principals",
-        target=target,
-        snapshot=snapshot,
-        principal_count=len(unique_principals),
-        owned_labels=frozenset(_normalize_account(p) for p in unique_principals),
-        allow_owned_terminal_target=allow_owned_terminal_target,
-        target_mode=target_mode,
-        display_friendly=display_friendly,
-        runtime_graph=runtime_graph,
-    )
+        _dfs_elapsed = time.monotonic() - _dfs_t0
+        print_info_debug(
+            f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=principals)"
+        )
+        records = _filter_zero_length_display_paths(
+            records, domain=domain, scope="principals"
+        )
+        records = _apply_local_postprocessing_pipeline(
+            records,
+            shell=shell,
+            domain=domain,
+            scope="principals",
+            target=target,
+            snapshot=snapshot,
+            principal_count=len(unique_principals),
+            owned_labels=frozenset(_normalize_account(p) for p in unique_principals),
+            allow_owned_terminal_target=allow_owned_terminal_target,
+            target_mode=target_mode,
+            display_friendly=display_friendly,
+            runtime_graph=runtime_graph,
+        )
+    except _AttackPathMemoryBudgetExceeded as exc:
+        # The memory gate stopped discovery cleanly (mid-DFS or in the O(N²)
+        # post-DFS projection). Mirror the domain-scope self-recovery so the
+        # bounded result is CACHED under this function's outer (force_perterminal
+        # =False) key — otherwise every caller (owned scope delegates here) re-runs
+        # the aborting full DFS. ``force_perterminal`` already set means THIS run was
+        # the bounded fallback; re-raise so the shared helper degrades to empty.
+        if force_perterminal:
+            raise
+
+        def _recompute_bounded_principals() -> list[dict[str, Any]]:
+            return compute_display_paths_for_principals(
+                shell,
+                domain,
+                principals=principals,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                membership_sample_max=membership_sample_max,
+                target_mode=target_mode,
+                # Freshness: never serve/store a cached DFS result for the bounded
+                # re-run; the recovered RESULT is cached under the outer key below.
+                no_cache=True,
+                allow_owned_terminal_target=allow_owned_terminal_target,
+                display_friendly=display_friendly,
+                force_perterminal=True,
+            )
+
+        return _recover_from_memory_abort(
+            shell,
+            domain,
+            exc,
+            recompute_bounded=_recompute_bounded_principals,
+            cache_key=cache_key,
+            scope="principals",
+            no_cache=no_cache,
+        )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
         f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"

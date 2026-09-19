@@ -73,9 +73,11 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
+from adscan_core.reporting.kit_facts import chain_reconcile_clause
 from adscan_core.reporting.unauthenticated_reach import (
     REACHED_VIA_NULL_SESSION,
     UNAUTHENTICATED_REACH_BADGE,
+    entry_label_for_reached_via,
     is_unauthenticated_entry_label,
     notes_are_unauthenticated_reachable,
     reached_via_from_notes,
@@ -355,6 +357,29 @@ _ROUTE_STATES: dict[str, str] = {
 # so a reader can never mistake a bounded view for the complete graph.
 _ROUTE_MAP_MAX = 50
 
+# The compromise classes that describe a REAL compromise terminal — a proven
+# chain that lands on one of these has actually reached a Tier-0 asset (or an
+# escalation group / foothold on one). A chain that reaches anything else (a
+# stepping-stone, or the entry principal itself) is a FOOTHOLD, never an
+# achieved compromise, and the summary must never phrase it as one. See the
+# nomenclature standard (axis 2, Compromise Reach) and the Exposure-Validation
+# doctrine: never over-claim a compromise the run did not walk.
+_REAL_COMPROMISE_CLASSES: frozenset[str] = frozenset(
+    {
+        CompromiseClass.DOMAIN_BREAKER.value,
+        CompromiseClass.TIER0_FOOTHOLD.value,
+        CompromiseClass.PRIVILEGED_ESCALATOR.value,
+    }
+)
+
+# A prefix (the shared technique ROOT two near-identical routes hang off) that
+# this many alternate routes share collapses to ONE root-cause family line in
+# the route map, mirroring the client report's family grouping — 42 bullets that
+# all begin "AS-REP Roasting -> GenericAll" read as noise and bury the one real
+# fact (they share one fixable root). Below the threshold each route is its own
+# bullet, so a small handful is never over-consolidated.
+_ROUTE_FAMILY_MIN = 4
+
 _PLATFORM_LABELS: dict[str, str] = {
     "hackthebox": "Hack The Box",
     "tryhackme": "TryHackMe",
@@ -477,6 +502,15 @@ class SpineStep:
     #: ``chain_steps`` for the route map and the mermaid diagram, so the graph
     #: never loses a principal. Empty for an ordinary single-source step.
     sources: tuple[str, ...] = ()
+    #: An extra clause APPENDED to this step's rendered narrative (after the
+    #: catalog technique prose). The homogenized seam for a grant-then-DCSync
+    #: money path: the terminal WriteDACL/Owns/GenericAll step onto the DOMAIN
+    #: object confers replication rights, and the DCSync it chained is folded into
+    #: THIS step's narrative rather than added as a separate step/node — so the
+    #: path still terminates at the domain node with no step-count mismatch. Set
+    #: ONLY when the workspace PROVED the replication loot (SSOT:
+    #: ``adscan_core.reporting.dcsync_terminal``). Empty for every ordinary step.
+    narrative_suffix: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,15 +615,23 @@ class DiagramHop:
     entry (the synthetic ``Unauthenticated`` node for a no-credential path) and
     reads as one linear story.
 
-    ``solid`` drives the arrow style: a proven technique hop or a structural
-    membership pivot is solid (a fact), an unproven hop dashed (present in the
-    graph, not walked).
+    ``solid`` drives the arrow style: a PROVEN technique hop is solid (ADscan
+    walked it), everything else dashed. A structural group-membership pivot is
+    dashed (``structural=True``): it is a fact of the directory's hierarchy, not
+    a technique step ADscan proved, so drawing it solid inflated the diagram to
+    more "proved" hops than the summary's technique-step headline counts. The
+    dashed membership pivot plus the reconciling footnote make the diagram match
+    the count (spec §2 #13).
     """
 
     source: str
     target: str
     label: str
     solid: bool
+    #: True when this hop is a structural group-membership pivot (``MemberOf`` …)
+    #: rather than a proved technique step. Dashed in the diagram and counted as
+    #: a structural hop in the step-vs-hop reconciliation footnote.
+    structural: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,6 +676,28 @@ class SpineInputs:
     terminal_steps: tuple[SpineStep, ...] = ()
     terminal_title: str = "Final access"
     terminal_proven: bool = False
+    #: True ONLY when the PROVEN chain actually reaches a real compromise terminal
+    #: (compromise class domain_breaker / tier0_foothold / privileged_escalator).
+    #: ``terminal_proven`` alone is True whenever ANY step succeeded, which over-
+    #: claims an entry-only foothold as a reached compromise — so the summary and
+    #: the "beyond this route" pointer gate on THIS, never on bare
+    #: ``terminal_proven``. See the shared honesty standard: entry proven is not
+    #: domain compromise.
+    terminal_compromise_proven: bool = False
+    #: The shared "did the domain fall?" headline fact (spec §2 #19), computed
+    #: once via ``kit_facts.domain_compromise_proven`` so the writeup headline and
+    #: the Security Assessment Report headline read ONE signal and cannot
+    #: disagree. Prefers the persisted ``promote_to_pwned`` verdict
+    #: (``auth == "pwned"`` — proven Domain Admin control) and falls back to this
+    #: run's own ``terminal_compromise_proven``. A pwned domain reads "falls" even
+    #: where the narrated chain stopped short of the terminal edge.
+    domain_compromise_proven: bool = False
+    #: The onward compromise the graph MAPPED but the run did not walk, phrased
+    #: for prose ("full domain compromise", "control of `X`", "a session on `X`").
+    #: Set only when the proof is entry-only yet a real-compromise route exists in
+    #: the graph; ``None`` when nothing further was mapped. Drives the honest
+    #: entry-only summary wording.
+    mapped_onward_compromise: str | None = None
     start_principal: str | None = None
     start_principal_note: str | None = None
     #: True when the chain's ENTRY edge was proven executable with NO credential
@@ -645,6 +709,20 @@ class SpineInputs:
     started_unauthenticated: bool = False
     chain_nodes: tuple[str, ...] = ()
     chain_steps: tuple[SpineStep, ...] = ()
+    #: The proven steps that lie ON the connected primary spine (the same journey
+    #: the mermaid draws). When set, ``_render_summary`` narrates THESE as the
+    #: linear kill-chain and counts them, rather than the raw ``chain_steps`` —
+    #: so a topologically disconnected standalone proof (e.g. an anonymous bind
+    #: sourced from a well-known group) that ``_order_proven_edges`` linearized
+    #: into ``chain_steps`` is not spliced into the linear chain. Empty when no
+    #: connected spine was resolved (the summary then falls back to
+    #: ``chain_steps``, preserving prior behaviour).
+    primary_spine_steps: tuple[SpineStep, ...] = ()
+    #: Proven steps that are NOT on the connected primary spine (the disconnected
+    #: standalone proofs). Reported by ``_render_summary`` in a separate sentence
+    #: ("ADscan also proved ... not on this chain: ...") so they are disclosed,
+    #: never dropped, while the primary chain stays a single linear story.
+    other_proven_steps: tuple[SpineStep, ...] = ()
     #: The connected teaching diagram ("The chain" mermaid): the materialized
     #: path source-to-target, starting at the run's real entry node, with the
     #: ``MemberOf`` pivots that bridge the proven edges. Empty when no connected
@@ -669,18 +747,40 @@ class SpineInputs:
         return any(step.outcome == "success" for step in self.chain_steps)
 
     @property
+    def has_recorded_provenance(self) -> bool:
+        """Return whether the writeup documents how at least one secret was obtained.
+
+        Provenance lives in three places, any one of which makes the "this run
+        did not record how each secret was obtained" confession false: a
+        credential row tagged with its origin, a stage tagged with its
+        credential origin, or a proven chain step whose narrative already states
+        the recovery technique (e.g. an executed AS-REP roast that yielded the
+        account's secret). The confession may only appear when ALL three are
+        absent — otherwise it contradicts prose already in the same document.
+        """
+        if any(row.origin for row in self.credentials):
+            return True
+        if any(stage.credential_origin for stage in self.stages):
+            return True
+        return self.chain_has_proven_step
+
+    @property
     def beyond_root_warranted(self) -> bool:
         """Return whether there is a root to point beyond.
 
         "Beyond this route" is a pointer to the routes the graph found and did
-        not walk, so it only belongs in a document where the box WAS finished:
-        the chain landed, and it landed either on a closing step or on a
-        captured flag. A run that never landed has nothing finished to look
-        "beyond" from. (The caller also requires ``alt_routes`` to be
-        non-empty before printing the section — a finished box with no other
-        discovered route has nothing to point at either.)
+        not walk, and its lead sentence claims the run "walked [one chain] end to
+        end" — so it belongs ONLY in a document where a real compromise WAS
+        walked, never on an entry-only foothold. It gates on
+        ``terminal_compromise_proven`` (the proven chain reached a real
+        compromise terminal), not bare ``terminal_proven`` (any step succeeded),
+        so an entry-only run never claims it walked a chain to compromise. (The
+        caller also requires ``alt_routes`` to be non-empty — a finished box with
+        no other discovered route has nothing to point at either.)
         """
-        return self.terminal_proven and bool(self.terminal_steps or self.flags)
+        return self.terminal_compromise_proven and bool(
+            self.terminal_steps or self.flags
+        )
 
 
 @dataclass(frozen=True)
@@ -720,6 +820,19 @@ def display_node(
     raw = str(node or "").strip()
     if not raw:
         return ""
+    # A raw SID node label (a collector artifact where a principal was referenced
+    # by SID before its LDAP object resolved — e.g. the phantom Guest
+    # ``S-1-5-21-...-501`` node) is resolved to its friendly name FIRST, so no
+    # writeup prose ever prints a bare ``S-1-...`` token. The @WELLKNOWN case is
+    # left to the account/@-split logic below, which already strips that realm.
+    if raw.split("@", 1)[0].strip().upper().startswith("S-1-"):
+        from adscan_internal.services.well_known_principals import (
+            humanize_principal_label,
+        )
+
+        humanized = humanize_principal_label(raw)
+        if humanized and not humanized.upper().startswith("S-1-"):
+            raw = humanized
     if raw.rstrip(".").upper() == str(domain or "").strip().rstrip(".").upper():
         return raw.lower()
     account = _node_account(raw)
@@ -1296,11 +1409,37 @@ def _build_steps(
         catalog_details = dict(details)
         catalog_details.setdefault("dc_ip", dc_ip or "")
         catalog_details.setdefault("domain", domain)
+        # A PROVEN no-credential read (the run's real entry) is authored from the
+        # synthetic ``Unauthenticated`` entry node, exactly as the SAR and the
+        # mermaid diagram render it — never the raw read-set ACL principal, which
+        # can be a well-known group or an unresolved SID node (the phantom Guest
+        # ``S-1-5-21-...-501`` node). Rewriting the source here means the summary's
+        # causal one-liner (built from ``catalog_step``) and the step header both
+        # name the entry node, with no raw SID and no "and Everyone" read-set tail.
+        step_unauth = notes_are_unauthenticated_reachable(details)
+        step_reached_via = reached_via_from_notes(details)
+        if step_unauth:
+            entry_label = entry_label_for_reached_via(step_reached_via)
+            source_display = entry_label
+            catalog_details["from"] = entry_label
+        else:
+            source_display = display_node(source, accounts=accounts, domain=domain)
+        target_display = display_node(target, accounts=accounts, domain=domain)
+        # The catalog narrative/remediation substitutes {source}/{target} from the
+        # step details, and a raw graph edge carries neither the stamped
+        # sAMAccountName the report pipeline uses nor the writeup's own casing
+        # rules. Feed the already-humanized display forms (accounts lower-cased,
+        # groups de-shouted, realm stripped) so the rendered narrative reads
+        # ``michael.wrightson`` / ``Backup Operators`` here too, never the
+        # shouting ``MICHAEL.WRIGHTSON@CICADA.HTB`` UPN label. Commands still
+        # degrade to the honest ``<...>`` identity fill-ins (no stamped identity).
+        catalog_details["from"] = source_display
+        catalog_details["display_to"] = target_display
         steps.append(
             SpineStep(
                 technique=technique_for(relation),
-                source=display_node(source, accounts=accounts, domain=domain),
-                target=display_node(target, accounts=accounts, domain=domain),
+                source=source_display,
+                target=target_display,
                 outcome=outcome,
                 attempts=record.attempts,
                 at=record.at,
@@ -1326,8 +1465,8 @@ def _build_steps(
                 catalog_step={"action": relation, "details": catalog_details},
                 discovered_unauth=str(details.get("origin") or "").strip().lower()
                 == "unauth_enrichment",
-                unauthenticated_reachable=notes_are_unauthenticated_reachable(details),
-                reached_via=reached_via_from_notes(details),
+                unauthenticated_reachable=step_unauth,
+                reached_via=step_reached_via,
             )
         )
     return steps
@@ -1492,6 +1631,58 @@ def _terminal_title(compromise_class: str, target: str, *, proven: bool) -> str:
     if proven:
         return outcome
     return f"Route to {outcome[0].lower() + outcome[1:]}"
+
+
+def _compromise_reach_phrase(compromise_class: str, target: str) -> str:
+    """Return how a mapped-but-unwalked compromise reads in a sentence.
+
+    The prose form of a compromise class, for the entry-only summary that says
+    "the graph mapped an onward route to <this>". Distinct from
+    :func:`_terminal_title` (a section heading): this is a mid-sentence clause.
+    """
+    normalized = str(compromise_class or "").strip().lower()
+    if normalized == CompromiseClass.DOMAIN_BREAKER.value:
+        return "full domain compromise"
+    if normalized == CompromiseClass.PRIVILEGED_ESCALATOR.value:
+        return f"control of `{target}`"
+    if normalized == CompromiseClass.TIER0_FOOTHOLD.value:
+        return f"a session on `{target}`"
+    return f"`{target}`"
+
+
+def _mapped_onward_compromise(
+    ordered: list[dict[str, Any]], *, accounts: frozenset[str], domain: str
+) -> str | None:
+    """Return the strongest real-compromise terminal the graph MAPPED, as prose.
+
+    Walks the client-ordered routes for the highest-reaching real compromise
+    (domain breaker over group takeover over Tier-0 foothold) and returns its
+    prose reach phrase, or ``None`` when the graph mapped no onward compromise
+    at all. Used only to word the honest entry-only summary — it states what the
+    graph found beyond the proven foothold without claiming the run walked it.
+    """
+    rank = {
+        CompromiseClass.DOMAIN_BREAKER.value: 3,
+        CompromiseClass.PRIVILEGED_ESCALATOR.value: 2,
+        CompromiseClass.TIER0_FOOTHOLD.value: 1,
+    }
+    best_rank = 0
+    best_phrase: str | None = None
+    for path in ordered:
+        compromise_class = str(path.get("compromise_class") or "").strip().lower()
+        current = rank.get(compromise_class, 0)
+        if current <= best_rank:
+            continue
+        nodes = path.get("nodes")
+        nodes = nodes if isinstance(nodes, list) else []
+        target = (
+            display_node(str(nodes[-1]), accounts=accounts, domain=domain)
+            if nodes
+            else domain
+        )
+        best_rank = current
+        best_phrase = _compromise_reach_phrase(compromise_class, target)
+    return best_phrase
 
 
 def _route_status_reason(path: dict[str, Any]) -> str:
@@ -2154,17 +2345,75 @@ def collect_spine_inputs(
     # When no canonical path matches the proven chain's terminal, diagram_hops is
     # empty and the mermaid falls back to chain_steps (prior behaviour).
     diagram_hops: tuple[DiagramHop, ...] = ()
+    # F4: the SUMMARY chain and the coverage line must derive from the SAME
+    # connected spine the mermaid draws, not the raw proven edges — otherwise a
+    # topologically disconnected standalone proof (a well-known-group-sourced
+    # anonymous bind) that _order_proven_edges linearized into chain_steps gets
+    # spliced into the linear kill-chain while the diagram correctly omits it.
+    primary_spine_steps: tuple[SpineStep, ...] = ()
+    other_proven_steps: tuple[SpineStep, ...] = ()
     if primary and chain_steps:
         diagram_path = _canonical_diagram_path(ordered, primary)
         if diagram_path is not None:
-            diagram_hops, diagram_coverage = _build_diagram_hops(
+            diagram_hops, diagram_coverage, shown_keys = _build_diagram_hops(
                 diagram_path, chain_steps, accounts=accounts, domain=domain
             )
-            # The coverage line sits under the diagram, so it must count what the
-            # diagram shows (distinct proven attacks, well-known-source duplicates
-            # folded) rather than the raw proven-edge tally.
-            if diagram_hops and diagram_coverage is not None:
+            if diagram_hops and shown_keys:
+                # Split the proven chain steps by whether their (technique,
+                # target) is on the connected diagram path. On-spine steps are
+                # the linear chain the summary narrates; off-spine proven steps
+                # are the standalone proofs it reports separately.
+                on_spine: list[SpineStep] = []
+                off_spine: list[SpineStep] = []
+                for step in chain_steps:
+                    key = (
+                        _technique_key(step.technique.relation),
+                        _node_account(step.target).strip().upper(),
+                    )
+                    if step.is_context:
+                        on_spine.append(step)  # structural pivots stay with the chain
+                    elif key in shown_keys:
+                        on_spine.append(step)
+                    elif step.outcome == "success":
+                        off_spine.append(step)
+                    else:
+                        on_spine.append(step)
+                primary_spine_steps = tuple(on_spine)
+                other_proven_steps = tuple(off_spine)
+                # The coverage line sits under the diagram: every connected
+                # proven attack is drawn, so it reads "All N edges ... appear
+                # below"; the off-spine proofs are disclosed in the summary's
+                # own separate sentence, never dropped.
+                chain_coverage = (len(shown_keys), len(shown_keys))
+            elif diagram_hops and diagram_coverage is not None:
+                # Diagram drew but nothing to split on — keep prior behaviour.
                 chain_coverage = diagram_coverage
+    # Homogenized grant-then-DCSync terminal: a money path whose terminal grant is
+    # WriteDACL/Owns/GenericAll on the DOMAIN object confers replication rights, and
+    # the DCSync it chained is FOLDED into that terminal step's narrative (never a
+    # separate step/node — the path stays homogeneous, terminates at the domain
+    # node, and the step count matches the diagram). Proven only, from the SAME
+    # per-domain ``domain_compromise`` events the report reads. The events are
+    # persisted under ``technical_report["domains"][domain]["events"]`` (the durable
+    # record); ``domain_data`` is often EMPTY on a standalone ``deliver`` (it is not
+    # the live in-memory session), so read the technical_report provenance first.
+    from adscan_core.reporting.dcsync_terminal import (  # noqa: PLC0415
+        extract_dcsync_tier0_secrets,
+    )
+
+    _dcsync_events = _domain_compromise_events(technical_report, domain, domain_data)
+    _dcsync_secrets = extract_dcsync_tier0_secrets(
+        _dcsync_events,
+        compromised_credentials=domain_data.get("compromised_credentials"),
+    )
+    if _dcsync_secrets:
+        primary_spine_steps, stages, terminal_steps = _fold_dcsync_into_rendered_collections(
+            primary_spine_steps=primary_spine_steps,
+            stages=stages,
+            terminal_steps=terminal_steps,
+            secrets=_dcsync_secrets,
+            domain=domain,
+        )
     chain_nodes = tuple(
         display_node(str(n), accounts=accounts, domain=domain)
         for n in (primary.get("nodes") or [])
@@ -2205,6 +2454,33 @@ def collect_spine_inputs(
     terminal_proven = (
         any(step.outcome == "success" for step in terminal_steps)
         or str(primary.get("status") or "").strip().lower() in _PROVEN_STATUSES
+    )
+    # An ACHIEVED compromise, not merely a proven entry step: True only when the
+    # PROVEN chain (``proven_primary`` — all-success by construction) reaches a
+    # real compromise terminal. When the proof is entry-only, resolve the onward
+    # compromise the graph mapped (but the run did not walk) so the summary can
+    # state the honest split instead of naming the entry principal as an outcome.
+    terminal_compromise_proven = (
+        proven_primary is not None
+        and str(proven_primary.get("compromise_class") or "").strip().lower()
+        in _REAL_COMPROMISE_CLASSES
+    )
+    # The shared domain-compromise headline fact (spec §2 #19): prefer the
+    # persisted promote_to_pwned verdict so the writeup and the Security
+    # Assessment Report headline read ONE signal. ``domain_data`` carries the
+    # live ``auth == "pwned"`` here; the SAR reads the same fact off the persisted
+    # kit_facts block.
+    from adscan_core.reporting.kit_facts import (  # noqa: PLC0415
+        domain_compromise_proven as _domain_compromise_proven,
+    )
+
+    domain_compromise_proven = _domain_compromise_proven(
+        domain_data, proven_domain_compromise=terminal_compromise_proven
+    )
+    mapped_onward_compromise = (
+        None
+        if terminal_compromise_proven
+        else _mapped_onward_compromise(ordered, accounts=accounts, domain=domain)
     )
     # The start principal has to be an ACCOUNT, because it is pasted into a
     # command — and it has to be THIS chain's own entry point, not the session's
@@ -2252,7 +2528,7 @@ def collect_spine_inputs(
         False,
     )
     if started_unauthenticated:
-        start_principal_note = "derived — no starting credential"
+        start_principal_note = "derived, no starting credential"
     elif start_row is None or not start_row.origin:
         start_principal_note = None
     elif start_row.origin == _ORIGIN_SUPPLIED:
@@ -2295,11 +2571,16 @@ def collect_spine_inputs(
             proven=terminal_proven,
         ),
         terminal_proven=terminal_proven,
+        terminal_compromise_proven=terminal_compromise_proven,
+        domain_compromise_proven=domain_compromise_proven,
+        mapped_onward_compromise=mapped_onward_compromise,
         start_principal=start_principal or None,
         start_principal_note=start_principal_note,
         started_unauthenticated=started_unauthenticated,
         chain_nodes=chain_nodes,
         chain_steps=tuple(chain_steps),
+        primary_spine_steps=primary_spine_steps,
+        other_proven_steps=other_proven_steps,
         diagram_hops=diagram_hops,
         chain_coverage=chain_coverage,
         alt_routes=tuple(alt_routes),
@@ -2384,7 +2665,7 @@ def _build_diagram_hops(
     *,
     accounts: frozenset[str],
     domain: str,
-) -> tuple[tuple[DiagramHop, ...], tuple[int, int] | None]:
+) -> tuple[tuple[DiagramHop, ...], tuple[int, int] | None, frozenset[tuple[str, str]]]:
     """Build the connected diagram hops from a canonical path + the proven set.
 
     The SKELETON (nodes, order, relation labels, the ``MemberOf`` pivots) comes
@@ -2400,7 +2681,7 @@ def _build_diagram_hops(
     """
     steps = path.get("steps")
     if not isinstance(steps, list) or not steps:
-        return (), None
+        return (), None, frozenset()
 
     proven_keys = {
         (_technique_key(s.technique.relation), _node_account(s.target).strip().upper())
@@ -2430,13 +2711,21 @@ def _build_diagram_hops(
                 source=_diagram_node_label(src_raw, accounts=accounts, domain=domain),
                 target=dst_label,
                 label="member of" if structural else technique_for(relation).name,
-                solid=structural or proven,
+                # A structural membership pivot is a directory fact, NOT a proved
+                # technique hop — dash it so the count of solid arrows matches the
+                # technique-step headline (spec §2 #13). Only a proven technique
+                # hop draws solid.
+                solid=proven,
+                structural=structural,
             )
         )
 
     total = len(proven_keys)
     coverage = (len(shown_keys), total) if total else None
-    return tuple(hops), coverage
+    # ``shown_keys`` are the proven-attack keys that lie ON the connected path —
+    # the caller uses them to split the proven chain_steps into the on-spine
+    # linear chain and the off-spine standalone proofs (F4).
+    return tuple(hops), coverage, frozenset(shown_keys)
 
 
 def _render_mermaid(inputs: SpineInputs) -> list[str]:
@@ -2444,18 +2733,19 @@ def _render_mermaid(inputs: SpineInputs) -> list[str]:
 
     A diagram, not an image: it renders natively on GitHub and in Obsidian, it
     survives a diff, and the author can rename a node without opening an editor.
-    Proven hops get a solid arrow, graph-only hops a dashed one, so the picture
-    states what was proven without a caption claiming it. A membership hop is
-    solid: it is a fact read out of the directory, not a step that was skipped.
+    A proved technique hop gets a solid arrow; a structural group-membership
+    pivot and a graph-only (unwalked) hop get a dashed one — so the count of
+    solid arrows matches the summary's technique-step headline (spec §2 #13).
 
     When a connected materialized spine is available (``diagram_hops``) it is
     drawn — one linear story from the run's real entry node through the
     ``MemberOf`` pivots to the terminal. Otherwise the raw proven ``chain_steps``
     are drawn (the theoretical / unmatched-terminal fallback).
     """
+    # Each edge: (source, target, label, solid, structural).
     if inputs.diagram_hops:
-        edges: list[tuple[str, str, str, bool]] = [
-            (h.source, h.target, h.label, h.solid)
+        edges: list[tuple[str, str, str, bool, bool]] = [
+            (h.source, h.target, h.label, h.solid, h.structural)
             for h in inputs.diagram_hops
             if h.source and h.target
         ]
@@ -2465,7 +2755,8 @@ def _render_mermaid(inputs: SpineInputs) -> list[str]:
                 step.source,
                 step.target,
                 step.technique.name,
-                step.outcome == "success" or step.is_context,
+                step.outcome == "success",
+                step.is_context,
             )
             for step in inputs.chain_steps
             if step.source and step.target
@@ -2476,24 +2767,32 @@ def _render_mermaid(inputs: SpineInputs) -> list[str]:
         return []
     lines = ["```mermaid", "flowchart TD"]
     nodes: list[str] = []
-    for source, target, _label, _solid in edges:
+    for source, target, _label, _solid, _structural in edges:
         for endpoint in (source, target):
             if endpoint and endpoint not in nodes:
                 nodes.append(endpoint)
     ids = {node: f"n{i}" for i, node in enumerate(nodes)}
     for node in nodes:
         lines.append(f'    {ids[node]}["{_mermaid_label(node)}"]')
-    for source, target, label, solid in edges:
+    has_structural = any(structural for *_ignored, structural in edges)
+    for source, target, label, solid, _structural in edges:
         arrow = "-->" if solid else "-.->"
         lines.append(
             f"    {ids[source]} {arrow}|{_mermaid_label(label)}| {ids[target]}"
         )
     lines.append("```")
     lines.append("")
-    lines.append(
-        "Solid arrow: ADscan proved this hop. Dashed: present in the graph, not "
-        "walked in this run."
+    caption = (
+        "Solid arrow: ADscan proved this technique hop. Dashed: present in the "
+        "graph, not walked in this run"
     )
+    caption += (
+        " (a group-membership hop is a directory fact bridging the chain, not a "
+        "proved step)."
+        if has_structural
+        else "."
+    )
+    lines.append(caption)
     return lines
 
 
@@ -2715,14 +3014,18 @@ def _render_step(step: SpineStep) -> list[str]:
         # an authenticated reader and would misstate this one).
         lead = [
             "Found during unauthenticated enumeration, before this run held "
-            "any credential — the actual entry point.",
+            "any credential: the actual entry point.",
             "",
         ]
 
     # When several principals could read the same credential (one GPP cpassword
     # readable by Everyone AND Domain Users), name every reader on the one line
-    # rather than repeating the whole teaching step per reader.
-    if step.sources:
+    # rather than repeating the whole teaching step per reader. A PROVEN
+    # no-credential entry is the exception: its source is the single synthetic
+    # ``Unauthenticated`` entry node (the read-set ACL principals are the "who the
+    # ACL allows", already stated by the badge above), so it renders one source
+    # with no read-set tail — matching the SAR and the mermaid diagram.
+    if step.sources and not step.unauthenticated_reachable:
         readers = _join_names((step.source, *step.sources))
         endpoints = f"{readers} to `{step.target}`"
     else:
@@ -2757,9 +3060,17 @@ def _render_step(step: SpineStep) -> list[str]:
     # content yet for this relation.
     if step.catalog_step is not None:
         narrative = render_step_narrative(step.catalog_step)
-        if narrative:
-            lines.append(narrative)
-            lines.append("")
+        if narrative or step.narrative_suffix:
+            # Fold any chained-DCSync proof (narrative_suffix) into the SAME
+            # paragraph as the technique narrative, so the terminal WriteDACL step
+            # reads as one continuous account of the grant and the replication it
+            # chained — no separate step, terminus stays the domain node.
+            paragraph = " ".join(
+                part for part in (narrative.rstrip() if narrative else "", step.narrative_suffix) if part
+            ).strip()
+            if paragraph:
+                lines.append(paragraph)
+                lines.append("")
         twist = _kerberoast_direct_domain_twist(step)
         if twist:
             lines.append(twist)
@@ -2818,7 +3129,14 @@ def _render_summary(inputs: SpineInputs) -> list[str]:
     # The headline counts the ATTACK, so it counts the teaching view: several
     # edges describing one read (same technique, secret and artifact, different
     # reader) are one step here, exactly as the stages below narrate them once.
-    teaching_steps = _collapse_multi_source_read_steps(list(inputs.chain_steps))
+    # When a connected primary spine was resolved (the same chain the mermaid
+    # draws), narrate THAT as the linear kill-chain — never the raw chain_steps,
+    # which _order_proven_edges may have linearized a disconnected standalone
+    # proof into. The off-spine proofs are disclosed in a separate sentence.
+    if inputs.primary_spine_steps:
+        teaching_steps = _collapse_multi_source_read_steps(list(inputs.primary_spine_steps))
+    else:
+        teaching_steps = _collapse_multi_source_read_steps(list(inputs.chain_steps))
     proven_steps = [
         step
         for step in teaching_steps
@@ -2836,12 +3154,189 @@ def _render_summary(inputs: SpineInputs) -> list[str]:
         ]
     chain = " → ".join(_summary_step_phrase(step) for step in proven_steps)
     step_count = _count_phrase(len(proven_steps), "step")
-    outcome = (
-        inputs.terminal_title[0].lower() + inputs.terminal_title[1:]
-        if inputs.terminal_proven
-        else "a route that did not close"
+    # The step-vs-hop reconciliation footnote (spec §2 #13): the headline counts
+    # PROVED TECHNIQUE steps, while the diagram (and the Security Assessment
+    # Report) count graph HOPS — including the structural group-membership pivots
+    # that bridge the chain. One shared clause, rendered on both surfaces, states
+    # the difference so a reader crossing the two documents is not confused.
+    structural_hops = sum(1 for h in inputs.diagram_hops if h.structural)
+    reconcile_clause = chain_reconcile_clause(
+        technique_steps=len(proven_steps),
+        hop_count=len(proven_steps) + structural_hops,
+        structural_hops=structural_hops,
     )
-    return [f"`{inputs.domain}` falls in {step_count}: {chain}, ending in {outcome}."]
+    reconcile_suffix = f" The chain is {reconcile_clause}." if reconcile_clause else ""
+    # Disclose any proven finding that is NOT on the connected primary chain
+    # (a topologically disconnected standalone proof) in its own sentence, so
+    # the linear chain above stays one story while the run's full proof is
+    # never hidden.
+    other_note = _render_other_proven_note(inputs)
+    # Only phrase the outcome as an ACHIEVED compromise when the domain is proven
+    # compromised — the run's proven chain reached a real compromise terminal, OR
+    # the persisted promote_to_pwned SSOT records proven Domain Admin control
+    # (the shared headline fact the Security Assessment Report reads too, spec §2
+    # #19). An entry-only proof with no compromise states the honest split: the
+    # foothold was proven; the onward route to compromise was mapped, not walked.
+    if inputs.terminal_compromise_proven or inputs.domain_compromise_proven:
+        outcome = inputs.terminal_title[0].lower() + inputs.terminal_title[1:]
+        return [
+            f"`{inputs.domain}` falls in {step_count}: {chain}, ending in "
+            f"{outcome}.{reconcile_suffix}"
+        ] + other_note
+    if inputs.mapped_onward_compromise:
+        return [
+            f"`{inputs.domain}`: ADscan proved the entry in {step_count}: {chain}. "
+            f"The graph mapped an onward route to {inputs.mapped_onward_compromise} "
+            f"that this run did not walk end to end.{reconcile_suffix}"
+        ] + other_note
+    return [
+        f"`{inputs.domain}`: ADscan proved the entry in {step_count}: {chain}. "
+        f"No onward route to full domain compromise was mapped this run.{reconcile_suffix}"
+    ] + other_note
+
+
+def _render_other_proven_note(inputs: SpineInputs) -> list[str]:
+    """Return the "other proven findings" sentence, or ``[]`` when there are none.
+
+    A proven edge that is NOT on the connected primary spine (a standalone
+    proof the reached-set walk would otherwise splice into the linear chain) is
+    disclosed here — named, never dropped — so the summary chain stays one
+    linear story while the run's full proof is still reported.
+    """
+    others = [
+        step
+        for step in _collapse_multi_source_read_steps(list(inputs.other_proven_steps))
+        if not step.is_context and step.outcome == "success"
+    ]
+    if not others:
+        return []
+    phrases = "; ".join(_summary_step_phrase(step) for step in others)
+    count_word = "one standalone finding" if len(others) == 1 else f"{len(others)} standalone findings"
+    return [
+        "",
+        f"ADscan also proved {count_word} not on this chain: {phrases}.",
+    ]
+
+
+def _domain_compromise_events(
+    technical_report: dict[str, Any], domain: str, domain_data: dict[str, Any]
+) -> list[Any]:
+    """Return the per-domain event list, preferring the persisted technical_report.
+
+    The ``domain_compromise`` events are the durable proof record. On a standalone
+    ``deliver`` (rendering from persisted artifacts, not a live session)
+    ``domain_data`` is NOT the in-memory ``shell.domains_data`` and carries no
+    ``events``; the events live in ``technical_report["domains"][domain]["events"]``.
+    So read the technical_report provenance first, falling back to ``domain_data``
+    for the live-session path where both are populated.
+    """
+    domains = technical_report.get("domains") if isinstance(technical_report, dict) else None
+    payload = domains.get(domain) if isinstance(domains, dict) else None
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if isinstance(events, list):
+        return events
+    fallback = domain_data.get("events") if isinstance(domain_data, dict) else None
+    return fallback if isinstance(fallback, list) else []
+
+
+def _fold_dcsync_into_terminal_step(
+    *,
+    primary_spine_steps: tuple[SpineStep, ...],
+    secrets: list[str],
+    domain: str,
+) -> tuple[SpineStep, ...]:
+    """Fold a chained DCSync into the terminal WriteDACL->domain step's narrative.
+
+    A money path that ends by granting replication rights on the DOMAIN object
+    (WriteDACL / Owns / GenericAll) terminates at that grant; the DCSync it enabled
+    is not a graph edge, so the chain stops there. HOMOGENIZATION (founder
+    2026-09-18): every path terminates at the domain node, so the DCSync is NOT a
+    separate step/hop — it is folded into the terminal grant step's OWN narrative
+    (``narrative_suffix``), naming the proven Tier-0 secrets. The step count, the
+    diagram and the coverage are UNCHANGED (no self-loop, no 3-vs-N mismatch).
+
+    Scans for the LAST grant-relation step onto the domain object (robust to a
+    disconnected proven edge trailing after the real terminal) and enriches only
+    that one. A no-op (returns the tuple unchanged) unless the workspace PROVED the
+    loot (``secrets`` non-empty) AND the chain carries such a terminal. SSOT for the
+    decision + prose: ``adscan_core.reporting.dcsync_terminal``.
+    """
+    from adscan_core.reporting.dcsync_terminal import (  # noqa: PLC0415
+        build_dcsync_chain_enrichment,
+        is_grant_relation,
+        terminal_target_is_domain,
+    )
+
+    if not primary_spine_steps or not secrets:
+        return primary_spine_steps
+    grant_idx = next(
+        (
+            i
+            for i in range(len(primary_spine_steps) - 1, -1, -1)
+            if not primary_spine_steps[i].is_context
+            and is_grant_relation(primary_spine_steps[i].technique.relation)
+            and terminal_target_is_domain(
+                terminal_target_label=primary_spine_steps[i].target,
+                domain_display=domain,
+            )
+        ),
+        None,
+    )
+    if grant_idx is None:
+        return primary_spine_steps
+    terminal = primary_spine_steps[grant_idx]
+    enrichment = build_dcsync_chain_enrichment(
+        path_status="success",
+        terminal_relation=terminal.technique.relation,
+        terminal_target_label=terminal.target,
+        domain_display=domain,
+        secrets=secrets,
+    )
+    if enrichment is None:
+        return primary_spine_steps
+    long_clause, _short_clause = enrichment
+    existing = terminal.narrative_suffix.strip()
+    merged = f"{existing} {long_clause}".strip() if existing else long_clause
+    steps = list(primary_spine_steps)
+    steps[grant_idx] = dataclasses.replace(terminal, narrative_suffix=merged)
+    return tuple(steps)
+
+
+def _fold_dcsync_into_rendered_collections(
+    *,
+    primary_spine_steps: tuple[SpineStep, ...],
+    stages: tuple[SpineStage, ...],
+    terminal_steps: tuple[SpineStep, ...],
+    secrets: list[str],
+    domain: str,
+) -> tuple[tuple[SpineStep, ...], tuple[SpineStage, ...], tuple[SpineStep, ...]]:
+    """Apply the DCSync fold to EVERY collection that renders the money path.
+
+    The terminal grant->domain step appears in more than one collection: the
+    ``primary_spine_steps`` (the SUMMARY one-liner + the diagram) and the
+    per-step SECTION collections (``stages`` + ``terminal_steps``, built from
+    ``chain_steps``). The narrative enrichment must land in all of them, or the
+    proof shows on one surface (e.g. the diagram-derived summary) but not the
+    per-step section a reader actually studies. Each collection is enriched
+    independently through the same SSOT helper, so the terminal step folds the
+    chained-DCSync clause identically everywhere and nowhere else.
+    """
+    new_primary = _fold_dcsync_into_terminal_step(
+        primary_spine_steps=primary_spine_steps, secrets=secrets, domain=domain
+    )
+    new_terminal = _fold_dcsync_into_terminal_step(
+        primary_spine_steps=terminal_steps, secrets=secrets, domain=domain
+    )
+    new_stages = tuple(
+        dataclasses.replace(
+            stage,
+            steps=_fold_dcsync_into_terminal_step(
+                primary_spine_steps=stage.steps, secrets=secrets, domain=domain
+            ),
+        )
+        for stage in stages
+    )
+    return new_primary, new_stages, new_terminal
 
 
 def _render_frontmatter(inputs: SpineInputs, *, today: str) -> list[str]:
@@ -2920,9 +3415,9 @@ def _render_target_table(inputs: SpineInputs) -> list[str]:
         # derived principal as what the unauthenticated entry YIELDED, not as a
         # handed starting credential.
         if inputs.start_principal:
-            start = f"None — unauthenticated start; derived `{inputs.start_principal}`"
+            start = f"None: unauthenticated start; derived `{inputs.start_principal}`"
         else:
-            start = "None — unauthenticated start"
+            start = "None: unauthenticated start"
     elif inputs.start_principal:
         start = f"`{inputs.start_principal}`"
         if inputs.start_principal_note:
@@ -2945,12 +3440,16 @@ def _render_target_table(inputs: SpineInputs) -> list[str]:
 
 
 def _render_recon(inputs: SpineInputs, *, asset_link: str | None) -> list[str]:
-    """Return the recon section: what answered, per host."""
-    lines = ["## Recon", ""]
+    """Return the recon section: what answered, per host.
+
+    Suppressed entirely when the workspace holds no port-scan output — an empty
+    section whose only content is "no output" is a confession of absence that
+    reads as a rendering failure, not a finding. The section simply does not
+    appear (an assume-breach or LDAP-only run has nothing to show here).
+    """
     if not inputs.services:
-        lines.append("No port-scan output in the workspace for this domain.")
-        lines.append("")
-        return lines
+        return []
+    lines = ["## Recon", ""]
     by_host: dict[str, list[ServiceRow]] = {}
     for row in inputs.services:
         by_host.setdefault(row.host, []).append(row)
@@ -2994,6 +3493,62 @@ def _render_enumeration(inputs: SpineInputs) -> list[str]:
     return lines
 
 
+def _route_technique_root(route: AltRoute) -> tuple[str, ...]:
+    """Return the shared technique ROOT a family of near-identical routes hangs off.
+
+    The first two techniques of the route — the root the client report groups on
+    (e.g. ``AS-REP Roasting → GenericAll``). A route with a single technique
+    keys on that one; a purely-structural route on a placeholder so it never
+    silently folds into a technique family.
+    """
+    if not route.techniques:
+        return ("a direct edge",)
+    return tuple(route.techniques[:2])
+
+
+def _route_family_key(route: AltRoute) -> tuple[str, ...]:
+    """Return the key routes must SHARE to collapse into one root-cause line.
+
+    Both the verification STATUS and the technique root: routes are only folded
+    when they are near-identical AND verified to the same depth. Verification
+    status is the fact a reader most needs per route, so a proven route and a
+    theoretical route sharing a root are never silently merged — only genuine
+    duplicates (same root, same status) collapse.
+    """
+    return (route.status, *_route_technique_root(route))
+
+
+def _render_route_bullet(route: AltRoute) -> str:
+    """Return one route as its own bullet (small families and singletons)."""
+    via = ", then ".join(route.techniques) if route.techniques else "a direct edge"
+    state = _ROUTE_STATES.get(route.status, route.status)
+    reason = f": {route.status_reason}" if route.status_reason else ""
+    return f"- `{route.source}` to `{route.target}` via {via} ({state}){reason}"
+
+
+def _render_route_family(group: list[AltRoute]) -> str:
+    """Return one consolidated line for a family of routes sharing root and status.
+
+    States the shared root, how far the family was verified, and the distinct
+    targets it reaches — every fact drawn from the routes themselves, none
+    invented. This is what turns forty near-duplicate bullets into one readable
+    root-cause statement. All routes in the group share the same status by
+    construction, so the verification state is stated once.
+    """
+    first = group[0]
+    root = " → ".join(_route_technique_root(first))
+    state = _ROUTE_STATES.get(first.status, first.status)
+    targets: list[str] = []
+    for route in group:
+        if route.target and route.target not in targets:
+            targets.append(route.target)
+    target_list = ", ".join(f"`{t}`" for t in targets)
+    return (
+        f"- {len(group)} further routes share the same {root} root "
+        f"({state}); targets: {target_list}."
+    )
+
+
 def _render_route_map(inputs: SpineInputs) -> list[str]:
     """Return the route-map section: every route the graph carried, tagged honestly.
 
@@ -3017,16 +3572,23 @@ def _render_route_map(inputs: SpineInputs) -> list[str]:
     lines = ["### Other routes in the graph", ""]
     lines.append(
         "Every other route ADscan's graph carried to a comparable target, and "
-        "how far each one was verified — not just the one chain above."
+        "how far each one was verified, not just the one chain above."
     )
     lines.append("")
+    # Collapse near-identical routes that share a technique ROOT into ONE
+    # root-cause family line (mirrors the client report's family grouping): a
+    # long list of routes all beginning with the same two techniques reads as
+    # noise and buries the one fact that matters — they share a single fixable
+    # root. Small groups stay one bullet per route. Grouping is derived from the
+    # routes' own shared technique prefix, never fabricated.
+    families: dict[tuple[str, ...], list[AltRoute]] = {}
     for route in shown:
-        via = ", then ".join(route.techniques) if route.techniques else "a direct edge"
-        state = _ROUTE_STATES.get(route.status, route.status)
-        reason = f" — {route.status_reason}" if route.status_reason else ""
-        lines.append(
-            f"- `{route.source}` to `{route.target}` via {via} ({state}){reason}"
-        )
+        families.setdefault(_route_family_key(route), []).append(route)
+    for group in families.values():
+        if len(group) >= _ROUTE_FAMILY_MIN:
+            lines.append(_render_route_family(group))
+        else:
+            lines.extend(_render_route_bullet(route) for route in group)
     if bounded:
         lines.append("")
         lines.append(
@@ -3116,28 +3678,56 @@ def _render_credential_ledger(inputs: SpineInputs) -> list[str]:
         return []
     known = [row for row in inputs.credentials if row.origin]
     lines = ["### Credentials recovered", ""]
+    # Accounts-vs-secrets reconciliation (kit-facts SSOT, spec §2 #12): this
+    # ledger frames the recovered set as "secrets" while the Security Assessment
+    # Report §09 frames the same credential store as "accounts". When the krbtgt
+    # account key is among them, both surfaces render this ONE shared clause,
+    # computed from the same count, so a reader crossing the two documents is not
+    # left with two different totals.
+    from adscan_core.reporting.kit_facts import (  # noqa: PLC0415
+        recovered_secret_reconcile_clause,
+    )
+
+    _krbtgt_recovered = any(
+        row.principal.strip().lower() == "krbtgt" for row in inputs.credentials
+    )
+    _recovered_secret_note = recovered_secret_reconcile_clause(
+        total_secrets=len(inputs.credentials), krbtgt_included=_krbtgt_recovered
+    )
     if not known:
         lines.append("| Account | Secret | Value |")
         lines.append("|---|---|---|")
         for row in inputs.credentials:
-            shown = f"`{row.value}`" if row.value else "—"
+            shown = f"`{row.value}`" if row.value else "n/a"
             lines.append(f"| `{row.principal}` | {row.secret_kind} | {shown} |")
         lines.append("")
-        lines.append(
-            "This run did not record how each secret was obtained, so the "
-            "provenance is not in the workspace to print."
-        )
-        lines.append("")
+        # The confession is only honest when the workspace records NO provenance
+        # anywhere. It must not fire when the executed chain (or a stage/row)
+        # already states how a secret was obtained — printing "did not record how
+        # each secret was obtained" above a chain that narrates the AS-REP roast
+        # that yielded one contradicts the document itself.
+        if not inputs.has_recorded_provenance:
+            lines.append(
+                "This run did not record how each secret was obtained, so the "
+                "provenance is not in the workspace to print."
+            )
+            lines.append("")
+        if _recovered_secret_note:
+            lines.append(_recovered_secret_note)
+            lines.append("")
         return lines
     lines.append("| Account | Secret | Value | Recovered via |")
     lines.append("|---|---|---|---|")
     for row in inputs.credentials:
-        shown = f"`{row.value}`" if row.value else "—"
+        shown = f"`{row.value}`" if row.value else "n/a"
         lines.append(
             f"| `{row.principal}` | {row.secret_kind} | {shown} | "
             f"{row.origin or 'not recorded'} |"
         )
     lines.append("")
+    if _recovered_secret_note:
+        lines.append(_recovered_secret_note)
+        lines.append("")
     return lines
 
 
@@ -3354,7 +3944,7 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
         lines.append(
             f"This is the one chain the run walked end to end. The graph carried "
             f"{_count_phrase(len(inputs.alt_routes), 'other route')} to a "
-            'comparable target — see "Other routes in the graph" under Domain '
+            'comparable target; see "Other routes in the graph" under Domain '
             "enumeration for how far each one was verified."
         )
         lines.append("")
@@ -3483,7 +4073,7 @@ def _print_ready_panel(artifacts: SpineArtifacts, markers: int) -> None:
             "Generated end to end from the workspace: nothing is left blank for "
             "hand-fill, and every claim states how it was proven."
             if markers == 0
-            else f"{markers} place(s) still carry a `{WRITE_MARKER}` marker — "
+            else f"{markers} place(s) still carry a `{WRITE_MARKER}` marker. "
             "unexpected; search for them before publishing."
         ),
         Text(""),

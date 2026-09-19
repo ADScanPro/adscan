@@ -107,7 +107,10 @@ from adscan_core.posture_score import (
     PostureScore,
     compute_posture_score,
 )
-from adscan_core.reporting.attack_path_memory_gate import merge_attack_path_coverage
+from adscan_core.reporting.attack_path_memory_gate import (
+    exposure_population_reconciliation,
+    merge_attack_path_coverage,
+)
 from adscan_core.reporting.chokepoint_copy import (
     CHOKEPOINT_MAX_ROWS,
     STRUCTURAL_CHOKE_BADGE,
@@ -125,8 +128,14 @@ from adscan_core.reporting.domain_scope import (
     classify_report_domains,
     format_discovered_domains_note,
 )
+from adscan_core.reporting.principal_display import humanize_principal_for_prose
 from adscan_core.reporting.finding_aliases import collapse_finding_aliases
 from adscan_core.reporting.finding_vuln_map import is_reportable_finding
+from adscan_core.reporting.reach_claim import (
+    full_compromise_reach_phrase,
+    reaches_full_compromise_clause,
+    tier0_reach_sub_phrase,
+)
 from adscan_core.reporting.share_credential_verification import (
     source_verification_label_for_step,
 )
@@ -197,6 +206,7 @@ from adscan_internal.services.exposure_score_service import (
     aggregate_tier0_population,
     derive_domain_user_reach,
     derive_posture_path_inputs,
+    report_tier_for_record,
 )
 from adscan_internal.services.path_state import _PROVEN_STATUSES, client_status_label
 from adscan_internal.services.post_compromise_obligations import (
@@ -747,6 +757,12 @@ class LiteReportModel:
     #: A bounded run states the boundary so it never reads as exhaustive. SSOT:
     #: :mod:`adscan_core.reporting.attack_path_memory_gate`.
     attack_path_coverage_statement: str = ""
+    #: One clause reconciling the exposure-population figures a SAMPLED coverage
+    #: note anchors on: the all-principals total (groups and computers included),
+    #: the user accounts among them, and the non-administrative subset. Empty
+    #: unless the run was sampled and the three counts nest coherently. SSOT:
+    #: :func:`adscan_core.reporting.attack_path_memory_gate.exposure_population_reconciliation`.
+    attack_path_coverage_reconciliation: str = ""
     #: Client-facing coverage boundary for the SMB host-enrichment sweep, set ONLY
     #: when the sweep was bounded on a large directory (a scale-gate cap or skip,
     #: or an operator early stop) in one or more domains. Empty on a full sweep —
@@ -1048,7 +1064,21 @@ def _step_endpoints(step: dict[str, Any]) -> tuple[str, str]:
                 return value.strip()
         return ""
 
-    return _pick("from", "source"), _pick("display_to", "to", "target")
+    # Both endpoints are stored RAW (the ``from`` / ``source`` side has no display
+    # variant, so it is always the shouting collector label). Humanize ON EMIT
+    # through the shared prose SSOT so this client deliverable never shouts a
+    # principal (``SVC_TGS@ACTIVE.HTB`` -> ``svc_tgs``, ``BACKUP OPERATORS`` ->
+    # ``Backup Operators``), matching the rest of the report. ``from_kind`` /
+    # ``to_kind`` are passed when the step carries them so a shouting GROUP reads
+    # as words rather than lower case.
+    source = _pick("from", "source")
+    target = _pick("display_to", "to", "target")
+    source_kind = _pick("from_kind", "source_kind")
+    target_kind = _pick("to_kind", "target_kind")
+    return (
+        humanize_principal_for_prose(label=source, kind=source_kind) if source else "",
+        humanize_principal_for_prose(label=target, kind=target_kind) if target else "",
+    )
 
 
 def _step_affected_object(step: dict[str, Any]) -> str:
@@ -1592,6 +1622,11 @@ def build_lite_remediation_start_here(
             ),
             executed=row_executed,
             mapped=not row_executed,
+            # For an executed row, also state the broader mapped blast radius so
+            # a high-leverage fix (few executed, many mapped) does not read as
+            # narrower than a lower mapped row (MED-1). Parity with PRO.
+            mapped_breadth=affected if row_executed else None,
+            total_mapped=int(total_mapped_paths) if row_executed else None,
         )
         choke_id = entry.top_choke_point_id.strip() or None
         badge = bool(is_structural_choke(choke_id, card_map))
@@ -2011,7 +2046,31 @@ def build_bottom_line(
     return " ".join(parts)
 
 
-def build_verdict(*, paths_to_da: int, paths_total: int) -> tuple[str, str, str]:
+def reach_walked_end_to_end(raw_paths: Sequence[Mapping[str, Any]]) -> bool:
+    """Return True when at least one route to full domain compromise was WALKED.
+
+    Mirrors the PRO ``reach_end_to_end_proven`` gate (``html_pdf_generator``): a
+    reach claim may say "a validated path to full domain compromise" only when a
+    T1 (full-domain-compromise) route was actually executed end to end — a raw
+    status in the shared :data:`_PROVEN_STATUSES` set. Otherwise the route is
+    mapped with only its entry step proven, and the honest phrase is used. This
+    keeps the free and paid documents from wording the same partial-only
+    workspace differently (the reach-vs-execution cross-tier honesty class).
+    """
+    for record in raw_paths:
+        if not isinstance(record, Mapping):
+            continue
+        if (
+            str(record.get("status") or "").strip().lower() in _PROVEN_STATUSES
+            and report_tier_for_record(record) == "T1"
+        ):
+            return True
+    return False
+
+
+def build_verdict(
+    *, paths_to_da: int, paths_total: int, end_to_end_proven: bool = False
+) -> tuple[str, str, str]:
     """Compose the one-sentence verdict the report opens with.
 
     Returns ``(figure, text, tone)``. The figure is set large beside the
@@ -2019,9 +2078,10 @@ def build_verdict(*, paths_to_da: int, paths_total: int) -> tuple[str, str, str]
     a CSS token: ``critical`` when at least one path reaches full domain
     compromise, ``ok`` when none does.
 
-    The wording never overstates: "reach full domain compromise" is what the
-    graph shows; whether each path was executed end to end is the per-path
-    status further down.
+    The wording never overstates: a route that reaches full domain compromise
+    but was not walked end to end says so (entry step proven, chain mapped),
+    resolved through the shared reach-claim SSOT so the free and paid documents
+    cannot drift apart on this sentence.
     """
     if paths_total <= 0:
         return ("0", "attack paths were identified in this environment.", "ok")
@@ -2034,17 +2094,22 @@ def build_verdict(*, paths_to_da: int, paths_total: int) -> tuple[str, str, str]
             "ok",
         )
     plural = "" if paths_total == 1 else "s"
-    # Verb agrees with the figure (the subject): "1 ... reaches", "3 ... reach".
-    verb = "reaches" if paths_to_da == 1 else "reach"
+    clause = reaches_full_compromise_clause(
+        end_to_end_proven, plural=paths_to_da != 1
+    )
     return (
         str(paths_to_da),
-        f"of {paths_total} identified attack path{plural} {verb} full domain "
-        "compromise.",
+        f"of {paths_total} identified attack path{plural} {clause}.",
         "critical",
     )
 
 
-def _build_sprawl_lead(sprawl: Mapping[str, Any], reach: DomainUserReach) -> str:
+def _build_sprawl_lead(
+    sprawl: Mapping[str, Any],
+    reach: DomainUserReach,
+    *,
+    end_to_end_proven: bool = False,
+) -> str:
     """Compose the SPRAWL headline, with path exposure demoted to its tail.
 
     Used only where the engine set ``leads`` — a quarter or more of the account
@@ -2094,8 +2159,8 @@ def _build_sprawl_lead(sprawl: Mapping[str, Any], reach: DomainUserReach) -> str
         also = "has" if affected == 1 else "have"
         return (
             f"{lead} {affected} of the remaining {ordinary_total} ordinary "
-            f"(non-administrative) {remaining} also {also} a validated path to "
-            f"full domain compromise."
+            f"(non-administrative) {remaining} also {also} "
+            f"{full_compromise_reach_phrase(end_to_end_proven)}."
         )
     return (
         f"{lead} Tier separation is the finding here; path exposure is measured "
@@ -2133,7 +2198,10 @@ def _build_sprawl_tail(sprawl: Mapping[str, Any] | None) -> str:
 
 
 def build_verdict_reach(
-    reach: DomainUserReach, sprawl: Mapping[str, Any] | None = None
+    reach: DomainUserReach,
+    sprawl: Mapping[str, Any] | None = None,
+    *,
+    end_to_end_proven: bool = False,
 ) -> str:
     """Compose the account-population line that sits under the verdict.
 
@@ -2170,7 +2238,7 @@ def build_verdict_reach(
     """
     sprawl_leads = bool(sprawl and sprawl.get("available") and sprawl.get("leads"))
     if sprawl_leads and sprawl is not None:
-        return _build_sprawl_lead(sprawl, reach)
+        return _build_sprawl_lead(sprawl, reach, end_to_end_proven=end_to_end_proven)
     if not reach.available or reach.affected <= 0 or reach.total <= 0:
         return ""
     if reach.ordinary_available and reach.ordinary_affected > 0:
@@ -2178,8 +2246,8 @@ def build_verdict_reach(
         has_or_have = "has" if reach.ordinary_affected == 1 else "have"
         lead = (
             f"{reach.ordinary_affected} of {reach.ordinary_total} ordinary "
-            f"(non-administrative) domain user {accounts} {has_or_have} a "
-            f"validated path to full domain compromise"
+            f"(non-administrative) domain user {accounts} {has_or_have} "
+            f"{full_compromise_reach_phrase(end_to_end_proven)}"
         )
         if reach.ordinary_affected >= reach.ordinary_total:
             sentence = f"{lead}."
@@ -2215,7 +2283,9 @@ class ExposureFigure:
     sub: str
 
 
-def build_exposure_figure(reach: DomainUserReach) -> ExposureFigure:
+def build_exposure_figure(
+    reach: DomainUserReach, *, end_to_end_proven: bool = False
+) -> ExposureFigure:
     """Resolve the ledger's headline exposure figure from the shared reach SSOT.
 
     Mirrors :func:`build_verdict_reach`'s branch selection EXACTLY so the ledger
@@ -2240,7 +2310,7 @@ def build_exposure_figure(reach: DomainUserReach) -> ExposureFigure:
             available=True,
             pct=reach.ordinary_pct,
             label="Ordinary accounts exposed",
-            sub="have a validated path to Tier 0 · higher is worse",
+            sub=f"{tier0_reach_sub_phrase(end_to_end_proven)} · higher is worse",
         )
     return ExposureFigure(
         available=True,
@@ -2538,8 +2608,15 @@ def build_report_model(
     else:
         domain_label = domain_names[0]
 
+    # Whether any route to full domain compromise was actually WALKED end to end
+    # — the gate for "validated" vs "mapped, entry proven" reach wording. Mirrors
+    # the PRO ``reach_end_to_end_proven`` gate so the two tiers cannot word the
+    # same partial-only workspace differently.
+    reach_end_to_end_proven = reach_walked_end_to_end(raw_paths)
     verdict_figure, verdict_text, verdict_tone = build_verdict(
-        paths_to_da=inputs.paths_to_da, paths_total=paths_total
+        paths_to_da=inputs.paths_to_da,
+        paths_total=paths_total,
+        end_to_end_proven=reach_end_to_end_proven,
     )
     # Zero-credential LEAD: set only when the engine proved a path to full domain
     # compromise that began from an unauthenticated foothold. It leads the verdict
@@ -2566,6 +2643,7 @@ def build_report_model(
     verdict_reach = build_verdict_reach(
         domain_user_reach,
         aggregate_tier0_population(domains),
+        end_to_end_proven=reach_end_to_end_proven,
     )
     # The headline exposure figure, LABELLED distinctly from the posture score.
     # Resolved from the SAME shared DomainUserReach SSOT and the SAME branch the
@@ -2574,7 +2652,23 @@ def build_report_model(
     # sentence can never quote different numbers — and the figure appears
     # whenever the prose states a reach, not only on the subset of artifacts
     # whose Tier split happens to reconcile.
-    exposure_figure = build_exposure_figure(domain_user_reach)
+    exposure_figure = build_exposure_figure(
+        domain_user_reach, end_to_end_proven=reach_end_to_end_proven
+    )
+
+    # Bridge the three exposure-population figures a SAMPLED coverage note leaves
+    # unreconciled: the all-principals total the note anchors on, the user
+    # accounts among them, and the non-administrative subset. Sourced from the
+    # SAME DomainUserReach SSOT the exposure figure uses, so the free and paid
+    # tiers word the reconciliation identically. Empty unless sampled.
+    _lite_coverage_view = merge_attack_path_coverage(domains.values())
+    attack_path_coverage_reconciliation = ""
+    if _lite_coverage_view.get("sampled") and domain_user_reach.ordinary_available:
+        attack_path_coverage_reconciliation = exposure_population_reconciliation(
+            exposure_source_count=_lite_coverage_view.get("exposure_source_count"),
+            user_account_count=domain_user_reach.affected,
+            ordinary_user_count=domain_user_reach.ordinary_affected,
+        )
 
     return LiteReportModel(
         workspace_name=workspace_name,
@@ -2634,9 +2728,8 @@ def build_report_model(
         client_logo_uri=client_logo_uri,
         obligations=tuple(obligations),
         reference_environment=str(reference_environment or "").strip(),
-        attack_path_coverage_statement=(
-            merge_attack_path_coverage(domains.values()).get("statement") or ""
-        ),
+        attack_path_coverage_statement=(_lite_coverage_view.get("statement") or ""),
+        attack_path_coverage_reconciliation=attack_path_coverage_reconciliation,
         host_enrichment_coverage_statement=(
             merge_host_enrichment_coverage(domains.values()).get("statement") or ""
         ),
@@ -3269,6 +3362,19 @@ def generate_lite_report_artifacts(
             restamped_choke = read_json_file(str(tr_path))
             if isinstance(restamped_choke, dict):
                 technical_report = restamped_choke
+
+        # Kit-facts SSOT — stamp the derived cross-document scalars onto the model
+        # AFTER every source block (exposure_kpis, chokepoint) is present, so the
+        # free report and the paid kit read ONE canonical value via
+        # ``read_kit_fact`` instead of each re-deriving it. Mirrors the PRO seam in
+        # ``report_service.ensure_report_attack_paths``. Best-effort; never raises.
+        try:
+            from adscan_core.reporting.kit_facts import build_kit_facts
+
+            build_kit_facts(technical_report, workspace_dir)
+        except Exception as exc:  # noqa: BLE001 - a report never fails on this
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         workspace_name = str(
             getattr(shell, "current_workspace", None)
@@ -4413,7 +4519,7 @@ ol.oblig-steps > li {
     {% if m.attack_path_coverage_statement %}
     <div class="ds-note">
       <div class="ds-note-k">Coverage limit</div>
-      <div class="ds-note-t">{{ m.attack_path_coverage_statement }}</div>
+      <div class="ds-note-t">{{ m.attack_path_coverage_statement }}{% if m.attack_path_coverage_reconciliation %} {{ m.attack_path_coverage_reconciliation }}{% endif %}</div>
     </div>
     {% endif %}
     {% if m.host_enrichment_coverage_statement %}
