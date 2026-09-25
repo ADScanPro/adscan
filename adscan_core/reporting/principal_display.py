@@ -229,6 +229,64 @@ def humanize_domain_for_display(domain: str) -> str:
     return str(domain or "").strip().rstrip(".").lower()
 
 
+# Common connector words kept lower-case inside a de-shouted multi-word name, so
+# a localized display name reads naturally (``Controller di dominio`` /
+# ``Autenticazione Kerberos``) instead of an all-title ``Controller Di Dominio``.
+# Language-agnostic small set (EN + Latin-language articles/prepositions); NEVER a
+# translation, only casing — the words themselves are preserved verbatim.
+_DISPLAY_CONNECTOR_WORDS: frozenset[str] = frozenset(
+    {
+        "of", "and", "the", "for", "to", "a", "an", "in", "on", "by", "or",
+        "di", "del", "della", "dei", "degli", "delle", "dello", "dell",
+        "da", "e", "il", "la", "lo", "i", "gli", "le", "per", "con", "su",
+        "al", "allo", "alla", "ai", "agli", "alle",
+        "de", "y", "el", "los", "las", "un", "una",
+    }
+)
+
+
+def deshout_display_label(name: str) -> str:
+    """De-shout an ALL-CAPS display label to the directory's own casing.
+
+    A directory can return an object's display name SHOUTING (an ADCS template
+    display ``CONTROLLER DI DOMINIO`` / ``AUTENTICAZIONE KERBEROS``), and a
+    client deliverable must never render it that way beside the same object's
+    properly-cased siblings. This restores a readable casing WITHOUT translating:
+    the words are preserved verbatim in the environment's own language, only their
+    case changes. Each word is title-cased, except a common connector word kept
+    lower-case when it is not the first word (so ``CONTROLLER DI DOMINIO`` reads
+    ``Controller di Dominio``, not ``Controller Di Dominio``).
+
+    Only a MULTI-WORD all-caps name is de-shouted: a localized display name is a
+    phrase with spaces (``CONTROLLER DI DOMINIO``), whereas a SINGLE-token all-caps
+    name is almost always a CN / short identifier whose exact case matters
+    (``ESC1``, ``MACHINE``, ``DomainController``) — those are returned VERBATIM, as
+    is any already mixed/proper-cased display. Empty-safe.
+
+    Args:
+        name: The candidate display label, any case.
+
+    Returns:
+        The de-shouted label, or the input unchanged when it is not a multi-word
+        all-caps phrase.
+    """
+    text = str(name or "").strip()
+    if not text or not text.isupper() or " " not in text:
+        return text
+    words = text.split(" ")
+    out: list[str] = []
+    for i, word in enumerate(words):
+        if not word:
+            out.append(word)
+            continue
+        lowered = word.lower()
+        if i > 0 and lowered in _DISPLAY_CONNECTOR_WORDS:
+            out.append(lowered)
+        else:
+            out.append(word[:1].upper() + word[1:].lower())
+    return " ".join(out)
+
+
 def humanize_principal_label(label: str) -> str:
     """Return the client-facing display form of a graph node / principal label.
 
@@ -456,3 +514,32 @@ def format_graph_node_label(
     if "." in node_value and not any(ch.isspace() for ch in node_value):
         return humanize_domain_for_display(node_value)
     return node_value
+
+
+def humanize_chokepoint_node_label(node_label: str, domain: str | None = None) -> str:
+    """Return the client-facing display for a choke-point object / target label.
+
+    The ONE humanizer both report tiers share for the choke-point remediation
+    table — LITE (``lite_html_report._build_chokepoint_remediation``) and PRO
+    (``html_pdf_generator.build_chokepoint_section``) both render the persisted
+    ``ranked_chokepoints`` rows, whose ``node_label`` / ``protected_terminal_label``
+    are the RAW attack-graph labels (a shouting UPN, a machine account, a
+    ``@WELLKNOWN`` sentinel, a locale-translated built-in group). Routing both
+    tiers through this SSOT is what keeps the free and paid choke-point tables
+    from naming the same object differently, and keeps a raw label out of either.
+
+    The raw label is humanized through the node-label SSOT
+    :func:`format_graph_node_label` (shouting UPN de-shouted, ``@WELLKNOWN``
+    stripped, well-known name canonical, domain lower-cased). A directory's
+    LOCALIZED built-in group name (Italian ``Computer del dominio``,
+    ``Controller di dominio``) is rendered in its OWN directory language, never
+    translated to English — the client's remediation commands reference the
+    object by the CN it actually has on their (localized) DC.
+
+    Best-effort and total: an empty label returns ``""`` (so an absent
+    protected-target stays absent, not the node-label ``"N/A"`` sentinel); any
+    unexpected shape is humanized rather than passed through raw.
+    """
+    if not str(node_label or "").strip():
+        return ""
+    return format_graph_node_label(node_label, domain)

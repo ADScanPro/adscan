@@ -14,6 +14,150 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+## [13.1.0] - 2026-09-25
+
+### Added
+
+- ADCS findings now state exactly one of three honest outcomes: validated (the vulnerable
+  certificate authority was reachable and the escalation ran to completion), a data gap (the
+  weakness was detected but its CA could not be reached to prove it, with the step to validate
+  it), or directory hygiene (a decommissioned CA still registered in the directory); a data gap
+  never reads as a confirmed critical. An ESC8 finding additionally names the web-enrollment
+  transport the assessment relayed over (HTTP or HTTPS) and the observed channel-binding state,
+  so the remediation targets the exact vector (disable HTTP enrollment on that CA first) rather
+  than generic hardening.
+- The report and platform now show a "Most Exposed Accounts" block under the exposure headline:
+  the accounts the most compromise paths can reach, worst first, stating how many paths reach
+  each one and how many were validated end to end. It names the top accounts to prioritise for
+  Protected Users, tiering, credential rotation and LAPS, and collapses the long tail so a large
+  domain stays readable.
+- ADscan now identifies a directory-synchronization account (a Microsoft Entra Connect / MSOL_*
+  sync account) that holds directory-replication rights and classifies it as a Tier-0 control-plane
+  asset. Its ability to replicate every secret in the domain is surfaced in the report, the coverage
+  report and the platform as a Tier-0 hardening item to confirm and contain, hedged as a capability
+  to verify is authorized rather than an attack ADscan performed, so a replication account created
+  for cloud sync is no longer taken for a benign service account or lost among lower-severity findings.
+
+### Changed
+
+- The remediation section is now one ordered "Start Here" list, led by how many of your affected
+  users each fix removes exposure for (as "N of M affected users (X%)"), with the attack-path count
+  as a secondary figure: a fix that protects more people ranks above one that breaks more graph paths
+  but touches fewer accounts, and a fix on a path executed end to end leads the ones only mapped. The
+  former standalone "Structural Choke Points" table is gone (a fix with no alternate route now carries
+  a "durable fix" badge on its row), and the "Vulnerability Impact on Attack Paths" table is reframed
+  as a subordinate finding register that points back to Start Here for the order to work in.
+- The attack-path listing in the exposure report no longer prints one near-identical row per
+  foothold: when several routes reach the same target by the same technique from different
+  starting accounts, they now show as a single finding that names every foothold it opens from,
+  so a fan-out-heavy domain reads as a handful of findings instead of dozens of repeats. The
+  identified-path counts are unchanged; only the presentation groups the duplicates.
+- The report's Compromised Credentials section no longer lists every account one row at a
+  time once the domain has fallen. Credentials obtained by targeted techniques (kerberoast,
+  GPP, LSASS, spray, ADCS, ACL abuse) stay listed individually as the breach story, while the
+  full-directory extraction that follows domain compromise collapses into a single line stating
+  the total and the secret-type breakdown, with the complete per-account list in the appendix.
+  A fully-owned domain that used to run tens of pages of identical DCSync rows now reads in one.
+- Shadow Credentials (a pre-existing msDS-KeyCredentialLink entry) are now presented as a
+  persistence indicator to investigate rather than an attack ADscan performs. The operator
+  panel groups and caps the objects so a Windows Hello for Business rollout no longer floods
+  the terminal, and surfaces Tier-0 assets first. The client finding is now Medium by default
+  (a detection, not a proven exposure), rising only when the affected object is itself Tier-0.
+
+### Fixed
+
+- Remediation and verification commands in the report and hardening playbook now run as
+  written. Commands that touch a computer account or a certificate template use the
+  object-class-agnostic cmdlets (a machine account is no longer handed a user-only cmdlet
+  that errors on paste), account names that would be misread by the shell are quoted, and
+  every place a command needs a host or address the client supplies now shows a clear
+  fill-in instead of a made-up example, so a copied command targets the real object rather
+  than one that does not exist.
+
+- Attack paths no longer over-claim domain compromise through a logged-on user's session
+  without proving the takeover of that user. Reaching a user's live session now requires the
+  step that actually seizes it (dump its credentials or run code as it) before the path can
+  use that user's own access, so a chain like "admin on host A, a user is logged on there,
+  that user can RDP to host B" no longer silently escalates to full domain compromise on host B.
+- Reading arbitrary files off a SQL Server host via bulk operations is now reported as an
+  over-privilege finding, not an attack step: it is a file read as the SQL service account, not
+  host takeover, so it no longer appears as a hop in an attack path. A non-administrator holding
+  the bulk-operations permission (which it should not) is flagged with native remediation to
+  revoke it; for a SQL administrator, where the capability is inherent, it is not reported as noise.
+- The domain-scope attack-path listing no longer buries a separately compromisable host
+  or account just because a larger kill chain happens to pivot through it: a stepping
+  stone on the way to a high-value target now appears as its own finding, so the
+  most-direct and the holistic views of a domain show the same set of targets. Pure
+  waypoints that only ever sit inside a chain stay folded into it, and a target reachable
+  only as a dead end that leads nowhere toward a high-value asset stays out of the
+  high-value listing.
+- Principal, group, computer and domain names now read consistently in human form across
+  the report and the platform. The attack-path "reachable via" routes and the
+  choke-point "start here" table no longer show raw directory labels (an all-caps
+  `SERVICE$@DOMAIN`, a `Everyone@WELLKNOWN` sentinel, or a shouting built-in group). Each
+  object is named exactly as your directory holds it: a built-in group in a localized
+  directory keeps its own display name (an Italian "Computer del dominio" reads "Computer
+  del dominio", not an English translation), so the names in the report match the objects
+  and remediation commands you run on the domain controller, and an account or host reads
+  as its lower-cased name.
+- The domain-compromise exposure headline now counts real standard users correctly. It
+  previously mixed in machine accounts pulled in through Authenticated Users, which roughly
+  doubled the figure, and separately dropped accounts whose username carries a locale-specific
+  character (the Turkish dotless-i or the German ß), which undercounted it. The headline now
+  leads with real user accounts only (for example "100% of standard user accounts, 1,150 of
+  1,150"), and the figure reconciles across the free report, the client report and the platform.
+- Domain name resolution during collection no longer aborts the whole batch when a
+  configured resolver entry is a hostname rather than an IP address; the malformed
+  entry is skipped and resolution proceeds through the valid nameservers.
+- An ADCS relay attack (ESC8) whose listener port was already held by another
+  ADscan listener (for example, LLMNR/NBT-NS poisoning or the credential-capture
+  listener started earlier in the scan) no longer crashes the scan with a raw
+  "address already in use" error. The relay step now reports the listener as
+  unavailable and the scan continues to the next attack path and the
+  password-spraying phase.
+- When an attack-path step fails and the remaining steps are skipped, the halt message
+  now states WHY it failed (the underlying exploit / LDAP cause) instead of only "step
+  failed", so a blocked compromise is diagnosable from the run output and logs.
+- LDAP channel binding now derives its `tls-server-end-point` token from the domain
+  controller's own certificate signature algorithm instead of always using SHA-256. Against
+  a DC whose LDAPS certificate is signed with SHA-384 or SHA-512, authentication no longer
+  fails with `SEC_E_BAD_BINDINGS`, which previously could leave a scan returning near-empty
+  results instead of a clear collection failure. Standard SHA-256 certificates are unaffected.
+- Attack paths shown for a single owned or named account, and for "attack paths owned",
+  now stop expanding once they reach a Tier-0 asset and close with the shortest route to
+  full domain compromise, instead of also listing every further account and group that
+  Tier-0 asset can reach. This removes hundreds of near-duplicate routes to the same
+  finding on domains with a control mega-hub (an Account Operators-style group) and
+  brings these views in line with what the full-domain exposure report already showed.
+- Exposure reports and the platform now materialize attack paths completely on far more
+  large directories with control mega-hubs, instead of falling back to a sampled result.
+  A Tier-0 group that only ends a path is no longer mistaken for one that multiplies
+  routes, and a conservative memory estimate that depended on transient free memory no
+  longer aborts discovery, which previously could render "0 attack paths" even where the
+  domain had been compromised. When a result is still sampled under real memory pressure it
+  is labeled with its coverage, proven and reachable routes are stated distinctly, and a
+  compromised domain is never reported as having none.
+
+- GPP credential harvesting (cpassword and autologon) now completes on enterprise domains. It
+  previously walked the entire SYSVOL tree under a single time budget and, on a domain with many
+  Group Policy Objects, ran out of time and returned nothing; it now walks only the policy subtree
+  where GPP files live, with a per-share budget that keeps partial results. It also reaches each
+  domain controller by its correct Kerberos name, so a multi-controller domain (where it previously
+  addressed a controller by IP with the wrong service name and built duplicate targets) no longer
+  fails to read the replicated policy.
+- ESC8 and ESC11 execution now targets the specific vulnerable certificate authority the
+  finding identifies, so a domain with more than one CA no longer dead-ends on the
+  first-discovered or a decommissioned one. ESC8 web enrollment over HTTPS also no longer fails
+  when the CA does not cleanly close the TLS connection: teardown is best-effort, so a slow or
+  ungraceful shutdown no longer masks a certificate that was already issued.
+- The report and the hardening playbook now agree on the fix order and the headcount: the
+  playbook runbooks follow the same Start Here order instead of re-ranking by severity, the
+  severity score and the remediation order are labeled as two distinct things, and the number
+  of standard user accounts with a path to full domain compromise reads identically on the
+  free report, the paid report and the playbook.
+
+### Removed
+
 ## [13.0.0] - 2026-09-19
 
 ### Added
@@ -896,7 +1040,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v13.0.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v13.1.0...HEAD
+[13.1.0]: https://github.com/ADScanPro/adscan/compare/v13.0.0...v13.1.0
 [13.0.0]: https://github.com/ADScanPro/adscan/compare/v12.0.0...v13.0.0
 [12.0.0]: https://github.com/ADScanPro/adscan/compare/v11.3.0...v12.0.0
 [11.3.0]: https://github.com/ADScanPro/adscan/compare/v11.2.0...v11.3.0

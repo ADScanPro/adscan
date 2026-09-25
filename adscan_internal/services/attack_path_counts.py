@@ -82,6 +82,25 @@ _REACH_ORDER: tuple[CompromiseClass, ...] = (
 
 
 @dataclass(frozen=True)
+class PathHeadline:
+    """The one client-facing attack-path headline every surface renders.
+
+    Built once by :meth:`ClientPathTotals.render_headline` so the CLI panel, the
+    LITE/PRO report cards and the web CTEM say the SAME sentence. ``reachable``
+    is the effective full-domain-compromise figure (k when materialization
+    walked the graph, the reachable-set cardinality when the mega-hub fallback
+    fired); ``proven`` is the end-to-end ``exploited`` count shown distinctly.
+    ``label`` never reads "0" / "not compromised" when ``compromised`` is true.
+    """
+
+    proven: int
+    reachable: int
+    sampled: bool
+    compromised: bool
+    label: str
+
+
+@dataclass(frozen=True)
 class ClientPathTotals:
     """The cardinalities of one curated client attack-path set.
 
@@ -118,9 +137,25 @@ class ClientPathTotals:
     reachable_domain_object: int = 0
     reachable_tier0_direct: int = 0
     reachable_tier0_enabler: int = 0
+    #: Standard-user (enabled, non-Tier-0, non-synthetic) exposure ratio — how
+    #: many real user accounts hold a reachable path to full domain compromise.
+    #: k-INDEPENDENT (a reverse-reachability set cardinality), so it is the client
+    #: exposure headline that survives the mega-hub sampled fallback. Distinct
+    #: from the reachable_* PRINCIPAL count, whose denominator folds in machine
+    #: accounts via ``Authenticated Users``. 0/0 when the block is absent.
+    tier2_exposure_with_path: int = 0
+    tier2_exposure_total: int = 0
     #: ``compromise_class`` -> open-exposure path count. Drives the reach label
     #: without any surface re-deriving the class ordering.
     open_exposure_by_class: Mapping[str, int] = field(default_factory=dict)
+    #: Coverage mode of the run that produced these figures: ``"complete"`` when
+    #: materialization walked the graph, ``"sampled"``/``"bounded"`` when the
+    #: control-mega-hub fallback fired. Drives the effective figures below.
+    coverage_mode: str = "complete"
+    #: Proven full-domain-compromise count sourced from the persisted snapshot
+    #: (k-independent), used when coverage is sampled and ``path_axis`` collapsed
+    #: so the proven ``exploited`` count is not lost with the materialized set.
+    proven_full_domain_compromise_override: int = 0
 
     def __bool__(self) -> bool:
         """Truthy when the run produced any curated path at all."""
@@ -145,11 +180,124 @@ class ClientPathTotals:
         cls = self.strongest_reach_class
         return compromise_reach_label_short(cls) if cls is not None else ""
 
+    @property
+    def tier2_exposure_pct(self) -> float:
+        """Share of standard user accounts with a reachable path to Tier 0."""
+        if self.tier2_exposure_total <= 0:
+            return 0.0
+        return min(
+            100.0,
+            round(self.tier2_exposure_with_path / self.tier2_exposure_total * 100.0, 1),
+        )
+
+    @property
+    def has_tier2_exposure(self) -> bool:
+        """True when a standard-user exposure ratio is available to report."""
+        return self.tier2_exposure_total > 0
+
+    def render_tier2_exposure_headline(self) -> str | None:
+        """Return the one client/operator standard-user exposure sentence.
+
+        The exposure thesis as a ratio a CISO reads directly: of the domain's
+        real, non-privileged user accounts, how many hold a reachable route to
+        full domain compromise. Rendered from the SSOT so the CLI panel, the
+        LITE/PRO reports and the web CTEM say the SAME sentence. ``None`` when no
+        standard-user population is available (older/empty workspace), so a
+        surface degrades rather than printing a zero it cannot stand behind.
+
+        The magnitude is REACHABILITY (a route exists), not proven execution —
+        the wording says "reachable", never "validated", per the
+        Exposure-Validation doctrine.
+        """
+        if not self.has_tier2_exposure:
+            return None
+        pct = self.tier2_exposure_pct
+        pct_text = f"{pct:g}"
+        return (
+            f"{pct_text}% of standard user accounts "
+            f"({self.tier2_exposure_with_path:,} of {self.tier2_exposure_total:,}) "
+            "hold a reachable path to full domain compromise"
+        )
+
+    @property
+    def effective_reach_is_sampled(self) -> bool:
+        """True when materialization fell back (``sampled``/``bounded`` coverage).
+
+        In that mode ``path_axis`` (k) is empty by construction, so the client
+        figures MUST come from the reachability set, not from k.
+        """
+        return self.coverage_mode != "complete"
+
+    @property
+    def effective_full_domain_compromise(self) -> int:
+        """Routes to full domain compromise a client-facing headline may use.
+
+        ``paths_full_domain_compromise`` (k) on a complete run — byte-identical
+        to today — and the reachable-set cardinality when the mega-hub fallback
+        collapsed k to 0. Never renders 0 on a domain that has reachable routes.
+        """
+        if self.effective_reach_is_sampled:
+            return self.reachable_full_domain_compromise
+        return self.paths_full_domain_compromise
+
+    @property
+    def effective_proven_full_domain_compromise(self) -> int:
+        """The end-to-end ``exploited`` count, snapshot-sourced under fallback.
+
+        Under sampled coverage ``path_axis`` is empty, so ``paths_proven`` is 0;
+        the persisted snapshot's ``exploited`` count (the override) preserves the
+        proven figure that k lost.
+        """
+        if (
+            self.effective_reach_is_sampled
+            and self.proven_full_domain_compromise_override > 0
+        ):
+            return self.proven_full_domain_compromise_override
+        return self.paths_proven
+
+    def render_headline(self, domain_compromised: bool) -> "PathHeadline":
+        """Build the one shared client/operator attack-path headline.
+
+        Every surface renders from this so proven-vs-reachable and the "never 0
+        on a compromised domain" rule live in exactly one place.
+        """
+        reachable = self.effective_full_domain_compromise
+        # Tie proven to the runtime compromise oracle: a stale snapshot can never
+        # invent a proven route on a domain the current state says is not owned.
+        proven = (
+            self.effective_proven_full_domain_compromise if domain_compromised else 0
+        )
+        sampled = self.effective_reach_is_sampled
+        suffix = " (sampled coverage)" if sampled else ""
+        if domain_compromised:
+            head = "full domain compromise proven"
+            if proven > 0:
+                head = f"{head} ({proven} route(s) validated end-to-end)"
+            parts = [head]
+            if reachable > 0:
+                parts.append(f"{reachable} reachable route(s) to full domain compromise")
+            label = "; ".join(parts) + suffix
+        elif reachable > 0:
+            label = f"{reachable} reachable route(s) to full domain compromise{suffix}"
+        else:
+            label = "no attack paths found"
+        return PathHeadline(
+            proven=proven,
+            reachable=reachable,
+            sampled=sampled,
+            compromised=bool(domain_compromised),
+            label=label,
+        )
+
     def merged_with(self, other: "ClientPathTotals") -> "ClientPathTotals":
         """Return the sum of two domains' totals (for a multi-domain session)."""
         by_class: dict[str, int] = dict(self.open_exposure_by_class)
         for key, value in other.open_exposure_by_class.items():
             by_class[key] = by_class.get(key, 0) + int(value or 0)
+        # A session is sampled if ANY of its domains fell back — the honest
+        # headline for the whole session must not claim complete coverage.
+        merged_modes = {self.coverage_mode, other.coverage_mode} - {"complete"}
+        merged_mode = next(iter(merged_modes)) if merged_modes else "complete"
         return ClientPathTotals(
             paths_total=self.paths_total + other.paths_total,
             paths_open_exposure=self.paths_open_exposure + other.paths_open_exposure,
@@ -175,6 +323,17 @@ class ClientPathTotals:
             ),
             reachable_tier0_enabler=(
                 self.reachable_tier0_enabler + other.reachable_tier0_enabler
+            ),
+            tier2_exposure_with_path=(
+                self.tier2_exposure_with_path + other.tier2_exposure_with_path
+            ),
+            tier2_exposure_total=(
+                self.tier2_exposure_total + other.tier2_exposure_total
+            ),
+            coverage_mode=merged_mode,
+            proven_full_domain_compromise_override=(
+                self.proven_full_domain_compromise_override
+                + other.proven_full_domain_compromise_override
             ),
             open_exposure_by_class=by_class,
         )
@@ -212,6 +371,8 @@ def _coerce_int(value: object) -> int:
 
 def client_path_totals_from_kpis(
     exposure_kpis: Mapping[str, Any] | None,
+    *,
+    proven_override: int | None = None,
 ) -> ClientPathTotals:
     """Return the named totals from an ``exposure_kpis`` block. Pure.
 
@@ -235,6 +396,30 @@ def client_path_totals_from_kpis(
 
     reachability = exposure_kpis.get("reachability")
     reach = reachability if isinstance(reachability, Mapping) else {}
+
+    tier2_raw = exposure_kpis.get("tier2_exposure")
+    tier2 = tier2_raw if isinstance(tier2_raw, Mapping) else {}
+
+    # Reconcile the standard-user population to ONE figure across every surface.
+    # The tier2_exposure block is a reverse-reachability set cardinality whose
+    # denominator can drift a handful of accounts above the ASSESSED non-Tier-0
+    # (tier2) population the tiering breakdown records — the same population the
+    # SAR and LITE report through ``derive_domain_user_reach``/
+    # ``derive_ordinary_breaker_stat`` (its ``ordinary_total``). When that happens,
+    # the Playbook/CLI/web (which read this block) print a bigger "N of M standard
+    # user accounts" than the SAR/LITE, a cross-surface concordance defect. The
+    # assessed population is authoritative, so cap the standard-user denominator
+    # (and numerator) to it. Only fires on the over-count case, so a workspace
+    # without a tiering breakdown, or one where the two already agree, is
+    # byte-identical to before.
+    tier2_with = _coerce_int(tier2.get("with_path"))
+    tier2_total = _coerce_int(tier2.get("total"))
+    _population = exposure_kpis.get("population_tier_breakdown")
+    if isinstance(_population, Mapping):
+        _assessed_tier2 = _coerce_int(_population.get("tier2"))
+        if _assessed_tier2 > 0 and tier2_total > _assessed_tier2:
+            tier2_total = _assessed_tier2
+            tier2_with = min(tier2_with, _assessed_tier2)
 
     total = 0
     open_exposure = 0
@@ -264,6 +449,16 @@ def client_path_totals_from_kpis(
             elif status in NOT_ASSESSED_STATUSES:
                 not_assessed += _coerce_int(count)
 
+    # Coverage mode: prefer the engine-stamped flag; infer it when absent (older
+    # workspace) from the k-collapsed-but-reachable signature. "sampled"/
+    # "bounded" both mean the effective figures must read reachability, not k.
+    reachable_fdc = _coerce_int(reach.get("full_domain_compromise"))
+    declared_mode = exposure_kpis.get("coverage_mode")
+    if isinstance(declared_mode, str) and declared_mode.strip():
+        coverage_mode = declared_mode.strip().lower()
+    else:
+        coverage_mode = "sampled" if (total == 0 and reachable_fdc > 0) else "complete"
+
     return ClientPathTotals(
         paths_total=total,
         paths_open_exposure=open_exposure,
@@ -281,8 +476,101 @@ def client_path_totals_from_kpis(
         reachable_domain_object=_coerce_int(reach.get("domain_object")),
         reachable_tier0_direct=_coerce_int(reach.get("tier0_direct")),
         reachable_tier0_enabler=_coerce_int(reach.get("tier0_enabler")),
+        tier2_exposure_with_path=tier2_with,
+        tier2_exposure_total=tier2_total,
+        coverage_mode=coverage_mode,
+        proven_full_domain_compromise_override=_coerce_int(proven_override),
         open_exposure_by_class=by_class,
     )
+
+
+#: Snapshot path statuses that count as an END-TO-END proven route. Spans the
+#: three status vocabularies' proven tokens (see CLAUDE.md § status vocabularies)
+#: so a proven route keyed "domain_compromised" or "success" is not missed.
+_SNAPSHOT_PROVEN_STATUSES = frozenset({"exploited", "domain_compromised", "success"})
+
+
+def proven_full_domain_compromise_from_snapshot(
+    snapshot: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
+) -> int:
+    """Count end-to-end proven routes to full domain compromise in a snapshot.
+
+    Reads ``attack_paths_snapshot.json`` (a ``{"paths": [...]}`` mapping or the
+    bare path list) and counts ``domain_breaker`` paths whose status is proven.
+    This is k-INDEPENDENT: it survives the control-mega-hub fallback that empties
+    ``path_axis``, so it preserves the proven figure the report cards would
+    otherwise lose with the materialized set. Pure; 0 for a missing snapshot.
+    """
+    if isinstance(snapshot, Mapping):
+        paths: Any = snapshot.get("paths")
+    else:
+        paths = snapshot
+    if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes)):
+        return 0
+    count = 0
+    for path in paths:
+        if not isinstance(path, Mapping):
+            continue
+        status = str(path.get("status") or "").strip().lower()
+        cls = str(path.get("compromise_class") or "").strip().lower()
+        if cls == CompromiseClass.DOMAIN_BREAKER.value:
+            if status in _SNAPSHOT_PROVEN_STATUSES:
+                count += 1
+    return count
+
+
+def proven_full_domain_compromise_from_executions(
+    executions: Sequence[Mapping[str, Any]] | None,
+) -> int:
+    """Count distinct proven full-domain-compromise routes from execution rows.
+
+    Reads the RUNTIME execution sidecar (``domains/<domain>/post_ex/
+    path_executions.json`` via ``load_executions``): the record of attacks that
+    actually ran, independent of the theoretical-path snapshot. Counts distinct
+    ``attack_path_id`` whose recorded ``path_state`` reached
+    ``domain_compromised``. This is the PREFERRED proven source (a run fact, not
+    a projection); the snapshot is the fallback when the sidecar is absent. Pure.
+    """
+    if not isinstance(executions, Sequence) or isinstance(executions, (str, bytes)):
+        return 0
+    proven_paths: set[str] = set()
+    for row in executions:
+        if not isinstance(row, Mapping):
+            continue
+        state = str(row.get("path_state") or "").strip().lower()
+        ap_id = str(row.get("attack_path_id") or "").strip()
+        if ap_id and state == "domain_compromised":
+            proven_paths.add(ap_id)
+    return len(proven_paths)
+
+
+def client_path_totals_for_domain(
+    exposure_kpis: Mapping[str, Any] | None,
+    *,
+    snapshot: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+    executions: Sequence[Mapping[str, Any]] | None = None,
+) -> ClientPathTotals:
+    """SSOT entry point: combine ``exposure_kpis`` with the proven-route sources.
+
+    ``exposure_kpis`` supplies the k / reachability figures (both RUNTIME).
+    ``executions`` (the preferred, runtime execution sidecar) and ``snapshot``
+    (the fallback) each supply a k-independent proven full-domain-compromise
+    count that survives the mega-hub fallback which empties ``path_axis``; the
+    higher of the available sources is used, so a run still reports "N proven"
+    alongside the reachable routes. The proven figure is only ASSERTED by
+    :meth:`ClientPathTotals.render_headline` when the caller's compromise oracle
+    (``auth == "pwned"``) agrees, so neither a stale snapshot nor a stale sidecar
+    can ever claim a proven route on a domain the current state says is not owned.
+    Every client- and operator-facing surface calls THIS, so the proven-vs-
+    reachable resolution lives in exactly one place.
+    """
+    candidates: list[int] = []
+    if executions is not None:
+        candidates.append(proven_full_domain_compromise_from_executions(executions))
+    if snapshot is not None:
+        candidates.append(proven_full_domain_compromise_from_snapshot(snapshot))
+    proven_override = max(candidates) if candidates else None
+    return client_path_totals_from_kpis(exposure_kpis, proven_override=proven_override)
 
 
 def client_path_totals_from_paths(

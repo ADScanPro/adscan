@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: "ADscan"
-version: "13.0.0"
-date-released: "2026-09-19"
+version: "13.1.0"
+date-released: "2026-09-25"
 authors:
   - family-names: "Martin Dominguez"
     given-names: "Yeray"

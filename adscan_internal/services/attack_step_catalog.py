@@ -4451,7 +4451,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Read the domain object's DACL and confirm {source} has the "
             "Get-Changes / Get-Changes-All rights (read-only):\n"
             "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
-            "get object <domain-dn> --attr nTSecurityDescriptor --resolve-sd\n"
+            "get object {domain_dn} --attr nTSecurityDescriptor --resolve-sd\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
         "remediation": (
@@ -5016,18 +5016,17 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/unsigned-endpoints"
         ),
         "remediation": (
-            "Disable HTTP web enrollment where it is not required (remove the "
-            "Certificate Enrollment Web role, or restrict it to HTTPS only) so "
-            "there is no unsigned NTLM endpoint to relay to.",
-            "Enable Extended Protection for Authentication (channel binding) and "
-            "require HTTPS on the enrollment web site so relayed NTLM "
-            "authentication is rejected.",
             "Enforce SMB signing and, where possible, disable NTLM in favour of "
             "Kerberos so the coercion-to-relay chain has no authentication to "
             "capture.",
+            "Enforce LDAP signing and channel binding on domain controllers so a "
+            "coerced authentication cannot be relayed to the directory either.",
             "Reduce which accounts can be coerced by hardening the coercion "
             "triggers (Print Spooler, EFSRPC, DFS) on domain controllers and "
             "servers.",
+            "For the web-enrollment endpoint itself, apply the fix called out for "
+            "the exact transport this route relayed over in the Web Enrollment "
+            "Transport detail on this finding.",
         ),
     },
     "adcsesc9": {
@@ -5840,7 +5839,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "#   (or the checker PoC)  zerologon_tester.py <dc_netbios_name> "
             "{target}\n"
             "# Weaponised exploitation resets the DC machine password and is "
-            "destructive — coordinate with the client before running any such tool."
+            "destructive; coordinate with the client before running any such tool."
         ),
         "verify_windows": (
             "Confirm the domain controllers have the CVE-2020-1472 patch and are in "
@@ -5899,7 +5898,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "(non-destructive):\n"
             "nxc ldap {dc_ip} -u <user> -p <pass> -M maq\n"
             "# Weaponised exploitation (creates + renames + deletes a machine "
-            "account — coordinate with the client first):\n"
+            "account; coordinate with the client first):\n"
             "impacket-getST -spn 'cifs/{target_hostname}' -impersonate administrator "
             "-dc-ip {dc_ip} '{domain}/<new_machine>$:<machine_pass>'"
         ),
@@ -5957,7 +5956,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "nxc smb {target_hostname} -u '' -p '' -M ms17-010\n"
             "#   (or)  nmap -p445 --script smb-vuln-ms17-010 {target}\n"
             "# Weaponised exploitation risks crashing the target (kernel memory "
-            "corruption) — coordinate with the client before running any exploit."
+            "corruption) coordinate with the client before running any exploit."
         ),
         "verify_windows": (
             "Confirm the MS17-010 patch is installed and, more decisively, that "
@@ -6013,7 +6012,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "#   (or)  rpcdump.py '{domain}/<user>:<pass>@{target_hostname}' | grep -i "
             "'MS-RPRN\\|spoolss'\n"
             "# Weaponised exploitation loads a driver into a SYSTEM service and is "
-            "disruptive — coordinate with the client before running any exploit."
+            "disruptive; coordinate with the client before running any exploit."
         ),
         "verify_windows": (
             "Confirm the spooler is disabled where possible, the CVE-2021-34527 "
@@ -6381,7 +6380,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Enumerate who holds the replication rights over the domain object "
             "(read-only ACL analysis):\n"
             "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
-            "get object <domain-DN> --attr nTSecurityDescriptor\n"
+            "get object {domain_dn} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
         "remediation": (
@@ -6431,7 +6430,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Enumerate who holds the Get-Changes-All right over the domain object "
             "(read-only ACL analysis):\n"
             "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
-            "get object <domain-DN> --attr nTSecurityDescriptor\n"
+            "get object {domain_dn} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
         "remediation": (
@@ -6482,7 +6481,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Read-only ACL analysis of who holds the filtered-set replication right "
             "over the domain object:\n"
             "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
-            "get object <domain-DN> --attr nTSecurityDescriptor\n"
+            "get object {domain_dn} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
         "remediation": (
@@ -6808,12 +6807,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "direct path to controlling it."
         ),
         "manual": (
-            "# Target USER — reset the password using the extended right:\n"
+            "# Target USER. Reset the password using the extended right:\n"
             "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
             "set password {target_identity} 'Newp@ss123!'\n"
-            "# Target COMPUTER — read its LAPS local-admin password:\n"
+            "# Target COMPUTER. Read its LAPS local-admin password:\n"
             "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --module laps\n"
-            "# Target DOMAIN object — the set includes the replication rights (DCSync):\n"
+            "# Target DOMAIN object. The set includes the replication rights (DCSync):\n"
             "impacket-secretsdump -just-dc {domain}/<user>:<pass>@{dc_ip}"
         ),
         "verify_windows": (
@@ -7074,7 +7073,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "protocol."
         ),
         "manual": (
-            "# Membership IS the control — confirm and, if warranted, exercise it.\n"
+            "# Membership IS the control. Confirm and, if warranted, exercise it.\n"
             "# List the privileged group's members (nested included):\n"
             "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --groups 'Domain Admins'\n"
             "#   As a member, control of the target follows directly (e.g. reset a\n"
@@ -7775,7 +7774,7 @@ def _acl_remediation_fragments(
     if cls == "computer":
         return {
             "acl_full_control_rationale": (
-                "GenericAll carries key-credential write (Shadow Credentials — a certificate the "
+                "GenericAll carries key-credential write (Shadow Credentials: a certificate the "
                 "machine account can then authenticate with) and "
                 "msDS-AllowedToActOnBehalfOfOtherIdentity write (resource-based constrained "
                 "delegation) in one ACE, so either one left in place restores the takeover: which "
@@ -7793,7 +7792,7 @@ def _acl_remediation_fragments(
             "genericwrite_attr_rationale": (
                 "GenericWrite over a computer is a takeover because two of the attributes it "
                 "covers each hand over the host on their own: msDS-KeyCredentialLink (Shadow "
-                "Credentials — a certificate the machine account can authenticate with) and "
+                "Credentials: a certificate the machine account can authenticate with) and "
                 "msDS-AllowedToActOnBehalfOfOtherIdentity (which lets another host impersonate "
                 f'any user to this one). A scoped grant such as {scoped}<group>:WP;'
                 'servicePrincipalName"` gives the delegation its attribute and none of those.'
@@ -7918,12 +7917,13 @@ def _acl_remediation_fragments(
     # Unknown object class — describe every avenue honestly, assert no single class.
     return {
         "acl_full_control_rationale": (
-            "Full control in one ACE carries the object's most sensitive writes — for a group "
+            "Full control in one ACE carries the object's most sensitive writes: for a group "
             "adding members, for a user a password reset / Shadow Credentials / "
             "servicePrincipalName, for a computer Shadow Credentials or resource-based "
             "constrained delegation, for the domain object the replication rights that authorise "
-            "a replication of every secret — so leaving it in place restores the takeover: which "
-            "is why narrowing it to the exact delegation needed is the fix and auditing it is not."
+            "a replication of every secret. Leaving any one of them in place restores the "
+            "takeover, which is why narrowing it to the exact delegation needed is the fix and "
+            "auditing it is not."
         ),
         "acl_scoped_grant_example": (
             "Use the Delegation of Control wizard, or a scoped, attribute-level ACE, so only the "
@@ -7935,9 +7935,9 @@ def _acl_remediation_fragments(
         ),
         "genericwrite_attr_rationale": (
             "GenericWrite is a takeover because the attributes it covers depend on the object's "
-            "class — the `member` attribute for a group, msDS-KeyCredentialLink / "
+            "class: the `member` attribute for a group, msDS-KeyCredentialLink / "
             "servicePrincipalName / msDS-AllowedToActOnBehalfOfOtherIdentity for a user or "
-            "computer, the replication rights for the domain object — and several of them hand "
+            "computer, the replication rights for the domain object. Several of them hand "
             "over the object on their own. Grant only the specific attribute the delegation "
             "needs, never a broad write."
         ),
@@ -8465,6 +8465,22 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         if first_label:
             netbios_domain = first_label.upper()
 
+    # The domain's default naming-context DN for the ``{domain_dn}`` placeholder
+    # (DCSync verify commands, domain-head ACL reads). NOT a secret — it is the
+    # scanned domain's own coordinate — so a runnable ``get object DC=htb,DC=local``
+    # is far better than a literal ``<domain-dn>`` token the client must fill in by
+    # hand. Prefer a DN the render seam stamped (``domain_dn`` / a domain-head
+    # ``target_dn``); otherwise derive it from the DNS domain (``htb.local`` ->
+    # ``DC=htb,DC=local``). Degrades to an honest angle-bracket fill-in when the
+    # domain is unknown (a synthetic edge bake), never a silently-wrong value.
+    domain_dn = ""
+    if isinstance(details, dict):
+        domain_dn = str(details.get("domain_dn") or "").strip()
+    if not domain_dn and domain:
+        _labels = [part.strip() for part in domain.split(".") if part.strip()]
+        if _labels:
+            domain_dn = ",".join(f"DC={label}" for label in _labels)
+
     # xp_cmdshell execution plan — whether OS-command execution is already
     # available on the instance or the attacker must enable it first (and revert
     # it afterward). Carried from the overlay notes into details. Always resolves
@@ -8654,6 +8670,9 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         "domain": domain or "<domain>",
         # The NT-account (backslash) form for dsacls / NTAccount principals.
         "netbios_domain": netbios_domain or "<domain>",
+        # The domain's naming-context DN (see derivation above); honest fill-in
+        # when the domain is unknown so the command stays valid and copyable.
+        "domain_dn": domain_dn or "<domain-distinguished-name>",
         # The OWNED principal that actually EXECUTES the step — the value a
         # ``-u`` / auth argument in a manual command needs. For a group-source
         # ACL edge the display ``source`` is the group (which cannot
@@ -8869,7 +8888,7 @@ _DYNAMIC_IDENTITY_MEMBERSHIP_REMEDIATION: tuple[str, ...] = (
     "a credential to a named, tier-appropriate group).",
     "Audit every object whose DACL grants rights to {target}, and replace the "
     "broad grant with a specific, tier-appropriate group. Verify with dsacls or "
-    "(Get-Acl \"AD:<objectDN>\").Access.",
+    "(Get-Acl \"AD:{target_dn}\").Access.",
 )
 
 
@@ -8991,6 +9010,26 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
     if entry is None:
         return []
 
+    _rem_details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    _rem_domain = str(_rem_details.get("domain") or "").strip()
+
+    def _fill_env(lines: list[str]) -> list[str]:
+        """Interpolate the assessed domain into the ``<domain>`` fill-in token.
+
+        A technique-level remediation carries a literal ``<domain>`` placeholder
+        (``Set-ADDomain -Identity <domain> -Replace ...``). On the finding path the
+        VULN_CATALOG personalizer fills it, but the attack-STEP path renders these
+        lines raw, so a client's Start-Here / Technical-Findings command would name
+        a literal ``<domain>``. Fill it here so the copy-pasted command names the
+        client's own domain. ``adscan_internal.pro`` cannot be imported from this
+        LITE-safe module, so the substitution is local and case-insensitive on the
+        ``<domain>`` token; it never matches ``<domain-dn>``. Left standing when the
+        domain is unknown (an honest fill-in, never a wrong name).
+        """
+        if not _rem_domain:
+            return lines
+        return [re.sub(r"<domain>", _rem_domain, line, flags=re.IGNORECASE) for line in lines]
+
     def _clean_bullet(value: Any) -> str:
         # VULN_CATALOG remediation lines carry a literal "[bullet] " marker; the
         # step renderer emits its own bullet, so strip the marker for parity
@@ -9010,9 +9049,11 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
         prose = resolve_technique_prose(getattr(entry, "vuln_key", None))
         remediation = prose.get("remediation")
         if isinstance(remediation, (list, tuple)):
-            return [cleaned for item in remediation if (cleaned := _clean_bullet(item))]
+            return _fill_env(
+                [cleaned for item in remediation if (cleaned := _clean_bullet(item))]
+            )
         if isinstance(remediation, str) and _clean_bullet(remediation):
-            return [_clean_bullet(remediation)]
+            return _fill_env([_clean_bullet(remediation)])
         return []
 
     if _step_source_is_tier0_direct(step):
@@ -9054,7 +9095,7 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
                 for k, v in placeholders.items():
                     out = out.replace("{" + k + "}", v)
                 rendered.append(out)
-        return rendered
+        return _fill_env(rendered)
     # Fallback: pull the canonical static remediation from VULN_CATALOG via the
     # vuln_key join (ADCS ESC* and any vuln-bearing edge without per-edge steps).
     return _technique_remediation()

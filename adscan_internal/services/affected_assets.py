@@ -39,6 +39,7 @@ from adscan_internal.services.affected_asset_rules import (
 )
 from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
 from adscan_internal.services.well_known_principals import (
+    deshout_display_label,
     humanize_domain_for_display,
     humanize_principal_for_prose,
 )
@@ -1340,36 +1341,64 @@ def _humanize_principal_assets(
     :func:`~adscan_internal.services.well_known_principals.humanize_principal_for_prose`
     so an all-caps user account (``SVC_TGS``) reads ``svc_tgs``, a well-known
     identity renders canonical (``Everyone`` / ``Users``), a ``@WELLKNOWN``
-    sentinel is stripped, and a bare SID resolves to a friendly name. A host, the
-    domain object, a template, a CA, a share and an artifact are not principals
-    and pass through untouched (keyed off the engine-resolved asset type, with
-    the string heuristic as the fallback). A trailing qualifier
+    sentinel is stripped, and a bare SID resolves to a friendly name. A
+    LOCALE-translated built-in group renders in the environment's OWN directory
+    language (Italian ``Computer del dominio``) — never translated to English:
+    the struct entity's ``display`` already carries the directory's real
+    mixed-case name, and the prose SSOT preserves it verbatim. A host FQDN, the
+    domain object, and a bare machine account (``BRAAVOS$``) are lower-cased
+    through the domain SSOT so the whole report renders one casing; a template, a
+    CA, a share and an artifact pass through untouched. A trailing qualifier
     (`` · attribute``) is preserved; only the principal name is humanized.
     """
     if not assets:
         return assets
     type_index = build_asset_type_index(vuln_data)
+    original_name_index = _principal_original_name_index(vuln_data)
     humanized: list[str] = []
     for asset in assets:
         asset_type = resolve_asset_type(asset, type_index)
         name, sep, qualifier = str(asset).partition(ACCOUNT_QUALIFIER_SEPARATOR)
         if asset_type in ("user", "group"):
+            # Prefer the directory's ORIGINAL-cased name (the struct entity's
+            # ``display`` / a stored account record) so a localized built-in group
+            # keeps its real mixed casing (``Computer del dominio``) rather than a
+            # de-shout/title-case. Falls back to the raw asset name when the finding
+            # carries no original-cased record. The prose SSOT then only strips a
+            # ``@WELLKNOWN`` / intra-domain ``@domain`` suffix, canonicalizes a
+            # well-known identity, and lower-cases a shouting user account — it
+            # preserves an already-mixed-case name verbatim (never title-cases it).
+            source_name = original_name_index.get(name.strip().casefold()) or original_name_index.get(
+                name.strip().split("@", 1)[0].strip().casefold()
+            )
             display = humanize_principal_for_prose(
-                label=name.strip(),
+                label=(source_name or name).strip(),
                 kind="Group" if asset_type == "group" else "User",
                 report_domain=str(domain_name or ""),
             )
-        elif asset_type in ("host", "domain") and "." in name:
-            # A host FQDN (``DC.ACTIVE.HTB``) and the domain object (``ACTIVE.HTB``)
-            # are case-insensitive DNS names the graph stores SHOUTING; the rest of
-            # the report renders them lower-case (``dc.active.htb`` / ``active.htb``).
-            # Route through the same domain SSOT the graph node labels use so the
+        elif asset_type in ("host", "domain"):
+            # A host FQDN (``DC.ACTIVE.HTB``), the domain object (``ACTIVE.HTB``)
+            # and a bare machine account (``BRAAVOS$``) are case-insensitive names
+            # the graph stores SHOUTING; the rest of the report renders them
+            # lower-case (``dc.active.htb`` / ``active.htb`` / ``braavos$``). Route
+            # through the same domain SSOT the graph node labels use so the
             # affected-assets list, the Playbook and the appendix name a host the
-            # SAME lower-case way as the attack-path diagram. Only a DOTTED token is
-            # a domain / FQDN; a bare NetBIOS host or a machine account (``BRAAVOS$``)
-            # is left untouched here (its FQDN display already lower-cases at the
-            # struct SSOT ``format_host_display``).
+            # SAME lower-case way as the attack-path diagram. ``humanize_domain_for_display``
+            # only lower-cases/trims, so it is safe for an FQDN+IP display, an IP,
+            # a bare NetBIOS host, and a machine account alike.
             display = humanize_domain_for_display(name.strip())
+        elif asset_type == "template":
+            # A directory can return a certificate template's DISPLAY name
+            # SHOUTING (a localized default template, Italian ``CONTROLLER DI
+            # DOMINIO`` / ``AUTENTICAZIONE KERBEROS``). De-shout it to the
+            # directory's own casing (never translated), preserving the
+            # ``Template: `` prefix. A CA name (``SIFI-CA``) is deliberately NOT
+            # de-shouted — it is an acronym/host-style identifier, not a phrase.
+            prefix, psep, tname = name.partition(": ")
+            if psep and tname.strip():
+                display = f"{prefix}: {deshout_display_label(tname.strip())}"
+            else:
+                display = deshout_display_label(name.strip())
         else:
             humanized.append(asset)
             continue
@@ -1378,6 +1407,50 @@ def _humanize_principal_assets(
             continue
         humanized.append(f"{display}{sep}{qualifier}" if sep else display)
     return humanized
+
+
+def _principal_original_name_index(vuln_data: Any) -> dict[str, str]:
+    """Map a finding's principal names to the directory's ORIGINAL-cased name.
+
+    Keyed by the casefolded name the flat extractor emits, valued by the
+    directory's real mixed-case display (the struct entity ``display``), so the
+    flat humanizer can render a LOCALE-translated built-in group in its OWN
+    language and casing (``Computer del dominio``) instead of a shouting label it
+    would title-case. Built best-effort from the structured entities and the
+    account records; a finding with neither yields ``{}`` (the humanizer then
+    falls back to the raw asset name). Returns ``{}`` on any failure — the
+    original-name lookup is an enrichment, never a hard dependency.
+    """
+    index: dict[str, str] = {}
+    try:
+        view = _details_view(vuln_data) if isinstance(vuln_data, dict) else {}
+
+        raw = view.get(SERIALIZED_ENTITIES_KEY)
+        if isinstance(raw, list):
+            for entity in raw:
+                if not isinstance(entity, dict):
+                    continue
+                original = str(entity.get("display") or "").strip()
+                if not original:
+                    continue
+                for token in (entity.get("display"), entity.get("identifier")):
+                    text = str(token or "").strip()
+                    if text:
+                        index.setdefault(text.casefold(), original)
+                        index.setdefault(text.split("@", 1)[0].strip().casefold(), original)
+
+        for source in (view, vuln_data):
+            for name, _sid, qualifier in iter_account_records(source):
+                bare = str(name or "").strip()
+                if not bare:
+                    continue
+                display = format_account_display(name, qualifier).strip()
+                if display:
+                    index.setdefault(display.casefold(), bare)
+                index.setdefault(bare.casefold(), bare)
+    except Exception:  # noqa: BLE001 - original-name lookup is never fatal
+        return {}
+    return index
 
 
 def _drop_machine_account_shadows(assets: list[str]) -> list[str]:

@@ -44,7 +44,7 @@ _USER_SPRAY_ATTRS = [
     # already accounts for auto-unlock AND per-user PSO lockout duration, which a
     # manual lockoutTime-vs-domain-lockoutDuration calculation cannot (a Tier-0 PSO
     # with a different/zero duration would be mis-judged). Validated against
-    # cyberzaintza: Administrator (Tier-0 PSO) reads 0x10 here while its lockoutTime
+    # realcorp: Administrator (Tier-0 PSO) reads 0x10 here while its lockoutTime
     # is a year old, so the manual heuristic wrongly cleared it.
     "msDS-User-Account-Control-Computed",
 ]

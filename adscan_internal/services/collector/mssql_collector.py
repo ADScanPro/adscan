@@ -86,6 +86,12 @@ _CONTROL_SERVER_PERMISSION = "control server"
 _BULK_ADMIN_ROLE = "bulkadmin"
 # Explicit server permission that confers OPENROWSET(BULK ...) capability.
 _BULK_OPERATIONS_PERMISSION = "administer bulk operations"
+# Vulnerability finding key for a NON-sysadmin principal holding ADMINISTER BULK
+# OPERATIONS (arbitrary file read via OPENROWSET(BULK ...) as the SQL service
+# account). Declared in the vuln catalog (PRO ``VULN_CATALOG`` + LITE meta slice)
+# and mapped by every compliance framework. Suppressed for sysadmin, where the
+# capability is inherent to the role.
+_BULK_OPS_OVERPRIVILEGE_FINDING_KEY = "mssql_bulk_operations_overprivilege"
 
 # SQL principal ``type`` codes that correspond to an AD principal we can correlate
 # back to a graph node by SID. S=SQL login (local, no AD SID), R=server role.
@@ -1395,6 +1401,64 @@ def upsert_mssql_linked_server_edges(
 # ---------------------------------------------------------------------------
 
 
+def _record_bulk_operations_overprivilege_finding(
+    shell: object,
+    domain: str,
+    results: list[MSSQLInstanceAuthorization],
+) -> None:
+    """Record the non-sysadmin ADMINISTER BULK OPERATIONS over-privilege finding.
+
+    A principal that is NOT SQL Server sysadmin but holds ADMINISTER BULK
+    OPERATIONS (via the ``bulkadmin`` fixed server role or an explicit grant) can
+    read arbitrary files off the SQL host as the service account through
+    ``OPENROWSET(BULK ...)`` — an over-privilege / data-exposure weakness. This is
+    a VULNERABILITY finding, not a traversable attack step (a file read, not host
+    takeover). For a **sysadmin** the capability is inherent to the role (sysadmin
+    bypasses every permission check), so it is deliberately SUPPRESSED there
+    (signal, not noise) — the sysadmin privilege itself is surfaced as the SQLAdmin
+    edge. Only principals correlated to a graph node (an edge was upserted) are
+    reported, so the finding names a real asset. Best-effort: never breaks
+    collection.
+    """
+    affected: list[dict[str, Any]] = []
+    for result in results:
+        if not getattr(result, "connected", False):
+            continue
+        _host_node, fqdn = _resolve_instance_host_node(shell, domain, result.instance)
+        instance_label = fqdn or result.instance.host
+        for fact in result.principals:
+            if not (fact.effective_bulk_admin and not fact.effective_sysadmin):
+                continue
+            if not fact.matched_label:
+                continue
+            affected.append(
+                {
+                    "principal": fact.matched_label,
+                    "instance": instance_label,
+                    "via_group": fact.is_group,
+                }
+            )
+    if not affected:
+        return
+    try:
+        from adscan_core.reporting.technical_report import record_technical_finding
+
+        record_technical_finding(
+            shell,
+            domain,
+            key=_BULK_OPS_OVERPRIVILEGE_FINDING_KEY,
+            status="confirmed",
+            details={"count": len(affected), "principals": affected},
+        )
+    except Exception as exc:  # noqa: BLE001 — reporting must never break collection
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            "[mssql-collector] bulk-ops over-privilege finding record failed: "
+            f"{exc}"
+        )
+
+
 async def collect_mssql_authorization(
     shell: object,
     domain: str,
@@ -1464,6 +1528,11 @@ async def collect_mssql_authorization(
                 any_edges = True
         if any_edges or summary.instances_connected:
             save_attack_graph(shell, domain_clean, graph)
+        # Surface the non-sysadmin ADMINISTER BULK OPERATIONS over-privilege as a
+        # VULNERABILITY finding (arbitrary file read via OPENROWSET(BULK ...)) — no
+        # longer modelled as a MssqlOpenRowsetBulkRead attack edge. Reads the
+        # per-principal facts populated by the upsert above (matched_label set).
+        _record_bulk_operations_overprivilege_finding(shell, domain_clean, results)
     except Exception as exc:  # noqa: BLE001 — collection must never raise upward
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

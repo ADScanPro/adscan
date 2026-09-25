@@ -288,6 +288,68 @@ DCBindingProbe = Callable[[str], Awaitable[tuple[int, bool] | None]]
 # ---------------------------------------------------------------------------
 
 
+def _collect_computer_hostnames(result: CollectionResult) -> set[str]:
+    """Return every hostname a collected Computer object owns (lower-cased).
+
+    The set carries both the full ``dNSHostName`` FQDN and its short label, plus
+    each computer's ``sAMAccountName`` short name (``DC01$`` → ``dc01``), so a CA
+    host can be matched against it whether the CA advertises an FQDN or a short
+    name. Used to answer "does any computer own this CA host?" — the second,
+    conservative condition of the orphaned-CA hygiene test.
+    """
+    names: set[str] = set()
+    for node in result.nodes.values():
+        if str(node.kind) != "Computer":
+            continue
+        dns_name = str(node.properties.get("dnshostname") or "").strip().lower().rstrip(".")
+        if dns_name:
+            names.add(dns_name)
+            names.add(dns_name.split(".", 1)[0])
+        sam = str(node.samaccountname or "").strip().lower().split("@", 1)[0].rstrip("$")
+        if sam:
+            names.add(sam)
+    return names
+
+
+def _ca_host_is_orphaned(
+    *,
+    ca_host: str,
+    name_unresolvable: bool,
+    computer_hostnames: "set[str] | frozenset[str]",
+) -> bool:
+    """Return whether an enterprise CA is ORPHANED (the observed-certain hygiene case).
+
+    A CA is orphaned — a decommissioned CA object still registered in Active
+    Directory — when BOTH conditions hold:
+
+    * ``name_unresolvable`` — the CA host name did not resolve to any usable
+      address after the full resolver ladder (the web probe's ``could_not_verify``
+      / NXDOMAIN signal). A host that RESOLVES but is merely unreachable
+      (timeout / firewall) is NOT unresolvable and is a DATA GAP, never orphaned.
+    * no collected Computer object owns that hostname — a live CA runs on a
+      domain-joined member server that has a Computer object; its absence is what
+      distinguishes a decommissioned host from one that is only unreachable.
+
+    Both are required (Exposure-Validation: cache observations, never absences).
+    An IP-only CA host is never orphaned — without an FQDN there is no NXDOMAIN to
+    observe. Returns ``False`` on any uncertainty, so the hygiene finding is only
+    ever emitted on observed-certain decommissioning.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address
+
+    host = str(ca_host or "").strip().rstrip(".")
+    if not host or is_ip_address(host):
+        return False
+    if not name_unresolvable:
+        return False
+    host_lower = host.lower()
+    if host_lower in computer_hostnames:
+        return False
+    if host_lower.split(".", 1)[0] in computer_hostnames:
+        return False
+    return True
+
+
 def _attrs(entry: Any) -> dict[str, list[Any]]:
     """Return a case-preserving dict of attribute name → list of values.
 
@@ -959,6 +1021,14 @@ class ADCSCollector:
                 f"[adcs-collector] phase2/3 emitted {total_added} ADCSESC* edge(s)"
             )
 
+        # Orphaned-CA hygiene signal (Part B3). A CA whose host does not resolve
+        # anywhere AND has no Computer object is a decommissioned CA object still
+        # registered in AD — a HYGIENE finding, never an exploitable ESC. Emitted
+        # observed-certain only (a resolvable-but-unreachable CA, or one with a
+        # Computer object, stays a DATA GAP). Runs AFTER ESC detection so a stale
+        # CA that also carries an LDAP-detected ESC edge renders as hygiene.
+        self._stamp_orphaned_cas(result, cas, ca_probes)
+
         # Mark ADCS nodes that are ESC targets as high-value so the Phase 2 BFS
         # treats them as Tier-0 terminal nodes and surfaces attack paths to them.
         # CertTemplates with ADCSESC1/2/3/6/9/10/15 edges and EnterpriseCA nodes
@@ -1012,6 +1082,72 @@ class ADCSCollector:
             print_info_debug(
                 f"[adcs-collector] marked {len(updated)} ADCS node(s) as highvalue "
                 f"(ESC targets → Tier-0 BFS terminals)"
+            )
+
+    def _stamp_orphaned_cas(
+        self,
+        result: CollectionResult,
+        cas: list[CollectorNode],
+        ca_probes: dict[str, "_CAProbeBundle"],
+    ) -> None:
+        """Flag decommissioned CA objects and emit their standalone hygiene finding.
+
+        For each enterprise CA that is orphaned (host unresolvable + no Computer
+        object, per :func:`_ca_host_is_orphaned`):
+
+        * stamps ``is_orphaned_ca=True`` on the CA node so the persisted
+          ``adcs_enterprise_cas.json`` record carries the signal;
+        * stamps the standalone hygiene ``adcs_finding_state`` block on the CA
+          record, so the finding stands on its own with NO dependency on an ESC
+          edge existing (an orphaned CA's web enrollment is a data gap, so it
+          usually has no ESC edge at all);
+        * marks ``is_orphaned_ca`` on any ADCS ESC edge that DOES target the stale
+          CA, so the report/web edge views (which read the same signal) render it
+          as hygiene rather than a data gap.
+        """
+        from adscan_core.reporting.adcs_finding_state import (
+            ADCS_FINDING_STATE_KEY,
+            STATE_HYGIENE,
+            build_adcs_finding_state,
+        )
+
+        computer_hostnames = _collect_computer_hostnames(result)
+        orphaned = 0
+        for ca in cas:
+            probe = ca_probes.get(ca.object_id)
+            web = probe.web if probe is not None else None
+            # ``could_not_verify`` is the "name did not resolve to any usable
+            # address" signal (NXDOMAIN / no recovered IP after the full resolver
+            # ladder), distinct from a resolvable-but-unreachable host — which
+            # connects on its recovered IP and never sets could_not_verify.
+            name_unresolvable = bool(web is not None and web.could_not_verify)
+            ca_host = str(ca.properties.get("dns_hostname") or "").strip()
+            if not _ca_host_is_orphaned(
+                ca_host=ca_host,
+                name_unresolvable=name_unresolvable,
+                computer_hostnames=computer_hostnames,
+            ):
+                continue
+            ca.properties["is_orphaned_ca"] = True
+            ca.properties[ADCS_FINDING_STATE_KEY] = build_adcs_finding_state(
+                state=STATE_HYGIENE, ca_host=ca_host
+            )
+            for edge in result.edges:
+                if (
+                    edge.target_object_id == ca.object_id
+                    and str(edge.relation or "").upper().startswith("ADCSESC")
+                ):
+                    edge.notes["is_orphaned_ca"] = True
+            orphaned += 1
+            print_info_debug(
+                "[adcs-collector] CA "
+                f"{mark_sensitive(ca_host, 'hostname')} is orphaned "
+                "(host unresolvable + no computer object) — hygiene finding, "
+                "not an exploitable ESC"
+            )
+        if orphaned:
+            print_info_debug(
+                f"[adcs-collector] flagged {orphaned} orphaned CA(s) as hygiene findings"
             )
 
     def _build_web_probe_credential(self) -> WebProbeCredential | None:

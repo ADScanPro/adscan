@@ -1923,7 +1923,7 @@ def _pick_live_node(ip_nodes: list[Any]) -> Any:
     """Return the LIVE node among several that resolve to one IP.
 
     Stale DNS / IP reuse can leave two enabled computer accounts pointing at one
-    IP (e.g. a decommissioned CZN007 sharing the IP with the live CZN012). The
+    IP (e.g. a decommissioned HOST01 sharing the IP with the live HOST02). The
     live machine is the most-recently-authenticated one (highest
     lastLogonTimestamp). Prefer enabled nodes; fall back to the first when no
     liveness signal exists (the transport SPN retry then backstops correctness).

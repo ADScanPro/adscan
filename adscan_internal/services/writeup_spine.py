@@ -1153,18 +1153,59 @@ def _inventory_rows(
 
 
 def _dc_operating_system(domain_dir: Path) -> str | None:
-    """Return the domain controller's OS string from the collected inventory."""
+    """Return the domain controller's OS string from the collected inventory.
+
+    The inventory holds EVERY computer object in the domain — workstations,
+    servers, and stale/legacy machines left in the directory — so returning the
+    first record that carries an ``os`` string picks an arbitrary host. On a
+    large real estate that first host is often a decommissioned legacy
+    workstation (a "Windows XP Professional" object never cleaned up), which then
+    renders as the engagement's operating system in the writeup front-matter — an
+    embarrassing mis-detection on a modern (e.g. ADCS/ESC8) domain.
+
+    The OS the writeup means is the DOMAIN CONTROLLER's, so select the DC record
+    by its authoritative AD marker — ``primaryGroupID`` 516 (Domain Controllers)
+    or 521 (Read-Only Domain Controllers) — never the first computer with an
+    ``os``. When no record carries that marker (an older workspace whose
+    inventory predates ``primaryGroupID`` capture), fall back to the first
+    SERVER OS seen so an arbitrary legacy WORKSTATION can never become the
+    headline OS; a modern DC always runs a Server OS. Return ``None`` (the
+    front-matter omits the field) when neither is available, rather than a
+    silently-wrong value.
+    """
     payload = _read_json(str(domain_dir / "inventory" / "computers.json"))
     records = payload.get("records") if isinstance(payload, dict) else None
     if not isinstance(records, list):
         return None
+
+    def _os_of(record: dict[str, Any]) -> str:
+        properties = record.get("properties")
+        if isinstance(properties, dict):
+            os_value = properties.get("os")
+            if isinstance(os_value, str) and os_value.strip():
+                return os_value.strip()
+        return ""
+
+    def _primary_group_id(record: dict[str, Any]) -> int | None:
+        properties = record.get("properties")
+        raw = properties.get("primarygroupid") if isinstance(properties, dict) else None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    server_os_fallback: str | None = None
     for record in records:
         if not isinstance(record, dict):
             continue
-        properties = record.get("properties")
-        if isinstance(properties, dict) and properties.get("os"):
-            return str(properties["os"])
-    return None
+        os_value = _os_of(record)
+        if not os_value:
+            continue
+        if _primary_group_id(record) in (516, 521):
+            return os_value
+        if server_os_fallback is None and "server" in os_value.lower():
+            server_os_fallback = os_value
+    return server_os_fallback
 
 
 def _execution_index(

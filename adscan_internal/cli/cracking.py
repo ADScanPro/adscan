@@ -221,6 +221,68 @@ _HASHCAT_BENIGN_STDERR_PATTERNS = (
     "nvmlDeviceGetFanSpeed(): Not Supported",
     "Mixing --show with --username or --dynamic-x can cause exponential delay in output.",
 )
+
+# hashcat's multi-line status / setup screen ("Sorting salts", "Comparing hashes
+# with potfile", "Loading rules", device init, dictionary-cache build, ...) is
+# pure progress noise, not a diagnosable failure cause. Dumping the raw hashcat
+# stderr VERBATIM into the session recording floods it and buries the surrounding
+# attack-path output (prod session 342efff7d: the hashcat status screen mangled a
+# GenericWrite failure line). ``_compact_hashcat_stderr`` drops these lines so
+# only a genuinely-diagnostic remainder (capped) ever reaches console/recording.
+_HASHCAT_PROGRESS_NOISE_MARKERS = (
+    "sorting salts",
+    "comparing hashes with potfile",
+    "comparing hashes with the potfile",
+    "comparing hashes with",
+    "loading rules",
+    "dictionary cache building",
+    "dictionary cache built",
+    "dictionary cache hit",
+    "generating dictionary stats",
+    "counted lines in",
+    "counting lines in",
+    "parsed hashes",
+    "removing duplicate hashes",
+    "sorting hashes",
+    "sorting words",
+    "hashes loaded",
+    "initializing backend runtime",
+    "initializing device kernels",
+    "initialized device kernels",
+    "host memory required",
+    "generated bitmap tables",
+    "watchdog: temperature",
+    "watchdog: hardware monitoring",
+    "starting attack in stdin mode",
+    "autotuned",
+)
+
+
+def _compact_hashcat_stderr(stderr: str, *, max_lines: int = 6) -> str:
+    """Return a compact, recording-safe rendering of hashcat stderr.
+
+    hashcat emits a multi-line status / setup screen that is pure progress noise
+    (see ``_HASHCAT_PROGRESS_NOISE_MARKERS``). Printing the raw stderr verbatim
+    floods the session recording and buries the surrounding output, so this drops
+    the known progress-noise lines, keeps at most ``max_lines`` of the remaining
+    (genuinely diagnostic) lines, and appends a suppressed-count note when it
+    truncates. Returns ``""`` when nothing diagnostic remains, so the caller can
+    stay silent instead of dumping the noise.
+    """
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    meaningful = [
+        ln
+        for ln in lines
+        if not any(marker in ln.lower() for marker in _HASHCAT_PROGRESS_NOISE_MARKERS)
+    ]
+    if not meaningful:
+        return ""
+    kept = meaningful[:max_lines]
+    suppressed = len(meaningful) - len(kept)
+    rendered = "\n".join(kept)
+    if suppressed > 0:
+        rendered += f"\n(+{suppressed} more hashcat stderr line(s) suppressed)"
+    return rendered
 # hashcat's single-instance guard: a second process sharing the same session
 # name (the default ``hashcat``) aborts with this line and exit code 255. Every
 # ADscan crack now runs under a unique ``--session`` name (see
@@ -4148,12 +4210,15 @@ def execute_cracking(
                 print_warning(
                     f"Initial cracking command may have failed. Return code: {completed_process_initial.returncode}"
                 )
-                if initial_stderr and not _is_benign_hashcat_stderr(initial_stderr):
-                    print_error(f"Error output: {initial_stderr}")
-                elif initial_stderr:
+                # Compact the stderr first: hashcat's multi-line status/setup screen
+                # is progress noise that would flood the recording verbatim.
+                compact_initial_stderr = _compact_hashcat_stderr(initial_stderr)
+                if compact_initial_stderr and not _is_benign_hashcat_stderr(initial_stderr):
+                    print_error(f"Error output:\n{compact_initial_stderr}")
+                elif compact_initial_stderr:
                     print_info_debug(
                         "Non-fatal hashcat stderr during initial cracking run:\n"
-                        f"{initial_stderr}"
+                        f"{compact_initial_stderr}"
                     )
                 if _HASHCAT_NO_DEVICE_TEXT in combined_output:
                     print_warning(
@@ -4193,10 +4258,13 @@ def execute_cracking(
                     "hashcat finished with exit code 1 (candidate space exhausted). "
                     "Checking the potfile for recovered credentials."
                 )
-                if initial_stderr and not _is_benign_hashcat_stderr(initial_stderr):
+                compact_exhausted_stderr = _compact_hashcat_stderr(initial_stderr)
+                if compact_exhausted_stderr and not _is_benign_hashcat_stderr(
+                    initial_stderr
+                ):
                     print_info_debug(
                         "hashcat emitted additional stderr during the exhausted run:\n"
-                        f"{initial_stderr}"
+                        f"{compact_exhausted_stderr}"
                     )
             # Record failure cause hint for the no-match panel later.
             cause_from_output = _classify_hashcat_failure(
@@ -4290,25 +4358,31 @@ def execute_cracking(
             print_warning(
                 f"'hashcat --show' command may have failed. Return code: {completed_process_show.returncode}"
             )
-            if completed_process_show.stderr and not _is_benign_hashcat_stderr(
+            # Compact the stderr: the '--show' pass also prints the hashcat
+            # status/setup screen, which would flood the recording verbatim.
+            compact_show_stderr = _compact_hashcat_stderr(completed_process_show.stderr or "")
+            if compact_show_stderr and not _is_benign_hashcat_stderr(
                 completed_process_show.stderr
             ):
-                print_error(f"Error output: {completed_process_show.stderr}")
-            elif completed_process_show.stderr:
+                print_error(f"Error output:\n{compact_show_stderr}")
+            elif compact_show_stderr:
                 print_info_debug(
                     "Non-fatal hashcat stderr during '--show':\n"
-                    f"{completed_process_show.stderr}"
+                    f"{compact_show_stderr}"
                 )
         elif completed_process_show.stderr:
-            if _is_benign_hashcat_stderr(completed_process_show.stderr):
+            compact_show_stderr = _compact_hashcat_stderr(completed_process_show.stderr)
+            if not compact_show_stderr:
+                pass
+            elif _is_benign_hashcat_stderr(completed_process_show.stderr):
                 print_info_debug(
                     "Non-fatal hashcat stderr during '--show':\n"
-                    f"{completed_process_show.stderr}"
+                    f"{compact_show_stderr}"
                 )
             else:
                 print_warning_debug(
                     "Unexpected hashcat stderr during '--show':\n"
-                    f"{completed_process_show.stderr}"
+                    f"{compact_show_stderr}"
                 )
 
         show_stdout = ""

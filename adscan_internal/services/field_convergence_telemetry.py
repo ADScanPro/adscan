@@ -150,6 +150,28 @@ def build_field_convergence_properties(shell: Any, domain: str) -> dict[str, int
         properties["findings_total"] = findings_total
         properties["findings_on_path"] = findings_on_path
         properties["findings_dead_end"] = max(0, findings_total - findings_on_path)
+
+        # Guard the path denominator against 0 when the curated (materialized)
+        # path set collapsed under the control-mega-hub sampled fallback: a
+        # choke-point ratio read against ``paths_total_analyzed`` would otherwise
+        # be 0/0 (undefined) on a domain that still has reachable routes. Fall
+        # the denominator back to the EFFECTIVE reachable full-domain-compromise
+        # figure (the counts SSOT) so the ratio stays defined and honest — 0
+        # choke points over N reachable routes, never an undefined ratio. On a
+        # complete run ``paths_total_analyzed`` is already > 0, so this is a
+        # no-op there.
+        if properties["paths_total_analyzed"] <= 0 and isinstance(domain_entry, dict):
+            kpis = domain_entry.get("exposure_kpis")
+            if isinstance(kpis, dict):
+                from adscan_internal.services.attack_path_counts import (
+                    client_path_totals_from_kpis,
+                )
+
+                effective = client_path_totals_from_kpis(
+                    kpis
+                ).effective_full_domain_compromise
+                if effective > 0:
+                    properties["paths_total_analyzed"] = effective
     except Exception as exc:  # noqa: BLE001 - analytics must never break the scan
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

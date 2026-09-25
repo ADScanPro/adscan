@@ -71,7 +71,10 @@ from adscan_internal.services.affected_assets import (
     is_precise_share_locator,
     iter_account_records,
 )
-from adscan_internal.services.well_known_principals import humanize_principal_for_prose
+from adscan_internal.services.well_known_principals import (
+    deshout_display_label,
+    humanize_principal_for_prose,
+)
 
 # Entity type constants — the typed axis the platform correlates on.
 TYPE_USER = "user"
@@ -809,11 +812,14 @@ def build_affected_asset_entities(
                 if name and name.lower() not in ca_lower:
                     template_names.append(name)
         for template in template_names:
+            # De-shout a SHOUTING localized template DISPLAY (never translated);
+            # the identifier stays the raw CN for remediation commands. Same
+            # class fix as _typed_entities_from_flat_strings.
             entities.append(
                 AffectedAssetEntity(
                     type=TYPE_TEMPLATE,
                     identifier=template,
-                    display=template,
+                    display=deshout_display_label(template),
                     role=ROLE_AFFECTED,
                 )
             )
@@ -957,9 +963,19 @@ def _typed_entities_from_flat_strings(
         if lower.startswith("template: "):
             name = text[len("template: ") :].strip()
             if name:
+                # A directory can return a certificate template's DISPLAY name
+                # SHOUTING (a localized default template, e.g. Italian
+                # ``CONTROLLER DI DOMINIO`` / ``AUTENTICAZIONE KERBEROS``); the
+                # client deliverable must not render it that way beside the
+                # correctly-cased siblings. De-shout the DISPLAY to the
+                # directory's own casing (never translated) while keeping the
+                # IDENTIFIER as the raw name so the template CN used in
+                # remediation commands is unchanged.
                 out.append(
                     AffectedAssetEntity(
-                        type=TYPE_TEMPLATE, identifier=name, display=name
+                        type=TYPE_TEMPLATE,
+                        identifier=name,
+                        display=deshout_display_label(name),
                     )
                 )
         elif lower.startswith("ca: "):

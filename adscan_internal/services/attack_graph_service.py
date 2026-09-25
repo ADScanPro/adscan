@@ -12,7 +12,10 @@ from contextvars import ContextVar
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Iterator, Mapping, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, cast
+
+if TYPE_CHECKING:
+    from adscan_internal.services.chokepoint_cardinality import Tier2ExposureRatio
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -37,7 +40,10 @@ from adscan_internal.workspaces.computers import load_enabled_computer_samaccoun
 
 from adscan_internal.services import attack_graph_core, attack_paths_core
 from adscan_internal.services import attack_path_progress
-from adscan_internal.services.attack_path_explosion_predictor import predicts_explosion
+from adscan_internal.services.attack_path_explosion_predictor import (
+    predicts_explosion,
+    predicts_explosion_reachable,
+)
 
 # The budget-exceeded signal now lives in the pure-logic gate module so BOTH this
 # service layer (which catches it) and ``attack_graph_core`` (the in-DFS bound,
@@ -1692,7 +1698,9 @@ def get_users_in_group_rid_from_snapshot(
         if not recursive_labels:
             continue
         if group_label in recursive_labels:
-            members.append(_membership_label_to_name(user_label).lower())
+            members.append(
+                attack_paths_core.membership_label_to_real_name(snapshot, user_label)
+            )
     return sorted(set(members), key=str.lower)
 
 
@@ -1721,7 +1729,9 @@ def _get_users_in_group_label_from_snapshot(
         if not recursive_labels:
             continue
         if canonical_group in recursive_labels:
-            members.append(_membership_label_to_name(user_label).lower())
+            members.append(
+                attack_paths_core.membership_label_to_real_name(snapshot, user_label)
+            )
     return sorted(set(members), key=str.lower)
 
 
@@ -1865,9 +1875,14 @@ def resolve_group_user_members(
         if has_users:
             members_labels = group_members.get(canonical_group, set()) or set()
             members = [
-                _membership_label_to_name(label).strip().lower()
+                name
                 for label in members_labels
-                if isinstance(label, str) and _membership_label_to_name(label).strip()
+                if isinstance(label, str)
+                and (
+                    name := attack_paths_core.membership_label_to_real_name(
+                        snapshot, label
+                    )
+                )
             ]
             if enabled_users is not None:
                 members = [user for user in members if user in enabled_users]
@@ -2076,23 +2091,28 @@ def _read_memory_ceiling() -> tuple[int | None, int | None]:
 
 
 def _gate_attack_path_memory_pre_dfs(nodes: int, edges: int) -> None:
-    """Stage A — project the graph term only, before the DFS runs.
+    """Stage A — project the graph-RESIDENT term only, before the DFS runs.
 
-    The graph-resident memory is the only signal available before an hour of DFS.
-    A graph large enough to cross the ceiling on its own is surfaced HERE, at phase
-    entry, because the remedy (resize + re-run) is one the operator should learn
-    now rather than after the DFS burns time.
+    DETERMINISTIC and NEAR-CERTAIN-ONLY (2026-09). Stage A projects ONLY the
+    graph-resident term (nodes/edges — no path-combinatorics estimate) and, per
+    :func:`evaluate_projection`, compares it against the STABLE absolute ceiling
+    (``limit_bytes``), never the transient ``available_bytes``. So the verdict is
+    reproducible — the SAME graph on the SAME host decides the SAME way regardless
+    of what else is running — and it fires only when the graph is literally too big
+    to hold, the one thing that is knowable before the DFS.
 
-    Interactive: WARN and proceed — ``raw_paths`` (often the dominant term) is not
-    yet known, so a viable compute is not aborted prematurely; the operator sees
-    the resize advice and can choose to stop.
+    Interactive: WARN and proceed — the operator sees the resize advice and can
+    choose to stop.
 
-    Non-interactive (``adscan ci`` / the web worker): when the GRAPH TERM ALONE
-    already crosses the threshold the run is unconditionally doomed — adding the
-    path term can only make it worse — and there is nobody to react, so proceeding
-    would only burn the DFS and reach the same fatal allocation. In that case block
-    now (raise the declared abort) so the run stops cleanly with a coverage
-    declaration instead of being ``SIGKILL``ed. The abort is caught at the public
+    Non-interactive (``adscan ci`` / the web worker): raise the declared abort so
+    the run stops cleanly with a coverage declaration instead of being
+    ``SIGKILL``ed. This is safe to keep unattended because Stage A projects ONLY
+    the graph-resident term against the deterministic total ceiling — a
+    near-certain "graph too large to hold" signal, not the uncertain projected
+    PEAK. The uncertain peak (graph + estimated path term) is Stage B's job
+    (post-DFS, ``raw_paths`` known); a domain whose graph fits but whose PEAK might
+    not is NOT aborted here — it proceeds, and the in-DFS ``DfsMemoryBudget``
+    (actual RSS) is the authoritative OOM guard. The abort is caught at the public
     entry point.
 
     Best-effort: any failure other than the declared abort leaves the compute
@@ -2277,6 +2297,171 @@ def _choose_attack_path_engine(graph: dict[str, Any]) -> str:
         return "dfs"
 
 
+def _engine_label(force_perterminal: bool) -> str:
+    """Return the HONEST engine label for a debug line — never a static string.
+
+    Reflects the engine that ACTUALLY ran, so a bounded fallback can no longer be
+    mis-read as a complete DFS:
+
+    * ``"perterminal"`` — the bounded per-terminal engine ran, because it was
+      forced for this run (``force_perterminal``, e.g. the memory-abort recovery or
+      the reachable-explosion predictor) OR selected via the
+      ``ADSCAN_ATTACK_PATH_ENGINE=perterminal`` env.
+    * ``"local-dfs"`` — the complete all-simple-paths DFS ran (the default).
+
+    This mirrors the ``engine_used`` marker recorded by
+    :func:`_record_attack_path_engine_used` (``"fallback"`` ↔ ``perterminal``,
+    ``"dfs"`` ↔ ``local-dfs``). Best-effort: an env read failure defaults to the
+    ``force_perterminal`` signal and never breaks discovery.
+    """
+    perterminal = bool(force_perterminal)
+    if not perterminal:
+        try:
+            perterminal = attack_graph_core._perterminal_engine_selected()
+        except Exception:  # noqa: BLE001 — a debug label must never break discovery.
+            perterminal = False
+    return "perterminal" if perterminal else "local-dfs"
+
+
+def _effective_engine_label(shell: object, force_perterminal: bool) -> str:
+    """Return the REAL engine label, preferring the recorded engine marker.
+
+    The local ``force_perterminal`` flag reflects only whether THIS call forced
+    the bounded engine; a DEEPER memory-abort RECOVERY (inside a scope compute)
+    switches to the bounded fallback and records it on
+    ``shell._attack_path_engine_used`` ("fallback"/"dfs"), which the local flag
+    never sees. So a fallback that happened via recovery would read ``local-dfs``
+    at the orchestration summary if keyed only on the local flag. Prefer the
+    authoritative recorded marker (``"fallback"`` ↔ ``perterminal``, ``"dfs"`` ↔
+    ``local-dfs``); a forced-bounded run is always ``perterminal``; otherwise fall
+    back to :func:`_engine_label`. Best-effort/debug-only: never raises.
+    """
+    recorded = None
+    try:
+        recorded = getattr(shell, "_attack_path_engine_used", None)
+    except Exception:  # noqa: BLE001 — a debug label must never break discovery.
+        recorded = None
+    if force_perterminal or recorded == "fallback":
+        return "perterminal"
+    if recorded == "dfs":
+        return "local-dfs"
+    return _engine_label(force_perterminal)
+
+
+def _resolve_scope_start_node_ids(
+    shell: object,
+    domain: str,
+    *,
+    scope_norm: str,
+    username: str | None,
+    principals: list[str] | None,
+    graph: dict[str, Any],
+) -> set[str] | None:
+    """Resolve the start-node id set the reachable-explosion predicate walks from.
+
+    The reachability-aware predictor (:func:`predicts_explosion_reachable`) counts
+    a control mega-hub only when an owned/start principal can actually reach it, so
+    it needs the scope's start set. This mirrors
+    :func:`adscan_internal.services.attack_paths_core._resolve_start_node_ids_for_scope`
+    for the service-layer scope vocabulary — which adds ``owned`` on top of
+    ``user``/``principals``/``domain``:
+
+    * ``user`` — the single principal named by ``username`` (empty set when the
+      label resolves to no node, so the predicate never fires spuriously);
+    * ``principals`` — every listed principal that resolves to a node;
+    * ``owned`` — every owned principal (across trusted domains) that resolves to a
+      node;
+    * ``domain`` — the real domain-scope source set (enabled non-high-value users +
+      the synthetic unauth entry) via
+      :func:`adscan_internal.services.attack_graph_core.derive_domain_scope_source_ids_for_graph`,
+      so :func:`predicts_explosion_reachable` only fires when an actual domain-scope
+      start principal reaches a control mega-hub — an orphan hub (no members) no
+      longer forces the bounded engine on a domain the DFS would complete.
+
+    Never raises: an unexpected resolution failure returns ``None`` so the
+    predicate falls back to the raw structural count (the conservative, pre-change
+    behaviour) rather than silently skipping the routing.
+
+    Args:
+        shell: The shell holding ``domains_data`` (owned-principal resolution).
+        domain: The domain whose paths are computed.
+        scope_norm: The normalized scope (``domain``/``user``/``owned``/``principals``).
+        username: The single principal for ``user`` scope.
+        principals: The explicit principal list for ``principals`` scope.
+        graph: The loaded attack graph (nodes as a dict) for label resolution.
+
+    Returns:
+        The resolved start-node id set (including the domain-scope source set), an
+        empty set when a scoped compute resolves to no node, or ``None`` on a
+        resolution failure (the predicate then falls back to the raw structural
+        count — the conservative pre-change behaviour).
+    """
+    try:
+        if scope_norm == "domain":
+            # The real domain-scope start set (enabled non-high-value users + the
+            # synthetic unauth entry) via the shared SSOT, so the reachability
+            # basis matches the DFS sources. An orphan control mega-hub no enabled
+            # user reaches (e.g. Account Operators with no members) is now
+            # correctly seen as unreachable → the domain routes to the full DFS
+            # instead of the bounded fallback. Empty set only for a graph with no
+            # eligible start node (the predicate then never fires).
+            return attack_graph_core.derive_domain_scope_source_ids_for_graph(graph)
+        if scope_norm == "user":
+            label = str(username or "").strip()
+            node_id = _find_node_id_by_label(graph, label) if label else None
+            return {node_id} if node_id else set()
+        if scope_norm == "principals":
+            labels = [
+                str(principal or "").strip()
+                for principal in (principals or [])
+                if str(principal or "").strip()
+            ]
+        elif scope_norm == "owned":
+            labels = get_attack_path_owned_principal_labels(
+                shell, domain, include_trusted_domains=True
+            )
+        else:
+            return None
+        ids: set[str] = set()
+        for label in labels:
+            node_id = _find_node_id_by_label(graph, label)
+            if node_id:
+                ids.add(node_id)
+        return ids
+    except Exception:  # noqa: BLE001 — a routing miss must never break discovery.
+        return None
+
+
+def _service_scope_predicts_explosion(
+    shell: object,
+    base_graph: dict[str, Any],
+    start_node_ids: set[str] | None,
+) -> bool:
+    """Return True when the reachable-explosion predictor fires for a scope's start set.
+
+    The PROACTIVE routing check the service-layer computes
+    (:func:`compute_display_paths_for_domain` / ``_for_user`` / ``_for_principals``)
+    run BEFORE the DFS. The deliverable / report path
+    (:func:`adscan_internal.services.report_attack_paths.compute_report_attack_paths`)
+    and the attack-path execution reconciler call those computes DIRECTLY — not
+    through :func:`_compute_attack_path_summaries_inner` — so without this they got
+    NO proactive routing and paid a full DFS abort before the reactive memory-gate
+    recovery. It mirrors the inner beacon's decision exactly: a dense hub-mesh that
+    an actual scope start principal can reach routes to the bounded per-terminal
+    engine early. Best-effort: a routing miss returns ``False`` (run the DFS) and
+    never breaks discovery. Records the engine marker when it fires.
+    """
+    try:
+        fired = predicts_explosion_reachable(base_graph, start_node_ids=start_node_ids)
+    except Exception:  # noqa: BLE001 — a routing miss must never break discovery.
+        return False
+    if fired:
+        _record_attack_path_engine_used(
+            shell, engine="fallback", reason="predicted_explosion"
+        )
+    return bool(fired)
+
+
 def _record_attack_path_engine_used(
     shell: object, *, engine: str, reason: str | None = None
 ) -> None:
@@ -2294,9 +2479,55 @@ def _record_attack_path_engine_used(
         pass
 
 
+def _reset_attack_path_coverage_status_line(shell: object) -> None:
+    """Reset the once-per-compute guard for the coverage-status INFO line.
+
+    Called at the top of every top-level attack-path compute entry so a bounded
+    run in THIS compute surfaces its coverage line exactly once, regardless of how
+    many internal recovery/emit points fire. Best-effort; never raises.
+    """
+    try:
+        setattr(shell, "_attack_path_coverage_line_shown", False)
+    except Exception:  # noqa: BLE001 — the guard is best-effort.
+        pass
+
+
+def _emit_attack_path_coverage_status_line(shell: object, coverage_view: Any) -> None:
+    """Surface a BOUNDED/SAMPLED coverage boundary to the operator at INFO, once.
+
+    When a compute actually ran bounded, the coverage boundary is a data-gap
+    DISCLOSURE the operator must see at INFO by default (not only under
+    ``--debug``): so it prints the SAME client-facing coverage sentence the
+    deliverable carries (CLAUDE.md § "A bounded computation is a data gap") —
+    NEVER the internal engine name and NEVER the memory reason (those stay
+    ``--debug``). A COMPLETE run has no gap and prints nothing. Fires at most once
+    per top-level compute via the guard reset by
+    :func:`_reset_attack_path_coverage_status_line`, so the several internal
+    emit points (proactive fallback, abort recovery, hard stop) collapse to one
+    line. Best-effort; never raises.
+    """
+    try:
+        if not isinstance(coverage_view, Mapping):
+            return
+        if not coverage_view.get("has_gap"):
+            return
+        statement = str(coverage_view.get("statement") or "").strip()
+        if not statement:
+            return
+        if getattr(shell, "_attack_path_coverage_line_shown", False):
+            return
+        try:
+            setattr(shell, "_attack_path_coverage_line_shown", True)
+        except Exception:  # noqa: BLE001 — the guard is best-effort.
+            pass
+        print_info(statement)
+    except Exception:  # noqa: BLE001 — the coverage line is best-effort.
+        pass
+
+
 def _handle_attack_path_memory_abort(
     shell: object, domain: str, exc: "_AttackPathMemoryBudgetExceeded"
-) -> None:
+) -> dict[str, Any] | None:
     """Handle a memory-gate abort: operator terminal line + client coverage record.
 
     Two audiences, two messages (CLAUDE.md § "A bounded computation is a data
@@ -2304,7 +2535,10 @@ def _handle_attack_path_memory_abort(
     memory, the ceiling, resize-or-free); the CLIENT deliverable gets only the
     coverage boundary — how many routes were examined and that the set is not
     exhaustive — never the internal reason and never a verdict about their
-    directory. Best-effort; never raises.
+    directory. Returns the recorded BOUNDED coverage block (or ``None`` on
+    failure) so the recovery seam can surface its client-facing coverage line at
+    INFO iff the bounded recompute never overwrites it with a SAMPLED result.
+    Best-effort; never raises.
     """
     try:
         print_warning(exc.operator_message)
@@ -2322,9 +2556,11 @@ def _handle_attack_path_memory_abort(
             bounded=True, examined_routes=exc.examined_routes
         )
         record_attack_path_coverage(shell, domain, coverage=coverage)
+        return coverage
     except Exception as record_exc:  # noqa: BLE001
         telemetry.capture_exception(record_exc)
         print_exception(exception=record_exc)
+        return None
 
 
 def _resolve_exposure_source_count(shell: object, domain: str) -> int | None:
@@ -2395,6 +2631,50 @@ def _resolve_exposure_source_count_for_graph(graph: dict[str, Any]) -> int | Non
         return None
 
 
+def _resolve_tier2_exposure_for_graph(
+    graph: dict[str, Any],
+) -> "Tier2ExposureRatio | None":
+    """Return the standard-user → Tier-0 reachability ratio, or ``None``.
+
+    Mirrors :func:`_resolve_exposure_source_count_for_graph`: derives the SAME
+    value-terminal set (domain objects plus the Tier-0 / promotable high-value
+    candidates) and hands it to the k-independent
+    :func:`chokepoint_cardinality.tier2_exposure_ratio`. This is the client
+    exposure headline ("what share of my standard users can reach full domain
+    compromise") and survives the mega-hub sampled fallback that collapses the
+    materialized figures. Best-effort: ``None`` on any failure or no terminal.
+    """
+    try:
+        if not isinstance(graph, dict):
+            return None
+        nodes = graph.get("nodes")
+        nodes_map = (
+            nodes
+            if isinstance(nodes, dict)
+            else {str(n.get("id")): n for n in (nodes or []) if isinstance(n, dict)}
+        )
+        edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+        terminals: set[str] = {
+            str(node_id)
+            for node_id, node in nodes_map.items()
+            if isinstance(node, dict) and attack_graph_core._node_is_domain(node)  # noqa: SLF001
+        }
+        terminals |= attack_graph_core._build_high_value_terminal_candidate_ids(  # noqa: SLF001
+            nodes_map, edges, mode="tier0"
+        )
+        if not terminals:
+            return None
+        from adscan_internal.services.chokepoint_cardinality import (
+            tier2_exposure_ratio,
+        )
+
+        return tier2_exposure_ratio(graph, value_terminals=terminals)
+    except Exception as exc:  # noqa: BLE001 — the ratio is best-effort.
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
 def _handle_attack_path_sampled_coverage(shell: object, domain: str) -> None:
     """Record the SAMPLED coverage declaration after a fallback-engine run.
 
@@ -2408,6 +2688,7 @@ def _handle_attack_path_sampled_coverage(shell: object, domain: str) -> None:
     """
     try:
         from adscan_core.reporting.attack_path_memory_gate import (
+            attack_path_coverage_view,
             build_attack_path_coverage,
         )
         from adscan_core.reporting.technical_report import (
@@ -2419,6 +2700,9 @@ def _handle_attack_path_sampled_coverage(shell: object, domain: str) -> None:
             exposure_source_count=_resolve_exposure_source_count(shell, domain),
         )
         record_attack_path_coverage(shell, domain, coverage=coverage)
+        _emit_attack_path_coverage_status_line(
+            shell, attack_path_coverage_view(coverage)
+        )
     except Exception as record_exc:  # noqa: BLE001
         telemetry.capture_exception(record_exc)
         print_exception(exception=record_exc)
@@ -2496,21 +2780,22 @@ def _emit_attack_path_discovery_started(
             pass
 
         # Collapsed pre-flight for the non-interactive (`adscan ci`) run: one line,
-        # not the full REPL panel — the scale + the engine-routing decision. Gated
-        # to non-interactive so the interactive path shows only the rich panel.
+        # not the full REPL panel — just the graph SCALE. It deliberately carries
+        # NO routing verdict: the structural predictor here (mega-hub count) now
+        # DIVERGES from the real reachability + Tier-0-aware routing decision, which
+        # is only known AFTER routing, so a "sampled mode" verdict here would lie on
+        # a run that actually completes the full discovery. The authoritative engine
+        # / coverage status is reported post-run (see the coverage-status line the
+        # fallback path emits and the recorded ``AttackPathCoverage``). Gated to
+        # non-interactive so the interactive path shows only the rich panel.
         try:
             from adscan_internal.interaction import is_non_interactive
 
             if is_non_interactive(shell):
                 marked = mark_sensitive(domain, "domain")
-                verdict = (
-                    f"sampled mode ({mega_hub_count} control mega-hubs)"
-                    if predicts_sampled
-                    else "full discovery"
-                )
                 print_info(
                     f"Attack graph {marked}: {nodes_count:,} nodes, "
-                    f"{edges_count:,} edges -> {verdict}."
+                    f"{edges_count:,} edges."
                 )
         except Exception:  # noqa: BLE001 — the one-liner is best-effort.
             pass
@@ -10205,18 +10490,9 @@ class CredentialSourceStep:
     record_on_failure: bool = False
 
 
-def _is_collectable_computers_scope_node(node: dict[str, Any] | None) -> bool:
-    """Return True for the synthetic host-scope node used by native collection."""
-    if not isinstance(node, dict):
-        return False
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    return (
-        bool(props.get("synthetic"))
-        and str(props.get("scope_kind") or "").strip().lower()
-        == "collectable_computers"
-        and str(props.get("target_selector") or "").strip().lower()
-        == "all_collectable_computers"
-    )
+# Relocated to attack_graph_core (shell-free) so the shared core non-domain listing
+# collapse can consume it; aliased here so existing callsites/imports are unchanged.
+_is_collectable_computers_scope_node = attack_graph_core.is_collectable_computers_scope_node
 
 
 def _is_scope_expandable_computer_node(node: dict[str, Any] | None) -> bool:
@@ -10359,158 +10635,6 @@ def record_credential_source_steps(
     return recorded
 
 
-def compute_maximal_attack_paths(
-    graph: dict[str, Any],
-    *,
-    max_depth: int,
-    target: str = "highvalue",
-    terminal_mode: str = "domain",
-    start_node_ids: set[str] | None = None,
-) -> list[AttackPath]:
-    """Compute maximal paths up to depth.
-
-    By default we only return paths whose terminal node is marked high value.
-    High-value detection relies on node metadata persisted in `attack_graph.json`
-    (Tier Zero, highvalue, admin_tier_0 tag).
-
-    Important:
-        This is a core graph primitive. Do not use it directly for user-facing
-        CLI/web attack-path summaries. UX callers must go through
-        `get_attack_path_summaries()` so shell-aware post-processing is applied
-        consistently (Affected counts, zero-length filtering, cache/logging, and
-        future UX enrichments).
-    """
-    if max_depth <= 0:
-        return []
-
-    nodes_map = graph.get("nodes")
-    edges = graph.get("edges")
-    if not isinstance(nodes_map, dict) or not isinstance(edges, list):
-        return []
-
-    adjacency: dict[str, list[dict[str, Any]]] = {}
-    incoming: dict[str, int] = {}
-    outgoing: dict[str, int] = {}
-    for edge in _iter_runtime_graph_edges(graph):
-        if attack_graph_core._is_nontraversable_attack_edge(edge, nodes_map):  # noqa: SLF001
-            continue
-        from_id = str(edge.get("from") or "")
-        to_id = str(edge.get("to") or "")
-        rel = str(edge.get("relation") or "")
-        if not from_id or not to_id or not rel:
-            continue
-        adjacency.setdefault(from_id, []).append(edge)
-        outgoing[from_id] = outgoing.get(from_id, 0) + 1
-        # Runtime MemberOf edges are contextual and should not change which nodes
-        # are considered "sources" in domain-wide path listing.
-        edge_type = str(edge.get("edge_type") or "")
-        if not (rel == "MemberOf" and edge_type == "runtime"):
-            incoming[to_id] = incoming.get(to_id, 0) + 1
-        incoming.setdefault(from_id, incoming.get(from_id, 0))
-        outgoing.setdefault(to_id, outgoing.get(to_id, 0))
-
-    def is_terminal(node_id: str) -> bool:
-        node = nodes_map.get(node_id)
-        if not isinstance(node, dict):
-            return False
-        mode = (terminal_mode or "domain").strip().lower()
-        if mode == "domain":
-            return _node_is_domain(node)
-        if mode == "impact":
-            return _node_is_impact_high_value(node)
-        return _node_is_tier0(node)
-
-    allowed_start_ids: set[str] = (
-        {str(node_id) for node_id in start_node_ids if str(node_id).strip()}
-        if start_node_ids
-        else set()
-    )
-    sources: list[str] = []
-    for node_id, node in nodes_map.items():
-        if not isinstance(node, dict):
-            continue
-        if allowed_start_ids and node_id not in allowed_start_ids:
-            continue
-        if outgoing.get(node_id, 0) <= 0:
-            continue
-        if not _node_is_enabled_user(node):
-            continue
-        if _node_is_effectively_high_value(node):
-            continue
-        sources.append(node_id)
-
-    paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
-
-    def emit(acc_steps: list[AttackPathStep]) -> None:
-        if not acc_steps:
-            return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
-            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
-        ):
-            return
-        signature = tuple(
-            attack_graph_core.attack_path_step_signature(s) for s in acc_steps
-        )
-        if signature in seen_signatures:
-            return
-        seen_signatures.add(signature)
-        paths.append(
-            AttackPath(
-                steps=list(acc_steps),
-                source_id=acc_steps[0].from_id,
-                target_id=acc_steps[-1].to_id,
-            )
-        )
-
-    def dfs(
-        current: str,
-        visited: set[str],
-        acc_steps: list[AttackPathStep],
-    ) -> None:
-        actionable_depth = attack_graph_core._count_actionable_edges(acc_steps)  # noqa: SLF001
-        structural_depth = len(acc_steps) - actionable_depth
-        if (
-            actionable_depth >= max_depth
-            or structural_depth >= attack_graph_core._MAX_STRUCTURAL_HOPS  # noqa: SLF001
-            or (acc_steps and is_terminal(current))
-        ):
-            emit(acc_steps)
-            return
-
-        next_edges = adjacency.get(current) or []
-        if not next_edges:
-            emit(acc_steps)
-            return
-
-        extended = False
-        for edge in next_edges:
-            to_id = str(edge.get("to") or "")
-            if not to_id or to_id in visited:
-                continue
-            step = AttackPathStep(
-                from_id=current,
-                relation=str(edge.get("relation") or ""),
-                to_id=to_id,
-                status=str(edge.get("status") or "discovered"),
-                notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
-            )
-            visited.add(to_id)
-            acc_steps.append(step)
-            dfs(to_id, visited, acc_steps)
-            acc_steps.pop()
-            visited.remove(to_id)
-            extended = True
-
-        if not extended and acc_steps:
-            emit(acc_steps)
-
-    for source in sources:
-        dfs(source, visited={source}, acc_steps=[])
-
-    return paths
-
-
 def _normalize_account(value: str) -> str:
     name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
@@ -10611,7 +10735,7 @@ def paths_involving_user(
     if not normalized:
         return []
 
-    computed = compute_maximal_attack_paths(graph, max_depth=max_depth)
+    computed = attack_graph_core.compute_maximal_attack_paths(graph, max_depth=max_depth)
     results: list[dict[str, Any]] = []
     for path in computed:
         record = path_to_display_record(graph, path)
@@ -14640,111 +14764,6 @@ def _normalize_principal_kinds_from_snapshot(
     return changed
 
 
-def compute_maximal_attack_paths_from_start(
-    graph: dict[str, Any],
-    *,
-    start_node_id: str,
-    max_depth: int,
-    target: str = "highvalue",
-    terminal_mode: str = "domain",
-) -> list[AttackPath]:
-    """Compute maximal paths starting from a specific node."""
-    if max_depth <= 0 or not start_node_id:
-        return []
-
-    nodes_map = graph.get("nodes")
-    edges = graph.get("edges")
-    if not isinstance(nodes_map, dict) or not isinstance(edges, list):
-        return []
-
-    adjacency: dict[str, list[dict[str, Any]]] = {}
-    for edge in _iter_runtime_graph_edges(graph):
-        if attack_graph_core._is_nontraversable_attack_edge(edge, nodes_map):  # noqa: SLF001
-            continue
-        from_id = str(edge.get("from") or "")
-        to_id = str(edge.get("to") or "")
-        rel = str(edge.get("relation") or "")
-        if not from_id or not to_id or not rel:
-            continue
-        adjacency.setdefault(from_id, []).append(edge)
-
-    def is_terminal(node_id: str) -> bool:
-        node = nodes_map.get(node_id)
-        if not isinstance(node, dict):
-            return False
-        mode = (terminal_mode or "domain").strip().lower()
-        if mode == "domain":
-            return _node_is_domain(node)
-        if mode == "impact":
-            return _node_is_impact_high_value(node)
-        return _node_is_tier0(node)
-
-    paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
-
-    def emit(acc_steps: list[AttackPathStep]) -> None:
-        if not acc_steps:
-            return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
-            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
-        ):
-            return
-        signature = tuple(
-            attack_graph_core.attack_path_step_signature(s) for s in acc_steps
-        )
-        if signature in seen_signatures:
-            return
-        seen_signatures.add(signature)
-        paths.append(
-            AttackPath(
-                steps=list(acc_steps),
-                source_id=acc_steps[0].from_id,
-                target_id=acc_steps[-1].to_id,
-            )
-        )
-
-    def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
-        actionable_depth = attack_graph_core._count_actionable_edges(acc_steps)  # noqa: SLF001
-        structural_depth = len(acc_steps) - actionable_depth
-        if (
-            actionable_depth >= max_depth
-            or structural_depth >= attack_graph_core._MAX_STRUCTURAL_HOPS  # noqa: SLF001
-            or (acc_steps and is_terminal(current))
-        ):
-            emit(acc_steps)
-            return
-
-        next_edges = adjacency.get(current) or []
-        if not next_edges:
-            emit(acc_steps)
-            return
-
-        extended = False
-        for edge in next_edges:
-            to_id = str(edge.get("to") or "")
-            if not to_id or to_id in visited:
-                continue
-            step = AttackPathStep(
-                from_id=current,
-                relation=str(edge.get("relation") or ""),
-                to_id=to_id,
-                status=str(edge.get("status") or "discovered"),
-                notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
-            )
-            visited.add(to_id)
-            acc_steps.append(step)
-            dfs(to_id, visited, acc_steps)
-            acc_steps.pop()
-            visited.remove(to_id)
-            extended = True
-
-        if not extended:
-            emit(acc_steps)
-
-    dfs(start_node_id, visited={start_node_id}, acc_steps=[])
-    return paths
-
-
 def _sort_display_paths(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     from adscan_internal.services.attack_step_support_registry import (
         build_path_priority_key,
@@ -14889,131 +14908,12 @@ def _stitch_principal_memberships_for_runtime_paths(
     return snapshot_injected, runtime_injected
 
 
-def _build_snapshot_label_to_node(
-    snapshot: dict[str, Any] | None,
-    base_graph: dict[str, Any] | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Build a {label: node_dict} index for HV lookups.
-
-    Sources (merged, base_graph wins on conflict):
-      1. Membership snapshot nodes  — users and groups with HV properties.
-      2. Attack graph nodes         — domain nodes and other targets that the DFS
-         uses as terminals; these carry the ``highvalue``/``isTierZero``/
-         ``system_tags`` properties that ``_node_is_effectively_high_value`` checks.
-
-    The snapshot alone is insufficient because it only contains user/group
-    membership data and never includes domain-level nodes (e.g. ``ESSOS.LOCAL``).
-    Without the attack graph, domain terminals are always tagged as pivot.
-    """
-    result: dict[str, dict[str, Any]] = {}
-
-    # Layer 1: snapshot nodes (users/groups).
-    if snapshot:
-        snap_nodes = snapshot.get("nodes")
-        if isinstance(snap_nodes, dict):
-            for node in snap_nodes.values():
-                if isinstance(node, dict):
-                    label = str(node.get("label") or "").strip()
-                    if label:
-                        result[label] = node
-
-    # Layer 2: attack graph nodes (domains, computers, CAs, etc.) — override snapshot.
-    if base_graph:
-        ag_nodes = base_graph.get("nodes")
-        if isinstance(ag_nodes, dict):
-            for node in ag_nodes.values():
-                if isinstance(node, dict):
-                    label = str(node.get("label") or "").strip()
-                    if label:
-                        result[label] = node
-
-    return result
-
-
-def _trim_trailing_memberof_edges(
-    rec: dict[str, Any],
-    *,
-    label_to_node: dict[str, Any],
-    except_hv: bool,
-) -> dict[str, Any] | None:
-    """Strip trailing MemberOf-to-non-HV edges from a path record.
-
-    Recursively removes trailing (MemberOf, Group) pairs until the last relation
-    is not MemberOf, the terminal node is HV (when except_hv=True, matching BH CE
-    behaviour where HV terminals are kept), or the path becomes degenerate (< 2 nodes).
-
-    Args:
-        rec: Path record dict with ``nodes`` and ``relations``/``rels`` keys.
-        label_to_node: Label-to-node index built from snapshot + attack graph.
-        except_hv: When True, stop trimming as soon as the terminal node is HV
-            (mirrors BH CE ``target="all"`` semantics).
-
-    Returns:
-        Trimmed copy of *rec* with updated ``nodes``, ``relations``/``rels``, and
-        ``target`` fields, or ``None`` if the path has fewer than 2 nodes after
-        trimming (degenerate — discard).
-    """
-    nodes = list(rec.get("nodes") or [])
-    rel_key = "relations" if "relations" in rec else "rels"
-    rels = list(rec.get(rel_key) or [])
-
-    while rels:
-        last_rel = str(rels[-1]).strip().lower()
-        if last_rel != "memberof":
-            break
-        if except_hv:
-            tgt_label = str(nodes[-1]) if nodes else ""
-            tgt_node = label_to_node.get(tgt_label) or {}
-            if attack_graph_core._node_target_priority_class(tgt_node) != "pivot":  # noqa: SLF001
-                break  # HV terminal — stop trimming, keep as-is
-        # Remove the last node and last relation.
-        nodes = nodes[:-1]
-        rels = rels[:-1]
-
-    if len(nodes) < 2:
-        return None
-
-    trimmed = dict(rec)
-    trimmed["nodes"] = nodes
-    trimmed[rel_key] = rels
-    trimmed["target"] = nodes[-1]
-    # ``terminal_target_label`` is stamped at path-creation time from the
-    # pre-trim ``path.target_id``. When we strip trailing MemberOf hops the
-    # terminal node changes, so the stamped label is now stale and points at
-    # the discarded pivot group (e.g. a CrackNTLMv1 path trimmed back to the DC
-    # computer object would still carry the trailing
-    # ``DENIED RODC PASSWORD REPLICATION GROUP`` label). Stage-7 classification
-    # resolves the target node via ``terminal_target_label`` first, so leaving
-    # it stale mislabels the path (compromise_enabler instead of
-    # domain_breaker). Reset it to the trimmed terminal label so the classifier
-    # resolves the real terminal node.
-    if "terminal_target_label" in trimmed:
-        trimmed["terminal_target_label"] = nodes[-1]
-    return trimmed
-
-
-def _record_terminal_is_hv(
-    rec: dict[str, Any],
-    label_to_node: dict[str, Any],
-) -> bool:
-    """Return True when *rec*'s terminal node is high-value / tier-0.
-
-    Consults the same ``_node_is_effectively_high_value`` predicate used by the
-    HV-tag stage (stage 7 in the local pipeline, stage 6 in the BH pipeline) so
-    that the containment filter and any UX ordering logic use identical criteria.
-
-    Args:
-        rec: Display path record with a ``target`` field.
-        label_to_node: Label-to-node index (snapshot + attack graph nodes).
-
-    Returns:
-        True if the target node is effectively high-value; False otherwise or
-        when the target cannot be resolved.
-    """
-    tgt_node = label_to_node.get(str(rec.get("target") or "")) or {}
-    return (
-        attack_graph_core._node_target_priority_class(tgt_node) != "pivot"  # noqa: SLF001
-    )
+# Relocated to attack_graph_core (shell-free) so the shared core non-domain listing
+# collapse consumes the SAME helpers; aliased here so existing callsites/imports are
+# unchanged (incl. tests importing them from this module).
+_build_snapshot_label_to_node = attack_graph_core.build_snapshot_label_to_node
+_trim_trailing_memberof_edges = attack_graph_core.trim_trailing_memberof_edges
+_record_terminal_is_hv = attack_graph_core.record_terminal_is_hv
 
 
 def _record_terminal_is_terminal_target(
@@ -16204,11 +16104,36 @@ def _apply_local_postprocessing_pipeline(
 
     # Stage 6: Containment filter.
     #
-    # domain scope: always keep_longest (holistic view — full chain is more
-    #   informative than sub-paths).
+    # domain scope: the ``keep_longest`` flag is honored ONLY on the
+    #   display_friendly branch (:16382, ``filter_domain_listing_paths``). The
+    #   older "domain is always keep_longest" wording was wrong, but so is
+    #   "the REPL vs client difference is keep_longest": the REAL driver is
+    #   ``display_friendly``, and for the REPL the keep_longest flag is INERT.
+    #   Read the dispatch below (:16315) to see why:
+    #     • REPL listing (``run_show_attack_paths``): leaves display_friendly
+    #       =None -> derived False (target_mode "object"), and defaults
+    #       keep_longest=False. df=False routes it to BRANCH 1
+    #       (``if not display_friendly``), which is scope-AGNOSTIC, runs
+    #       ``filter_contained_paths_for_domain_listing(keep_shortest=True,
+    #       preserve_prefix_paths=True)``, and NEVER reads keep_longest. So the
+    #       REPL's keep_longest=False changes nothing — it is dead config on
+    #       this path.
+    #     • deliverable/report (``compute_report_attack_paths``), the persisted
+    #       snapshot re-materializer, and the attack-path execution offer pass
+    #       display_friendly=True + keep_longest=True. df=True + scope=="domain"
+    #       routes them to the ELSE branch (:16382) ->
+    #       ``filter_domain_listing_paths(keep_longest=True)``, the tier-aware
+    #       domain filter WITH the affected-widening carve-out.
+    #   These are two DIFFERENT filters, not one filter under two flags, so the
+    #   REPL and client finding sets DIFFER MATERIALLY on a real domain — not
+    #   merely in the length representative of a tied nested family. This
+    #   REPL<->client divergence is KNOWN, unintended drift (Defect A/C in
+    #   docs/superpowers/specs/2026-09-24-attack-path-collapse-single-ladder.md),
+    #   pending consolidation of both branches onto one symmetric ladder. Do NOT
+    #   assume the two surfaces agree until that lands.
     # owned/principals multi-principal: HV-aware keep_shortest regardless of
     #   target mode.  Rationale: owned principals are already compromised; the
-    # domain scope  : keep_longest — holistic view, reduce noise.
+    #   most direct route is the operational answer.
     # non-domain     : unified HV-aware keep_shortest + Pass-2 prefix removal.
     #   • Pass 1 (keep_shortest + HV priority): keep shorter path to same terminal;
     #     HV-terminal paths beat non-HV regardless of length (Case 2 + HV priority).
@@ -16226,17 +16151,25 @@ def _apply_local_postprocessing_pipeline(
     # most direct route to each distinct HV/tier-0 target.
     # Contained-path filter strategy:
     #
-    #   not display_friendly (programmatic / object-targeted)
+    #   not display_friendly (programmatic / object-targeted) — SCOPE-AGNOSTIC,
+    #   fires for EVERY scope incl. domain (this is the REPL domain-listing path)
     #     → keep_shortest + preserve_prefix_paths: most direct route from any
     #       source to the specific target object.  Super-paths that pass through
     #       an already-owned intermediate before reaching the target are dropped
     #       in favour of the shorter sub-path that starts directly from that
     #       owned intermediate.  preserve_prefix_paths ensures a shorter path
     #       ending AT the target is not removed if a longer path passes through
-    #       it en route to a different node.
+    #       it en route to a different node.  keep_longest is NOT read here — the
+    #       REPL's keep_longest default is inert on this branch (see the Stage-6
+    #       header above).
     #
-    #   display_friendly, scope == "domain"
-    #     → keep_longest: holistic kill-chain view; sub-paths are noise.
+    #   display_friendly, scope == "domain" (deliverable/report/snapshot/exec)
+    #     → filter_domain_listing_paths honoring the threaded keep_longest flag
+    #       (True in every current caller = holistic kill-chain, sub-paths are
+    #       noise; False would be shortest-HV-aware). This is a DIFFERENT filter
+    #       from the not-display_friendly branch above (tier-aware, with the
+    #       affected-widening carve-out), which is why the REPL and the client
+    #       domain listings diverge materially — see the Stage-6 header.
     #
     #   display_friendly, scope != "domain", tier0/impact target mode
     #     → keep_shortest HV-aware: most direct route to each distinct HV
@@ -16349,7 +16282,12 @@ def _apply_local_postprocessing_pipeline(
         # agree.
         _mode_label = "keep_longest" if keep_longest else "shortest-hv-aware"
         result, n_contained = attack_graph_core.filter_domain_listing_paths(
-            records, label_to_node=_label_to_node, keep_longest=keep_longest
+            records,
+            label_to_node=_label_to_node,
+            keep_longest=keep_longest,
+            # HV-scope filter: only a ``--target highvalue`` listing drops a non-HV
+            # dead-end terminal (``--target all`` is meant to include non-HV terminals).
+            restrict_to_hv_scope=(target == "highvalue"),
         )
         if n_contained:
             print_info_debug(
@@ -16498,6 +16436,7 @@ def compute_display_paths_for_user(
                 jon.snow -> Domain Users -> jon.snow -> ...
              because our DFS only returns simple paths (no repeated nodes).
     """
+    _reset_attack_path_coverage_status_line(shell)
     started_at = time.monotonic()
     effective_depth = _effective_max_depth(max_depth, scope="user", target=target)
     print_info_debug(
@@ -16536,6 +16475,27 @@ def compute_display_paths_for_user(
         return cached
 
     base_graph = _load_attack_graph_for_paths(shell, domain)
+    if not force_perterminal:
+        # Proactive explosion routing for the DIRECT callers of this compute (see
+        # ``compute_display_paths_for_domain``). The user's own node is the start
+        # set; the predictor fires only when that principal reaches a control
+        # mega-hub mesh.
+        _user_start_node_id = _find_node_id_by_label(base_graph, username)
+        _user_start_ids = {_user_start_node_id} if _user_start_node_id else set()
+        if _service_scope_predicts_explosion(shell, base_graph, _user_start_ids):
+            return compute_display_paths_for_user(
+                shell,
+                domain,
+                username=username,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                no_cache=no_cache,
+                allow_owned_terminal_target=allow_owned_terminal_target,
+                display_friendly=display_friendly,
+                force_perterminal=True,
+            )
     snapshot = _load_membership_snapshot(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
@@ -16630,7 +16590,7 @@ def compute_display_paths_for_user(
         )
         _dfs_elapsed = time.monotonic() - _dfs_t0
         print_info_debug(
-            f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=user)"
+            f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=user)"
         )
         records = _filter_zero_length_display_paths(records, domain=domain, scope="user")
         # Populate owned_labels so the owned-terminal filter can drop paths whose
@@ -16696,7 +16656,7 @@ def compute_display_paths_for_user(
         )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
-        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
+        f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
         f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=user)"
     )
     _log_attack_path_compute_timing(
@@ -16745,6 +16705,7 @@ def compute_display_paths_for_domain(
     context-only `MemberOf` step so the operator can understand why the path is
     surfaced.
     """
+    _reset_attack_path_coverage_status_line(shell)
     started_at = time.monotonic()
     effective_depth = _effective_max_depth(max_depth, scope="domain", target=target)
     print_info_debug(
@@ -16790,6 +16751,31 @@ def compute_display_paths_for_domain(
         return cached
 
     base_graph = _load_attack_graph_for_paths(shell, domain)
+    if not force_perterminal:
+        # Proactive explosion routing (mirrors the inner beacon) for the DIRECT
+        # callers of this service compute — the deliver/report path and the
+        # attack-path execution reconciler bypass ``_compute_attack_path_summaries_inner``,
+        # so without this they get NO proactive check and pay a full DFS abort
+        # before the reactive memory-gate recovery. The reachability basis is the
+        # real domain-scope source set (shared SSOT), so an orphan control mega-hub
+        # no enabled user reaches never forces the bounded engine.
+        _domain_start_ids = (
+            attack_graph_core.derive_domain_scope_source_ids_for_graph(base_graph)
+        )
+        if _service_scope_predicts_explosion(shell, base_graph, _domain_start_ids):
+            return compute_display_paths_for_domain(
+                shell,
+                domain,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                no_cache=no_cache,
+                allow_owned_terminal_target=allow_owned_terminal_target,
+                display_friendly=display_friendly,
+                keep_longest=keep_longest,
+                force_perterminal=True,
+            )
     snapshot = _load_membership_snapshot(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
@@ -16875,7 +16861,7 @@ def compute_display_paths_for_domain(
         )
         _dfs_elapsed = time.monotonic() - _dfs_t0
         print_info_debug(
-            f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=domain)"
+            f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=domain)"
         )
         records = _filter_zero_length_display_paths(
             records, domain=domain, scope="domain"
@@ -16937,7 +16923,7 @@ def compute_display_paths_for_domain(
         )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
-        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
+        f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
         f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=domain)"
     )
     _log_attack_path_compute_timing(
@@ -17686,14 +17672,24 @@ def _recover_from_memory_abort(
     logic can never drift across the seams (CLAUDE.md § "A bounded computation is a
     data gap").
     """
-    _handle_attack_path_memory_abort(shell, domain, exc)
+    _bounded_block = _handle_attack_path_memory_abort(shell, domain, exc)
     _record_attack_path_engine_used(shell, engine="fallback", reason="dfs_aborted")
     _recompute_started_at = time.monotonic()
     try:
         result = recompute_bounded()
     except _AttackPathMemoryBudgetExceeded:
         # The bounded fallback itself blew the budget — the hard-abort ("bounded")
-        # record stands and the result is empty, exactly as before.
+        # record stands and the result is empty, exactly as before. The bounded
+        # coverage boundary is a data-gap disclosure, so surface it to the operator
+        # at INFO (no SAMPLED result will overwrite it here).
+        if _bounded_block is not None:
+            from adscan_core.reporting.attack_path_memory_gate import (
+                attack_path_coverage_view,
+            )
+
+            _emit_attack_path_coverage_status_line(
+                shell, attack_path_coverage_view(_bounded_block)
+            )
         return []
     _handle_attack_path_sampled_coverage(shell, domain)
     if cache_key is not None:
@@ -18227,7 +18223,7 @@ def _diagnose_zero_domain_paths(
 
     # We do reach the Domain via at least one edge — the break must be earlier.
     try:
-        fallback = compute_maximal_attack_paths(
+        fallback = attack_graph_core.compute_maximal_attack_paths(
             graph,
             max_depth=max_depth,
             target="highvalue",
@@ -18316,28 +18312,36 @@ def _compute_attack_path_summaries_inner(
         _stage_a_edges_count = 0
 
     # Pre-DFS hybrid switch: run the cheap explosion predictor over the base
-    # graph BEFORE the all-simple-paths DFS runs. A dense hub-mesh graph (>= 2
-    # control mega-hubs) routes to the BOUNDED per-terminal fallback engine here,
-    # so it never pays the ~2M-state DFS abort cost. Completing graphs never carry
-    # this signature (Potech = 18 mega-hubs; the most extreme completer = 1;
-    # threshold >= 2), so the DFS path stays byte-identical — the predictor must
-    # not fire on them. When the predictor fires we ALSO skip the size-linear
-    # pre-gate: the fallback is bounded, so the DFS-oriented pre-gate would only
-    # abort a run the fallback can complete.
+    # graph BEFORE the all-simple-paths DFS runs. A dense hub-mesh graph routes to
+    # the BOUNDED per-terminal fallback engine here, so it never pays the ~2M-state
+    # DFS abort cost. The routing uses the REACHABILITY-aware predictor
+    # (:func:`predicts_explosion_reachable`): it counts a control mega-hub only when
+    # an owned/start principal of THIS scope can actually reach it, so a mega-hub no
+    # path traverses (an escalation group with no members, a frontier-stopped
+    # Exchange mesh) no longer forces the bounded engine on a domain the full DFS
+    # would complete. For domain scope the start set is ``None`` (all principals),
+    # which falls back to the raw structural count — byte-identical to the previous
+    # routing. Completing graphs on the byte-identity battery (Essos/Forest/
+    # Blackfield) carry no mega-hub at all, so the DFS path stays byte-identical.
+    # When the predictor fires we ALSO skip the size-linear pre-gate: the fallback
+    # is bounded, so the DFS-oriented pre-gate would only abort a run it can
+    # complete.
     if not force_perterminal and isinstance(_stage_a_graph, dict):
-        if (
-            _choose_attack_path_engine(
-                {
-                    "nodes": (
-                        list(_stage_a_nodes.values())
-                        if isinstance(_stage_a_nodes, dict)
-                        else (_stage_a_nodes or [])
-                    ),
-                    "edges": _stage_a_edges or [],
-                }
+        _start_node_ids = _resolve_scope_start_node_ids(
+            shell,
+            domain,
+            scope_norm=scope_norm,
+            username=username,
+            principals=principals,
+            graph=_stage_a_graph,
+        )
+        try:
+            _predicted_explosion = predicts_explosion_reachable(
+                _stage_a_graph, start_node_ids=_start_node_ids
             )
-            == "fallback"
-        ):
+        except Exception:  # noqa: BLE001 — a routing miss must never break discovery.
+            _predicted_explosion = False
+        if _predicted_explosion:
             force_perterminal = True
             _record_attack_path_engine_used(
                 shell, engine="fallback", reason="predicted_explosion"
@@ -18443,7 +18447,7 @@ def _compute_attack_path_summaries_inner(
     else:
         raise ValueError(f"Unsupported attack path summary scope: {scope_norm!r}")
     print_info_debug(
-        f"[engine=local-dfs] {len(local_result)} path(s) in {time.perf_counter() - _local_t0:.2f}s"
+        f"[engine={_effective_engine_label(shell, force_perterminal)}] {len(local_result)} path(s) in {time.perf_counter() - _local_t0:.2f}s"
     )
     if not local_result and str(target_mode or "").strip().lower() == "domain":
         _diagnose_zero_domain_paths(
@@ -18454,10 +18458,24 @@ def _compute_attack_path_summaries_inner(
             principals=principals,
             max_depth=max_depth,
         )
-    return _apply_attack_path_summary_filters(
+    filtered_result = _apply_attack_path_summary_filters(
         local_result,
         filters=summary_filters,
     )
+    if scope_norm == "domain":
+        # Axis-D story-level DISPLAY fold: collapse routes that reach the SAME
+        # terminal via the SAME edge sequence but start from DIFFERENT origin
+        # principals into ONE row carrying the N origins in ``origin_alternatives``
+        # (attack_graph_core.fold_origin_stories). Applied HERE, on the domain
+        # display LISTING only — the KPI/exposure source
+        # (``compute_report_attack_paths``) never routes through
+        # ``get_attack_path_summaries``, so the exposure counts stay
+        # origin-sensitive (guardrail #1). It is a no-op when a domain has no origin
+        # fan-out, so the byte-identity snapshot (Essos/Forest/Blackfield) is
+        # preserved by construction. Report/web rendering of the folded rows is a
+        # tracked follow-up (see the Axis-D spec).
+        filtered_result = attack_graph_core.fold_origin_stories(filtered_result)
+    return filtered_result
 
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
@@ -18544,6 +18562,7 @@ def compute_display_paths_for_principals(
     This is used to implement `attack_paths <domain> owned` without spamming one
     identical membership-originating path per owned user.
     """
+    _reset_attack_path_coverage_status_line(shell)
     started_at = time.monotonic()
     effective_depth = _effective_max_depth(max_depth, scope="principals", target=target)
     print_info_debug(
@@ -18626,6 +18645,30 @@ def compute_display_paths_for_principals(
     )
 
     base_graph = _load_attack_graph_for_paths(shell, domain)
+    if not force_perterminal:
+        # Proactive explosion routing for the DIRECT callers of this compute (see
+        # ``compute_display_paths_for_domain``). Every listed principal that
+        # resolves to a node seeds the reachability walk.
+        _principal_start_ids: set[str] = set()
+        for _principal_label in unique_principals:
+            _principal_node_id = _find_node_id_by_label(base_graph, _principal_label)
+            if _principal_node_id:
+                _principal_start_ids.add(_principal_node_id)
+        if _service_scope_predicts_explosion(shell, base_graph, _principal_start_ids):
+            return compute_display_paths_for_principals(
+                shell,
+                domain,
+                principals=principals,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                membership_sample_max=membership_sample_max,
+                target_mode=target_mode,
+                no_cache=no_cache,
+                allow_owned_terminal_target=allow_owned_terminal_target,
+                display_friendly=display_friendly,
+                force_perterminal=True,
+            )
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
         domain=domain,
@@ -18732,7 +18775,7 @@ def compute_display_paths_for_principals(
         )
         _dfs_elapsed = time.monotonic() - _dfs_t0
         print_info_debug(
-            f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=principals)"
+            f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=principals)"
         )
         records = _filter_zero_length_display_paths(
             records, domain=domain, scope="principals"
@@ -18790,7 +18833,7 @@ def compute_display_paths_for_principals(
         )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
-        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
+        f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
         f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=principals)"
     )
     _log_attack_path_compute_timing(

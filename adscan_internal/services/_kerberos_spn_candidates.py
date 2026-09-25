@@ -3,7 +3,7 @@
 The low-level SMB transport must NOT import the workspace or the shell, yet it
 needs to recover from a Kerberos AP/KDC failure caused by a STALE-DNS wrong-host
 SPN: when an IP has two enabled computer A-records (e.g. a decommissioned
-``CZN007`` sharing the IP with the live ``CZN012``, no reverse PTR), targeting the
+``HOST01`` sharing the IP with the live ``HOST02``, no reverse PTR), targeting the
 stale name yields a TGS the live host rejects. The fix is to retry with the LIVE
 candidate FQDN for that IP.
 

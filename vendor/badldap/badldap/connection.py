@@ -18,11 +18,45 @@ from badldap.commons.authbuilder import get_auth_context
 from badldap.network.packetizer import LDAPPacketizer
 from asysocks.unicomm.common.target import UniProto
 from badldap.commons.exceptions import LDAPBindException, LDAPAddException, LDAPModifyException, LDAPDeleteException, LDAPModifyDNException, LDAPSearchException
+import hashlib
 from hashlib import sha256
+from asn1crypto import x509 as _asn1_x509
 from asysocks.unicomm.client import UniClient
 from badauth.common.constants import asyauthProtocol
 from badauth.common.credentials import UniCredential
 from badauth.common.winapi.constants import ISC_REQ
+
+
+def _tls_server_end_point_digest(certdata):
+	"""Compute the RFC 5929 ``tls-server-end-point`` certificate hash.
+
+	The token MUST be built with the certificate's OWN signature hash
+	algorithm, EXCEPT when that algorithm is MD5 or SHA-1 — in which case
+	SHA-256 is used (RFC 5929 §4.1). Hardcoding SHA-256 breaks LDAP channel
+	binding against Domain Controllers whose LDAPS certificate is signed with
+	SHA-384/SHA-512: the DC derives the expected token with SHA-384/512 and
+	rejects our SHA-256 token with ``SEC_E_BAD_BINDINGS``, which typically
+	surfaces as a silent near-empty collection rather than a clear auth error.
+
+	Falls back to SHA-256 (the historical behaviour) whenever the certificate
+	cannot be parsed or its signature algorithm cannot be mapped to a hash
+	``hashlib`` guarantees on every platform — so a working SHA-256 environment
+	can never regress, and the Windows bundle (§ cross-platform) stays safe.
+
+	:param certdata: DER-encoded peer certificate bytes.
+	:return: The raw digest bytes to append after ``tls-server-end-point:``.
+	"""
+	algo = 'sha256'
+	try:
+		cert_hash_algo = _asn1_x509.Certificate.load(certdata).hash_algo
+		# RFC 5929: MD5/SHA-1 signatures are upgraded to SHA-256; every other
+		# algorithm is used as-is, but only if hashlib can build it portably.
+		if cert_hash_algo not in ('md5', 'sha1') and cert_hash_algo in hashlib.algorithms_guaranteed:
+			algo = cert_hash_algo
+	except Exception:
+		# Never let a certificate-parsing hiccup break an otherwise-fine bind.
+		algo = 'sha256'
+	return hashlib.new(algo, certdata).digest()
 
 
 def _complete_ldap_message_length(buf):
@@ -311,7 +345,7 @@ class MSLDAPClientConnection:
 					self.cb_data = b'tls-server-end-point:' + sha256(b'').digest()
 				else:
 					certdata = self.network.get_peer_certificate()
-					self.cb_data = b'tls-server-end-point:' + sha256(certdata).digest()
+					self.cb_data = b'tls-server-end-point:' + _tls_server_end_point_digest(certdata)
 
 			self.handle_incoming_task = asyncio.create_task(self.__handle_incoming())
 			self.status = MSLDAPClientStatus.CONNECTED

@@ -83,6 +83,12 @@ class _Esc8SchemeDecision:
     scheme: str | None = None
     port: int | None = None
     abort_reason: str | None = None
+    # Observed web-enrollment transport surface (from the EPA-aware probe), so the
+    # persisted ESC8 finding can carry the exact vector it relayed over and drive
+    # a remediation conditional on scheme + EPA (see adcs_esc8_transport SSOT).
+    http_available: bool | None = None
+    https_available: bool | None = None
+    epa_enforced: bool | None = None
 
     @property
     def viable(self) -> bool:
@@ -103,8 +109,9 @@ async def _resolve_esc8_scheme(config: EscConfig) -> _Esc8SchemeDecision:
       listening for web enrollment → ABORT: there is no ESC8 vulnerability here.
     * The sole avenue is HTTPS with EPA (channel binding) enforced, and HTTP is
       not available → the relay is defeated → ABORT.
-    * A scheme answered with NTLM/Negotiate → relay to it (HTTPS preferred when
-      both qualify; avoids the historical hardcode that always relayed to ``:80``).
+    * A scheme answered with NTLM/Negotiate → relay to it HTTP-first (HTTP is
+      EPA-agnostic and always relays; HTTPS is used only as the sole EPA-free
+      avenue). See the selection block below.
     * Genuinely AMBIGUOUS (a port is OPEN but NTLM/Negotiate could not be
       confirmed, or the probe itself errored) → default to HTTP rather than
       aborting a chain the operator launched.
@@ -152,16 +159,40 @@ async def _resolve_esc8_scheme(config: EscConfig) -> _Esc8SchemeDecision:
         )
         return _Esc8SchemeDecision(abort_reason=_ESC8_EPA_REASON)
 
-    if result.answering_scheme == "https":
+    # ESC8 relay scheme — HTTP-first.
+    #
+    # An HTTP relay is EPA-agnostic and always succeeds when certsrv offers NTLM
+    # over HTTP: there is no TLS channel, so there is no channel binding to
+    # defeat, and it avoids the TLS-teardown complexity of the HTTPS path. HTTPS
+    # relays ONLY when the CA does not enforce EPA, so it is used solely when HTTP
+    # is not an NTLM avenue. The two certain non-viable cases (nothing listening,
+    # and HTTPS-only-with-EPA) were already aborted above, so if HTTPS is the only
+    # remaining avenue here it is EPA-free. This mirrors the certipy / ntlmrelayx
+    # default of relaying to http://<ca>/certsrv/, and prefers the transport where
+    # a hardened HTTPS endpoint (EPA) cannot silently defeat the relay while a
+    # working HTTP avenue exists.
+    if result.http_ntlm:
         print_info_debug(
-            f"[esc8] relay scheme=https (certsrv offered NTLM/Negotiate over TLS): host={masked}"
+            f"[esc8] relay scheme=http (HTTP-first: EPA-agnostic NTLM avenue): host={masked}"
         )
-        return _Esc8SchemeDecision(scheme="https", port=_HTTPS_PORT)
-    if result.answering_scheme == "http":
+        return _Esc8SchemeDecision(
+            scheme="http",
+            port=_HTTP_PORT,
+            http_available=result.http_ntlm,
+            https_available=result.https_ntlm,
+            epa_enforced=result.epa_enforced,
+        )
+    if result.https_ntlm:
         print_info_debug(
-            f"[esc8] relay scheme=http (certsrv offered NTLM/Negotiate): host={masked}"
+            f"[esc8] relay scheme=https (sole NTLM avenue; EPA-free): host={masked}"
         )
-        return _Esc8SchemeDecision(scheme="http", port=_HTTP_PORT)
+        return _Esc8SchemeDecision(
+            scheme="https",
+            port=_HTTPS_PORT,
+            http_available=result.http_ntlm,
+            https_available=result.https_ntlm,
+            epa_enforced=result.epa_enforced,
+        )
 
     # A port is open but NTLM/Negotiate could not be confirmed — genuinely
     # ambiguous. Keep the legacy default rather than aborting.
@@ -170,6 +201,32 @@ async def _resolve_esc8_scheme(config: EscConfig) -> _Esc8SchemeDecision:
         f"defaulting relay to http: host={masked}"
     )
     return _Esc8SchemeDecision(scheme="http", port=_HTTP_PORT)
+
+
+def _stamp_esc8_transport(result: EscResult, decision: _Esc8SchemeDecision) -> EscResult:
+    """Record the observed ESC8 transport + EPA on the result evidence (SSOT).
+
+    Stamped at this ONE seam so the persisted ESC8 finding — and the report /
+    web CTEM remediation derived from it — carries the exact vector the relay
+    used and the observed channel-binding state, never a generic guess. Best
+    effort: never mutate a caller-supplied evidence identity into something the
+    downstream reader cannot parse.
+    """
+
+    from adscan_core.reporting.adcs_esc8_transport import (
+        ESC8_TRANSPORT_KEY,
+        build_esc8_transport,
+    )
+
+    if not isinstance(result.evidence, dict):
+        result.evidence = {}
+    result.evidence[ESC8_TRANSPORT_KEY] = build_esc8_transport(
+        observed_scheme=decision.scheme or "",
+        http_available=decision.http_available,
+        https_available=decision.https_available,
+        epa_enforced=decision.epa_enforced,
+    )
+    return result
 
 
 def _esc8_not_viable_result(technique: str, reason: str) -> EscResult:
@@ -202,7 +259,7 @@ async def run_esc8(config: EscConfig) -> EscResult:
     scheme, port = decision.scheme, decision.port
 
     print_relay_preflight(
-        technique=f"ESC8 — ADCS Web Enrollment ({scheme.upper()})",
+        technique=f"ESC8: ADCS Web Enrollment ({scheme.upper()})",
         coerce_target=config.dc_ip,
         ca_host=config.ca_host,
         ca_name=config.ca_name or "ADCS-CA",
@@ -224,11 +281,12 @@ async def run_esc8(config: EscConfig) -> EscResult:
         )
     )
     result = await _run_adcs_relay_chain(config, listener_host, target)
-    return _relay_chain_to_esc_result(
+    esc_result = _relay_chain_to_esc_result(
         result, config=config, esc=8,
         technique="ESC8",
         fallback_error="ESC8 relay did not issue a certificate",
     )
+    return _stamp_esc8_transport(esc_result, decision)
 
 
 async def run_esc11(config: EscConfig) -> EscResult:
@@ -239,7 +297,7 @@ async def run_esc11(config: EscConfig) -> EscResult:
     template = config.template or "DomainController"
 
     print_relay_preflight(
-        technique="ESC11 — MS-ICPR (RPC/DCOM)",
+        technique="ESC11: MS-ICPR (RPC/DCOM)",
         coerce_target=config.dc_ip,
         ca_host=config.ca_host,
         ca_name=config.ca_name or "ADCS-CA",
@@ -356,7 +414,7 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
     relay_fqdn = f"{relay_name}.{config.domain}"
 
     print_relay_preflight(
-        technique="ESC8 — Kerberos relay (DNS prefix trick, opaque forward)",
+        technique="ESC8: Kerberos relay (DNS prefix trick, opaque forward)",
         coerce_target=config.dc_ip,
         ca_host=config.ca_host,
         ca_name=config.ca_name or "ADCS-CA",
@@ -399,13 +457,14 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
             config, listener_host, relay_name, relay_fqdn, krb_target
         )
 
-    return _relay_result_to_esc(
+    esc_result = _relay_result_to_esc(
         result,
         config=config,
         esc=8,
         technique="ESC8-KRB",
         fallback_error="ESC8 Kerberos relay did not issue a certificate",
     )
+    return _stamp_esc8_transport(esc_result, decision)
 
 
 async def _run_adcs_smb_krb_relay_chain(
@@ -448,7 +507,38 @@ async def _run_adcs_smb_krb_relay_chain(
         authproto="kerberos" if config.use_kerberos else "ntlm",
     )
 
-    await listener.start()
+    from adscan_internal.services.relay.core import (
+        RelayListenerUnavailableError,
+        RelayRunResult,
+    )
+
+    try:
+        await listener.start()
+    except RelayListenerUnavailableError as exc:
+        # The SMB listen port is already held (e.g. by the poisoning / capture
+        # listener). Return a failed chain result carrying the honest reason so
+        # ESC8-KRB continues instead of aborting the phase with a raw traceback.
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+        from adscan_internal.rich_output import print_warning  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(
+            f"Kerberos relay SMB listener could not start on port {exc.port} "
+            f"({exc.reason}). Skipping ESC8 Kerberos relay and continuing."
+        )
+        return _KrbRelayChainResult(
+            relay_result=RelayRunResult(
+                results=(),
+                timed_out=False,
+                authentications_seen=0,
+                listener_error=exc.reason_summary,
+            ),
+            coercion_success=False,
+            coercion_attempts=0,
+        )
+
     try:
         coercion_task = asyncio.create_task(
             _coerce_smb_krb(config, factory, coerce_listener_name)
@@ -457,7 +547,6 @@ async def _run_adcs_smb_krb_relay_chain(
             spnego_bytes = await asyncio.wait_for(capture_queue.get(), timeout=120.0)
         except asyncio.TimeoutError:
             coercion_task.cancel()
-            from adscan_internal.services.relay.core import RelayRunResult
             return _KrbRelayChainResult(
                 relay_result=RelayRunResult(results=(), timed_out=True, authentications_seen=0),
                 coercion_success=False,
@@ -469,7 +558,6 @@ async def _run_adcs_smb_krb_relay_chain(
     finally:
         await listener.stop()
 
-    from adscan_internal.services.relay.core import RelayRunResult
     return _KrbRelayChainResult(
         relay_result=RelayRunResult(
             results=(relay_result_item,),
@@ -535,7 +623,7 @@ def _disclose_issued_certificate(
     register_issued_certificate(
         config.shell,
         domain=config.domain,
-        technique=f"ADCS{technique} — certificate issued through a relayed authentication",
+        technique=f"ADCS{technique}: certificate issued through a relayed authentication",
         principal=relay_item.principal or metadata.get("cert_subject"),
         serial=metadata.get("cert_serial"),
         request_id=metadata.get("request_id"),
@@ -589,8 +677,9 @@ def _relay_result_to_esc(
         timed_out=result.relay_result.timed_out,
         coercion_success=result.coercion_success,
     )
-    error = fallback_error
-    if relay_results:
+    listener_error = getattr(result.relay_result, "listener_error", None)
+    error = listener_error or fallback_error
+    if not listener_error and relay_results:
         error = relay_results[-1].error or error
     return EscResult(
         success=False, esc=esc, error=error,
@@ -649,8 +738,9 @@ def _relay_chain_to_esc_result(
         timed_out=result.relay_result.timed_out,
         coercion_success=result.coercion_success,
     )
-    error = fallback_error
-    if relay_results:
+    listener_error = getattr(result.relay_result, "listener_error", None)
+    error = listener_error or fallback_error
+    if not listener_error and relay_results:
         error = relay_results[-1].error or error
     return EscResult(
         success=False,

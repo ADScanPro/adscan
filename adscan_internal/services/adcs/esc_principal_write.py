@@ -265,7 +265,7 @@ async def run_esc9(config: EscConfig) -> EscResult:
             dns_server=config.dns_server,
             ledger_shell=config.shell,
             ledger_domain=config.domain,
-            ledger_technique="ADCSESC9 — certificate enrollment under the swapped UPN",
+            ledger_technique="ADCSESC9: certificate enrollment under the swapped UPN",
             **({} if _esc9_key_size is None else {"key_size": int(_esc9_key_size)}),
         )
         req = await request_certificate_native(req_cfg, out)
@@ -480,7 +480,7 @@ async def run_esc14(config: EscConfig) -> EscResult:
             dns_server=config.dns_server,
             ledger_shell=config.shell,
             ledger_domain=config.domain,
-            ledger_technique="ADCSESC14 — machine certificate enrollment",
+            ledger_technique="ADCSESC14: machine certificate enrollment",
             **({} if _esc14_key_size is None else {"key_size": int(_esc14_key_size)}),
         )
         req = await request_certificate_native(req_cfg, out)

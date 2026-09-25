@@ -1,18 +1,21 @@
-"""Attack-graph pre-flight: surface scale + the engine-routing decision.
+"""Attack-graph pre-flight: surface scale before attack-path discovery runs.
 
 Before attack-path discovery walks a large, dense directory graph, an operator
-has no signal of how big the graph is or that ADscan's mega-hub predictor has
-already decided — silently, inside ``_choose_attack_path_engine`` — to route the
-graph to the bounded/sampled fallback engine. This module makes that decision
-VISIBLE without changing it.
+has no signal of how big the graph is or how dense its control fan-out is. This
+module surfaces those STRUCTURAL facts — it does NOT predict or assert the
+engine's actual routing decision (sampled vs. full discovery): that decision
+depends on reachability and the Tier-0 frontier, resolved only inside the
+compute itself, so a structural pre-flight verdict can and does diverge from
+the real outcome. The authoritative bounded/complete status is surfaced
+post-run instead.
 
 It is a pentester's pre-flight, not a new analysis and not a client-report
 section: every figure it shows already exists (node/edge counts on the loaded
-graph, the control mega-hub count and explosion verdict from the predictor, and
-the exposure anchor from the choke-point SSOT). The builder is pure and
-read-only; three thin render call-sites consume it (the ``graph_stats`` REPL
-verb, the inline pre-flight before a normal ``attack_paths`` compute, and the
-collapsed ``adscan ci`` beacon line).
+graph, the raw control mega-hub count from the predictor, and the exposure
+anchor from the choke-point SSOT). The builder is pure and read-only; three
+thin render call-sites consume it (the ``graph_stats`` REPL verb, the inline
+pre-flight before a normal ``attack_paths`` compute, and the collapsed
+``adscan ci`` beacon line).
 """
 
 from __future__ import annotations
@@ -22,7 +25,6 @@ from typing import Any
 
 from adscan_internal.services.attack_path_explosion_predictor import (
     count_control_mega_hubs,
-    predicts_explosion,
     top_control_hubs,
 )
 
@@ -40,12 +42,13 @@ class GraphStats:
         nodes: Node count in the graph.
         edges: Edge count in the graph.
         edge_node_ratio: ``edges / nodes`` (0.0 when there are no nodes).
-        mega_hub_count: Control mega-hubs the predictor counts (the routing signal).
+        mega_hub_count: Control mega-hubs the predictor counts — a structural
+            observation only. It does NOT predict the engine's actual routing
+            decision (sampled vs. full discovery): that depends on reachability
+            and the Tier-0 frontier, known only after the compute runs. Never
+            render it as a routing verdict.
         top_hubs: The top control fan-outs as ``(source_label, relation, count)``,
             highest first — the human breakdown of what drives the density.
-        predicts_sampled: The predictor's verdict — ``True`` when discovery WILL
-            route to the sampled fallback engine (a prediction, never a coverage
-            claim).
         exposure_source_count: Enabled principals with SOME validated route to a
             Tier-0 target, or ``None`` when it cannot be resolved.
     """
@@ -55,7 +58,6 @@ class GraphStats:
     edge_node_ratio: float
     mega_hub_count: int
     top_hubs: list[tuple[str, str, int]] = field(default_factory=list)
-    predicts_sampled: bool = False
     exposure_source_count: int | None = None
 
 
@@ -78,7 +80,7 @@ def build_graph_stats(
     """Assemble the pre-flight facts for ``domain``'s attack graph.
 
     Pure and read-only: it loads the graph ONCE (or reuses ``graph`` when the
-    caller already holds it — never double-loads), runs the explosion predictor,
+    caller already holds it — never double-loads), runs the mega-hub counter,
     the top-hub extractor and the exposure-source count, and returns the facts.
     It performs NO path compute, no console output and no writes.
 
@@ -91,8 +93,9 @@ def build_graph_stats(
             second ``load_attack_graph`` when it already has the graph in hand.
 
     Returns:
-        A :class:`GraphStats` with the scale, top hubs, sampled-mode prediction and
-        exposure anchor. On an unreadable / missing graph, an all-zero stats value.
+        A :class:`GraphStats` with the scale, top hubs, structural mega-hub count
+        and exposure anchor. On an unreadable / missing graph, an all-zero stats
+        value.
     """
     from adscan_internal.services.attack_graph_service import (
         _resolve_exposure_source_count_for_graph,
@@ -117,7 +120,6 @@ def build_graph_stats(
         edge_node_ratio=ratio,
         mega_hub_count=count_control_mega_hubs(graph),
         top_hubs=top_control_hubs(graph, top_n=_TOP_HUBS_SHOWN),
-        predicts_sampled=predicts_explosion(graph),
         exposure_source_count=_resolve_exposure_source_count_for_graph(graph),
     )
 
@@ -148,10 +150,13 @@ def render_graph_stats_panel(stats: GraphStats, domain: str) -> None:
 
     A static one-shot panel (no ``LiveSession``). Uses the shared ``print_panel``
     so the ``_TeeConsole`` auto-mirrors it into the session recording — NEVER
-    constructs a ``Console()``. The verdict line is a PREDICTION ("will run in
-    sampled mode"), never a coverage claim; "sampled mode" mirrors the post-run
-    ``COVERAGE_MODE_SAMPLED`` vocabulary so the pre-flight and the coverage
-    declaration use one word for one thing.
+    constructs a ``Console()``. The mega-hub count is a STRUCTURAL observation
+    only — this panel never asserts a routing verdict ("will run in sampled
+    mode" / "full discovery"): the structural predictor diverges from the real
+    reachability + Tier-0-aware routing decision, which is only known AFTER the
+    compute runs. The authoritative bounded/complete status is surfaced
+    post-run instead (the result panel body and the recorded
+    ``COVERAGE_MODE_SAMPLED`` coverage declaration).
 
     Args:
         stats: The pre-flight facts.
@@ -191,19 +196,12 @@ def render_graph_stats_panel(stats: GraphStats, domain: str) -> None:
             )
 
     lines.append(Text(""))
-    if stats.predicts_sampled:
-        hub_word = "hub" if stats.mega_hub_count == 1 else "hubs"
-        verdict = Text.from_markup(
-            f"[bold]{stats.mega_hub_count}[/bold] control mega-{hub_word} detected. "
-            "Path discovery will run in sampled mode: every reachable Tier-0 "
-            "target is covered, but the number of routes shown per target is "
-            "capped."
+    hub_word = "hub" if stats.mega_hub_count == 1 else "hubs"
+    lines.append(
+        Text.from_markup(
+            f"[bold]{stats.mega_hub_count}[/bold] control mega-{hub_word} detected."
         )
-    else:
-        verdict = Text(
-            "Within the full-discovery budget. All routes will be enumerated."
-        )
-    lines.append(verdict)
+    )
 
     if stats.exposure_source_count is not None and stats.exposure_source_count > 0:
         principal_word = (

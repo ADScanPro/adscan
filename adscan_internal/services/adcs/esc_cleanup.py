@@ -148,7 +148,7 @@ def register_issued_certificate(
         change_id = ledger.register_change(
             kind=_tax.KIND_ISSUED_CERTIFICATE,
             domain=domain,
-            target=f"Certificate for {subject} — serial {serial_display}",
+            target=f"Certificate for {subject}, serial {serial_display}",
             detail={
                 "principal": principal,
                 "serial": serial,
@@ -329,7 +329,7 @@ def register_forged_certificate(
         change_id = ledger.register_change(
             kind=_tax.KIND_FORGED_CERTIFICATE,
             domain=domain,
-            target=f"Forged certificate for {subject_display} — serial {serial_display}",
+            target=f"Forged certificate for {subject_display}, serial {serial_display}",
             detail={
                 "principal": principal,
                 "subject": subject,
@@ -350,7 +350,7 @@ def register_forged_certificate(
         print_exception(exception=exc)
         return None
     object_dn = (
-        f"CA {ca_name} — no request id (certificate absent from the CA database)"
+        f"CA {ca_name}, no request id (certificate absent from the CA database)"
         if ca_name
         else "No request id (certificate absent from the CA database)"
     )

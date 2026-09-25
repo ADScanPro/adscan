@@ -15,6 +15,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
+from adscan_core.reporting.attack_path_coverage import (
+    AttackPathCoverage,
+    REASON_DFS_ABORTED,
+    REASON_PREDICTED_EXPLOSION,
+)
+from adscan_core.reporting.attack_path_memory_gate import (
+    _AttackPathMemoryBudgetExceeded,
+)
 from adscan_core.reporting.unauthenticated_reach import (
     UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE,
     is_unauthenticated_entry_label,
@@ -27,13 +35,18 @@ from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services import attack_graph_core
 from adscan_internal.services import attack_path_progress
+from adscan_internal.services.attack_path_explosion_predictor import (
+    predicts_explosion_reachable,
+)
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
 from adscan_internal.services.compromise_class import (
+    apply_path_based_classification,
     is_proven_unauthenticated_domain_breaker,
     resolve_record_compromise_class,
 )
+from adscan_internal.services.tier_descent_prune import apply_tier_descent_prune
 from adscan_internal.services.path_state import (
     _PROVEN_STATUSES,
     COVERAGE_SAMPLE_STATUS,
@@ -43,6 +56,7 @@ from adscan_internal.services.tier_lattice import (
     classify_target_tier,
     comparability_key,
     record_domain_compromise_tier,
+    stamp_records_domain_compromise_tier,
     stamp_records_target_tier,
     target_tier_from_record,
     tier_dominates,
@@ -428,6 +442,17 @@ def prepare_membership_snapshot(
     ):
         normalized = dict(data)
         normalized.setdefault("tier0_users", [])
+        # Ensure the label->real-name map exists on a pre-built snapshot too, so
+        # locale-sensitive names resolve losslessly regardless of which branch
+        # produced the snapshot. Merge (never clobber) any persisted map.
+        if isinstance(normalized.get("nodes"), dict):
+            derived_names = _build_label_to_name(normalized["nodes"], domain)
+            existing_names = normalized.get("label_to_name")
+            if isinstance(existing_names, dict):
+                for key, value in derived_names.items():
+                    existing_names.setdefault(key, value)
+            elif derived_names:
+                normalized["label_to_name"] = derived_names
         # When the file also has raw BH edges (membership-1.0 schema written by
         # persist_bloodhound_membership_snapshot), merge those MemberOf edges into
         # the existing dicts. This prevents runtime additions (ESC13, AddMember)
@@ -524,6 +549,12 @@ def prepare_membership_snapshot(
     group_labels: set[str] = set()
     label_to_sid: dict[str, str] = {}
     sid_to_label: dict[str, str] = {}
+    # Canonical UPPER label -> REAL sAMAccountName (lower-cased for census/display
+    # parity). Captured from the node's true samaccountname so a locale-sensitive
+    # name (Turkish dotless-i, German ß) can be recovered exactly instead of being
+    # rebuilt by lower-casing the UPPER label (which corrupts it). See
+    # ``membership_label_to_real_name`` and the KPI reconciliation it fixes.
+    label_to_name: dict[str, str] = _build_label_to_name(nodes_map, domain)
     domain_sid: str | None = None
     preferred_domain_sid: str | None = None
     first_domain_sid: str | None = None
@@ -628,6 +659,7 @@ def prepare_membership_snapshot(
         "tier0_users": sorted(tier0_users, key=str.lower),
         "label_to_sid": label_to_sid,
         "sid_to_label": sid_to_label,
+        "label_to_name": label_to_name,
         "domain_sid": domain_sid,
     }
 
@@ -737,6 +769,56 @@ def _membership_label_to_name(label: str) -> str:
     if "@" in raw:
         return raw.split("@", 1)[0].strip()
     return raw
+
+
+def _build_label_to_name(nodes_map: dict[str, Any], domain: str) -> dict[str, str]:
+    """Map each User/Computer canonical label -> its REAL sAMAccountName (lower).
+
+    Captured from the node's actual ``samaccountname`` BEFORE the canonical label
+    is upper-cased, so a locale-sensitive name (Turkish dotless-i ``ı``, German
+    ``ß``) survives losslessly. Consumers use :func:`membership_label_to_real_name`
+    to recover it instead of lower-casing the UPPER canonical label, which
+    corrupts such names (``AYAZICI`` -> ``ayazici`` != real ``ayazıcı``).
+    """
+    out: dict[str, str] = {}
+    if not isinstance(nodes_map, dict):
+        return out
+    for node in nodes_map.values():
+        if not isinstance(node, dict) or _node_kind(node) not in {"User", "Computer"}:
+            continue
+        real_name = str(_canonical_principal_label_for_membership(node) or "").strip()
+        if not real_name:
+            continue
+        label = _canonical_membership_label(domain, real_name)
+        if label:
+            out.setdefault(label, real_name.lower())
+    return out
+
+
+def membership_label_to_real_name(snapshot: Any, label: str) -> str:
+    """Recover a principal's REAL sAMAccountName from its canonical label.
+
+    Uses the snapshot's ``label_to_name`` map (populated by
+    :func:`prepare_membership_snapshot` from the node's true ``samaccountname``)
+    so locale-sensitive names are exact. Falls back to the legacy
+    ``_membership_label_to_name(label).lower()`` reconstruction only when the
+    label is absent from the map (a synthetic / augmented label with no backing
+    node) — for plain ASCII names the two agree, so the fallback never regresses
+    the common case.
+
+    This is the SSOT for "canonical membership label -> real name". Never rebuild
+    a real name inline by lower-casing the UPPER label: that silently drops
+    accounts whose name contains ``ı`` / ``ß`` from every real-name-keyed set
+    (the enabled-users census, the exposure-KPI ordinary denominator).
+    """
+    lossy = _membership_label_to_name(label).strip().lower()
+    if isinstance(snapshot, dict):
+        mapping = snapshot.get("label_to_name")
+        if isinstance(mapping, dict):
+            resolved = mapping.get(label)
+            if isinstance(resolved, str) and resolved:
+                return resolved
+    return lossy
 
 
 def _normalize_account(value: str) -> str:
@@ -3434,6 +3516,166 @@ def filter_shortest_paths_for_principals(
     return [record for idx, record in enumerate(records) if idx in keep_indices]
 
 
+def apply_nondomain_display_listing_collapse(
+    records: list[dict[str, Any]],
+    *,
+    graph: dict[str, Any],
+    domain: str,
+    snapshot: dict[str, Any] | None,
+    scope: str,
+    target: str = "highvalue",
+    target_mode: str = "object",
+    owned_labels: frozenset[str] | None = None,
+    allow_owned_terminal_target: bool = False,
+    display_friendly: bool | None = None,
+    principal_count: int = 1,
+) -> list[dict[str, Any]]:
+    """Collapse a non-domain (owned/user/principals) display-path listing — the SSOT.
+
+    This is the shell-free skeleton of the CLI service's non-domain
+    ``_apply_local_postprocessing_pipeline`` path-SET stages, extracted so BOTH the
+    CLI (which re-applies these stages after this collapse — idempotently) AND the
+    web CTEM (which calls the core compute directly, with no shell) collapse the
+    SAME owned/user/principals listing to the SAME finding set. Before this, the web
+    rendered these scopes UNCOLLAPSED (~15× the CLI count on a dense graph) because
+    the service pipeline never ran on that surface.
+
+    Stages (mirroring the service's shell-free, path-SET-affecting stages, in order):
+    scope-filter → terminal-MemberOf trim (target all/lowpriv) → owned-terminal
+    filter → minimize (scope/principal_count-aware leading-MemberOf) → exact-key
+    dedup → affected-user metadata (filter_empty) → tier stamps → tier-descent prune
+    → containment collapse (``filter_contained_paths_for_domain_listing``) →
+    trailing-contextual dedup (6c) → prefix-dominated elimination (6b).
+
+    Shell-only stages the service keeps CLI-side (they change only display metadata,
+    never the SET) are NOT run here: the memory gate, the extra shell affected-user
+    fallbacks, ``_annotate_record_target_priority`` (ADCS/OU), and decoration.
+
+    The operation is IDEMPOTENT (running it again removes nothing), which is what
+    lets the CLI service pipeline re-apply its equivalent stages on this already-
+    collapsed output byte-identically. ``domain`` scope is NOT routed here — it has
+    its own ``filter_domain_listing_paths`` skeleton (terminal + tier collapse key).
+    """
+    if not records:
+        return records
+
+    label_to_node = attack_graph_core.build_snapshot_label_to_node(
+        snapshot, base_graph=graph
+    )
+    target_mode_norm = str(target_mode or "object").strip().lower()
+    if display_friendly is None:
+        display_friendly = target_mode_norm != "object"
+
+    # Stage 1: collectable-computers scope-terminal filter (internal scope nodes).
+    scope_filtered: list[dict[str, Any]] = []
+    for rec in records:
+        node_labels = rec.get("nodes") if isinstance(rec.get("nodes"), list) else []
+        terminal_label = str(
+            rec.get("target") or (node_labels[-1] if node_labels else "") or ""
+        ).strip()
+        if attack_graph_core.is_collectable_computers_scope_node(
+            label_to_node.get(terminal_label)
+        ):
+            continue
+        scope_filtered.append(rec)
+    records = scope_filtered
+
+    # Stage 2: non-terminal MemberOf trim (mirrors BH CE; target all/lowpriv only).
+    if target in {"all", "lowpriv"}:
+        except_hv = target == "all"
+        trimmed_kept: list[dict[str, Any]] = []
+        for rec in records:
+            rels = rec.get("relations") or rec.get("rels") or []
+            if str(rels[-1] if rels else "").strip().lower() != "memberof":
+                trimmed_kept.append(rec)
+                continue
+            if except_hv:
+                tgt_node = label_to_node.get(str(rec.get("target") or "")) or {}
+                if attack_graph_core._node_is_effectively_high_value(tgt_node):  # noqa: SLF001
+                    trimmed_kept.append(rec)
+                    continue
+            trimmed = attack_graph_core.trim_trailing_memberof_edges(
+                rec, label_to_node=label_to_node, except_hv=except_hv
+            )
+            if trimmed is not None:
+                trimmed_kept.append(trimmed)
+        records = trimmed_kept
+
+    # Stage 2b: owned-terminal filter — drop paths ending at an owned principal.
+    if owned_labels and scope != "domain" and not allow_owned_terminal_target:
+        records = [
+            rec
+            for rec in records
+            if _normalize_account(str(rec.get("target") or "")) not in owned_labels
+        ]
+
+    # Stage 3: minimize (scope/principal_count-aware — enables leading-MemberOf strip
+    # for multi-principal listings, matching the service call exactly).
+    records = minimize_display_paths(
+        records,
+        domain=domain,
+        snapshot=snapshot,
+        scope=scope,
+        principal_count=principal_count,
+    )
+
+    # Stage 4: exact-key safety-net dedup.
+    seen: set[Any] = set()
+    deduped: list[dict[str, Any]] = []
+    for rec in records:
+        key = attack_graph_core.display_record_signature(rec)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(rec)
+    records = deduped
+
+    # Stage 5: affected-user metadata (core; filter_empty prunes empty-affected rows
+    # that minimize's source rewrite can create). The shell fallbacks the service
+    # layers on top are metadata-only and never change the SET, so they stay CLI-side.
+    records = apply_affected_user_metadata(
+        records, graph=graph, domain=domain, snapshot=snapshot, filter_empty=True
+    )
+    if not records:
+        return records
+
+    # Stage 6: tier stamps + tier-descent noise prune, then the containment collapse.
+    stamp_records_target_tier(records, label_to_node=label_to_node)
+    stamp_records_domain_compromise_tier(records, label_to_node=label_to_node)
+    records = apply_tier_descent_prune(records, label_to_node)
+    if not display_friendly:
+        records, _ = attack_graph_core.filter_contained_paths_for_domain_listing(
+            records, keep_shortest=True, preserve_prefix_paths=True
+        )
+    elif target_mode_norm in {"tier0", "impact"}:
+        records, _ = attack_graph_core.filter_contained_paths_for_domain_listing(
+            records,
+            keep_shortest=True,
+            is_hv_terminal=lambda rec: attack_graph_core.record_terminal_is_hv(
+                rec, label_to_node
+            ),
+            preserve_prefix_paths=True,
+        )
+    else:
+        records, _ = attack_graph_core.filter_contained_paths_for_domain_listing(
+            records, keep_shortest=False
+        )
+
+    # Stage 6c/6b: trailing-contextual dedup then prefix-dominated elimination.
+    records, _ = attack_graph_core.deduplicate_trailing_contextual_suffix_paths(records)
+    records, _ = attack_graph_core.filter_prefix_paths_dominated_by_super_path(records)
+
+    # Path-based compromise-class stamp (display metadata; matches the service's
+    # stage-7 classification so the web reads the same class the CLI does).
+    for rec in records:
+        target_lookup_label = str(
+            rec.get("terminal_target_label") or rec.get("target") or ""
+        )
+        tgt_node = label_to_node.get(target_lookup_label) or {}
+        apply_path_based_classification(rec, tgt_node)
+
+    return records
+
+
 def _inject_memberof_edges_from_snapshot(
     runtime_graph: dict[str, Any],
     domain: str,
@@ -3803,7 +4045,12 @@ def compute_display_paths_for_domain(
         if isinstance(n, dict)
     }
     filtered, _ = attack_graph_core.filter_domain_listing_paths(
-        deduped, label_to_node=_l2n, keep_longest=keep_longest
+        deduped,
+        label_to_node=_l2n,
+        keep_longest=keep_longest,
+        # HV-scope filter: only a ``--target highvalue`` listing drops a non-HV dead-end
+        # terminal (a ``--target all`` listing is meant to include non-HV terminals).
+        restrict_to_hv_scope=(str(target) == "highvalue"),
     )
     _log_phase_timing(
         scope="domain",
@@ -4255,3 +4502,255 @@ def compute_display_paths_for_principals(
         records=annotated,
     )
     return annotated
+
+
+# --------------------------------------------------------------------------- #
+# The self-protecting compute primitive (the fallback-decision SSOT).
+# --------------------------------------------------------------------------- #
+#
+# ``compute_display_paths_with_fallback`` unifies the two ways attack-path
+# discovery falls back from the complete DFS engine to the bounded per-terminal
+# engine, so REPL, deliver, the service computes AND the paid web CTEM converge on
+# ONE decision:
+#
+#   1. PROACTIVE — the reachability-aware explosion predicate
+#      (``predicts_explosion_reachable``) routes a genuinely-exploding domain
+#      straight to the bounded engine, skipping a DFS that would abort anyway.
+#   2. REACTIVE — on the DFS branch the in-DFS ``DfsMemoryBudget`` (already inside
+#      ``attack_graph_core``'s DFS entry points) raises
+#      ``_AttackPathMemoryBudgetExceeded`` on a mid-recursion runaway; the primitive
+#      catches it and re-runs the bounded engine ONCE. A nested abort (the bounded
+#      engine itself hits the ceiling) degrades to an empty, coverage-bounded result
+#      and NEVER recurses.
+#
+# It lives here — the pure, import-safe home of the ``compute_display_paths_for_*``
+# functions the web imports directly — so the same self-protection reaches the web
+# CTEM, which calls the core functions (not the ``attack_graph_service`` wrappers)
+# and therefore had neither the proactive routing nor the reactive recovery. See
+# ``docs/superpowers/specs/2026-09-23-attack-path-fallback-decision-ssot.md``.
+
+
+def _resolve_start_node_ids_for_scope(
+    graph: dict[str, Any], scope: str, scope_kwargs: dict[str, Any]
+) -> set[str] | None:
+    """Return the start-node id set the reachable-explosion predicate walks from.
+
+    The predicate only counts a control mega-hub that an owned/start principal can
+    actually reach, so it needs the scope's start set:
+
+    * ``user`` — the single principal named by ``username`` (empty set when the
+      label resolves to no node, so nothing is reachable and the predicate never
+      fires spuriously);
+    * ``principals`` — every principal in the ``principals`` list that resolves to
+      a node;
+    * ``domain`` — the resolved low-priv start ids when the caller supplies them
+      (``start_node_ids``), else the real domain-scope source set derived from the
+      graph via the shared SSOT
+      (``attack_graph_core.derive_domain_scope_source_ids_for_graph``), so the web
+      (which drives this primitive) also stops routing a domain whose only
+      mega-hub is unreachable (an orphan escalation group) to the bounded engine.
+    """
+    if scope == "user":
+        username = scope_kwargs.get("username")
+        node_id = _find_node_id_by_label(graph, str(username)) if username else None
+        return {node_id} if node_id else set()
+    if scope == "principals":
+        ids: set[str] = set()
+        for principal in scope_kwargs.get("principals") or []:
+            node_id = _find_node_id_by_label(graph, str(principal))
+            if node_id:
+                ids.add(node_id)
+        return ids
+    start_node_ids = scope_kwargs.get("start_node_ids")
+    if start_node_ids:
+        return set(start_node_ids)
+    # Domain scope with no explicit start set: derive the real domain-scope source
+    # set from the graph rather than ``None`` (which would fall back to the raw
+    # structural mega-hub count and over-fire on an orphan hub). An empty set means
+    # no eligible start node, so the predicate never fires spuriously.
+    return attack_graph_core.derive_domain_scope_source_ids_for_graph(graph)
+
+
+def _run_scope_compute(
+    graph: dict[str, Any],
+    *,
+    domain: str,
+    snapshot: dict[str, Any] | None,
+    scope: str,
+    scope_kwargs: dict[str, Any],
+    force_perterminal: bool,
+) -> list[dict[str, Any]]:
+    """Dispatch to the requested scope's core compute with the fallback flag set.
+
+    ``scope_kwargs`` carries the per-scope kwargs the existing core function takes
+    (``max_depth``/``target``/``target_mode``/``username``/``principals``/…). The
+    functions are looked up as module globals at call time, so a test can
+    monkeypatch ``attack_paths_core.compute_display_paths_for_<scope>``.
+    """
+    kwargs = dict(scope_kwargs or {})
+    if scope == "domain":
+        return compute_display_paths_for_domain(
+            graph,
+            domain=domain,
+            snapshot=snapshot,
+            force_perterminal=force_perterminal,
+            **kwargs,
+        )
+    if scope == "user":
+        return compute_display_paths_for_user(
+            graph,
+            domain=domain,
+            snapshot=snapshot,
+            force_perterminal=force_perterminal,
+            **kwargs,
+        )
+    if scope == "principals":
+        return compute_display_paths_for_principals(
+            graph,
+            domain=domain,
+            snapshot=snapshot,
+            force_perterminal=force_perterminal,
+            **kwargs,
+        )
+    raise ValueError(f"unknown attack-path scope: {scope!r}")
+
+
+def compute_display_paths_with_fallback(
+    graph: dict[str, Any],
+    domain: str,
+    *,
+    snapshot: dict[str, Any] | None,
+    scope: str,
+    scope_kwargs: dict[str, Any],
+    exposure_source_count: int | None = None,
+) -> tuple[list[dict[str, Any]], AttackPathCoverage]:
+    """Compute display paths for a scope, self-protecting against explosion/OOM.
+
+    The SSOT that unifies proactive explosion routing with reactive RAM-gate
+    recovery, returning ``(paths, AttackPathCoverage)``. Every caller — REPL,
+    deliver, the service computes and the web CTEM — gets the same decision and the
+    same client-facing coverage declaration.
+
+    Behaviour:
+
+    1. **Proactive.** Resolve the scope's start set and run
+       :func:`predicts_explosion_reachable`. If it fires, run the scope compute with
+       the bounded per-terminal engine (``force_perterminal=True``) WITHOUT first
+       attempting the DFS — a coverage-floored SAMPLED result
+       (``reason=predicted_explosion``).
+    2. **DFS.** Otherwise run the full DFS (``force_perterminal=False``). On success,
+       a COMPLETE result.
+    3. **Reactive recovery.** If the DFS raises ``_AttackPathMemoryBudgetExceeded``
+       (the in-DFS runaway bound, or any memory-gate abort the core pipeline
+       surfaces), re-run ONCE with the bounded engine — a SAMPLED result
+       (``reason=dfs_aborted``). If that bounded re-run ITSELF raises, return
+       ``([], coverage)`` with a hard-stop BOUNDED declaration and do NOT recurse.
+
+    Args:
+        graph: The attack graph dict (read for the start-set resolution).
+        domain: The domain whose paths are computed.
+        snapshot: The membership snapshot, or ``None``.
+        scope: ``"domain"`` / ``"user"`` / ``"principals"``.
+        scope_kwargs: The per-scope kwargs the core compute function takes.
+        exposure_source_count: Optional stable exposure count for the SAMPLED
+            declaration (how many principals reach a high-value target). Left
+            ``None`` yields a valid declaration without the concrete number; a
+            caller that can compute it (the service/web) supplies it.
+
+    Returns:
+        ``(paths, coverage)``. ``coverage.engine_used`` is ``"dfs"`` for a complete
+        run or ``"fallback"`` for either bounded case; ``coverage.bounded`` is
+        ``True`` for every fallback result.
+    """
+    start_node_ids = _resolve_start_node_ids_for_scope(graph, scope, scope_kwargs)
+
+    def _collapse_nondomain(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse an owned/user/principals listing to the SAME finding set the CLI
+        service pipeline produces.
+
+        The CLI runs ``_apply_local_postprocessing_pipeline`` after its DFS; the web
+        CTEM (the only caller of this fallback primitive) calls the core computes
+        directly and never did, so it rendered owned/user/principals UNCOLLAPSED
+        (~15× the CLI count). Routing every non-domain fallback result through the
+        shared shell-free collapse SSOT closes that CLI↔web drift without moving the
+        CLI (which does not use this primitive). ``domain`` scope has its own collapse
+        inside ``compute_display_paths_for_domain`` and is passed through untouched.
+        """
+        if scope == "domain" or not paths:
+            return paths
+        principals = scope_kwargs.get("principals") if scope == "principals" else None
+        owned_labels = (
+            frozenset(_normalize_account(str(p)) for p in principals)
+            if principals
+            else None
+        )
+        principal_count = len(principals) if principals else 1
+        try:
+            return apply_nondomain_display_listing_collapse(
+                paths,
+                graph=graph,
+                domain=domain,
+                snapshot=snapshot,
+                scope=scope,
+                target=str(scope_kwargs.get("target") or "highvalue"),
+                target_mode=str(scope_kwargs.get("target_mode") or "object"),
+                owned_labels=owned_labels,
+                principal_count=principal_count,
+            )
+        except Exception:  # noqa: BLE001 — a collapse miss must never break discovery.
+            return paths
+
+    # 1. Proactive — skip the DFS that would abort anyway.
+    try:
+        predicted = predicts_explosion_reachable(graph, start_node_ids=start_node_ids)
+    except Exception:  # noqa: BLE001 — a routing miss must never break discovery.
+        predicted = False
+    if predicted:
+        paths = _run_scope_compute(
+            graph,
+            domain=domain,
+            snapshot=snapshot,
+            scope=scope,
+            scope_kwargs=scope_kwargs,
+            force_perterminal=True,
+        )
+        return _collapse_nondomain(paths), AttackPathCoverage.fallback(
+            reason=REASON_PREDICTED_EXPLOSION,
+            exposure_source_count=exposure_source_count,
+        )
+
+    # 2. DFS, with 3. reactive recovery on a memory-gate abort.
+    try:
+        paths = _run_scope_compute(
+            graph,
+            domain=domain,
+            snapshot=snapshot,
+            scope=scope,
+            scope_kwargs=scope_kwargs,
+            force_perterminal=False,
+        )
+        return _collapse_nondomain(paths), AttackPathCoverage.complete()
+    except _AttackPathMemoryBudgetExceeded as exc:
+        try:
+            paths = _run_scope_compute(
+                graph,
+                domain=domain,
+                snapshot=snapshot,
+                scope=scope,
+                scope_kwargs=scope_kwargs,
+                force_perterminal=True,
+            )
+        except _AttackPathMemoryBudgetExceeded:
+            # The bounded engine itself hit the ceiling — degrade to an empty,
+            # coverage-bounded result. NEVER recurse (mirror
+            # ``attack_graph_service._recover_from_memory_abort``).
+            return [], AttackPathCoverage.fallback(
+                reason=REASON_DFS_ABORTED,
+                examined_routes=exc.examined_routes,
+                hard_stop=True,
+            )
+        return _collapse_nondomain(paths), AttackPathCoverage.fallback(
+            reason=REASON_DFS_ABORTED,
+            examined_routes=exc.examined_routes,
+            exposure_source_count=exposure_source_count,
+        )

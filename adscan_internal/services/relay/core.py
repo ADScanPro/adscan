@@ -18,6 +18,31 @@ from adscan_internal.rich_output import mark_sensitive, print_error_debug
 from adscan_core.rich_output import print_exception
 
 
+class RelayListenerUnavailableError(Exception):
+    """The relay listener could not bind its host/port (a vantage/data gap).
+
+    Raised when the listen socket cannot be opened — most commonly
+    ``EADDRINUSE`` because another ADscan listener (NBT-NS/LLMNR poisoning, the
+    shared SMB capture listener) already holds the port. This is a DATA/VANTAGE
+    gap, NOT a defensive control: it never claims the environment blocked the
+    attack (Exposure-Validation doctrine). The relay runner converts it into a
+    failed :class:`RelayRunResult` so execution continues to the next path
+    instead of aborting the whole phase with a raw traceback.
+    """
+
+    def __init__(self, *, host: str, port: int, reason: str) -> None:
+        self.host = host
+        self.port = port
+        self.reason = reason
+        super().__init__(self.reason_summary)
+
+    @property
+    def reason_summary(self) -> str:
+        """One-line, client-safe reason (no defensive-control claim)."""
+
+        return f"relay listener port {self.port} unavailable — {self.reason}"
+
+
 @dataclass(frozen=True)
 class RelayAuthentication:
     """Authentication material captured from a relay source.
@@ -83,6 +108,11 @@ class RelayRunResult:
     results: tuple[RelayTargetResult, ...]
     timed_out: bool
     authentications_seen: int
+    # Set to a one-line, client-safe reason when the listener could not bind
+    # (e.g. the port was already held). ``None`` on any run where the listener
+    # came up. Consumers render this as an honest "listener unavailable" data
+    # gap instead of a generic "no auth captured".
+    listener_error: str | None = None
 
     @property
     def success(self) -> bool:

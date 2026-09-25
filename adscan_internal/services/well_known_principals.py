@@ -33,6 +33,8 @@ from adscan_core.reporting.principal_display import (  # noqa: F401
     _DOMAIN_RELATIVE_RID_NAMES,
     _WELL_KNOWN,
     _looks_like_sid,
+    deshout_display_label,
+    humanize_chokepoint_node_label,
     humanize_domain_for_display,
     humanize_principal_for_prose,
     humanize_principal_label,

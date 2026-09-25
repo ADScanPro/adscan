@@ -7,7 +7,7 @@ credential through :func:`resolve_sweep_credential` BEFORE it builds per-host
 configs. The result is a reuse-ready, lockout-safe credential that every per-host
 config shares.
 
-The problem this fixes (validated 2026-06-16 on the Cyberzaintza audit)
+The problem this fixes (validated 2026-06-16 on the RealCorp audit)
 ====================================================================
 Passing a plaintext password / NT hash straight into N per-host transport
 configs makes each host mint its OWN TGT from the secret (``kerberos-password://``

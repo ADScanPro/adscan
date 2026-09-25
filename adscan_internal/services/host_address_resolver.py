@@ -51,8 +51,10 @@ from adscan_core.rich_output import (
 )
 
 __all__ = [
+    "DCConnectTarget",
     "HostAddress",
     "resolve_connect_and_spn",
+    "resolve_dc_connect_targets",
     "resolve_host_address",
 ]
 
@@ -1283,3 +1285,132 @@ def resolve_connect_and_spn(
     except Exception as exc:  # noqa: BLE001 — best-effort; keep the name on failure
         print_exception(exception=exc)
     return host, spn_fqdn
+
+
+@dataclass(frozen=True)
+class DCConnectTarget:
+    """One distinct DC to connect to: reachable IP + its OWN Kerberos SPN FQDN.
+
+    ``connect_ip`` is the reachable address SMB/RPC connects to (multi-homed-aware).
+    ``spn_fqdn`` is THIS DC's own FQDN for the ``cifs/<fqdn>`` / ``ldap/<fqdn>``
+    service ticket — never another DC's FQDN and never an IP; ``None`` when no FQDN
+    could be recovered (the caller then relies on the NTLM fallback). ``display`` is
+    the operator-facing label.
+    """
+
+    connect_ip: str
+    spn_fqdn: Optional[str]
+    display: str
+
+
+def resolve_dc_connect_targets(
+    shell: Any,
+    *,
+    domain: str,
+    service: Optional[str] = "smb",
+    probe_port: Optional[int] = 445,
+) -> list[DCConnectTarget]:
+    """Resolve ONE connect target per distinct DC of ``domain`` (SSOT).
+
+    The single source of truth for "iterate every DC and connect to each" — the
+    pattern a multi-DC SYSVOL/SMB/Kerberos sweep needs, and the one place the
+    multi-DC wrong-SPN / duplicated-target bug is prevented. It composes the two
+    existing SSOTs:
+
+    - :func:`adscan_internal.models.domain.resolve_domain_controllers` folds each DC's
+      IP/short/FQDN aliases into ONE record, so a domain that recorded every DC under
+      both its IP and its FQDN yields one record per DC (not two).
+    - :func:`resolve_connect_and_spn` splits each DC into ``(reachable_ip, own_FQDN)``
+      — the IP for the CONNECT, the DC's OWN FQDN for the Kerberos SPN. This fixes the
+      class where an IP DC target inherited the PDC's ``pdc_hostname_fqdn``
+      (``resolve_dc_fqdn`` is domain-wide) so the KDC rejected the ``cifs/<pdc>``
+      ticket presented to a different DC's host (``KRB_ERR_GENERIC`` / ``0xC000006A``).
+
+    Records that resolve to the SAME reachable IP are deduped (an IP-only alias and
+    its FQDN sibling collapse to one target, preferring the entry that recovered a
+    real FQDN SPN). Falls back to ``[pdc]`` when no DC records exist (early scan flow,
+    or a single-DC lab). Best-effort: an unresolvable / down DC stays in the list with
+    its verbatim identifier so the caller can attempt it and skip it gracefully —
+    never a hard failure here.
+
+    Args:
+        shell: The pentest shell (carries ``domains_data`` + workspace dirs).
+        domain: The target domain whose DCs to resolve.
+        service: Service label threaded into the multi-homed NIC selection (``"smb"``).
+        probe_port: The port the caller will connect on, so the reachable IP chosen is
+            one that answers THAT service (445 for SMB).
+
+    Returns:
+        One :class:`DCConnectTarget` per distinct DC, in discovery order.
+    """
+    from adscan_internal.models.domain import (  # noqa: PLC0415
+        resolve_dc_ip,
+        resolve_domain_controllers,
+    )
+    from adscan_internal.services._kerberos_spn import (  # noqa: PLC0415
+        is_ip_address,
+    )
+
+    domain_data = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    pdc = str(domain_data.get("pdc") or "").strip()
+    try:
+        dc_ip = resolve_dc_ip(domain_data)
+    except Exception:  # noqa: BLE001 - resolver read is best-effort
+        dc_ip = None
+
+    # (connect_hint, spn_hint) per SSOT-deduped DC record. Prefer an IP alias for the
+    # connect hint; the SPN hint is the record's OWN FQDN (never the PDC's).
+    endpoints: list[tuple[str, Optional[str]]] = []
+    for rec in resolve_domain_controllers(domain_data).dcs:
+        aliases = [a for a in rec.aliases if a]
+        fqdn = rec.fqdn
+        ip_alias = next((a for a in aliases if is_ip_address(a)), None)
+        connect_hint = ip_alias or fqdn or (aliases[0] if aliases else "")
+        if not connect_hint:
+            continue
+        spn_hint = fqdn or (None if is_ip_address(connect_hint) else connect_hint)
+        endpoints.append((connect_hint, spn_hint))
+    if not endpoints and pdc:
+        endpoints.append((pdc, None if is_ip_address(pdc) else pdc))
+
+    by_ip: dict[str, DCConnectTarget] = {}
+    order: list[str] = []
+    for connect_hint, spn_hint in endpoints:
+        connect_ip: str = connect_hint
+        spn: Optional[str] = spn_hint or connect_hint
+        try:
+            connect_ip, spn = resolve_connect_and_spn(
+                shell,
+                host=connect_hint,
+                domain=domain,
+                resolver_ip=str(dc_ip) if dc_ip else None,
+                spn_hostname=spn_hint or connect_hint,
+                probe_port=probe_port,
+                service=service,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; keep the hint
+            print_exception(exception=exc)
+            connect_ip, spn = connect_hint, (spn_hint or connect_hint)
+        # resolve_connect_and_spn never invents an FQDN from an IP, so an IP-shaped
+        # spn means "no FQDN recovered" -> the caller uses the NTLM fallback.
+        spn_fqdn = spn if (spn and not is_ip_address(str(spn))) else None
+        key = str(connect_ip).strip().lower()
+        if not key:
+            continue
+        existing = by_ip.get(key)
+        if existing is None:
+            by_ip[key] = DCConnectTarget(
+                connect_ip=str(connect_ip),
+                spn_fqdn=spn_fqdn,
+                display=spn_fqdn or str(connect_ip),
+            )
+            order.append(key)
+        elif existing.spn_fqdn is None and spn_fqdn:
+            # A later record recovered a real FQDN for the same reachable IP —
+            # upgrade the deduped target from the NTLM-only entry.
+            by_ip[key] = DCConnectTarget(
+                connect_ip=existing.connect_ip,
+                spn_fqdn=spn_fqdn,
+                display=spn_fqdn,
+            )
+    return [by_ip[k] for k in order]

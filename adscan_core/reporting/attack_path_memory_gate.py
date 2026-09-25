@@ -177,7 +177,9 @@ ATTACK_PATH_COVERAGE_KEY = "attack_path_coverage"
 # SAME declared ``_AttackPathMemoryBudgetExceeded`` the outer gate raises, so the
 # coverage-bounded declaration fires unchanged.
 #
-# Two mechanisms, both ON by default, both raising the same exception:
+# Two mechanisms raise the SAME exception, but they are NOT co-equal: RSS is the
+# authoritative bound whenever it can read, and the absolute count cap is a strict
+# FALLBACK that only governs when RSS sampling is unavailable.
 #
 #   1. PRIMARY — RSS vs the real available ceiling. Every ``_RSS_SAMPLE_STRIDE``
 #      DFS invocations (cheap: the sample is amortised ~1/4096), sample the process
@@ -187,16 +189,39 @@ ATTACK_PATH_COVERAGE_KEY = "attack_path_coverage"
 #      about to kill — stop cleanly. A domain that FITS in RAM never crosses the
 #      fraction, so the bound never fires and coverage is byte-identical: only the
 #      pathological case that OOMs today is touched. This is the zero-coverage-loss
-#      guarantee.
+#      guarantee. Once this reader has produced ONE usable reading (both a process
+#      RSS and a positive available ceiling), RSS is the SOLE abort authority for
+#      the rest of the compute and the mechanism-2 cap below is switched off.
 #
-#   2. SECONDARY — an absolute DFS-state cap, a safety net for environments where
+#   2. SECONDARY (FALLBACK ONLY) — an absolute DFS-state cap for environments where
 #      RSS sampling is unavailable/unreliable (no ``/proc``, no cgroup, a platform
-#      whose RSS reader returns ``None``). Set high enough that no NORMAL domain
-#      reaches it: a real enterprise reporter proved a ~100k-state ceiling stops the
-#      runaway they hit on 24 GB, and the largest healthy real/synthetic baseline
-#      (Forest ``domain/all`` ≈ 96k pre-minimisation transient states) sits just
-#      under that, so the default is set with headroom above the worst healthy case
-#      rather than at it. Configurable via ``ADSCAN_ATTACK_PATHS_MAX_DFS_STATES``.
+#      whose RSS reader returns ``None`` or a partial reading). It fires ONLY when
+#      RSS sampling has NEVER produced a usable reading; the instant RSS reads
+#      successfully it stops being an abort authority. This restores the documented
+#      intent (Task 6g, 2026-09): the fixed count cap previously fired
+#      UNCONDITIONALLY at ``_DEFAULT_MAX_DFS_STATES`` even on a host with ample free
+#      RAM whose RSS reader worked fine, aborting a large-but-fitting all-principals
+#      materialisation to a SAMPLED result with a spurious "raise your memory"
+#      message when the COMPLETE result would have fit — a false positive that
+#      contradicted both this module's own "RSS is primary" comment and the product
+#      doctrine (coverage first; bound only by REAL memory pressure). Deriving the
+#      cap from a memory reading was considered and REJECTED as self-contradictory:
+#      if you can read memory to size the cap you can read RSS live, which IS
+#      mechanism 1 — so the cap stays a pure count needing no memory reader at all,
+#      its whole reason to exist. Set high enough that no NORMAL domain reaches it
+#      even in the RSS-unavailable case: a real enterprise reporter proved a
+#      ~100k-state ceiling stops the runaway they hit on 24 GB, and the largest
+#      healthy real/synthetic baseline (Forest ``domain/all`` ≈ 96k pre-minimisation
+#      transient states) sits just under that, so the default has headroom above the
+#      worst healthy case. Configurable via ``ADSCAN_ATTACK_PATHS_MAX_DFS_STATES``
+#      (which only matters on the RSS-unavailable path).
+#
+#   Why RSS-when-available is SUFFICIENT — no OOM exposure from disabling the count
+#   cap: attack-path enumeration grows resident state INCREMENTALLY. Each path is
+#   bounded and the DFS is cycle-free via the visited set, so there is no sudden
+#   large allocation between two stride samples that the RSS check could jump over.
+#   The ~4096-tick sample catches a runaway long before the kill boundary, so when
+#   RSS is live the count cap adds nothing but false positives.
 
 #: How many ``dfs()`` invocations between RSS samples. A sample reads ``/proc`` and
 #: a cgroup file; at one every few thousand recursive calls the cost is negligible
@@ -209,11 +234,13 @@ _RSS_SAMPLE_STRIDE = 4096
 #: unrecoverable, so the bound leaves the same headroom the projection gate does.
 _RSS_STOP_FRACTION = SAFETY_FRACTION
 
-#: Default absolute DFS-state ceiling (the secondary net). Above the worst HEALTHY
-#: baseline (Forest ``domain/all`` ≈ 96k transient states) with headroom, so a
-#: normal domain never reaches it and the RSS check remains the primary bound.
-#: Operators can RAISE it (or effectively disable it with a very high value) via
-#: ``ADSCAN_ATTACK_PATHS_MAX_DFS_STATES``; the default protects every run.
+#: Default absolute DFS-state ceiling (the secondary net, RSS-UNAVAILABLE path
+#: only). Above the worst HEALTHY baseline (Forest ``domain/all`` ≈ 96k transient
+#: states) with headroom, so even a run with no RSS reader never reaches it on a
+#: normal domain; when RSS sampling works it is the authoritative bound and this cap
+#: never fires. Operators can RAISE it (or effectively disable it with a very high
+#: value) via ``ADSCAN_ATTACK_PATHS_MAX_DFS_STATES``; it protects the RSS-unavailable
+#: case only.
 _DEFAULT_MAX_DFS_STATES = 2_000_000
 
 #: Env var name that overrides the absolute DFS-state ceiling. Forwarded to the
@@ -224,6 +251,10 @@ _MAX_DFS_STATES_ENV = "ADSCAN_ATTACK_PATHS_MAX_DFS_STATES"
 
 def _read_max_dfs_states() -> int:
     """Return the absolute DFS-state ceiling from the env override, best-effort.
+
+    This ceiling governs ONLY the RSS-unavailable fallback path (see
+    :class:`DfsMemoryBudget`): when RSS sampling produces a usable reading the count
+    cap never fires, so this value is inert on any host with a working memory reader.
 
     Falls back to :data:`_DEFAULT_MAX_DFS_STATES` on an unset/invalid value. A
     non-positive override is treated as "disable the absolute net" by returning a
@@ -275,14 +306,26 @@ class DfsMemoryBudget:
     ``attack_graph_core``, so the three sites cannot drift on the bound logic.
     ``tick`` increments a state counter and, every :data:`_RSS_SAMPLE_STRIDE`
     invocations, samples live RSS vs available memory; it raises
-    :class:`_AttackPathMemoryBudgetExceeded` when either the RSS fraction or the
-    absolute state cap is crossed. Both checks are ON by default.
+    :class:`_AttackPathMemoryBudgetExceeded` on real memory pressure.
+
+    **RSS is authoritative; the absolute state cap is a strict fallback.** The RSS
+    fraction check is always live. The absolute ``max_states`` cap fires ONLY when
+    RSS sampling has NEVER produced a usable reading (:attr:`_rss_active` still
+    ``False``) — a host with no ``/proc``/cgroup and an RSS reader that returns
+    ``None``. The first usable reading (a process RSS AND a positive available
+    ceiling) latches :attr:`_rss_active` ``True`` and from then on the RSS fraction
+    is the sole abort authority; the count cap cannot fire. This is the documented
+    intent (Task 6g): the count cap used to abort UNCONDITIONALLY at ``max_states``
+    even when RSS reported the host nowhere near its limit, turning a
+    large-but-fitting materialisation into a false bounded/sampled result. See the
+    module comment for why RSS-when-available is sufficient (incremental state
+    growth, no allocation spike between samples).
 
     Best-effort by construction: the RSS sample is wrapped so a sampling failure
     (no ``/proc``, no cgroup, an RSS/available read that returns ``None``) silently
-    falls back to the absolute state-cap-only path — a broken memory reader must
-    never break discovery, and the state cap is the safety net for exactly that
-    environment.
+    leaves :attr:`_rss_active` ``False`` and lets the absolute state cap remain the
+    net — a broken memory reader must never break discovery, and the count cap is
+    the safety net for exactly that environment.
 
     The message is DEFERRED to raise-time and worded for the operator; the client
     coverage declaration is built from :attr:`examined_states` by the catch site,
@@ -302,39 +345,61 @@ class DfsMemoryBudget:
         self._max_states = (
             int(max_states) if max_states is not None else _read_max_dfs_states()
         )
+        #: Latched ``True`` the first time :meth:`_rss_crossed_ceiling` obtains a
+        #: USABLE reading (a process RSS and a positive available ceiling). While it
+        #: is ``False`` — RSS sampling has never succeeded — the absolute state cap
+        #: is the fallback net; once it is ``True`` the RSS fraction is the sole
+        #: abort authority and the count cap can never fire.
+        self._rss_active = False
 
     def tick(self) -> None:
         """Account one ``dfs()`` invocation; raise the budget exception if bound.
 
         Called at the top of every recursive ``dfs()``. Increments the state
-        counter, checks the absolute cap unconditionally (cheap), and samples RSS
-        once every ``sample_stride`` calls (the expensive read, amortised to ~zero).
+        counter and applies the two bounds with RSS as the authority:
+
+        * PRIMARY — sample live RSS vs available memory on the stride (the expensive
+          read, amortised to ~zero) and abort on real memory pressure. A usable
+          reading latches :attr:`_rss_active`.
+        * SECONDARY (fallback) — the absolute state cap fires ONLY when RSS sampling
+          has never produced a usable reading. When the cap is reached but RSS is
+          not yet confirmed active, take one RSS sample now, so the cap can never
+          fire ahead of a working RSS reader regardless of how ``sample_stride`` and
+          ``max_states`` relate. If that sample is usable, RSS governs (and aborts
+          here only if it actually crossed the ceiling); only a genuinely
+          unavailable reader lets the count cap abort.
         """
         self.examined_states += 1
+        at_cap = self.examined_states >= self._max_states
 
-        # Secondary net — absolute DFS-state ceiling. Cheap, checked every call.
-        if self.examined_states >= self._max_states:
+        # PRIMARY — RSS vs the real available ceiling. Sample on the stride, and also
+        # once the absolute cap is reached while RSS has not yet confirmed usable, so
+        # the fallback cap never pre-empts a working RSS reader.
+        if self.examined_states % self._sample_stride == 0 or (
+            at_cap and not self._rss_active
+        ):
+            crossed, rss_bytes, available_bytes = self._rss_crossed_ceiling()
+            if crossed:
+                raise _AttackPathMemoryBudgetExceeded(
+                    _dfs_bound_operator_message(
+                        reason="rss",
+                        examined_states=self.examined_states,
+                        projected_bytes=rss_bytes,
+                        available_bytes=available_bytes,
+                    ),
+                    examined_routes=self.examined_states,
+                )
+
+        # SECONDARY net — absolute DFS-state ceiling. Fires ONLY when RSS sampling
+        # has never produced a usable reading (no /proc, no cgroup, a None reader).
+        # Once RSS is active the fraction check above is the sole abort authority.
+        if at_cap and not self._rss_active:
             raise _AttackPathMemoryBudgetExceeded(
                 _dfs_bound_operator_message(
                     reason="state_cap",
                     examined_states=self.examined_states,
                     projected_bytes=None,
                     available_bytes=None,
-                ),
-                examined_routes=self.examined_states,
-            )
-
-        # Primary — RSS vs the real available ceiling, sampled on a stride.
-        if self.examined_states % self._sample_stride != 0:
-            return
-        crossed, rss_bytes, available_bytes = self._rss_crossed_ceiling()
-        if crossed:
-            raise _AttackPathMemoryBudgetExceeded(
-                _dfs_bound_operator_message(
-                    reason="rss",
-                    examined_states=self.examined_states,
-                    projected_bytes=rss_bytes,
-                    available_bytes=available_bytes,
                 ),
                 examined_routes=self.examined_states,
             )
@@ -346,6 +411,11 @@ class DfsMemoryBudget:
         readable AND ``rss >= available * fraction``. Any failure (no reader, a
         ``None`` value) returns ``(False, ...)`` so the DFS proceeds under the
         absolute state cap alone — never abort on a blind read.
+
+        A USABLE reading (both a process RSS and a positive available ceiling)
+        latches :attr:`_rss_active` ``True`` — from then on RSS is the sole abort
+        authority and the absolute state cap is disabled. A partial/absent reading
+        leaves the latch untouched, so the count-cap fallback still governs.
         """
         try:
             from adscan_core import memory_probe
@@ -359,6 +429,10 @@ class DfsMemoryBudget:
             return False, None, None
         if available <= 0:
             return False, rss, available
+        # A usable reading: RSS is now authoritative, so the count cap is switched
+        # off for the rest of the compute (the false-positive fix — RSS, when it can
+        # read, is the ground truth the state count only ever approximated).
+        self._rss_active = True
         threshold = int(available * self._rss_stop_fraction)
         return rss >= threshold, rss, available
 
@@ -494,6 +568,24 @@ def project_peak_bytes(
     return graph_term + max(affected_term, density_term)
 
 
+def _resolve_pre_dfs_ceiling(limit_bytes: Optional[int]) -> Optional[int]:
+    """Pick the DETERMINISTIC ceiling for the Stage-A (pre-DFS) verdict.
+
+    Stage A must be reproducible: the SAME graph on the SAME host must reach the
+    SAME abort/proceed decision regardless of the transient free RAM at that
+    instant. So it compares ONLY against the STABLE absolute ceiling — the
+    container cgroup limit or the host total — never ``available_bytes`` (which
+    another workload moves minute to minute). Returns ``None`` when no hard limit
+    is known, so the gate proceeds (no deterministic ceiling to judge against) and
+    the in-DFS ``DfsMemoryBudget`` — sampling actual RSS vs the real headroom —
+    stays the authoritative OOM guard. Stage B keeps the headroom-aware
+    :func:`_resolve_ceiling` instead.
+    """
+    if isinstance(limit_bytes, int) and limit_bytes > 0:
+        return limit_bytes
+    return None
+
+
 def _resolve_ceiling(
     limit_bytes: Optional[int], available_bytes: Optional[int]
 ) -> Optional[int]:
@@ -562,6 +654,24 @@ def evaluate_projection(
 ) -> MemoryProjection:
     """Project the peak for a stage and decide whether it crosses the ceiling.
 
+    **The ceiling is stage-aware, by design (2026-09).**
+
+    * **Stage A (``pre_dfs``, ``raw_paths is None``) — DETERMINISTIC.** The pre-DFS
+      verdict compares the graph-resident term against the STABLE absolute ceiling
+      (``limit_bytes``, the container/host total limit) ONLY, never the transient
+      ``available_bytes``. Comparing against free RAM made the SAME graph flip
+      abort/proceed depending on what else ran on the host (non-deterministic), and
+      over-aborted a domain that completes comfortably. Stage A projects only the
+      graph-resident term (no path-combinatorics estimate), so a Stage-A
+      ``exceeds`` is the near-certain "graph literally too big to hold" case. When
+      no hard ``limit_bytes`` is known there is no deterministic ceiling → the gate
+      proceeds and the in-DFS ``DfsMemoryBudget`` (actual-RSS) stays the
+      authoritative OOM guard.
+    * **Stage B (``post_dfs``) — unchanged.** It projects the full peak (graph +
+      the affected-aware / density path terms) and compares against the REAL
+      headroom (``available_bytes`` preferred, ``limit_bytes`` fallback), because a
+      post-DFS spike is killed by the memory free RIGHT NOW.
+
     Args:
         nodes: Graph node count.
         edges: Graph edge count.
@@ -569,7 +679,8 @@ def evaluate_projection(
             pre-DFS stage (graph term only).
         limit_bytes: The container memory ceiling (cgroup limit), or ``None``.
         available_bytes: Memory free right now, or ``None``.
-        stage: ``"pre_dfs"`` or ``"post_dfs"`` — recorded on the result.
+        stage: ``"pre_dfs"`` or ``"post_dfs"`` — recorded on the result and, per the
+            note above, selects the ceiling (deterministic total vs real headroom).
         affected_count: CONSERVATIVE estimate of the per-path blast radius for the
             post-DFS stage — an upper bound (the domain's enabled-principal count),
             because the true value is not known until after this gate. Ignored on
@@ -582,10 +693,10 @@ def evaluate_projection(
     """
     if raw_paths is None:
         projected = project_graph_term_bytes(nodes, edges)
+        ceiling = _resolve_pre_dfs_ceiling(limit_bytes)
     else:
         projected = project_peak_bytes(nodes, edges, raw_paths, affected_count)
-
-    ceiling = _resolve_ceiling(limit_bytes, available_bytes)
+        ceiling = _resolve_ceiling(limit_bytes, available_bytes)
     if ceiling is None:
         return MemoryProjection(
             projected_peak_bytes=projected,
@@ -694,7 +805,8 @@ def _coverage_statement(examined_routes: int) -> str:
         return (
             f"Attack-path discovery stopped after examining {examined_routes:,} "
             "candidate routes; routes beyond that were not evaluated. The routes "
-            "reported here are validated as usual, but the set is not exhaustive. "
+            "reported here are exposure paths confirmed by configuration, held to the same standard "
+            "as elsewhere in this report, but the set is not exhaustive. "
             "A re-run on a larger analysis host will evaluate the remainder."
         )
     return (
@@ -725,7 +837,8 @@ def _sampled_statement(exposure_source_count: int | None) -> str:
             f"as a count: {exposure}. That count is the figure to track across "
             "re-scans, as it is stable even though the specific routes shown are a "
             "sample and may change from one scan to the next. The routes reported "
-            "here are validated as usual."
+            "here are exposure paths confirmed by configuration, held to the same standard as "
+            "elsewhere in this report."
         )
     return (
         "This directory is large enough that attack-path discovery reports a "
@@ -734,7 +847,8 @@ def _sampled_statement(exposure_source_count: int | None) -> str:
         "how many principals can reach a high-value target. That count is the "
         "figure to track across re-scans, as it is stable even though the specific "
         "routes shown are a sample and may change from one scan to the next. The "
-        "routes reported here are validated as usual."
+        "routes reported here are exposure paths confirmed by configuration, held to the same "
+        "standard as elsewhere in this report."
     )
 
 

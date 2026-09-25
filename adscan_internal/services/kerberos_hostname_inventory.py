@@ -133,13 +133,13 @@ def load_workspace_ip_hostname_inventory(
                 _add_inventory_candidate(inventory, ip=ip, hostname=hostname)
 
     # Liveness ranking: when an IP has MULTIPLE FQDN candidates (stale DNS / IP
-    # reuse — e.g. a decommissioned CZN007 A-record sharing the IP with the live
-    # CZN012, both enabled computers, no reverse PTR), order the most-recently-
+    # reuse — e.g. a decommissioned HOST01 A-record sharing the IP with the live
+    # HOST02, both enabled computers, no reverse PTR), order the most-recently-
     # authenticated computer FIRST so choose_hostname_for_kerberos_spn picks the
     # host that is ACTUALLY at this IP now. Without this the first candidate
     # (often the stale one) yields a TGS the live host can't decrypt
     # → KRB_ERR_GENERIC. lastLogonTimestamp is the reliable liveness signal
-    # (Cyberzaintza 2026-06-17). Best-effort: no computer data → original order.
+    # (RealCorp 2026-06-17). Best-effort: no computer data → original order.
     liveness = _load_computer_liveness(workspace_dir, domains_dir, domain)
     if liveness:
         for hostnames in inventory.values():

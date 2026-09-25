@@ -26,7 +26,16 @@ __all__ = [
 ]
 
 #: Used when at least one route to full domain compromise was WALKED end to end.
-FULL_COMPROMISE_VALIDATED_PHRASE = "a validated path to full domain compromise"
+#: NOTE: this is a REACH-population phrase ("N accounts have ___"), and that
+#: population is larger than the routes ADscan actually executed — so it must NOT
+#: say "validated". The word "validated" is reserved for the separate execution
+#: count ("M routes executed end to end"), or a reach phrase reading "N have a
+#: validated path" collides with "M validated end to end" and overclaims proof on
+#: the theoretical majority. The reach is worded as CONFIRMED BY CONFIGURATION
+#: instead — naming what the confirmation rests on (the directory's configuration),
+#: so a bare "confirmed" cannot be misread as "executed"; whether a given route was
+#: executed is the stronger, separate claim.
+FULL_COMPROMISE_VALIDATED_PHRASE = "a path to full domain compromise, confirmed by configuration"
 
 #: Used when the route reaches full domain compromise but was NOT walked end to
 #: end — only its entry step is proven. Never claims execution it cannot stand
@@ -69,5 +78,5 @@ def reaches_full_compromise_clause(end_to_end_proven: bool, *, plural: bool) -> 
 def tier0_reach_sub_phrase(end_to_end_proven: bool) -> str:
     """Return the exposure-figure sub-line clause for the Tier-0 reach share."""
     if end_to_end_proven:
-        return "have a validated path to Tier 0"
+        return "have a path to Tier 0, confirmed by configuration"
     return "have a mapped path to Tier 0 whose entry step is proven"

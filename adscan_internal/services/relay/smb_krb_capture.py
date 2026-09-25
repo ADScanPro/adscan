@@ -296,11 +296,25 @@ class SMBKrbCaptureListener:
         self._server: asyncio.Server | None = None
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(
-            self._handle,
-            self._config.listen_host,
-            self._config.listen_port,
+        from adscan_internal.services.relay.core import (  # noqa: PLC0415
+            RelayListenerUnavailableError,
         )
+
+        try:
+            self._server = await asyncio.start_server(
+                self._handle,
+                self._config.listen_host,
+                self._config.listen_port,
+            )
+        except OSError as exc:
+            # Port already held (e.g. by the poisoning / capture listener). Raise
+            # the typed listener-unavailable error so the ESC8-KRB caller renders
+            # an honest data gap and continues, instead of a raw OSError crash.
+            raise RelayListenerUnavailableError(
+                host=self._config.listen_host,
+                port=self._config.listen_port,
+                reason=str(exc) or "address already in use",
+            ) from exc
         print_info(
             f"Kerberos relay SMB listener ready — "
             f"{self._config.listen_host}:{self._config.listen_port}"

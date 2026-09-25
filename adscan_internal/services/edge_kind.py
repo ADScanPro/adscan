@@ -253,18 +253,15 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         # XpCmdshell chain instead of chaining after it).
         "MssqlSeImpersonateEscalation",
         "MssqlTokenTheftEscalation",
-        # OPENROWSET(BULK ...) arbitrary-file-read — the terminal MSSQL-hosted
-        # data-exposure technique reached once a session holds ADMINISTER BULK
-        # OPERATIONS on a SQL instance (SQLAdmin locally — sysadmin always has
-        # it; or a below-sysadmin SQLAccess login / linked-server login mapping
-        # that holds the permission or ``bulkadmin`` role membership, a PER-EDGE
-        # fact). A DERIVED self-loop overlay minted by attack_graph_core.
-        # _build_implicit_openrowset_bulk_overlay (mirrors the XpCmdshell
-        # overlay): unlike xp_cmdshell (RCE, sysadmin-only), this is a
-        # credential/data-exposure read, not host code execution — same DERIVED
-        # class as DumpSAM/DumpDPAPI (a lateral-credential follow-up, not a
-        # self-credential/host-control bridge). NOT a graph edge the collector
-        # emits directly.
+        # OPENROWSET(BULK ...) arbitrary-file-read. NO LONGER an emitted or
+        # traversed attack edge: it is a FILE READ as the SQL service account, not
+        # OS code execution or host takeover, and it self-loops without advancing
+        # compromise (same class as an existing shadow credential). It is surfaced
+        # instead as the ``mssql_bulk_operations_overprivilege`` VULNERABILITY
+        # finding for a NON-sysadmin principal (suppressed for sysadmin, where the
+        # capability is inherent). The classification is retained only so any
+        # legacy/persisted edge is typed consistently; the DFS excludes it via
+        # _is_nontraversable_attack_edge and no overlay mints it.
         "MssqlOpenRowsetBulkRead",
     }
 )

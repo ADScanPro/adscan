@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, TYPE_CHECKING, Any
+from typing import Callable, NamedTuple, TYPE_CHECKING, Any
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -1668,6 +1668,142 @@ _PRIVILEGED_GROUP_FRAGMENTS: tuple[str, ...] = (
 )
 
 
+class _ShadowRow(NamedTuple):
+    """One rendered row of the Shadow Credentials panel."""
+
+    samaccountname: str
+    kind: str
+    key_count: int
+    location: str
+    is_tier0: bool
+
+
+class _ShadowSelection(NamedTuple):
+    """Scale-bounded view of the shadow-credential findings.
+
+    ``rows`` is already capped and ordered for display; the counts describe the
+    FULL finding set so the summary can state totals honestly even when the
+    table is collapsed.
+    """
+
+    rows: list[_ShadowRow]
+    total: int
+    users: int
+    computers: int
+    tier0: int
+    hidden: int
+    hidden_users: int
+    hidden_computers: int
+
+
+#: How many shadow-credential objects the CLI table renders before collapsing
+#: the remainder into a summary line. A Windows Hello for Business rollout can
+#: populate msDS-KeyCredentialLink on hundreds or thousands of user objects, so
+#: the panel must stay bounded regardless of finding count.
+_SHADOW_ROW_CAP = 15
+
+
+def _dn_parent_container(distinguished_name: str) -> str:
+    """Return the object's immediate parent container RDN (e.g. ``OU=Servers``).
+
+    Gives the operator a cheap "where does this live" signal to spot an object
+    outside the expected WHfB scope, without dumping the whole DN. Returns an
+    empty string when the DN has no parent component.
+    """
+    if not distinguished_name:
+        return ""
+    # Split on unescaped commas only (a literal ``\,`` inside an RDN is not a
+    # separator).
+    parts: list[str] = []
+    buf = ""
+    escaped = False
+    for ch in distinguished_name:
+        if escaped:
+            buf += ch
+            escaped = False
+        elif ch == "\\":
+            buf += ch
+            escaped = True
+        elif ch == ",":
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    # parts[0] is the object's own RDN; parts[1] is its parent container.
+    for candidate in parts[1:]:
+        candidate = candidate.strip()
+        if candidate.upper().startswith(("DC=",)):
+            break  # reached the domain suffix; no meaningful container
+        if candidate:
+            return candidate
+    return ""
+
+
+def _select_shadow_credential_rows(
+    findings: list[Any],
+    nodes: dict[str, Any],
+    *,
+    cap: int = _SHADOW_ROW_CAP,
+) -> _ShadowSelection:
+    """Order and cap shadow-credential findings for the CLI panel.
+
+    Ordering surfaces the highest-signal objects first: Tier-0 assets, then
+    computer objects (Windows Hello for Business populates user objects, so a
+    key credential on a computer is more anomalous), then most keys, then name.
+    Every Tier-0 object is always shown (they are the alarming ones); the rest
+    fill the remaining slots up to ``cap``. This is a pure function so the
+    scale-bounding behaviour can be unit-tested without rendering.
+    """
+    enriched: list[_ShadowRow] = []
+    for finding in findings:
+        object_id = str(getattr(finding, "object_id", "") or "")
+        node = nodes.get(object_id.upper()) if object_id else None
+        is_tier0 = bool(getattr(node, "highvalue", False))
+        enriched.append(
+            _ShadowRow(
+                samaccountname=str(getattr(finding, "samaccountname", "") or ""),
+                kind=str(getattr(finding, "kind", "") or ""),
+                key_count=int(getattr(finding, "key_count", 0) or 0),
+                location=_dn_parent_container(
+                    str(getattr(finding, "distinguished_name", "") or "")
+                ),
+                is_tier0=is_tier0,
+            )
+        )
+
+    def _is_computer(row: _ShadowRow) -> bool:
+        return row.kind.strip().lower() == "computer"
+
+    enriched.sort(
+        key=lambda r: (
+            0 if r.is_tier0 else 1,
+            0 if _is_computer(r) else 1,
+            -r.key_count,
+            r.samaccountname.lower(),
+        )
+    )
+
+    tier0_rows = [r for r in enriched if r.is_tier0]
+    other_rows = [r for r in enriched if not r.is_tier0]
+    if len(tier0_rows) >= cap:
+        shown = tier0_rows
+    else:
+        shown = tier0_rows + other_rows[: cap - len(tier0_rows)]
+
+    hidden_rows = enriched[len(shown):]
+    return _ShadowSelection(
+        rows=shown,
+        total=len(enriched),
+        users=sum(1 for r in enriched if r.kind.strip().lower() == "user"),
+        computers=sum(1 for r in enriched if _is_computer(r)),
+        tier0=len(tier0_rows),
+        hidden=len(hidden_rows),
+        hidden_users=sum(1 for r in hidden_rows if r.kind.strip().lower() == "user"),
+        hidden_computers=sum(1 for r in hidden_rows if _is_computer(r)),
+    )
+
+
 def _print_collector_enrichment_panel(
     result: Any,
     domain: str,
@@ -1701,40 +1837,81 @@ def _print_collector_enrichment_panel(
     marked_domain = mark_sensitive(domain, "domain")
 
     # ── Panel 1: Shadow Credentials ──────────────────────────────────────────
+    #
+    # A pre-existing ``msDS-KeyCredentialLink`` entry is a PERSISTENCE indicator,
+    # not an attack ADscan can execute: authenticating through it needs the
+    # private key of whoever registered it (Windows Hello for Business, or an
+    # attacker who planted a backdoor). So this panel frames every object as an
+    # IoC to investigate, never an action ADscan performs. It is also bounded
+    # for scale: a WHfB rollout can populate the attribute on thousands of
+    # objects, so the table caps and collapses the remainder.
     shadow_findings = list(result.shadow_credential_findings or [])
     if shadow_findings:
+        sel = _select_shadow_credential_rows(
+            shadow_findings, getattr(result, "nodes", {}) or {}
+        )
+
+        tier0_line = ""
+        if sel.tier0:
+            verb = "sits" if sel.tier0 == 1 else "sit"
+            tier0_line = (
+                f"\n[bold yellow]{sel.tier0} of them {verb} on Tier-0 asset(s)"
+                "[/bold yellow]; review those first."
+            )
+        print_panel(
+            f"[bold]{sel.total}[/bold] object(s) already carry a key credential "
+            f"({sel.users} user(s), {sel.computers} computer(s)) on "
+            f"{marked_domain}."
+            f"{tier0_line}\n"
+            "A key credential permits PKINIT logon as the object and NT-hash "
+            "recovery without the account password, and it survives a password "
+            "reset. Using one needs the matching private key, which ADscan does "
+            "not hold. Whoever registered it does.\n"
+            "Legitimate entries come from [bold]Windows Hello for Business"
+            "[/bold] enrolment. An entry outside a WHfB rollout is a persistence "
+            "backdoor to investigate: confirm the writer, or treat the account "
+            "as already compromised.",
+            title="[bold yellow]Shadow Credentials Present "
+            "(msDS-KeyCredentialLink)[/bold yellow]",
+            border_style=BRAND_COLORS["warning"],
+        )
+
         table = Table(
             show_header=True,
-            header_style="bold red",
+            header_style="bold yellow",
             show_edge=False,
             pad_edge=False,
         )
-        table.add_column("Object", style="white", min_width=28)
-        table.add_column("Kind", style="dim", width=10)
-        table.add_column("Keys", justify="right", style="red bold", width=5)
-        table.add_column("Action", style="yellow")
-        for f in shadow_findings:
-            marked_sam = mark_sensitive(f.samaccountname, "user")
-            action = (
-                "pkinit → getnthash"
-                if f.kind == "User"
-                else "investigate (WHfB or backdoor?)"
+        table.add_column("Object", style="white", min_width=24, overflow="fold")
+        table.add_column("Kind", style="dim", width=9)
+        table.add_column("Keys", justify="right", style="yellow", width=5)
+        table.add_column("Location", style="dim", overflow="ellipsis", max_width=22)
+        table.add_column("Tier", width=7)
+        for row in sel.rows:
+            marked_sam = mark_sensitive(row.samaccountname, "user")
+            marked_loc = (
+                mark_sensitive(row.location, "path") if row.location else "[dim]·[/dim]"
             )
-            table.add_row(marked_sam, f.kind, str(f.key_count), action)
-        print_panel(
-            f"[bold]{len(shadow_findings)} object(s)[/bold] have existing "
-            f"[bold red]msDS-KeyCredentialLink[/bold red] entries on "
-            f"{marked_domain}.\n"
-            "These allow PKINIT authentication → NT hash retrieval "
-            "[bold]without knowing the account password[/bold].\n"
-            "Legitimate entries exist only when WHfB is deployed via GPO.",
-            title="[bold red]Shadow Credentials Detected[/bold red]",
-            border_style=BRAND_COLORS["error"],
-        )
+            tier_cell = "[bold red]Tier 0[/bold red]" if row.is_tier0 else "[dim]·[/dim]"
+            table.add_row(
+                marked_sam,
+                row.kind,
+                str(row.key_count),
+                marked_loc,
+                tier_cell,
+                style="bold" if row.is_tier0 else None,
+            )
+        if sel.hidden:
+            table.caption = (
+                f"… and {sel.hidden} more ({sel.hidden_users} user(s), "
+                f"{sel.hidden_computers} computer(s)). "
+                "Full inventory in the client report and the workspace."
+            )
+            table.caption_style = "dim italic"
         print_panel_with_table(
             table,
-            title=f"Shadow Credential Targets ({len(shadow_findings)})",
-            border_style=BRAND_COLORS["error"],
+            title=f"Shadow Credential Objects ({sel.total})",
+            border_style=BRAND_COLORS["warning"],
         )
 
     # ── Panel 2: RC4-only Kerberoast Priority ────────────────────────────────

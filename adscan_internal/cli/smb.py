@@ -2496,33 +2496,19 @@ def _ensure_domain_smb_log_path(shell: Any, domain: str, filename: str) -> str:
 
 
 def _resolve_dc_targets_for_gpp(shell: Any, target_domain: str) -> list[str]:
-    """Resolve the list of DCs to scan for GPP credentials.
+    """Operator-facing list of DCs to scan for GPP (one entry per distinct DC).
 
-    Default policy: every DC of the target domain. GPP files are
-    SYSVOL-replicated, but legacy FRS staging shares (``Replication``,
-    ``SYSVOL_DFSR``, ``NtFrs``) typically only exist on the FRS source DC,
-    which is often *not* the PDC. Walking every DC makes the harvester
-    robust to that asymmetry; deduplication on ``(username, secret)``
-    inside the harvester collapses replicated hits to one entry.
-
-    Falls back to ``[pdc]`` when the DC inventory is unavailable (early
-    in the scan flow, or in single-DC labs like HTB Active).
+    Thin display wrapper over the DC-target SSOT
+    :func:`resolve_dc_connect_targets`; kept as a ``list[str]`` so header/summary
+    call sites render one deduped label per DC (PDC first).
     """
-    domain_data = shell.domains_data.get(target_domain, {}) or {}
-    pdc = str(domain_data.get("pdc") or "").strip()
+    from adscan_internal.services.host_address_resolver import (
+        resolve_dc_connect_targets,
+    )
 
-    raw_dcs = domain_data.get("dcs")
-    dcs: list[str] = []
-    if isinstance(raw_dcs, list):
-        dcs = [str(x).strip() for x in raw_dcs if str(x).strip()]
-    elif isinstance(raw_dcs, str) and raw_dcs.strip():
-        dcs = [piece.strip() for piece in raw_dcs.split(",") if piece.strip()]
-
-    targets: list[str] = []
-    for dc in dcs + ([pdc] if pdc else []):
-        if dc and dc not in targets:
-            targets.append(dc)
-    return targets
+    return [
+        t.display for t in resolve_dc_connect_targets(shell, domain=target_domain)
+    ]
 
 
 def _load_gpp_ip_hostname_inventory(shell: Any, domain: str) -> dict | None:
@@ -2552,23 +2538,79 @@ def _load_gpp_ip_hostname_inventory(shell: Any, domain: str) -> dict | None:
         return None
 
 
-async def _harvest_gpp_for_domain(
-    shell: Any, *, target_domain: str, timeout_per_target: int = 60
-):
-    """Run the unified GPP harvester across every DC of ``target_domain``.
+def _gpp_target_unreachable(exc: BaseException) -> bool:
+    """Return whether *exc* means the DC was UNREACHABLE (vs a definitive answer).
 
-    Returns a :class:`GPPHarvestResult` covering both cpassword and
-    autologon vectors. Auth mode is auto-resolved from ``domains_data``:
-    authenticated creds when available (with NTLM->Kerberos fallback via
-    ``smb_machine_with_fallback``), null session otherwise. Per-target
-    failures are isolated — one denied or unreachable DC does not abort
-    the rest.
+    SYSVOL/NETLOGON (and the FRS staging shares) are replicated, so GPP content is
+    identical on every DC — one reachable DC is sufficient. We therefore fall through
+    to the next DC ONLY when the current one is unreachable (connect refused, timeout,
+    no route, name-resolution failure). Any answer we actually got from a reachable DC
+    — access denied, or a successful walk — is definitive and terminal.
     """
-    import asyncio as _asyncio
+    import errno as _errno
 
+    if isinstance(
+        exc,
+        (ConnectionRefusedError, ConnectionResetError, TimeoutError),
+    ):
+        return True
+    if isinstance(exc, OSError) and exc.errno in {
+        _errno.ECONNREFUSED,
+        _errno.EHOSTUNREACH,
+        _errno.ENETUNREACH,
+        _errno.ETIMEDOUT,
+        _errno.ECONNRESET,
+    }:
+        return True
+    text = str(exc).lower()
+    markers = (
+        "connect call failed",
+        "connection refused",
+        "timed out",
+        "timeout",
+        "no route to host",
+        "host unreachable",
+        "network is unreachable",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "getaddrinfo",
+        "smbconnectionerror",
+        "connection error",
+    )
+    return any(marker in text for marker in markers)
+
+
+async def _harvest_gpp_for_domain(
+    shell: Any, *, target_domain: str, timeout_per_target: int = 120
+):
+    """Harvest GPP credentials from the FIRST reachable DC of ``target_domain``.
+
+    SYSVOL/NETLOGON (and the legacy FRS staging shares) are REPLICATED, so the GPP
+    files (``Groups.xml`` cpassword, ``Registry.xml`` autologon) are identical on
+    every DC — walking all of them re-reads the same content and multiplies OPSEC
+    noise (adscan-ad-constraints §11). So this walks the PDC first (GPO edits land on
+    the PDC Emulator by default, the freshest if replication lags) and STOPS at the
+    first DC that answers; it iterates to the next DC ONLY as a reachability fallback
+    (the preferred DC is down/unreachable, e.g. a dead ``dc-corp-03``).
+
+    Each DC target is built through the DC-target SSOT
+    :func:`resolve_dc_connect_targets` — connect to the DC's reachable IP, present a
+    ``cifs/<its-own-FQDN>`` service ticket (never the PDC's FQDN, never an IP), one
+    deduplicated entry per DC. Auth mode is auto-resolved from ``domains_data``:
+    authenticated creds when available (with NTLM->Kerberos fallback via
+    ``smb_machine_with_fallback``), null session otherwise.
+
+    Returns a :class:`GPPHarvestResult`. Failure (``status="error"``) is reported ONLY
+    when NO DC was reachable at all — a data gap, distinct from a reachable DC that
+    denied access.
+    """
     from adscan_internal.services.gpp_credential_harvester import (
         GPPHarvestResult,
         harvest_gpp_on_connection,
+    )
+    from adscan_internal.services.host_address_resolver import (
+        DCConnectTarget,
+        resolve_dc_connect_targets,
     )
     from adscan_internal.services.smb_transport import (
         SMBConfig,
@@ -2578,7 +2620,8 @@ async def _harvest_gpp_for_domain(
         _open_null_smb_connection,
     )
 
-    targets = _resolve_dc_targets_for_gpp(shell, target_domain)
+    # SSOT: PDC-first, one deduped target per DC, each with its OWN FQDN as SPN.
+    targets = resolve_dc_connect_targets(shell, domain=target_domain)
     base_cfg = _smb_config_for_auth(shell, target_domain)
 
     from adscan_internal.models.domain import resolve_dc_ip
@@ -2600,70 +2643,93 @@ async def _harvest_gpp_for_domain(
     except Exception:  # noqa: BLE001
         _domain_dc_ip = None
 
-    async def _harvest_one(target: str) -> GPPHarvestResult:
+    async def _harvest_one(target: DCConnectTarget) -> tuple[GPPHarvestResult, bool]:
+        """Harvest one DC. Returns ``(result, reachable)``.
+
+        ``reachable`` is False only when the DC could not be contacted (so the
+        caller falls through to the next DC); a reachable DC — walked or
+        access-denied — is a definitive, terminal answer.
+        """
+        connect_ip = target.connect_ip
         try:
             if base_cfg is not None:
-                # Per-target SMBConfig so we walk SYSVOL on every DC, not just
-                # the PDC. ``smb_machine_with_fallback`` owns NTLM -> Kerberos
-                # retry; the harvester only needs the underlying raw
-                # ``connection`` exposed by the SMBMachine.
-                #
-                # ``target`` may be a raw IP. Each target is a DC, so resolve a
-                # per-target FQDN for the SPN (``cifs/<fqdn>``) — ``cifs/<ip>``
-                # is rejected by the KDC. The KDC for THIS DC is itself: set
-                # ``kdc_ip=target`` only because the target IS a domain
-                # controller; never default to the target when it is a member.
+                # ``smb_machine_with_fallback`` owns the NTLM -> Kerberos retry; the
+                # harvester only needs the raw ``connection`` exposed by the
+                # SMBMachine. Connect to THIS DC's reachable IP and present a service
+                # ticket for THIS DC's OWN FQDN (``cifs/<fqdn>``) — never the PDC's
+                # FQDN (the multi-DC ``KRB_ERR_GENERIC`` / ``0xC000006A`` rejection)
+                # and never an IP. ``is_dc_target=False`` honours the per-DC FQDN the
+                # SSOT already resolved; the domain-wide ``resolve_dc_fqdn`` (PDC)
+                # path is not consulted for a specific DC.
                 _res = resolve_spn_or_decide_ntlm(
-                    target_host=target,
+                    target_host=target.spn_fqdn or connect_ip,
                     domain=target_domain,
                     domains_data=_domains_data,
                     ip_hostname_inventory=_gpp_inventory,
-                    resolver_ip=target,
+                    resolver_ip=connect_ip,
                     posture_snapshot=_gpp_posture,
-                    is_dc_target=True,
+                    is_dc_target=False,
                 )
                 _spn_host = (
                     _res.spn_host
                     if _res.kerberos_viable and _res.spn_host
-                    else (base_cfg.target_hostname or target)
+                    else (target.spn_fqdn or base_cfg.target_hostname or connect_ip)
                 )
                 cfg = SMBConfig(
-                    target_ip=target,
+                    target_ip=connect_ip,
                     target_hostname=_spn_host,
                     domain=base_cfg.domain,
                     username=base_cfg.username,
                     password=base_cfg.password,
                     nt_hash=base_cfg.nt_hash,
                     auth_domain=base_cfg.auth_domain,
-                    # KDC is this DC (target). resolve_dc_ip is the realm DC and
-                    # only used as a last resort so we never hit a non-KDC.
-                    kdc_ip=target or _domain_dc_ip or base_cfg.kdc_ip,
+                    # KDC is this DC. resolve_dc_ip is the realm DC and only used
+                    # as a last resort so we never hit a non-KDC.
+                    kdc_ip=connect_ip or _domain_dc_ip or base_cfg.kdc_ip,
                     timeout=base_cfg.timeout,
                     posture_snapshot=_gpp_posture,
                 )
                 async with smb_machine_with_fallback(cfg) as machine:
-                    return await harvest_gpp_on_connection(
-                        machine.connection, timeout=timeout_per_target
+                    return (
+                        await harvest_gpp_on_connection(
+                            machine.connection,
+                            domain=target_domain,
+                            timeout=timeout_per_target,
+                        ),
+                        True,
                     )
 
-            connection = await _open_null_smb_connection(target, 30)
+            connection = await _open_null_smb_connection(connect_ip, 30)
             async with connection:
                 _, login_err = await connection.login()
                 if login_err is not None:
                     r = GPPHarvestResult(
-                        status="denied", error=f"{target}: {login_err}"
+                        status="denied", error=f"{target.display}: {login_err}"
                     )
-                    r.targets_walked.append(target)
-                    return r
-                return await harvest_gpp_on_connection(
-                    connection, timeout=timeout_per_target
+                    r.targets_walked.append(target.display)
+                    return r, True
+                return (
+                    await harvest_gpp_on_connection(
+                        connection,
+                        domain=target_domain,
+                        timeout=timeout_per_target,
+                    ),
+                    True,
                 )
         except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            r = GPPHarvestResult(status="error", error=f"{target}: {exc}")
-            r.targets_walked.append(target)
-            return r
+            reachable = not _gpp_target_unreachable(exc)
+            if reachable:
+                # A definitive failure from a reachable DC — surface the traceback.
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+            else:
+                # Expected: this DC is down; we fall through to the next one.
+                print_info_debug(
+                    f"[gpp] DC {target.display} unreachable, trying next DC: {exc}"
+                )
+            r = GPPHarvestResult(status="error", error=f"{target.display}: {exc}")
+            r.targets_walked.append(target.display)
+            return r, reachable
 
     aggregate = GPPHarvestResult()
     if not targets:
@@ -2671,11 +2737,23 @@ async def _harvest_gpp_for_domain(
         aggregate.error = "no DC targets resolved"
         return aggregate
 
-    per_target = await _asyncio.gather(*[_harvest_one(t) for t in targets])
-    for r in per_target:
-        aggregate.merge(r)
+    any_reachable = False
+    for target in targets:
+        result, reachable = await _harvest_one(target)
+        aggregate.merge(result)
+        if reachable:
+            # Reachable DC = definitive answer. GPP content is replicated, so the
+            # other DCs would only re-read identical files — stop here.
+            any_reachable = True
+            break
+
+    if not any_reachable:
+        # Every DC was unreachable — an honest data gap, not "access denied".
+        aggregate.status = "error"
+        if not aggregate.error:
+            aggregate.error = "no domain controller was reachable"
     if not aggregate.targets_walked:
-        aggregate.targets_walked = list(targets)
+        aggregate.targets_walked = [t.display for t in targets]
     return aggregate
 
 

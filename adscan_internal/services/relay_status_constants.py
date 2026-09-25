@@ -18,7 +18,7 @@ from __future__ import annotations
 
 # The exact reflection blocked-reason string (refinement 1). Shared with the
 # report renderer and the L1 tests — keep it as the single source of truth.
-REFLECTION_BLOCKED_REASON = "single DC — self-relay reflection-mitigated"
+REFLECTION_BLOCKED_REASON = "single DC, self-relay reflection-mitigated"
 
 # Emitted when an eligible relay target exists topologically but has no usable
 # LDAP endpoint (missing/empty FQDN on the selected DC node). This is an ADscan

@@ -36,6 +36,7 @@ compatibility while the rest of the codebase is migrated.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
@@ -1648,11 +1649,22 @@ def privilege_tier_label(tier: PrivilegeTier) -> str:
 # Axis 2 — Compromise Reach. The highest tier a principal can ATTACK INTO via a
 # validated attack path. Keyed by the PATH's CompromiseClass (already computed
 # by ``derive_compromise_class_from_path`` — NOT recomputed here).
+# NOTE ON THE WORD "VALIDATED" (reserved for EXECUTED paths only). These are
+# REACH-class labels — the highest tier a path CAN reach, which may be theoretical
+# (mapped from configuration, not walked end to end). "Validated" / "executed" are
+# reserved exclusively for paths ADscan actually ran end to end, so a reach-class
+# label must never say "validated" — that word collides with the "N validated end
+# to end" execution count and would let a theoretical route read as a proven one.
+# The reach class is worded "path to full domain compromise, confirmed by
+# configuration" instead — naming what the confirmation rests on (the directory's
+# configuration), so a bare "confirmed" is never misread as "executed" beside the
+# separate "N executed end to end" count (the exposure EXISTS; whether it was
+# executed is a separate, stronger claim carried by the execution count).
 _COMPROMISE_REACH_LABELS: dict[CompromiseClass, str] = {
-    CompromiseClass.DOMAIN_BREAKER: "Validated path to full domain compromise (control of a Tier 0 asset)",
+    CompromiseClass.DOMAIN_BREAKER: "Path to full domain compromise, confirmed by configuration (control of a Tier 0 asset)",
     CompromiseClass.TIER0_FOOTHOLD: "Foothold on a Tier 0 asset (control pending validation)",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Control of a Tier 0 escalation group (one technique from domain)",
-    CompromiseClass.COMPROMISE_ENABLER: "Validated path that advances toward Tier 0",
+    CompromiseClass.COMPROMISE_ENABLER: "Path that advances toward Tier 0, confirmed by configuration",
     CompromiseClass.UNAUTHENTICATED_PRINCIPAL: "Unauthenticated reach",
     CompromiseClass.NONE: "Standard reach",
 }
@@ -2671,3 +2683,73 @@ def apply_path_based_classification(
     if cls is not CompromiseClass.NONE:
         record["target_terminal_class"] = outcome
     return cls
+
+
+class SyncAccountState(Enum):
+    """Tri-state classification of a directory-replication sync account.
+
+    CONFIRMED   — an Azure AD Connect sync account, recognized by BOTH the
+                  AAD Connect description anchor AND the ``MSOL_<12hex>`` name.
+                  Its DCSync is held by design; promote to Tier-0 direct.
+    AMBIGUOUS   — the ``MSOL_<12hex>`` name only, with no confirmable AAD
+                  Connect provenance (description stripped/edited, or a forged
+                  name). Do NOT auto-promote; surface for client confirmation.
+    NONE        — not a control-plane sync account. Any DCSync it holds stays a
+                  finding (a member server's machine account, a normal user,
+                  Cert Publishers).
+    """
+
+    CONFIRMED = "confirmed"
+    AMBIGUOUS = "ambiguous"
+    NONE = "none"
+
+
+# The AAD Connect installer writes this description in the install locale, but
+# the product proper-noun is retained across locales, so we anchor on it as a
+# case-insensitive substring rather than the full English sentence. See spec §3.1.
+_AAD_CONNECT_DESCRIPTION_ANCHOR = "microsoft azure active directory connect"
+_MSOL_SYNC_ACCOUNT_NAME_RE = re.compile(r"^msol_[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def is_control_plane_sync_account(
+    *, samaccountname: str | None, description: str | None
+) -> SyncAccountState:
+    """Classify a principal as an AAD Connect control-plane sync account.
+
+    CONFIRMED requires BOTH signals; the name alone is AMBIGUOUS (a forged name
+    with no AAD provenance is structurally indistinguishable from a legit account
+    otherwise, so name-only must never auto-promote). See spec §2/§3.
+    """
+    sam = (samaccountname or "").strip()
+    # Strip a DOMAIN\ prefix or @domain suffix if present.
+    if "\\" in sam:
+        sam = sam.split("\\", 1)[1]
+    if "@" in sam:
+        sam = sam.split("@", 1)[0]
+    name_ok = bool(_MSOL_SYNC_ACCOUNT_NAME_RE.match(sam.strip()))
+    desc_ok = _AAD_CONNECT_DESCRIPTION_ANCHOR in (description or "").lower()
+    if name_ok and desc_ok:
+        return SyncAccountState.CONFIRMED
+    if name_ok:
+        return SyncAccountState.AMBIGUOUS
+    return SyncAccountState.NONE
+
+
+def node_is_control_plane_sync_account(
+    node: Mapping[str, Any] | None,
+) -> SyncAccountState:
+    """Node-shaped wrapper: read ``samaccountname``/``description`` from props.
+
+    Works for an attack-graph node (``properties.samaccountname`` /
+    ``properties.description``) and, via ``_node_name`` fallback, for stub nodes.
+    """
+    if not isinstance(node, Mapping):
+        return SyncAccountState.NONE
+    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    sam = props.get("samaccountname") if isinstance(props, Mapping) else None
+    if not isinstance(sam, str) or not sam:
+        sam = _node_name(node)
+    desc = props.get("description") if isinstance(props, Mapping) else None
+    return is_control_plane_sync_account(
+        samaccountname=sam, description=desc if isinstance(desc, str) else None
+    )

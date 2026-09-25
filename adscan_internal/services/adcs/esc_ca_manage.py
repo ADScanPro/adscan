@@ -195,7 +195,7 @@ async def run_esc7(config: EscConfig) -> EscResult:
             dns_server=config.dns_server,
             ledger_shell=config.shell,
             ledger_domain=config.domain,
-            ledger_technique="ADCSESC7 — certificate issued through CA officer rights",
+            ledger_technique="ADCSESC7: certificate issued through CA officer rights",
             **({} if _esc7_key_size is None else {"key_size": int(_esc7_key_size)}),
         )
         req = await request_certificate_native(req_cfg, out)

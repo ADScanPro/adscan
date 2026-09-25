@@ -588,7 +588,9 @@ def _credential_obligation(
         steps.append(
             ObligationStep(
                 text=(
-                    f"{machine_count} of these are machine {_plural(machine_count, 'account')} "
+                    f"{machine_count} of these "
+                    f"{'is a' if machine_count == 1 else 'are'} "
+                    f"machine {_plural(machine_count, 'account')} "
                     f"({_join_names(machine_accounts)}). A machine account key also "
                     "unwraps material protected by that computer, so rotate it from "
                     "the host itself rather than from the directory. If the host is "

@@ -36,19 +36,19 @@ Design notes:
       large cardinalities (a mega-hub group / well-known SID). Reporting both lets
       the render (E3) prioritise the strongest choke of either kind. The edge view
       is the exact one the H3 brief's bridge test pins; the node view is the one
-      that lights up at Potech scale.
+      that lights up at Contoso scale.
 
 Complexity:
     The computation is driven per SOURCE, which is what keeps it cheap on a
     directory graph: the number of leaf originators is tiny (single/low digits
-    even at Potech scale, where ~34k nodes / ~276k edges yield only ~11 sources
+    even at Contoso scale, where ~34k nodes / ~276k edges yield only ~11 sources
     and a ~4.8k-node terminal-reachable set). For each source we forward-flood
     the reachable subgraph once (``O(E_r)`` over the ``E_r`` reachable edges) to
     learn the small set of edges it can reach, then test each such edge's
     criticality with a scoped forward BFS that skips it (a terminal is
     unreachable afterwards iff the edge was on ALL of that source's paths to
     ``S``). This is ``O(sources * reachable_edges * E_r)`` worst case but in
-    practice low-seconds at Potech, versus ~100s for the naive "remove each of
+    practice low-seconds at Contoso, versus ~100s for the naive "remove each of
     ~50k whole-graph candidate edges and re-flood" approach. It is exact:
     validated against the brute-force reflood oracle over thousands of random
     cyclic graphs.
@@ -56,6 +56,7 @@ Complexity:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 # Node kinds that can plausibly originate an attack (an enabled principal).
@@ -240,6 +241,147 @@ def exposure_source_count(graph: dict[str, Any], *, value_terminals: set[str]) -
     return count
 
 
+def _node_is_tier_zero(node: dict[str, Any]) -> bool:
+    """Return ``True`` when the node is flagged Tier 0 (control-plane).
+
+    The stamp lands under either the top-level ``isTierZero`` or
+    ``properties.isTierZero`` (the collector writes the latter, the graph
+    materializer often mirrors it to the top level). Either being truthy is
+    enough. A Tier-0 principal is excluded from the "standard user" denominator:
+    a Domain Admin reaching full domain compromise is the directory's own
+    hierarchy restated, and counting it inflates the ratio toward 100% by
+    construction (mirrors ``DomainUserReach.ordinary_*`` doctrine).
+    """
+    if bool(node.get("isTierZero")):
+        return True
+    props = node.get("properties")
+    return isinstance(props, dict) and bool(props.get("isTierZero"))
+
+
+def _node_label_is_wellknown(node: dict[str, Any]) -> bool:
+    """Return ``True`` for a synthetic well-known principal node.
+
+    Well-known SIDs (``Creator Owner@WELLKNOWN``, ``Network Service@WELLKNOWN``,
+    ``Principal Self@WELLKNOWN``) are modelled as ``User`` nodes but are NOT real
+    standard accounts, so they are excluded from the "standard user" denominator.
+    They are identified by the ``@WELLKNOWN`` label suffix or a ``WELLKNOWN``
+    ``properties.domain`` (the collector's synthetic realm).
+    """
+    label = str(node.get("label") or node.get("name") or "").strip()
+    if label.upper().endswith("@WELLKNOWN"):
+        return True
+    props = node.get("properties")
+    if isinstance(props, dict):
+        return str(props.get("domain") or "").strip().upper() == "WELLKNOWN"
+    return False
+
+
+def _node_is_standard_user(node: dict[str, Any]) -> bool:
+    """Return ``True`` for an enabled, non-Tier-0, non-synthetic USER account.
+
+    The denominator population of the Tier-2 exposure ratio: a real standard
+    (Tier 2) directory user. Deliberately excludes computers and groups (the
+    permissive ``exposure_source_count`` counts those — machine accounts fold in
+    via ``Authenticated Users`` and dominate the figure), disabled accounts,
+    Tier-0 principals, and synthetic well-known SIDs.
+    """
+    if str(node.get("kind") or "").strip() != "User":
+        return False
+    if _node_is_disabled(node):
+        return False
+    if _node_is_tier_zero(node):
+        return False
+    return not _node_label_is_wellknown(node)
+
+
+@dataclass(frozen=True)
+class Tier2ExposureRatio:
+    """Share of standard user accounts that can reach full domain compromise.
+
+    ADscan's exposure thesis expressed as ONE ratio a CISO reads directly: of the
+    domain's real, non-privileged user accounts, how many hold a reachable route
+    to a Tier-0 / full-domain-compromise target. It is k-INDEPENDENT (a
+    reverse-reachability SET cardinality over the base graph, exactly like
+    :func:`exposure_source_count`), so it survives the control-mega-hub sampled
+    fallback that collapses the materialized ``path_axis``/``user_axis`` counts to
+    0 — unlike the materialization-derived ``DomainUserReach``.
+
+    Distinct from :func:`exposure_source_count`, which counts ALL enabled
+    principals (users + computers + groups) and is dominated by machine accounts
+    folded in through ``Authenticated Users``. This ratio's denominator is real
+    standard USER accounts only, so it answers the buyer's question ("what share
+    of my people are exposed") without the machine-account inflation.
+
+    Attributes:
+        with_path: Standard user accounts with a reachable path to a value
+            terminal (the numerator).
+        total: The standard-user population (the denominator).
+    """
+
+    with_path: int = 0
+    total: int = 0
+
+    @property
+    def pct(self) -> float:
+        """Share of the standard-user population, saturating at 100."""
+        if self.total <= 0:
+            return 0.0
+        return min(100.0, round(self.with_path / self.total * 100.0, 1))
+
+    @property
+    def available(self) -> bool:
+        """True when there is a standard-user population to report against."""
+        return self.total > 0
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe block stamped into ``exposure_kpis``."""
+        return {
+            "with_path": int(self.with_path),
+            "total": int(self.total),
+            "pct": self.pct,
+        }
+
+
+def tier2_exposure_ratio(
+    graph: dict[str, Any], *, value_terminals: set[str]
+) -> Tier2ExposureRatio:
+    """Compute the standard-user → Tier-0 reachability ratio. Pure, k-independent.
+
+    ``with_path = |Reach^-1(S) intersect standard-users|`` and
+    ``total = |standard-users|``, where a standard user is an enabled, non-Tier-0,
+    non-synthetic ``User`` node (see :func:`_node_is_standard_user`). Uses the SAME
+    reverse-reachability primitive and value-terminal set as
+    :func:`exposure_source_count`, so it is cheap set algebra and reports honestly
+    even when the route sample is capped.
+
+    Args:
+        graph: The attack graph dict (``nodes`` dict-or-list, ``edges`` list).
+        value_terminals: The value-terminal (crown-jewel / Tier-0) node ids.
+
+    Returns:
+        The :class:`Tier2ExposureRatio`; an all-zero value when there is no
+        standard-user population or no value terminal.
+    """
+    nodes = _iter_nodes(graph)
+    standard_users = {
+        node_id
+        for node_id, node in nodes.items()
+        if isinstance(node, dict) and _node_is_standard_user(node)
+    }
+    total = len(standard_users)
+    if total == 0:
+        return Tier2ExposureRatio(with_path=0, total=0)
+
+    terminals = {str(t) for t in value_terminals if str(t)}
+    if not terminals:
+        return Tier2ExposureRatio(with_path=0, total=total)
+
+    reverse = _build_reverse_adjacency(graph)
+    reachable = _reverse_reach(reverse, terminals)
+    with_path = sum(1 for node_id in standard_users if node_id in reachable)
+    return Tier2ExposureRatio(with_path=with_path, total=total)
+
+
 def edge_key(from_id: str, relation: str, to_id: str) -> str:
     """Build the stable string key for an edge.
 
@@ -334,7 +476,7 @@ def compute_chokepoint_cardinality(
 
     It is computed source-by-source, which is what makes it cheap on a directory
     graph: the number of leaf originators is tiny (single/low digits even at
-    Potech scale ~34k nodes / ~276k edges, where there are ~11 sources), while
+    Contoso scale ~34k nodes / ~276k edges, where there are ~11 sources), while
     the terminal-reachable set is only a few thousand nodes. For each source we
     forward-flood the reachable subgraph once to learn the small set of edges it
     can reach, then test each such edge's criticality with a scoped forward BFS
@@ -342,7 +484,7 @@ def compute_chokepoint_cardinality(
     of that source's paths to ``S``. Each critical edge accrues +1 per source it
     severs. This is exact (validated against the brute-force reflood oracle over
     thousands of random cyclic graphs) and avoids the ``O(all_candidate_edges *
-    E)`` cost of the naive whole-graph reflood, which was ~100s at Potech.
+    E)`` cost of the naive whole-graph reflood, which was ~100s at Contoso.
 
     Counting SOURCES (not every reachable node) is what the bridge test expects:
     three low-priv sources funnelling through one bridge edge returns a
@@ -1063,6 +1205,28 @@ def stamp_chokepoint_cardinality_for_domain(
         except Exception as _sh_exc:  # noqa: BLE001 - lead is best-effort
             if print_exception is not None:
                 print_exception(exception=_sh_exc)
+
+        # Persist the "Most Exposed Accounts" per-user exposure (IA v2) HERE, at the
+        # same seam, so the web CTEM renders the SAME sub-block the PDF/LITE report
+        # fold under the exposure headline without recomputing. Built from THIS
+        # domain's attack paths (the SAME meta.affected_users the reach metric reads)
+        # via the import-safe ranking SSOT; scale-safe (top-N + tail collapse).
+        # JSON-safe; best-effort (a failure just omits the block).
+        try:
+            from adscan_core.reporting.user_exposure_ranking import (  # noqa: PLC0415
+                build_user_exposure_ranking,
+            )
+
+            _ue_paths = domain_data.get("attack_paths")
+            if isinstance(_ue_paths, list) and _ue_paths:
+                _user_exposure = build_user_exposure_ranking(
+                    [_p for _p in _ue_paths if isinstance(_p, dict)]
+                )
+                if _user_exposure.get("top_users"):
+                    summary["user_exposure"] = _user_exposure
+        except Exception as _ue_exc:  # noqa: BLE001 - block is best-effort
+            if print_exception is not None:
+                print_exception(exception=_ue_exc)
 
         domain_data["chokepoint_cardinality"] = summary
         record_chokepoint_cardinality(shell, domain, summary=summary)

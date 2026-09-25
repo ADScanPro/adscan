@@ -106,9 +106,11 @@ class WebEnrollmentProbeResult:
 
     ``web_enrollment_enabled`` is the overall ESC8 verdict (HTTP-aware): True
     only when at least one scheme answered ``GET /certsrv/certfnsh.asp`` with a
-    401 offering NTLM/Negotiate. The per-scheme ``*_ntlm`` flags and
-    ``answering_scheme`` let the relay pick the right transport (HTTPS-first
-    when both qualify).
+    401 offering NTLM/Negotiate. The per-scheme ``*_ntlm`` flags let the relay
+    pick the right transport HTTP-first (HTTP is EPA-agnostic, so HTTPS is used
+    only as the sole EPA-free avenue; see ``esc_relay._resolve_esc8_scheme``).
+    ``answering_scheme`` records which scheme answered first (the probe's
+    HTTPS-first order) and is kept for diagnostics.
     """
 
     target_host: str

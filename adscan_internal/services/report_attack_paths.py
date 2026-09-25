@@ -175,7 +175,177 @@ def compute_report_attack_paths(
 
     if not isinstance(paths, list):
         return []
-    return [path for path in paths if isinstance(path, dict)]
+    clean = [path for path in paths if isinstance(path, dict)]
+    for path in clean:
+        stamp_adcs_finding_views(path)
+    return clean
+
+
+def compute_report_attack_paths_display(
+    workspace_dir: str,
+    domain: str,
+    *,
+    max_depth: int = REPORT_ATTACK_PATH_MAX_DEPTH,
+    no_cache: bool = False,
+) -> list[dict[str, Any]]:
+    """Return the FOLDED display projection of the canonical report attack paths.
+
+    Axis-D story-level fold (COUNT != DISPLAY): the SAME canonical finding set
+    :func:`compute_report_attack_paths` returns — which every COUNT / KPI / score
+    reads and which stays byte-identical — is collapsed for RENDERING via
+    :func:`attack_graph_core.fold_origin_stories`, so N routes that reach the same
+    terminal by the same edge sequence from N different origin principals render as
+    ONE row carrying the origins in ``origin_alternatives`` (+ ``origin_route_count``).
+
+    This is the SHARED SSOT the LITE report, the PRO report and the web CTEM all
+    consume for their RENDERED rows, so the three surfaces fold identically. It
+    MUST NEVER feed a count: the canonical unfolded set (``compute_report_attack_paths``)
+    is the authoritative count source (guardrail: exposure score / the Tier-2 →
+    Tier-0 headline / ``path_axis`` all read the canonical set). Best-effort:
+    returns ``[]`` on any failure, mirroring the canonical function.
+    """
+    from adscan_internal.services import attack_graph_core
+
+    canonical = compute_report_attack_paths(
+        workspace_dir, domain, max_depth=max_depth, no_cache=no_cache
+    )
+    if not canonical:
+        return []
+    try:
+        return attack_graph_core.fold_origin_stories([dict(p) for p in canonical])
+    except Exception as exc:  # noqa: BLE001 - a display fold never breaks the report
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return [dict(p) for p in canonical]
+
+
+def build_origin_footholds_summary(
+    record: dict[str, Any], *, report_domain: str, max_named: int = 6
+) -> str | None:
+    """Return the human "reachable from N footholds" line for an origin-folded row.
+
+    ``None`` when the row is not an origin fold (``origin_route_count <= 1``), so a
+    non-folded card renders nothing extra. When it is a fold, names each distinct
+    origin principal through the humanization SSOT
+    (:func:`~adscan_internal.services.well_known_principals.humanize_principal_for_prose`)
+    so a client never sees a raw / shouting / ``@WELLKNOWN`` label — the SAME
+    humanizer every other client-facing principal label uses. Long lists are
+    truncated to ``max_named`` named principals plus an "and N more" tail so the
+    card stays readable on a dense domain.
+    """
+    try:
+        count = int(record.get("origin_route_count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    origins = record.get("origin_alternatives")
+    if count <= 1 or not isinstance(origins, list) or len(origins) <= 1:
+        return None
+
+    from adscan_internal.services.well_known_principals import (
+        humanize_principal_for_prose,
+    )
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for origin in origins:
+        if not isinstance(origin, dict):
+            continue
+        raw = str(origin.get("source") or origin.get("origin_node") or "").strip()
+        if not raw:
+            continue
+        try:
+            display = humanize_principal_for_prose(
+                label=raw, report_domain=str(report_domain or "")
+            )
+        except Exception:  # noqa: BLE001 - a label never breaks the render
+            display = raw
+        key = display.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(display)
+
+    distinct = len(names)
+    if distinct <= 1:
+        return None
+    if distinct <= max_named:
+        named = ", ".join(names)
+        return f"Reachable from {distinct} footholds: {named}."
+    shown = ", ".join(names[:max_named])
+    remaining = distinct - max_named
+    return f"Reachable from {distinct} footholds: {shown}, and {remaining} more."
+
+
+def stamp_adcs_finding_views(path: Any) -> None:
+    """Derive + stamp the ADCS three-state and ESC8-transport VIEWS onto a path.
+
+    Mutates each ADCS step's ``details`` in place, adding the render-ready views
+    both the PDF report and the paid web CTEM read from the SAME SSOT
+    (:mod:`adscan_core.reporting.adcs_finding_state` /
+    :mod:`adscan_core.reporting.adcs_esc8_transport`), so the two surfaces cannot
+    word the same ADCS state or ESC8 remediation differently. Best-effort: never
+    raises, so a report renders even if a step dict is malformed.
+
+    * ``adcs_finding_state_view`` — the three honest states (validated / data gap /
+      hygiene). Derived from the step status; ``hygiene`` requires a collector
+      ``is_orphaned_ca`` signal on the step details (absent today, wired when the
+      collector emits it — validated + data-gap render now).
+    * ``esc8_transport_view`` — the ESC8 observed transport + EPA-conditional
+      remediation, present only when the ESC8 relay stamped ``esc8_transport``.
+    """
+
+    from adscan_core.reporting.adcs_esc8_transport import (
+        ESC8_TRANSPORT_KEY,
+        esc8_transport_view,
+    )
+    from adscan_core.reporting.adcs_finding_state import (
+        ADCS_FINDING_STATE_KEY,
+        adcs_finding_state_view,
+        build_adcs_finding_state,
+        classify_adcs_edge_state,
+        is_adcs_esc_relation,
+    )
+
+    if not isinstance(path, dict):
+        return
+    steps = path.get("steps")
+    if not isinstance(steps, list):
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        details = step.get("details")
+        if not isinstance(details, dict):
+            continue
+        if not is_adcs_esc_relation(step.get("action")):
+            continue
+
+        # ESC8 observed transport + EPA-conditional remediation.
+        transport_block = details.get(ESC8_TRANSPORT_KEY)
+        if isinstance(transport_block, dict):
+            details["esc8_transport_view"] = esc8_transport_view(transport_block)
+
+        # Three honest states. Prefer a state a previous stage already stamped;
+        # otherwise derive from the step status + a collector orphaned-CA signal.
+        state_block = details.get(ADCS_FINDING_STATE_KEY)
+        if not isinstance(state_block, dict) or not state_block.get("state"):
+            state_name = classify_adcs_edge_state(
+                status=step.get("status"),
+                is_orphaned_ca=bool(details.get("is_orphaned_ca")),
+            )
+            if state_name:
+                state_block = build_adcs_finding_state(
+                    state=state_name,
+                    ca_host=str(
+                        details.get("target_dnshostname")
+                        or details.get("ca_host")
+                        or details.get("to")
+                        or ""
+                    ),
+                )
+                details[ADCS_FINDING_STATE_KEY] = state_block
+        if isinstance(state_block, dict) and state_block.get("state"):
+            details["adcs_finding_state_view"] = adcs_finding_state_view(state_block)
 
 
 def resolve_domain_assessment(

@@ -135,7 +135,25 @@ def _build_async_resolver(resolver_ips: list[str]) -> "dns.asyncresolver.Resolve
             DC first preserves the "the DC knows its own A records" behaviour.
     """
     resolver = dns.asyncresolver.Resolver(configure=False)
-    resolver.nameservers = list(resolver_ips)
+    # dnspython requires every nameserver to be a literal IP (v4 or v6); a single
+    # FQDN entry makes ``resolver.nameservers = [...]`` raise ``ValueError`` and
+    # aborts the WHOLE batch before any per-host guard can run (a stale/misbuilt
+    # resolver list must never take down resolution). Filter to valid IPs and
+    # drop anything else; an empty result degrades gracefully (dnspython raises
+    # NoNameservers per query, which ``_resolve_one`` catches → empty IP list).
+    valid_nameservers: list[str] = []
+    for entry in resolver_ips:
+        candidate = str(entry or "").strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            print_info_debug(
+                f"[dns-resolver] dropping non-IP nameserver entry {candidate!r} "
+                "(only literal IPs are valid resolvers)"
+            )
+            continue
+        valid_nameservers.append(candidate)
+    resolver.nameservers = valid_nameservers
     resolver.timeout = _DNS_QUERY_TIMEOUT_SECS
     resolver.lifetime = _DNS_QUERY_LIFETIME_SECS
     return resolver

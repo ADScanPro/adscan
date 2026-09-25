@@ -124,7 +124,7 @@ async def run_esc4(config: EscConfig) -> EscResult:
             dns_server=config.dns_server,
             ledger_shell=config.shell,
             ledger_domain=config.domain,
-            ledger_technique="ADCSESC4 — certificate enrollment on the mutated template",
+            ledger_technique="ADCSESC4: certificate enrollment on the mutated template",
             **({} if _esc4_key_size is None else {"key_size": int(_esc4_key_size)}),
         )
         req = await request_certificate_native(req_cfg, out)

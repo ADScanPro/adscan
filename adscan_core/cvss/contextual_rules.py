@@ -1211,22 +1211,22 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
     ),
     "shadow_credentials_present": VulnCvssDefinition(
         finding_type=FindingType.VULNERABILITY,
+        # Base is Medium: the presence of an msDS-KeyCredentialLink entry is a
+        # persistence indicator to investigate, not a proven exposure (ADscan
+        # cannot use the entry without the pre-existing private key). It
+        # elevates only when the affected object's own tier makes an
+        # unauthorised entry near-certainly high-impact.
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
-                condition=CONDITION_EXPLOITATION,
-                elevated_score=9.5,
-                reason="Shadow Credentials abuse confirmed: PKINIT authentication produced a TGT for the target",
-            ),
-            CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
-                elevated_score=9.5,
-                reason="Shadow Credentials writeable on a Tier-0 principal: PKINIT impersonation path",
+                elevated_score=8.8,
+                reason="Key credential present on a Tier-0 principal: an unauthorised entry here is standing domain compromise",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
-                reason="Shadow Credentials writeable on a Domain Controller object",
+                reason="Key credential present on a Domain Controller object: an unauthorised entry here is standing domain compromise",
             ),
         ],
     ),

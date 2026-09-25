@@ -284,12 +284,51 @@ def emit_scan_outcome(shell: Any, command_name: str) -> None:
             pass
 
 
-def _read_attack_paths_count(ws_dir: str) -> int:
-    """Sum materialized attack paths across all domain snapshots, best-effort (0 on miss).
+def _read_effective_reachable_count(ws_dir: str) -> int:
+    """Sum the EFFECTIVE reachable routes to full domain compromise, best-effort.
 
-    Each domain's snapshot lives at <ws_dir>/domains/<domain>/attack_paths_snapshot.json
-    and carries a top-level "paths" list. Best-effort: missing/unreadable files are
-    skipped; the function never raises.
+    Under the control-mega-hub sampled fallback the materialized snapshot
+    collapses to 0 while the run still stamped a reachability set. Reading the
+    effective full-domain-compromise figure off each domain's ``exposure_kpis``
+    (via the counts SSOT) keeps the telemetry count honest — never 0 on a domain
+    that has reachable routes. On a COMPLETE run the effective figure equals k,
+    but this is only consulted when the materialized snapshot summed to 0, so a
+    healthy run's count is unchanged. Best-effort; 0 on any miss.
+    """
+    try:
+        from adscan_internal.services.attack_path_counts import (
+            client_path_totals_from_kpis,
+        )
+
+        report_path = os.path.join(ws_dir, "technical_report.json")
+        if not os.path.isfile(report_path):
+            return 0
+        report = read_json_file(report_path)
+        domains = report.get("domains") if isinstance(report, dict) else None
+        if not isinstance(domains, dict):
+            return 0
+        total = 0
+        for entry in domains.values():
+            kpis = entry.get("exposure_kpis") if isinstance(entry, dict) else None
+            if not isinstance(kpis, dict):
+                continue
+            total += client_path_totals_from_kpis(kpis).effective_full_domain_compromise
+        return max(0, total)
+    except Exception:  # noqa: BLE001 - best effort
+        return 0
+
+
+def _read_attack_paths_count(ws_dir: str) -> int:
+    """Effective attack-path count across all domains, best-effort (0 on miss).
+
+    Prefers the materialized snapshot sum (each domain's
+    <ws_dir>/domains/<domain>/attack_paths_snapshot.json "paths" list). When that
+    is 0 it must NOT read as 0 on a domain that was reached or compromised: it
+    falls back to the effective reachable route count and, failing that, to 1
+    when any domain is proven-pwned (the golden rule — never 0 on a compromised
+    domain). This count is internal telemetry, not client-facing, but it must
+    still reflect reality (reachability / compromise), never a collapsed 0.
+    Best-effort: missing/unreadable files are skipped; the function never raises.
     """
     total = 0
     try:
@@ -304,7 +343,14 @@ def _read_attack_paths_count(ws_dir: str) -> int:
                 pass
     except Exception:  # noqa: BLE001 - best effort on glob
         pass
-    return total
+    if total > 0:
+        return total
+    reachable = _read_effective_reachable_count(ws_dir)
+    if reachable > 0:
+        return reachable
+    if _any_domain_pwned(ws_dir):
+        return 1
+    return 0
 
 
 def _any_domain_pwned(ws_dir: str) -> bool:
@@ -381,6 +427,13 @@ def _read_path_state(ws_dir: str) -> str | None:
                 pass
     except Exception:  # noqa: BLE001 - best effort on glob
         pass
+    # The materialized snapshot can be empty under the control-mega-hub sampled
+    # fallback even when the run stamped reachable routes. A domain with reachable
+    # routes but no proven execution is at least THEORETICAL — never a collapsed
+    # None that reads as "no attack surface". (The proven states are handled by
+    # the ``auth == "pwned"`` override at the top and by the snapshot scan above.)
+    if best_value is None and _read_effective_reachable_count(ws_dir) > 0:
+        return PathState.THEORETICAL.value
     return best_value
 
 

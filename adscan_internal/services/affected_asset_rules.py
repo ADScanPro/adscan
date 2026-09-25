@@ -406,6 +406,20 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.HOST_SCOPED,
         record_containers=("objects",),
     ),
+    # --- SQL Server bulk-operations over-privilege ---------------------------
+    # The MSSQL collector records one entry per NON-sysadmin principal holding
+    # ADMINISTER BULK OPERATIONS, under ``principals`` — each names the principal
+    # (``principal``) and the SQL host it holds the permission on (``instance``),
+    # which qualifies WHICH instance is exposed. No source/target principal split
+    # (it is a config over-privilege, not a traversal).
+    "mssql_bulk_operations_overprivilege": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+        record_containers=("principals",),
+        record_name_field="principal",
+        record_qualifier="instance",
+    ),
     # --- NTLMv1 escalation avenues -------------------------------------------
     # The affected asset is the machine account whose NetNTLMv1 response is
     # recoverable (typically a DC) — the edge TARGET, plus the ``dc_hosts`` /

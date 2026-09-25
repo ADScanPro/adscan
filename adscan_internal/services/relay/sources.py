@@ -11,7 +11,10 @@ from dataclasses import dataclass
 
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services.native_log_taming import is_benign_native_noise
-from adscan_internal.services.relay.core import RelayAuthentication
+from adscan_internal.services.relay.core import (
+    RelayAuthentication,
+    RelayListenerUnavailableError,
+)
 from adscan_internal.services.relay.identity import extract_ntlm_identity
 
 # Markers that are only safe to drop inside the relay listener flow — too
@@ -124,6 +127,36 @@ class RelaySourceConfig:
     protocol: str = "smb"
 
 
+async def probe_listener_bindable(host: str, port: int) -> None:
+    """Confirm the relay listen port can be bound; raise a typed error if not.
+
+    Runs BEFORE the OPSEC-costly coerce/ADIDNS setup so a port already held by
+    another ADscan listener (poisoning, the shared capture listener) is surfaced
+    immediately as a vantage/data gap instead of a 120s timeout followed by a raw
+    ``OSError`` at listener teardown. Binds a throwaway TCP server on the same
+    ``host``/``port`` (a plain-TCP bind is correct even for LDAPS/SMB — the TLS /
+    SMB negotiation happens after ``accept``), then closes it. On any ``OSError``
+    (``EADDRINUSE`` and friends) raises :class:`RelayListenerUnavailableError`.
+    """
+
+    async def _noop(
+        _reader: asyncio.StreamReader, _writer: asyncio.StreamWriter
+    ) -> None:  # pragma: no cover - never accepts a connection
+        return
+
+    try:
+        server = await asyncio.start_server(_noop, host, port)
+    except OSError as exc:
+        raise RelayListenerUnavailableError(
+            host=host, port=port, reason=str(exc) or "address already in use"
+        ) from exc
+    server.close()
+    try:
+        await server.wait_closed()
+    except Exception:  # noqa: BLE001 - best-effort teardown of the probe socket
+        pass
+
+
 class NativeRelaySource:
     """Base class for relay listeners that publish ADscan auth events."""
 
@@ -142,13 +175,23 @@ class NativeRelaySource:
         self._server_task: asyncio.Task[object] | None = None
 
     async def start(self) -> None:
-        """Start the listener and bridge captured contexts into ADscan events."""
+        """Start the listener and bridge captured contexts into ADscan events.
 
+        Confirms the listen port is bindable FIRST (raising
+        :class:`RelayListenerUnavailableError` when it is not) so a port already
+        held by another process is surfaced synchronously here — before any task
+        is spawned — instead of as a latent task exception that only crashes at
+        teardown. The runner converts that error into a failed result.
+        """
+
+        await probe_listener_bindable(
+            self.config.listen_host, self.config.listen_port
+        )
         self._bridge_task = asyncio.create_task(self._bridge_relay_contexts())
         self._server_task = asyncio.create_task(self._start_server())
 
     async def stop(self) -> None:
-        """Stop listener tasks."""
+        """Stop listener tasks (best-effort; never raises)."""
 
         for task in (self._server_task, self._bridge_task):
             if task is not None:
@@ -157,6 +200,13 @@ class NativeRelaySource:
                     await task
                 except asyncio.CancelledError:
                     pass
+                except Exception as exc:  # noqa: BLE001
+                    # A background listener task that already failed (e.g. a bind
+                    # error that raced past the preflight probe) must never crash
+                    # teardown — it has already been surfaced/logged elsewhere.
+                    print_info_debug(
+                        f"relay-teardown listener task ended with error: {exc}"
+                    )
 
     async def _start_server(self) -> object:
         raise NotImplementedError
@@ -215,6 +265,16 @@ class SMBRelaySource(NativeRelaySource):
         server = SMBRelayServer(target, settings)
         task, err = await server.run()
         if err is not None:
+            # A bind failure that raced past the preflight probe: re-raise as the
+            # typed listener-unavailable error so the runner converts it to a
+            # failed result rather than a raw OSError crash. Non-bind errors keep
+            # their original type.
+            if isinstance(err, OSError):
+                raise RelayListenerUnavailableError(
+                    host=self.config.listen_host,
+                    port=self.config.listen_port,
+                    reason=str(err) or "address already in use",
+                ) from err
             raise err
         return await task
 

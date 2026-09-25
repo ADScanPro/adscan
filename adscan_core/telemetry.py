@@ -3923,7 +3923,7 @@ def _strip_known_domain_suffix(value: str, domains: list[str]) -> Optional[str]:
 # The per-value redaction loops in ``_sanitize_rich_output`` (known users,
 # hostnames, base DNs, NetBIOS names, passwords, workspaces) each used to call
 # ``re.compile`` once PER VALUE, PER LOG LINE. Python's own ``re`` cache holds
-# only 512 entries, so a large domain (Sifi: 1172 users + 1463 hosts) overruns
+# only 512 entries, so a large domain (Engagement-Lab: 1172 users + 1463 hosts) overruns
 # it and every line re-compiles thousands of patterns from scratch — measured at
 # ~413 ms PER LOG LINE, which starves the foreground console (the workspace-open
 # "output drips" bug). ``_sanitize_rich_output`` runs from the logging formatter

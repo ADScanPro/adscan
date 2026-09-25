@@ -16,7 +16,7 @@ the domain-wide all-targets lens is treated as a DEV-ONLY capability:
 
 * The engine (``attack_graph_core`` / ``attack_paths_core``) and the debug script
   ``scripts/debug_attack_path_filters.py`` keep it fully working — that is how the
-  Potech OOM was reproduced and how benchmarks are run.
+  Contoso OOM was reproduced and how benchmarks are run.
 * Production surfaces (the CLI ``attack_paths <domain> --all`` at domain scope and
   the paid CTEM web backend) coerce it to the canonical high-value lens, so a
   customer run never launches the doomed worst case and a direct web API call

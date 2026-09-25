@@ -70,6 +70,7 @@ __all__ = [
     "compute_technique_priorities",
     "complexity_rank",
     "carries_client_exposure",
+    "domain_affected_user_total",
     "iter_domain_tagged_paths",
     "normalize_path_status",
     "path_technique_keys",
@@ -208,6 +209,100 @@ def technique_label(technique: str) -> str:
     return label or raw.replace("_", " ").title()
 
 
+def finding_technique_labels(key: str) -> set[str]:
+    """Return the client-facing technique labels a finding key can appear as.
+
+    Resolves the finding's graph-relation aliases via the affected-assets SSOT
+    (:func:`~adscan_internal.services.affected_assets._relation_aliases_for_vulnerability`),
+    then names each alias through :func:`technique_label` — the SAME business-
+    headline vocabulary the ``remediation_start_here`` rows carry. A posture
+    finding with no graph edge (LDAP signing, RC4, NTLM) resolves to no path-
+    technique label and so never matches a priority row. Best-effort: any failure
+    yields an empty set.
+
+    This is the ONE mapper both paid deliverables share to align a finding with
+    the paths-broken ranking, so the Security Assessment Report and the Hardening
+    Playbook can never disagree about which finding a priority row names.
+    """
+    try:
+        from adscan_internal.services.affected_assets import (  # noqa: PLC0415
+            _relation_aliases_for_vulnerability,
+        )
+    except Exception:  # noqa: BLE001 — a missing SSOT degrades to "not on path"
+        return set()
+
+    labels: set[str] = set()
+    for alias in _relation_aliases_for_vulnerability(str(key or "")):
+        label = technique_label(alias)
+        if label:
+            labels.add(label)
+    return labels
+
+
+def order_findings_by_priority(
+    findings: Sequence[Mapping[str, Any]],
+    priority_labels: Sequence[str],
+) -> list[Any]:
+    """Order findings to match the paths-broken priority ranking. Stable.
+
+    ``priority_labels`` is the ordered technique-label list the paths-broken
+    ranking produces (``remediation_start_here`` rows, or the ``action_label`` of
+    :func:`compute_technique_priorities`). Every finding whose technique matches a
+    priority row leads, in priority order — a finding's rank is the MINIMUM
+    priority index across its matching labels (via :func:`finding_technique_labels`).
+    Findings that match no priority row follow, keeping their incoming order (the
+    caller's severity/CVSS order), so nothing is dropped and off-path ordering is
+    unchanged.
+
+    Returns a new list of the SAME finding objects; the input is never mutated.
+    When ``priority_labels`` is empty the input order is preserved verbatim, so a
+    workspace with no persisted ranking degrades to the legacy severity order.
+    """
+    label_rank: dict[str, int] = {}
+    for idx, label in enumerate(priority_labels):
+        lbl = str(label or "").strip()
+        if lbl and lbl not in label_rank:
+            label_rank[lbl] = idx
+    findings_list = list(findings)
+    if not label_rank:
+        return findings_list
+    unmatched_rank = len(label_rank)
+
+    def _rank(finding: Any) -> int:
+        key = ""
+        if isinstance(finding, Mapping):
+            key = str(finding.get("key") or "")
+        matched = [label_rank[lbl] for lbl in finding_technique_labels(key) if lbl in label_rank]
+        return min(matched) if matched else unmatched_rank
+
+    return [
+        finding
+        for _, finding in sorted(
+            enumerate(findings_list), key=lambda pair: (_rank(pair[1]), pair[0])
+        )
+    ]
+
+
+def finding_priority_rank(finding: Mapping[str, Any], priority_labels: Sequence[str]) -> int | None:
+    """Return a finding's 1-based ADscan-Priority position, or ``None`` if off-path.
+
+    The position is derived from the SAME ``priority_labels`` order
+    :func:`order_findings_by_priority` sorts by: the finding's rank is the minimum
+    matching priority index, expressed 1-based. A finding whose technique is not on
+    any validated-path priority row returns ``None`` (it has no paths-broken rank).
+    """
+    label_rank: dict[str, int] = {}
+    for idx, label in enumerate(priority_labels):
+        lbl = str(label or "").strip()
+        if lbl and lbl not in label_rank:
+            label_rank[lbl] = idx
+    if not label_rank:
+        return None
+    key = str(finding.get("key") or "") if isinstance(finding, Mapping) else ""
+    matched = [label_rank[lbl] for lbl in finding_technique_labels(key) if lbl in label_rank]
+    return min(matched) + 1 if matched else None
+
+
 # ── Reading one path ──────────────────────────────────────────────────────────
 
 
@@ -301,6 +396,95 @@ def path_technique_keys(path: Mapping[str, Any]) -> list[str]:
         for relation in relations:
             _add(relation)
     return ordered
+
+
+def _build_domain_tier2_set(paths: Iterable[Mapping[str, Any]]) -> set[str] | None:
+    """The DOMAIN-level ordinary Tier-2 user set, from every path's tier map.
+
+    Aggregates ``meta.affected_users_tier_map`` across ALL paths and returns the
+    accounts graded ``tier2`` (lower-cased). This must be domain-level, not
+    per-path: only the broad-group paths (a handful) resolve full membership and
+    carry a tier map, while the many single-user paths carry none — so a per-path
+    filter would leak every single-user path's account. Aggregating gives the one
+    ordinary-Tier-2 population the exposure-KPI headline counts (its "N of M
+    standard users" figure). Returns ``None`` when NO path carries any tier data
+    (an old snapshot) so callers degrade to an unfiltered union rather than a zero
+    reach; returns a (possibly empty) set otherwise.
+    """
+    result: set[str] = set()
+    saw_tier_data = False
+    for path in paths or ():
+        if not isinstance(path, Mapping):
+            continue
+        meta = path.get("meta")
+        if not isinstance(meta, Mapping):
+            continue
+        tier_map = meta.get("affected_users_tier_map")
+        if not isinstance(tier_map, Mapping) or not tier_map:
+            continue
+        saw_tier_data = True
+        for user, tier in tier_map.items():
+            if (
+                isinstance(user, str)
+                and user.strip()
+                and str(tier).strip().lower() == "tier2"
+            ):
+                result.add(user.strip().lower())
+    return result if saw_tier_data else None
+
+
+def _path_affected_users(
+    path: Mapping[str, Any], tier2_set: set[str] | None = None
+) -> set[str]:
+    """Return the distinct ordinary **Tier-2** users one path exposes, lower-cased.
+
+    The set is read from the path record's ``meta.affected_users`` and FILTERED to
+    ``tier2_set`` — the DOMAIN-level ordinary Tier-2 population the caller built once
+    via :func:`_build_domain_tier2_set` (the SAME "ordinary (non-administrative)
+    user" population the exposure-KPI headline counts, its "N of M standard users
+    hold a reachable path" figure). A Tier-0 account (already privileged — its "path
+    to Tier 0" is meaningless and the KPI explicitly excludes it) and any account
+    not in the ordinary-Tier-2 set are dropped, so the reach numerator/denominator
+    agree with the KPI's ordinary figure instead of the raw affected set (which
+    mixes Tier-0 + untiered accounts). Lower-cased so ``SVC_TGS`` and ``svc_tgs``
+    fold to one person, which keeps the per-technique union and the domain union
+    self-consistent (one account once).
+
+    ``tier2_set`` is ``None`` ONLY when the whole domain carried no tier data (an
+    old snapshot that predates the stamp); the list is then kept UNFILTERED — a
+    best-effort degrade so an old workspace still ranks rather than collapsing to
+    zero reach. Returns an empty set when there is no ``meta.affected_users`` at
+    all; never raises.
+    """
+    meta = path.get("meta")
+    if not isinstance(meta, Mapping):
+        return set()
+    users = meta.get("affected_users")
+    if not isinstance(users, (list, tuple, set)):
+        return set()
+    names = {u.strip().lower() for u in users if isinstance(u, str) and u.strip()}
+    if tier2_set is not None:
+        return names & tier2_set
+    return names
+
+
+def domain_affected_user_total(paths: Iterable[Mapping[str, Any]]) -> int:
+    """Return the size of the UNION of ``meta.affected_users`` over all paths.
+
+    The domain denominator for the affected-user REACH metric. Numerator (a
+    technique's per-technique union) and denominator (this) come from the SAME
+    ``_path_affected_users`` source, so reach_pct is self-consistent by
+    construction — never crossed with the ``tier2_exposure_total`` /
+    ``affected_principal_count`` populations (the documented two-denominator trap
+    in :mod:`adscan_internal.services.exposure_score_service`). Overlap-honest: a
+    user counted in ten paths is one person here.
+    """
+    materialized = [p for p in (paths or ()) if isinstance(p, Mapping)]
+    tier2_set = _build_domain_tier2_set(materialized)
+    union: set[str] = set()
+    for path in materialized:
+        union |= _path_affected_users(path, tier2_set)
+    return len(union)
 
 
 def _path_principal(path: Mapping[str, Any]) -> str:
@@ -400,6 +584,15 @@ class TechniquePriority:
     can_fully_mitigate: bool
     mitre_technique_id: str | None
     mitre_technique_name: str | None
+    #: Distinct affected USERS this technique exposes — the size of the UNION of
+    #: each affected path's ``meta.affected_users``. This is the LEAD remediation
+    #: metric (a fix whose technique is exposed to 1,172 people outranks one that
+    #: breaks more graph paths but touches fewer people). Overlap-honest: it is a
+    #: set union, so it is never summed across techniques (Kerberoast and ESC8 can
+    #: both cover the same population). ``0`` when the paths carry no
+    #: ``meta.affected_users`` (an older snapshot), which degrades reach to the
+    #: legacy path-count lead rather than fabricating a number.
+    reach_users: int = 0
 
     @property
     def share(self) -> float:
@@ -498,7 +691,15 @@ def compute_technique_priorities(
     accumulators: dict[str, dict[str, Any]] = {}
     counted = 0
 
-    for path in paths or ():
+    # The DOMAIN-level ordinary Tier-2 population, resolved ONCE so every path's
+    # affected users filter to the SAME set the exposure-KPI headline counts. Only
+    # the broad-group paths carry a tier map, so it must be aggregated across all
+    # paths (a per-path filter leaks the single-user paths). Materialize the
+    # iterable because we pass over it twice (build the set, then accumulate).
+    materialized_paths = list(paths or ())
+    tier2_set = _build_domain_tier2_set(materialized_paths)
+
+    for path in materialized_paths:
         if not isinstance(path, Mapping):
             continue
         # Every usable record counts toward the denominator — the document still
@@ -511,6 +712,7 @@ def compute_technique_priorities(
         evidence = _STATUS_EVIDENCE_WEIGHT.get(status, 1)
         path_domain = _path_domain(path, domain)
         principal = _path_principal(path)
+        path_users = _path_affected_users(path, tier2_set)
 
         choke_point = path.get("top_choke_point")
         choke_id = ""
@@ -548,6 +750,7 @@ def compute_technique_priorities(
                 state = {
                     "paths_affected": 0,
                     "principals": set(),
+                    "affected_users": set(),
                     "domains": set(),
                     "exploited_paths": 0,
                     "worst_severity": severity,
@@ -562,6 +765,10 @@ def compute_technique_priorities(
             state["paths_affected"] += 1
             if principal:
                 state["principals"].add(principal)
+            # Accumulate the per-technique affected-USER union (the reach lead).
+            # A set union, so a user on several of this technique's paths counts
+            # once — the overlap-honesty rule.
+            state["affected_users"] |= path_users
             if path_domain:
                 state["domains"].add(path_domain)
             if status == "exploited":
@@ -639,6 +846,7 @@ def compute_technique_priorities(
                 can_fully_mitigate=bool(metadata["can_fully_mitigate"]),
                 mitre_technique_id=metadata["mitre_technique_id"],
                 mitre_technique_name=metadata["mitre_technique_name"],
+                reach_users=len(state["affected_users"]),
             )
         )
 

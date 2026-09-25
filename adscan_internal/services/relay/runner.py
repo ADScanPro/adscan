@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Literal
 
 from adscan_internal.services.relay.core import (
     RelayEngine,
+    RelayListenerUnavailableError,
     RelayRunConfig,
     RelayRunResult,
     RelayTarget,
@@ -67,9 +69,36 @@ async def run_native_relay(
         ),
     )
 
-    from adscan_core.rich_output import print_info_debug  # noqa: PLC0415
+    from adscan_core.rich_output import (  # noqa: PLC0415
+        print_exception,
+        print_info_debug,
+        print_warning,
+    )
+    from adscan_core import telemetry  # noqa: PLC0415
 
-    await source.start()
+    try:
+        await source.start()
+    except RelayListenerUnavailableError as exc:
+        # The listen port could not be bound (e.g. already held by the poisoning
+        # / capture listener). Turn it into a failed result so the ESC8 / RBCD
+        # caller continues to the next path instead of aborting the whole phase
+        # with a raw traceback. This is a vantage/data gap, never a defensive
+        # control claim (Exposure-Validation doctrine).
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(
+            f"Relay listener could not start on port {exc.port} "
+            f"({exc.reason}). Skipping the relay attempt and continuing."
+        )
+        with contextlib.suppress(Exception):
+            await source.stop()
+        return RelayRunResult(
+            results=(),
+            timed_out=False,
+            authentications_seen=0,
+            listener_error=exc.reason_summary,
+        )
+
     try:
         return await engine.run()
     finally:

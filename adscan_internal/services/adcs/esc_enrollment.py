@@ -71,7 +71,7 @@ def _request_cfg(
         # environment-change ledger as soon as the CA issues it.
         ledger_shell=config.shell,
         ledger_domain=config.domain,
-        ledger_technique=f"ADCSESC{config.esc} — certificate enrollment",
+        ledger_technique=f"ADCSESC{config.esc}: certificate enrollment",
         **({} if _key_size is None else {"key_size": int(_key_size)}),
     )
 

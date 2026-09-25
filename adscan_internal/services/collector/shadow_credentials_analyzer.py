@@ -1,10 +1,25 @@
-"""Detect AD objects that already have msDS-KeyCredentialLink entries (shadow credentials)."""
+"""Detect AD objects that already have msDS-KeyCredentialLink entries (shadow credentials).
+
+An EXISTING shadow credential is a PERSISTENCE indicator — a possible attacker
+backdoor, or a legitimate Windows Hello for Business enrolment — NOT a traversable
+attack edge. Using one to authenticate as the object (PKINIT → UnPAC-the-hash)
+requires the PRE-EXISTING private key, which the operator does not hold; whoever
+planted the key does. So this analyzer emits ONLY the ``shadow_credentials_present``
+FINDING (surfaced in the CLI intelligence panel + the client report, and mapped by
+every compliance framework). It deliberately does NOT write a ``HasShadowCredentials``
+graph edge: modelling "reaching an object that already has a shadow credential" as a
+``direct_target_compromise`` self-loop was an overclaim (ADscan cannot use the
+credential) and, because it rendered as a ``X → X`` self-loop, it also defeated the
+redundant-MemberOf minimiser and truncated legitimate domain-compromise chains at the
+computer. The real, operator-executable attack is the distinct ``AddKeyCredentialLink``
+control edge (write access → plant OUR OWN key → PKINIT), emitted separately by the
+ACL parser and left fully traversable.
+"""
 
 from __future__ import annotations
 
 from adscan_internal.services.collector.models import (
     CollectionResult,
-    CollectorEdge,
     ShadowCredentialFinding,
 )
 
@@ -16,8 +31,9 @@ def analyze_shadow_credentials(
 ) -> list[ShadowCredentialFinding]:
     """Find nodes with existing msDS-KeyCredentialLink entries.
 
-    Also writes a HasShadowCredentials self-loop edge for each finding so that
-    intelligence.py can surface them via the tactical findings display.
+    Returns one :class:`ShadowCredentialFinding` per object carrying a key
+    credential. Emits NO graph edge — an existing shadow credential is a persistence
+    IoC finding, not an attack step (see the module docstring).
     """
     findings: list[ShadowCredentialFinding] = []
     for node in result.nodes.values():
@@ -33,15 +49,6 @@ def analyze_shadow_credentials(
                 kind=node.kind,
                 distinguished_name=node.distinguished_name,
                 key_count=key_count,
-            )
-        )
-        result.add_edge(
-            CollectorEdge(
-                source_object_id=node.object_id,
-                target_object_id=node.object_id,
-                relation="HasShadowCredentials",
-                source="ldap",
-                method="msDS-KeyCredentialLink",
             )
         )
     return findings

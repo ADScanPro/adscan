@@ -619,6 +619,27 @@ def derive_domain_user_reach(
                 candidate = any_bucket.get("tier_breakdown")
                 domain_breakdown = candidate if isinstance(candidate, Mapping) else None
             domain_all_users = domain_all_users or bool(any_bucket.get("all_users"))
+        # k-independent fallback: under the control-mega-hub SAMPLED coverage the
+        # user_axis collapses to 0 (materialization is capped) even on a
+        # compromised domain, so the "X of N users" figure would read 0. The
+        # engine-stamped ``tier2_exposure`` ratio is a reverse-reachability set
+        # cardinality that survives the fallback, and it is ALREADY the ordinary
+        # (enabled, non-Tier-0, real-user) split — so when user_axis produced
+        # nothing, use it directly for this domain and skip the tier_breakdown
+        # reconciliation (there is no per-status breakdown to reconcile). Healthy
+        # domains never enter this branch (user_axis > 0), so they are unchanged.
+        if domain_affected == 0:
+            tier2 = kpis.get("tier2_exposure")
+            if isinstance(tier2, Mapping):
+                t2_with = max(0, int(tier2.get("with_path", 0) or 0))
+                t2_total = max(0, int(tier2.get("total", 0) or 0))
+                if t2_with > 0 and t2_total > 0:
+                    affected += t2_with
+                    ordinary_affected += t2_with
+                    ordinary_total += t2_total
+                    ordinary_available = True
+                    continue
+
         affected += domain_affected
         any_all_users = any_all_users or domain_all_users
 
@@ -629,17 +650,32 @@ def derive_domain_user_reach(
         tiers = _coerce_tier_breakdown(domain_breakdown)
         if tiers is None or sum(tiers) != domain_affected or domain_affected <= 0:
             continue
-        # NOTE: this DomainUserReach.ordinary_total is a SEPARATE internal figure
-        # (the LITE report displays the sprawl's ``ordinary_count`` instead, so it
-        # never shows this denominator). It deliberately keeps the observed-tier0
-        # subtraction and does NOT pass ``population_tier0`` — the PRO PDF + web KPI
-        # are the surfaces that exclude the full Tier-0 population (they call
-        # derive_ordinary_breaker_stat with population_tier0 directly).
+        # This DomainUserReach.ordinary_total IS the denominator the LITE report's
+        # headline renders ("N of M ordinary accounts", build_verdict_reach /
+        # build_exposure_figure read ``reach.ordinary_total``). It MUST therefore
+        # exclude the FULL Tier-0-by-membership POPULATION — not merely the Tier-0
+        # accounts that happen to hold an outbound path — exactly as the PRO PDF
+        # (html_pdf_generator ``_agg_blast_radius``) and the web KPI
+        # (exposure_kpis_view) do, or the free and paid tiers quote different
+        # denominators off one scan (the 1142-vs-1141 concordance bug). Read the
+        # engine-stamped ``population_tier_breakdown.tier0`` and pass it as
+        # ``population_tier0`` so a Tier-0 SINK (e.g. the RID-500 Administrator,
+        # present in the population but absent from the affected set) is dropped
+        # from the ordinary denominator. ``derive_ordinary_breaker_stat`` floors
+        # it at ``max(affected_tier0, population_tier0)``, so a smaller/absent
+        # population figure never regresses the previous behaviour.
+        _ptb = kpis.get("population_tier_breakdown")
+        population_tier0 = (
+            max(0, int(_ptb.get("tier0", 0) or 0))
+            if isinstance(_ptb, Mapping)
+            else None
+        )
         stat = derive_ordinary_breaker_stat(
             tier0=tiers[0],
             tier1=tiers[1],
             tier2=tiers[2],
             domain_user_count=domain_users,
+            population_tier0=population_tier0,
         )
         ordinary_affected += int(stat["ordinary_with_breaker"])
         ordinary_total += int(stat["ordinary_total"])
@@ -1080,6 +1116,7 @@ def compute_exposure_kpis(
     excluded_users: Sequence[str] | None = None,
     population_tier_breakdown: Mapping[str, Any] | None = None,
     reachability: Mapping[str, int] | None = None,
+    tier2_exposure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the exposure KPI block (path-axis + user-axis blast radius).
 
@@ -1407,6 +1444,34 @@ def compute_exposure_kpis(
         }
     if reachability is not None:
         block["reachability"] = dict(reachability)
+    if tier2_exposure is not None:
+        block["tier2_exposure"] = dict(tier2_exposure)
+    # TWO Tier-2 numbers coexist in this block ON PURPOSE — they measure different
+    # populations, and a consumer must NEVER cross them for a denominator:
+    #   * ``population_tier_breakdown.tier2`` — the graded ACCOUNT population
+    #     (``resolve_population_tier_breakdown`` over ``AccountPopulation``). Its
+    #     buckets sum to ``domain_user_count``, so it is the ONLY correct source
+    #     for the ordinary-account denominator (``domain_user_count -
+    #     population_tier_breakdown.tier0`` = enabled non-Tier-0 accounts). This is
+    #     what ``derive_domain_user_reach`` / ``derive_ordinary_breaker_stat`` and
+    #     the PRO/web KPI use.
+    #   * ``tier2_exposure.total`` — the count of standard-user NODES in the ATTACK
+    #     GRAPH (``tier2_exposure_ratio`` → ``_node_is_standard_user``: enabled,
+    #     non-Tier-0-by-stamped-label, non-synthetic ``User`` nodes). It is a
+    #     k-independent reverse-reachability ratio (``with_path / total``) and is
+    #     the "share of standard users that can reach Tier 0" headline; it is NOT
+    #     the account population and legitimately differs (a graph may hold User
+    #     nodes absent from the enabled-account set, and its Tier-0 exclusion is the
+    #     stamped-label mechanism, not the group grader). Consume it ONLY as its own
+    #     ratio (numerator AND denominator both from ``tier2_exposure``), NEVER as
+    #     the ordinary-account denominator. ``derive_domain_user_reach`` uses it only
+    #     in the SAMPLED-collapse fallback, where its own ratio is the honest signal.
+    # Likewise the THREE Tier-0 numbers are distinct and each has one role:
+    # ``population_tier_breakdown.tier0`` (population membership → ordinary
+    # denominator exclusion), ``population_tier_breakdown.tier0_direct`` (the
+    # direct-vs-escalation split → the sprawl figure), and the AFFECTED-set
+    # ``user_axis.*.any.tier_breakdown.tier0`` (Tier-0 accounts that HOLD a path →
+    # the affected-count reconciliation only).
     return block
 
 
@@ -1540,6 +1605,9 @@ def stamp_exposure_kpis_for_domain(
         # failure must never break the block, so it is guarded and leaves
         # reachability=None (the reachable_* fields then default to 0).
         _reachability = dict(reachability) if reachability is not None else None
+        # Hoisted so the k-independent Tier-2 exposure ratio can reuse the graph
+        # loaded for reachability instead of reloading it.
+        _graph: dict[str, Any] | None = None
         if _reachability is None:
             try:
                 from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
@@ -1576,6 +1644,29 @@ def stamp_exposure_kpis_for_domain(
                     print_exception(exception=_reach_exc)
                 _reachability = None
 
+        # Standard-user -> Tier-0 reachability ratio (k-independent: a
+        # reverse-reachability set cardinality over the base graph). It is the
+        # client exposure headline and survives the control-mega-hub sampled
+        # fallback that collapses the materialized user_axis to 0. Best-effort:
+        # a failure leaves the block absent (consumers degrade to user_axis).
+        _tier2_exposure = None
+        try:
+            from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+                _resolve_tier2_exposure_for_graph,
+                load_attack_graph,
+            )
+
+            _tier2_graph = _graph
+            if not isinstance(_tier2_graph, dict):
+                _tier2_graph = load_attack_graph(_kpi_shell, domain)
+            _ratio = _resolve_tier2_exposure_for_graph(_tier2_graph)
+            if _ratio is not None and _ratio.available:
+                _tier2_exposure = _ratio.as_dict()
+        except Exception as _tier2_exc:  # noqa: BLE001
+            if print_exception is not None:
+                print_exception(exception=_tier2_exc)
+            _tier2_exposure = None
+
         _kpis = compute_exposure_kpis(
             records,
             domain_user_count=_user_count,
@@ -1587,6 +1678,7 @@ def stamp_exposure_kpis_for_domain(
             executions=_executions or None,
             computed_at=computed_at or None,
             reachability=_reachability,
+            tier2_exposure=_tier2_exposure,
         )
         domain_data["exposure_kpis"] = _kpis
         record_exposure_kpis(

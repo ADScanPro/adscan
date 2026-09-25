@@ -21,6 +21,7 @@ import re
 import secrets
 import time
 
+from rich.markup import escape as rich_markup_escape
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
@@ -104,6 +105,7 @@ from adscan_internal.cli.roasting_execution import (
 from adscan_internal.cli.ace_step_execution import (
     ACL_ACE_RELATIONS,
     build_ace_step_context,
+    consume_ace_step_failure_reason,
     describe_ace_relation_support,
     describe_ace_step_support,
     execute_ace_step,
@@ -181,6 +183,7 @@ from adscan_internal.services.network_probe_service import (
     TCPProbeResult,
     SERVICE_PROBE_PORTS,
     action_to_service_ports,
+    tcp_probe,
     tcp_probe_multi,
 )
 from adscan_internal.services.smb_privilege import (
@@ -3613,6 +3616,300 @@ def _extract_cert_templates_from_step_details(
         {t for t in templates if isinstance(t, str) and t.strip()}, key=str.lower
     )
     return unique
+
+
+def _extract_vulnerable_ca_from_step_details(
+    details: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the SPECIFIC vulnerable Enterprise CA recorded on the step.
+
+    CA-anchored ADCS escalations (ESC8 / ESC11 / relay-to-ADCS) target one exact
+    Certificate Authority, which the collector records on the edge under
+    ``details["vulnerable_resources"]`` as the entry with ``kind == "EnterpriseCA"``
+    (mirrors :func:`_extract_cert_templates_from_step_details`, which reads the
+    same list filtered by the ``CertTemplate`` kind). Returning that entry lets
+    execution connect to the CA the finding is actually about instead of the
+    domain-wide ``adcs`` scalar (the first enrollment server the collector saw),
+    which in a multi-CA domain is frequently a different — often decommissioned —
+    host.
+
+    Returns the first EnterpriseCA resource dict (``name`` / ``object_id`` /
+    ``distinguished_name``), or ``None`` when the step carries none.
+    """
+    vr_list = details.get("vulnerable_resources")
+    if not isinstance(vr_list, list):
+        return None
+    for entry in vr_list:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("kind") or "").strip().lower() == "enterpriseca":
+            return entry
+    return None
+
+
+def _resolve_ca_dns_hostname(
+    shell: Any,
+    domain: str,
+    *,
+    ca_name: str = "",
+    ca_object_id: str = "",
+) -> str | None:
+    """Resolve an Enterprise CA's DNS hostname from the workspace ADCS inventory.
+
+    The vulnerable-resources CA entry carries the CA ``name`` / ``object_id`` but
+    not its ``dns_hostname``; the CA-to-host mapping lives in the persisted
+    ``adcs_enterprise_cas.json`` inventory (each record's
+    ``properties.dns_hostname``). Reads it through the inventory SSOT
+    (:meth:`LocalGraphService._inventory_records`) and matches by ``object_id``
+    first, then by ``name`` (both case-insensitive).
+
+    Returns the CA's ``dns_hostname`` (an FQDN), or ``None`` when the CA is not in
+    the inventory or has no recorded hostname (an honest data gap for the caller).
+    """
+    from adscan_internal.services.local_graph_service import (  # noqa: PLC0415
+        LocalGraphService,
+    )
+
+    try:
+        records = LocalGraphService(shell)._inventory_records(  # noqa: SLF001
+            domain, "adcs_enterprise_cas.json"
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+    target_oid = ca_object_id.strip().upper()
+    target_name = ca_name.strip().casefold()
+
+    def _hostname(record: dict[str, Any]) -> str | None:
+        host = str(record.get("dns_hostname") or "").strip()
+        return host or None
+
+    if target_oid:
+        for record in records:
+            if str(record.get("objectid") or "").strip().upper() == target_oid:
+                return _hostname(record)
+    if target_name:
+        for record in records:
+            if str(record.get("name") or "").split("@", 1)[0].strip().casefold() == target_name:
+                return _hostname(record)
+    return None
+
+
+def _extract_vulnerable_template_from_step_details(
+    details: dict[str, Any],
+) -> str | None:
+    """Return the SPECIFIC vulnerable certificate TEMPLATE recorded on the step.
+
+    Template-anchored ADCS escalations (ESC1/2/3/4/6/9/10/13/14/15) are exploited
+    by enrolling the vulnerable template at any CA that PUBLISHES it and is
+    reachable. The collector records that template on the edge under
+    ``details["vulnerable_resources"]`` as the entry with ``kind == "CertTemplate"``
+    (mirrors :func:`_extract_vulnerable_ca_from_step_details`, which reads the
+    same list filtered by the ``EnterpriseCA`` kind). Returning it lets execution
+    invert the CA-to-template map and pick a reachable publishing CA instead of
+    the domain-wide ``adcs`` scalar (the first enrollment server the collector
+    saw), which in a multi-CA domain is frequently a different — often
+    decommissioned — host that does not publish the vulnerable template at all.
+
+    Returns the first CertTemplate resource ``name`` (its CN), or ``None`` when
+    the step carries none.
+    """
+    vr_list = details.get("vulnerable_resources")
+    if not isinstance(vr_list, list):
+        return None
+    for entry in vr_list:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("kind") or "").strip().lower() in {
+            "certtemplate",
+            "certificatetemplate",
+        }:
+            name = entry.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return None
+
+
+def _ca_enrollment_port_reachable(connect_ip: str, *, port: int = 445) -> bool:
+    """Best-effort live TCP probe of a CA's enrollment port (never raises).
+
+    A CA host can RESOLVE yet have the enrollment surface closed (the Engagement-Lab
+    ``forward`` case: resolves to an IP, but SMB/RPC does not answer). Reachability
+    is a per-CA, per-port property, so the selection LIVE-probes the MS-ICPR /
+    RPC-over-SMB enrollment port (445) rather than trusting a cached verdict —
+    mirrors the "always live-probe the service port" rule in
+    ``host_address_resolver``. Returns ``True`` only when the port answers.
+    """
+    ip = str(connect_ip or "").strip()
+    if not ip:
+        return False
+    try:
+        result = run_async_sync(tcp_probe(ip, port, timeout=3.0))
+        return getattr(result, "status", "") == "open"
+    except Exception as exc:  # noqa: BLE001 — best-effort probe; absence != closed
+        print_exception(exception=exc)
+        return False
+
+
+def _resolve_reachable_publishing_ca(
+    shell: Any,
+    domain: str,
+    template_cn: str,
+) -> tuple[str, str, str | None] | None:
+    """Resolve a REACHABLE Enterprise CA that publishes ``template_cn`` (SSOT half).
+
+    Template-anchored ADCS escalations enroll the vulnerable template at any CA
+    that publishes it AND is reachable. The CA-to-template mapping is already
+    collected: each enterprise-CA inventory record carries ``certificate_templates``
+    (the published template CNs; ``adcs_collector.py``). This inverts that map —
+    selects the CAs whose list contains ``template_cn`` (case-insensitive),
+    resolves each candidate's ``dns_hostname`` to a connect address via the
+    host-resolution SSOT, and LIVE-probes the enrollment port. Returns the FIRST
+    candidate that both resolves AND whose enrollment port answers. A CA that is
+    NXDOMAIN/offline (does not resolve) or resolves but has the enrollment port
+    closed is NOT selected — a dead/unreachable CA is an honest data gap
+    (Exposure-Validation), never a blind fall-through to the wrong CA. Returns
+    ``(ca_name, connect_ip, spn_fqdn)`` or ``None`` when no publishing CA
+    resolves and reaches.
+    """
+    template_key = str(template_cn or "").strip().casefold()
+    if not template_key:
+        return None
+
+    from adscan_internal.services.local_graph_service import (  # noqa: PLC0415
+        LocalGraphService,
+    )
+
+    try:
+        records = LocalGraphService(shell)._inventory_records(  # noqa: SLF001
+            domain, "adcs_enterprise_cas.json"
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+    from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+        resolve_host_address,
+    )
+
+    for record in records:
+        published = record.get("certificate_templates") or []
+        if not isinstance(published, (list, tuple)):
+            published = [published]
+        published_norm = {str(t).strip().casefold() for t in published if t}
+        if template_key not in published_norm:
+            continue
+        ca_name = str(record.get("name") or "").split("@", 1)[0].strip()
+        ca_dns = str(record.get("dns_hostname") or "").strip().rstrip(".")
+        if not ca_dns:
+            continue
+        try:
+            address = resolve_host_address(
+                shell,
+                host=ca_dns,
+                domain=domain,
+                service="adcs",
+                probe_port=445,
+                allow_operator_prompt=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            continue
+        connect_ip = str(address.resolved_ip or "").strip()
+        if not connect_ip:
+            continue
+        if not _ca_enrollment_port_reachable(connect_ip):
+            continue
+        print_info_debug(
+            "adcs-ca-select: template "
+            f"{mark_sensitive(template_cn, 'service')} -> reachable publishing CA "
+            f"{mark_sensitive(ca_name or ca_dns, 'hostname')} "
+            f"({mark_sensitive(connect_ip, 'ip')})"
+        )
+        return (ca_name, connect_ip, ca_dns or None)
+    return None
+
+
+def resolve_esc_execution_ca(
+    shell: Any,
+    domain: str,
+    details: dict[str, Any],
+    *,
+    domain_data: dict[str, Any],
+) -> tuple[str, str, str | None] | None:
+    """Resolve the ``(ca_name, ca_host, ca_fqdn)`` an ADCS ESC step targets — SSOT.
+
+    ONE place every ADCS ESC execution branch resolves which Certificate Authority
+    to enroll at / relay to, so a multi-CA domain never dead-ends on the wrong
+    (often decommissioned, no-longer-resolving) CA. This is the generalization of
+    the Part A CA-anchored fix into a single path every branch shares
+    ("fix the class at the SSOT"). Precedence:
+
+    (a) CA-ANCHORED (ESC7/8/11/relay-to-ADCS): the step carries a specific
+        vulnerable EnterpriseCA resource — resolve THAT CA's host.
+    (b) TEMPLATE-ANCHORED (ESC1/2/3/4/6/9/10/13/14/15): the step carries a
+        vulnerable CertTemplate — pick a REACHABLE CA that PUBLISHES it.
+    (c) LEGACY / no vulnerable resource: the domain-wide ``adcs``/``ca`` scalar
+        (byte-identical to the pre-multi-CA behaviour, for older/other edges).
+
+    Returns ``(ca_name, ca_host, ca_fqdn)`` — ``ca_host`` a reachable connect IP
+    (or an FQDN when resolution could not narrow it), ``ca_fqdn`` the Kerberos-SPN
+    FQDN or ``None`` — or ``None`` for an honest data gap: the vulnerable
+    CA/template is known but no reachable CA was found. On ``None`` the caller
+    emits the ``unavailable`` data-gap step, never a blind connect to the wrong CA
+    and never the misleading "check the template DACL / Web Enrollment" message.
+    """
+    # (a) CA-anchored — the finding names a specific vulnerable CA.
+    vulnerable_ca = _extract_vulnerable_ca_from_step_details(details)
+    if vulnerable_ca is not None:
+        step_ca_name = str(vulnerable_ca.get("name") or "").strip()
+        ca_dns = _resolve_ca_dns_hostname(
+            shell,
+            domain,
+            ca_name=step_ca_name,
+            ca_object_id=str(vulnerable_ca.get("object_id") or "").strip(),
+        )
+        if not ca_dns:
+            return None
+        from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+            resolve_connect_and_spn,
+        )
+
+        connect_ip, spn_fqdn = resolve_connect_and_spn(
+            shell,
+            host=ca_dns,
+            domain=domain,
+            spn_hostname=ca_dns,
+        )
+        ca_host = str(connect_ip or "")
+        if not ca_host:
+            return None
+        return (
+            step_ca_name or str(domain_data.get("ca") or ""),
+            ca_host,
+            spn_fqdn or None,
+        )
+
+    # (b) Template-anchored — pick a reachable CA that publishes the template.
+    template_cn = _extract_vulnerable_template_from_step_details(details)
+    if template_cn:
+        return _resolve_reachable_publishing_ca(shell, domain, template_cn)
+
+    # (c) Legacy fallback — the domain-wide scalar (byte-identical to before).
+    ca_name = str(domain_data.get("ca") or "")
+    ca_host = str(
+        domain_data.get("adcs")
+        or domain_data.get("pdc_hostname")
+        or domain_data.get("pdc")
+        or ""
+    )
+    if not ca_host or not ca_name:
+        return None
+    return (ca_name, ca_host, _resolve_ca_fqdn(domain_data))
 
 
 def _extract_effective_group_from_step_details(details: dict[str, Any]) -> str | None:
@@ -8800,6 +9097,7 @@ def execute_selected_attack_path(
             step_index: int,
             executable_step_position: int,
             actor: str | None = None,
+            reason: str | None = None,
         ) -> None:
             """Single source for the universal halt-on-failure of a path step.
 
@@ -8820,19 +9118,35 @@ def execute_selected_attack_path(
             """
             marked_action = action
             marked_target = mark_sensitive(to_label or "", "node")
+            # The cause is UNTRUSTED (exploit/LDAP text): escape it so a
+            # bracket-shaped token can never break Rich markup (see the Rich
+            # square-bracket rule), and keep it to one clause on the halt line.
+            clean_reason = (reason or "").strip()
+            reason_suffix = ""
+            if clean_reason:
+                reason_suffix = " — " + rich_markup_escape(clean_reason)
             print_warning(
                 f"[dim]Step {executable_step_position}/{total_executable_steps}[/dim] "
                 f"[bold]{marked_action}[/bold] on {marked_target} failed — "
-                "remaining path steps skipped."
+                "remaining path steps skipped." + reason_suffix
             )
+            # Cause line to adscan.debug.log + the recording so the next
+            # occurrence is diagnosable even when the exploit's own error scrolled
+            # far above the halt line.
+            if clean_reason:
+                print_info_debug(
+                    "attack-path halt cause: "
+                    f"{mark_sensitive(clean_reason, 'detail')}"
+                )
             _record_attack_path_execution_event(
                 shell,
                 domain=domain,
                 summary=summary,
                 event_stage="path_aborted",
                 message=(
-                    f"{action} failed on {to_label}; "
-                    "subsequent steps require this to succeed and were skipped."
+                    f"{action} failed on {to_label}"
+                    + (f" ({clean_reason})" if clean_reason else "")
+                    + "; subsequent steps require this to succeed and were skipped."
                 ),
                 step_index=step_index,
                 total_steps=total_executable_steps,
@@ -8842,6 +9156,7 @@ def execute_selected_attack_path(
                 from_label=from_label,
                 to_label=to_label,
                 step_status="aborted",
+                reason=clean_reason or None,
                 actor=actor,
             )
 
@@ -9984,6 +10299,11 @@ def execute_selected_attack_path(
                     step_index=idx,
                     executable_step_position=executable_step_position,
                     actor="",
+                    reason=(
+                        "the credential-less entry read succeeded but the derived "
+                        "owner credential was not recoverable to carry forward to the "
+                        "next step"
+                    ),
                 )
                 break
 
@@ -11583,6 +11903,16 @@ def execute_selected_attack_path(
                                 shell, context=exec_context
                             )
                         last_outcome = get_last_ace_execution_outcome(shell) or {}
+                        # Concrete failure cause for a False result: the dedicated
+                        # ACE failure-reason channel (set by execute_ace_step's
+                        # authored exits) first, then any reason the execution
+                        # outcome carried. A delegated exploit primitive that
+                        # returned False without recording one falls back to an
+                        # honest relation-scoped message at the halt site below, so
+                        # the halt is never causeless.
+                        ace_fail_reason = consume_ace_step_failure_reason(shell) or (
+                            str(last_outcome.get("reason") or "").strip() or None
+                        )
                         _apply_execution_outcome_context_handoff(last_outcome)
                         register_cleanup_from_outcome(
                             shell,
@@ -11653,7 +11983,15 @@ def execute_selected_attack_path(
                                 domain=domain,
                                 summary=summary,
                                 event_stage="step_failed",
-                                message=f"{action} failed on {to_label}.",
+                                message=(
+                                    f"{action} failed on {to_label}"
+                                    + (
+                                        f" ({ace_fail_reason})"
+                                        if ace_fail_reason
+                                        else ""
+                                    )
+                                    + "."
+                                ),
                                 step_index=idx,
                                 total_steps=total_executable_steps,
                                 executable_step_index=executable_step_position,
@@ -11662,6 +12000,7 @@ def execute_selected_attack_path(
                                 from_label=from_label,
                                 to_label=to_label,
                                 step_status="failed",
+                                reason=ace_fail_reason,
                                 actor=exec_context.exec_username,
                             )
                     except Exception as exc:  # noqa: BLE001
@@ -11725,6 +12064,13 @@ def execute_selected_attack_path(
                         step_index=idx,
                         executable_step_position=executable_step_position,
                         actor=exec_context.exec_username,
+                        reason=(
+                            ace_fail_reason
+                            or f"the {action} exploitation primitive did not complete "
+                            "(the target state it establishes was not reached); see the "
+                            "step output above and adscan.debug.log for the underlying "
+                            "LDAP / exploit error"
+                        ),
                     )
                     break
 
@@ -12247,6 +12593,29 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
+                # Resolve the CA this ESC enrolls at through the ADCS
+                # execution-CA SSOT (a reachable CA that publishes the vulnerable
+                # template, or the specific vulnerable CA off the edge), never the
+                # domain-wide scalar which in a multi-CA domain may be a
+                # decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC1",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable template could not be "
+                            "resolved or reached — provide "
+                            "ADSCAN_HOST_IP_<HOST>=<ip> to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+
                 esc1_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -12332,6 +12701,9 @@ def execute_selected_attack_path(
                         template=template,
                         auth_domain=esc1_auth_domain,
                         auth_kdc=esc1_auth_kdc,
+                        ca_name_override=esc_ca_name,
+                        ca_host_override=esc_ca_host,
+                        ca_fqdn_override=esc_ca_fqdn,
                     )
                     if not esc1_result.success:
                         _handle_failed_adcs_step(
@@ -12442,6 +12814,29 @@ def execute_selected_attack_path(
                         reason="Missing ADCS/CA info in domain data",
                     )
                     return execution_started
+
+                # Resolve the CA this ESC enrolls at through the ADCS
+                # execution-CA SSOT (a reachable CA that publishes the vulnerable
+                # template, or the specific vulnerable CA off the edge), never the
+                # domain-wide scalar which in a multi-CA domain may be a
+                # decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC3",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable template could not be "
+                            "resolved or reached — provide "
+                            "ADSCAN_HOST_IP_<HOST>=<ip> to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
 
                 esc3_agent_templates = _extract_cert_templates_by_role(
                     details,
@@ -12581,6 +12976,9 @@ def execute_selected_attack_path(
                             client_auth_template=client_auth_template,
                             auth_domain=esc3_auth_domain,
                             auth_kdc=esc3_auth_kdc,
+                            ca_name_override=esc_ca_name,
+                            ca_host_override=esc_ca_host,
+                            ca_fqdn_override=esc_ca_fqdn,
                         )
                     )
                     if not esc3_success:
@@ -12698,6 +13096,30 @@ def execute_selected_attack_path(
                         reason="Missing ADCS/CA info in domain data",
                     )
                     return execution_started
+
+                # Resolve the CA this ESC enrolls at through the ADCS
+                # execution-CA SSOT (a reachable CA that publishes the vulnerable
+                # template, or the specific vulnerable CA off the edge), never the
+                # domain-wide scalar which in a multi-CA domain may be a
+                # decommissioned host. Resolve before prompting so an unreachable
+                # CA is not offered as a disruptive operation.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC4",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable template could not be "
+                            "resolved or reached — provide "
+                            "ADSCAN_HOST_IP_<HOST>=<ip> to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
 
                 # ESC4 is disruptive: it modifies a certificate template in AD.
                 # Require explicit operator confirmation.
@@ -12832,6 +13254,9 @@ def execute_selected_attack_path(
                         template=template,
                         auth_domain=esc4_auth_domain,
                         auth_kdc=esc4_auth_kdc,
+                        ca_name_override=esc_ca_name,
+                        ca_host_override=esc_ca_host,
+                        ca_fqdn_override=esc_ca_fqdn,
                     )
                     if not esc4_result.success:
                         _handle_failed_adcs_step(
@@ -12944,6 +13369,29 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
+                # Resolve the CA this ESC enrolls at through the ADCS
+                # execution-CA SSOT (a reachable CA that publishes the vulnerable
+                # template, or the specific vulnerable CA off the edge), never the
+                # domain-wide scalar which in a multi-CA domain may be a
+                # decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC13",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable template could not be "
+                            "resolved or reached — provide "
+                            "ADSCAN_HOST_IP_<HOST>=<ip> to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+
                 esc13_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -13046,6 +13494,9 @@ def execute_selected_attack_path(
                             effective_group=effective_group,
                             auth_domain=esc13_auth_domain,
                             auth_kdc=esc13_auth_kdc,
+                            ca_name_override=esc_ca_name,
+                            ca_host_override=esc_ca_host,
+                            ca_fqdn_override=esc_ca_fqdn,
                         )
                     )
                     if not esc13_success:
@@ -13115,15 +13566,36 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         "ADCSESC2",
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
+                # Resolve the CA this ESC targets through the ADCS execution-CA
+                # SSOT (a reachable publishing CA for the vulnerable template, or
+                # the specific vulnerable CA off the edge), never the domain-wide
+                # scalar which in a multi-CA domain may be a decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC2",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA/template could not be "
+                            "resolved or reached — provide ADSCAN_HOST_IP_<HOST>=<ip> "
+                            "to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -13199,20 +13671,15 @@ def execute_selected_attack_path(
                         auth_domain=esc2_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc2_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=str(
-                            domain_data.get("adcs")
-                            or domain_data.get("pdc_hostname")
-                            or domain_data.get("pdc")
-                            or ""
-                        ),
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_host=esc_ca_host,
+                        ca_name=esc_ca_name,
                         template=template,
                         username=exec_username,
                         password=password,
                         target_upn=esc2_target_upn,
                         workspace_dir=_resolve_workspace_dir(shell, domain),
                         shell=shell,
-                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        ca_fqdn=esc_ca_fqdn,
                         dc_fqdn=(
                             domain_data.get("dc_fqdn")
                             or domain_data.get("pdc_hostname")
@@ -13280,15 +13747,36 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         "ADCSESC6",
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
+                # Resolve the CA this ESC targets through the ADCS execution-CA
+                # SSOT (a reachable publishing CA for the vulnerable template, or
+                # the specific vulnerable CA off the edge), never the domain-wide
+                # scalar which in a multi-CA domain may be a decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC6",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA/template could not be "
+                            "resolved or reached — provide ADSCAN_HOST_IP_<HOST>=<ip> "
+                            "to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -13364,20 +13852,15 @@ def execute_selected_attack_path(
                         auth_domain=esc6_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc6_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=str(
-                            domain_data.get("adcs")
-                            or domain_data.get("pdc_hostname")
-                            or domain_data.get("pdc")
-                            or ""
-                        ),
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_host=esc_ca_host,
+                        ca_name=esc_ca_name,
                         template=template,
                         username=exec_username,
                         password=password,
                         target_upn=esc6_target_upn,
                         workspace_dir=_resolve_workspace_dir(shell, domain),
                         shell=shell,
-                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        ca_fqdn=esc_ca_fqdn,
                         dc_fqdn=(
                             domain_data.get("dc_fqdn")
                             or domain_data.get("pdc_hostname")
@@ -13445,15 +13928,36 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         "ADCSESC7",
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
+                # Resolve the CA this ESC targets through the ADCS execution-CA
+                # SSOT (a reachable publishing CA for the vulnerable template, or
+                # the specific vulnerable CA off the edge), never the domain-wide
+                # scalar which in a multi-CA domain may be a decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC7",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA/template could not be "
+                            "resolved or reached — provide ADSCAN_HOST_IP_<HOST>=<ip> "
+                            "to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
                 from adscan_internal.cli.privileged_target_selection import (
                     resolve_privileged_target_user,
                 )
@@ -13513,20 +14017,15 @@ def execute_selected_attack_path(
                         auth_domain=esc7_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc7_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=str(
-                            domain_data.get("adcs")
-                            or domain_data.get("pdc_hostname")
-                            or domain_data.get("pdc")
-                            or ""
-                        ),
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_host=esc_ca_host,
+                        ca_name=esc_ca_name,
                         template=None,
                         username=exec_username,
                         password=password,
                         target_upn=esc7_target_upn,
                         workspace_dir=_resolve_workspace_dir(shell, domain),
                         shell=shell,
-                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        ca_fqdn=esc_ca_fqdn,
                         dc_fqdn=(
                             domain_data.get("dc_fqdn")
                             or domain_data.get("pdc_hostname")
@@ -13597,17 +14096,13 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if (
-                    not domain_data.get("pdc")
-                    or not domain_data.get("adcs")
-                    or not domain_data.get("ca")
-                ):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         action_name,
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/ADCS/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
 
@@ -13618,12 +14113,32 @@ def execute_selected_attack_path(
 
                     template = _resolve_template_cn(shell, domain, str(detail_templates[0]).strip()) or template
 
-                ca_host = str(domain_data.get("adcs") or "")
-                ca_fqdn = (
-                    ca_host
-                    if ca_host and not re.fullmatch(r"\d+(?:\.\d+){3}", ca_host)
-                    else None
+                # Resolve which CA this ESC8/ESC11 relay targets through the ADCS
+                # execution-CA SSOT: the specific vulnerable CA off the edge when
+                # present, else the domain-wide scalar. In a multi-CA domain the
+                # scalar (the FIRST enrollment server the collector saw) is
+                # frequently a different — often decommissioned, no-longer-
+                # resolving — host, so relaying to it dead-ends the technique.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
                 )
+                if esc_ca_target is None:
+                    # Honest data gap (Exposure-Validation): the vulnerable CA is
+                    # known but its host is not resolvable/reachable. Never relay
+                    # blindly to the wrong CA, and never emit the misleading
+                    # "check the template DACL / Web Enrollment" message.
+                    _mark_blocked_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA could not be resolved or "
+                            "reached — provide ADSCAN_HOST_IP_<HOST>=<ip> to validate."
+                        ),
+                    )
+                    return execution_started
+                ca_name, ca_host, ca_fqdn = esc_ca_target
                 execution_started = True
                 with _active_step_context(
                     action=action_name,
@@ -13665,7 +14180,7 @@ def execute_selected_attack_path(
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc8_auth_kdc or str(domain_data.get("pdc") or ""),
                         ca_host=ca_host,
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_name=ca_name,
                         template=template,
                         username=exec_username,
                         password=password,
@@ -13680,25 +14195,36 @@ def execute_selected_attack_path(
                         ),
                     )
                     esc8_result = run_esc_sync(esc_cfg)
+                    # Carry the observed web-enrollment transport + EPA (stamped by
+                    # the relay onto EscResult.evidence) into the edge notes, so the
+                    # report and web CTEM render an ESC8 remediation conditional on
+                    # the vector actually relayed over (SSOT: adcs_esc8_transport).
+                    esc8_notes: dict[str, Any] = {
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    }
+                    _esc8_evidence = getattr(esc8_result, "evidence", None)
+                    if esc_number == 8 and isinstance(_esc8_evidence, dict):
+                        from adscan_core.reporting.adcs_esc8_transport import (
+                            ESC8_TRANSPORT_KEY,
+                        )
+
+                        _esc8_transport = _esc8_evidence.get(ESC8_TRANSPORT_KEY)
+                        if isinstance(_esc8_transport, dict):
+                            esc8_notes[ESC8_TRANSPORT_KEY] = _esc8_transport
                     if not esc8_result.success:
                         _handle_failed_adcs_step(
                             action_name,
                             from_label,
                             to_label,
-                            notes={
-                                "username": exec_username,
-                                "template_used_for_run": template,
-                            },
+                            notes=esc8_notes,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
                         action_name,
                         from_label,
                         to_label,
-                        notes={
-                            "username": exec_username,
-                            "template_used_for_run": template,
-                        },
+                        notes=esc8_notes,
                         impersonated_target=_resolve_target_upn(to_label, domain),
                         esc_result=esc8_result,
                     )
@@ -13969,15 +14495,36 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         "ADCSESC9",
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
+                # Resolve the CA this ESC targets through the ADCS execution-CA
+                # SSOT (a reachable publishing CA for the vulnerable template, or
+                # the specific vulnerable CA off the edge), never the domain-wide
+                # scalar which in a multi-CA domain may be a decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC9",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA/template could not be "
+                            "resolved or reached — provide ADSCAN_HOST_IP_<HOST>=<ip> "
+                            "to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -14076,20 +14623,15 @@ def execute_selected_attack_path(
                         auth_domain=esc9_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc9_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=str(
-                            domain_data.get("adcs")
-                            or domain_data.get("pdc_hostname")
-                            or domain_data.get("pdc")
-                            or ""
-                        ),
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_host=esc_ca_host,
+                        ca_name=esc_ca_name,
                         template=template,
                         username=exec_username,
                         password=password,
                         target_upn=esc9_target_upn,
                         workspace_dir=_resolve_workspace_dir(shell, domain),
                         shell=shell,
-                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        ca_fqdn=esc_ca_fqdn,
                         target_account=esc9_puppet,
                         target_account_dn=_resolve_esc9_puppet_dn(details or {}) or "",
                         dc_fqdn=(
@@ -14159,15 +14701,36 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         "ADCSESC14",
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
+                # Resolve the CA this ESC targets through the ADCS execution-CA
+                # SSOT (a reachable publishing CA for the vulnerable template, or
+                # the specific vulnerable CA off the edge), never the domain-wide
+                # scalar which in a multi-CA domain may be a decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC14",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA/template could not be "
+                            "resolved or reached — provide ADSCAN_HOST_IP_<HOST>=<ip> "
+                            "to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -14238,20 +14801,15 @@ def execute_selected_attack_path(
                         auth_domain=esc14_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc14_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=str(
-                            domain_data.get("adcs")
-                            or domain_data.get("pdc_hostname")
-                            or domain_data.get("pdc")
-                            or ""
-                        ),
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_host=esc_ca_host,
+                        ca_name=esc_ca_name,
                         template=template,
                         username=exec_username,
                         password=password,
                         target_upn=_resolve_target_upn(to_label, domain),
                         workspace_dir=_resolve_workspace_dir(shell, domain),
                         shell=shell,
-                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        ca_fqdn=esc_ca_fqdn,
                         target_account=esc14_puppet,
                         target_account_dn=_resolve_esc9_puppet_dn(details or {}) or "",
                         dc_fqdn=(
@@ -14321,15 +14879,36 @@ def execute_selected_attack_path(
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
-                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                if not domain_data.get("pdc"):
                     _mark_blocked_step(
                         "ADCSESC15",
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing PDC/CA info in domain data",
+                        reason="Missing PDC info in domain data",
                     )
                     return execution_started
+                # Resolve the CA this ESC targets through the ADCS execution-CA
+                # SSOT (a reachable publishing CA for the vulnerable template, or
+                # the specific vulnerable CA off the edge), never the domain-wide
+                # scalar which in a multi-CA domain may be a decommissioned host.
+                esc_ca_target = resolve_esc_execution_ca(
+                    shell, domain, details, domain_data=domain_data
+                )
+                if esc_ca_target is None:
+                    _mark_blocked_step(
+                        "ADCSESC15",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "CA host for the vulnerable CA/template could not be "
+                            "resolved or reached — provide ADSCAN_HOST_IP_<HOST>=<ip> "
+                            "to validate."
+                        ),
+                    )
+                    return execution_started
+                esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -14405,20 +14984,15 @@ def execute_selected_attack_path(
                         auth_domain=esc15_auth_domain,
                         dc_ip=str(domain_data.get("pdc") or ""),
                         auth_kdc=esc15_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=str(
-                            domain_data.get("adcs")
-                            or domain_data.get("pdc_hostname")
-                            or domain_data.get("pdc")
-                            or ""
-                        ),
-                        ca_name=str(domain_data.get("ca") or ""),
+                        ca_host=esc_ca_host,
+                        ca_name=esc_ca_name,
                         template=template,
                         username=exec_username,
                         password=password,
                         target_upn=esc15_target_upn,
                         workspace_dir=_resolve_workspace_dir(shell, domain),
                         shell=shell,
-                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        ca_fqdn=esc_ca_fqdn,
                         dc_fqdn=(
                             domain_data.get("dc_fqdn")
                             or domain_data.get("pdc_hostname")
@@ -15253,6 +15827,11 @@ def execute_selected_attack_path(
                         step_index=idx,
                         executable_step_position=executable_step_position,
                         actor=exec_username,
+                        reason=(
+                            "HasSession exploitation did not establish the privileged "
+                            "membership the downstream steps depend on (it was rolled "
+                            "back)"
+                        ),
                     )
                     break
                 continue
@@ -15506,6 +16085,15 @@ def execute_selected_attack_path(
                         step_index=idx,
                         executable_step_position=executable_step_position,
                         actor=exec_username,
+                        reason=(
+                            "SPNJack did not mint the privileged service ticket the "
+                            "downstream step depends on"
+                            + (
+                                f": {spnjack_result.error}"
+                                if spnjack_result.error
+                                else ""
+                            )
+                        ),
                     )
                     break
                 continue
@@ -15791,6 +16379,15 @@ def execute_selected_attack_path(
                             step_index=idx,
                             executable_step_position=executable_step_position,
                             actor=member_user,
+                            reason=(
+                                "AllowedToAct (RBCD) did not mint a usable service "
+                                "ticket against the target"
+                                + (
+                                    f": {retry.last_error}"
+                                    if getattr(retry, "last_error", None)
+                                    else ""
+                                )
+                            ),
                         )
                     break
                 continue
@@ -16048,6 +16645,11 @@ def execute_selected_attack_path(
                         step_index=idx,
                         executable_step_position=executable_step_position,
                         actor=bo_username,
+                        reason=(
+                            "Backup Operators escalation ran but did not recover the "
+                            "DC machine-account credential the downstream DCSync "
+                            "depends on"
+                        ),
                     )
                     break
                 continue
@@ -16158,6 +16760,11 @@ def execute_selected_attack_path(
                         step_index=idx,
                         executable_step_position=executable_step_position,
                         actor=rc_username,
+                        reason=(
+                            "RaiseChild did not complete the child-to-forest-root "
+                            "escalation (child krbtgt DCSync, inter-realm TGT forge, "
+                            "or parent DCSync failed)"
+                        ),
                     )
                     break
                 continue

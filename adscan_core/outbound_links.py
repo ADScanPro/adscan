@@ -149,6 +149,13 @@ _PLACEMENTS: dict[str, _Placement] = {
     # person who books a demo and buys, not the pentester who runs the tool.
     "victory_enterprise_demo": _Placement("/get-a-demo"),
     "session_summary_enterprise_demo": _Placement("/get-a-demo"),
+    # The Enterprise-lane door INSIDE the generated LITE report — the report-sourced
+    # sibling of ``lite_report``. When the reader is the org's own security owner
+    # (internal security / sysadmin / CISO, resolved via the role+OS CTA lane), the
+    # forwarded document's primary upsell points at the Enterprise demo, not the /pro
+    # CLI. Source-tagged like ``lite_report`` so a click from a forwarded deliverable
+    # is attributed to the report, not the unattributed bucket.
+    "lite_report_enterprise_demo": _Placement("/get-a-demo", source=UTM_SOURCE_REPORT),
     # Gate placement for the Enterprise CTA lane mapping (used by cta_placement_for_lane).
     "pro_gate_enterprise_demo": _Placement("/get-a-demo"),
     # The "Get beta access" line shown when a PRO-only import is absent.

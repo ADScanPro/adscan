@@ -34,6 +34,7 @@ from typing import Any, Mapping
 
 from adscan_internal.services.technique_priority import (
     compute_technique_priorities,
+    domain_affected_user_total,
     iter_domain_tagged_paths,
 )
 
@@ -93,10 +94,16 @@ def compute_remediation_priorities(
         Dicts in the shape the report template and the web remediation schema
         consume, highest impact first, each stamped with its 1-based ``rank``.
     """
+    tagged_paths = iter_domain_tagged_paths(domains_data)
     techniques = compute_technique_priorities(
-        iter_domain_tagged_paths(domains_data),
+        tagged_paths,
         total_paths=total_paths,
     )
+    # The affected-USER reach denominator: the union of every path's
+    # ``meta.affected_users`` across the whole domain set. Numerator and
+    # denominator share the ONE source, so reach_pct is self-consistent — never
+    # crossed with the tier2_exposure / affected_principal populations.
+    reach_total = domain_affected_user_total(tagged_paths)
 
     results: list[dict[str, Any]] = []
     for entry in techniques:
@@ -124,6 +131,18 @@ def compute_remediation_priorities(
                 # same technique — the same label, two numbers, across the tier
                 # boundary a client crosses when they pay.
                 "affected_principals": entry.affected_principals,
+                # The LEAD remediation metric: distinct affected USERS exposed via
+                # this technique — users with a path that traverses it (a set union
+                # over the technique's paths, never summed across techniques), with
+                # the domain-union denominator and a self-consistent percentage.
+                # This is a surface figure (not a protection claim) the client
+                # reads first (their people, in their language), above the
+                # attack-path count which stays as the secondary redundancy axis.
+                "reach_users": entry.reach_users,
+                "reach_total": reach_total,
+                "reach_pct": (
+                    min(round(entry.reach_users / max(reach_total, 1) * 100, 1), 100.0)
+                ),
                 "max_blast": entry.max_blast_radius,
                 "severity": entry.max_choke_point_severity,
                 # The node this technique's top choke maps to (best-effort), so the
@@ -145,16 +164,23 @@ def compute_remediation_priorities(
         )
 
     # Proven-first ordering (the "most first" ranking the section header promises):
-    # any fix that breaks an EXECUTED attack path leads the mapped-only fixes, and
-    # within each group the count is monotonically descending — proven rows by
-    # executed count, then mapped rows by breadth. The proven-first key is a SORT
-    # prefix only; it never touches ``impact_score`` (other report figures read it).
+    # any fix that breaks an EXECUTED attack path leads the mapped-only fixes. The
+    # LEAD discriminator after the proven prefix is the number of ATTACK PATHS each
+    # fix breaks (the honest sort the section title now states), because affected-
+    # user reach is uniform on a bridged domain (every ordinary account funnels
+    # through the same chains) and so ranks nothing there. Affected-user reach is
+    # the TIE-BREAK at an equal path count, which keeps a 100%-user fix above a
+    # 0%-user (computer/group-foothold) fix when they break the same number of
+    # paths. The impact score is the final deterministic tie-break. The proven-
+    # first key is a SORT prefix only; it never touches ``impact_score`` (other
+    # report figures read it).
     results.sort(
         key=lambda x: (
             0 if x["exploited_paths"] > 0 else 1,
             -x["exploited_paths"],
-            -x["impact_score"],
             -x["paths_affected"],
+            -x["reach_users"],
+            -x["impact_score"],
         )
     )
 
@@ -294,7 +320,11 @@ def build_remediation_start_here(
         A JSON/Jinja-safe render model ``{headline, chain_note,
         total_executed_paths, total_mapped_paths, rows, kpi_card}`` where each
         row is ``{label, item_line, badge, badge_label, paths_affected,
-        exploited_paths, executed, chain_tie_size}``. ``chain_note`` is a
+        exploited_paths, executed, chain_tie_size, reach_*}`` PLUS the
+        per-technique remediation guidance carried for the merged section
+        (``mitre_id``, ``mitre_name``, ``complexity``, ``complexity_label``,
+        ``remediation_effort``, ``remediation_steps``, ``can_mitigate``,
+        ``paths_pct``, ``affected_principals``). ``chain_note`` is a
         client-safe sentence explaining a self-cancelling tie (see
         :func:`_break_ties_by_remediation_effort`), or ``""`` when the
         leading rows are not tied. Returns ``None`` when there are no
@@ -303,6 +333,7 @@ def build_remediation_start_here(
     from adscan_core.reporting.chokepoint_copy import (  # noqa: PLC0415
         STRUCTURAL_CHOKE_BADGE,
         is_structural_choke,
+        reach_uniform_note,
         remediation_chain_note,
         remediation_item_line,
         remediation_kpi_lines,
@@ -313,6 +344,40 @@ def build_remediation_start_here(
         return None
 
     card_map = node_cardinality if isinstance(node_cardinality, dict) else {}
+
+    # Uniform-reach detection over the fixes that touch ANY ordinary user. On a
+    # bridged domain every ordinary account funnels through the same chains, so
+    # each such fix reaches the identical share (usually 100%). When that share is
+    # a single value across two or more fixes it discriminates nothing, so the
+    # per-row reach lead is dropped in favour of the attack-path count and the
+    # uniform share is stated ONCE above the table. A varying reach keeps the
+    # per-row reach lead. Fixes reaching 0 ordinary users (computer/group
+    # footholds) are excluded from the uniformity test and always get their own
+    # honest foothold wording.
+    _reach_shares = {
+        round(float(entry.get("reach_pct") or 0.0), 1)
+        for entry in priorities
+        if isinstance(entry, dict) and int(entry.get("reach_users") or 0) > 0
+    }
+    _reach_bearing_fixes = sum(
+        1
+        for entry in priorities
+        if isinstance(entry, dict) and int(entry.get("reach_users") or 0) > 0
+    )
+    reach_is_uniform = _reach_bearing_fixes >= 2 and len(_reach_shares) == 1
+    uniform_reach_pct = next(iter(_reach_shares)) if reach_is_uniform else 0.0
+    # A representative reach-bearing fix supplies the ABSOLUTE affected-user
+    # population for the uniform section lead (the reach is uniform, so any
+    # reach-bearing fix carries the same numbers; the #1 row may be a 0-reach
+    # foothold, so pick the first fix that actually reaches users).
+    _uniform_reach_users = 0
+    _uniform_reach_total = 0
+    if reach_is_uniform:
+        for entry in priorities:
+            if isinstance(entry, dict) and int(entry.get("reach_users") or 0) > 0:
+                _uniform_reach_users = int(entry.get("reach_users") or 0)
+                _uniform_reach_total = int(entry.get("reach_total") or 0)
+                break
 
     rows: list[dict[str, Any]] = []
     for entry in priorities:
@@ -326,6 +391,18 @@ def build_remediation_start_here(
             exploited_paths = int(entry.get("exploited_paths") or 0)
         except (TypeError, ValueError):
             exploited_paths = 0
+        try:
+            row_reach_users = int(entry.get("reach_users") or 0)
+        except (TypeError, ValueError):
+            row_reach_users = 0
+        try:
+            row_reach_total = int(entry.get("reach_total") or 0)
+        except (TypeError, ValueError):
+            row_reach_total = 0
+        try:
+            row_reach_pct = float(entry.get("reach_pct") or 0.0)
+        except (TypeError, ValueError):
+            row_reach_pct = 0.0
         # The count is scoped to what was EXECUTED so "executed" is literally
         # true. A technique that only appears in theoretical paths (executed
         # count 0) is worded as "mapped" and never claims execution.
@@ -342,6 +419,16 @@ def build_remediation_start_here(
             # narrower than a lower mapped row (MED-1).
             mapped_breadth=paths_affected if row_executed else None,
             total_mapped=total_mapped_paths if row_executed else None,
+            # The affected-USER reach LEAD: when the workspace carries a user
+            # population (reach_total > 0), the line leads with "N of M affected
+            # users have a path through this technique (X%)" (a surface figure, not
+            # a protection claim) and the path count becomes the secondary clause.
+            # A workspace without the population degrades to the legacy path-count
+            # lead.
+            reach_users=row_reach_users,
+            reach_total=row_reach_total,
+            reach_pct=row_reach_pct,
+            reach_is_uniform=reach_is_uniform,
         )
         choke_id = _resolve_row_choke_identifier(entry.get("top_choke_point"))
         badge = bool(is_structural_choke(choke_id, card_map))
@@ -359,6 +446,22 @@ def build_remediation_start_here(
                 "exploited_paths": exploited_paths,
                 "executed": row_executed,
                 "chain_tie_size": chain_tie_size,
+                "reach_users": row_reach_users,
+                "reach_total": row_reach_total,
+                "reach_pct": row_reach_pct,
+                # Per-technique remediation guidance, carried onto the row so the
+                # merged remediation section (IA v2: ONE ranked list) can attach
+                # the fix detail to each row instead of a second ranked table.
+                # Sourced from the SAME ranking entry, so nothing is recomputed.
+                "mitre_id": entry.get("mitre_id") or "",
+                "mitre_name": entry.get("mitre_name") or "",
+                "complexity": str(entry.get("complexity") or ""),
+                "complexity_label": str(entry.get("complexity_label") or ""),
+                "remediation_effort": str(entry.get("remediation_effort") or ""),
+                "remediation_steps": list(entry.get("remediation_steps") or []),
+                "can_mitigate": bool(entry.get("can_mitigate", True)),
+                "paths_pct": entry.get("paths_pct"),
+                "affected_principals": int(entry.get("affected_principals") or 0),
             }
         )
 
@@ -373,11 +476,18 @@ def build_remediation_start_here(
         rows[0]["exploited_paths"] if top_executed else rows[0]["paths_affected"]
     )
     top_denominator = total_executed_paths if top_executed else total_mapped_paths
+    top_reach_users = int(rows[0].get("reach_users") or 0)
+    top_reach_total = int(rows[0].get("reach_total") or 0)
+    top_reach_pct = float(rows[0].get("reach_pct") or 0.0)
     headline = remediation_start_here_headline(
         top_paths_broken=top_paths_broken,
         total_validated_paths=top_denominator,
         bounded=bounded,
         mapped=not top_executed,
+        reach_users=top_reach_users,
+        reach_total=top_reach_total,
+        reach_pct=top_reach_pct,
+        reach_is_uniform=reach_is_uniform,
     )
     # KPI headline card — derived from the SAME top fix the section leads with (the
     # #1 paths-broken row), executed-framed, so the CISO's headline card and the
@@ -397,6 +507,13 @@ def build_remediation_start_here(
         # the Start-Here row it summarises and never reading narrower than it.
         mapped_breadth=rows[0]["paths_affected"] if top_executed else None,
         total_mapped=total_mapped_paths if top_executed else None,
+        # The affected-USER reach LEAD for the KPI card (falls back to the path
+        # count when the workspace carries no user population, or when reach is
+        # uniform — a non-discriminating 100% must not headline the card).
+        reach_users=top_reach_users,
+        reach_total=top_reach_total,
+        reach_pct=top_reach_pct,
+        reach_is_uniform=reach_is_uniform,
     )
     # A single linear attack chain leaves the leading rows tied on the exact
     # same paths-broken count — the ranking already reorders that tie by
@@ -411,15 +528,37 @@ def build_remediation_start_here(
     return {
         "headline": headline,
         "chain_note": chain_note,
+        # When affected-user reach is uniform across the fixes, the ONE sentence a
+        # renderer shows above the table instead of repeating the same percentage
+        # per row (empty string otherwise). ``reach_is_uniform`` lets a renderer
+        # switch the impact column header from a reach lead to a paths lead.
+        "reach_is_uniform": reach_is_uniform,
+        "reach_uniform_note": (
+            reach_uniform_note(
+                uniform_reach_pct,
+                reach_users=_uniform_reach_users,
+                reach_total=_uniform_reach_total,
+            )
+            if reach_is_uniform
+            else ""
+        ),
         "total_executed_paths": total_executed_paths,
         "total_mapped_paths": total_mapped_paths,
         "rows": rows,
         "kpi_card": {
+            # The NAMED fix the card is about — the #1 row's technique label — so
+            # the hero can say WHICH fix is the highest-confidence one, not just a
+            # bare count. The order is proven-executed first, so the #1 is the
+            # highest-CONFIDENCE (proven in this environment) fix, not the widest.
+            "label": str(rows[0].get("label") or ""),
             "big": kpi_card["big"],
             "ratio": kpi_card["ratio"],
             "context": kpi_card["context"],
             "top_paths_broken": int(top_paths_broken),
             "total_validated_paths": int(top_denominator),
             "executed": bool(top_executed),
+            "reach_users": int(top_reach_users),
+            "reach_total": int(top_reach_total),
+            "reach_pct": float(top_reach_pct),
         },
     }

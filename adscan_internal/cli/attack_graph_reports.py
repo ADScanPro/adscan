@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from adscan_internal.services.attack_path_progress import (
         AttackPathComputeProgress,
     )
+    from adscan_internal.services.attack_path_counts import PathHeadline
 
 
 # Compute-time path cap for `attack_paths` UX.
@@ -1725,8 +1726,11 @@ def _render_attack_path_preflight(shell: object, target_domain: str) -> None:
     """Render the graph-stats pre-flight panel once per domain per command.
 
     A best-effort, static one-shot panel shown before the attack-path compute: the
-    graph scale, the heaviest control-hub fan-outs, and whether discovery will run
-    in sampled mode (the routing decision the engine already takes). It reads
+    graph scale, the heaviest control-hub fan-outs, and the raw control mega-hub
+    count. It does NOT predict a routing verdict (sampled vs. full discovery) —
+    the structural mega-hub count diverges from the real reachability +
+    Tier-0-aware routing decision, which is only known AFTER the compute runs; the
+    authoritative bounded/complete status is surfaced post-run instead. It reads
     counts off the loaded graph and runs the cheap predictor — it NEVER triggers a
     path compute. A shell-scoped set (kept off ``domains_data`` so it never reaches
     ``save_workspace_data``) de-duplicates the render across a multi-call command
@@ -1795,8 +1799,188 @@ _CHECKLIST_STATE_GLYPHS: dict[str, tuple[str, str]] = {
 }
 
 
+def _load_attack_paths_snapshot(shell: object, target_domain: str) -> Any:
+    """Return the persisted ``attack_paths_snapshot.json`` payload, or ``None``.
+
+    Best-effort: any missing/unreadable artifact yields ``None`` (the proven
+    override just falls back to the k figures). Sourced so the reachable-routes
+    panel can show the k-independent proven ``exploited`` count under sampled
+    coverage, where ``path_axis`` has collapsed.
+    """
+    try:
+        from adscan_internal.workspaces import read_json_file
+
+        workspace_cwd = resolve_workspace_cwd(shell)
+        domains_dir = getattr(shell, "domains_dir", "domains")
+        snapshot_path = domain_subpath(
+            workspace_cwd, domains_dir, target_domain, "attack_paths_snapshot.json"
+        )
+        if not os.path.exists(snapshot_path):
+            return None
+        return read_json_file(snapshot_path)
+    except Exception:  # noqa: BLE001 — a missing snapshot just means "no override"
+        return None
+
+
+def _load_exposure_kpis_from_report(shell: object, target_domain: str) -> Any:
+    """Return ``domains[<domain>].exposure_kpis`` from ``technical_report.json``.
+
+    The interactive REPL session's ``domains_data`` does NOT carry the
+    ``exposure_kpis`` block (it is stamped into ``technical_report.json`` only by
+    the report/LITE flow), so the reachable-routes panel falls back to reading it
+    from the persisted report when it is absent in memory. Best-effort: any
+    missing/unreadable artifact yields ``None``.
+    """
+    try:
+        from adscan_internal.workspaces import read_json_file
+
+        workspace_cwd = resolve_workspace_cwd(shell)
+        report_path = os.path.join(workspace_cwd, "technical_report.json")
+        if not os.path.exists(report_path):
+            return None
+        report = read_json_file(report_path)
+        domains = report.get("domains") if isinstance(report, dict) else None
+        if not isinstance(domains, dict):
+            return None
+        domain_block = domains.get(target_domain)
+        if isinstance(domain_block, dict):
+            return domain_block.get("exposure_kpis")
+        return None
+    except Exception:  # noqa: BLE001 — a missing report just means "no reachability"
+        return None
+
+
+def _load_exposure_source_count(shell: object, target_domain: str) -> int:
+    """Enabled principals with a validated route to a Tier-0 target (best-effort).
+
+    The impactful magnitude the pre-flight already computes
+    (``GraphStats.exposure_source_count``) — recomputed here so the reachable-
+    routes panel can headline it distinctly from the Tier-0 asset count. Returns
+    0 on any failure (the panel simply omits the line).
+    """
+    try:
+        from adscan_internal.services.graph_stats_service import build_graph_stats
+
+        stats = build_graph_stats(shell, target_domain)
+        return int(getattr(stats, "exposure_source_count", 0) or 0)
+    except Exception:  # noqa: BLE001 — a missing count just omits the line
+        return 0
+
+
+def _resolve_attack_path_reachability_headline(
+    shell: object, target_domain: str
+) -> "tuple[PathHeadline | None, int, int, str | None]":
+    """Resolve the shared attack-path headline for a domain (best-effort).
+
+    Reads the SSOT (``client_path_totals_for_domain`` in ``attack_path_counts``),
+    so k-vs-reachability is never re-derived here. Returns ``(headline,
+    reachable_tier0, exposure_source_count, tier2_exposure_sentence)``;
+    ``(None, 0, 0, None)`` when nothing can be resolved. Under the control-mega-
+    hub sampled fallback the k figures collapse to 0, so the headline reads the
+    reachability set instead of a bare zero. ``tier2_exposure_sentence`` is the
+    standard-user exposure ratio — the client headline that excludes the machine
+    accounts the permissive ``exposure_source_count`` folds in.
+    """
+    try:
+        from adscan_internal.services.attack_path_counts import (
+            client_path_totals_for_domain,
+        )
+
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        domain_data = (
+            domains_data.get(target_domain)
+            if isinstance(domains_data, dict)
+            else None
+        )
+        if not isinstance(domain_data, dict):
+            return None, 0, 0, None
+        kpis = domain_data.get("exposure_kpis")
+        if not isinstance(kpis, dict):
+            # The REPL session does not stamp exposure_kpis into domains_data;
+            # fall back to the persisted report so reachability is available.
+            kpis = _load_exposure_kpis_from_report(shell, target_domain)
+        snapshot = _load_attack_paths_snapshot(shell, target_domain)
+        totals = client_path_totals_for_domain(kpis, snapshot=snapshot)
+        domain_compromised = (
+            str(domain_data.get("auth", "")).strip().lower() == "pwned"
+        )
+        source_count = _load_exposure_source_count(shell, target_domain)
+        return (
+            totals.render_headline(domain_compromised),
+            int(totals.reachable_tier0),
+            source_count,
+            totals.render_tier2_exposure_headline(),
+        )
+    except Exception:  # noqa: BLE001 — the panel must never break the flow
+        return None, 0, 0, None
+
+
+def _headline_has_reachability(headline: "PathHeadline | None") -> bool:
+    """True when a headline carries reachable/sampled/compromised exposure.
+
+    The gate for showing the reachable-routes panel instead of a bare "0" /
+    "No attack paths recorded": a genuinely clean domain (no reachable routes,
+    complete coverage, not compromised) keeps the honest empty message.
+    """
+    return bool(
+        headline is not None
+        and (headline.sampled or headline.reachable > 0 or headline.compromised)
+    )
+
+
+def _render_sampled_reachability_rows(
+    headline: "PathHeadline",
+    tier0_reachable: int,
+    exposure_source_count: int = 0,
+    tier2_exposure_sentence: "str | None" = None,
+) -> list[Any]:
+    """Return the operator rows for a sampled-materialization reachable result.
+
+    Turns "0 materialized routes" into immediate offensive value: the reachable
+    route count + the sampling cause (control mega-hubs) + the magnitude of the
+    exposure and a pointer to the choke points that cut the most routes. The
+    route sentence is the shared :meth:`ClientPathTotals.render_headline` label,
+    so the CLI, report and web quote the SAME figure.
+
+    The exposure magnitude line headlines the standard-user ratio
+    (``tier2_exposure_sentence`` — "N% of standard user accounts hold a reachable
+    path to full domain compromise"), which is the client-meaningful figure: it
+    excludes the machine accounts that the permissive ``exposure_source_count``
+    folds in via ``Authenticated Users`` (~half the count on a large domain).
+    ``exposure_source_count`` is the fallback for an older workspace with no
+    stamped ratio. ``tier0_reachable`` (assets) is a DISTINCT quantity, labelled
+    as such.
+    """
+    rows: list[Any] = [
+        Text("Materialization sampled (control mega-hubs).", style="bold"),
+        Text(headline.label, style="yellow"),
+    ]
+    if tier2_exposure_sentence:
+        rows.append(Text(f"{tier2_exposure_sentence}.", style="dim"))
+    elif exposure_source_count > 0:
+        principal_word = "principal" if exposure_source_count == 1 else "principals"
+        hold_word = "holds" if exposure_source_count == 1 else "hold"
+        rows.append(
+            Text(
+                f"{exposure_source_count:,} {principal_word} {hold_word} a reachable "
+                "path to Tier 0.",
+                style="dim",
+            )
+        )
+    if tier0_reachable > 0:
+        asset_word = "asset" if tier0_reachable == 1 else "assets"
+        rows.append(
+            Text(f"{tier0_reachable:,} Tier-0 {asset_word} reachable.", style="dim")
+        )
+    rows.append(
+        Text("See choke points for the fixes that cut the most routes.", style="dim")
+    )
+    return rows
+
+
 def _render_attack_path_compute_progress(
     progress: "AttackPathComputeProgress",
+    headline: "PathHeadline | None" = None,
 ) -> Panel:
     """Build the live progress panel for the attack-path compute.
 
@@ -1810,12 +1994,27 @@ def _render_attack_path_compute_progress(
     rows: list[Any] = []
 
     if done:
-        rows.append(
-            Text.assemble(
-                ("Attack paths computed: ", "bold"),
-                (f"{progress.final_paths:,}", "green"),
-            )
+        # A control-mega-hub sampled materialization can return 0 concrete
+        # routes even though the reachability set proves the domain is exposed.
+        # Report the reachable figure so a bare "0" never reads as "nothing
+        # found" (the reachable-routes panel below carries the actionable copy).
+        sampled_materialization = (
+            progress.final_paths == 0 and _headline_has_reachability(headline)
         )
+        if sampled_materialization:
+            rows.append(
+                Text.assemble(
+                    ("Materialization sampled: ", "bold"),
+                    (headline.label, "yellow"),  # type: ignore[union-attr]
+                )
+            )
+        else:
+            rows.append(
+                Text.assemble(
+                    ("Attack paths computed: ", "bold"),
+                    (f"{progress.final_paths:,}", "green"),
+                )
+            )
         if progress.raw_paths:
             rows.append(
                 Text(f"Paths discovered: {progress.raw_paths:,}", style="dim")
@@ -1832,7 +2031,9 @@ def _render_attack_path_compute_progress(
         )
         return Panel(
             Group(*rows),
-            title="Attack Paths · complete",
+            title="Attack Paths · sampled"
+            if sampled_materialization
+            else "Attack Paths · complete",
             border_style="green",
             box=ROUNDED,
             padding=(0, 1),
@@ -1894,11 +2095,19 @@ def _render_attack_path_compute_progress(
 class _AttackPathComputeProgressRenderable:
     """Rich renderable that re-reads the live progress snapshot each frame."""
 
-    def __init__(self, progress: "AttackPathComputeProgress") -> None:
+    def __init__(
+        self,
+        progress: "AttackPathComputeProgress",
+        headline: "PathHeadline | None" = None,
+    ) -> None:
         self._progress = progress
+        #: Resolved once the compute is done, so the final frame (and the
+        #: alt-screen-pop summary) can show reachable routes when a sampled
+        #: materialization returned 0 concrete paths.
+        self.headline = headline
 
     def __rich__(self) -> Panel:
-        return _render_attack_path_compute_progress(self._progress)
+        return _render_attack_path_compute_progress(self._progress, self.headline)
 
 
 def _emit_attack_path_compute_telemetry(
@@ -2554,7 +2763,11 @@ def run_show_attack_paths(
 
     def _compute_progress_summary(console: Any) -> None:
         try:
-            console.print(_render_attack_path_compute_progress(_compute_progress))
+            console.print(
+                _render_attack_path_compute_progress(
+                    _compute_progress, _progress_renderable.headline
+                )
+            )
         except Exception:  # noqa: BLE001 — the recap must never break the flow
             pass
 
@@ -2573,6 +2786,16 @@ def run_show_attack_paths(
         with _app_progress.track_compute_progress(_compute_progress):
             path_refs = _compute_paths()
         _compute_progress.mark_done(final_paths=len(path_refs))
+        # Materialization returned 0 concrete routes but the domain may still be
+        # reachable (control-mega-hub sampled fallback). Resolve the shared
+        # headline so the final compute frame + the summary reprint show the
+        # reachable figure instead of a bare "0".
+        if not path_refs:
+            _reach_headline, _, _, _ = _resolve_attack_path_reachability_headline(
+                shell, target_domain
+            )
+            if _headline_has_reachability(_reach_headline):
+                _progress_renderable.headline = _reach_headline
         _progress_session.update(_progress_renderable)
 
     _emit_attack_path_compute_telemetry(shell, target_domain, _compute_progress)
@@ -2633,7 +2856,27 @@ def run_show_attack_paths(
         path_refs = deduped
 
     if not path_refs:
-        print_warning("No attack paths recorded for this domain.")
+        # A control-mega-hub sampled materialization can return 0 concrete routes
+        # while the reachability set still proves the domain is exposed. Give the
+        # operator the actionable reachable-routes panel (routes + Tier-0 reach +
+        # choke-point pointer) instead of a bare "No attack paths recorded".
+        _reach_headline, _reach_tier0, _reach_sources, _reach_tier2 = (
+            _resolve_attack_path_reachability_headline(shell, target_domain)
+        )
+        if _headline_has_reachability(_reach_headline):
+            print_panel(
+                Group(
+                    *_render_sampled_reachability_rows(
+                        _reach_headline, _reach_tier0, _reach_sources, _reach_tier2
+                    )
+                ),
+                title="[bold]Attack paths · reachable[/]",
+                border_style="yellow",
+                title_align="left",
+                padding=(1, 2),
+            )
+        else:
+            print_warning("No attack paths recorded for this domain.")
         return
 
     # Annotate execution readiness BEFORE the table sort. The canonical sort
@@ -2670,7 +2913,6 @@ def run_show_attack_paths(
         from adscan_internal.cli.widgets.scan_recap import (
             render_fanout_capability_lines,
         )
-        from rich.console import Group
 
         _fanout_steps = build_recap_fanout_steps(shell, target_domain, max_steps=5)
         _fanout_lines = render_fanout_capability_lines(_fanout_steps, with_header=False)

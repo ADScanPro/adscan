@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable, Mapping
@@ -326,6 +326,60 @@ def _host_control_withheld_after_access(
     return False
 
 
+# Session-become follow-ups: the two techniques that turn a ``HasSession``
+# ARRIVAL on the session user into OWNERSHIP of that user (run code / dump creds
+# as them). They are the ONLY edges admissible directly off a ``HasSession`` edge;
+# every other outbound edge of the session user is withheld until one has run.
+# Kept distinct from ``PRINCIPAL_COMPROMISE_FOLLOWUP_RELATIONS`` (which also lists
+# ``DumpLSA``, the MACHINE become-step for a Computer arrival) — a machine
+# self-credential dump does NOT "become" the session user.
+_SESSION_BECOME_RELATION_KEYS: frozenset[str] = frozenset(
+    {"dumplsass", "scheduledtask"}
+)
+
+
+def _session_user_edge_withheld_before_become(
+    path_relations: list[str],
+    candidate_relation: str,
+) -> bool:
+    """Return True when a session-user edge is reached before the become-step.
+
+    ``HasSession`` (``Computer -> HasSession -> User``) is an ACCESS edge: it means
+    a logon session of the user exists on the host, NOT that the path owns the
+    user. To traverse the session user's OWN outbound edges the path must first
+    "become" them with a principal-compromise follow-up — ``DumpLSASS`` (dump their
+    credentials from the host LSASS) or ``ScheduledTask`` (run code under their
+    interactive token) — both of which need LOCAL ADMIN on the host the session
+    lives on. :func:`_build_implicit_session_followup_overlay` injects those two
+    as self-loops on the session-user node so the DFS can traverse them.
+
+    Without this gate the become-step was OPTIONAL: ``HasSession`` carries the
+    coarse ``access_capability_only`` semantics → provides ``local_admin_session``,
+    which satisfied Gate 2 for the session user's transparent outbound pivots
+    (``CanRDP`` / ``MemberOf``), so the path chained the session user's own edges
+    DIRECTLY off ``HasSession`` (``AdminTo → HasSession → CanRDP …``,
+    ``… → HasSession → MemberOf → …``) without ever proving the become. That both
+    skips a real prerequisite AND leaks the host-specific ``local_admin_session``
+    across the pivot onto a NEW host (the downstream false ``CanRDP → DumpLSA``
+    machine-account bridge, which Gate 2 then blocks once the become-step replaces
+    the context with ``credential_recovered``).
+
+    Walk back from the candidate: a become-step already run since the session →
+    allowed (the path owns the user); the most recent ``HasSession`` with no
+    intervening become-step → withheld. The become-steps themselves are always
+    admissible (they ARE the unlock).
+    """
+    cand = str(candidate_relation or "").strip().lower()
+    if cand in _SESSION_BECOME_RELATION_KEYS:
+        return False
+    for rel in reversed(path_relations):
+        if rel in _SESSION_BECOME_RELATION_KEYS:
+            return False
+        if rel == "hassession":
+            return True
+    return False
+
+
 def _candidate_is_dc_dcsync_bridge(candidate_edge: dict[str, Any] | None) -> bool:
     """Return True for the synthetic direct-DCSync overlay edge (F6).
 
@@ -395,6 +449,19 @@ def _edges_chain_ok(
     # is a property of the SQL session, so the lateral hop belongs to the MSSQL
     # lane, not the OS lane.
     if _mssql_session_edge_withheld_off_non_mssql_arrival(path_relations, cand_rel):
+        return False
+
+    # Gate 1.6 — session-user edges are withheld until the become-step runs.
+    # A HasSession arrival lands ON the session user but does NOT own it: to
+    # traverse the session user's OWN outbound edges the path must first "become"
+    # them via a principal-compromise follow-up (DumpLSASS / ScheduledTask), which
+    # needs local admin on the host the session lives on. Without this gate, the
+    # session user's own CanRDP / MemberOf chained DIRECTLY off HasSession (its
+    # coarse access_capability_only → local_admin_session provision satisfied the
+    # transparent pivots in Gate 2), making the become-step OPTIONAL where the
+    # model requires it MANDATORY — the false `AdminTo → HasSession → CanRDP …`
+    # and `… HasSession → MemberOf → …` chains.
+    if _session_user_edge_withheld_before_become(path_relations, cand_rel):
         return False
 
     # F6 — the synthetic direct-DCSync bridge IS the modeled direct replication
@@ -666,13 +733,47 @@ def _is_nontraversable_attack_edge(
       SPNJack derivation read it) but is non-traversable here. ``WriteSPN → User``
       stays traversable as targeted Kerberoast; only the Computer class is gated.
 
+    * **``HasShadowCredentials``** (an object that ALREADY carries an
+      ``msDS-KeyCredentialLink`` entry, emitted as a self-loop) — a persistence
+      INDICATOR, not a traversable compromise transition. Authenticating as the
+      object through that credential requires the PRE-EXISTING private key, which
+      the operator does not hold — whoever planted the key does (Windows Hello for
+      Business, or an attacker who left a backdoor). So reaching the object does not
+      let ADscan use the existing shadow credential, and modelling it as a
+      ``direct_target_compromise`` self-loop was both an overclaim and the source of
+      the redundant-MemberOf truncation bug. It is surfaced instead as the
+      ``shadow_credentials_present`` finding (compliance-mapped across every
+      framework), never walked. The distinct ``AddKeyCredentialLink`` control edge
+      (write access → plant OUR OWN key → PKINIT) is a real attack and stays
+      traversable.
+
+    * **``MssqlOpenRowsetBulkRead``** (``OPENROWSET(BULK ...)`` arbitrary-file-read,
+      previously emitted as a Computer self-loop) — a FILE READ as the SQL service
+      account, NOT operating-system code execution or host takeover. Like an
+      existing shadow credential it self-loops without advancing compromise, so it
+      is not a traversable attack step. A non-sysadmin principal holding ADMINISTER
+      BULK OPERATIONS / the ``bulkadmin`` role is surfaced instead as the
+      ``mssql_bulk_operations_overprivilege`` VULNERABILITY finding (suppressed for
+      sysadmin, where the capability is inherent to the role).
+
     Args:
         edge: One graph edge dict.
         nodes_map: The graph ``nodes`` dict (id → node). When ``None`` the
-            class-aware ``WriteSPN`` check is skipped (share-access still applies),
-            so callers without node context degrade safely.
+            class-aware ``WriteSPN`` check is skipped (share-access + shadow-creds
+            still apply), so callers without node context degrade safely.
     """
     if _is_excluded_share_access_edge(edge):
+        return True
+    if str(edge.get("relation") or "").strip().lower() == "hasshadowcredentials":
+        # Existing shadow credential = persistence IoC finding, not an attack edge
+        # (the operator lacks the pre-existing private key). See the class note above.
+        return True
+    if str(edge.get("relation") or "").strip().lower() == "mssqlopenrowsetbulkread":
+        # OPENROWSET(BULK ...) arbitrary-file-read = a FILE READ as the SQL service
+        # account, not code execution or host takeover, and it self-loops without
+        # advancing compromise. A non-sysadmin principal holding ADMINISTER BULK
+        # OPERATIONS is surfaced as the ``mssql_bulk_operations_overprivilege``
+        # VULNERABILITY finding, never walked (same class as HasShadowCredentials).
         return True
     if str(edge.get("relation") or "").strip().lower() == "writespn":
         if isinstance(nodes_map, dict):
@@ -1659,6 +1760,219 @@ def collapse_equivalent_authenticated_routes(records: list[dict[str, Any]]) -> l
     return result
 
 
+def _story_fold_key(record: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """The ORIGIN-AGNOSTIC display-fold key: (terminal asset, edge sequence).
+
+    Two display records fold into ONE ``story`` row ONLY when this key is equal
+    — the SAME terminal target reached by the SAME ordered edge sequence
+    (relations), regardless of which ORIGIN principal (``nodes[0]``) started the
+    chain. This is deliberately blind to the origin (and, since two footholds may
+    reach the same continuation through different intermediate pivots, blind to
+    the interior nodes) so the ``~N routes, one per foothold`` fan-out of a single
+    finding collapses to one row that carries the N origins in
+    ``origin_alternatives``.
+
+    It is a STRICT superset of the same-story requirement (guardrail #3): a
+    distinct technique yields a distinct relation sequence and a distinct terminal
+    yields a distinct target, so neither can ever fold together. The terminal is
+    read from ``terminal_target_label`` first (the pre-``MemberOf``-trim asset the
+    fold must key on) with ``target`` as the fallback — mirroring
+    :func:`_authenticated_collapse_key`.
+    """
+    terminal = str(record.get("terminal_target_label") or record.get("target") or "")
+    relations = tuple(str(r) for r in (record.get("relations") or []))
+    return (terminal, relations)
+
+
+def _derive_origin_alternatives(
+    members: list[dict[str, Any]], rep_src: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Structured origin-axis fold sub-structure (SSOT) — the ``via`` analog for STARTS.
+
+    :func:`_derive_via_alternatives` captures the interior-pivot alternatives (the
+    branches BETWEEN start and terminal); this is its counterpart on the ORIGIN
+    axis — the distinct start principals (``nodes[0]``) a single story is reachable
+    from. Guardrail #2 (preserve every tuple): each entry carries enough to BOTH
+    execute the chain from that origin (its own ``nodes`` / ``relations`` route)
+    AND remediate that origin (its ``source`` principal). One entry per distinct
+    origin label, strongest-proof member chosen when several members share it, in
+    stable label order, with ``in_representative`` set for the origin the surviving
+    representative row itself starts from.
+    """
+    rep_nodes = [str(n) for n in (rep_src.get("nodes") or [])]
+    rep_origin = rep_nodes[0] if rep_nodes else ""
+
+    # Every distinct origin across the fold, in first-seen order, mapped to the
+    # strongest-proof (then first-seen) member that starts there.
+    best_by_origin: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for m in members:
+        m_nodes = m.get("nodes") or []
+        if not m_nodes:
+            continue
+        origin = str(m_nodes[0])
+        prior = best_by_origin.get(origin)
+        if prior is None:
+            best_by_origin[origin] = m
+            order.append(origin)
+        elif _path_proof_rank(m) < _path_proof_rank(prior):
+            best_by_origin[origin] = m
+
+    alternatives: list[dict[str, Any]] = []
+    for origin in order:
+        member = best_by_origin[origin]
+        alternatives.append(
+            {
+                "source": str(member.get("source") or origin),
+                "origin_node": origin,
+                "status": str(member.get("status") or ""),
+                "in_representative": origin == rep_origin,
+                # The full route from this origin — preserves the tuple so the
+                # follow-up render can offer "execute from THIS foothold" and the
+                # remediation can name THIS origin's principal.
+                "nodes": [str(n) for n in (member.get("nodes") or [])],
+                "relations": [str(r) for r in (member.get("relations") or [])],
+                "affected": sorted({str(a) for a in (member.get("affected") or [])}),
+            }
+        )
+    alternatives.sort(key=lambda a: (not a["in_representative"], a["source"]))
+    return alternatives
+
+
+def fold_origin_stories(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold same-story different-ORIGIN routes into one display row (Axis-D).
+
+    A DISPLAY-LAYER transform for the domain listing: many routes that reach the
+    SAME terminal via the SAME edge sequence but start from DIFFERENT origin
+    principals (``<userA> -> AdminTo -> <host>$ -> ... -> domain`` vs the same chain
+    from ``<userB>``) are ONE finding rendered as N near-identical rows — the #1
+    noise source of the domain listing on a fan-out-heavy domain. This collapses
+    each such ``story`` (:func:`_story_fold_key` — terminal + edge sequence,
+    origin-agnostic) into one representative row carrying every origin in
+    ``origin_alternatives`` (guardrail #2: no tuple is lost; each origin keeps its
+    own route + source), so nothing is deleted, only re-projected.
+
+    Guardrails honoured:
+
+    * **#1 KPI stays origin-sensitive.** This runs STRICTLY DOWNSTREAM of the
+      finding set the exposure KPIs / score count (``compute_report_attack_paths``
+      is never routed through here) — it is applied only to the display listing
+      (``get_attack_path_summaries`` domain scope). So the "N standard users with a
+      path to Tier 0" headline and the exposure score still count N, never the
+      folded-row count.
+    * **#2 every tuple preserved** in ``origin_alternatives`` (per-origin route +
+      source + affected) and the ``affected`` union.
+    * **#3 same story only** — the key is (terminal, edge sequence); a distinct
+      technique or terminal never folds.
+
+    Only a group with >=2 members AND >=2 DISTINCT origins folds — a single-origin
+    key (already the norm after the same-source
+    :func:`collapse_equivalent_authenticated_routes`) passes through byte-identical
+    (no annotation bloat). ORDER-PRESERVING: each surviving representative is
+    emitted at the position of its FIRST member; passthrough rows stay in place.
+    IDEMPOTENT: re-running over folded output is a no-op (each story is then a
+    single-member group whose prior ``origin_route_count`` annotation is kept).
+    """
+    if len(records) <= 1:
+        return records
+
+    groups: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        groups[_story_fold_key(r)].append(r)
+
+    def _distinct_origins(members: list[dict[str, Any]]) -> list[str]:
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for m in members:
+            nodes = m.get("nodes") or []
+            origin = str(nodes[0]) if nodes else ""
+            if origin and origin not in seen_set:
+                seen_set.add(origin)
+                seen.append(origin)
+        return seen
+
+    def _build_representative(members: list[dict[str, Any]]) -> dict[str, Any]:
+        origins = _distinct_origins(members)
+        if len(members) == 1 or len(origins) <= 1:
+            # A single-origin story: nothing to fold on the origin axis. Preserve a
+            # prior fold's annotation (idempotency) but otherwise pass through.
+            rep = dict(members[0])
+            prior = rep.get("origin_route_count")
+            if not (isinstance(prior, int) and prior > 1):
+                rep.setdefault("origin_route_count", 1)
+            return rep
+        # Executed-preferring representative — the SAME three-level proof rank the
+        # same-source fold uses (fully-executed > partial > theoretical), then the
+        # shortest chain, then stable original order.
+        rep_src = min(
+            members,
+            key=lambda r: (
+                _path_proof_rank(r),
+                len(r.get("relations") or []),
+                records.index(r),
+            ),
+        )
+        rep = dict(rep_src)
+        rep["origin_route_count"] = len(origins)
+        affected: set[str] = set(rep_src.get("affected") or [])
+        interchange: set[str] = set(rep.get("via_interchangeable") or [])
+        for m in members:
+            affected.update(m.get("affected") or [])
+            for n in (m.get("nodes") or [])[1:-1]:
+                interchange.add(str(n))
+        rep["affected"] = sorted(affected)
+        rep["via_interchangeable"] = sorted(interchange)
+        rep["via_alternatives"] = _derive_via_alternatives(members, rep_src)
+        rep["origin_alternatives"] = _derive_origin_alternatives(members, rep_src)
+        return rep
+
+    def _passthrough(record: dict[str, Any]) -> dict[str, Any]:
+        """Return a non-folded row unchanged but carrying ``origin_route_count=1``.
+
+        Mirrors the single-origin branch of :func:`_build_representative` so a row
+        that is NOT an origin fold reads the same whether it was a lone record or a
+        member of a group that turned out not to fold. Idempotent: a prior fold's
+        ``origin_route_count`` annotation is preserved.
+        """
+        rep = dict(record)
+        prior = rep.get("origin_route_count")
+        if not (isinstance(prior, int) and prior > 1):
+            rep.setdefault("origin_route_count", 1)
+        return rep
+
+    # A group is a REAL origin fold ONLY when it has >=2 members AND >=2 DISTINCT
+    # origins; only such a group collapses to one representative carrying every
+    # origin. Every other key passes THROUGH in place — a lone record, or (only
+    # with degenerate records that lack ``nodes`` or repeat an origin, which the
+    # upstream same-source collapse removes before this runs) a multi-member
+    # single-origin group. This honours the docstring's "single-origin key passes
+    # through / passthrough rows stay in place" promise and guardrail #2 (never
+    # DROP a route that was not genuinely folded into ``origin_alternatives``):
+    # the previous loop emitted only the FIRST member of any same-key group, which
+    # silently dropped the rest of a non-folding group. On real data every
+    # story-group member carries a distinct origin, so this is byte-identical
+    # there (proven by the engine snapshot + the domain-listing baselines).
+    folded_keys = {
+        key
+        for key, members in groups.items()
+        if len(members) >= 2 and len(_distinct_origins(members)) >= 2
+    }
+    representatives = {key: _build_representative(groups[key]) for key in folded_keys}
+
+    result: list[dict[str, Any]] = []
+    emitted: set[tuple[str, tuple[str, ...]]] = set()
+    for r in records:
+        key = _story_fold_key(r)
+        if key not in folded_keys:
+            result.append(_passthrough(r))
+            continue
+        if key in emitted:
+            continue  # folded twin — its representative already emitted in place
+        emitted.add(key)
+        result.append(representatives[key])
+    return result
+
+
 def filter_contained_paths_for_domain_listing(
     records: list[dict[str, Any]],
     *,
@@ -1776,7 +2090,14 @@ def filter_contained_paths_for_domain_listing(
                 # Same max-affected level — keep the most-proven (lowest) rank.
                 covered[sub] = (aff, min(prev[1], rank))
 
-        kept: list[dict[str, Any]] = []
+        # Pass 1 — longest-first: keep the longest path and drop its strict
+        # sub-paths, rescuing a broader-origin / more-proven sub-path (the
+        # affected-widening carve-out). ``kept_entries`` carries each survivor with
+        # its literal signature so Pass 2 (below) can find, for a kept LONG path,
+        # the kept SHORTER sub-paths that dominate it.
+        kept_entries: list[
+            tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]
+        ] = []
         removed = 0
         for nodes_t, rels_t, record in normalized:
             sig = (nodes_t, rels_t)
@@ -1805,7 +2126,7 @@ def filter_contained_paths_for_domain_listing(
                     removed += 1
                     continue
                 # Rescued — fall through and keep it.
-            kept.append(record)
+            kept_entries.append((nodes_t, rels_t, record))
             rel_len = len(rels_t)
             if rel_len <= 0:
                 continue
@@ -1825,16 +2146,108 @@ def filter_contained_paths_for_domain_listing(
                         _mark_covered(
                             (nodes_t[start : end + 1], rels_t[start:end]), aff, rank
                         )
-        return _finalize(kept, removed)
+
+        # Pass 2 (the MIRROR of the keep_shortest branch's Pass 2) — remove a
+        # LONGER kept path A when a SHORTER kept path B (a strict sub-path of A on
+        # the SAME literal-signature containment Pass 1 uses) DOMINATES it on the
+        # ladder, so keep_longest is no longer structurally unable to drop a
+        # redundant long path:
+        #   1. B reaches a strictly HIGHER domain-compromise tier than A → drop A
+        #      (a shorter route that already achieves more domain impact; a T4
+        #      Domain-object A is never dropped — nothing out-ranks T4).
+        #   2. same tier + same terminal (B is a suffix of A) + B affects strictly
+        #      MORE principals → drop the narrow long twin; the broad short finding
+        #      carries the blast-radius headline.
+        #   3. same tier + same terminal + affected TIE + B fully-executed while A
+        #      is not → drop the non-executed long twin so the proven route wins.
+        # Invariant carried verbatim from Pass 1 / the keep_shortest branch: a
+        # PROVEN unauthenticated-reachable foothold A is never dropped for an
+        # authenticated B lacking the flag. HV-terminal protection is respected by
+        # construction — A is only ever dropped by broader / higher-tier / proven
+        # dominance, never by bare length. Domain-listing scope ONLY
+        # (``affected_widening_carveout``); the non-domain keep_longest callers pass
+        # the flag off and get Pass-1-only behaviour, byte-identical to before.
+        if not affected_widening_carveout or len(kept_entries) <= 1:
+            return _finalize([entry[2] for entry in kept_entries], removed)
+
+        kept_sig_index: dict[
+            tuple[tuple[str, ...], tuple[str, ...]],
+            list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]],
+        ] = {}
+        for entry in kept_entries:
+            kept_sig_index.setdefault((entry[0], entry[1]), []).append(entry)
+
+        pass2_kept: list[dict[str, Any]] = []
+        pass2_removed = 0
+        for a_nodes, a_rels, record in kept_entries:
+            a_rel_len = len(a_rels)
+            dominated = False
+            if a_rel_len > 0:
+                a_tier = domain_compromise_tier_from_record(record)
+                a_terminal = a_nodes[-1] if a_nodes else None
+                a_aff = _record_affected_principal_count(record)
+                a_proof = _path_proof_rank(record)
+                a_unauth = _record_is_unauthenticated_reachable(record)
+                probed: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+                for start in range(0, a_rel_len):
+                    if dominated:
+                        break
+                    for end in range(start + 1, a_rel_len + 1):
+                        if end - start >= a_rel_len:
+                            continue  # strict sub-sequence only (never A itself)
+                        sub_sig = (a_nodes[start : end + 1], a_rels[start:end])
+                        if sub_sig in probed:
+                            continue
+                        probed.add(sub_sig)
+                        bucket = kept_sig_index.get(sub_sig)
+                        if not bucket:
+                            continue
+                        for b_nodes, _b_rels, other in bucket:
+                            if other is record:
+                                continue
+                            # Never drop a proven no-credential foothold for an
+                            # authenticated twin that lacks the flag.
+                            if a_unauth and not _record_is_unauthenticated_reachable(
+                                other
+                            ):
+                                continue
+                            b_tier = domain_compromise_tier_from_record(other)
+                            if b_tier > a_tier:
+                                dominated = True
+                                break
+                            if b_tier == a_tier and (
+                                (b_nodes[-1] if b_nodes else None) == a_terminal
+                            ):
+                                b_aff = _record_affected_principal_count(other)
+                                if b_aff > a_aff:
+                                    dominated = True
+                                    break
+                                if (
+                                    b_aff == a_aff
+                                    and _path_proof_rank(other) == 0
+                                    and a_proof != 0
+                                ):
+                                    dominated = True
+                                    break
+                        if dominated:
+                            break
+            if dominated:
+                pass2_removed += 1
+            else:
+                pass2_kept.append(record)
+        return _finalize(pass2_kept, removed + pass2_removed)
     else:
-        # Owned/principals multi-user mode: keep the most direct path within each
-        # contained group, while never collapsing a higher domain-compromise tier
-        # into a lower one.  Matching is CONTEXT-INSENSITIVE (F5 Fix #1): two paths
-        # are compared on their non-contextual attack core (``attack_core_signature``
-        # — MemberOf/structural relations stripped, ``X→DumpLSA→X`` self-loops
-        # collapsed), NOT the literal node/rel arrays.  Dominance uses the 4-tier
-        # domain-compromise total order (F5 Fix #2): T4 Domain object > T3
-        # direct-breaker group > T2 enabler > T1 host.
+        # keep_shortest ladder — the domain-listing keep_shortest mode AND the
+        # owned/user/principals callers. Matching is CONTEXT-INSENSITIVE (F5 Fix #1):
+        # two paths are compared on their non-contextual attack core
+        # (``attack_core_signature`` — MemberOf/structural relations stripped,
+        # ``X→DumpLSA→X`` self-loops collapsed), NOT the literal node/rel arrays.
+        # Dominance uses the 4-tier domain-compromise total order (F5 Fix #2): T4
+        # Domain object > T3 direct-breaker group > T2 enabler > T1 host, gated to an
+        # attack-core containment relationship, and — under the domain-listing SSOT —
+        # never dropping an INDEPENDENT distinct terminal (``independent_terminals``),
+        # so a computer a bigger kill chain merely transits is preserved as its own
+        # finding instead of being buried.
         #
         # Sort key (process the record that should be KEPT first):
         #   (-domain_compromise_tier, not is_hv, length)
@@ -1854,15 +2267,97 @@ def filter_contained_paths_for_domain_listing(
             cores_by_id[id(record)] = _entry_core(record)
             tiers_by_id[id(record)] = domain_compromise_tier_from_record(record)
 
+        # DISTINCT-TERMINAL preservation set (domain listing only). A terminal is an
+        # INDEPENDENT finding — a separately compromisable target, not a mere waypoint
+        # a bigger kill chain pivots through — iff it has at least ONE route whose
+        # attack core is NOT contained (prefix/sub-sequence) in any strictly-HIGHER
+        # domain-compromise-tier path's core. A terminal ALL of whose routes are
+        # subsumed by a higher-tier chain (e.g. a computer the domain kill-chain merely
+        # transits) is a pure waypoint and stays folded into that chain. This set is
+        # what makes the two modes agree on WHICH terminals survive: without it,
+        # keep_shortest silently buried an independent terminal (its short route is a
+        # sub-sequence of the transiting chain) that keep_longest keeps via that
+        # terminal's own longer independent route — a real coverage loss on a fan-out
+        # domain. Only the cross-terminal tier dominance in Pass 2 consults it, and
+        # only under the domain-listing SSOT (``affected_widening_carveout``); the
+        # owned/user/principals callers never build it (they keep the legacy
+        # most-direct cross-terminal collapse, byte-identical). Indexed sub-quadratically
+        # by the endpoint pair, mirroring the Pass-2 ``super_by_endpoints`` pattern.
+        independent_terminals: set[str] = set()
+        # Per-record: is this route's attack core SUBSUMED (prefix/sub-sequence) by a
+        # strictly-HIGHER domain-compromise-tier path's core? A subsumed route is a mere
+        # segment of a bigger kill chain; a NON-subsumed route reaches its terminal by a
+        # path no bigger chain contains. Consumed by (a) the ``independent_terminals`` set
+        # below and (b) the representative-selection sort tiebreak — see ``_sort_key``.
+        subsumed_by_id: dict[int, bool] = {}
+        if affected_widening_carveout:
+            higher_by_endpoints: dict[
+                tuple[tuple[str, str], tuple[str, str]],
+                list[tuple[AttackCore, int]],
+            ] = {}
+            for _nt, _rt, record in normalized:
+                b_core = cores_by_id[id(record)]
+                if b_core is None or not b_core[1]:
+                    continue
+                b_tier = tiers_by_id[id(record)]
+                b_steps = b_core[1]
+                n_b = len(b_steps)
+                seen_pairs: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+                for i in range(n_b):
+                    for j in range(i, n_b):
+                        endpoints = (b_steps[i], b_steps[j])
+                        if endpoints in seen_pairs:
+                            continue
+                        seen_pairs.add(endpoints)
+                        higher_by_endpoints.setdefault(endpoints, []).append(
+                            (b_core, b_tier)
+                        )
+            for _nt, _rt, record in normalized:
+                a_core = cores_by_id[id(record)]
+                if a_core is None or not a_core[1]:
+                    subsumed_by_id[id(record)] = False
+                    continue
+                a_tier = tiers_by_id[id(record)]
+                a_endpoints = (a_core[1][0], a_core[1][-1])
+                subsumed = False
+                for b_core, b_tier in higher_by_endpoints.get(a_endpoints, ()):
+                    if b_tier <= a_tier or b_core is a_core:
+                        continue
+                    if attack_core_is_prefix(a_core, b_core) or attack_core_is_subsequence(
+                        a_core, b_core
+                    ):
+                        subsumed = True
+                        break
+                subsumed_by_id[id(record)] = subsumed
+            for nodes_t, _rt, record in normalized:
+                terminal = nodes_t[-1] if nodes_t else None
+                if terminal is None:
+                    continue
+                if not subsumed_by_id.get(id(record), False):
+                    independent_terminals.add(terminal)
+
         def _sort_key(
             item: tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]],
-        ) -> tuple[int, bool, int]:
+        ) -> tuple[int, bool, bool, int]:
             record = item[2]
             dct = tiers_by_id[id(record)]
             not_hv = (
                 (not is_hv_terminal(record)) if is_hv_terminal is not None else True
             )
-            return (-dct, not_hv, len(item[1]))
+            # Representative selection: among the routes to a terminal, PREFER a route
+            # whose core is NOT subsumed by a bigger kill chain — so an INDEPENDENT
+            # terminal is represented by its OWN independent route, not by a segment of
+            # the chain that transits it. Without this, keep_shortest keeps the terminal's
+            # shortest route, which for such a terminal is often a leading prefix of the
+            # transiting chain; every downstream stage that recomputes independence (the
+            # second, service-layer collapse; the prefix filter 6b) then sees only that
+            # prefix, judges the terminal a mere waypoint, and re-buries it — so the fix
+            # would hold at this stage but be lost in the full pipeline. Making the
+            # representative self-evidently independent survives every later stage. Domain
+            # listing only (``subsumed_by_id`` is populated iff the carve-out is on); with
+            # the carve-out off the map is empty → ``False`` for all → byte-identical.
+            subsumed = subsumed_by_id.get(id(record), False)
+            return (-dct, not_hv, subsumed, len(item[1]))
 
         normalized.sort(key=_sort_key)
         # Pass 1 — drop a candidate B when an already-kept A's attack core is a
@@ -2105,7 +2600,26 @@ def filter_contained_paths_for_domain_listing(
                             dominated = True
                             break
                         continue
-                    if b_tier >= a_tier:
+                    # DISTINCT-TERMINAL HARD GATE (domain listing only). A shorter path
+                    # A whose core is contained in the higher/equal-tier super-path B is
+                    # normally a redundant route and is dropped here. But when A ends at a
+                    # DIFFERENT terminal that is an INDEPENDENT finding (reachable by a
+                    # route no bigger chain subsumes — ``independent_terminals``), B merely
+                    # PIVOTS THROUGH A's terminal on the way to its own; A is a separately
+                    # compromisable target, not redundant, so it is preserved. This is the
+                    # coverage fix of the single-ladder spec: keep_shortest previously
+                    # buried such a distinct terminal because its short route is a
+                    # sub-sequence of the transiting chain, while keep_longest kept it via
+                    # that terminal's own longer independent route. A pure WAYPOINT
+                    # terminal (every route subsumed) is NOT independent and still
+                    # collapses. Owned/user/principals (carve-out OFF) never populate
+                    # ``independent_terminals`` and keep the legacy cross-terminal
+                    # most-direct collapse, byte-identical.
+                    if b_tier >= a_tier and not (
+                        affected_widening_carveout
+                        and kept_terminal_by_id.get(id(other)) != a_terminal
+                        and a_terminal in independent_terminals
+                    ):
                         dominated = True
                         break
             if dominated:
@@ -2114,6 +2628,73 @@ def filter_contained_paths_for_domain_listing(
                 pass2_kept.append(record)
 
         return _finalize(pass2_kept, removed_multi + pass2_removed)
+
+
+def _domain_listing_waypoint_terminals(records: list[dict[str, Any]]) -> set[str]:
+    """Return the terminals that are WAYPOINTS on some higher-tier domain kill chain.
+
+    A terminal is a waypoint iff it has at least ONE route whose attack core is
+    contained (prefix / sub-sequence) in a strictly-HIGHER domain-compromise-tier
+    path's core — i.e. a bigger chain PASSES THROUGH it on the way to a more valuable
+    target. In a ``--target highvalue`` domain listing this is the scope test for a
+    non-high-value terminal: a non-HV asset earns a place in the listing when
+    compromising it ADVANCES an attacker toward a high-value target (it is a genuine
+    stepping stone); a non-HV asset reachable only as a DEAD END (no route on any
+    higher-tier chain) is out of scope for a domain-compromise listing and is dropped.
+    HV / Tier-0 terminals are always in scope regardless (handled by the caller).
+
+    Records must already carry the stamped ``domain_compromise_tier`` (the caller
+    stamps it before invoking). Indexed sub-quadratically by the endpoint pair,
+    mirroring the containment-filter's ``super_by_endpoints`` pattern.
+    """
+    cores: list[AttackCore | None] = []
+    tiers: list[int] = []
+    for record in records:
+        nodes = record.get("nodes")
+        rels = record.get("relations")
+        core = (
+            attack_core_signature(nodes, rels)
+            if isinstance(nodes, list) and isinstance(rels, list)
+            else None
+        )
+        cores.append(core)
+        tiers.append(domain_compromise_tier_from_record(record))
+    higher_by_endpoints: dict[
+        tuple[tuple[str, str], tuple[str, str]], list[tuple[AttackCore, int]]
+    ] = {}
+    for idx, b_core in enumerate(cores):
+        if b_core is None or not b_core[1]:
+            continue
+        b_tier = tiers[idx]
+        b_steps = b_core[1]
+        seen: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+        for i in range(len(b_steps)):
+            for j in range(i, len(b_steps)):
+                endpoints = (b_steps[i], b_steps[j])
+                if endpoints in seen:
+                    continue
+                seen.add(endpoints)
+                higher_by_endpoints.setdefault(endpoints, []).append((b_core, b_tier))
+    waypoints: set[str] = set()
+    for idx, record in enumerate(records):
+        nodes = record.get("nodes")
+        terminal = str(nodes[-1]) if isinstance(nodes, list) and nodes else None
+        if terminal is None or terminal in waypoints:
+            continue
+        a_core = cores[idx]
+        if a_core is None or not a_core[1]:
+            continue
+        a_tier = tiers[idx]
+        a_endpoints = (a_core[1][0], a_core[1][-1])
+        for b_core, b_tier in higher_by_endpoints.get(a_endpoints, ()):
+            if b_tier <= a_tier or b_core is a_core:
+                continue
+            if attack_core_is_prefix(a_core, b_core) or attack_core_is_subsequence(
+                a_core, b_core
+            ):
+                waypoints.add(terminal)
+                break
+    return waypoints
 
 
 # ── Domain-scope listing shortest/longest mode ─────────────────────────────────
@@ -2131,6 +2712,7 @@ def filter_domain_listing_paths(
     *,
     label_to_node: Mapping[str, Mapping[str, Any]],
     keep_longest: bool = False,
+    restrict_to_hv_scope: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """Apply the domain-scope listing filter, shortest HV-aware by default.
 
@@ -2162,18 +2744,9 @@ def filter_domain_listing_paths(
             instead of the default shortest HV-aware route.
 
     Returns:
-        ``(kept_records, removed_count)`` from the containment filter.
+        ``(kept_records, removed_count)`` from the containment filter, after the
+        HV-scope filter (below) drops any non-high-value dead-end terminal.
     """
-    if keep_longest:
-        # Holistic view: collapse sub-paths into the longest kill chain, BUT rescue
-        # a broader-origin sub-path (strictly more affected principals than the
-        # super-path covering it) — the "more affected wins" doctrine now applies
-        # in BOTH domain-listing modes, not just keep_shortest.
-        return filter_contained_paths_for_domain_listing(
-            records, keep_shortest=False, affected_widening_carveout=True
-        )
-    # Shortest HV-aware: stamp the tiers the keep_shortest branch consumes, then
-    # keep the most direct route while protecting HV / domain-object terminals.
     stamp_records_target_tier(records, label_to_node=label_to_node)
     stamp_records_domain_compromise_tier(records, label_to_node=label_to_node)
     resolve = label_to_node or {}
@@ -2183,16 +2756,73 @@ def filter_domain_listing_paths(
         target_node = resolve.get(str(record.get("target") or "")) or {}
         return _node_target_priority_class(target_node) != "pivot"
 
-    return filter_contained_paths_for_domain_listing(
-        records,
-        keep_shortest=True,
-        is_hv_terminal=_is_hv_terminal,
-        preserve_prefix_paths=True,
-        # Domain-listing SSOT: prefer the broader-origin twin (more affected
-        # principals) over its single-principal suffix at equal tier/terminal, so
-        # the "any Domain User can reach this" blast-radius headline survives.
-        # Domain scope only — owned/principals never reach this wrapper.
-        affected_widening_carveout=True,
+    # HV-SCOPE filter (both modes, keeps the two identical) — applied ONLY for a
+    # ``--target highvalue`` listing (``restrict_to_hv_scope``). There, every terminal
+    # must be IN SCOPE: either high-value / Tier-0 itself, or a WAYPOINT a higher-tier
+    # kill chain transits toward a high-value target (a genuine stepping stone). A non-HV
+    # asset reachable only as a DEAD END — no route on any bigger chain, so compromising
+    # it advances nothing toward domain compromise — is out of scope and is dropped.
+    # keep_longest already omits such terminals (its collapse folds them), so this is
+    # byte-identical for keep_longest; it makes keep_shortest — where the distinct-terminal
+    # recovery would otherwise surface a dead-end computer — converge to the SAME terminal
+    # set. Computed from the FULL input (pre-collapse), so a terminal's waypoint role is
+    # judged on all its routes, not just the surviving one. NEVER for ``--target all`` /
+    # ``lowpriv``: there a non-HV terminal is exactly what the caller asked to see.
+    _waypoints = (
+        _domain_listing_waypoint_terminals(records) if restrict_to_hv_scope else set()
+    )
+
+    def _hv_scope_filter(
+        result: tuple[list[dict[str, Any]], int],
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not restrict_to_hv_scope:
+            return result
+        kept_records, removed = result
+        scoped: list[dict[str, Any]] = []
+        for r in kept_records:
+            terminal = str(r.get("target") or "")
+            # Never drop on UNCERTAINTY: a terminal we cannot positively resolve in the
+            # graph (data gap, or a stubbed/synthetic record) has UNKNOWN HV status, so
+            # keep it — the filter only removes a terminal PROVEN to be a non-HV dead end.
+            if resolve.get(terminal) is None:
+                scoped.append(r)
+                continue
+            if _is_hv_terminal(r) or terminal in _waypoints:
+                scoped.append(r)
+        return scoped, removed + (len(kept_records) - len(scoped))
+
+    if keep_longest:
+        # Holistic view: keep the longest kill chain, rescuing a broader-origin
+        # sub-path (strictly more affected principals) and dropping a redundant LONG
+        # path a shorter one dominates. NOTE: this branch keeps the literal-signature
+        # containment collapse, which already preserves every INDEPENDENT terminal (a
+        # distinct target's own longest route is not a literal sub-array of the chain
+        # that transits it) and collapses same-terminal origin fan-out. The keep_shortest
+        # branch reaches the SAME distinct-terminal set through the attack-core ladder's
+        # ``independent_terminals`` gate + the shared HV-scope filter above. Fully routing
+        # keep_longest through that ladder is deferred until the origin-fan-out fold
+        # (Axis D) lands — attack-core matching there does NOT collapse the per-origin
+        # fan-out that literal matching does, so it would triple the deliverable row count
+        # before the fold exists to absorb it.
+        return _hv_scope_filter(
+            filter_contained_paths_for_domain_listing(
+                records, keep_shortest=False, affected_widening_carveout=True
+            )
+        )
+    # Shortest HV-aware: keep the most direct route while protecting HV / domain-object /
+    # independent-distinct terminals, then apply the shared HV-scope filter.
+    return _hv_scope_filter(
+        filter_contained_paths_for_domain_listing(
+            records,
+            keep_shortest=True,
+            is_hv_terminal=_is_hv_terminal,
+            preserve_prefix_paths=True,
+            # Domain-listing SSOT: prefer the broader-origin twin (more affected
+            # principals) over its single-principal suffix at equal tier/terminal, and
+            # preserve an INDEPENDENT distinct terminal a higher-tier chain merely pivots
+            # through. Domain scope only — owned/principals never reach this wrapper.
+            affected_widening_carveout=True,
+        )
     )
 
 
@@ -3575,84 +4205,6 @@ def _build_implicit_xpcmdshell_overlay(
     return overlay
 
 
-def _build_implicit_openrowset_bulk_overlay(
-    graph: dict[str, Any],
-) -> dict[str, list[dict[str, Any]]]:
-    """Build virtual ``MssqlOpenRowsetBulkRead`` self-loops for BULK-ops-capable hosts.
-
-    ``OPENROWSET(BULK ... , SINGLE_BLOB)`` lets a session that holds ADMINISTER
-    BULK OPERATIONS read arbitrary files the SQL service account can reach — an
-    arbitrary-file-read technique, chained off the SAME three MSSQL access
-    relations as the XpCmdshell overlay (mirrors
-    :func:`_build_implicit_xpcmdshell_overlay`), but with a DIFFERENT gate:
-    unlike xp_cmdshell (sysadmin-only), this capability is reachable WITHOUT
-    sysadmin —
-
-      * ``SQLAdmin`` — sysadmin on the LOCAL instance always has it (sysadmin
-        bypasses every permission check) — unconditional, like XpCmdshell;
-      * ``SQLAccess`` — below-sysadmin local access. Conditional on the
-        collector's PER-PRINCIPAL fact ``notes.bulk_ops_capable`` (effective
-        ``bulkadmin`` role membership or an explicit ``ADMINISTER BULK
-        OPERATIONS`` grant) — the case XpCmdshell explicitly excludes, but this
-        technique does not, since the permission does not require sysadmin;
-      * ``MssqlLinkedServerLateral`` — conditional on the PER-EDGE fact
-        ``notes.remote_bulk_admin`` (set by the collector's read-only remote
-        probe), mirroring ``notes.remote_is_sysadmin`` for XpCmdshell.
-
-    Computed once per DFS call, never persisted.
-    """
-    nodes_map: dict[str, Any] = graph.get("nodes") or {}
-    overlay: dict[str, list[dict[str, Any]]] = {}
-    seen_computer_targets: set[str] = set()
-
-    for edge in graph.get("edges") or []:
-        if not isinstance(edge, dict):
-            continue
-        rel = str(edge.get("relation") or "").strip().lower()
-        if rel not in {"sqladmin", "sqlaccess", _MSSQL_LINKED_KEY}:
-            continue
-        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
-        exec_identity = ""
-        if rel == _MSSQL_LINKED_KEY:
-            bulk_capable = bool(notes.get("remote_bulk_admin"))
-            exec_identity = str(notes.get("remote_login") or "").strip()
-        elif rel == "sqladmin":
-            # Sysadmin on the local instance always has ADMINISTER BULK
-            # OPERATIONS — the permission check does not apply to sysadmin.
-            bulk_capable = True
-        else:  # sqlaccess
-            bulk_capable = bool(notes.get("bulk_ops_capable"))
-        if not bulk_capable:
-            continue
-        to_id = str(edge.get("to") or "").strip()
-        if not to_id or to_id in seen_computer_targets:
-            continue
-        target_node = nodes_map.get(to_id)
-        if not isinstance(target_node, dict):
-            continue
-        if str(target_node.get("kind") or "").strip().lower() != "computer":
-            continue
-        seen_computer_targets.add(to_id)
-        loop_notes: dict[str, Any] = {
-            "virtual": True,
-            "theoretical": True,
-            "synthesized_from": "implicit_openrowset_bulk_bridge",
-        }
-        if exec_identity:
-            loop_notes["execution_identity"] = exec_identity
-        overlay.setdefault(to_id, []).append(
-            {
-                "from": to_id,
-                "to": to_id,
-                "relation": "MssqlOpenRowsetBulkRead",
-                "kind": "derived",
-                "notes": loop_notes,
-            }
-        )
-
-    return overlay
-
-
 def _build_implicit_path_overlays(
     graph: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -3672,12 +4224,15 @@ def _build_implicit_path_overlays(
       (:func:`_build_implicit_session_followup_overlay`) —
       ``User -> ScheduledTask -> User`` and ``User -> DumpLSASS -> User`` for the
       session user a ``HasSession`` edge lands on, so the path can "become" the
-      session user and traverse their outbound edges;
-    * the OPENROWSET(BULK ...) arbitrary-file-read bridge
-      (:func:`_build_implicit_openrowset_bulk_overlay`) —
-      ``Computer -> MssqlOpenRowsetBulkRead -> Computer`` for any MSSQL access
-      edge (SQLAdmin unconditionally, SQLAccess / MssqlLinkedServerLateral
-      conditional on the collector's per-principal / per-edge BULK-ops fact).
+      session user and traverse their outbound edges.
+
+    ``OPENROWSET(BULK ...)`` arbitrary-file-read is deliberately NOT overlaid here:
+    it is a FILE READ as the SQL service account, not code execution or host
+    takeover, and it self-loops without advancing compromise (the same class as an
+    existing shadow credential). A non-sysadmin principal holding ADMINISTER BULK
+    OPERATIONS / the bulkadmin role is surfaced instead as the
+    ``mssql_bulk_operations_overprivilege`` VULNERABILITY finding (the MSSQL
+    collector emits it, suppressed for sysadmin where the capability is inherent).
     """
     merged: dict[str, list[dict[str, Any]]] = {}
     for builder in (
@@ -3685,7 +4240,6 @@ def _build_implicit_path_overlays(
         _build_implicit_dc_dcsync_overlay,
         _build_implicit_session_followup_overlay,
         _build_implicit_xpcmdshell_overlay,
-        _build_implicit_openrowset_bulk_overlay,
     ):
         for node_id, edges in builder(graph).items():
             merged.setdefault(node_id, []).extend(edges)
@@ -3880,6 +4434,65 @@ def _build_reverse_reachable_node_ids(
     return reachable
 
 
+def _build_tier0_to_domain_closure(
+    view: Any,
+    nodes_map: dict[str, Any],
+    *,
+    local_reuse_by_node: dict[str, list[dict[str, Any]]],
+    local_reuse_existing_pairs: set[tuple[str, str]],
+    local_reuse_useful_nodes: set[str],
+) -> dict[str, list[AttackPathStep]]:
+    """Shortest forward step-chain from every node to the AD Domain object.
+
+    A reverse-BFS from the domain node over the SAME DFS-visible adjacency the
+    DFS walks (so it inherits share-edge / non-traversable exclusion). For each
+    node reachable to the domain, stores the ordered ``AttackPathStep`` list of
+    the shortest forward path node -> ... -> domain. The domain maps to ``[]``;
+    an unreachable node has no key. O(V+E), computed once per DFS call.
+    """
+    domain_ids = {
+        str(nid)
+        for nid, node in nodes_map.items()
+        if isinstance(node, dict) and _node_is_domain(node)
+    }
+    if not domain_ids:
+        return {}
+    # Reverse adjacency carrying the FORWARD edge (so a step can be reconstructed).
+    reverse: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        for edge in _iter_outgoing_edges_with_virtual_local_reuse(
+            str(node_id), adjacency=view.adjacency, acc_steps=[],
+            local_reuse_by_node=local_reuse_by_node,
+            local_reuse_existing_pairs=local_reuse_existing_pairs,
+            local_reuse_useful_nodes=local_reuse_useful_nodes,
+        ):
+            if not isinstance(edge, dict):
+                continue
+            to_id = str(edge.get("to") or "").strip()
+            if to_id:
+                reverse.setdefault(to_id, []).append((str(node_id), edge))
+    # BFS out from the domain(s); first time we reach a node is its shortest path.
+    closure: dict[str, list[AttackPathStep]] = {d: [] for d in domain_ids}
+    queue: deque[str] = deque(domain_ids)
+    while queue:
+        current = queue.popleft()
+        for predecessor, fwd_edge in reverse.get(current, ()):
+            if predecessor in closure:
+                continue
+            step = AttackPathStep(
+                from_id=predecessor,
+                relation=str(fwd_edge.get("relation") or ""),
+                to_id=current,
+                status=str(fwd_edge.get("status") or "discovered"),
+                notes={},
+            )
+            closure[predecessor] = [step, *closure[current]]
+            queue.append(predecessor)
+    return closure
+
+
 def _build_high_value_reachable_node_ids(
     graph: dict[str, Any],
     *,
@@ -3979,6 +4592,13 @@ _W_IMPLICIT_EDGE_OVERLAY: dict[str, list[dict[str, Any]]] = {}
 # `highvalue`), in which case the expansion guard is a no-op and no node is
 # skipped — see _dfs_sources_batch_worker.
 _W_REACHABLE_NODE_IDS: set[str] = set()
+# Tier-0 frontier-terminal invariant (mirrors the sequential DFS — see
+# ``_build_tier0_to_domain_closure`` and the frontier-stop in the sequential
+# ``dfs`` closure inside ``compute_maximal_attack_paths``). Precomputed once in
+# the main process and shipped to each worker via the pool initializer, exactly
+# like ``_W_TERMINAL_SET``.
+_W_TIER0_IDS: frozenset[str] = frozenset()
+_W_TIER0_CLOSURE: dict[str, list[AttackPathStep]] = {}
 
 
 def _dfs_worker_init(
@@ -3989,11 +4609,20 @@ def _dfs_worker_init(
     terminal_set: set[str],
     implicit_edge_overlay: dict[str, list[dict[str, Any]]],
     reachable_node_ids: set[str],
+    tier0_ids: frozenset[str] | None = None,
+    tier0_closure: dict[str, list[AttackPathStep]] | None = None,
 ) -> None:
-    """Populate per-worker globals. Called once per worker process by the pool initializer."""
+    """Populate per-worker globals. Called once per worker process by the pool initializer.
+
+    *tier0_ids* / *tier0_closure* default to empty when omitted (existing
+    callers that pre-date the Tier-0 frontier invariant, e.g. direct
+    in-process worker tests) — an empty ``tier0_ids`` means the frontier-stop
+    never fires, which is byte-identical to the pre-Task-4 worker behaviour.
+    """
     global _W_ADJACENCY, _W_LOCAL_REUSE_BY_NODE  # noqa: PLW0603
     global _W_LOCAL_REUSE_EXISTING_PAIRS, _W_LOCAL_REUSE_USEFUL_NODES, _W_TERMINAL_SET  # noqa: PLW0603
     global _W_IMPLICIT_EDGE_OVERLAY, _W_REACHABLE_NODE_IDS  # noqa: PLW0603
+    global _W_TIER0_IDS, _W_TIER0_CLOSURE  # noqa: PLW0603
     _W_ADJACENCY = adjacency
     _W_LOCAL_REUSE_BY_NODE = local_reuse_by_node
     _W_LOCAL_REUSE_EXISTING_PAIRS = local_reuse_existing_pairs
@@ -4001,6 +4630,8 @@ def _dfs_worker_init(
     _W_TERMINAL_SET = terminal_set
     _W_IMPLICIT_EDGE_OVERLAY = implicit_edge_overlay
     _W_REACHABLE_NODE_IDS = reachable_node_ids
+    _W_TIER0_IDS = tier0_ids if tier0_ids is not None else frozenset()
+    _W_TIER0_CLOSURE = tier0_closure if tier0_closure is not None else {}
 
 
 def _dfs_sources_batch_worker(
@@ -4018,6 +4649,8 @@ def _dfs_sources_batch_worker(
     """
     terminal_set = _W_TERMINAL_SET
     reachable_node_ids = _W_REACHABLE_NODE_IDS
+    tier0_ids = _W_TIER0_IDS
+    tier0_closure = _W_TIER0_CLOSURE
     # Rebuild the shared expansion view (concern 1) from the per-worker globals
     # the pool initializer populated. The worker path carries no gentime-collapse
     # state (it is not passed to workers), so those fields are empty — byte-
@@ -4046,7 +4679,11 @@ def _dfs_sources_batch_worker(
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if target == "highvalue" and acc_steps[-1].to_id not in terminal_set:
+        # Tier-0 frontier carve (mirrors the sequential DFS's ``emit``): a Tier-0
+        # node with no forward closure to the domain object is itself a valid
+        # terminal, so accept it alongside the existing terminal-set gate.
+        last_is_tier0_frontier = acc_steps[-1].to_id in tier0_ids
+        if target == "highvalue" and acc_steps[-1].to_id not in terminal_set and not last_is_tier0_frontier:
             return
         if target == "lowpriv" and acc_steps[-1].to_id in terminal_set:
             return
@@ -4062,16 +4699,67 @@ def _dfs_sources_batch_worker(
             )
         )
 
+    def _emit_with_closure(acc_steps: list[AttackPathStep], stop_node: str) -> None:
+        """Emit acc_steps extended by the shortest closure stop_node -> domain.
+
+        Mirrors the sequential DFS's ``_emit_with_closure``: drops the closure
+        (emits the prefix as-is) when it would revisit a node already in the
+        prefix span, so a path never repeats a node.
+        """
+        closure = tier0_closure.get(stop_node)
+        if not closure:
+            emit(acc_steps)
+            return
+        span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
+        if any(s.to_id in span for s in closure):
+            emit(acc_steps)
+            return
+        emit([*acc_steps, *closure])
+
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
+        # A Domain terminal normally stops the DFS, but a compromised domain
+        # that can escalate cross-forest (CrossOrgTgtDelegation etc.) into an
+        # unvisited domain is NOT the end — keep traversing (mirrors the
+        # sequential DFS's ``terminal_here`` carve).
+        terminal_here = bool(acc_steps) and current in terminal_set
+        if terminal_here and _domain_has_cross_domain_escalation_out(
+            current, _W_ADJACENCY, visited
+        ):
+            terminal_here = False
+        # Tier-0 frontier-terminal (mirrors the sequential DFS): once the walk
+        # reaches a Tier-0 node (not the domain itself — ``terminal_here``
+        # handles that), stop expanding and close with the shortest path to
+        # the domain instead of fanning out past it. Gated to non-lowpriv
+        # targets, same as the sequential engine.
+        if (
+            target != "lowpriv"
+            and acc_steps
+            and not terminal_here
+            and current in tier0_ids
+            and not _domain_has_cross_domain_escalation_out(
+                current, _W_ADJACENCY, visited
+            )
+        ):
+            closure_here = tier0_closure.get(current)
+            closure_domain_id = closure_here[-1].to_id if closure_here else None
+            closure_domain_escalates = bool(
+                closure_domain_id
+                and _domain_has_cross_domain_escalation_out(
+                    closure_domain_id, _W_ADJACENCY, visited
+                )
+            )
+            if not closure_domain_escalates:
+                _emit_with_closure(acc_steps, current)
+                return
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
-            or (acc_steps and current in terminal_set)
+            or terminal_here
         ):
             emit(acc_steps)
             return
@@ -4154,6 +4842,8 @@ def _run_parallel_domain_dfs(
     n_workers: int,
     implicit_edge_overlay: dict[str, list[dict[str, Any]]] | None = None,
     reachable_node_ids: set[str] | None = None,
+    tier0_ids: frozenset[str] | None = None,
+    tier0_closure: dict[str, list[AttackPathStep]] | None = None,
 ) -> list[AttackPath]:
     """Distribute the DFS over *n_workers* spawn-context processes.
 
@@ -4166,6 +4856,10 @@ def _run_parallel_domain_dfs(
     high-value/Tier-0 sink). When non-empty, each worker honours it as an
     expansion guard, mirroring the sequential DFS. Empty/None disables the
     guard (target=all/lowpriv), so no node is pruned.
+
+    *tier0_ids* and *tier0_closure* carry the Tier-0 frontier-terminal
+    invariant (see ``_build_tier0_to_domain_closure``) into each worker so the
+    parallel engine emits the SAME finding set as the sequential engine.
     """
     import concurrent.futures
     import multiprocessing
@@ -4193,6 +4887,8 @@ def _run_parallel_domain_dfs(
                 terminal_set,
                 implicit_edge_overlay or {},
                 reachable_node_ids or set(),
+                tier0_ids or frozenset(),
+                tier0_closure or {},
             ),
         ) as pool:
             futures = [
@@ -4895,6 +5591,111 @@ def admit_frontier_edge(
     return "admit", is_self_loop, step_notes
 
 
+def _perterminal_path_respects_tier0_frontier(
+    steps: list[AttackPathStep],
+    tier0_ids: frozenset[str],
+    tier0_closure: dict[str, list[AttackPathStep]],
+) -> bool:
+    """Return True iff ``steps`` respects the Tier-0 frontier-terminal invariant.
+
+    The per-terminal reverse-flood reconstruction (``compute_perterminal_attack_paths``)
+    has no built-in Tier-0 gate: it walks forward toward ANY terminal under a
+    distance/slack budget (``admit_frontier_edge`` + ``_RECON_SLACK``), so it can
+    materialize routes the sequential/parallel DFS engines never emit once they
+    apply the frontier-stop rule — either a route that ends BARE at a Tier-0 node
+    that DOES have a closure to the domain (the DFS never stops there; it always
+    appends the closure), or a route that continues PAST a Tier-0 node onto a
+    DIFFERENT node instead of following that Tier-0's own precomputed closure
+    (e.g. ``low -> adm(Tier-0) -> ewp(Tier-0) -> domain`` instead of the DFS's
+    ``low -> adm(Tier-0) -> domain``).
+
+    Mirrors the DFS semantics: it re-validates the frontier condition at EVERY
+    Tier-0 node the path passes through — not just the first — exactly as the
+    sequential DFS re-checks the frontier condition on every recursive step, so
+    a path is never admitted just because its FIRST Tier-0 happened to be
+    legitimate while a LATER Tier-0 (e.g. reached past a cross-forest
+    continuation) is not. For each Tier-0 node encountered, the remaining steps
+    from that node must be an exact PREFIX match — relation and target — of
+    that node's own ``tier0_closure`` entry. A non-empty match may be followed
+    by further steps (a cross-forest continuation past the domain reached by
+    the closure is still admissible, mirroring the DFS's cross-domain-
+    escalation carve) — including further Tier-0 nodes, each of which is
+    independently re-validated by this same rule as the scan continues. When a
+    Tier-0 node has NO closure to any domain, the path is only valid if it
+    stops exactly there (the DFS's own "no closure exists" bare-terminal case).
+    """
+    if not tier0_ids or not steps:
+        return True
+    node_seq: list[str] = [steps[0].from_id, *[s.to_id for s in steps]]
+    for idx, node_id in enumerate(node_seq):
+        if node_id not in tier0_ids:
+            continue
+        # Every Tier-0 node along the path is checked independently — no early
+        # return on the first match, so a legitimate continuation past one
+        # Tier-0's closure is still held to the same invariant at any FURTHER
+        # Tier-0 it subsequently passes through.
+        following_steps = steps[idx:]
+        closure = tier0_closure.get(node_id) or []
+        if not closure:
+            if following_steps:
+                return False
+            continue
+        if len(following_steps) < len(closure):
+            return False
+        for actual_step, closure_step in zip(following_steps[: len(closure)], closure):
+            if (
+                actual_step.relation != closure_step.relation
+                or actual_step.to_id != closure_step.to_id
+            ):
+                return False
+    return True
+
+
+def _perterminal_path_respects_domain_frontier(
+    steps: list[AttackPathStep],
+    nodes_map: dict[str, Any],
+    adjacency: Mapping[str, list[dict[str, Any]]],
+) -> bool:
+    """Return True iff ``steps`` respects the Domain-object frontier invariant.
+
+    A materialized route can only reach a SECOND Tier-0 node by first passing
+    through a Domain object (every ``tier0_closure`` entry terminates AT a
+    domain, by construction), so the Tier-0 revalidation above is not, on its
+    own, sufficient for parity on a cross-forest fixture — the per-terminal
+    reverse-flood also has no domain-frontier gate of its own.
+
+    A compromised Domain node is normally a hard DFS terminal in object mode;
+    the sequential DFS only continues PAST it when it carries an outbound
+    ``CrossOrgTgtDelegation``/``RaiseChild`` edge to an as-yet-unvisited node
+    (``_domain_has_cross_domain_escalation_out``), and once that clears the
+    terminal, ANY of the domain's forward edges become explorable — not only
+    the escalation edge itself. So the per-terminal reconstruction can diverge
+    two ways: it can stop BARE at a domain that DOES escalate (the DFS never
+    stops there — it always keeps going), or it can continue PAST a domain
+    that does NOT escalate (the DFS never gets past it at all). Both are
+    rejected here, mirroring the DFS's own ``terminal_here`` clearing exactly.
+    """
+    if not steps:
+        return True
+    node_seq: list[str] = [steps[0].from_id, *[s.to_id for s in steps]]
+    visited_so_far: set[str] = {node_seq[0]}
+    for idx, node_id in enumerate(node_seq):
+        if idx > 0:
+            visited_so_far.add(node_id)
+        node = nodes_map.get(node_id)
+        if not isinstance(node, dict) or not _node_is_domain(node):
+            continue
+        escalates = _domain_has_cross_domain_escalation_out(
+            node_id, adjacency, visited_so_far
+        )
+        has_following_step = idx < len(steps)
+        if escalates and not has_following_step:
+            return False  # the DFS would have kept going past this domain
+        if not escalates and has_following_step:
+            return False  # the DFS would have stopped dead at this domain
+    return True
+
+
 def compute_perterminal_attack_paths(
     *,
     view: "AttackPathExpansionView",
@@ -4906,6 +5707,8 @@ def compute_perterminal_attack_paths(
     max_paths_cap: int | None,
     budget: "DfsMemoryBudget",
     enforce_terminal_floor: bool = True,
+    tier0_ids: frozenset[str] = frozenset(),
+    tier0_closure: dict[str, list[AttackPathStep]] | None = None,
 ) -> list[AttackPath]:
     """Per-terminal, budgeted, REVERSE-reachability-first path materialization.
 
@@ -4951,6 +5754,22 @@ def compute_perterminal_attack_paths(
             silently absent. Reuses the flood's already-computed
             distance/hit-source data (no re-flood, negligible budget cost). When
             False the output is byte-identical to the pre-floor engine.
+        tier0_ids: Node ids the caller has already classified as non-domain
+            Tier-0 (mirrors the sequential/parallel DFS's precomputed set). When
+            non-empty, every materialized route is post-filtered through
+            ``_perterminal_path_respects_tier0_frontier`` so this engine's
+            finding set matches the DFS engines on the Tier-0 frontier-terminal
+            invariant. Empty (default) skips the filter entirely — byte-identical
+            to the pre-invariant engine — which is the correct behaviour for a
+            caller that has not computed the closure (e.g. the single-start
+            variant).
+        tier0_closure: The precomputed shortest forward step-chain from each
+            Tier-0 node to the domain object (``_build_tier0_to_domain_closure``).
+            Required (non-None) whenever ``tier0_ids`` is non-empty. When
+            ``tier0_ids`` is non-empty this also activates the companion
+            domain-frontier check (``_perterminal_path_respects_domain_frontier``)
+            — a second Tier-0 is only ever reachable through a domain re-entry
+            point, so the two filters run together.
 
     Returns:
         The list of materialized :class:`AttackPath` routes (deduped by step
@@ -5384,6 +6203,21 @@ def compute_perterminal_attack_paths(
                 )
             emitted_terminals.add(term_id)
 
+    # Tier-0 frontier-terminal invariant parity (Task 5): the reverse-flood
+    # reconstruction above has no built-in Tier-0 gate, so it can materialize a
+    # route the sequential/parallel DFS engines never emit once they apply the
+    # frontier-stop rule. Post-filter so this engine's finding set matches theirs
+    # on any mega-hub graph. No-op (byte-identical) when the caller did not
+    # supply the closure (``tier0_ids`` empty — e.g. the single-start variant).
+    if tier0_ids:
+        _closure_map = tier0_closure or {}
+        paths = [
+            p
+            for p in paths
+            if _perterminal_path_respects_tier0_frontier(p.steps, tier0_ids, _closure_map)
+            and _perterminal_path_respects_domain_frontier(p.steps, nodes_map, adjacency)
+        ]
+
     return paths
 
 
@@ -5585,6 +6419,79 @@ def _unauth_entry_domain(graph: dict[str, Any]) -> str:
     return ""
 
 
+def derive_domain_scope_source_ids(
+    nodes_map: dict[str, Any], outgoing: dict[str, int]
+) -> set[str]:
+    """Return the domain-scope (all-principals) DFS source node ids.
+
+    SSOT for "which nodes seed the domain-wide DFS": every node with an outbound
+    edge that is EITHER the synthetic ``Unauthenticated`` entry OR an enabled,
+    non-effectively-high-value user. This is the exact predicate
+    :func:`compute_maximal_attack_paths` applies for its ``sources`` when no
+    explicit ``start_node_ids`` set is supplied, factored into one place so the
+    reachability basis the explosion-routing predictor
+    (``predicts_explosion_reachable``) walks from CANNOT drift from the DFS sources
+    it is meant to mirror.
+
+    Args:
+        nodes_map: The graph's ``id -> node`` mapping.
+        outgoing: Per-node out-degree — a node with no outbound edge cannot seed a
+            path. For the in-engine call this is the expansion view's traversable
+            out-degree; a lighter per-``from`` count is sufficient at a routing seam.
+
+    Returns:
+        The set of domain-scope source node ids (never ``None``).
+    """
+    result: set[str] = set()
+    if not isinstance(nodes_map, dict):
+        return result
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        if outgoing.get(node_id, 0) <= 0:
+            continue
+        # Narrow, proven-flag-gated carve: the synthetic Unauthenticated entry node
+        # is a valid DFS start even though it is not an enabled USER. Everyone /
+        # Users / Guests / Anonymous stay excluded — only this synthetic node is
+        # admitted, and only when ``_prepend_unauthenticated_entry_nodes`` created
+        # it from a PROVEN no-credential read.
+        if _node_is_synthetic_unauthenticated_entry(node):
+            result.add(str(node_id))
+            continue
+        if not _node_is_enabled_user(node):
+            continue
+        if _node_is_effectively_high_value(node):
+            continue
+        result.add(str(node_id))
+    return result
+
+
+def derive_domain_scope_source_ids_for_graph(graph: dict[str, Any]) -> set[str]:
+    """Return the domain-scope DFS source ids computed directly from a graph dict.
+
+    A convenience wrapper over :func:`derive_domain_scope_source_ids` for a routing
+    seam that holds a raw/base graph (``nodes`` + ``edges``) rather than a
+    materialized expansion view. ``outgoing`` is a plain per-``from`` out-degree
+    over the edge list — the same ``from`` / ``to`` fields the explosion
+    predictor's reachability walk reads — so the source set and the reachability
+    walk agree on node identity. Never raises: a malformed graph yields an empty
+    set (the conservative "run the DFS" routing).
+    """
+    nodes_map = graph.get("nodes") if isinstance(graph, dict) else None
+    edges = graph.get("edges") if isinstance(graph, dict) else None
+    if not isinstance(nodes_map, dict) or not isinstance(edges, list):
+        return set()
+    outgoing: dict[str, int] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        from_id = str(edge.get("from") or "")
+        if not from_id:
+            continue
+        outgoing[from_id] = outgoing.get(from_id, 0) + 1
+    return derive_domain_scope_source_ids(nodes_map, outgoing)
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
@@ -5653,6 +6560,28 @@ def compute_maximal_attack_paths(
     adjacency = view.adjacency
     outgoing = view.outgoing
 
+    # Tier-0 frontier-terminal invariant: the shortest forward closure from each
+    # Tier-0 node to the domain object, precomputed once (Task 1's
+    # ``_build_tier0_to_domain_closure``). The sequential DFS below stops
+    # expanding at a Tier-0 node and appends this closure instead of walking
+    # every subtree past it.
+    tier0_closure = _build_tier0_to_domain_closure(
+        view,
+        nodes_map,
+        local_reuse_by_node=view.local_reuse_by_node,
+        local_reuse_existing_pairs=view.local_reuse_existing_pairs,
+        local_reuse_useful_nodes=view.local_reuse_useful_nodes,
+    )
+    # The Tier-0 predicate result, precomputed once and shipped to the parallel
+    # worker via the pool initializer (Task 4) — mirrors the per-node check the
+    # sequential DFS runs inline (``not _node_is_domain(node) and
+    # _node_is_tier0(node)``), so the worker never needs ``nodes_map``.
+    tier0_ids: frozenset[str] = frozenset(
+        nid
+        for nid, node in nodes_map.items()
+        if isinstance(node, dict) and not _node_is_domain(node) and _node_is_tier0(node)
+    )
+
     mode = normalize_target_mode(terminal_mode)
 
     def is_terminal(node_id: str) -> bool:
@@ -5687,6 +6616,14 @@ def compute_maximal_attack_paths(
             allowed_start_ids |= unauthenticated_entry_ids
         if allowed_reachable_ids:
             allowed_reachable_ids |= unauthenticated_entry_ids
+    # The domain-scope source predicate (enabled non-effectively-high-value users
+    # with an outbound edge + the synthetic Unauthenticated entry) is factored into
+    # the ``derive_domain_scope_source_ids`` SSOT so the explosion-routing predictor
+    # walks its reachability from EXACTLY this set and cannot drift. The loop below
+    # keeps iterating ``nodes_map.items()`` in order — preserving the DFS root
+    # order byte-for-byte — and only intersects the derived set with the caller's
+    # ``allowed_start_ids`` / ``allowed_reachable_ids`` restrictions.
+    domain_source_ids = derive_domain_scope_source_ids(nodes_map, outgoing)
     sources: list[str] = []
     for node_id, node in nodes_map.items():
         if not isinstance(node, dict):
@@ -5695,19 +6632,9 @@ def compute_maximal_attack_paths(
             continue
         if allowed_reachable_ids and node_id not in allowed_reachable_ids:
             continue
-        if outgoing.get(node_id, 0) <= 0:
-            continue
-        # Narrow, proven-flag-gated carve: the synthetic Unauthenticated entry node
-        # is a valid DFS start even though it is not an enabled USER. Everyone /
-        # Users / Guests / Anonymous stay excluded — only this synthetic node is
-        # admitted, and only when ``_prepend_unauthenticated_entry_nodes`` created
-        # it from a PROVEN no-credential read.
-        if _node_is_synthetic_unauthenticated_entry(node):
-            sources.append(node_id)
-            continue
-        if not _node_is_enabled_user(node):
-            continue
-        if _node_is_effectively_high_value(node):
+        # The derived set already encodes the outbound-edge gate, the synthetic
+        # Unauthenticated-entry carve, and the enabled-non-high-value-user rule.
+        if node_id not in domain_source_ids:
             continue
         sources.append(node_id)
 
@@ -5758,6 +6685,8 @@ def compute_maximal_attack_paths(
             max_depth=max_depth,
             max_paths_cap=max_paths_cap,
             budget=DfsMemoryBudget(),
+            tier0_ids=tier0_ids,
+            tier0_closure=tier0_closure,
         )
 
     # --- Parallel DFS (domain scope) -----------------------------------------
@@ -5802,6 +6731,8 @@ def compute_maximal_attack_paths(
             n_workers,
             view.implicit_edge_overlay,
             allowed_reachable_ids,
+            tier0_ids,
+            tier0_closure,
         )
         if parallel_paths or not sources:
             return parallel_paths
@@ -5836,9 +6767,18 @@ def compute_maximal_attack_paths(
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
-            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
-        ):
+        last_node = nodes_map.get(acc_steps[-1].to_id)
+        # Tier-0 frontier carve: a Tier-0 node with no forward closure to the
+        # domain object is itself a valid terminal (the finding IS reaching that
+        # Tier-0 asset), so accept it alongside the existing domain-terminal gate.
+        last_is_tier0_frontier = isinstance(last_node, dict) and _node_is_tier0(
+            last_node
+        )
+        if (
+            target == "highvalue"
+            and not is_terminal(acc_steps[-1].to_id)
+            and not last_is_tier0_frontier
+        ) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
             return
         if (
             active_guard_members is not None
@@ -5864,6 +6804,22 @@ def compute_maximal_attack_paths(
             )
         )
 
+    def _emit_with_closure(acc_steps: list[AttackPathStep], stop_node: str) -> None:
+        """Emit acc_steps extended by the shortest closure stop_node -> domain.
+
+        Drops the closure (emits the prefix as-is) when the closure would revisit
+        a node already in the prefix span, so a path never repeats a node.
+        """
+        closure = tier0_closure.get(stop_node)
+        if not closure:
+            emit(acc_steps)
+            return
+        span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
+        if any(s.to_id in span for s in closure):
+            emit(acc_steps)
+            return
+        emit([*acc_steps, *closure])
+
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
@@ -5879,6 +6835,46 @@ def compute_maximal_attack_paths(
             current, adjacency, visited
         ):
             terminal_here = False
+        # Tier-0 frontier-terminal (two-phase invariant): once the walk reaches a
+        # Tier-0 object (not the domain itself, which the existing terminal path
+        # handles), stop expanding and close with the shortest path to the domain.
+        # The cross-domain-escalation carve already cleared ``terminal_here`` for a
+        # domain that must keep chaining cross-forest; mirror it here so a Tier-0
+        # with a cross-forest escalation out is NOT frontier-stopped.
+        # The invariant is defined only for a highvalue-terminal walk: for
+        # ``target == "lowpriv"`` a Tier-0 midpoint is not the goal (the goal is a
+        # LOW-priv endpoint reached THROUGH it), so stopping there would truncate
+        # and drop the real low-priv path past the Tier-0. Gate the frontier stop
+        # to non-lowpriv targets so lowpriv stays byte-identical to before.
+        node_here = nodes_map.get(current)
+        if (
+            target != "lowpriv"
+            and acc_steps
+            and not terminal_here
+            and isinstance(node_here, dict)
+            and not _node_is_domain(node_here)
+            and _node_is_tier0(node_here)
+            and not _domain_has_cross_domain_escalation_out(
+                current, adjacency, visited
+            )
+        ):
+            # The Tier-0's own closure lands on a Domain object; if THAT domain
+            # can still escalate cross-forest (the same carve as ``terminal_here``
+            # above, applied to the closure target rather than ``current``), the
+            # kill chain must keep chaining through it instead of being cut short
+            # at the Tier-0 with a bare closure — mirrors
+            # ``… -> DCSync -> EXT -> CrossOrgTgtDelegation -> HTB`` reaching HTB.
+            closure_here = tier0_closure.get(current)
+            closure_domain_id = closure_here[-1].to_id if closure_here else None
+            closure_domain_escalates = bool(
+                closure_domain_id
+                and _domain_has_cross_domain_escalation_out(
+                    closure_domain_id, adjacency, visited
+                )
+            )
+            if not closure_domain_escalates:
+                _emit_with_closure(acc_steps, current)
+                return
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
@@ -6053,12 +7049,37 @@ def compute_maximal_attack_paths_from_start(
             return _node_is_terminal_target(node, mode=mode)
         return _node_is_terminal_target(node, mode=mode)
 
+    # Tier-0 frontier-terminal invariant (mirrors ``compute_maximal_attack_paths``
+    # 6027-6047). The single-start DFS below stops expanding at a Tier-0 node and
+    # appends the shortest forward closure to the domain instead of walking every
+    # subtree past it — so a per-start display / ``execute attack_paths`` run
+    # frontier-stops exactly like the domain-scope engine (no Tier-0→Tier-2
+    # descents, no lateral mega-hub explosion). See the two-phase design spec
+    # ``2026-09-23-attack-path-tier0-terminal-two-phase-engine-design.md``.
+    tier0_closure = _build_tier0_to_domain_closure(
+        view,
+        nodes_map,
+        local_reuse_by_node=view.local_reuse_by_node,
+        local_reuse_existing_pairs=view.local_reuse_existing_pairs,
+        local_reuse_useful_nodes=view.local_reuse_useful_nodes,
+    )
+    tier0_ids: frozenset[str] = frozenset(
+        nid
+        for nid, node in nodes_map.items()
+        if isinstance(node, dict) and not _node_is_domain(node) and _node_is_tier0(node)
+    )
+
     # --- Per-terminal reverse-flood engine (opt-in via env) ------------------
     # When ADSCAN_ATTACK_PATH_ENGINE == "perterminal", the target-rooted engine
     # replaces the per-start DFS below. Default OFF: the DFS path runs
     # byte-identically to before. The single start node is the only source.
     # ``force_perterminal`` is the hybrid switch's call-scoped route (predictor /
     # abort backstop) — same effect, without mutating the process-wide env var.
+    # The Tier-0 frontier filter is passed so this engine's finding set matches
+    # the native single-start DFS below (and, transitively, the domain-scope
+    # engine's per-start subset) on the frontier-terminal invariant. The
+    # per-terminal filter re-validates the frontier at EVERY Tier-0 including a
+    # Tier-0 START node, so the degenerate Tier-0-start case is handled here too.
     if _perterminal_engine_selected() or force_perterminal:
         return compute_perterminal_attack_paths(
             view=view,
@@ -6069,6 +7090,8 @@ def compute_maximal_attack_paths_from_start(
             max_depth=max_depth,
             max_paths_cap=max_paths_cap,
             budget=DfsMemoryBudget(),
+            tier0_ids=tier0_ids if target != "lowpriv" else frozenset(),
+            tier0_closure=tier0_closure,
         )
 
     paths: list[AttackPath] = []
@@ -6083,9 +7106,21 @@ def compute_maximal_attack_paths_from_start(
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
-            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
-        ):
+        last_node = nodes_map.get(acc_steps[-1].to_id)
+        # Tier-0 frontier carve (mirrors the domain engine's ``emit``): a Tier-0
+        # node with no forward closure to the domain object is itself a valid
+        # terminal (the finding IS reaching that Tier-0 asset), so accept it
+        # alongside the existing domain-terminal gate.
+        last_is_tier0_frontier = (
+            target != "lowpriv"
+            and isinstance(last_node, dict)
+            and _node_is_tier0(last_node)
+        )
+        if (
+            target == "highvalue"
+            and not is_terminal(acc_steps[-1].to_id)
+            and not last_is_tier0_frontier
+        ) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
             return
         signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
@@ -6098,6 +7133,23 @@ def compute_maximal_attack_paths_from_start(
                 target_id=acc_steps[-1].to_id,
             )
         )
+
+    def _emit_with_closure(acc_steps: list[AttackPathStep], stop_node: str) -> None:
+        """Emit acc_steps extended by the shortest closure stop_node -> domain.
+
+        Drops the closure (emits the prefix as-is) when the closure would revisit
+        a node already in the prefix span, so a path never repeats a node. Exact
+        mirror of the domain engine's ``_emit_with_closure``.
+        """
+        closure = tier0_closure.get(stop_node)
+        if not closure:
+            emit(acc_steps)
+            return
+        span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
+        if any(s.to_id in span for s in closure):
+            emit(acc_steps)
+            return
+        emit([*acc_steps, *closure])
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         _budget.tick()
@@ -6114,6 +7166,37 @@ def compute_maximal_attack_paths_from_start(
             current, adjacency, visited
         ):
             terminal_here = False
+        # Tier-0 frontier-terminal (two-phase invariant) — exact mirror of the
+        # domain engine's block in ``compute_maximal_attack_paths``. Once the walk
+        # reaches a Tier-0 object (not the domain itself, handled by the terminal
+        # path), stop expanding and close with the shortest path to the domain,
+        # unless the Tier-0 (or the domain its closure lands on) can still escalate
+        # cross-forest — then keep chaining. Gated to non-lowpriv targets so a
+        # lowpriv walk (goal = a low-priv endpoint reached THROUGH the Tier-0)
+        # stays byte-identical to before.
+        node_here = nodes_map.get(current)
+        if (
+            target != "lowpriv"
+            and acc_steps
+            and not terminal_here
+            and isinstance(node_here, dict)
+            and not _node_is_domain(node_here)
+            and _node_is_tier0(node_here)
+            and not _domain_has_cross_domain_escalation_out(
+                current, adjacency, visited
+            )
+        ):
+            closure_here = tier0_closure.get(current)
+            closure_domain_id = closure_here[-1].to_id if closure_here else None
+            closure_domain_escalates = bool(
+                closure_domain_id
+                and _domain_has_cross_domain_escalation_out(
+                    closure_domain_id, adjacency, visited
+                )
+            )
+            if not closure_domain_escalates:
+                _emit_with_closure(acc_steps, current)
+                return
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
@@ -6165,6 +7248,30 @@ def compute_maximal_attack_paths_from_start(
 
         if not extended:
             emit(acc_steps)
+
+    # Degenerate case — the explicit start node is ITSELF Tier-0 (e.g.
+    # ``execute attack_paths <domain> Administrator``, or a Tier-0 principal in an
+    # owned/principals set). In domain/owned scope a Tier-0 is never a start (the
+    # source loop excludes every effectively-high-value node), but the single-start
+    # entry takes an operator-chosen node. The start already sits AT the Tier-0
+    # frontier, so Phase-1 discovery would only descend a tier (which the invariant
+    # forbids): skip discovery entirely and emit ONLY the Phase-2 shortest closure
+    # to the domain — forcing shortest-to-domain even when ``target == "all"`` (from
+    # a Tier-0, ``all`` collapses to ``highvalue``). Emit nothing if the Tier-0 start
+    # has no closure to the domain (it is already at/above the frontier — there is
+    # no onward attack path to show). Gated to non-lowpriv so a lowpriv walk is
+    # unaffected. Reuses the same closure map as the frontier stop — one primitive.
+    start_node = nodes_map.get(start_node_id)
+    if (
+        target != "lowpriv"
+        and isinstance(start_node, dict)
+        and not _node_is_domain(start_node)
+        and _node_is_tier0(start_node)
+    ):
+        closure_from_start = tier0_closure.get(start_node_id)
+        if closure_from_start:
+            emit(list(closure_from_start))
+        return paths
 
     dfs(start_node_id, visited={start_node_id}, acc_steps=[])
     return paths
@@ -7298,6 +8405,136 @@ def _node_is_terminal_target(node: dict[str, Any], *, mode: str = "tier0") -> bo
     if terminal_class == "followup_terminal":
         return True
     return False
+
+
+def build_snapshot_label_to_node(
+    snapshot: dict[str, Any] | None,
+    base_graph: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build a {label: node_dict} index for HV / tier lookups.
+
+    Sources (merged, base_graph wins on conflict):
+      1. Membership snapshot nodes  — users and groups with HV properties.
+      2. Attack graph nodes         — domain nodes and other targets that the DFS
+         uses as terminals; these carry the ``highvalue``/``isTierZero``/
+         ``system_tags`` properties that ``_node_is_effectively_high_value`` checks.
+
+    The snapshot alone is insufficient because it only contains user/group
+    membership data and never includes domain-level nodes (e.g. ``ESSOS.LOCAL``).
+    Without the attack graph, domain terminals are always tagged as pivot.
+
+    Shell-free (snapshot + base_graph only) so BOTH the CLI service pipeline and the
+    shared core non-domain listing collapse build the SAME index — see
+    ``attack_paths_core.apply_nondomain_display_listing_collapse``.
+    """
+    result: dict[str, dict[str, Any]] = {}
+
+    # Layer 1: snapshot nodes (users/groups).
+    if snapshot:
+        snap_nodes = snapshot.get("nodes")
+        if isinstance(snap_nodes, dict):
+            for node in snap_nodes.values():
+                if isinstance(node, dict):
+                    label = str(node.get("label") or "").strip()
+                    if label:
+                        result[label] = node
+
+    # Layer 2: attack graph nodes (domains, computers, CAs, etc.) — override snapshot.
+    if base_graph:
+        ag_nodes = base_graph.get("nodes")
+        if isinstance(ag_nodes, dict):
+            for node in ag_nodes.values():
+                if isinstance(node, dict):
+                    label = str(node.get("label") or "").strip()
+                    if label:
+                        result[label] = node
+
+    return result
+
+
+def is_collectable_computers_scope_node(node: dict[str, Any] | None) -> bool:
+    """Return True for the synthetic host-scope node used by native collection."""
+    if not isinstance(node, dict):
+        return False
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return (
+        bool(props.get("synthetic"))
+        and str(props.get("scope_kind") or "").strip().lower()
+        == "collectable_computers"
+        and str(props.get("target_selector") or "").strip().lower()
+        == "all_collectable_computers"
+    )
+
+
+def trim_trailing_memberof_edges(
+    rec: dict[str, Any],
+    *,
+    label_to_node: dict[str, Any],
+    except_hv: bool,
+) -> dict[str, Any] | None:
+    """Strip trailing MemberOf-to-non-HV edges from a path record.
+
+    Recursively removes trailing (MemberOf, Group) pairs until the last relation
+    is not MemberOf, the terminal node is HV (when except_hv=True, matching BH CE
+    behaviour where HV terminals are kept), or the path becomes degenerate (< 2 nodes).
+
+    Args:
+        rec: Path record dict with ``nodes`` and ``relations``/``rels`` keys.
+        label_to_node: Label-to-node index built from snapshot + attack graph.
+        except_hv: When True, stop trimming as soon as the terminal node is HV
+            (mirrors BH CE ``target="all"`` semantics).
+
+    Returns:
+        Trimmed copy of *rec* with updated ``nodes``, ``relations``/``rels``, and
+        ``target`` fields, or ``None`` if the path has fewer than 2 nodes after
+        trimming (degenerate — discard).
+    """
+    nodes = list(rec.get("nodes") or [])
+    rel_key = "relations" if "relations" in rec else "rels"
+    rels = list(rec.get(rel_key) or [])
+
+    while rels:
+        last_rel = str(rels[-1]).strip().lower()
+        if last_rel != "memberof":
+            break
+        if except_hv:
+            tgt_label = str(nodes[-1]) if nodes else ""
+            tgt_node = label_to_node.get(tgt_label) or {}
+            if _node_target_priority_class(tgt_node) != "pivot":
+                break  # HV terminal — stop trimming, keep as-is
+        # Remove the last node and last relation.
+        nodes = nodes[:-1]
+        rels = rels[:-1]
+
+    if len(nodes) < 2:
+        return None
+
+    trimmed = dict(rec)
+    trimmed["nodes"] = nodes
+    trimmed[rel_key] = rels
+    trimmed["target"] = nodes[-1]
+    # ``terminal_target_label`` is stamped at path-creation time from the pre-trim
+    # ``path.target_id``. When we strip trailing MemberOf hops the terminal node
+    # changes, so the stamped label is now stale and points at the discarded pivot
+    # group. Stage-7 classification resolves the target node via
+    # ``terminal_target_label`` first, so leaving it stale mislabels the path. Reset
+    # it to the trimmed terminal label so the classifier resolves the real terminal.
+    if "terminal_target_label" in trimmed:
+        trimmed["terminal_target_label"] = nodes[-1]
+    return trimmed
+
+
+def record_terminal_is_hv(
+    rec: dict[str, Any],
+    label_to_node: dict[str, Any],
+) -> bool:
+    """Return True when *rec*'s terminal node is high-value / tier-0.
+
+    Consults the same ``_node_target_priority_class`` predicate the HV-tag stage
+    uses so the containment filter and any UX ordering logic use identical criteria.
+    """
+    tgt_node = label_to_node.get(str(rec.get("target") or "")) or {}
+    return _node_target_priority_class(tgt_node) != "pivot"
 
 
 def _try_promote_target_via_membership_edges(

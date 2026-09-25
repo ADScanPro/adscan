@@ -135,14 +135,10 @@ def edge_grants_local_admin_session(
 def _is_stamped_direct_breaker(node: Mapping[str, Any] | None) -> bool:
     """Return whether ``node`` carries a membership-aware ``tier0_direct`` stamp.
 
-    Tier-label SSOT: this augments the name/RID ``is_direct_domain_breaker_target``
-    detector so a terminal on a Domain Admins MEMBER (a User the NAME matcher on
-    its own identity misses, but whose membership-aware stamp is ``tier0_direct``)
-    is classified into the top ``domain`` lane. It is purely ADDITIVE — it only
-    ever RAISES a terminal into the protective domain lane, never lowers one — so
-    the redundant-MemberOf minimizer never strips a proven compromise prefix. The
-    stamped-label read is unconditional — validated in lab and made permanent (the
-    ADSCAN_TIER_LABEL_SSOT reader switch was removed 2026-09-09).
+    Tier-label SSOT: augments the name/RID ``is_direct_domain_breaker_target``
+    detector so a terminal on a Domain Admins MEMBER (whose membership-aware stamp
+    is ``tier0_direct``) is classified into the top ``domain`` lane. Purely
+    ADDITIVE — only ever RAISES a terminal into the protective domain lane.
     """
     from adscan_internal.services.compromise_class import (  # noqa: PLC0415
         PrivilegeTier,

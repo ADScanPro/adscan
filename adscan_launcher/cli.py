@@ -2118,6 +2118,56 @@ def _build_update_context_for_launcher(
     )
 
 
+def _render_pro_upsell_and_record(
+    cmd: str,
+    *,
+    telemetry_console: Console | None = None,
+    capture_session: bool = False,
+) -> None:
+    """Render the canonical PRO upsell on the shared, tee'd host console.
+
+    Single seam for every host-side PRO-upsell impression (the pre-gate and
+    the exit-42 backstops). It renders through :func:`get_console` — the
+    shared ``_TeeConsole`` that ``set_output_config`` wired to the launcher's
+    recording ``telemetry_console`` — so the panel auto-mirrors into the
+    session recording. A bare ``Console`` here would paint the terminal but
+    never reach ``telemetry_console``, leaving the peak-value LITE->PRO
+    activation moment invisible to the activation radar.
+
+    Args:
+        cmd: The PRO-only command that was refused (``"ci"`` / ``"deliver"``).
+        telemetry_console: The launcher's recording console. Required for the
+            session capture; ignored when ``capture_session`` is ``False``.
+        capture_session: When ``True`` (the host pre-gate, which exits before
+            :func:`_run_host_command_with_session_capture` ever runs), flush
+            the launcher session here so the impression reaches the recording
+            before the process exits. The refused command is force-added to
+            the allow-list so a ``deliver`` refusal (not in the default set)
+            is captured too.
+    """
+    from adscan_core.operator_role import resolve_cta_lane
+    from adscan_core.output._state import get_console
+    from adscan_core.pro_upsell import render_pro_upsell_panel
+
+    lane = resolve_cta_lane()
+    get_console().print(
+        render_pro_upsell_panel(cmd, context="direct_invocation", lane=lane)
+    )
+    if capture_session and telemetry_console is not None:
+        _capture_launcher_command_session(
+            command_type=cmd,
+            telemetry_console=telemetry_console,
+            success=None,
+            extra={
+                "mode": "host",
+                "session_scope": "launcher_pro_pregate",
+                "pro_pregate_refused": True,
+                "pro_pregate_command": cmd,
+                "cta_lane": getattr(lane, "value", str(lane)),
+            },
+            allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS) | {cmd},
+        )
+
 
 def _run_pro_passthrough_with_upsell_gate(
     *,
@@ -2160,13 +2210,7 @@ def _run_pro_passthrough_with_upsell_gate(
     # and the rc came back as 42.
     if rc == 42 and is_pro_only(cmd):
         try:
-            from adscan_core.operator_role import resolve_cta_lane
-            from adscan_core.pro_upsell import render_pro_upsell_panel
-
-            lane = resolve_cta_lane()
-            console = Console(theme=ADSCAN_THEME)
-            panel = render_pro_upsell_panel(cmd, context="direct_invocation", lane=lane)
-            console.print(panel)
+            _render_pro_upsell_and_record(cmd)
             return 0
         except Exception as exc:  # noqa: BLE001 — best-effort upsell render
             capture_exception(exc)
@@ -2189,14 +2233,7 @@ def _ci_handle_passthrough_rc(rc: int) -> int:
 
     if rc == 42 and is_pro_only("ci"):
         try:
-            from adscan_core.operator_role import resolve_cta_lane
-            from adscan_core.pro_upsell import render_pro_upsell_panel
-
-            lane = resolve_cta_lane()
-            console = Console(theme=ADSCAN_THEME)
-            console.print(
-                render_pro_upsell_panel("ci", context="direct_invocation", lane=lane)
-            )
+            _render_pro_upsell_and_record("ci")
             return 0
         except Exception as exc:  # noqa: BLE001 — best-effort upsell render
             capture_exception(exc)
@@ -2205,7 +2242,9 @@ def _ci_handle_passthrough_rc(rc: int) -> int:
     return int(rc)
 
 
-def _maybe_pregate_pro_command(cmd: str) -> None:
+def _maybe_pregate_pro_command(
+    cmd: str, *, telemetry_console: Console | None = None
+) -> None:
     """Skip the container entirely for a PRO-only command under confirmed LITE.
 
     ``resolve_runtime_license_mode()`` already resolves the tier for free
@@ -2223,10 +2262,20 @@ def _maybe_pregate_pro_command(cmd: str) -> None:
     own exit-42 + ``_run_pro_passthrough_with_upsell_gate`` /
     ``_ci_handle_passthrough_rc`` remain the backstop.
 
+    The upsell is rendered through the shared tee'd console and the launcher
+    session is captured HERE, before the ``SystemExit(0)`` — this pre-gate
+    fires before :func:`_run_host_command_with_session_capture` ever runs, so
+    without an explicit capture the peak-value LITE->PRO activation moment (a
+    free user reaching for the paid autonomous scan) never reaches the session
+    recording and the activation radar stays blind to it.
+
     Args:
         cmd: The subcommand about to run (e.g. ``"ci"``, ``"deliver"``,
             ``"report"``). A no-op for any command not in
             :data:`adscan_core.cli_catalog.PRO_ONLY_COMMANDS`.
+        telemetry_console: The launcher's recording console, so the captured
+            impression reaches the session recording. When ``None`` the panel
+            still renders (through the tee'd console) but no session is flushed.
 
     Raises:
         SystemExit: With code 0, when the pre-gate fires.
@@ -2238,12 +2287,9 @@ def _maybe_pregate_pro_command(cmd: str) -> None:
     if (resolve_runtime_license_mode() or "").upper() != "LITE":
         return
 
-    from adscan_core.operator_role import resolve_cta_lane
-    from adscan_core.pro_upsell import render_pro_upsell_panel
-
-    lane = resolve_cta_lane()
-    console = Console(theme=ADSCAN_THEME)
-    console.print(render_pro_upsell_panel(cmd, context="direct_invocation", lane=lane))
+    _render_pro_upsell_and_record(
+        cmd, telemetry_console=telemetry_console, capture_session=True
+    )
     raise SystemExit(0)
 
 
@@ -2530,7 +2576,7 @@ def main(argv: list[str] | None = None) -> None:
         # Host-side pre-gate: skip the container entirely when the resolvable
         # tier is confirmed LITE. No-op (returns) for PRO / unresolvable —
         # the exit-42 backstop below still applies in that case.
-        _maybe_pregate_pro_command(cmd)
+        _maybe_pregate_pro_command(cmd, telemetry_console=telemetry_console)
         # Pass-through execution inside the container, but still do Docker-mode preflight.
         passthrough = list(getattr(ns, "args", []) or [])
         # argparse.REMAINDER keeps leading --, but may start with a "--" separator.
@@ -2673,7 +2719,7 @@ def main(argv: list[str] | None = None) -> None:
         # Host-side pre-gate: no-op for LITE-tier deliverables (cheatsheet,
         # mitre-navigator) since `is_pro_only` gates first; skips the
         # container for `deliver` under a confirmed LITE license.
-        _maybe_pregate_pro_command(cmd)
+        _maybe_pregate_pro_command(cmd, telemetry_console=telemetry_console)
         deliv_args: list[str] = [cmd]
         output_path = getattr(ns, "output_path", None)
         if output_path:

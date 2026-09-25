@@ -703,7 +703,7 @@ def build_kit_facts(report: dict[str, Any], workspace_dir: str) -> dict[str, Any
     # kit_facts pulls in no engine or native stack.
     try:
         from adscan_internal.services.attack_path_counts import (  # noqa: PLC0415
-            client_path_totals_from_kpis,
+            client_path_totals_for_domain,
         )
     except Exception:  # noqa: BLE001 - no engine available → leave the block absent
         return stamped
@@ -712,14 +712,47 @@ def build_kit_facts(report: dict[str, Any], workspace_dir: str) -> dict[str, Any
         if not isinstance(entry, dict):
             continue
         facts: dict[str, Any] = {}
+        # Resolve the promote_to_pwned oracle (auth == "pwned") FIRST: the
+        # attack-path fact below must still emit on a domain ADscan compromised
+        # even when the control-mega-hub fallback sampled materialization and
+        # collapsed ``path_axis`` (the ``k`` figure) to 0. The later block that
+        # used to compute this is folded here so it is read once.
+        _domain_compromised = False
         try:
-            totals = client_path_totals_from_kpis(entry.get("exposure_kpis"))
-            if totals.paths_total > 0:
+            _auth = _read_domain_auth(entry, workspace_dir, str(domain_name))
+            if _auth:
+                facts["domain_compromised"] = _auth == "pwned"
+                _domain_compromised = _auth == "pwned"
+        except Exception:  # noqa: BLE001 - one scalar failing must not drop the rest
+            pass
+        try:
+            # Route the figures through the cardinality SSOT with the persisted
+            # snapshot, so the EFFECTIVE full-domain-compromise count (k on a
+            # complete run, the reachable-set cardinality under the sampled
+            # fallback) and the snapshot-sourced proven count survive the
+            # collapse. On a complete run every value equals the pre-change ``k``
+            # figure, so a healthy domain stays byte-identical.
+            _snapshot = _load_snapshot_paths(workspace_dir, str(domain_name))
+            totals = client_path_totals_for_domain(
+                entry.get("exposure_kpis"),
+                snapshot={"paths": _snapshot} if _snapshot else None,
+            )
+            # Emit whenever the domain carries a curated path (byte-identical to
+            # the old ``paths_total > 0`` gate), OR the effective reach is
+            # non-zero (the sampled-fallback case the old gate dropped), OR the
+            # domain fell (the promote oracle wins — never render "0 paths").
+            if (
+                totals.paths_total > 0
+                or totals.effective_full_domain_compromise > 0
+                or _domain_compromised
+            ):
                 facts["attack_path_totals"] = {
                     "paths_total": totals.paths_total,
-                    "paths_executed": totals.paths_proven,
+                    "paths_executed": totals.effective_proven_full_domain_compromise,
                     "paths_open_exposure": totals.paths_open_exposure,
-                    "paths_full_domain_compromise": totals.paths_full_domain_compromise,
+                    "paths_full_domain_compromise": (
+                        totals.effective_full_domain_compromise
+                    ),
                 }
         except Exception:  # noqa: BLE001 - one scalar failing must not drop the rest
             pass
@@ -742,16 +775,6 @@ def build_kit_facts(report: dict[str, Any], workspace_dir: str) -> dict[str, Any
                     facts["chain_step_count"] = technique
                     facts["chain_hop_count"] = hops
                     facts["chain_structural_hops"] = structural
-        except Exception:  # noqa: BLE001 - one scalar failing must not drop the rest
-            pass
-        try:
-            # The domain-compromise headline fact both the SAR and the writeup
-            # gate on — the persisted promote_to_pwned SSOT. Only a definitively
-            # readable verdict is stamped; when auth is unknown the fact stays
-            # absent and each surface falls back to its own proven signal.
-            auth = _read_domain_auth(entry, workspace_dir, str(domain_name))
-            if auth:
-                facts["domain_compromised"] = auth == "pwned"
         except Exception:  # noqa: BLE001 - one scalar failing must not drop the rest
             pass
         try:

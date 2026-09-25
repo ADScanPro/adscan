@@ -68,6 +68,45 @@ def _consume_group_membership_operation_outcome(shell: Any) -> dict[str, Any]:
     return outcome
 
 
+def record_ace_step_failure_reason(shell: Any, reason: str | None) -> None:
+    """Record the concrete cause of an ACE-step failure for the caller to surface.
+
+    Dedicated one-way channel (separate from the execution-outcome dict, which
+    drives the credential handoff / cleanup registration) that the attack-path
+    executor reads after ``execute_ace_step`` returns ``False``. It threads the
+    real cause into the operator halt warning, the ``path_aborted`` telemetry
+    event, and the debug log — so a halted GenericWrite / ACE step is
+    diagnosable instead of logging no cause at all.
+    """
+    cleaned = (reason or "").strip()
+    setattr(shell, "_last_ace_failure_reason", cleaned or None)
+
+
+def consume_ace_step_failure_reason(shell: Any) -> str | None:
+    """Return and clear the last recorded ACE-step failure reason."""
+    reason = getattr(shell, "_last_ace_failure_reason", None)
+    setattr(shell, "_last_ace_failure_reason", None)
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
+def _ace_step_failed(shell: Any, reason: str) -> bool:
+    """Record ``reason`` as the ACE step's definitive failure cause; return ``False``.
+
+    Single exit helper for every ``execute_ace_step`` failure whose cause is known
+    here: it retains the cause on the shell (for the executor to surface in the
+    halt warning + ``path_aborted`` event) AND drops a debug line at the return
+    point so ``adscan.debug.log`` and the session recording carry the cause. Use
+    it in place of a bare ``return False`` wherever a concrete reason exists.
+    The reason is bracket-free and marked sensitive so it is markup-safe and
+    telemetry-safe (see the Rich square-bracket rule).
+    """
+    record_ace_step_failure_reason(shell, reason)
+    cleaned = (reason or "").strip()
+    if cleaned:
+        print_info_debug(f"ace step failed: {mark_sensitive(cleaned, 'detail')}")
+    return False
+
+
 def _normalize_account(value: str) -> str:
     name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
@@ -1819,6 +1858,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
     """
     relation = context.relation.strip().lower()
     set_last_execution_outcome(shell, None)
+    record_ace_step_failure_reason(shell, None)
     if relation not in ACL_ACE_RELATIONS:
         return None
 
@@ -1850,7 +1890,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 f"AllExtendedRights on a '{target_kind}' target has no supported "
                 "extended-right abuse (only user, computer, and domain are actionable)."
             )
-            return False
+            return _ace_step_failed(
+                shell,
+                f"AllExtendedRights on a '{target_kind}' target has no supported "
+                "extended-right abuse",
+            )
         print_info_debug(
             f"ace allextendedrights -> {effective_relation} "
             f"(target_kind={target_kind})"
@@ -1878,10 +1922,19 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         # the edge is marked failed. ``None`` signals an aborted run
         # (missing context, transport failure) - also failed.
         if not isinstance(result, dict):
-            return False
+            return _ace_step_failed(
+                shell,
+                "DCSync replication did not run (missing execution context or a "
+                "DRSUAPI transport failure — dynamic RPC 49152-65535 may be filtered)",
+            )
         if result.get("krbtgt") or int(result.get("tier0_count", 0)) >= 1:
             return True
-        return False
+        return _ace_step_failed(
+            shell,
+            "DCSync replicated but returned no Tier-0 secret (no krbtgt / RID-500 / "
+            "Domain-Admins account) — the acting principal lacks replication rights "
+            "on this domain",
+        )
 
     if relation == "readgmsapassword":
         from_domain = (
@@ -2034,7 +2087,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 "ForceChangePassword did not complete; the target password was not "
                 "changed. No cleanup obligation was recorded."
             )
-            return False
+            return _ace_step_failed(
+                shell,
+                "ForceChangePassword did not complete; the target password was not "
+                "changed",
+            )
 
         _acl_cleanup_register(
             shell,
@@ -2076,7 +2133,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     f"Target {marked_to} is disabled — Shadow Credentials needs an "
                     "enabled computer to authenticate via PKINIT."
                 )
-                return False
+                return _ace_step_failed(
+                    shell,
+                    "target computer is disabled — Shadow Credentials needs an "
+                    "enabled computer to authenticate via PKINIT",
+                )
             return shell.exploit_control_computer_object(
                 context.domain,
                 context.exec_username,
@@ -2091,7 +2152,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 print_warning(
                     f"Target {marked_to} is disabled — enable it before Shadow Credentials."
                 )
-                return False
+                return _ace_step_failed(
+                    shell,
+                    "target user is disabled — enable it before Shadow Credentials",
+                )
             # User shadow-creds: add a KeyCredentialLink to the user, PKINIT as
             # them. ForceChangePassword is NOT offered (this edge does not grant it).
             return shell.exploit_generic_all_user(
@@ -2109,7 +2173,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             f"AddKeyCredentialLink exploitation requires a user or computer target "
             f"(got '{target_kind}')."
         )
-        return False
+        return _ace_step_failed(
+            shell,
+            f"AddKeyCredentialLink requires a user or computer target (got '{target_kind}')",
+        )
 
     if relation in {"genericall", "genericwrite", "writeaccountrestrictions"}:
         if target_kind == "gpo" and relation in {"genericall", "genericwrite"}:
@@ -2144,7 +2211,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         print_warning(
                             f"Could not restore {marked_to}. Skipping exploitation."
                         )
-                        return False
+                        return _ace_step_failed(
+                            shell,
+                            "could not restore the tombstoned target from the AD "
+                            "Recycle Bin",
+                        )
                     # Reanimated. target_enabled was read from the tombstone's
                     # PRESERVED userAccountControl, so the enable-first check below
                     # still fires for a restored-but-disabled account.
@@ -2165,7 +2236,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         print_warning(
                             f"Could not enable {marked_to}. Skipping exploitation."
                         )
-                        return False
+                        return _ace_step_failed(
+                            shell,
+                            "could not enable the disabled target user before "
+                            "exploitation",
+                        )
                 else:
                     print_warning(
                         f"Skipping exploitation for disabled target {marked_to}."
@@ -2183,7 +2258,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         print_warning(
                             f"Could not enable {marked_to}. Skipping exploitation."
                         )
-                        return False
+                        return _ace_step_failed(
+                            shell,
+                            "could not enable the disabled target computer before "
+                            "exploitation",
+                        )
                 else:
                     print_warning(
                         f"Skipping exploitation for disabled target {marked_to}."
@@ -2241,7 +2320,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 print_warning(
                     "Computer-object control exploitation helper is unavailable in this shell context."
                 )
-                return False
+                return _ace_step_failed(
+                    shell,
+                    "computer-object control exploitation helper is unavailable in "
+                    "this shell context",
+                )
 
             ok = shell.exploit_generic_all_user(
                 context.domain,
@@ -2282,7 +2365,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "GenericWrite on a Domain object does not grant DACL "
                     "modification; DCSync is not reachable through this edge."
                 )
-                return False
+                return _ace_step_failed(
+                    shell,
+                    "GenericWrite on a Domain object does not grant DACL modification; "
+                    "DCSync is not reachable through this edge",
+                )
             return _execute_genericall_domain_dcsync(shell, context)
 
         if target_kind == "group":
@@ -2343,7 +2430,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         print_warning(
             f"GenericAll/GenericWrite exploitation not supported for target type {context.target_kind}."
         )
-        return False
+        return _ace_step_failed(
+            shell,
+            f"GenericAll/GenericWrite exploitation not supported for target type "
+            f"'{context.target_kind}'",
+        )
 
     if relation == "addself":
         print_info(

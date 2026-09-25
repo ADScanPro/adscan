@@ -221,7 +221,7 @@ def analyze_audit_findings(
             # decommissioned/renamed host that was never disabled. Beyond the
             # account-hygiene risk, its leftover DNS A-record can still resolve
             # to a now-reused IP and misdirect Kerberos SPN resolution (observed
-            # on Cyberzaintza: stale CZN007$ shared an IP with the live CZN012$).
+            # on RealCorp: stale HOST01$ shared an IP with the live HOST02$).
             # Staleness MUST key off lastLogonTimestamp (real authentication
             # activity), NOT pwdLastSet. pwdLastSet is a false proxy: legacy /
             # pre-Win2000-compat / manually-set machine passwords (the Timeroast

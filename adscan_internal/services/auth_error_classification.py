@@ -43,7 +43,7 @@ NATIVE_KERBEROS_INFRA_ERROR_MARKERS: tuple[str, ...] = (
     # does not yet handle — observed on Windows 11 / Server 2025 where
     # impacket/nxc parse it fine). These are Kerberos-leg failures, not a
     # credential rejection: when NTLM is available it is the correct fallback
-    # (validated on Cyberzaintza 2026-06-17). Specific enough not to match a
+    # (validated on RealCorp 2026-06-17). Specific enough not to match a
     # genuine connection error.
     "ASN1_STRUCTS.AP_REP",
     "ASN1_STRUCTS.AP_REQ",

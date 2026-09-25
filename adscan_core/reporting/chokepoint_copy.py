@@ -39,6 +39,18 @@ BOUNDED_CAVEAT: str = (
     "Route discovery was bounded, so wider coverage may surface more."
 )
 
+#: The one honesty caveat for the affected-USER reach metric, stated ONCE where the
+#: reach lead / highest-leverage panel is (never per row). The reach of a technique
+#: is an EXPOSURE-SURFACE figure (how many users have a path THROUGH it), not a
+#: protection figure: a user's exposure runs through several techniques, so closing
+#: one reduces their exposure without necessarily removing it. Client-safe: no
+#: em-dash, no percentage, human-grade English.
+OVERLAP_CAVEAT: str = (
+    "A user's exposure can run through several techniques, so closing one "
+    "reduces their exposure without necessarily removing it. Full protection "
+    "needs every technique on a user's paths closed, so work the ranked list."
+)
+
 #: How many ranked choke rows the "Start here" section surfaces. ONE cap shared by
 #: every tier — the LITE report, the PRO deliverable, and the web CTEM panel all
 #: read this so a client comparing the free report and the paid surface sees the
@@ -230,6 +242,120 @@ def is_structural_choke(
     return cardinality > 0
 
 
+def _reach_lead_sentence(
+    reach_users: int | None,
+    reach_total: int | None,
+    reach_pct: float | None,
+    *,
+    executed: bool,
+) -> str | None:
+    """Return the affected-USER reach lead sentence, or ``None`` when unavailable.
+
+    The LEAD metric of the prioritised-remediation surface (founder decision,
+    Value-Equation grounded): a fix is framed first by how many of the client's
+    people are EXPOSED via this technique, in their language and client-verifiable,
+    above the attack-path count which stays as the secondary redundancy axis.
+
+    The verb is deliberately SURFACE, never elimination. ``reach(technique)`` is
+    the count of users who have a validated path that TRAVERSES this technique, an
+    EXPOSURE-SURFACE figure, NOT a protection figure: because a user's exposure
+    runs through several techniques, closing this one reduces their exposure
+    without necessarily removing it (see :data:`OVERLAP_CAVEAT`). So the sentence
+    reads "N of M affected users have a path through this technique", never
+    "removes exposure for N users" / "protects N users".
+
+    Returns ``None`` when the workspace carries no affected-user population
+    (``reach_total`` falsy / reach args absent), so the caller degrades to the
+    legacy path-count lead rather than printing "0 of 0 (0%)". The percentage is
+    the ONE place a percentage is allowed on this surface, because it is
+    client-verifiable ("we have ~2,500 users") and it is self-consistent by
+    construction (numerator and denominator share one source). ``executed``
+    qualifies the path as "validated" (the technique sits on a path ADscan ran end
+    to end) versus a plain "path" otherwise, keeping the validated/theoretical
+    honesty. No em-dash.
+    """
+    if not reach_total or reach_users is None or reach_pct is None:
+        return None
+    users_noun = "affected user" if reach_users == 1 else "affected users"
+    have = "has" if reach_users == 1 else "have"
+    qualifier = "a validated path" if executed else "a path"
+    return (
+        f"{reach_users:,} of {reach_total:,} {users_noun} {have} {qualifier} "
+        f"through this technique ({reach_pct:g}%)."
+    )
+
+
+def reach_uniform_note(
+    reach_pct: float,
+    *,
+    reach_users: int | None = None,
+    reach_total: int | None = None,
+) -> str:
+    """Return the ONE sentence shown above the table when reach is uniform.
+
+    On a bridged domain every ordinary account funnels through the same chains, so
+    the affected-user reach of the fixes that carry a user path is the identical
+    percentage (usually 100%). Repeating that number on every row ranks nothing and
+    reads as filler. Stated ONCE here instead, this is the SECTION LEAD that carries
+    the people stakes (the buyer's dream outcome, and client-verifiable against their
+    own population), so the reader never has to infer it from a row.
+
+    When the absolute affected-user population is passed (``reach_users`` /
+    ``reach_total``), the lead NAMES it ("1,141 of 1,141 affected users (100%)") so
+    the people number is unmistakable, states the real ordering rule the rows then
+    follow (proven execution first, then attack paths broken), and appends the ONE
+    :data:`OVERLAP_CAVEAT`: in the uniform case this lead is the single place the
+    affected-user reach is stated, so the reduce-not-remove honesty rides here. The
+    verb is SURFACE ("sit on an attack path that runs through"), never a protection
+    claim.
+
+    Called WITHOUT the population (legacy callers), it returns the percentage-only
+    sentence, scoped to "the fixes that carry an ordinary-user path": some surfaced
+    fixes reach zero ordinary users (their routes originate from computer or group
+    footholds) and their rows say so plainly, so a blanket "every ordinary user
+    funnels through the same chains" would contradict them. Client-safe: no em-dash,
+    human-grade English; the single percentage is client-verifiable (their own
+    population).
+    """
+    if reach_total:
+        # Uniform reach: every fix reaches the same population, so reach_users and
+        # reach_total coincide. A caller that carries only the denominator (the LITE
+        # Start Here) still gets the named people-lead; the SAR passes both.
+        if reach_users is None:
+            reach_users = reach_total
+        users_noun = "affected user" if reach_users == 1 else "affected users"
+        return (
+            f"{reach_users:,} of {reach_total:,} {users_noun} ({reach_pct:g}%) sit on "
+            f"an attack path that runs through the techniques below, so the people at "
+            f"stake are the same for every fix here. The fixes differ in how much of "
+            f"your validated attack surface each one removes, and that is the order "
+            f"below. {OVERLAP_CAVEAT}"
+        )
+    return (
+        f"Ordinary-user exposure funnels through the same chains, so the fixes "
+        f"that carry an ordinary-user path all reach the same share ({reach_pct:g}%). "
+        f"Fixes below are ordered by proven execution first, then by how many "
+        f"attack paths each one breaks."
+    )
+
+
+def _foothold_reach_sentence(paths_broken: int, *, executed: bool) -> str:
+    """Return the honest lead for a fix no ordinary USER account runs through.
+
+    A fix can break real attack paths while reaching 0% of ordinary users: its
+    paths originate from computer or group footholds, not user accounts. Rendering
+    "0% of users" beside "eliminates N paths" reads as a bug; this states the
+    honest reason instead. Client-safe: no em-dash, no percentage.
+    """
+    routes_noun = "attack path" if paths_broken == 1 else "attack paths"
+    verb = "closes" if executed else "would close"
+    return (
+        f"No ordinary user account runs through this technique; the "
+        f"{paths_broken:,} {routes_noun} it {verb} originate from computer or "
+        f"group footholds."
+    )
+
+
 def _count_noun(count: int, singular: str, plural: str) -> str:
     """Return ``"{count:,} noun"`` with singular/plural agreement.
 
@@ -335,6 +461,10 @@ def remediation_kpi_lines(
     bounded: bool = False,
     mapped_breadth: int | None = None,
     total_mapped: int | None = None,
+    reach_users: int | None = None,
+    reach_total: int | None = None,
+    reach_pct: float | None = None,
+    reach_is_uniform: bool = False,
 ) -> dict[str, str]:
     """Return the three KPI-card lines for the top prioritised remediation.
 
@@ -376,11 +506,61 @@ def remediation_kpi_lines(
         A dict with keys ``big``, ``ratio``, ``context``. No percentage, no
         em-dash.
     """
+    # Affected-USER reach LEAD: when the workspace carries a user population, the
+    # card headlines the people EXPOSED via the top fix's technique (the buyer's
+    # metric, a surface figure, not a protection claim), the percentage lives on
+    # ``ratio``, and the attack-path count moves to the honest execution-stance
+    # ``context`` line. Falls back to the path-count card below when no user
+    # population is present, OR when reach is UNIFORM — a non-discriminating 100%
+    # must not headline the highest-leverage card (the founder decision), so the
+    # card leads with the proven aspect + attack-path count instead.
+    if (
+        reach_total
+        and reach_users is not None
+        and reach_pct is not None
+        and not reach_is_uniform
+    ):
+        users_noun = "user" if reach_users == 1 else "users"
+        big = f"{reach_users:,} of {reach_total:,} {users_noun}"
+        ratio = f"{reach_pct:g}% of affected users have a path through the top fix"
+        # "Across N of M attack path(s)": the noun agrees with the denominator M
+        # (total_validated_paths), not the numerator N.
+        if executed:
+            ctx_noun = (
+                "validated attack path"
+                if total_validated_paths == 1
+                else "validated attack paths"
+            )
+            context = (
+                f"Across {top_paths_broken:,} of {total_validated_paths:,} "
+                f"{ctx_noun} ADscan executed"
+            )
+        elif mapped:
+            ctx_noun = (
+                "mapped attack path"
+                if total_validated_paths == 1
+                else "mapped attack paths"
+            )
+            context = (
+                f"Across {top_paths_broken:,} of {total_validated_paths:,} "
+                f"{ctx_noun}, not yet executed"
+            )
+        else:
+            ctx_noun = (
+                "attack path" if total_validated_paths == 1 else "attack paths"
+            )
+            context = (
+                f"Across {top_paths_broken:,} of {total_validated_paths:,} {ctx_noun}"
+            )
+        if bounded:
+            context = f"{context} (among the routes we evaluated)"
+        return {"big": big, "ratio": ratio, "context": context}
+
     # ``big`` leads with the bare count and a short noun so it never wraps at the
     # card's large display size; the qualifier ("validated" / "mapped") and the
     # honest execution stance live on the shorter ``ratio`` / ``context`` lines.
     if executed:
-        big_noun = "path" if top_paths_broken == 1 else "paths"
+        big_noun = "path" if total_validated_paths == 1 else "paths"
         ratio = "Top fix breaks validated attack paths ADscan executed"
         context = "Executed end to end, closed by one fix"
         # State the WIDER blast radius too when the fix also breaks theoretical
@@ -392,17 +572,17 @@ def remediation_kpi_lines(
             and total_mapped is not None
             and mapped_breadth > top_paths_broken
         ):
-            breadth_noun = "attack path" if mapped_breadth == 1 else "attack paths"
+            breadth_noun = "attack path" if total_mapped == 1 else "attack paths"
             context = (
                 f"Executed end to end; breaks {mapped_breadth:,} of "
                 f"{total_mapped:,} {breadth_noun} in total"
             )
     elif mapped:
-        big_noun = "path" if top_paths_broken == 1 else "paths"
+        big_noun = "path" if total_validated_paths == 1 else "paths"
         ratio = "Top fix breaks mapped attack paths"
         context = "Mapped, not yet executed, closed by one fix"
     else:
-        big_noun = "path" if top_paths_broken == 1 else "paths"
+        big_noun = "path" if total_validated_paths == 1 else "paths"
         ratio = "Top fix breaks attack paths in scope"
         context = "Closed by one fix"
 
@@ -420,14 +600,25 @@ def remediation_item_line(
     total_validated_paths: int,
     executed: bool,
     mapped: bool = False,
+    proven_step: bool = False,
+    proven_terminal: bool = False,
     mapped_breadth: int | None = None,
     total_mapped: int | None = None,
+    reach_users: int | None = None,
+    reach_total: int | None = None,
+    reach_pct: float | None = None,
+    reach_is_uniform: bool = False,
 ) -> str:
     """Return the per-item client line for a prioritised remediation.
 
-    States how many of the client's attack paths this one fix eliminates, framed
-    as COUNTS, never a percentage. A percentage here would read as a competitor's
-    modeled-exposure register.
+    LEADS with the affected-USER reach when the workspace carries a user
+    population (``reach_total`` > 0): "N of M affected users have a path through
+    this technique (X%)", the EXPOSURE-SURFACE metric the buyer reads first (not a
+    protection claim), followed by the attack-path count as the SECONDARY
+    redundancy clause. Falls back to the path-count lead when no user population is
+    present (an older snapshot). The percentage appears ONLY in the user-reach
+    lead, where it is client-verifiable and self-consistent; the path clause below
+    stays count-only.
 
     The stance is deliberate and load-bearing (the "validated, not estimated"
     wedge): the word only claims "validated" / "executed" when the count is of
@@ -449,6 +640,21 @@ def remediation_item_line(
             The wording avoids any execution/validation claim ("mapped attack
             paths ADscan has not yet executed"). Ignored when ``executed`` is
             set; the executed stance wins.
+        proven_step: The technique's OWN step was proven (a ``success`` step on a
+            partial route) even though no route through it ran end to end. Only
+            meaningful with ``mapped`` set: it replaces "ADscan has not yet
+            executed" (which reads as "never run") with the honest partial-proof
+            stance — ADscan executed the technique, the full routes stay mapped.
+            The COUNT and denominator stay in the mapped register (the routes were
+            not walked end to end), so it never manufactures an "N of 0".
+        proven_terminal: Only meaningful with ``proven_step`` set. The technique
+            was proven as the domain-compromise TERMINAL step of one or more routes
+            (its own step ran to completion, e.g. a DCSync that ends the route),
+            NOT a mid-chain partial-only proof. The routes leading INTO it are
+            credited to the ENTRY fix that opens them (the counting model), so this
+            fix adds few incremental routes; the line then reads its proven terminal
+            role as the win it is, never "mapped, not yet walked end to end", which
+            would contradict a domain-compromise step ADscan actually executed.
         mapped_breadth: For an ``executed`` row, the fix's TOTAL blast radius
             across all statuses (the technique's all-status ``paths_affected``).
             When it exceeds ``paths_broken`` — i.e. the fix also breaks
@@ -461,36 +667,98 @@ def remediation_item_line(
             total in scope). Required alongside ``mapped_breadth``.
 
     Returns:
-        A single human-grade English sentence. No percentage, no em-dash.
+        A single human-grade English line. No em-dash. A percentage appears only
+        in the affected-user reach lead (when a user population is present);
+        the path clause is count-only.
     """
+    # Choose the LEAD clause honestly:
+    #  * reach carried but this fix reaches 0 ordinary users -> the foothold lead
+    #    ("no ordinary user account runs through this; the N paths originate from
+    #    computer/group footholds"), never a bare "0%".
+    #  * reach is UNIFORM across the top fixes -> drop the per-row reach lead
+    #    entirely (it ranks nothing; the uniform note above the table states it
+    #    once) and lead the row with the discriminating attack-path count.
+    #  * reach VARIES -> the affected-user reach lead is the discriminator.
+    if reach_total and reach_users == 0:
+        lead: str | None = _foothold_reach_sentence(paths_broken, executed=executed)
+    elif reach_is_uniform:
+        lead = None
+    else:
+        lead = _reach_lead_sentence(
+            reach_users, reach_total, reach_pct, executed=executed
+        )
+    # The noun in "N of M attack path(s)" agrees with the DENOMINATOR M (the
+    # total in scope), not with N: "1 of 2 validated attack paths", not "...
+    # attack path". Pluralize on total_validated_paths / total_mapped.
     if executed:
         noun = (
-            "validated attack path" if paths_broken == 1 else "validated attack paths"
+            "validated attack path"
+            if total_validated_paths == 1
+            else "validated attack paths"
         )
         line = (
             f"Eliminates {paths_broken:,} of {total_validated_paths:,} {noun} "
             f"ADscan executed."
         )
+        # Show the broader "N of <total_mapped> in total" figure on EVERY executed
+        # row, unless it is byte-for-byte the same claim as the validated figure
+        # (same count AND same denominator) — so a proven fix always carries BOTH
+        # its validated share and its all-status share, and two proven rows never
+        # read with inconsistent detail (one with the "/total", one without). The
+        # only suppression is a genuine duplicate: executed count == mapped breadth
+        # AND executed total == mapped total.
         if (
             mapped_breadth is not None
             and total_mapped is not None
-            and mapped_breadth > paths_broken
+            and (mapped_breadth, total_mapped) != (paths_broken, total_validated_paths)
         ):
-            breadth_noun = "attack path" if mapped_breadth == 1 else "attack paths"
+            breadth_noun = "attack path" if total_mapped == 1 else "attack paths"
             line = (
                 f"Eliminates {paths_broken:,} of {total_validated_paths:,} {noun} "
                 f"ADscan executed, and {mapped_breadth:,} of {total_mapped:,} "
                 f"{breadth_noun} in total."
             )
-        return line
+        return f"{lead} {line}" if lead else line
     if mapped:
-        noun = "mapped attack path" if paths_broken == 1 else "mapped attack paths"
-        return (
-            f"Would eliminate {paths_broken:,} of {total_validated_paths:,} {noun} "
-            f"ADscan has not yet executed."
+        noun = (
+            "mapped attack path"
+            if total_validated_paths == 1
+            else "mapped attack paths"
         )
-    noun = "attack path" if paths_broken == 1 else "attack paths"
-    return f"Eliminates {paths_broken:,} of {total_validated_paths:,} {noun}."
+        if proven_step and proven_terminal:
+            # The technique was proven as the domain-compromise TERMINAL step (e.g. a
+            # DCSync that ends the route). The routes leading into it are credited to
+            # the ENTRY fix that opens them above, so removing this technique closes
+            # only the incremental routes it does not already terminate. It must read
+            # its proven terminal role as the win it is, never "mapped, not yet
+            # walked" (which would deny a domain-compromise step ADscan executed).
+            extra_noun = "attack path" if total_validated_paths == 1 else "attack paths"
+            line = (
+                f"ADscan proved this technique as the step that reaches domain "
+                f"compromise. The routes leading into it are credited to the fix that "
+                f"opens them above, so removing it here closes a further "
+                f"{paths_broken:,} of {total_validated_paths:,} {extra_noun}."
+            )
+        elif proven_step:
+            # The technique's own step was PROVEN on a partial route, so the line
+            # must never read "not yet executed" (which means "never run"): ADscan
+            # DID run this technique. What stays mapped is the FULL route it sits
+            # on, so the count keeps the mapped register and the wording states the
+            # honest partial proof.
+            line = (
+                f"Would eliminate {paths_broken:,} of {total_validated_paths:,} "
+                f"{noun}. ADscan executed this technique; the routes it sits on are "
+                f"mapped, not yet walked end to end."
+            )
+        else:
+            line = (
+                f"Would eliminate {paths_broken:,} of {total_validated_paths:,} {noun} "
+                f"ADscan has not yet executed."
+            )
+        return f"{lead} {line}" if lead else line
+    noun = "attack path" if total_validated_paths == 1 else "attack paths"
+    line = f"Eliminates {paths_broken:,} of {total_validated_paths:,} {noun}."
+    return f"{lead} {line}" if lead else line
 
 
 def remediation_start_here_headline(
@@ -499,19 +767,25 @@ def remediation_start_here_headline(
     total_validated_paths: int,
     bounded: bool,
     mapped: bool = False,
+    reach_users: int | None = None,
+    reach_total: int | None = None,
+    reach_pct: float | None = None,
+    reach_is_uniform: bool = False,
 ) -> str:
     """Return the "Start here" lead sentence for the remediation section.
 
-    Leads the prioritised-remediation section by pointing the client at the
-    fixes that break the most attack paths ADscan executed against their domain.
-    Counts only, never a percentage, and executed-framed (never modeled). When
-    the underlying route discovery was bounded or sampled, a caveat qualifies the
-    claim to the routes ADscan evaluated.
+    LEADS with the affected-USER reach when the workspace carries a user
+    population: the top fix's technique is on a path for N of M affected users
+    (X%) (a surface figure, not a protection claim), and the attack-path count
+    follows as the secondary axis, then the one :data:`OVERLAP_CAVEAT` sentence.
+    Falls back to the path-count lead when no user population is present (an older
+    snapshot).
 
     The execution claim is honest: when nothing in scope was executed end to end
-    (every path is theoretical), ``mapped`` must be set so the lead says the
-    fixes break the most MAPPED paths, never "executed" — the same "validated,
-    not estimated" discipline as :func:`remediation_item_line`.
+    (every path is theoretical), ``mapped`` must be set so the lead speaks of
+    MAPPED paths, never "executed" — the same "validated, not estimated"
+    discipline as :func:`remediation_item_line`. When bounded, a caveat qualifies
+    the claim to the routes ADscan evaluated.
 
     Args:
         top_paths_broken: How many paths the top fixes break, in the register of
@@ -521,20 +795,46 @@ def remediation_start_here_headline(
         bounded: Whether route discovery was bounded or sampled.
         mapped: Nothing in scope was executed end to end, so the lead may not
             claim execution and speaks of MAPPED paths instead.
+        reach_users: Distinct affected users with a path through the top fix's
+            technique.
+        reach_total: The domain affected-user denominator.
+        reach_pct: ``reach_users`` as a percentage of ``reach_total``.
 
     Returns:
-        A single human-grade English sentence. No percentage, no em-dash.
+        A single human-grade English sentence. No em-dash. A percentage appears
+        only in the affected-user reach lead (when a user population is present).
     """
-    if mapped:
+    stance = "we mapped" if mapped else "we executed"
+    # When reach is UNIFORM (every top fix reaches the same share of users), the
+    # per-fix reach lead ranks nothing — the uniform note above the table states
+    # it once. The headline then leads with the REAL ordering rule: proven
+    # execution first, then attack paths broken. Fall through to the path-count
+    # lead below (skipping the reach lead) for exactly that reason.
+    if reach_is_uniform:
+        reach_total = None
+    if reach_total and reach_users is not None and reach_pct is not None:
+        users_noun = "user" if reach_users == 1 else "users"
+        # SURFACE wording, never elimination: the top fix's technique sits on a
+        # path for these users, it does not on its own protect them (see
+        # OVERLAP_CAVEAT, appended once below). The path-count clause stays honest.
+        path_phrase = "a mapped path" if mapped else "a validated path"
         lead = (
-            "Start here: these fixes break the most attack paths we mapped "
-            "against your domain"
+            f"Start here: your top fix's technique is on {path_phrase} for "
+            f"{reach_users:,} of {reach_total:,} affected {users_noun} "
+            f"({reach_pct:g}%), and these fixes break the most attack paths "
+            f"{stance} against your domain "
+            f"({top_paths_broken:,} of {total_validated_paths:,})"
         )
-    else:
-        lead = (
-            "Start here: these fixes break the most attack paths we executed "
-            "against your domain"
-        )
+        if bounded:
+            lead = f"{lead}, among the routes we evaluated"
+        # The overlap caveat is stated ONCE, here at the reach lead (the SSOT),
+        # never per row.
+        return f"{lead}. {OVERLAP_CAVEAT}"
+
+    lead = (
+        f"Start here: these fixes break the most attack paths {stance} "
+        "against your domain"
+    )
     if bounded:
         return (
             f"{lead}, among the routes we evaluated "

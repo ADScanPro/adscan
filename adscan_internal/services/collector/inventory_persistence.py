@@ -405,7 +405,9 @@ def _classify_principals_by_membership(
     from adscan_internal.services.compromise_class import (
         CompromiseClass,
         PrivilegeTier,
+        SyncAccountState,
         classify_principal_by_groups,
+        node_is_control_plane_sync_account,
         privilege_tier_for_computer,
         privilege_tier_for_principal,
         privilege_tier_for_principal_with_admin_assets,
@@ -561,6 +563,33 @@ def _classify_principals_by_membership(
         effective_tier = privilege_tier_for_principal_with_admin_assets(
             membership_tier, administered_tiers
         )
+        # Legitimate control-plane sync account (AAD Connect): its DCSync is held
+        # by design and it is a Tier-0 asset (whoever controls it owns the forest
+        # via replication). Promote a CONFIRMED account to tier0_direct so it is
+        # skipped as a source and its DCSync is reframed (spec §4). AMBIGUOUS is
+        # NOT promoted; it is marked for a client-confirmation item. Detection is
+        # by AAD provenance, never by "holds DCSync" (which would hide a backdoor).
+        # The node's samaccountname lives on a dedicated field for a CollectorNode,
+        # so feed it into the node-shaped mapping the predicate reads.
+        sync_props = dict(node.properties or {})
+        node_sam = getattr(node, "samaccountname", "") or ""
+        if node_sam and not sync_props.get("samaccountname"):
+            sync_props["samaccountname"] = node_sam
+        sync_state = node_is_control_plane_sync_account(
+            {"kind": "User", "properties": sync_props}
+        )
+        if sync_state is SyncAccountState.CONFIRMED:
+            effective_tier = PrivilegeTier.TIER0_DIRECT
+            cls = CompromiseClass.DOMAIN_BREAKER
+            tier_basis[oid] = "control_plane_sync_account"
+        elif sync_state is SyncAccountState.AMBIGUOUS:
+            # Carry a marker onto the node so the report can raise a
+            # "confirm this AAD Connect account" item (Task 5). Does not change
+            # the tier — an unconfirmed account is not silently promoted.
+            try:
+                node.properties["control_plane_sync_state"] = "ambiguous"
+            except Exception:  # noqa: BLE001 - properties may be read-only in a stub
+                pass
         # Only stamp a non-default class/tier; low-priv principals carry NONE /
         # Tier 2 implicitly so the artifact stays compact.
         if cls is not CompromiseClass.NONE:

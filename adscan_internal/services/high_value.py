@@ -44,6 +44,19 @@ def is_node_tier0(node: dict[str, Any]) -> bool:
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     if bool(props.get("isTierZero")):
         return True
+    # Stamped-label SSOT (the label-based replacement for the legacy isTierZero
+    # flag): a node stamped tier0_direct/tier0_escalation_capable at collection
+    # is Tier-0 here too, so a legit control-plane sync account is skipped as an
+    # attack-path source.
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            node_is_tier0_by_stamped_label,
+        )
+
+        if node_is_tier0_by_stamped_label(node):
+            return True
+    except Exception:  # noqa: BLE001 - a missing SSOT is not fatal to the read
+        pass
     tags = node.get("system_tags") or props.get("system_tags") or []
     if isinstance(tags, str):
         tags = [tags]

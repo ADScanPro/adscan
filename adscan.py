@@ -112,10 +112,9 @@ from adscan_internal.reporting_compat import (
 )
 from adscan_internal.session_summary import (
     count_workspace_credentials,
-    get_attack_path_metrics_for_verdict,
+    resolve_attack_path_verdict,
     resolve_client_path_totals,
     resolve_session_attack_paths_for_summary,
-    select_attack_path_verdict,
 )
 from adscan_internal.ssl_certificates import configure_ssl_certificates
 from adscan_internal.subprocess_env import (
@@ -17538,9 +17537,8 @@ class PentestShell:
         # incremented, so keying on it falsely reported EVERY authenticated scan
         # as "hardened" even when exploited paths existed.
         _scan_mode = getattr(self, "scan_mode", None)
-        _ap_verdict = select_attack_path_verdict(
-            get_attack_path_metrics_for_verdict(self, domains=[domain]),
-            scan_mode=_scan_mode,
+        _ap_verdict = resolve_attack_path_verdict(
+            self, domains=[domain], scan_mode=_scan_mode
         )
         if _ap_verdict.kind == "exploited":
             if should_show_victory_hint("scan_complete_report", "subtle"):

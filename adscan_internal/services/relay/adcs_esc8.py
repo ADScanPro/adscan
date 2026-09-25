@@ -160,14 +160,28 @@ class _AdcsWebEnrollmentClient:
         )
 
     async def close(self) -> None:
-        """Close the target HTTP connection."""
+        """Close the target connection, best-effort.
 
-        if self._writer is None:
-            return
-        self._writer.close()
-        await self._writer.wait_closed()
+        On HTTPS the TLS close-notify handshake in ``wait_closed()`` can hang
+        when the (relayed) peer never sends its own close-notify, raising
+        ``TimeoutError: SSL shutdown timed out``. ``run()`` calls this from a
+        ``finally``, so an exception here would propagate and mask the actual
+        enrollment result (the certificate is already obtained by this point).
+        Cleanup must never determine the technique outcome, so cap the shutdown
+        wait and swallow any error. ``CancelledError`` (a ``BaseException``) is
+        deliberately NOT swallowed so cancellation still propagates.
+        """
+
+        writer = self._writer
         self._writer = None
         self._reader = None
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=5)
+        except Exception:  # noqa: BLE001 — best-effort cleanup; TLS close may hang
+            pass
 
     async def authenticate(self, gssapi) -> None:
         """Complete HTTP NTLM/Negotiate authentication using the relayed GSSAPI context."""

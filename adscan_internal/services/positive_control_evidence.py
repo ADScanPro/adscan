@@ -34,9 +34,11 @@ offensive tool.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 from adscan_core import telemetry
+from adscan_core.reporting.principal_display import humanize_principal_for_prose
 from adscan_core.rich_output import print_exception, print_info_debug
 from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.services.domain_posture import (
@@ -635,10 +637,207 @@ def emit_endpoint_protection_positive(shell: Any, domain: str, nodes: Any) -> No
         print_info_debug(f"[positive-control] endpoint protection positive emit failed: {exc}")
 
 
+# ── Control-plane sync account (Azure AD Connect) hardening items ────────────
+# An Azure AD Connect ("AAD Connect" / DirSync) account named MSOL_<12 hex> holds
+# directory-replication (DCSync-equivalent) rights on the domain BY DESIGN, to
+# support Password Hash Sync. ADscan suppresses the anomalous DCSync finding for a
+# confirmed one (attack_graph_findings._is_breaker_held_legitimate_edge, keyed on
+# the stamped Tier-0 label). This must NOT leave the report silent about a Tier-0
+# asset (the third-state doctrine), so in place of the suppressed finding ADscan
+# surfaces a Tier-0 asset-HARDENING item — a positive/action item, never a
+# vulnerability. The tri-state SSOT node_is_control_plane_sync_account decides
+# CONFIRMED (both signals) vs AMBIGUOUS (name only, provenance unconfirmed).
+
+
+def _parse_aad_connect_description(description: str) -> tuple[str, str]:
+    """Best-effort extract (install_host, tenant) from an AAD Connect description.
+
+    The installer writes the description in the install locale, so the surrounding
+    prose is localized, but the ``computer <HOST>`` and ``tenant <tenant>`` tokens
+    are stable enough to anchor on when present. Returns empty strings for any
+    field that could not be read — the item then simply omits it rather than
+    guessing (the placeholder doctrine: name the real value or nothing).
+    """
+    text = description or ""
+    host_match = re.search(
+        r"running on computer\s+([A-Za-z0-9._-]+)", text, re.IGNORECASE
+    )
+    tenant_match = re.search(
+        r"synchronize to tenant\s+([A-Za-z0-9._-]+)", text, re.IGNORECASE
+    )
+    install_host = host_match.group(1).strip().rstrip(".") if host_match else ""
+    tenant = tenant_match.group(1).strip().rstrip(".") if tenant_match else ""
+    return install_host, tenant
+
+
+def _domain_to_dn(domain: str) -> str:
+    """Return the LDAP base DN for *domain* (``corp.example`` -> ``DC=corp,DC=example``)."""
+    parts = [p for p in str(domain or "").split(".") if p]
+    return ",".join(f"DC={p}" for p in parts) if parts else "DC=<your-domain>"
+
+
+def _sync_account_display(samaccountname: str) -> str:
+    """Client-prose display of an MSOL sync account: bare sAMAccountName, lower-cased.
+
+    Runs through the principal-display SSOT first (to strip any ``DOMAIN\\`` /
+    ``@realm`` qualifier the way every deliverable does), then lower-cases: an MSOL
+    account is a machine-generated identifier stored mixed-case (``MSOL_<hex>``),
+    and AD names are case-insensitive, so the human form is the lower-cased account
+    that also matches the native remediation commands.
+    """
+    display = humanize_principal_for_prose(
+        label=str(samaccountname or ""),
+        samaccountname=str(samaccountname or ""),
+        kind="user",
+    )
+    return display.lower()
+
+
+def emit_control_plane_sync_account_items(shell: Any, domain: str, graph: Any) -> None:
+    """Emit a Tier-0 asset-hardening item for each Azure AD Connect sync account.
+
+    Reframes the by-design DCSync of a control-plane sync account as an asset to
+    protect rather than a finding. Two states, both persisted as ``control_evidence``:
+
+    * CONFIRMED (AAD Connect provenance + MSOL name) -> a Tier-0 asset-hardening
+      item: protect the AAD Connect server, treat the account as Tier 0. Reads the
+      install host and tenant from the persisted ``description`` when present.
+    * AMBIGUOUS (MSOL name only, provenance unconfirmed) -> a single client-
+      confirmation item: confirm the account belongs to an authorized installation.
+
+    One entry per account (keyed by sAMAccountName), so several MSOL accounts do
+    not collapse onto one. Idempotent (``record_control_evidence`` updates by key)
+    and best-effort. Native remediation only; no offensive-tool names; English.
+    """
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, dict):
+        return
+    try:
+        # Deferred import keeps the classification SSOT out of the module import
+        # graph until an actual sync-account emit is requested.
+        from adscan_internal.services.compromise_class import (
+            SyncAccountState,
+            node_is_control_plane_sync_account,
+        )
+
+        recorder = _resolve_recorder()
+        if recorder is None:
+            return
+
+        domain_dn = _domain_to_dn(domain_name)
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                continue
+            state = node_is_control_plane_sync_account(node)
+            if state is SyncAccountState.NONE:
+                continue
+
+            props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            sam = str(props.get("samaccountname") or node.get("name") or node.get("label") or "").strip()
+            if not sam:
+                continue
+            account = _sync_account_display(sam)
+            account_lower = sam.split("\\")[-1].split("@")[0].strip().lower()
+            install_host, tenant = _parse_aad_connect_description(
+                str(props.get("description") or "")
+            )
+
+            provenance = ""
+            if install_host and tenant:
+                provenance = (
+                    f" The account runs on {install_host} and synchronizes to tenant "
+                    f"{tenant}; confirm this installation is authorized."
+                )
+            elif install_host:
+                provenance = f" The account runs on {install_host}; confirm this installation is authorized."
+
+            if state is SyncAccountState.CONFIRMED:
+                guidance = (
+                    f"{account} is an Azure AD Connect directory-synchronization account. "
+                    "Its directory-replication rights are granted at installation to support "
+                    "Password Hash Sync, so this access is expected and is not a "
+                    "misconfiguration. Anyone who controls this account, or the server it runs "
+                    "on, can replicate every credential in the domain, which makes it a Tier 0 "
+                    "identity. Protect the Azure AD Connect server to the same standard as a "
+                    "domain controller, restrict this account's sign-in to that server, and "
+                    "manage its password under your Tier 0 rotation policy." + provenance
+                )
+                remediation = (
+                    f"Confirm the account and its provenance: Get-ADUser {account_lower} "
+                    "-Properties Description,MemberOf,whenCreated. Review the directory-"
+                    f'replication grant on the domain head: dsacls "{domain_dn}". Restrict '
+                    "interactive and remote sign-in to the Azure AD Connect server with a "
+                    "Group Policy 'Deny log on' assignment, and place the account in a Tier 0 "
+                    "organizational unit governed by your privileged-access policy."
+                )
+                recorder(
+                    shell,
+                    domain_name,
+                    key=f"control_plane_sync_account_tier0::{account_lower}",
+                    title="Azure AD Connect Sync Account (Tier 0 Asset)",
+                    category="Tier 0 Asset Hardening",
+                    status="observed",
+                    details={
+                        "account": account,
+                        "install_host": install_host,
+                        "tenant": tenant,
+                        "sync_account_state": "confirmed",
+                        "source": "attack_graph",
+                        "evidence": guidance,
+                        "remediation": remediation,
+                    },
+                )
+            else:  # SyncAccountState.AMBIGUOUS
+                guidance = (
+                    f"{account} matches the naming pattern of an Azure AD Connect directory-"
+                    "synchronization account, but its Azure AD Connect provenance could not be "
+                    "confirmed from the directory because the account description is absent or "
+                    "edited. A legitimate synchronization account and an account created by an "
+                    "attacker that borrows this naming pattern are indistinguishable in the "
+                    "directory apart from that provenance, so this one needs a human decision. "
+                    "Confirm with your identity team whether the account belongs to an "
+                    "authorized Azure AD Connect installation. If it does, protect it as a "
+                    "Tier 0 identity. If no such installation exists, its directory-replication "
+                    "rights are unauthorized and should be removed." + provenance
+                )
+                remediation = (
+                    f"Verify provenance: Get-ADUser {account_lower} -Properties "
+                    "Description,whenCreated,MemberOf. Review the directory-replication grant it "
+                    f'holds on the domain head: dsacls "{domain_dn}". If the account is not part '
+                    "of an authorized Azure AD Connect deployment, remove its Get-Changes and "
+                    "Get-Changes-All grant on the domain object."
+                )
+                recorder(
+                    shell,
+                    domain_name,
+                    key=f"control_plane_sync_account_ambiguous::{account_lower}",
+                    title="Confirm Azure AD Connect Sync Account Is Authorized",
+                    category="Tier 0 Asset Hardening",
+                    status="needs_confirmation",
+                    details={
+                        "account": account,
+                        "install_host": install_host,
+                        "tenant": tenant,
+                        "sync_account_state": "ambiguous",
+                        "source": "attack_graph",
+                        "evidence": guidance,
+                        "remediation": remediation,
+                    },
+                )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[positive-control] sync-account hardening emit failed: {exc}")
+
+
 __all__ = [
     "emit_posture_positives",
     "emit_password_policy_positive",
     "emit_cve_not_vulnerable_positives",
     "emit_registry_positives",
     "emit_endpoint_protection_positive",
+    "emit_control_plane_sync_account_items",
 ]

@@ -532,7 +532,7 @@ from adscan_internal.services.gpp_credential_harvester import (  # noqa: E402,F4
 
 
 async def _gpp_harvest(
-    connection: Any, timeout: int
+    connection: Any, timeout: int, domain: str = ""
 ) -> tuple[list[GPPLeak], list[GPPAutologinLeak], TaskStatus, str | None]:
     r"""Walk every plausible GPP share looking for cpassword + autologin.
 
@@ -548,7 +548,9 @@ async def _gpp_harvest(
         harvest_gpp_on_connection,
     )
 
-    result = await harvest_gpp_on_connection(connection, timeout=timeout)
+    result = await harvest_gpp_on_connection(
+        connection, domain=domain, timeout=timeout
+    )
     return (
         result.cpassword_leaks,
         result.autologin_leaks,
@@ -1120,7 +1122,9 @@ async def run_unauth_enrichment_async(
                         autologin_leaks,
                         gpp_status,
                         gpp_err,
-                    ) = await _gpp_harvest(connection, config.timeout)
+                    ) = await _gpp_harvest(
+                        connection, config.timeout, domain=config.domain
+                    )
                     results.gpp_leaks = leaks
                     results.gpp_autologin_leaks = autologin_leaks
                     results.gpp_status = gpp_status

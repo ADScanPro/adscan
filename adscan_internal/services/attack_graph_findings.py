@@ -52,9 +52,11 @@ from adscan_core.reporting.technical_report import (
     _utc_now_iso,
     finding_catalog,
 )
+from adscan_core import telemetry
 from adscan_core.reporting.unauthenticated_reach import reached_via_from_notes
 from adscan_core.rich_output import (
     mark_sensitive,
+    print_exception,
     print_info_debug,
     print_warning,
 )
@@ -280,7 +282,40 @@ def _is_breaker_held_legitimate_edge(
     source_node = nodes_map.get(str(edge.get("from") or ""))
     if not isinstance(source_node, dict):
         return False
-    return is_direct_domain_breaker_target(source_node)
+    if is_direct_domain_breaker_target(source_node):
+        return True
+    # A legitimate control-plane sync account is stamped tier0_direct at
+    # collection; its DCSync is held by design, so it is breaker-held too.
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        PrivilegeTier,
+        node_stamped_privilege_tier,
+    )
+
+    return node_stamped_privilege_tier(source_node) is PrivilegeTier.TIER0_DIRECT
+
+
+def _emit_control_plane_sync_account_items(
+    shell: ReportShell,
+    domain: str,
+    graph: dict[str, Any],
+) -> None:
+    """Emit the Tier-0 asset-hardening item(s) for any AAD Connect sync account.
+
+    Thin, best-effort bridge into the positive-evidence SSOT
+    (:func:`adscan_internal.services.positive_control_evidence.emit_control_plane_sync_account_items`),
+    co-located with the DCSync-finding suppression so the reframe (suppress the
+    finding, surface the hardening item) stays atomic. Lazily imported to avoid an
+    import cycle and to keep the emit optional; never raises into the caller.
+    """
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_control_plane_sync_account_items,
+        )
+
+        emit_control_plane_sync_account_items(shell, domain, graph)
+    except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _edge_declares_no_client_exposure(edge: dict[str, Any]) -> bool:
@@ -1247,6 +1282,13 @@ def sync_attack_graph_findings(
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not edges:
         return False
+
+    # Reframe a legitimate control-plane (Azure AD Connect) sync account's by-design
+    # DCSync — suppressed as a finding by ``_is_breaker_held_legitimate_edge`` — into
+    # a Tier-0 asset-hardening item, so the report is never silent about a Tier-0
+    # asset (the third-state doctrine). Runs before the early-return below so it
+    # still fires when the only relevant edge is the suppressed sync-account DCSync.
+    _emit_control_plane_sync_account_items(shell, domain, graph)
 
     def _label(node_id: str) -> str:
         node = nodes_map.get(node_id)

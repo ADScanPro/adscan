@@ -67,7 +67,7 @@ def _flag_enabled() -> bool:
     clean (0 real paths lost, ESSOS$/trust-account misclassification handled by
     Protection C), −93% descending-noise reduction. Reversible: set
     ``ADSCAN_ATTACK_PATHS_TIER_DESCENT_PRUNE=0`` to disable. (Only exercised on
-    Forest so far among fixtures with real memberships; Potech's no-op was a
+    Forest so far among fixtures with real memberships; Contoso's no-op was a
     fabricated-memberships data artifact, not a prune result — a large-domain
     live/synthetic-with-real-memberships run remains a good follow-up before wide
     reliance.)

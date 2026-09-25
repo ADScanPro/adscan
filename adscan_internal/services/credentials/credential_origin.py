@@ -273,6 +273,55 @@ _ORIGIN_LABELS: dict[str, str] = {
 _ORIGIN_LABELS.update(_ESC_PRETTY)
 
 
+# ---------------------------------------------------------------------------
+# Mass full-directory extraction origins.
+# ---------------------------------------------------------------------------
+# These acquisitions yield EVERY principal's credential in one act once the
+# domain has fallen: a directory-wide DRSUAPI replication (DCSync), an NTDS.dit
+# extraction, or a full secretsdump. After full domain compromise, "every
+# account's hash via DCSync" is ONE fact, not one finding per account — so the
+# report collapses these rows into a single summary line instead of flooding the
+# deliverable with a per-account table (see
+# ``credential_provenance_databinding.partition_compromised_credentials``).
+#
+# Kept as a named constant here, in the origin SSOT, so no consumer hardcodes
+# the slugs. The DCSync-family relation tokens (``getchanges*``) are included
+# because an origin DERIVED from the executing attack step arrives as the
+# attack-graph relation key (see :func:`origin_slug_for_relation`), not as the
+# canonical ``dcsync`` slug — all name the same directory-wide replication.
+_FULL_DIRECTORY_EXTRACTION_ORIGINS: frozenset[str] = frozenset(
+    _normalize_origin(origin)
+    for origin in (
+        ORIGIN_DCSYNC,
+        ORIGIN_NTDS,
+        ORIGIN_SECRETSDUMP,
+        "getchanges",
+        "getchangesall",
+        "getchangesinfilteredset",
+    )
+)
+
+
+def is_full_directory_extraction_origin(origin: Any) -> bool:
+    """Return True when an origin is a mass full-directory credential extraction.
+
+    A directory-wide DRSUAPI replication (DCSync), an NTDS.dit extraction, or a
+    full secretsdump recovers every principal's secret in a single act once the
+    domain has fallen. The report partitions these from targeted, pre-compromise
+    techniques and collapses them into one summary line rather than one row per
+    account. Normalizes the slug first (alias-aware), so ``ADCS``-style casing,
+    the ``dcsync`` slug, and the ``getchanges`` relation token all resolve.
+
+    Args:
+        origin: Raw machine-readable origin slug (the row's ``method`` value).
+
+    Returns:
+        ``True`` iff the origin belongs to
+        :data:`_FULL_DIRECTORY_EXTRACTION_ORIGINS`.
+    """
+    return _normalize_origin(origin) in _FULL_DIRECTORY_EXTRACTION_ORIGINS
+
+
 def origin_display_label(origin: str) -> str:
     """Return the human-readable "via X" label for a raw origin slug.
 
