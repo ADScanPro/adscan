@@ -35,6 +35,17 @@ from rich.prompt import Confirm
 if TYPE_CHECKING:
     from adscan_internal.cli.repl_args import ReplArgumentParser
 
+from adscan_internal.services.endpoint_defense_attempts import (
+    outcome_for,
+    record_attempt,
+    record_endpoint_defense_for_domain,
+)
+from adscan_internal.services.exploitation.endpoint_posture import (
+    ENDPOINT_POSTURE_BADGE_LEGEND,
+    endpoint_posture_badge,
+    probe_endpoint_posture,
+    render_edr_interference_hint,
+)
 from adscan_internal import (
     print_error,
     print_exception,
@@ -65,7 +76,11 @@ from adscan_internal.workspaces.computers import (
 from adscan_internal.workspaces.subpaths import domain_relpath
 
 
-from adscan_internal.services.exploitation.native_dump_service import NativeDumpService
+from adscan_internal.services.exploitation.native_dump_service import (
+    NativeDumpService,
+    derive_dpapi_posture_notes,
+    derive_registry_posture_notes,
+)
 from adscan_internal.services.exploitation.dpapi_native_dump import (
     DpapiNativeDumpService,
     DpapiDumpResult as DpapiFullDumpResult,
@@ -97,7 +112,6 @@ from rich.text import Text as RichText
 
 from adscan_internal.services.exploitation.host_fingerprint_service import (
     HostFingerprint,
-    HostFingerprintService,
 )
 from adscan_internal.services.host_reachability_filter import (
     filter_reachable_hosts,
@@ -3264,7 +3278,7 @@ def run_dump_registries(
     display.operation_header(
         "Registry Dump (native RRP)", pdc_hostname or pdc_ip, phases=2
     )
-    display.phase_start(1, 2, f"Saving SAM / SECURITY / SYSTEM from {marked_pdc}")
+    display.phase_start(1, 2, f"Reading SAM / SECURITY / SYSTEM from {marked_pdc}")
 
     is_hash = len(password) == 32 and all(
         c in "0123456789abcdef" for c in password.lower()
@@ -3281,18 +3295,97 @@ def run_dump_registries(
         use_kerberos=False,
     )
 
+    from adscan_internal.services.exploitation.native_dump_service import (
+        derive_registry_posture_notes,
+    )
+
+    # Probe the host's endpoint posture BEFORE the dump — see the matching
+    # comment in ``_native_execute_dump_sam``. One probe, three consumers.
+    fp = run_async_sync(
+        probe_endpoint_posture(
+            smb_config,
+            dump_label="SAM/SECURITY (Backup Operators)",
+            host=pdc_hostname or pdc_ip,
+            shell=shell,
+        )
+    )
+
     with tempfile.TemporaryDirectory(prefix="adscan-regdump-") as tmp:
         result = run_async_sync(
             NativeDumpService().backup_operator_dump(smb_config, workspace_dir=tmp)
         )
 
+    # Stamp the defensive-posture context onto the BackupOperatorDump
+    # attack-step edge, mirroring DumpLSA/DumpSAM exactly (derive + stamp,
+    # best-effort). ``_update_active_attack_graph_step_status`` merges the
+    # notes into the step details ONLY when that attack-step is active —
+    # a no-op for a run outside an attack path (the REPL `dump_*` commands, or `adscan execute dump_*`).
+    try:
+        posture_notes = derive_registry_posture_notes(
+            success=result.success,
+            source_method=result.source_method,
+            inline_retry_exhausted=result.inline_retry_exhausted,
+            fp=fp,
+        )
+        updater = getattr(shell, "_update_active_attack_graph_step_status", None)
+        if callable(updater):
+            updater(
+                domain=domain,
+                status="success" if result.success else "attempted",
+                notes=posture_notes,
+            )
+    except Exception as exc:  # noqa: BLE001 — posture stamping must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[backup_operator_dump] posture-context stamp skipped: {exc}")
+    # Record this attempt for the client's endpoint-defense section. Separate
+    # from the edge stamp above, which is a no-op outside an attack path: this
+    # covers the workbench and `adscan execute` runs too, which are exactly
+    # where an operator tests one host against one product.
+    try:
+        record_attempt(
+            shell,
+            technique="BackupOperatorDump",
+            domain=domain,
+            host=pdc_hostname or pdc_ip,
+            fp=fp,
+            outcome=outcome_for(
+                success=result.success,
+                interrupted_every_retry=result.inline_retry_exhausted,
+            ),
+            source_method=result.source_method,
+        )
+        record_endpoint_defense_for_domain(shell, domain)
+    except Exception as exc:  # noqa: BLE001 — a record must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+    # Live operator heads-up: fires immediately at the moment of failure, so
+    # the operator does not mistake endpoint interference for an ADscan bug.
+    if result.inline_retry_exhausted:
+        try:
+            render_edr_interference_hint(
+                dump_label="SAM/SECURITY (Backup Operators)", fp=fp, confirmed=True
+            )
+        except Exception as exc:  # noqa: BLE001 — a terminal hint must never break the dump
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
     if not result.success:
         display.phase_error(f"Registry dump failed: {result.error or 'unknown'}")
         return
 
+    from adscan_internal.cli.backup_operators_escalation import (
+        _registry_read_outcome_line,
+    )
+
     display.phase_success(
-        f"Hives downloaded  ·  SAM: {len(result.sam_hashes)} accounts"
-        f"  | LSA: {len(result.lsa_secrets)} secrets"
+        _registry_read_outcome_line(
+            result,
+            sam_label=f"SAM: {len(result.sam_hashes)} accounts",
+            lsa_label=f"LSA: {len(result.lsa_secrets)} secrets",
+        )
     )
 
     display.phase_start(2, 2, "Streaming credentials")
@@ -3762,15 +3855,34 @@ async def _run_native_dump_batch_live(
             return []
         hosts = list(reach.reachable)
 
+    _CONSOLE.print(f"  {ENDPOINT_POSTURE_BADGE_LEGEND}\n")
+
     concurrency = _native_dump_concurrency(dump_kind)
     semaphore = asyncio.Semaphore(concurrency)
     all_results: list[tuple[str, Any]] = []
+    # Per-host endpoint posture, observed on the way into each dump. Kept in
+    # a side map rather than widened into the result tuple, which callers and
+    # the summary renderers already destructure as ``(host, result)``.
+    host_posture: dict[str, Any] = {}
 
     async def _run_one(host: str) -> tuple[str, Any]:
         async with semaphore:
             svc = NativeDumpService()
             config = _build_smb_config_from_shell(shell, host, domain)
             ws = _native_host_workspace_dir(shell, domain, host)
+            # Observe (and thereby persist) this host's AV/EDR posture before
+            # the dump. ``announce=False``: a campaign must not print a panel
+            # per host, so the posture rides the per-host status line below as
+            # a badge instead. Cheap at scale — a host already fingerprinted
+            # during collection is a cache hit, which does not re-probe and
+            # does not rewrite the inventory.
+            host_posture[host] = await probe_endpoint_posture(
+                config,
+                dump_label=dump_kind.upper(),
+                host=host,
+                shell=shell,
+                announce=False,
+            )
             if dump_kind == "sam":
                 result = await svc.dump_sam(config, workspace_dir=ws)
             elif dump_kind == "lsa":
@@ -3800,11 +3912,15 @@ async def _run_native_dump_batch_live(
             all_results.append((host, result))
             prog.advance(task_id)
 
+            badge = endpoint_posture_badge(host_posture.get(host))
+            badge_cell = f"  {badge}" if badge else ""
+
             if getattr(result, "success", False):
                 n, lines = on_result(host, result)
                 label = f"[{_ICE}]{n} finding{'s' if n != 1 else ''}[/{_ICE}]"
                 _CONSOLE.print(
-                    f"  [{_ACID}]✓[/{_ACID}] [{_MUTED}]{host}[/{_MUTED}]  {label}"
+                    f"  [{_ACID}]✓[/{_ACID}] [{_MUTED}]{host}[/{_MUTED}]"
+                    f"  {label}{badge_cell}"
                 )
                 for line in lines:
                     _CONSOLE.print(line)
@@ -3812,7 +3928,7 @@ async def _run_native_dump_batch_live(
                 err = str(getattr(result, "error", "") or "")[:70]
                 _CONSOLE.print(
                     f"  [{_LAVA}]✗[/{_LAVA}] [{_MUTED}]{host}[/{_MUTED}]"
-                    f"  [{_MUTED}]{err}[/{_MUTED}]"
+                    f"  [{_MUTED}]{err}[/{_MUTED}]{badge_cell}"
                 )
 
     return all_results
@@ -4272,7 +4388,13 @@ def _native_execute_dump_lsass_bulk(
         ) as prog:
             prog.add_task("")
             fp_sample = _run_native_async(
-                HostFingerprintService().fingerprint(config_sample)
+                probe_endpoint_posture(
+                    config_sample,
+                    dump_label="LSASS",
+                    host=dc_hosts[0],
+                    shell=shell,
+                    announce=False,
+                )
             )
         if fp_sample and fp_sample.detected_products:
             intel.record_host_products(
@@ -4645,6 +4767,51 @@ def _build_native_sam_reuse_candidates(
     return candidates
 
 
+def _report_failed_dump_attempt(
+    shell: Any,
+    *,
+    technique: str,
+    dump_label: str,
+    domain: str,
+    host: str,
+    fp: Any,
+    exc: BaseException,
+) -> None:
+    """Report a dump that raised, to the operator and to the client record.
+
+    The raising path used to return before both: the live interference panel is
+    gated on the returned result, and the attempt record came after it. So the
+    reads an endpoint product interrupted on every attempt, which are the whole
+    point of this reporting, were the ones that produced nothing at all.
+
+    An exception carrying a repeated pipe teardown is recorded as an
+    interruption; anything else stays undetermined and is attributed to no
+    product. Best-effort throughout: a failed dump must not also fail here.
+    """
+    try:
+        from adscan_internal.services.exploitation.native_dump_service import (
+            is_interrupted_read_failure,
+        )
+
+        interrupted = is_interrupted_read_failure(exc)
+        if interrupted:
+            render_edr_interference_hint(
+                dump_label=dump_label, fp=fp, confirmed=fp is not None
+            )
+        record_attempt(
+            shell,
+            technique=technique,
+            domain=domain,
+            host=host,
+            fp=fp,
+            outcome=outcome_for(success=False, interrupted_every_retry=interrupted),
+        )
+        record_endpoint_defense_for_domain(shell, domain)
+    except Exception as report_exc:  # noqa: BLE001 — never mask the real failure
+        telemetry.capture_exception(report_exc)
+        print_exception(exception=report_exc)
+
+
 def _native_execute_dump_sam(
     shell: Any,
     *,
@@ -4662,6 +4829,14 @@ def _native_execute_dump_sam(
     config = _build_smb_config_from_shell(shell, host, domain)
     svc = NativeDumpService()
 
+    # Probe the host's endpoint posture BEFORE the dump, so the operator sees
+    # what they are walking into rather than only learning of it from a
+    # PIPE_BROKEN afterwards. One probe feeds the pre-flight panel, the
+    # client-report posture stamp below, and the post-failure hint.
+    fp = _run_native_async(
+        probe_endpoint_posture(config, dump_label="SAM", host=host, shell=shell)
+    )
+
     display.operation_header("SAM Dump", host=host, phases=4)
     display.phase_start(1, 4, "Building SMB connection")
     display.phase_start(2, 4, "Saving SAM + SYSTEM hives via remote registry")
@@ -4673,8 +4848,79 @@ def _native_execute_dump_sam(
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
+        # A dump that RAISED is the case this feature was built for, and it was
+        # the one case that left no trace: the live hint is gated on the
+        # returned result, the attempt record came after it, so a read the EDR
+        # interrupted on every attempt produced neither. Observed live against
+        # a CrowdStrike-protected host: the run ended on a bare SMB error with
+        # no panel telling the operator it was very likely the product, which
+        # is the exact confusion the panel exists to prevent.
+        _report_failed_dump_attempt(
+            shell,
+            technique="DumpSAM",
+            dump_label="SAM",
+            domain=domain,
+            host=host,
+            fp=fp,
+            exc=exc,
+        )
         display.phase_error(f"SAM dump failed: {exc}")
         return
+
+    # Stamp the defensive-posture context onto the DumpSAM attack-step edge,
+    # mirroring the DumpLSASS pattern exactly (derive + stamp, best-effort).
+    # ``_update_active_attack_graph_step_status`` merges the notes into the
+    # step details ONLY when a DumpSAM attack-step is active — a no-op for
+    # a run outside an attack path (the REPL `dump_*` commands, or `adscan execute dump_*`).
+    try:
+        posture_notes = derive_registry_posture_notes(
+            success=result.success,
+            source_method=result.source_method,
+            inline_retry_exhausted=result.inline_retry_exhausted,
+            fp=fp,
+        )
+        updater = getattr(shell, "_update_active_attack_graph_step_status", None)
+        if callable(updater):
+            updater(
+                domain=domain,
+                status="success" if result.success else "attempted",
+                notes=posture_notes,
+            )
+    except Exception as exc:  # noqa: BLE001 — posture stamping must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[dump_sam] posture-context stamp skipped: {exc}")
+    # Record this attempt for the client's endpoint-defense section. Separate
+    # from the edge stamp above, which is a no-op outside an attack path: this
+    # covers the workbench and `adscan execute` runs too, which are exactly
+    # where an operator tests one host against one product.
+    try:
+        record_attempt(
+            shell,
+            technique="DumpSAM",
+            domain=domain,
+            host=host,
+            fp=fp,
+            outcome=outcome_for(
+                success=result.success,
+                interrupted_every_retry=result.inline_retry_exhausted,
+            ),
+            source_method=result.source_method,
+        )
+        record_endpoint_defense_for_domain(shell, domain)
+    except Exception as exc:  # noqa: BLE001 — a record must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+    # Live operator heads-up: fires immediately at the moment of failure, so
+    # the operator does not mistake endpoint interference for an ADscan bug.
+    if result.inline_retry_exhausted:
+        try:
+            render_edr_interference_hint(dump_label="SAM", fp=fp, confirmed=True)
+        except Exception as exc:  # noqa: BLE001 — a terminal hint must never break the dump
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     if not result.success:
         display.phase_error(result.error or "SAM dump failed")
@@ -5101,6 +5347,12 @@ def _native_execute_dump_lsa(
     # so a wall-clock delta across a dump can come back negative or huge.
     started = time.monotonic()
 
+    # Probe the host's endpoint posture BEFORE the dump — see the matching
+    # comment in ``_native_execute_dump_sam``. One probe, three consumers.
+    fp = _run_native_async(
+        probe_endpoint_posture(config, dump_label="LSA", host=host, shell=shell)
+    )
+
     display.operation_header("LSA Dump", host=host, phases=4)
     display.phase_start(1, 4, "Building SMB connection")
     display.phase_start(2, 4, "Saving SECURITY + SYSTEM hives via remote registry")
@@ -5112,8 +5364,79 @@ def _native_execute_dump_lsa(
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
+        # A dump that RAISED is the case this feature was built for, and it was
+        # the one case that left no trace: the live hint is gated on the
+        # returned result, the attempt record came after it, so a read the EDR
+        # interrupted on every attempt produced neither. Observed live against
+        # a CrowdStrike-protected host: the run ended on a bare SMB error with
+        # no panel telling the operator it was very likely the product, which
+        # is the exact confusion the panel exists to prevent.
+        _report_failed_dump_attempt(
+            shell,
+            technique="DumpLSA",
+            dump_label="LSA",
+            domain=domain,
+            host=host,
+            fp=fp,
+            exc=exc,
+        )
         display.phase_error(f"LSA dump failed: {exc}")
         return
+
+    # Stamp the defensive-posture context onto the DumpLSA attack-step edge,
+    # mirroring the DumpLSASS pattern exactly (derive + stamp, best-effort).
+    # ``_update_active_attack_graph_step_status`` merges the notes into the
+    # step details ONLY when a DumpLSA attack-step is active — a no-op for
+    # a run outside an attack path (the REPL `dump_*` commands, or `adscan execute dump_*`).
+    try:
+        posture_notes = derive_registry_posture_notes(
+            success=result.success,
+            source_method=result.source_method,
+            inline_retry_exhausted=result.inline_retry_exhausted,
+            fp=fp,
+        )
+        updater = getattr(shell, "_update_active_attack_graph_step_status", None)
+        if callable(updater):
+            updater(
+                domain=domain,
+                status="success" if result.success else "attempted",
+                notes=posture_notes,
+            )
+    except Exception as exc:  # noqa: BLE001 — posture stamping must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[dump_lsa] posture-context stamp skipped: {exc}")
+    # Record this attempt for the client's endpoint-defense section. Separate
+    # from the edge stamp above, which is a no-op outside an attack path: this
+    # covers the workbench and `adscan execute` runs too, which are exactly
+    # where an operator tests one host against one product.
+    try:
+        record_attempt(
+            shell,
+            technique="DumpLSA",
+            domain=domain,
+            host=host,
+            fp=fp,
+            outcome=outcome_for(
+                success=result.success,
+                interrupted_every_retry=result.inline_retry_exhausted,
+            ),
+            source_method=result.source_method,
+        )
+        record_endpoint_defense_for_domain(shell, domain)
+    except Exception as exc:  # noqa: BLE001 — a record must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+    # Live operator heads-up: fires immediately at the moment of failure, so
+    # the operator does not mistake endpoint interference for an ADscan bug.
+    if result.inline_retry_exhausted:
+        try:
+            render_edr_interference_hint(dump_label="LSA", fp=fp, confirmed=True)
+        except Exception as exc:  # noqa: BLE001 — a terminal hint must never break the dump
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     if not result.success:
         display.phase_error(result.error or "LSA dump failed")
@@ -5424,6 +5747,13 @@ def _native_execute_dump_dpapi(
     if pdc_ip:
         config.kdc_ip = pdc_ip
 
+    # Probe the host's endpoint posture BEFORE the dump, the same as the other
+    # credential-dump paths. DPAPI had no fingerprinting step at all, so its
+    # interference hint could only ever say "no product was checked".
+    fp = _run_native_async(
+        probe_endpoint_posture(config, dump_label="DPAPI", host=host, shell=shell)
+    )
+
     display.dpapi_phase_done(2, 4, True, "Acquiring keys...")
 
     svc = DpapiNativeDumpService()
@@ -5437,8 +5767,48 @@ def _native_execute_dump_dpapi(
                 known_da=known_da,
                 pdc_ip=pdc_ip,
                 pdc_hostname=pdc_hostname,
+                endpoint_fingerprint=fp,
             )
         )
+
+    # Record this attempt for the client's endpoint-defense section. DPAPI has
+    # no per-retry interruption signal (it builds its own RemoteRegistry with
+    # no retry infrastructure, see BACKLOG), so the outcome is honestly
+    # completed-or-undetermined and is never attributed to a product.
+    # Stamp the defensive-posture context onto the DumpDPAPI attack-step edge,
+    # mirroring the DumpLSA/DumpSAM pattern exactly (derive + stamp,
+    # best-effort). Without this the platform's edge panel carried no posture
+    # sentence for a DPAPI edge while every sibling technique had one, which a
+    # real engagement surfaced: the fingerprint and the outcome were already
+    # here for the attempt ledger, only the authored sentence was missing.
+    try:
+        dpapi_posture_notes = derive_dpapi_posture_notes(
+            success=result.success, fp=fp
+        )
+        updater = getattr(shell, "_update_active_attack_graph_step_status", None)
+        if callable(updater):
+            updater(
+                domain=domain,
+                status="success" if result.success else "attempted",
+                notes=dpapi_posture_notes,
+            )
+    except Exception as exc:  # noqa: BLE001 — posture stamping must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[dump_dpapi] posture-context stamp skipped: {exc}")
+    try:
+        record_attempt(
+            shell,
+            technique="DumpDPAPI",
+            domain=domain,
+            host=host,
+            fp=fp,
+            outcome=outcome_for(success=result.success),
+        )
+        record_endpoint_defense_for_domain(shell, domain)
+    except Exception as exc:  # noqa: BLE001 — a record must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     total_mk = len(result.decrypted_masterkeys) + len(result.locked_masterkeys)
     dec_mk = len(result.decrypted_masterkeys)
@@ -6331,7 +6701,19 @@ async def run_intelligent_lsass_dump(
             console=_CONSOLE,
         ) as prog:
             prog.add_task("")
-            fp = await HostFingerprintService().fingerprint(config)
+            # ``announce=False``: LSASS renders its own richer panel below,
+            # which also shows the ranked extraction methods. The seam is
+            # used for the observation itself, which it persists into the
+            # per-host inventory the report and web CTEM read.
+            fp = await probe_endpoint_posture(
+                config,
+                dump_label="LSASS",
+                host=host,
+                shell=shell,
+                announce=False,
+            )
+        if fp is None:
+            fp = HostFingerprint(target_ip=config.target_ip)
 
         if fp.detected_products:
             intel.record_host_products(
@@ -6383,8 +6765,9 @@ async def run_intelligent_lsass_dump(
     # the ONE join point where the dump outcome and the observed endpoint posture
     # coexist (the OrchestratorResult). ``_update_active_attack_graph_step_status``
     # merges the notes into the step details ONLY when a DumpLSASS attack-step is
-    # active — so this is a no-op for a standalone ``adscan dumps`` run (which
-    # writes no attack-graph edge) and the narrative stays attack-path-scoped by
+    # active — so this is a no-op for a run outside an attack path (the REPL
+    # `dump_*` commands, or `adscan execute dump_*`), which writes no
+    # attack-graph edge, and the narrative stays attack-path-scoped by
     # construction. Best-effort: never let posture stamping break the dump flow.
     try:
         posture_notes = derive_lsass_posture_notes(result)
@@ -6399,6 +6782,28 @@ async def run_intelligent_lsass_dump(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"[lsass] posture-context stamp skipped: {exc}")
+    # Record this attempt for the client's endpoint-defense section. Separate
+    # from the edge stamp above, which is a no-op outside an attack path: this
+    # covers the workbench and `adscan execute` runs too, which are exactly
+    # where an operator tests one host against one product.
+    try:
+        record_attempt(
+            shell,
+            technique="DumpLSASS",
+            domain=domain,
+            host=host,
+            fp=fp,
+            outcome=outcome_for(
+                success=result.success,
+                interrupted_every_retry=False,
+            ),
+            source_method=result.method_used or None,
+        )
+        record_endpoint_defense_for_domain(shell, domain)
+    except Exception as exc:  # noqa: BLE001 — a record must never break the dump
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
 
     # ── Phase 3: Results ──────────────────────────────────────────────────────
     if result.success and result.dump_result:
@@ -6432,31 +6837,15 @@ async def run_intelligent_lsass_dump(
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
 
-        # Register uploaded artifacts in the ledger and report cleanup status.
+        # Operator-facing cleanup summary only. The ledger record for each
+        # remote artefact is written at the WRITE seam (the upload helper and
+        # the download helper in native_dump_service / smb_transport), which is
+        # the only place that knows the real path and the delete outcome.
+        # Registering here as well would double-count every file in the client's
+        # disclosure, and would miss every backend whose artefacts never reach
+        # these two lists.
         dr = result.dump_result
         if dr.artifacts_cleaned or dr.artifacts_failed:
-            ledger = getattr(shell, "environment_change_ledger", None)
-            for path in (*dr.artifacts_cleaned, *dr.artifacts_failed):
-                change_id: str | None = None
-                if ledger is not None:
-                    change_id = ledger.register_change(
-                        kind="file_uploaded",
-                        domain=domain or "",
-                        target=path,
-                        detail={"host": host, "method": result.method_used},
-                        method=result.method_used,
-                    )
-                if path in dr.artifacts_cleaned:
-                    if ledger is not None and change_id:
-                        ledger.mark_reverted(change_id)
-                else:
-                    if ledger is not None and change_id:
-                        ledger.mark_failed(
-                            change_id,
-                            error=f"Delete failed; manual cleanup required on {host}",
-                            manual_cleanup_instructions=f'del "{path}" on {host}',
-                        )
-
             total = len(dr.artifacts_cleaned) + len(dr.artifacts_failed)
             if dr.artifacts_failed:
                 _CONSOLE.print(

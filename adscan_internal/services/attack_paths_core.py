@@ -13,7 +13,7 @@ import os
 import re
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 from adscan_core.reporting.attack_path_coverage import (
     AttackPathCoverage,
@@ -158,13 +158,65 @@ _PW_MAX_PATHS: int | None = None
 _PW_TARGET: str = "highvalue"
 _PW_TARGET_MODE: str = "domain"
 _PW_FILTER_SHORTEST: bool = True
+# Derived membership indexes, memoized per membership snapshot.
+#
+# The key carries only the DOMAIN and the build parameters; WHICH snapshot the
+# entry was built from is recorded in the value, and an entry is served only
+# after ``cached_snapshot is snapshot``. Keying on ``id(snapshot)`` instead is
+# unsound: the key outlives the dict it names, and CPython reuses a freed
+# address, so the next snapshot can land on it and be handed the previous
+# snapshot's index. That is reachable mid-scan — every runtime membership write
+# (AddMember, RBCD, ESC13) invalidates the snapshot cache, the next read loads a
+# fresh snapshot, and a pre-write index served for it makes the membership just
+# obtained invisible to path search: lost coverage, the forbidden direction.
+#
+# Holding the snapshot in the value also BOUNDS these caches to one entry per
+# (domain, parameters) rather than one per snapshot object ever seen: a new
+# snapshot for the same domain overwrites its entry and releases the old one.
 _GROUP_MEMBERSHIP_INDEX_CACHE: dict[
-    tuple[int, str, int], tuple[dict[str, int], dict[str, list[str]]]
+    tuple[str, int],
+    tuple[dict[str, Any], tuple[dict[str, int], dict[str, list[str]]]],
 ] = {}
 _GROUP_MEMBER_INDEX_CACHE: dict[
-    tuple[int, str, bool, bool],
-    tuple[dict[str, set[str]], dict[str, set[str]], bool],
+    tuple[str, bool, bool],
+    tuple[
+        dict[str, Any],
+        tuple[dict[str, set[str]], dict[str, set[str]], bool],
+    ],
 ] = {}
+
+_CachedT = TypeVar("_CachedT")
+
+
+def _snapshot_memo_get(
+    cache: dict[Any, tuple[dict[str, Any], _CachedT]],
+    key: Any,
+    snapshot: dict[str, Any],
+) -> _CachedT | None:
+    """Return the memoized value for ``key`` iff it came from THIS snapshot.
+
+    Identity, not ``id()``: the cached snapshot is compared with ``is`` against
+    the one in hand, so a freed snapshot's address cannot be mistaken for a live
+    snapshot's content.
+    """
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    cached_snapshot, value = entry
+    if cached_snapshot is not snapshot:
+        return None
+    return value
+
+
+def _snapshot_memo_set(
+    cache: dict[Any, tuple[dict[str, Any], _CachedT]],
+    key: Any,
+    snapshot: dict[str, Any],
+    value: _CachedT,
+) -> _CachedT:
+    """Memoize ``value`` for ``key`` together with the snapshot that produced it."""
+    cache[key] = (snapshot, value)
+    return value
 
 
 def _log_phase_timing(
@@ -1134,8 +1186,8 @@ def build_group_membership_index(
         return {}, {}
 
     if principal_labels is None:
-        cache_key = (id(snapshot), str(domain or "").strip().upper(), int(sample_limit))
-        cached = _GROUP_MEMBERSHIP_INDEX_CACHE.get(cache_key)
+        cache_key = (str(domain or "").strip().upper(), int(sample_limit))
+        cached = _snapshot_memo_get(_GROUP_MEMBERSHIP_INDEX_CACHE, cache_key, snapshot)
         if cached is not None:
             return cached
 
@@ -1186,7 +1238,7 @@ def build_group_membership_index(
 
     result = (counts, samples)
     if principal_labels is None:
-        _GROUP_MEMBERSHIP_INDEX_CACHE[cache_key] = result
+        _snapshot_memo_set(_GROUP_MEMBERSHIP_INDEX_CACHE, cache_key, snapshot, result)
     return result
 
 
@@ -1233,12 +1285,11 @@ def build_group_member_index(
         return {}, {}, False
 
     cache_key = (
-        id(snapshot),
         str(domain or "").strip().upper(),
         bool(exclude_tier0),
         bool(include_computers),
     )
-    cached = _GROUP_MEMBER_INDEX_CACHE.get(cache_key)
+    cached = _snapshot_memo_get(_GROUP_MEMBER_INDEX_CACHE, cache_key, snapshot)
     if cached is not None:
         return cached
 
@@ -1296,7 +1347,7 @@ def build_group_member_index(
             _add_to_index(computer_group_members, canonical_computer, direct_groups)
 
     result = (user_group_members, computer_group_members, has_users or has_computers)
-    _GROUP_MEMBER_INDEX_CACHE[cache_key] = result
+    _snapshot_memo_set(_GROUP_MEMBER_INDEX_CACHE, cache_key, snapshot, result)
     return result
 
 
@@ -1377,17 +1428,29 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
     # Collect the non-context actions in the SAME pass that reads the statuses so
     # each step's ``action`` is normalized once, not twice (this function is a
     # per-path hot spot at domain scale — ~30k calls on Forest/L15k domain/all).
-    non_context_actions: list[str] = []
+    # The support-registry fallbacks below exist for a step that was NOT run (its
+    # persisted status still carries the pre-flip default, e.g. CrackNTLMv1). A
+    # step whose OWN status is ``success`` was executed and PROVEN, so its
+    # relation's registry verdict must not speak for it: letting it do so made a
+    # chain of proven evidence steps plus one theoretical tail render as
+    # ``unsupported``, burying a validated finding (seen on Cicada, where the
+    # proven ``PasswordInShare`` credential chain is registry-``unsupported``).
+    # So the registry is consulted only over the UNPROVEN actions.
+    unproven_actions: list[str] = []
     for step in steps:
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
         if action in _CONTEXT_RELATIONS_LOWER:
             continue
-        non_context_actions.append(action)
         value = step.get("status")
-        if isinstance(value, str) and value:
-            statuses.append(value.strip().lower())
+        status_token = (
+            value.strip().lower() if isinstance(value, str) and value else ""
+        )
+        if status_token:
+            statuses.append(status_token)
+        if status_token != "success":
+            unproven_actions.append(action)
 
     if statuses and all(status == "success" for status in statuses):
         return "exploited"
@@ -1397,15 +1460,15 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         classify_relation_support,
     )
 
-    # Classify each DISTINCT non-context action's support kind exactly once. The
-    # three fallback passes below each scan ``non_context_actions``; on a path with
+    # Classify each DISTINCT unproven action's support kind exactly once. The
+    # three fallback passes below each scan ``unproven_actions``; on a path with
     # repeated relations the naive form re-classified the same action up to three
     # times. ``classify_relation_support`` is a pure function of its string arg, so
     # sharing the per-action ``.kind`` is byte-identical and collapses the calls to
     # O(distinct actions).
     support_kind_by_action = {
         action: classify_relation_support(action).kind
-        for action in set(non_context_actions)
+        for action in set(unproven_actions)
     }
 
     # PARTIAL — a chain with >=1 VALIDATED (success) step that did NOT execute
@@ -1423,33 +1486,49 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         "unavailable",
         "unsupported",
         "closed_by_configuration",
+        "not_vulnerable",
     }
     has_doctrine_status = any(s in _doctrine_critical for s in statuses) or any(
         support_kind_by_action[action] in {"policy_blocked", "unsupported"}
-        for action in non_context_actions
+        for action in unproven_actions
     )
     if any(status == "success" for status in statuses) and not has_doctrine_status:
         return "partial"
 
+    # BLOCKED outranks every other non-proven token, because it is the only one
+    # that describes what ADSCAN DECIDED. ``exploited`` is what was achieved,
+    # ``attempted`` what could not be completed, ``theoretical`` what was never
+    # touched: all three describe the environment or our observation of it. A
+    # blocked step is the chain's binding constraint, so a route carrying one is
+    # only as walkable as that link, and labelling it ``attempted`` or
+    # ``theoretical`` asserts "we did not test this" when ADscan tested up to the
+    # wall and chose not to cross. This is the same precedence the ``partial``
+    # guard above already applies (a safety abstention must never be masked),
+    # extended over the remaining non-proven tokens for consistency. The TOKEN
+    # does not encode WHERE in the chain the block sits; the client-facing prose
+    # does, because a terminal block ("reached the door, declined the last act")
+    # and a mid-chain block ("everything past it is unproven, we never got
+    # there") are different stories and only one of them may claim the route was
+    # walked to its end.
+    if any(status == "blocked" for status in statuses):
+        return "blocked"
+    if any(
+        support_kind_by_action[action] == "policy_blocked"
+        for action in unproven_actions
+    ):
+        return "blocked"
     if any(status in {"attempted", "failed", "error"} for status in statuses):
         return "attempted"
     if any(status == "unavailable" for status in statuses):
         return "unavailable"
-    if any(status == "blocked" for status in statuses):
-        return "blocked"
     if any(status == "unsupported" for status in statuses):
         return "unsupported"
-    if any(
-        support_kind_by_action[action] == "policy_blocked"
-        for action in non_context_actions
-    ):
-        return "blocked"
     if any(
         # Live support classification is the single source of truth — surface an
         # ``unsupported`` relation even when the persisted step status still
         # carries the pre-flip default (see CrackNTLMv1).
         support_kind_by_action[action] == "unsupported"
-        for action in non_context_actions
+        for action in unproven_actions
     ):
         return "unsupported"
     # An avenue ADscan observed to be CLOSED with certainty by the environment's
@@ -1463,6 +1542,13 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
     # rollup in ``attack_graph_core._path_from_steps``.
     if any(status == "closed_by_configuration" for status in statuses):
         return "closed_by_configuration"
+    # A finding ADscan actively proved absent (ESC15 confirm-mode observed a
+    # patched CA). The weakness does not exist, so the path is a DISMISSED
+    # finding — excluded from exposure, and never a theoretical "pending
+    # validation" edge. Placed last, after every not-run/blocked/config signal,
+    # so a genuine attempted/blocked/unsupported status keeps precedence.
+    if any(status == "not_vulnerable" for status in statuses):
+        return "not_vulnerable"
     return "theoretical"
 
 
@@ -3324,7 +3410,9 @@ def _minimize_display_record_by_repeated_labels(
         return record
 
     # Self-loop transparency: a self-loop step (from == to — the DumpLSA /
-    # DumpLSASS / DumpDPAPI in-place overlays) renders as two CONSECUTIVE
+    # DumpLSASS / ScheduledTask / XpCmdshell in-place overlays; DumpDPAPI and
+    # DumpSAM are NOT among them, they are lateral follow-ups emitting a
+    # different principal per the access-followups SSOT) renders as two CONSECUTIVE
     # identical node labels (``X → DumpLSA → X``). The only way two adjacent
     # node labels are equal is a self-loop, and a self-loop is an in-place
     # context upgrade, NOT a loop back to an already-visited node. It must not
@@ -4508,10 +4596,28 @@ def compute_display_paths_for_principals(
 # The self-protecting compute primitive (the fallback-decision SSOT).
 # --------------------------------------------------------------------------- #
 #
+# TWO things are shared here, and they are shared by DIFFERENT sets of callers.
+# Keeping them apart is what makes the convergence safe:
+#
+#   * The DECISION + the COVERAGE value object — ``proactive_fallback_predicted``
+#     and ``AttackPathCoverage`` — are shared by EVERY compute path: the REPL /
+#     summaries entry point, the service ``compute_display_paths_for_*`` wrappers,
+#     the deliver/report derivation, and the web CTEM. One predicate, one coverage
+#     vocabulary, no per-seam re-derivation.
+#   * The whole compute PIPELINE below (``compute_display_paths_with_fallback``) is
+#     consumed by the WEB CTEM only. The service wrappers in
+#     ``attack_graph_service`` run a longer pipeline around the same core computes
+#     (materialized artifacts, the prepared runtime graph, proven-execution
+#     reconciliation and ``_apply_local_postprocessing_pipeline``), so they
+#     delegate the DECISION and build the SAME ``AttackPathCoverage``, but they do
+#     NOT route through this primitive. That is deliberate: this primitive applies
+#     ``_collapse_nondomain`` precisely because the web never runs the service
+#     postprocessing, and sending the CLI through it would collapse owned / user /
+#     principals listings TWICE and change the CLI finding set.
+#
 # ``compute_display_paths_with_fallback`` unifies the two ways attack-path
 # discovery falls back from the complete DFS engine to the bounded per-terminal
-# engine, so REPL, deliver, the service computes AND the paid web CTEM converge on
-# ONE decision:
+# engine:
 #
 #   1. PROACTIVE — the reachability-aware explosion predicate
 #      (``predicts_explosion_reachable``) routes a genuinely-exploding domain
@@ -4528,6 +4634,50 @@ def compute_display_paths_for_principals(
 # CTEM, which calls the core functions (not the ``attack_graph_service`` wrappers)
 # and therefore had neither the proactive routing nor the reactive recovery. See
 # ``docs/superpowers/specs/2026-09-23-attack-path-fallback-decision-ssot.md``.
+
+
+def proactive_fallback_predicted(
+    graph: dict[str, Any],
+    *,
+    scope: str,
+    scope_kwargs: dict[str, Any] | None = None,
+    start_node_ids: set[str] | None = None,
+) -> bool:
+    """Return the shared PROACTIVE verdict: should this scope skip the DFS?
+
+    The fallback-decision SSOT every compute seam consumes — the web CTEM through
+    :func:`compute_display_paths_with_fallback`, the service wrappers through
+    ``attack_graph_service._service_scope_predicts_explosion``, and the REPL /
+    summaries entry point through its own pre-DFS routing. Before this existed
+    each seam called :func:`predicts_explosion_reachable` itself, so the "which
+    engine" rule lived in three places and could drift.
+
+    Args:
+        graph: The attack graph the predicate walks.
+        scope: ``"domain"`` / ``"user"`` / ``"principals"``.
+        scope_kwargs: The scope's compute kwargs, used to resolve the start set
+            when ``start_node_ids`` is not supplied.
+        start_node_ids: The start set to reason from, when the caller already
+            resolved it. Passed through VERBATIM — including ``None``, which the
+            predicate reads as "no reachability basis" and answers from the raw
+            structural mega-hub count. A caller that wants the derived
+            domain-scope source set leaves this unset.
+
+    Returns:
+        ``True`` when the bounded per-terminal engine should run instead of the
+        DFS. Best-effort: any failure answers ``False`` (run the DFS), so a
+        routing miss can never break discovery.
+    """
+    try:
+        if start_node_ids is None and scope_kwargs is not None:
+            start_node_ids = _resolve_start_node_ids_for_scope(
+                graph, scope, scope_kwargs
+            )
+        return bool(
+            predicts_explosion_reachable(graph, start_node_ids=start_node_ids)
+        )
+    except Exception:  # noqa: BLE001 — a routing miss must never break discovery.
+        return False
 
 
 def _resolve_start_node_ids_for_scope(
@@ -4626,10 +4776,16 @@ def compute_display_paths_with_fallback(
 ) -> tuple[list[dict[str, Any]], AttackPathCoverage]:
     """Compute display paths for a scope, self-protecting against explosion/OOM.
 
-    The SSOT that unifies proactive explosion routing with reactive RAM-gate
-    recovery, returning ``(paths, AttackPathCoverage)``. Every caller — REPL,
-    deliver, the service computes and the web CTEM — gets the same decision and the
-    same client-facing coverage declaration.
+    The compute pipeline that unifies proactive explosion routing with reactive
+    RAM-gate recovery, returning ``(paths, AttackPathCoverage)``. The WEB CTEM is
+    its caller: it drives the core computes directly and otherwise runs no
+    self-protection at all. The REPL, the service wrappers and deliver share the
+    DECISION (:func:`proactive_fallback_predicted`) and the coverage vocabulary
+    (:class:`~adscan_core.reporting.attack_path_coverage.AttackPathCoverage`) but
+    keep their own surrounding pipeline, so they must NOT be routed through here:
+    ``_collapse_nondomain`` below substitutes for the service postprocessing the
+    web never runs, and applying it on top of that postprocessing would collapse a
+    non-domain listing twice.
 
     Behaviour:
 
@@ -4700,12 +4856,12 @@ def compute_display_paths_with_fallback(
         except Exception:  # noqa: BLE001 — a collapse miss must never break discovery.
             return paths
 
-    # 1. Proactive — skip the DFS that would abort anyway.
-    try:
-        predicted = predicts_explosion_reachable(graph, start_node_ids=start_node_ids)
-    except Exception:  # noqa: BLE001 — a routing miss must never break discovery.
-        predicted = False
-    if predicted:
+    # 1. Proactive — skip the DFS that would abort anyway. Routed through the
+    #    shared decision so the web, the service wrappers and the REPL cannot
+    #    answer "which engine" differently.
+    if proactive_fallback_predicted(
+        graph, scope=scope, scope_kwargs=scope_kwargs, start_node_ids=start_node_ids
+    ):
         paths = _run_scope_compute(
             graph,
             domain=domain,

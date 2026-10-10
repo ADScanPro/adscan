@@ -26,11 +26,30 @@ def activate_workspace(shell: Any, *, workspaces_dir: str, workspace_name: str) 
     # Initialise the environment change ledger for the newly activated workspace.
     # Wrapped in a broad except so a ledger failure never blocks workspace activation.
     try:
-        from adscan_internal.services.environment_change_ledger import EnvironmentChangeLedger
+        from adscan_internal.services.environment_change_ledger import (
+            EnvironmentChangeLedger,
+            register_session_ledger,
+        )
 
         shell.environment_change_ledger = EnvironmentChangeLedger(paths.root)
+        # Publish it for this workspace. A report rendered DURING the run (the
+        # in-run `ci --generate-report` seam, every `deliver` helper) receives a
+        # workspace path and no shell, and the ledger file may not be flushed
+        # yet at that instant: without this the report states that the change
+        # record could not be read while the record is live in the session.
+        register_session_ledger(shell.environment_change_ledger, workspace_dir=paths.root)
     except Exception:  # noqa: BLE001 — best-effort, must not break activation
         shell.environment_change_ledger = None
+        try:
+            from adscan_internal.services.environment_change_ledger import (
+                register_session_ledger as _unregister,
+            )
+
+            # A workspace whose ledger could not be initialized must not inherit
+            # a stale registration from a previously activated workspace.
+            _unregister(None, workspace_dir=paths.root)
+        except Exception:  # noqa: BLE001
+            pass
 
     shell.acl_cleanup_actions: list[dict] = []
 

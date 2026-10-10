@@ -37,6 +37,49 @@ from adscan_internal.workspaces.state import apply_workspace_variables_to_shell
 from adscan_internal.cli.common import build_telemetry_context
 
 
+def _reconcile_loaded_credential_stores(shell: Any) -> None:
+    """Repair credential stores that diverge from their own metadata.
+
+    Runs once per workspace load, across every loaded domain. Repair is
+    additive and restores only material already present in the store (a typed
+    ``nt_hash`` / ``password`` slot becomes the active secret again, recovered
+    Kerberos keys are seeded into the typed key store). A secret is never
+    invented, and an orphan with nothing left to restore is reported instead of
+    being silently dropped.
+
+    Best-effort: a workspace must still load if this fails.
+    """
+    from adscan_internal.services.credential_store_service import (
+        audit_domain_credential_store,
+    )
+
+    domains_data = getattr(shell, "domains_data", None)
+    if not domains_data:
+        return
+    repaired = 0
+    unrepaired: list[str] = []
+    try:
+        for domain in list(domains_data.keys()):
+            report = audit_domain_credential_store(domains_data, domain, repair=True)
+            repaired += len(report.reconciled_users)
+            unrepaired.extend(report.unreconcilable_users)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return
+
+    if repaired:
+        print_warning(
+            f"Restored {repaired} credential(s) whose stored metadata had lost its "
+            "secret. Recovered key material is available again."
+        )
+    if unrepaired:
+        print_warning_verbose(
+            f"{len(unrepaired)} principal(s) keep credential metadata with no "
+            "recoverable secret left in the store."
+        )
+
+
 def _apply_workspace_name_inference(shell: Any) -> None:
     """Populate lab inference metadata from the workspace name if not already known.
 
@@ -994,6 +1037,13 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             # Infer lab from workspace name, backfilling inference metadata
             # even for existing workspaces that already have lab_provider set.
             _apply_workspace_name_inference(shell)
+
+            # Heal a credential store that contradicts itself before anything
+            # reads it. A metadata record with no credential advertises a
+            # recovered principal whose secret does not resolve, so ownership
+            # checks read it as NOT owned while its Kerberos keys sit unread
+            # beside it. Restores only material the store already holds.
+            _reconcile_loaded_credential_stores(shell)
 
             # Update telemetry context
             telemetry_context = build_telemetry_context(

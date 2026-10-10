@@ -28,7 +28,11 @@ from typing import Any
 
 from adscan_core import telemetry
 from adscan_core.pal import tools as pal_tools
-from adscan_core.rich_output import print_exception, print_warning_debug
+from adscan_core.rich_output import (
+    print_exception,
+    print_info_debug,
+    print_warning_debug,
+)
 from adscan_internal.services.cracking.john_benchmark import run_john_benchmark
 
 # The hardware benchmark is an OPTIONAL warm-up: every failure in it degrades
@@ -46,16 +50,26 @@ from adscan_internal.services.cracking.john_benchmark import run_john_benchmark
 # ``adscan.debug.log`` (always) and on the console only under ``--debug``,
 # where the command line is fair game.
 #
-# ``adscan benchmark`` — the one place a human DID ask — still renders its own
+# the ``benchmark`` REPL command — the one place a human DID ask — still renders its own
 # clear, tool-name-free verdict when no rates come back.
 
-# The four hashcat modes ADscan cracks: NetNTLMv2, NetNTLMv1, Kerberoast
-# (TGS-REP, RC4), AS-REP Roasting (RC4). Etype-derived AES modes
-# (19600/19700/19800/19900) are NOT separately benchmarked -- they route
-# through the same base rates via the mode-aware rule cap in
-# cracking_wordlist_policy (AES is 20-40x slower than RC4, already handled by
-# the existing _AES_ROAST_HASHCAT_MODES policy in cli/cracking.py).
-BENCHMARK_MODES: tuple[str, ...] = ("5600", "5500", "13100", "18200")
+# The hashcat modes ADscan cracks: NetNTLMv2, NetNTLMv1, Kerberoast (TGS-REP,
+# RC4), AS-REP Roasting (RC4), NT (a hash replicated out of the directory).
+# Etype-derived AES modes (19600/19700/19800/19900) are NOT separately
+# benchmarked -- they route through the same base rates via the mode-aware rule
+# cap in cracking_wordlist_policy (AES is 20-40x slower than RC4, already
+# handled by the existing _AES_ROAST_HASHCAT_MODES policy in cli/cracking.py).
+#
+# NT (1000) is here because it is the one mode whose rate the rest of the engine
+# could not infer from the others. A mode that is not measured borrows the
+# slowest measured mode's rate, which is deliberately pessimistic and harmless
+# while every unmeasured mode is genuinely slower than the reference. NT is the
+# FASTEST kernel in the product -- measured on the calibration-class GPU at
+# ~42,700 MH/s against ~567 MH/s for Kerberoast, a factor of ~75 -- so borrowing
+# the slowest rate for it is not conservatism, it plans the NT lane against a
+# speed the hardware beats by that factor. It is also the cheapest pair of the
+# set to measure, for exactly the same reason.
+BENCHMARK_MODES: tuple[str, ...] = ("5600", "5500", "13100", "18200", "1000")
 
 # v2 adds the ``complete`` flag: a record is only a full-hardware-hit when every
 # (mode, device) pair was attempted in one uninterrupted pass. A ``block=True``
@@ -63,8 +77,53 @@ BENCHMARK_MODES: tuple[str, ...] = ("5600", "5500", "13100", "18200")
 # warm-up sweep is routinely PAUSED mid-way — its measured pairs are persisted
 # as ``complete=False`` and the next scan RESUMES the remaining pairs instead of
 # re-sweeping from scratch. Bumping to 2 busts any v1 cache (re-measured once).
-_BENCHMARK_SCHEMA_VERSION = 2
+#
+# v3 adds NT (mode 1000) to ``BENCHMARK_MODES``. A v2 record is a complete sweep
+# of the four modes that existed then, so nothing short of a version bump would
+# make the engine go and measure the fifth -- ``complete=True`` is precisely the
+# claim that there is nothing left to measure. Bumping to 3 busts every v2 cache
+# so the NT rate is actually observed rather than borrowed from the slowest mode.
+_BENCHMARK_SCHEMA_VERSION = 3
 _BENCHMARK_TTL_SECONDS = 30 * 86400
+
+# The version of the MEASUREMENT METHOD behind an ``achieved`` entry -- what
+# ``_BENCHMARK_SCHEMA_VERSION`` is to the record's SHAPE, this is to how the
+# achieved number was DERIVED. Stamped on the record beside the map and checked
+# on read: a mismatched or MISSING version means every persisted achieved entry
+# was produced by a method that is no longer in use, so the reader serves none
+# of them and the effort engine falls back to the ``rates`` sweep (provisional,
+# and reported as such) until the pairs a scan actually reaches are re-probed.
+# Mirrors ``posture_probe._PROBE_SCHEMA_VERSION``, which versions probe LOGIC
+# the same way for the same reason.
+#
+# It is deliberately SEPARATE from ``_BENCHMARK_SCHEMA_VERSION`` and must stay
+# that way. Bumping this invalidates only the achieved map, which refills lazily
+# one (mode, workload) pair at a time as a scan reaches it -- a handful of ~26s
+# probes. Bumping the schema version would additionally discard the ``hashcat
+# -b`` sweep and force ten expensive (mode, device) pairs to be re-measured to
+# gain nothing, which is exactly why the achieved field was added without one.
+#
+# WHEN TO BUMP: any change to how the number is DERIVED, because a persisted
+# entry then describes a rate nobody measures any more and the engine would keep
+# planning and quoting against it for the rest of the 30-day TTL. That covers
+# the probe's observation window (``PROBE_RUNTIME_SECONDS``), its status
+# sampling (``PROBE_STATUS_TIMER_SECONDS``), which ticks the estimator takes and
+# how it reduces them (``rate_from_status_stream`` -- lowest running tick
+# today), the argv the probe runs the attack with (``build_probe_argv``: device
+# selection, ``-O``, the hash file / synthetic-target decision), and what the
+# workload key commits to (``achieved_rate_key``).
+#
+# WHEN NOT TO BUMP: anything that cannot change the number. A refactor, a
+# renamed helper, a new debug line, a docstring, a widened ``try``, a change to
+# WHEN a probe is allowed to run (the GPU-contention stand-down) rather than to
+# what it measures. A needless bump throws away measurements that are still
+# correct and buys a re-probe nobody asked for.
+#
+# v1 (2026-10-09): the first version. Entries written before this field existed
+#                  carry no version and read as stale, because the derivation
+#                  they were measured with cannot be established after the fact
+#                  -- unknown means stale, never "probably current".
+_ACHIEVED_METHOD_VERSION = 1
 _DEVICE_FLAGS: dict[str, str] = {"gpu": "2", "cpu": "1"}
 _DEVICE_NAME_LINE_RE = re.compile(r"Name\s*\.+?:\s*(.+)")
 # ``hashcat -I`` prints a ``Type...........: GPU`` line per backend device
@@ -95,6 +154,33 @@ class BenchmarkRecord:
     # (:func:`detect_gpu_present`) then falls back to the measured GPU rates, so
     # no schema bump / forced re-sweep is needed.
     has_gpu: bool | None = None
+    # Rates a real crack ACHIEVES, keyed ``{mode: {workload_key: {device: H/s}}}``
+    # where the workload key names the base wordlist and rule file measured (see
+    # ``achieved_rate_probe.achieved_rate_key``). These are what the effort
+    # engine plans and quotes against; ``rates`` above is the ``hashcat -b``
+    # number, kept as the honest-but-provisional fallback for a host where no
+    # probe can run and as the only signal the John CPU backend produces.
+    #
+    # Deliberately NOT a schema bump. The ``rates`` shape is unchanged and a
+    # record written before this field existed stays valid, so an existing
+    # install keeps its measured ``hashcat -b`` sweep and fills the achieved
+    # map in lazily, one (mode, workload) pair at a time, as the scan actually
+    # reaches those pairs. Bumping the version would have forced every install
+    # to re-sweep ten (mode, device) benchmark pairs to gain nothing.
+    #
+    # The METHOD those numbers were measured with is versioned separately by
+    # ``achieved_method_version`` below, so a change to the derivation can
+    # invalidate them without touching ``rates``.
+    achieved: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    # ``_ACHIEVED_METHOD_VERSION`` as of the measurement that wrote this map.
+    # ``None`` on a record written before this field existed, which reads as
+    # STALE (see :func:`current_achieved_rates`) rather than being trusted: the
+    # method behind those entries cannot be established after the fact. Per
+    # RECORD rather than per entry, because the version is one global constant
+    # describing one derivation -- so a bump makes every pre-bump entry stale at
+    # the same instant and a per-entry stamp would retain none of them, for the
+    # price of a deeper persisted shape.
+    achieved_method_version: int | None = None
 
 
 # --- fingerprint ---------------------------------------------------------
@@ -180,6 +266,79 @@ def _benchmark_cache_path() -> Path:
     return get_adscan_home() / "state" / "benchmark.json"
 
 
+def _coerce_achieved(raw: Any) -> dict[str, dict[str, dict[str, float]]]:
+    """Coerce a persisted achieved-rate map, dropping anything unparseable.
+
+    A legacy record has no ``achieved`` key at all, which reads as an empty map
+    and means every pair is still to be probed.
+    """
+    out: dict[str, dict[str, dict[str, float]]] = {}
+    for mode, workloads in (raw or {}).items():
+        if not isinstance(workloads, dict):
+            continue
+        per_mode: dict[str, dict[str, float]] = {}
+        for workload, devices in workloads.items():
+            if not isinstance(devices, dict):
+                continue
+            per_device: dict[str, float] = {}
+            for device, rate in devices.items():
+                try:
+                    value = float(rate)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    per_device[str(device)] = value
+            if per_device:
+                per_mode[str(workload)] = per_device
+        if per_mode:
+            out[str(mode)] = per_mode
+    return out
+
+
+def _coerce_method_version(raw: Any) -> int | None:
+    """The persisted achieved-method version, or ``None`` when absent/unusable.
+
+    An unparseable value is indistinguishable from an absent one for this
+    purpose: neither establishes which derivation produced the entries, so both
+    read as stale.
+    """
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def current_achieved_rates(
+    record: BenchmarkRecord | None,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """The achieved rates of `record` that TODAY's method measured.
+
+    The single gate every achieved-rate reader goes through. Returns an empty
+    map when there is no record, when it holds no achieved entries, or when its
+    ``achieved_method_version`` does not match ``_ACHIEVED_METHOD_VERSION``
+    (including the ``None`` of a record written before the field existed). An
+    empty map is the honest answer and reaches the documented fallback: the
+    effort policy then prices the workload off the ``hashcat -b`` ``rates``
+    number and flags the estimate provisional.
+    """
+    if record is None or not record.achieved:
+        return {}
+    if record.achieved_method_version != _ACHIEVED_METHOD_VERSION:
+        print_info_debug(
+            "achieved-rate: persisted entries were measured by method version "
+            f"{record.achieved_method_version} (current "
+            f"{_ACHIEVED_METHOD_VERSION}) -- not served, the estimate stays "
+            "provisional until the pairs are re-probed"
+        )
+        return {}
+    return {
+        mode: {workload: dict(devices) for workload, devices in workloads.items()}
+        for mode, workloads in record.achieved.items()
+    }
+
+
 def _load_cache() -> BenchmarkRecord | None:
     path = _benchmark_cache_path()
     try:
@@ -202,6 +361,12 @@ def _load_cache() -> BenchmarkRecord | None:
             # the measured GPU rates.
             has_gpu=(
                 None if data.get("has_gpu") is None else bool(data.get("has_gpu"))
+            ),
+            achieved=_coerce_achieved(data.get("achieved")),
+            # None (missing) reads as a stale measurement method -- the achieved
+            # map is then not served and the engine falls back to ``rates``.
+            achieved_method_version=_coerce_method_version(
+                data.get("achieved_method_version")
             ),
         )
     except Exception as exc:  # noqa: BLE001 -- a corrupt cache is cold, never crashes
@@ -226,6 +391,8 @@ def _save_cache(record: BenchmarkRecord) -> None:
             "rates": record.rates,
             "complete": record.complete,
             "has_gpu": record.has_gpu,
+            "achieved": record.achieved,
+            "achieved_method_version": record.achieved_method_version,
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         # Visible under --debug with the RESOLVED absolute path so a future
@@ -484,6 +651,14 @@ def _run_john_warmup(shell: Any, *, force: bool) -> dict[str, dict[str, float]] 
         rates=rates,
         complete=True,
         has_gpu=False,
+        # Carried forward, never discarded: a re-measured John self-test says
+        # nothing about the achieved rates already probed on the same seed. The
+        # method version travels with the map, so a carried-forward entry keeps
+        # being judged against the derivation that measured it.
+        achieved=dict(cached.achieved) if cache_is_john and cached else {},
+        achieved_method_version=(
+            cached.achieved_method_version if cache_is_john and cached else None
+        ),
     )
     _save_cache(record)
     return record.rates
@@ -518,7 +693,9 @@ def get_or_run_benchmark(
     * **Cold/partial cache => the sweep YIELDS to any real crack and RESUMES.**
       The best-effort warm-up takes the slot non-blocking, checks
       ``real_crack_pending()`` between pairs, and PAUSES the moment a real crack
-      wants the GPU (so the crack runs within one in-flight mode). Whatever it
+      wants the GPU (so the crack runs within one in-flight mode). The slot and
+      the demand signal both span PROCESSES, so a crack in ANOTHER ADscan
+      session pauses this sweep exactly as one in this session does. Whatever it
       measured is PERSISTED (``complete=False``); the next scan resumes the
       remaining pairs instead of re-sweeping. Without this, a scan where a crack
       always contends would discard its work every time and re-sweep forever.
@@ -632,6 +809,20 @@ def get_or_run_benchmark(
                 rates=rates,
                 complete=completed_full_pass,
                 has_gpu=probe_reports_gpu(probe_text or ""),
+                # Carried forward on the SAME hardware, discarded on a
+                # fingerprint change: an achieved rate is a property of this
+                # machine, so a different machine's numbers must not survive.
+                achieved=(
+                    dict(cached.achieved) if (resume and cached is not None) else {}
+                ),
+                # Travels with the map it describes: a carried-forward entry is
+                # still judged against the method that measured it, and a
+                # discarded map leaves no version claiming to describe it.
+                achieved_method_version=(
+                    cached.achieved_method_version
+                    if (resume and cached is not None)
+                    else None
+                ),
             )
             _save_cache(record)
             return record.rates
@@ -678,6 +869,215 @@ def load_cached_benchmark() -> dict[str, dict[str, float]] | None:
     if record is None or not record.rates:
         return None
     return record.rates
+
+
+def load_cached_achieved_rates() -> dict[str, dict[str, dict[str, float]]] | None:
+    """Return the persisted ACHIEVED rates without running hashcat.
+
+    The instant read the interactive effort selector and the estimates artifact
+    use, in the same shape and with the same freshness stance as
+    :func:`load_cached_benchmark`: a slightly stale number on unchanged hardware
+    is a fine basis for an estimate, and a hardware change is caught by the
+    fingerprint check the next time a probe runs. ``None`` when nothing has been
+    probed yet, which makes every estimate provisional until a pair is measured.
+
+    The measurement METHOD is not treated so loosely: entries measured by an
+    older (or unknown) derivation are not served at all, because a rate nobody
+    measures any more is not a ballpark, it is a wrong number
+    (:func:`current_achieved_rates`).
+    """
+    current = current_achieved_rates(_load_cache())
+    return current or None
+
+
+def _device_args_for_probe() -> list[str]:
+    """``["-D", "2"]`` when a GPU is known present, else no device restriction.
+
+    Mirrors the crack's own device selection
+    (``cracking_job._gpu_only_device_args``) so the probe measures on the
+    devices the crack will run on. Imported lazily to keep this module free of a
+    background_jobs import at load.
+    """
+    try:
+        from adscan_internal.services.background_jobs.cracking_job import (  # noqa: PLC0415
+            _gpu_only_device_args,
+        )
+
+        return list(_gpu_only_device_args())
+    except Exception as exc:  # noqa: BLE001 -- device selection is best-effort
+        telemetry.capture_exception(exc)
+        print_warning_debug(f"achieved-rate: device selection failed: {exc}")
+        return []
+
+
+def _persist_achieved_rate(
+    *, mode: str, workload_key: str, device_class: str, rate: float
+) -> None:
+    """Merge one measured achieved rate into the persisted record.
+
+    Writes into whatever record exists rather than demanding a fresh benchmark:
+    the achieved map is independent of the ``hashcat -b`` sweep's completeness,
+    and a host that never finished a sweep still deserves to keep the pairs it
+    did measure. Does nothing when no record exists at all, because there is no
+    fingerprint to attribute the measurement to and a record invented here
+    could be mistaken for a measured hardware identity.
+    """
+    record = _load_cache()
+    if record is None:
+        print_warning_debug(
+            "achieved-rate: no benchmark record to attach the measurement to"
+        )
+        return
+    # Merge onto the entries TODAY's method measured. When the record carries an
+    # older/unknown method version its entries are already not being served, so
+    # this drops them rather than letting a stale number sit beside a current
+    # one under a single current-version stamp.
+    achieved = current_achieved_rates(record)
+    achieved.setdefault(str(mode), {}).setdefault(workload_key, {})[
+        str(device_class)
+    ] = float(rate)
+    _save_cache(
+        BenchmarkRecord(
+            schema_version=record.schema_version,
+            fingerprint=record.fingerprint,
+            device_names=record.device_names,
+            measured_at=record.measured_at,
+            rates=record.rates,
+            complete=record.complete,
+            has_gpu=record.has_gpu,
+            achieved=achieved,
+            achieved_method_version=_ACHIEVED_METHOD_VERSION,
+        )
+    )
+
+
+def get_or_probe_achieved_rate(
+    shell: Any,
+    *,
+    mode: str,
+    wordlist: str,
+    rule_path: str | None,
+    device_class: str,
+    hash_count: int | None = None,
+    hash_file: str | None = None,
+) -> float | None:
+    """The rate a real crack achieves for one workload on this machine.
+
+    A workload is (base wordlist, rule file, number of distinct hashes). Reads
+    the persisted measurement when there is one, otherwise runs ONE short real
+    attack (:func:`achieved_rate_probe.run_achieved_rate_probe`) and persists
+    what it measured. Lazy by design: a scan pays for the workloads it actually
+    reaches, which is a handful rather than the five modes times four rungs a
+    sweep would cost.
+
+    ``hash_file`` is the file the crack will run. Supplying it is what makes the
+    measurement right for a salted mode, where the number of distinct hashes
+    changes the rate as much as the rule count does.
+
+    Returns ``None`` when no probe can run (no hashcat, no device, the slot is
+    held by a real crack, a probe that failed). ``None`` is the honest answer
+    and the policy degrades to a provisional estimate rather than quoting the
+    ``hashcat -b`` number as though it had been measured.
+    """
+    from adscan_internal.services.cracking.achieved_rate_probe import (  # noqa: PLC0415
+        achieved_rate_key,
+        run_achieved_rate_probe,
+    )
+
+    workload_key = achieved_rate_key(wordlist, rule_path, hash_count)
+    cached = current_achieved_rates(_load_cache())
+    existing = ((cached.get(str(mode)) or {}).get(workload_key) or {}).get(
+        str(device_class)
+    )
+    if existing:
+        return float(existing)
+
+    if not pal_tools.capability_available("cracking_gpu").available:
+        # No hashcat on this host. The John CPU backend has no equivalent
+        # achieved-rate probe, so its estimate stays on the ``john --test``
+        # rates and is reported provisional.
+        return None
+
+    from adscan_internal.services.hashcat_coordination import (  # noqa: PLC0415
+        real_crack_pending,
+    )
+
+    # Demand is published across processes as well, so this also stands down
+    # for a crack in another ADscan session rather than measuring a GPU that
+    # session is using. The estimate then stays on its provisional calibration
+    # and is reported as provisional, which is the honest answer.
+    if real_crack_pending():
+        print_info_debug(
+            f"achieved-rate: a real crack wants the GPU, no probe for mode {mode} "
+            f"(the estimate stays provisional)"
+        )
+        return None
+
+    command_executor = getattr(shell, "run_command", None)
+    if command_executor is None:
+        return None
+
+    rate = run_achieved_rate_probe(
+        command_executor,
+        mode=str(mode),
+        wordlist=wordlist,
+        rule_path=rule_path,
+        hash_file=hash_file,
+        device_args=_device_args_for_probe(),
+    )
+    if not rate:
+        return None
+    _persist_achieved_rate(
+        mode=str(mode),
+        workload_key=workload_key,
+        device_class=str(device_class),
+        rate=float(rate),
+    )
+    return float(rate)
+
+
+def make_achieved_rate_provider(shell: Any, *, hash_file: str | None = None) -> Any:
+    """A rate provider the effort policy can call without importing this module.
+
+    The policy is pure logic and must stay runnable with no shell (the web
+    renders estimates off a persisted cache), so the lazy-probing capability is
+    INJECTED as a callable rather than imported. Mirrors the cross-layer
+    provider-injection pattern used for the finding catalog.
+
+    ``hash_file`` is the file the lane is about to crack. Pass it whenever the
+    caller has it: the probe then runs the operator's real hashes, which is the
+    only way the measurement carries the right salt count for a salted mode, and
+    a password recovered inside the probe window reaches the crack that follows
+    instead of being discarded.
+
+    The returned callable takes ``(mode, wordlist, rule_path, device_class,
+    hash_count)`` as keywords and answers an achieved H/s or ``None``.
+    """
+
+    def _provider(
+        *,
+        mode: str,
+        wordlist: str,
+        rule_path: str | None,
+        device_class: str,
+        hash_count: int | None = None,
+    ) -> float | None:
+        try:
+            return get_or_probe_achieved_rate(
+                shell,
+                mode=mode,
+                wordlist=wordlist,
+                rule_path=rule_path,
+                device_class=device_class,
+                hash_count=hash_count,
+                hash_file=hash_file,
+            )
+        except Exception as exc:  # noqa: BLE001 -- planning must never break
+            telemetry.capture_exception(exc)
+            print_warning_debug(f"achieved-rate: provider failed: {exc}")
+            return None
+
+    return _provider
 
 
 def detect_gpu_present() -> bool | None:
@@ -743,7 +1143,14 @@ def write_benchmark_estimates(
         )
         wordlists_dir = str(get_adscan_home() / "wordlists")
         payload = build_estimates_payload(
-            benchmark, wordlists_dir=wordlists_dir, hardware_label=hardware_label
+            benchmark,
+            wordlists_dir=wordlists_dir,
+            hardware_label=hardware_label,
+            # Whatever achieved rates have already been probed sharpen the
+            # artifact; the warm-up never probes new pairs itself, because a
+            # pair is only worth a short real attack once some lane is about to
+            # run it.
+            achieved=(current_achieved_rates(record) or None),
         )
         payload["generated_at"] = _utcnow_iso()
 
@@ -813,10 +1220,14 @@ __all__ = [
     "probe_reports_gpu",
     "compute_fingerprint",
     "compute_john_fingerprint",
+    "current_achieved_rates",
     "detect_gpu_present",
     "is_fresh",
+    "get_or_probe_achieved_rate",
     "get_or_run_benchmark",
+    "load_cached_achieved_rates",
     "load_cached_benchmark",
+    "make_achieved_rate_provider",
     "write_benchmark_estimates",
     "warm_benchmark_async",
 ]

@@ -185,6 +185,28 @@ def _mark_backup_ops_success(
             print_error("Failed to persist Backup Operators success state.")
 
 
+def _registry_read_outcome_line(result, *, sam_label: str, lsa_label: str) -> str:
+    """Describe what the read actually did, by the route it actually took.
+
+    The line said "Hives downloaded" whichever route ran, which stopped being
+    true once the inline read became the primary path: on a successful inline
+    read nothing is saved, nothing is downloaded and nothing is deleted. An
+    operator deciding whether an engagement left a trace reads this line, and
+    on a monitored host the difference between "a hive was written to the DC
+    and removed" and "no file was created" is the whole question.
+    """
+    counts = f"{sam_label}  |  {lsa_label}"
+    method = str(getattr(result, "source_method", "") or "").strip().lower()
+    if method == "savekey":
+        return f"Hives exported and downloaded  ·  {counts}"
+    if method == "inline":
+        return f"Secrets read in place, no hive written  ·  {counts}"
+    # Neither route is recorded, so neither is claimed. "No hive written" is a
+    # statement about the engagement's footprint and an operator may act on
+    # it, so it is asserted only when the result says which backend ran.
+    return f"Secrets recovered  ·  {counts}"
+
+
 def _update_backup_ops_da_edge(
     shell: Any,
     *,
@@ -501,20 +523,30 @@ def offer_backup_operators_escalation(
             print_system_change_warning(
                 title="[bold yellow]Backup Operators Warning[/bold yellow]",
                 summary=(
-                    f"Saves SAM/SECURITY/SYSTEM hives from {marked_pdc} ({marked_domain}) "
-                    "via Remote Registry with SeBackupPrivilege flags."
+                    f"Reads SAM/SECURITY/SYSTEM secrets from {marked_pdc} "
+                    f"({marked_domain}) over Remote Registry using "
+                    "SeBackupPrivilege."
                 ),
                 planned_changes=[
-                    "Temporarily writes SAM, SECURITY, SYSTEM to C:\\Windows\\Temp on the DC.",
-                    "Downloads hives via ADMIN$ and deletes them immediately after.",
+                    "Reads the values over the already-open \\pipe\\winreg handle: "
+                    "no hive is written to disk and no key DACL is modified.",
+                    "Only if that read is denied, falls back to exporting the "
+                    "hives to C:\\Windows\\Temp, downloading them over ADMIN$ "
+                    "and deleting them immediately after.",
                     "Parses DC machine account hash ($MACHINE.ACC) from LSA secrets.",
                 ],
                 impact_notes=[
-                    "Hives are written to Windows\\Temp, not SYSVOL — reduced visibility vs legacy module.",
+                    "The primary read leaves no file behind, so there is nothing "
+                    "on disk for an endpoint product to find.",
+                    "The fallback does write the three hives to Windows\\Temp, "
+                    "which is the louder route and the one worth weighing on a "
+                    "monitored host.",
                     "RemoteRegistry service is started if not running.",
                 ],
                 cleanup_notes=[
-                    "Hives are deleted automatically via SMB after download.",
+                    "Nothing to clean up after the primary read: it creates no file.",
+                    "A hive written by the fallback is deleted automatically over "
+                    "SMB after download.",
                     "RemoteRegistry is left running — stop it manually if needed.",
                 ],
                 authorization_note=(
@@ -572,7 +604,7 @@ def offer_backup_operators_escalation(
         )
 
         # ── Phase 1: save & download hives ───────────────────────────────
-        display.phase_start(1, 3, f"Saving SAM / SECURITY / SYSTEM from {marked_pdc}")
+        display.phase_start(1, 3, f"Reading SAM / SECURITY / SYSTEM from {marked_pdc}")
         with tempfile.TemporaryDirectory(prefix="adscan-backupops-") as tmp:
             result = run_async_sync(
                 NativeDumpService().backup_operator_dump(
@@ -590,8 +622,11 @@ def offer_backup_operators_escalation(
             return False
 
         display.phase_success(
-            f"Hives downloaded — SAM: {len(result.sam_hashes)} accounts  "
-            f"| LSA: {len(result.lsa_secrets)} secrets"
+            _registry_read_outcome_line(
+                result,
+                sam_label=f"SAM: {len(result.sam_hashes)} accounts",
+                lsa_label=f"LSA: {len(result.lsa_secrets)} secrets",
+            )
         )
 
         # ── Phase 2: stream parsed credentials ───────────────────────────

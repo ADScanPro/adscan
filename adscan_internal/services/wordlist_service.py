@@ -538,8 +538,20 @@ def record_cracking_coverage_for_domain(
     wordlists_dir: Optional[str] = None,
     engine: Optional[str] = None,
     ruleset: Optional[str] = None,
+    **classes: Any,
 ) -> None:
     """Stamp the cracking-coverage statement for *domain* into the report.
+
+    THE one writer of that block, and the reason it has to be: password
+    recovery declares its coverage from several seams that each know a
+    different part of the answer. The pre-run seam knows which corpora the
+    image carries; the breach-corpus lookup knows how many hashes it checked;
+    the local wordlist attack knows how many it attacked and, when it finishes,
+    what it recovered. The underlying recorder overwrites the whole block, so a
+    seam that rebuilt it from only its own part would silently drop every other
+    seam's declaration and the report-wide note would revert to claiming full
+    strength. This reads the block already recorded and MERGES, so each seam
+    contributes its part and none erases another's.
 
     Called from the seams where a crack is about to run, so the declaration
     only appears for an assessment that actually attempted password recovery —
@@ -555,8 +567,12 @@ def record_cracking_coverage_for_domain(
     seam that only knows the wordlist state), the block carries only the corpus
     data-gap declaration, exactly as before.
 
-    Idempotent: both crack seams may call it many times per domain and the
-    recorder overwrites the same block with the same observation. Best-effort
+    ``classes`` carries any further
+    :func:`~adscan_core.reporting.cracking_coverage.build_cracking_coverage`
+    keyword (the breach-lookup and local-attack counters). A key NOT passed
+    keeps whatever the block already recorded.
+
+    Idempotent: every crack seam may call it many times per domain. Best-effort
     throughout — a report is never failed over its own coverage note.
     """
 
@@ -567,21 +583,51 @@ def record_cracking_coverage_for_domain(
             build_cracking_coverage,
         )
         from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            read_cracking_coverage,
             record_cracking_coverage,
         )
 
         service = WordlistService(wordlists_dir=wordlists_dir)
         missing = service.missing_optional_wordlists()
+        existing = read_cracking_coverage(shell, domain) or {}
+        merged: dict[str, Any] = {
+            key: existing.get(key)
+            for key in _CARRIED_COVERAGE_KEYS
+            if existing.get(key) is not None
+        }
+        merged.update(
+            {key: value for key, value in classes.items() if value is not None}
+        )
+        if engine is None and existing.get("engine") is not None:
+            engine = existing.get("engine")
+            if ruleset is None:
+                ruleset = existing.get("ruleset")
         record_cracking_coverage(
             shell,
             domain,
             coverage=build_cracking_coverage(
-                missing_wordlists=missing, engine=engine, ruleset=ruleset
+                missing_wordlists=missing,
+                engine=engine,
+                ruleset=ruleset,
+                **merged,
             ),
         )
     except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
+
+
+#: The per-class counters a later seam's write must carry THROUGH rather than
+#: drop. Each is owned by a different seam, and the block is rebuilt whole on
+#: every write, so a key missing from this tuple is a declaration that silently
+#: disappears the next time any other seam records.
+_CARRIED_COVERAGE_KEYS: tuple[str, ...] = (
+    "breach_lookup_only_hashes",
+    "breach_lookup_recovered",
+    "local_attack_hashes",
+    "local_attack_recovered",
+    "local_attack_status",
+)
 
 
 __all__ = [

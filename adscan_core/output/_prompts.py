@@ -38,6 +38,27 @@ _ORIGINAL_FLOAT_PROMPT_ASK: Optional[Callable[..., Any]] = None
 _PROMPT_LOGGING_WRAPPERS_INSTALLED = False
 
 
+#: Exceptions a prompt may raise that genuinely mean "there is no terminal to
+#: read an answer from", so resolving to the documented ``default=`` is the
+#: right answer (see ``CLAUDE.md`` § "Interactive prompts MUST auto-resolve"):
+#:
+#: * ``EOFError``     -- rich's ``input()`` on a closed/exhausted stdin. Rich
+#:   does NOT return the default on EOF itself; this clause is what does.
+#: * ``OSError``      -- a detached/invalid stdin (``Bad file descriptor``), and
+#:   ``io.UnsupportedOperation`` (a prompt_toolkit backend refusing a stdin with
+#:   no ``fileno``), which subclasses it.
+#: * ``ValueError``   -- ``I/O operation on closed file`` from a closed stream.
+#: * ``ImportError``  -- rich/questionary unavailable in a stripped runtime.
+#:
+#: Everything else -- ``RecursionError`` above all, plus ``AttributeError`` /
+#: ``TypeError`` / ``RuntimeError`` -- is a programming error, NOT an absent
+#: terminal. Those MUST surface: a broad clause turned a recursion into an
+#: answer, so the operator's reply was discarded and the prompt resolved to
+#: ``default=``, which on a ``default=True`` confirmation means acting without
+#: consent on a client network.
+_NO_TERMINAL_PROMPT_ERRORS = (EOFError, OSError, ValueError, ImportError)
+
+
 def _classify_prompt_answer(
     answer_text: str,
     *,
@@ -121,25 +142,44 @@ def install_prompt_logging_wrappers() -> None:
 
     from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
 
-    _ORIGINAL_PROMPT_ASK = Prompt.ask
-    _ORIGINAL_CONFIRM_ASK = Confirm.ask
-    _ORIGINAL_INT_PROMPT_ASK = IntPrompt.ask
-    _ORIGINAL_FLOAT_PROMPT_ASK = FloatPrompt.ask
-    Prompt.ask = _logged_prompt_ask  # type: ignore[assignment]
-    Confirm.ask = _logged_confirm_ask  # type: ignore[assignment]
-    IntPrompt.ask = _logged_int_prompt_ask  # type: ignore[assignment]
-    FloatPrompt.ask = _logged_float_prompt_ask  # type: ignore[assignment]
+    from adscan_core import prompting
+
+    # Resolve each "original" through the SSOT, which refuses to hand back one
+    # of our OWN wrappers (it returns rich's genuine implementation instead).
+    # Capturing a wrapper as its own original makes it call itself, and a
+    # re-executed module leaves exactly that state behind: the installed flag
+    # resets here while the wrapper stays on the rich class. That has to be
+    # recoverable, not poisonous.
+    _ORIGINAL_PROMPT_ASK = prompting.resolve_original_ask("Prompt")
+    _ORIGINAL_CONFIRM_ASK = prompting.resolve_original_ask("Confirm")
+    _ORIGINAL_INT_PROMPT_ASK = prompting.resolve_original_ask("IntPrompt")
+    _ORIGINAL_FLOAT_PROMPT_ASK = prompting.resolve_original_ask("FloatPrompt")
+    Prompt.ask = prompting.mark_prompt_logging_wrapper(_logged_prompt_ask)  # type: ignore[assignment]
+    Confirm.ask = prompting.mark_prompt_logging_wrapper(_logged_confirm_ask)  # type: ignore[assignment]
+    IntPrompt.ask = prompting.mark_prompt_logging_wrapper(_logged_int_prompt_ask)  # type: ignore[assignment]
+    FloatPrompt.ask = prompting.mark_prompt_logging_wrapper(  # type: ignore[assignment]
+        _logged_float_prompt_ask
+    )
     _PROMPT_LOGGING_WRAPPERS_INSTALLED = True
 
 
 def confirm_ask(prompt: str, default: bool) -> bool:
-    """Ask a yes/no confirmation prompt with centralized prompt logging."""
+    """Ask a yes/no confirmation prompt with centralized prompt logging.
+
+    Resolves to ``default`` only when there is genuinely no terminal to read an
+    answer from (``_NO_TERMINAL_PROMPT_ERRORS``). A programming error inside the
+    prompt machinery propagates instead of being converted into an answer: an
+    operator's reply must never be silently replaced by ``default``, which on a
+    ``default=True`` confirmation would mean proceeding without consent. The
+    non-interactive auto-resolve path is unaffected -- it resolves inside
+    :func:`adscan_core.prompting.logged_confirm_ask`, ahead of rich.
+    """
     try:
         install_prompt_logging_wrappers()
         from rich.prompt import Confirm
 
         return bool(Confirm.ask(prompt, default=default))
-    except Exception as exc:
+    except _NO_TERMINAL_PROMPT_ERRORS as exc:
         print_info_debug(
             f"[confirm] Fallback to default for '{prompt}': {default} ({type(exc).__name__})"
         )
@@ -163,6 +203,11 @@ def prompt_ask(
     empty string when no default is provided) instead of blocking on stdin,
     mirroring the questionary helpers. Pass ``shell`` so the non-interactive
     predicate can see ``shell.auto`` / the session command type.
+
+    In an interactive run the fallback to ``default`` is reserved for the
+    no-terminal errors in ``_NO_TERMINAL_PROMPT_ERRORS`` (rich raises
+    ``EOFError`` on an exhausted stdin rather than returning the default
+    itself). Anything else propagates rather than becoming an answer.
 
     ``prefill_default`` controls whether ``default`` is inserted as
     pre-existing editable text in the *interactive* input buffer. Rich's
@@ -201,7 +246,7 @@ def prompt_ask(
             **kwargs,
         )
         return "" if answer is None else str(answer)
-    except Exception as exc:
+    except _NO_TERMINAL_PROMPT_ERRORS as exc:
         fallback = "" if default is None else str(default)
         print_info_debug(
             f"[prompt] Fallback to default for '{prompt}': "
@@ -409,7 +454,9 @@ def questionary_ordered_selection(
     # given order. Never block; log + mirror like the other helpers.
     if _state._should_disable_prompt_interaction(shell):
         available_set = set(available)
-        resolved = [str(value) for value in default_order if str(value) in available_set]
+        resolved = [
+            str(value) for value in default_order if str(value) in available_set
+        ]
         print_info_debug(
             "[questionary] Non-interactive; selecting default ordered selection "
             f"for '{title}': {resolved}"
@@ -478,7 +525,7 @@ def _fallback_numeric_select_index(
             "Enter a number (0 to cancel)",
             default=default_number,
         )
-    except Exception:
+    except _NO_TERMINAL_PROMPT_ERRORS:
         return None
 
     if choice_num == 0:

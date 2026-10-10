@@ -93,6 +93,8 @@ _EDGE_TRANSLATION_NAMES: Final[frozenset[str]] = frozenset(
         "ForgedTicketFor",
         "ReadGMSAPasswordOf",
         "OwnsCertificateFor",
+        # Certighost (CVE-2026-54121)
+        "certighost",
     }
 )
 
@@ -135,6 +137,7 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "ReadShare",
         "WriteShare",
         "FullControlShare",
+        "certighost",
         # Auth
         "CanPSRemote",
         "CanRDP",
@@ -177,7 +180,6 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "DfsCoerce",
         "MsEven",
         "CoerceAndRelayNTLMToADCS",
-        "CoerceToTGT",
         "Zerologon",
         "NoPac",
         "PrintNightmare",

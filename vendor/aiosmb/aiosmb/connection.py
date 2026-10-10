@@ -1,4 +1,5 @@
 import enum
+import os
 import asyncio
 import copy
 import traceback
@@ -210,7 +211,17 @@ class SMBConnection:
 		self.ServerCapabilities = 0
 		self.ClientSecurityMode = NegotiateSecurityMode.NONE
 		if nosign is False:
-			self.ClientSecurityMode = NegotiateSecurityMode.SMB2_NEGOTIATE_SIGNING_ENABLED | NegotiateSecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED
+			# Advertise SIGNING_ENABLED only (0x01), matching impacket's and the
+			# standard Windows client's NEGOTIATE SecurityMode. The previous
+			# ENABLED|REQUIRED (0x03) made the client demand signing -- a
+			# plaintext pre-auth divergence from impacket (captured live on a
+			# CrowdStrike host, 2026-10-07: ADscan 0x03, impacket/nxc 0x01).
+			# This does NOT weaken outbound signing: aiosmb signs when
+			# ``self.signing_required`` is set, which is derived from the
+			# SERVER's negotiate response (a DC that requires signing is still
+			# honoured), never from this client advertisement -- so dropping
+			# REQUIRED here changes only what we advertise, not whether we sign.
+			self.ClientSecurityMode = NegotiateSecurityMode.SMB2_NEGOTIATE_SIGNING_ENABLED
 		self.ServerSecurityMode = 0
 		
 		
@@ -231,8 +242,19 @@ class SMBConnection:
 		self.CompressionId = None #the selected compression
 		self.CipherId = None #
 		self.CompressionIds = None
-		#if self.target.compression is True:
-		if True:
+		# Advertise the SMB2 COMPRESSION_CAPABILITIES negotiate context only
+		# when the target explicitly opts in (SMBTarget.compression, default
+		# False). An unconditional "if True" here forced an LZNT1 compression
+		# context into EVERY SMB 3.1.1 NEGOTIATE request -- a plaintext
+		# pre-auth fingerprint that impacket's own named-pipe client never
+		# sends (its negotiate carries only PREAUTH_INTEGRITY + ENCRYPTION).
+		# Advertising a lone LZNT1 compressor is exactly the kind of raw
+		# negotiate-framing divergence an endpoint sensor keys on to flag a
+		# non-Windows client, so it is dropped to default-off for parity with
+		# the standard client (compression is an opt-in throughput feature,
+		# never required for correctness). See the OPSEC wire-parity rule in
+		# the root CLAUDE.md and BACKLOG.md's PIPE_BROKEN entry.
+		if self.target.compression is True:
 			self.CompressionIds = [SMB2CompressionType.LZNT1]
 		self.SupportsChainedCompression = False
 		self.supported_encryptions = [SMB2Cipher.AES_128_CCM] #[SMB2Cipher.AES_128_GCM], SMB2Cipher.AES_128_GCM
@@ -579,9 +601,20 @@ class SMBConnection:
 			if NegotiateDialects.SMB311 in self.supported_dialects:
 				#SMB311 mandates the contextlist to be populated
 							
+				# MS-SMB2 2.2.3.1.1: the client MUST supply a fresh random Salt
+				# in the PREAUTH_INTEGRITY context. The construct() default is an
+				# EMPTY salt, which is both non-conformant and a plaintext
+				# pre-auth fingerprint -- Windows and impacket send 32 random
+				# bytes, so a zero-length salt marks the client as non-standard
+				# (captured live on a CrowdStrike host, 2026-10-07: ADscan
+				# SaltLength=0, impacket/nxc SaltLength=32). The salt is unique
+				# per connection and is carried inside the serialized NEGOTIATE
+				# that feeds the preauth-integrity hash, so no separate bookkeeping
+				# is needed. See the OPSEC wire-parity rule in the root CLAUDE.md.
 				command.NegotiateContextList.append(
 					SMB2PreauthIntegrityCapabilities.construct(
-						[self.PreauthIntegrityHashId]
+						[self.PreauthIntegrityHashId],
+						salt=os.urandom(32),
 					)
 				)
 							
@@ -650,13 +683,19 @@ class SMBConnection:
 				self.signing_required = False
 			
 					
+			# SSOT: NEGOTIATE only negotiates the CIPHER (a capability). It must
+			# NOT set ``encryption_required`` -- that is the server's authoritative
+			# per-session verdict (SMB2_SESSION_FLAG_ENCRYPT_DATA), resolved in ONE
+			# place in session_setup(). A member server that merely SUPPORTS
+			# encryption advertises this capability/context; forcing encryption from
+			# it sealed traffic that a supports-but-not-required host then dropped
+			# (CONNECTION_ABORTED). encryption_required stays at its init default
+			# (False) here and is set authoritatively in session_setup().
 			if NegotiateCapabilities.ENCRYPTION in rply.command.Capabilities:
-				self.encryption_required = True
 				self.CipherId = SMB2Cipher.AES_128_CCM
 
 			for negctx in rply.command.NegotiateContextList:
 				if negctx.ContextType == SMB2ContextType.ENCRYPTION_CAPABILITIES:
-					self.encryption_required = True
 					self.CipherId = negctx.Ciphers[0]
 						
 				if negctx.ContextType == SMB2ContextType.COMPRESSION_CAPABILITIES:
@@ -784,6 +823,67 @@ class SMBConnection:
 					or server_granted_null
 				)
 
+				# ADscan fix + DIAG: drive ``encryption_required`` from the server's
+				# AUTHORITATIVE per-session ENCRYPT_DATA flag, not the NEGOTIATE
+				# encryption CAPABILITY (which only negotiates the cipher). A member
+				# server that merely SUPPORTS encryption returns the NEGOTIATE
+				# encryption context (which set ``encryption_required=True`` in
+				# negotiate()), but does NOT set SMB2_SESSION_FLAG_ENCRYPT_DATA unless
+				# it REQUIRES encryption. Forcing encryption on a supports-but-not-
+				# required host made the server drop the connection on the first
+				# sealed RPC (CONNECTION_ABORTED). impacket keys encryption on the
+				# session/share ENCRYPT_DATA flag, not the cap.
+				server_requires_encryption = False
+				if server_session_flags is not None:
+					try:
+						server_requires_encryption = SessionFlags.SMB2_SESSION_FLAG_ENCRYPT_DATA in server_session_flags
+					except (TypeError, AttributeError):
+						try:
+							server_requires_encryption = bool(int(server_session_flags) & 0x00000004)
+						except Exception:
+							server_requires_encryption = False
+				if not is_guest_or_null:
+					# Encrypt whenever a cipher was negotiated -- the per-session
+					# ENCRYPT_DATA flag is a FLOOR, not a CEILING.
+					#
+					# ENCRYPT_DATA (SMB2_SESSION_FLAG_ENCRYPT_DATA) means "this
+					# server requires encryption for the whole session". Its
+					# ABSENCE does NOT mean plaintext is acceptable: MS-SMB2
+					# 3.3.5.7 lets a server require encryption PER SHARE. When a
+					# share has encryption enabled (SMB2_SHAREFLAG_ENCRYPT_DATA)
+					# -- not a default, an admin opts in per share or globally --
+					# the server rejects an unencrypted TREE_CONNECT to it with
+					# STATUS_ACCESS_DENIED (RejectUnencryptedAccess, which IS on
+					# by default since Server 2016, governs that rejection). That
+					# is unrecoverable for us, because the share flags are only
+					# readable from a tree-connect response we can never obtain.
+					#
+					# Reading the NEGOTIATE encryption CAPABILITY instead does
+					# not work either: for SMB 3.1.1 encryption is negotiated
+					# through the SMB2_ENCRYPTION_CAPABILITIES negotiate
+					# CONTEXT (the selected CipherId), and a 3.1.1 server
+					# deliberately leaves GLOBAL_CAP_ENCRYPTION clear. So a
+					# capability check sees "no encryption" on precisely the
+					# hosts that demand it.
+					#
+					# The negotiated CipherId is therefore the only sound
+					# signal, and encrypting on it is what Windows and impacket
+					# both do (impacket seals whenever it negotiated a cipher,
+					# regardless of the session flag). Verified live 2026-10-06
+					# against a Server 2019 member server: capability bit clear,
+					# session ENCRYPT_DATA clear, CipherId AES-128-CCM, and the
+					# plaintext IPC$ TREE_CONNECT denied with ACCESS_DENIED
+					# until we sealed it.
+					#
+					# NOTE: this MUST ship together with the 16-byte
+					# Session.SessionKey truncation below. Sealing with keys
+					# derived from a full 32-byte Kerberos subkey makes the
+					# server RST the connection, which is strictly worse than
+					# plaintext. Do not enable one without the other.
+					self.encryption_required = bool(
+						server_requires_encryption or self.CipherId is not None
+					)
+
 				if is_guest_or_null:
 					self.signing_required = False
 					# ADscan fix (root cause of guest CONNECTION_ABORTED on hardened
@@ -801,7 +901,44 @@ class SMBConnection:
 					# successful (guest-granted) session setup.
 					self.encryption_required = False
 
-				self.SessionKey = self.gssapi.get_session_key()[:16]
+				# Session.SessionKey is the FIRST 16 BYTES of the key the GSS
+				# mechanism returns -- never the full key. MS-SMB2 3.2.5.3 sets
+				# Session.SessionKey to "the first 16 bytes of the cryptographic
+				# key for this authenticated context" (zero-padded if shorter),
+				# and 3.1.4.2 feeds exactly that 16-byte value to
+				# KDF_CounterMode as Ki when deriving SigningKey /
+				# ApplicationKey / the C2S+S2C cipher keys below.
+				#
+				# For NTLM the key is already 16 bytes, so the slice is a no-op.
+				# For Kerberos with mutual auth the key here is the AP-REP subkey
+				# (MS-KILE 3.1.1.2), which is 32 bytes for
+				# AES256-CTS-HMAC-SHA1-96 -- and SMB still uses only its first 16
+				# bytes. An earlier ADscan change kept that 32-byte subkey whole,
+				# which derived cipher keys the SERVER does not derive.
+				#
+				# Why that stayed invisible, and how it was proven (do NOT "fix"
+				# this back to keeping the full key): the wrong keys are only
+				# exercised once traffic is actually signed or sealed. Against a
+				# member server with signing ENABLED-but-not-REQUIRED and no
+				# session-level encryption, nothing was ever signed or encrypted,
+				# so the bad keys were dead code. Once opportunistic encryption
+				# was enabled (see encryption_required above), the very first
+				# encrypted message -- the IPC$ TREE_CONNECT -- was answered by
+				# the server with a TCP RST (it could not decrypt it), surfacing
+				# as CONNECTION_ABORTED. Truncating to 16 bytes here turns that
+				# single RST into a full, sustained, bidirectional encrypted SMB3
+				# conversation against the same host. Verified live, 2026-10-06,
+				# against a Server 2019 member server (SMB 3.1.1, AES-128-CCM,
+				# Kerberos AES256) by packet capture.
+				#
+				# impacket's mutual-auth branch keeps the full AP-REP subkey
+				# (smb3.py), but that path is not what its working callers use:
+				# netexec does not request mutualAuth, so impacket takes its
+				# ``sessionKey.contents[:16]`` branch -- 16 bytes, matching the
+				# server. Do not cite impacket's mutual-auth branch as evidence
+				# for keeping 32 bytes; it is a latent bug there, not a contract.
+				session_key = self.gssapi.get_session_key()
+				self.SessionKey = session_key[:16]
 
 				# ADscan fix: SMB3 session-key derivation must NOT be gated on
 				# ``signing_required``. MS-SMB2 §3.2.5.3 derives SigningKey,

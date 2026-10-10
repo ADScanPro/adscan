@@ -165,34 +165,25 @@ async def parse_lsass_dump(dump_bytes: bytes) -> LSASSCredentials:
 # ---------------------------------------------------------------------------
 
 
-def _sync_parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUserCredential]:
-    """Synchronously parse an offline SAM hive using pypykatz library.
+def map_sam_secrets(sam_obj) -> list[LocalUserCredential]:
+    """Map a pypykatz SAM object's secrets into ADscan's ``LocalUserCredential`` model.
 
-    Uses OffineRegistry.from_bytes() — accepts bytes directly, no tempfile needed.
+    ``sam_obj`` is a ``pypykatz.registry.sam.common``-shaped object exposing
+    ``.secrets`` (each a username/rid/nt_hash/lm_hash record). It is produced
+    identically by two backends — ``OffineRegistry.from_bytes(...).sam`` (the
+    byte-based SaveKey path, via :func:`_sync_parse_sam_hive`) and
+    ``pypykatz.registry.remote_parser.RemoteRegistry(...).sam`` (the inline
+    SeBackupPrivilege read, via the ``read_registry_secrets`` SSOT in
+    ``native_dump_service.py``) — so both MUST route through this one mapper
+    to keep the client-facing model byte-identical regardless of extraction
+    method. See docs/superpowers/specs/2026-10-06-registry-secrets-inline-read-ssot-design.md.
     """
-    try:
-        from pypykatz.registry.offline_parser import OffineRegistry  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise SecretsParserError(
-            "pypykatz is not installed. Run 'adscan install' to install dependencies."
-        ) from exc
-
-    try:
-        registry = OffineRegistry.from_bytes(
-            system_data=system_bytes,
-            sam_data=sam_bytes,
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        raise SecretsParserError(f"pypykatz SAM parse error: {exc}") from exc
-
     results: list[LocalUserCredential] = []
-    if registry.sam is None:
+    if sam_obj is None:
         print_info_verbose("[secrets_parser] SAM section is empty after parsing")
         return results
 
-    for secret in registry.sam.secrets:
+    for secret in sam_obj.secrets:
         try:
             username: str = str(secret.username or "").strip()
             rid: int = int(secret.rid or 0)
@@ -213,9 +204,37 @@ def _sync_parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUse
         )
 
     print_info_debug(
-        f"[secrets_parser] parse_sam_hive extracted {len(results)} local user(s)"
+        f"[secrets_parser] map_sam_secrets extracted {len(results)} local user(s)"
     )
     return results
+
+
+def _sync_parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUserCredential]:
+    """Synchronously parse an offline SAM hive using pypykatz library.
+
+    Uses OffineRegistry.from_bytes() — accepts bytes directly, no tempfile needed.
+    Thin wrapper: parses bytes into a pypykatz SAM object, then delegates the
+    object-to-model mapping to :func:`map_sam_secrets` (the shared SSOT also
+    used by the inline backend).
+    """
+    try:
+        from pypykatz.registry.offline_parser import OffineRegistry  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise SecretsParserError(
+            "pypykatz is not installed. Run 'adscan install' to install dependencies."
+        ) from exc
+
+    try:
+        registry = OffineRegistry.from_bytes(
+            system_data=system_bytes,
+            sam_data=sam_bytes,
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        raise SecretsParserError(f"pypykatz SAM parse error: {exc}") from exc
+
+    return map_sam_secrets(registry.sam)
 
 
 async def parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUserCredential]:
@@ -231,37 +250,88 @@ async def parse_sam_hive(sam_bytes: bytes, system_bytes: bytes) -> list[LocalUse
 # ---------------------------------------------------------------------------
 
 
-def _sync_parse_lsa_secrets(
-    security_bytes: bytes,
-    system_bytes: bytes,
+def map_security_secrets(
+    security_obj,
     *,
     winlogon_default_user: str | None = None,
 ) -> LSASecrets:
-    """Synchronously parse SECURITY hive for LSA secrets using pypykatz library."""
+    """Map a pypykatz SECURITY object's cached secrets into ADscan's ``LSASecrets`` model.
+
+    ``security_obj`` exposes ``.cached_secrets`` and ``.dcc_hashes``, and is
+    produced by two backends — ``OffineRegistry.from_bytes(...).security``
+    (the byte-based SaveKey path, via :func:`_sync_parse_lsa_secrets`) and
+    ``pypykatz.registry.remote_parser.RemoteRegistry(...).security`` (the
+    inline SeBackupPrivilege read, via the ``read_registry_secrets`` SSOT in
+    ``native_dump_service.py``) — so both MUST route through this one mapper
+    to keep the client-facing model byte-identical regardless of extraction
+    method. See docs/superpowers/specs/2026-10-06-registry-secrets-inline-read-ssot-design.md.
+
+    **pypykatz landmine — the two backends do NOT yield the same classes.**
+    ``cached_secrets`` entries from the offline/bytes backend are instances of
+    ``pypykatz.registry.security.common.LSASecret*`` (the sync hierarchy);
+    entries from the inline/live ``RemoteRegistry`` backend are instances of
+    ``pypykatz.registry.security.acommon.LSASecret*`` (a SEPARATE async
+    hierarchy pypykatz's own ``asecurity.py`` imports from — same names, same
+    constructor shapes, but ``is not`` the same class objects as the sync
+    ones). An ``isinstance`` check against only ONE hierarchy silently matches
+    NOTHING for the other backend's secrets — no exception, `cached_secrets`
+    has entries, `map_security_secrets` returns an EMPTY model. This is a real
+    regression that shipped and was caught live against GOAD winterfell
+    (inline returned 0 secrets where the byte path found 7) before being
+    fixed here by checking BOTH hierarchies on every ``isinstance``. Do not
+    "simplify" this back down to one import.
+
+    ``winlogon_default_user`` is the DefaultUserName read from
+    ``HKLM\\SOFTWARE\\...\\Winlogon`` — pass it explicitly for the byte-based
+    path (the SOFTWARE hive may be downloaded/parsed separately there). The
+    inline ``RemoteRegistry`` backend already resolves this itself (it reads
+    SOFTWARE in the same session and calls ``security.set_default_user(...)``
+    before handing back the object), so a caller feeding an inline-sourced
+    object may omit it.
+    """
     try:
-        from pypykatz.registry.offline_parser import OffineRegistry  # type: ignore[import-untyped]
         from pypykatz.registry.security.common import (  # type: ignore[import-untyped]
-            LSASecret,
-            LSASecretASPNET,
-            LSASecretDPAPI,
-            LSASecretDefaultPassword,
-            LSASecretMachineAccount,
-            LSASecretService,
+            LSASecret as _SyncLSASecret,
+            LSASecretASPNET as _SyncLSASecretASPNET,
+            LSASecretDPAPI as _SyncLSASecretDPAPI,
+            LSASecretDefaultPassword as _SyncLSASecretDefaultPassword,
+            LSASecretMachineAccount as _SyncLSASecretMachineAccount,
+            LSASecretService as _SyncLSASecretService,
         )
     except ImportError as exc:
         raise SecretsParserError(
             "pypykatz is not installed. Run 'adscan install' to install dependencies."
         ) from exc
 
+    # The inline/live backend's SECURITY.get_secrets() (pypykatz asecurity.py)
+    # creates its cached_secrets from a SEPARATE async class hierarchy
+    # (acommon) — see the landmine note in the docstring above. Fall back to
+    # the sync-only classes (tuple of just the sync class) if a pypykatz
+    # version ever drops acommon, so this stays forward-compatible rather
+    # than hard-failing.
     try:
-        registry = OffineRegistry.from_bytes(
-            system_data=system_bytes,
-            security_data=security_bytes,
+        from pypykatz.registry.security.acommon import (  # type: ignore[import-untyped]
+            LSASecret as _AsyncLSASecret,
+            LSASecretASPNET as _AsyncLSASecretASPNET,
+            LSASecretDPAPI as _AsyncLSASecretDPAPI,
+            LSASecretDefaultPassword as _AsyncLSASecretDefaultPassword,
+            LSASecretMachineAccount as _AsyncLSASecretMachineAccount,
+            LSASecretService as _AsyncLSASecretService,
         )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        raise SecretsParserError(f"pypykatz SECURITY parse error: {exc}") from exc
+    except ImportError:
+        _AsyncLSASecret = _SyncLSASecret
+        _AsyncLSASecretASPNET = _SyncLSASecretASPNET
+        _AsyncLSASecretDPAPI = _SyncLSASecretDPAPI
+        _AsyncLSASecretDefaultPassword = _SyncLSASecretDefaultPassword
+        _AsyncLSASecretMachineAccount = _SyncLSASecretMachineAccount
+        _AsyncLSASecretService = _SyncLSASecretService
+
+    LSASecret = (_SyncLSASecret, _AsyncLSASecret)
+    LSASecretASPNET = (_SyncLSASecretASPNET, _AsyncLSASecretASPNET)
+    LSASecretDPAPI = (_SyncLSASecretDPAPI, _AsyncLSASecretDPAPI)
+    LSASecretDefaultPassword = (_SyncLSASecretDefaultPassword, _AsyncLSASecretDefaultPassword)
+    LSASecretMachineAccount = (_SyncLSASecretMachineAccount, _AsyncLSASecretMachineAccount)
+    LSASecretService = (_SyncLSASecretService, _AsyncLSASecretService)
 
     machine_nt_hash: str | None = None
     machine_raw: bytes | None = None
@@ -275,14 +345,14 @@ def _sync_parse_lsa_secrets(
     security_questions: dict[str, list[dict]] = {}
     raw_secrets: list[dict] = []
 
-    if registry.security is None:
+    if security_obj is None:
         print_info_verbose("[secrets_parser] SECURITY section is empty after parsing")
         return LSASecrets(
             machine_account_nt_hash=None,
             machine_account_password_raw=None,
         )
 
-    for secret in registry.security.cached_secrets:
+    for secret in security_obj.cached_secrets:
         try:
             raw_secrets.append(secret.to_dict())
             if isinstance(secret, LSASecretMachineAccount):
@@ -343,8 +413,30 @@ def _sync_parse_lsa_secrets(
                 # HKLM\SOFTWARE\...\Winlogon\DefaultUserName — same lookup
                 # impacket performs via getDefaultLoginAccount()).  Falls back
                 # to the raw key name when the Winlogon query was not possible.
+                #
+                # The inline RemoteRegistry backend already resolves the
+                # SOFTWARE hive's DefaultUserName in the same session and
+                # calls ``security.set_default_user(...)``, which stamps
+                # ``secret.username`` directly on the object — honor that
+                # self-attribution when the caller did not pass an explicit
+                # ``winlogon_default_user`` (the byte-based path never sets
+                # ``secret.username``, so this is a no-op there).
+                #
+                # pypykatz's OWN process_secret() unconditionally stamps
+                # ``self.username = "UNKNOWN"`` as its own unresolved
+                # placeholder (a TODO stub, same convention as
+                # LSASecretService below) — that is NOT a real attribution,
+                # so it must be excluded the same way the Service branch
+                # above excludes it, or a DefaultPassword secret whose owner
+                # was never resolved (SOFTWARE's DefaultUserName absent) gets
+                # mis-filed under the literal key "UNKNOWN" instead of
+                # falling through to the key-name fallback.
+                self_attributed_user = str(getattr(secret, "username", "") or "").strip()
+                if self_attributed_user.upper() == "UNKNOWN":
+                    self_attributed_user = ""
+                effective_default_user = winlogon_default_user or self_attributed_user or None
                 is_history = bool(getattr(secret, "history", False))
-                if is_history and winlogon_default_user:
+                if is_history and effective_default_user:
                     # History entry — suppress when we already know the real owner.
                     # The old password belongs to the same user but is expired/stale.
                     # Without suppression it would land in service_secrets under the
@@ -353,8 +445,8 @@ def _sync_parse_lsa_secrets(
                     pass
                 else:
                     svc_key = (
-                        winlogon_default_user
-                        if (winlogon_default_user and not is_history)
+                        effective_default_user
+                        if (effective_default_user and not is_history)
                         else str(secret.key_name or "DefaultPassword")
                     )
                     if not is_history or svc_key not in service_secrets:
@@ -398,7 +490,7 @@ def _sync_parse_lsa_secrets(
             print_exception(exception=exc)
             print_info_debug(f"[secrets_parser] error processing LSA secret: {exc}")
 
-    for dcc in registry.security.dcc_hashes:
+    for dcc in security_obj.dcc_hashes:
         try:
             dcc_hashes.append(str(dcc))
         except Exception as exc:
@@ -407,7 +499,7 @@ def _sync_parse_lsa_secrets(
             print_info_debug(f"[secrets_parser] error processing DCC hash: {exc}")
 
     print_info_debug(
-        f"[secrets_parser] parse_lsa_secrets: machine_acc={'yes' if machine_nt_hash else 'no'}, "
+        f"[secrets_parser] map_security_secrets: machine_acc={'yes' if machine_nt_hash else 'no'}, "
         f"dpapi={'yes' if dpapi_machine else 'no'}, "
         f"dcc={len(dcc_hashes)}, svc={len(service_secrets)}"
     )
@@ -424,6 +516,38 @@ def _sync_parse_lsa_secrets(
         security_questions=security_questions,
         raw_secrets=raw_secrets,
     )
+
+
+def _sync_parse_lsa_secrets(
+    security_bytes: bytes,
+    system_bytes: bytes,
+    *,
+    winlogon_default_user: str | None = None,
+) -> LSASecrets:
+    """Synchronously parse SECURITY hive for LSA secrets using pypykatz library.
+
+    Thin wrapper: parses bytes into a pypykatz SECURITY object, then delegates
+    the object-to-model mapping to :func:`map_security_secrets` (the shared
+    SSOT also used by the inline backend).
+    """
+    try:
+        from pypykatz.registry.offline_parser import OffineRegistry  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise SecretsParserError(
+            "pypykatz is not installed. Run 'adscan install' to install dependencies."
+        ) from exc
+
+    try:
+        registry = OffineRegistry.from_bytes(
+            system_data=system_bytes,
+            security_data=security_bytes,
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        raise SecretsParserError(f"pypykatz SECURITY parse error: {exc}") from exc
+
+    return map_security_secrets(registry.security, winlogon_default_user=winlogon_default_user)
 
 
 async def parse_lsa_secrets(

@@ -213,12 +213,26 @@ class SECURITY:
 				
 	async def get_secrets(self):
 		logger.debug('[SECURITY] get_secrets')
+		# Read SECURITY\Cache FIRST, before touching anything else under
+		# SECURITY (the LSA key, Policy\Secrets\*) -- matching impacket's
+		# own dumpCachedHashes(), which enumerates Cache before ever calling
+		# getLSASecretKey()/getNLKMSecret(). dump_dcc() already fetches
+		# self.lsa_key/self.NKLM_key lazily the moment it actually needs
+		# them (after the Cache open+enumerate succeeds), so simply not
+		# pre-fetching the LSA key here reproduces impacket's exact
+		# operation order with no change to the decrypted output -- same
+		# keys, same secrets, just not touched before Cache anymore.
+		await self.dump_dcc()
+
+		# Safety net: dump_dcc() only fetches self.lsa_key lazily once it
+		# has values to decrypt (after a non-empty Cache). An empty/absent
+		# Cache returns early from dump_dcc() before ever touching it, and
+		# the Policy\Secrets loop below uses self.lsa_key unconditionally --
+		# fetch it here if that happened, so this loop is correct regardless
+		# of whether the host had any DCC cache entries.
 		if self.lsa_key is None:
 			await self.get_lsa_key()
-		
 
-		await self.dump_dcc()
-		
 		# Let's first see if there are cached entries
 		keys = await self.hive.enum_key('Policy\\Secrets')
 		if keys is None:

@@ -303,6 +303,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        # `-v` is the universal short form and six independent documentation
+        # sites had already written it, so a user typing what they expect must
+        # not get an error. The subcommand-level `-v` on mitre-navigator is a
+        # separate namespace and is unaffected.
+        "-v",
         "--verbose",
         action="store_true",
         help="Enable verbose output (launcher + forwarded to container subcommands where applicable).",
@@ -869,6 +874,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Workspace name or path (default: prompt or most-recent).",
     )
     writeup_p.add_argument(
+        "--full-credentials", dest="full_credentials", action="store_true",
+        help=(
+            "Write the complete recovered-credential table, with values, into "
+            "the writeup. On a client engagement the values are withheld by "
+            "default and the writeup points at the workspace register instead."
+        ),
+    )
+    writeup_p.add_argument(
         "output_dir", nargs="?", default=None,
         help=(
             "Destination directory for the spine (default: a timestamped "
@@ -971,7 +984,7 @@ def _consume_trailing_global_flags(
     while idx < len(unknown):
         token = unknown[idx]
 
-        if token == "--verbose":
+        if token in ("-v", "--verbose"):
             setattr(ns, "verbose", True)
             idx += 1
             continue
@@ -2670,6 +2683,8 @@ def main(argv: list[str] | None = None) -> None:
         writeup_workspace = getattr(ns, "workspace", None)
         if writeup_workspace:
             writeup_args.extend(["--workspace", str(writeup_workspace)])
+        if bool(getattr(ns, "full_credentials", False)):
+            writeup_args.append("--full-credentials")
         writeup_output_dir = getattr(ns, "output_dir", None)
         if writeup_output_dir:
             writeup_args.append(str(writeup_output_dir))

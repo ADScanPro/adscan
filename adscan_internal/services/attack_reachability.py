@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 
 from adscan_internal.services.attack_graph_core import (
     _build_high_value_terminal_candidate_ids,
+    is_traversable_attack_edge,
 )
 from adscan_internal.services.compromise_class import (
     is_direct_domain_breaker_target,
@@ -94,10 +95,19 @@ def _forward_reachable(
 
     Start ids not present in *nodes_map* are ignored. Returns the set of reached
     node ids (including the valid start ids themselves).
+
+    The adjacency is built over ONLY traversable compromise edges — the SAME gate
+    the DFS uses (:func:`attack_graph_core.is_traversable_attack_edge`). Without
+    it the flood would cross share-access edges (e.g.
+    ``Everyone --FullControlShare--> DC$``), which are exposure findings, not
+    host-compromise transitions, and would falsely report full-domain reach for
+    every standard user.
     """
     adjacency: dict[str, list[str]] = {}
     for edge in edges:
         if not isinstance(edge, dict):
+            continue
+        if not is_traversable_attack_edge(edge, nodes_map):
             continue
         from_id = str(edge.get("from") or "").strip()
         to_id = str(edge.get("to") or "").strip()
@@ -182,6 +192,83 @@ def compute_reachable_terminals(
             )
         )
     return terminals
+
+
+def reachability_summary_for_workspace(
+    workspace_dir: str,
+    domain: str,
+    *,
+    graph: dict[str, Any] | None = None,
+) -> dict[str, int] | None:
+    """Return the reachable-terminal summary for one domain in a workspace.
+
+    The SSOT for "which distinct compromise terminals can the domain's enabled
+    low-priv users reach", resolved directly from the workspace graph. It is the
+    ONE place that (a) loads the base attack graph, (b) resolves the enabled
+    low-priv start scope, (c) normalizes the runtime node shape (the runtime
+    graph stores nodes as a DICT ``id -> node``; :func:`compute_reachable_terminals`
+    iterates ``nodes`` as a LIST, so a dict passed unnormalized computes 0), and
+    (d) floods + summarizes. Both the report's ``exposure_kpis`` stamping seam
+    (``exposure_score_service``) and the telemetry counts fallback
+    (``attack_path_counts.client_path_totals``) call this, so the ``reachable_*``
+    EXPOSURE numbers are computed identically whether or not a report has been
+    generated yet.
+
+    Args:
+        workspace_dir: The scan workspace root (execution ``.run_*`` dir for a
+            live scan). Used to build the shell namespace the graph/start-id
+            resolvers read from.
+        domain: The domain to summarize.
+        graph: An already-loaded base attack graph to reuse (avoids a second
+            reload when the caller has one). When ``None`` the graph is loaded
+            here.
+
+    Returns:
+        The per-class reachable-terminal summary (see
+        :func:`summarize_reachable_terminals`), or ``None`` on any failure /
+        missing graph. Best-effort: never raises.
+    """
+    workspace_dir = str(workspace_dir or "").strip()
+    domain_name = str(domain or "").strip()
+    if not workspace_dir or not domain_name:
+        return None
+    try:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            _resolve_domain_enabled_low_priv_user_start_ids,
+            load_attack_graph,
+        )
+
+        shell_ns = SimpleNamespace(
+            current_workspace_dir=workspace_dir, domains_dir="domains"
+        )
+        base_graph = graph if isinstance(graph, dict) else load_attack_graph(
+            shell_ns, domain_name
+        )
+        if not isinstance(base_graph, dict) or not base_graph:
+            return None
+        start_ids = _resolve_domain_enabled_low_priv_user_start_ids(
+            shell_ns, domain_name, base_graph
+        )
+        # The runtime graph stores nodes as a DICT (id -> node);
+        # compute_reachable_terminals iterates graph["nodes"] as a LIST, so
+        # normalize before passing (else it computes 0).
+        raw_nodes = base_graph.get("nodes")
+        norm_graph = {
+            "nodes": (
+                list(raw_nodes.values())
+                if isinstance(raw_nodes, dict)
+                else (raw_nodes or [])
+            ),
+            "edges": base_graph.get("edges") or [],
+        }
+        terminals = compute_reachable_terminals(
+            norm_graph, start_node_ids=start_ids, target="all"
+        )
+        return summarize_reachable_terminals(terminals)
+    except Exception:  # noqa: BLE001 - best-effort analytics/telemetry helper
+        return None
 
 
 def summarize_reachable_terminals(

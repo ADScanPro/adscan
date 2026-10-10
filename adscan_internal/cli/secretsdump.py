@@ -17,9 +17,23 @@ to the existing methods on the interactive shell.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 import os
 import re
+
+from adscan_core.reporting.privilege_tier_labels import (
+    PRIVILEGE_TIER_TOKEN_ORDER,
+    TIER0_TOKENS,
+    TIER_TOKEN_TIER0_DIRECT,
+    TIER_TOKEN_TIER0_ESCALATION_CAPABLE,
+    TIER_TOKEN_TIER1,
+    TIER_TOKEN_TIER2,
+    TIER_TOKEN_UNGRADED,
+    highest_privilege_tier_token,
+    privilege_tier_label_for_token,
+    privilege_tier_token_rank,
+    token_is_tier0,
+)
 
 from adscan_internal import (
     print_error,
@@ -56,14 +70,28 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
     tier0_cracked: int,
     high_value_extracted: int,
     high_value_cracked: int,
-    standard_extracted: int,
-    standard_cracked: int,
+    extracted_by_tier: Mapping[str, int],
+    cracked_by_tier: Mapping[str, int],
     cracked_reuse_groups: dict[str, list[dict[str, str]]],
     uncracked_reuse_groups: dict[str, list[dict[str, str]]],
 ) -> None:
     """Emit telemetry for DCSync-All cracking summary analytics.
 
     Only aggregate counters/ratios are emitted (no credential or user values).
+
+    The property names are a contract with dashboards that already read them, so
+    the privilege-tier split ADDS rather than renames:
+
+    * ``tier0_*`` keeps meaning ALL of Tier 0, direct and escalation-capable
+      together, so that series stays continuous across the change.
+    * ``tier0_direct_*`` / ``tier0_escalation_capable_*`` / ``tier1_*`` /
+      ``ungraded_*`` are the new per-tier counters.
+    * ``standard_*`` now means Tier 2 specifically. It previously meant
+      everything that was neither Tier-0 nor flagged high-value, which silently
+      included the Tier-1 server and application admins now counted on their
+      own; comparing it across the change is comparing two populations.
+    * ``high_value_*`` is unchanged and still the ORTHOGONAL ``highvalue`` flag,
+      which overlaps every tier and must never be added to one.
     """
     try:
         from adscan_internal.cli.common import build_lab_event_fields
@@ -86,9 +114,25 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
             max(cracked_reuse_groups.values(), key=len) if cracked_reuse_groups else []
         )
         largest_cracked_group_segment_counts = Counter(
-            str(row.get("risk_segment") or "Standard")
+            str(row.get("privilege_tier") or TIER_TOKEN_UNGRADED)
             for row in largest_cracked_group_rows
         )
+        standard_extracted = int(extracted_by_tier.get(TIER_TOKEN_TIER2, 0))
+        standard_cracked = int(cracked_by_tier.get(TIER_TOKEN_TIER2, 0))
+
+        def _per_tier(token: str) -> dict[str, Any]:
+            """One tier's extracted / cracked counters and its coverage."""
+            tier_extracted = int(extracted_by_tier.get(token, 0))
+            tier_cracked = int(cracked_by_tier.get(token, 0))
+            return {
+                f"{token}_extracted_count": tier_extracted,
+                f"{token}_cracked_count": tier_cracked,
+                f"{token}_crack_coverage_pct": round(
+                    ((tier_cracked / tier_extracted) * 100), 2
+                )
+                if tier_extracted > 0
+                else 0.0,
+            }
 
         properties: dict[str, Any] = {
             "domain": domain,
@@ -144,16 +188,30 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
             "reused_uncracked_accounts_count": uncracked_reused_accounts,
             "reused_cracked_largest_group_size": cracked_reuse_largest_group,
             "reused_uncracked_largest_group_size": uncracked_reuse_largest_group,
-            "largest_cracked_reuse_cluster_tier0_count": largest_cracked_group_segment_counts.get(
-                "Tier-0", 0
+            # Kept as ALL of Tier 0 (direct plus escalation-capable) so the
+            # existing series stays continuous; the directness split of the
+            # cluster is the pair below it.
+            "largest_cracked_reuse_cluster_tier0_count": sum(
+                largest_cracked_group_segment_counts.get(token, 0)
+                for token in TIER0_TOKENS
             ),
-            "largest_cracked_reuse_cluster_high_value_count": largest_cracked_group_segment_counts.get(
-                "High-Value", 0
+            "largest_cracked_reuse_cluster_tier0_direct_count": (
+                largest_cracked_group_segment_counts.get(TIER_TOKEN_TIER0_DIRECT, 0)
             ),
-            "largest_cracked_reuse_cluster_standard_count": largest_cracked_group_segment_counts.get(
-                "Standard", 0
+            "largest_cracked_reuse_cluster_standard_count": (
+                largest_cracked_group_segment_counts.get(TIER_TOKEN_TIER2, 0)
+            ),
+            "largest_cracked_reuse_cluster_ungraded_count": (
+                largest_cracked_group_segment_counts.get(TIER_TOKEN_UNGRADED, 0)
+            ),
+            # The orthogonal flag, counted on the cluster separately: an account
+            # here is also counted in its tier above, never in addition to it.
+            "largest_cracked_reuse_cluster_high_value_count": sum(
+                1 for row in largest_cracked_group_rows if row.get("high_value")
             ),
         }
+        for token in PRIVILEGE_TIER_TOKEN_ORDER:
+            properties.update(_per_tier(token))
         properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         telemetry.capture("dcsync_cracking_summary", properties)
     except Exception as exc:  # pragma: no cover - telemetry best effort
@@ -427,6 +485,143 @@ def _offer_machine_account_dump_fallback(
     )
 
 
+def _dcsync_cracking_attempted(
+    shell: Any, *, recovered_any: bool = False, domain: str = ""
+) -> bool:
+    """Whether password recovery actually RAN against these hashes.
+
+    Three signals, and the asymmetry between them is the whole point:
+
+    * ``recovered_any`` is PROOF. A recovered plaintext cannot exist unless
+      recovery ran, so it settles the question outright and does not depend on
+      any runtime gate still being readable afterwards.
+    * a LOCAL wordlist attack that ran to COMPLETION for this domain. This is
+      the term that matters for a regulated engagement, where the external
+      lookup is declined and used to leave the answer False even though the
+      audit corpus and both cracking backends were sitting on the host: an
+      attack that ran and recovered nothing is a real, reportable positive
+      about the client's passwords. Deliberately COMPLETION, not dispatch: this
+      flag decides whether a client-facing hygiene document exists at all, and
+      a document asserting a recovery rate off an unfinished attack would
+      understate exposure in the one direction that reads as "these passwords
+      held".
+    * the breach-corpus lookup's own gate, which the operator can decline per
+      session, is the authoritative answer when neither of the above applies.
+
+    Inference runs in ONE direction only. "Something was recovered, so recovery
+    ran" is sound. The inverse, "nothing was recovered, so assume we tried", is
+    the false negative this function exists to prevent: it is what produced a 0%
+    recovery rate reading as "your passwords are strong". So an unreadable gate
+    with nothing recovered answers False, never True.
+    """
+    if recovered_any:
+        return True
+    try:
+        from adscan_internal.services.cracking.local_nt_crack import (
+            local_nt_crack_completed,
+        )
+
+        if domain and local_nt_crack_completed(shell, domain):
+            return True
+    except Exception:  # noqa: BLE001 — unknown means do not claim an attempt
+        pass
+    try:
+        from adscan_internal.services.weakpass_service import weakpass_allowed
+
+        return bool(weakpass_allowed(shell))
+    except Exception:  # noqa: BLE001 — unknown means do not claim an attempt
+        return False
+
+
+def _build_password_hygiene_for_dump(
+    shell: Any,
+    *,
+    domain: str,
+    cracked_rows: list[dict[str, str]],
+    uncracked_rows: list[dict[str, str]],
+    high_value_usernames: Iterable[str] = (),
+) -> Any:
+    """Project the dump's rows onto the shared password-hygiene SSOT.
+
+    The rows already carry their graded ``privilege_tier``, so the grading is
+    reused rather than recomputed: this hands the derivation the per-account
+    tier, the orthogonal high-value flag and the attempt flag. Persisted and
+    rendered from the ONE block, so the operator panel, the telemetry emit and
+    the client deliverable read the same numbers.
+
+    An account whose row carries no tier is passed through as ungraded (absent
+    from the mapping), never as Tier 2.
+    """
+    from adscan_core.reporting.password_hygiene import build_password_hygiene
+    from adscan_internal.services.compromise_class import (
+        install_privilege_tier_label_provider,
+    )
+
+    # This is the AUTHORING seam, so it wires the tier-label owner here rather
+    # than depending on another layer having done it: the wording is resolved
+    # once and persisted with the block, and every surface downstream reads it
+    # verbatim without reaching the tier classifier.
+    install_privilege_tier_label_provider()
+
+    accounts: list[dict[str, Any]] = []
+    tier_by_username: dict[str, str] = {}
+    for row, recovered in ((r, True) for r in cracked_rows):
+        accounts.append(
+            {
+                "samaccountname": row.get("raw_user") or "",
+                "secret": row.get("raw_credential") or "",
+                "recovered": recovered,
+            }
+        )
+    for row in uncracked_rows:
+        accounts.append(
+            {
+                "samaccountname": row.get("raw_user") or "",
+                "secret": row.get("raw_credential") or "",
+                "recovered": False,
+            }
+        )
+    for row in [*cracked_rows, *uncracked_rows]:
+        user = str(row.get("raw_user") or "").strip()
+        tier = str(row.get("privilege_tier") or "").strip()
+        if user and tier:
+            tier_by_username[user] = tier
+
+    return build_password_hygiene(
+        accounts=accounts,
+        tier_by_username=tier_by_username,
+        high_value_usernames=high_value_usernames,
+        cracking_attempted=_dcsync_cracking_attempted(
+            shell, recovered_any=bool(cracked_rows), domain=domain
+        ),
+    )
+
+
+def _record_password_hygiene(shell: Any, domain: str, hygiene: Any) -> None:
+    """Persist the hygiene block so the deliverable and the web can read it.
+
+    Only ever persists a block that CARRIES figures. A run that attempted no
+    recovery writes nothing at all, which is what makes the absence structural:
+    a surface cannot render a conditional section it has no data for, so no
+    renderer has to remember a disclaimer.
+
+    The write itself goes through the shared persistence seam, which is also
+    where a background attack that finishes LATER folds its recoveries into this
+    same block, so the two writers cannot file the evidence differently.
+    """
+    try:
+        if not getattr(hygiene, "has_figures", False):
+            return
+        from adscan_internal.services.password_hygiene_persistence import (
+            persist_password_hygiene_details,
+        )
+
+        persist_password_hygiene_details(shell, domain, hygiene.as_dict())
+    except Exception as exc:  # noqa: BLE001 — a panel never fails over this
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def _render_dcsync_batch_cracking_summary(
     *,
     shell: Any,
@@ -470,7 +665,13 @@ def _render_dcsync_batch_cracking_summary(
         else:
             cracked_rows.append(row_base)
 
-    risk_map: dict[str, tuple[bool, bool]] = {}
+    # Grade every account by PRIVILEGE TIER, the canonical axis-1 taxonomy. An
+    # account the grading cannot place stays UNGRADED and reports as such: the
+    # panel used to collapse everything that was neither Tier-0 nor flagged
+    # high-value into "Standard", which reported server and application admins
+    # to the client as standard accounts.
+    tier_map: dict[str, str] = {}
+    high_value_normalized: set[str] = set()
 
     def normalize_user_for_lookup(value: str) -> str:
         return str(value or "").casefold()
@@ -478,39 +679,33 @@ def _render_dcsync_batch_cracking_summary(
     if user_values:
         try:
             from adscan_internal.services.high_value import (
-                classify_users_tier0_high_value,
+                classify_users_privilege_tier,
                 normalize_samaccountname,
             )
 
             normalize_user_for_lookup = normalize_samaccountname
-            resolved_risks = classify_users_tier0_high_value(
+            resolved_tiers = classify_users_privilege_tier(
                 shell, domain=domain, usernames=user_values
             )
-            risk_map = {
-                normalize_user_for_lookup(username): (
-                    bool(flags.is_tier0),
-                    bool(flags.is_high_value),
-                )
-                for username, flags in resolved_risks.items()
+            tier_map = {
+                normalize_user_for_lookup(username): str(flags.tier or "")
+                for username, flags in resolved_tiers.items()
+            }
+            high_value_normalized = {
+                normalize_user_for_lookup(username)
+                for username, flags in resolved_tiers.items()
+                if flags.is_high_value
             }
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_warning_debug(
-                f"[dcsync] Unable to classify cracked users by risk tier: {type(exc).__name__}"
+                f"[dcsync] Unable to grade cracked users by privilege tier: {type(exc).__name__}"
             )
 
-    def _classify_user(user_raw: str) -> tuple[bool, bool]:
-        normalized = normalize_user_for_lookup(user_raw)
-        return risk_map.get(normalized, (False, False))
-
-    def _risk_segment_for_user(user_raw: str) -> str:
-        is_tier0_user, is_high_value_user = _classify_user(user_raw)
-        if is_tier0_user:
-            return "Tier-0"
-        if is_high_value_user:
-            return "High-Value"
-        return "Standard"
+    def _tier_for_user(user_raw: str) -> str:
+        """The account's tier token, or the ungraded token when unresolved."""
+        return tier_map.get(normalize_user_for_lookup(user_raw)) or TIER_TOKEN_UNGRADED
 
     # Detect krbtgt in cracked list (golden ticket signal)
     krbtgt_cracked = any(
@@ -518,27 +713,70 @@ def _render_dcsync_batch_cracking_summary(
         for row in cracked_rows
     )
 
+    def _is_high_value(user_raw: str) -> bool:
+        return normalize_user_for_lookup(user_raw) in high_value_normalized
+
     for row in cracked_rows:
-        row["risk_segment"] = _risk_segment_for_user(row["raw_user"])
+        row["privilege_tier"] = _tier_for_user(row["raw_user"])
+        row["high_value"] = _is_high_value(row["raw_user"])
         row["User"] = mark_sensitive(str(row["raw_user"]), "user")
         row["Password"] = mark_sensitive(str(row["raw_credential"]), "password")
     for row in uncracked_rows:
-        row["risk_segment"] = _risk_segment_for_user(row["raw_user"])
+        row["privilege_tier"] = _tier_for_user(row["raw_user"])
+        row["high_value"] = _is_high_value(row["raw_user"])
         row["User"] = mark_sensitive(str(row["raw_user"]), "user")
         row["Hash"] = mark_sensitive(str(row["raw_credential"]), "password")
 
+    # The high-value flag travels on its own axis, so it is collected as the
+    # account names the derivation will fold, never merged into a tier.
+    high_value_users = [
+        str(row.get("raw_user") or "")
+        for row in [*cracked_rows, *uncracked_rows]
+        if row.get("high_value")
+    ]
+
+    # ── The hygiene SSOT, and the absence rule ───────────────────────────────
+    # Build the shared block FIRST, and bail out of the whole panel when it
+    # carries no figure. Without this the panel printed a 0% crack rate on a run
+    # where the operator declined the lookup and nothing was ever tested, which
+    # reads as "your passwords are strong": the dangerous false negative the
+    # Exposure-Validation doctrine forbids. The arithmetic alone yields 0.0
+    # whenever the cracked total is 0 against a non-zero extracted total, so
+    # guarding the rendered figure is not sufficient; the attempt has to be an
+    # input. Same block the telemetry emit and the client deliverable read, so
+    # the three cannot disagree about the client's own numbers.
+    hygiene = _build_password_hygiene_for_dump(
+        shell,
+        domain=domain,
+        cracked_rows=cracked_rows,
+        uncracked_rows=uncracked_rows,
+        high_value_usernames=high_value_users,
+    )
+    if not hygiene.has_figures:
+        print_info(
+            "Password recovery did not run for these hashes, so no recovery "
+            "figures are reported. The extracted material is in the credential "
+            "store."
+        )
+        return
+
     cracked_total = len(cracked_rows)
     uncracked_total = len(uncracked_rows)
+    # The per-tier figures come from the block the client's deliverable reads,
+    # not from a second Counter walk over the rows, so the panel and the report
+    # cannot disagree about the same numbers.
+    hygiene_segments = [segment.as_dict() for segment in hygiene.segments]
     extracted_by_segment = Counter(
-        row["risk_segment"] for row in [*cracked_rows, *uncracked_rows]
+        {str(s["tier"]): int(s["extracted"]) for s in hygiene_segments}
     )
-    cracked_by_segment = Counter(row["risk_segment"] for row in cracked_rows)
-    tier0_extracted = int(extracted_by_segment.get("Tier-0", 0))
-    high_value_extracted = int(extracted_by_segment.get("High-Value", 0))
-    standard_extracted = int(extracted_by_segment.get("Standard", 0))
-    tier0_cracked = int(cracked_by_segment.get("Tier-0", 0))
-    high_value_cracked = int(cracked_by_segment.get("High-Value", 0))
-    standard_cracked = int(cracked_by_segment.get("Standard", 0))
+    cracked_by_segment = Counter(
+        {str(s["tier"]): int(s["recovered"]) for s in hygiene_segments}
+    )
+    tier0_rollup = hygiene.tier0_segment
+    tier0_extracted = int(tier0_rollup.extracted) if tier0_rollup else 0
+    tier0_cracked = int(tier0_rollup.recovered) if tier0_rollup else 0
+    high_value_extracted = int(hygiene.high_value_extracted)
+    high_value_cracked = int(hygiene.high_value_recovered)
 
     def _format_count_and_percent(count: int, denominator: int) -> str:
         if denominator <= 0:
@@ -570,6 +808,10 @@ def _render_dcsync_batch_cracking_summary(
 
     total = len(cracked_rows) + len(uncracked_rows)
 
+    # Persist the SAME block the panel just gated on, so the client deliverable
+    # and the web CTEM read the operator's numbers rather than deriving their own.
+    _record_password_hygiene(shell, domain, hygiene)
+
     _capture_dcsync_batch_cracking_summary_telemetry(
         shell,
         domain=domain,
@@ -580,8 +822,8 @@ def _render_dcsync_batch_cracking_summary(
         tier0_cracked=tier0_cracked,
         high_value_extracted=high_value_extracted,
         high_value_cracked=high_value_cracked,
-        standard_extracted=standard_extracted,
-        standard_cracked=standard_cracked,
+        extracted_by_tier=extracted_by_segment,
+        cracked_by_tier=cracked_by_segment,
         cracked_reuse_groups=cracked_reuse_groups,
         uncracked_reuse_groups=uncracked_reuse_groups,
     )
@@ -613,18 +855,50 @@ def _render_dcsync_batch_cracking_summary(
         extracted: int,
     ) -> _RichText:
         line = _RichText()
-        seg_filled = round((cracked / extracted) * 20) if extracted > 0 else 0
-        seg_bar = "█" * seg_filled + "░" * (20 - seg_filled)
+        # The bar is narrower than it was because the label beside it is now the
+        # canonical tier wording, which is longer than the three words it
+        # replaced. The wording is the SSOT's and is never abbreviated here.
+        width = 14
+        seg_filled = round((cracked / extracted) * width) if extracted > 0 else 0
+        seg_bar = "█" * seg_filled + "░" * (width - seg_filled)
         crack_rate = f"{(cracked / extracted * 100):.0f}%" if extracted > 0 else "—"
-        line.append(f"  {label:<14}", style=label_style)
+        line.append(f"  {label:<38}", style=label_style)
         line.append(f"  {cracked}/{extracted}", style=f"bold {label_style}")
         line.append(f"  [{seg_bar}]", style=MUTED)
         line.append(f"  {crack_rate}", style=label_style)
         return line
 
-    tier0_line = _tier_summary_line("Tier-0", LAVA, tier0_cracked, tier0_extracted)
-    hv_line = _tier_summary_line("High-Value", AMBER, high_value_cracked, high_value_extracted)
-    std_line = _tier_summary_line("Standard", MUTED, standard_cracked, standard_extracted)
+    # One line per tier that HAS accounts, worst first, labelled by the ONE
+    # owner of the tier wording. A tier with nothing in it is not drawn: a row
+    # reading "0/0 —" is what the removed high-value bucket contributed.
+    _TIER_LINE_STYLES = {
+        TIER_TOKEN_TIER0_DIRECT: LAVA,
+        TIER_TOKEN_TIER0_ESCALATION_CAPABLE: AMBER,
+        TIER_TOKEN_TIER1: ICE_BLUE,
+        TIER_TOKEN_TIER2: MUTED,
+        TIER_TOKEN_UNGRADED: GHOST,
+    }
+    tier_lines = [
+        _tier_summary_line(
+            str(segment.get("label") or segment.get("tier") or ""),
+            _TIER_LINE_STYLES.get(str(segment.get("tier") or ""), MUTED),
+            int(segment.get("recovered") or 0),
+            int(segment.get("extracted") or 0),
+        )
+        for segment in hygiene_segments
+        if int(segment.get("extracted") or 0) > 0
+    ]
+    # The orthogonal axis gets its own line, below the tiers and visibly apart,
+    # because a high-value account is already counted in its tier above.
+    if high_value_extracted > 0:
+        tier_lines.append(
+            _tier_summary_line(
+                "High-value (any tier)",
+                AMBER,
+                high_value_cracked,
+                high_value_extracted,
+            )
+        )
 
     # ------------------------------------------------------------------
     # CRACKED / UNCRACKED / REUSED section headers
@@ -658,18 +932,27 @@ def _render_dcsync_batch_cracking_summary(
     if krbtgt_cracked:
         top_value_user = "krbtgt"
         top_value_style = LAVA
-    elif tier0_cracked > 0:
-        for row in cracked_rows:
-            if row.get("risk_segment") == "Tier-0":
-                top_value_user = str(row.get("raw_user") or "")
-                top_value_style = AMBER
-                break
-    elif high_value_cracked > 0:
-        for row in cracked_rows:
-            if row.get("risk_segment") == "High-Value":
-                top_value_user = str(row.get("raw_user") or "")
-                top_value_style = ICE_BLUE
-                break
+    else:
+        # The most privileged recovered account, by tier rank. An ungraded
+        # account never wins the slot: it is not evidence of privilege.
+        ranked = sorted(
+            (
+                row
+                for row in cracked_rows
+                if str(row.get("privilege_tier") or "")
+                in (
+                    TIER_TOKEN_TIER0_DIRECT,
+                    TIER_TOKEN_TIER0_ESCALATION_CAPABLE,
+                    TIER_TOKEN_TIER1,
+                )
+            ),
+            key=lambda row: privilege_tier_token_rank(row.get("privilege_tier")),
+        )
+        if ranked:
+            top_value_user = str(ranked[0].get("raw_user") or "")
+            top_value_style = (
+                LAVA if token_is_tier0(ranked[0].get("privilege_tier")) else ICE_BLUE
+            )
 
     if top_value_user:
         top_value_line.append("  Top value  ", style=MUTED)
@@ -683,9 +966,7 @@ def _render_dcsync_batch_cracking_summary(
         _RichText(""),
         _RichText("─" * 48, style=GHOST),
         _RichText(""),
-        tier0_line,
-        hv_line,
-        std_line,
+        *tier_lines,
         _RichText(""),
         _RichText("─" * 48, style=GHOST),
         _RichText(""),
@@ -757,14 +1038,23 @@ def _render_dcsync_batch_cracking_summary(
         cracked_preview_limit = cracked_preview_default
 
     if cracked_rows:
+        # One row per tier that has accounts, so the Extracted column sums to
+        # the extracted total and the table reconciles. The ungraded row is a
+        # real row: those accounts exist and the assessment could not place
+        # them, which is a gap to close rather than a reason to call them
+        # standard.
         segment_breakdown_rows = []
-        for segment in ("Tier-0", "High-Value", "Standard"):
-            extracted_count = int(extracted_by_segment.get(segment, 0))
-            cracked_count = int(cracked_by_segment.get(segment, 0))
+        for segment in hygiene_segments:
+            extracted_count = int(segment.get("extracted") or 0)
+            if extracted_count <= 0:
+                continue
+            cracked_count = int(segment.get("recovered") or 0)
             uncracked_count = max(extracted_count - cracked_count, 0)
             segment_breakdown_rows.append(
                 {
-                    "Segment": segment,
+                    "Privilege Tier": str(
+                        segment.get("label") or segment.get("tier") or ""
+                    ),
                     "Extracted": str(extracted_count),
                     "Cracked": str(cracked_count),
                     "Uncracked": str(uncracked_count),
@@ -775,7 +1065,7 @@ def _render_dcsync_batch_cracking_summary(
         print_info_table(
             segment_breakdown_rows,
             [
-                "Segment",
+                "Privilege Tier",
                 "Extracted",
                 "Cracked",
                 "Uncracked",
@@ -820,17 +1110,21 @@ def _render_dcsync_batch_cracking_summary(
             key=lambda item: (-len(item[1]), str(item[0]).casefold()),
         )
         for secret_value, rows in ordered[:5]:
-            segment_counts = Counter(
-                str(row.get("risk_segment") or "Standard") for row in rows
+            # The most privileged tier the cluster touches, named. Three count
+            # columns said how many accounts were inside Tier 0 without saying
+            # whether one of them controls the domain or is one technique away
+            # from it, which is the difference between a critical finding and a
+            # high one.
+            top_tier = highest_privilege_tier_token(
+                str(row.get("privilege_tier") or "") for row in rows
             )
             reuse_rows.append(
                 {
                     "Secret Type": secret_label,
                     "Secret": mark_sensitive(str(secret_value), "password"),
                     "Accounts": str(len(rows)),
-                    "Tier-0": str(segment_counts.get("Tier-0", 0)),
-                    "High-Value": str(segment_counts.get("High-Value", 0)),
-                    "Standard": str(segment_counts.get("Standard", 0)),
+                    "Highest Tier": privilege_tier_label_for_token(top_tier)
+                    or top_tier,
                 }
             )
 
@@ -840,7 +1134,7 @@ def _render_dcsync_batch_cracking_summary(
     if reuse_rows:
         print_info_table(
             reuse_rows,
-            ["Secret Type", "Secret", "Accounts", "Tier-0", "High-Value", "Standard"],
+            ["Secret Type", "Secret", "Accounts", "Highest Tier"],
             title="Top Reused Secrets",
         )
 
@@ -944,7 +1238,10 @@ def execute_dcsync_native(
         ``{"krbtgt": bool, "tier0_count": int, "total": int}`` summarising
         what was extracted, so callers (notably the attack-graph step
         executor) can decide whether the DCSync edge should be marked as
-        ``success`` or ``failed``.
+        ``success`` or ``failed``. An empty result additionally carries
+        ``vantage_unreachable``: ``True`` when the replication port range never
+        answered, so the caller states the real cause instead of blaming the
+        acting principal's rights for a transport it never had.
 
 
     Streams DRSUAPI secrets via the native dump service and runs the standard
@@ -1399,6 +1696,28 @@ def execute_dcsync_native(
         _stream_errors_lower = " ".join(_stream_error_types).lower()
         _is_network_block = "timeout" in _stream_errors_lower
         if _is_network_block:
+            # Client-facing coverage declaration. This is the ONE seam that
+            # observed the dynamic range stay silent, so it is where the record
+            # belongs. It is NOT a configuration close: what was measured is
+            # ADscan's own reach, not the DC's filtering policy, and the
+            # replication rights the step rested on were read from the directory
+            # and stand regardless. Without this the client reads a failed
+            # replication attempt as reassurance. SSOT:
+            # adscan_core.reporting.vantage_coverage.
+            from adscan_core.reporting.vantage_coverage import PROTOCOL_DRSUAPI
+            from adscan_internal.services.vantage_coverage_recording import (
+                record_unexercisable_privilege,
+            )
+
+            record_unexercisable_privilege(
+                shell,
+                domain,
+                protocol=PROTOCOL_DRSUAPI,
+                holder=username,
+                host=pdc_hostname or pdc_ip or "",
+                reachable_ports="135",
+                unreachable_ports="49152-65535",
+            )
             # tui-design: semantic color + glyph — amber ⚠ (network constraint)
             # not crimson ✗ (permission error). Contextual intelligence: distinguish
             # "not an ADscan bug" from "operator needs to fix rights".
@@ -1466,7 +1785,20 @@ def execute_dcsync_native(
         _offer_machine_account_dump_fallback(
             shell, domain, failure_reason=_no_cred_reason
         )
-        return {"krbtgt": False, "tier0_count": 0, "total": 0}
+        # ``vantage_unreachable`` tells the calling attack step WHY nothing came
+        # back. Without it the step's only honest-looking reading of an empty
+        # result is "the acting principal lacks replication rights", which is
+        # false when the replication port range was never reachable, and which
+        # would be recorded as the step's cause.
+        return {
+            "krbtgt": False,
+            "tier0_count": 0,
+            "total": 0,
+            "vantage_unreachable": bool(
+                errors_seen > 0
+                and "timeout" in " ".join(_stream_error_types).lower()
+            ),
+        }
 
     # ------------------------------------------------------------------ #
     # 3. Post-processing pipeline (credential persistence + cracking + display)

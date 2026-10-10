@@ -198,7 +198,7 @@ def _build_headline_path(shell: Any, domain: str) -> "Any | None":
 
 
 # How many collapsed capability nodes the recap surfaces. The recap is a
-# digest — the full list lives in ``adscan attack_paths`` — so a tight cap keeps
+# digest — the full list lives in the ``attack_paths`` REPL command — so a tight cap keeps
 # the highest-value blast-radius findings front-and-center.
 _RECAP_FANOUT_MAX: int = 3
 

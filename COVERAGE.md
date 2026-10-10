@@ -19,7 +19,7 @@ catalog and regenerate.
 
 <!-- BEGIN GENERATED: technique-inventory -->
 
-**104 techniques** across 15 categories · 71 executed end to end · AD CS ESC1–ESC17 · 79 reported finding types.
+**107 techniques** across 15 categories · 75 executed end to end · AD CS ESC1–ESC17 · 93 reported finding types.
 
 ### ACL / ACE Abuse (18)
 
@@ -43,7 +43,7 @@ catalog and regenerate.
 | Write SPN | Set SPN to force kerberoastable ticket generation | Executed | [T1558.003](https://attack.mitre.org/techniques/T1558/003/) |
 | WriteDACL | Rewrite ACLs to grant further privileges | Executed | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) |
 | WriteOwner | Take ownership to unlock privilege escalation | Executed | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) |
-### AD CS — Certificate Services (17)
+### AD CS — Certificate Services (18)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
@@ -63,6 +63,7 @@ catalog and regenerate.
 | AD CS ESC7 | ADCS ESC7 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC8 | ADCS ESC8 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | AD CS ESC9 | ADCS ESC9 privilege escalation path | Executed | [T1649](https://attack.mitre.org/techniques/T1649/) |
+| Certighost (AD CS Chase-Fallback DC Impersonation) | Certighost (CVE-2026-54121): the certificate authority chase fallback trusts a requester-supplied domain controller, letting a standard user obtain a certificate that authenticates as a domain controller | Detected | [T1649](https://attack.mitre.org/techniques/T1649/) |
 | Coerce and Relay NTLM to AD CS (ESC8) | Coerce NTLM authentication and relay it to ADCS endpoints | Executed | [T1187](https://attack.mitre.org/techniques/T1187/) |
 ### Authentication Coercion (3)
 
@@ -75,8 +76,8 @@ catalog and regenerate.
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
-| MSSQL OPENROWSET Bulk Read | SQL Server can read the raw content of any file the SQL Server service account can access on its host, without executing a single operating-system command. Any principal holding ADMINISTER BULK OPERATIONS — sysadmin, the bulkadmin fixed server role, an explicit grant, or a linked-server login mapping that lands on the same permission remotely — can pull configuration files, backup files, and scripts off the host and recover any credentials or connection strings stored in them. | Executed | [T1005](https://attack.mitre.org/techniques/T1005/) |
-### Credential Access (15)
+| MSSQL OPENROWSET Bulk Read | SQL Server can read the raw content of any file the SQL Server service account can access on its host, without executing a single operating-system command. Any principal holding ADMINISTER BULK OPERATIONS (sysadmin, the bulkadmin fixed server role, an explicit grant, or a linked-server login mapping that lands on the same permission remotely) can pull configuration files, backup files, and scripts off the host and recover any credentials or connection strings stored in them. | Executed | [T1005](https://attack.mitre.org/techniques/T1005/) |
+### Credential Access (16)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
@@ -93,29 +94,30 @@ catalog and regenerate.
 | MSSQL NetNTLMv2 Theft | A SQL sysadmin (or any user with EXECUTE rights on xp_dirtree / xp_fileexist) can force the SQL Server service account to authenticate to an attacker-controlled SMB share, capturing its NTLMv2 response hash. If the service account is a domain user, the hash can be cracked offline or relayed to authenticate as that account on other network resources. | Executed | [T1557.001](https://attack.mitre.org/techniques/T1557/001/) |
 | RODC krbtgt Secret Extraction | Extract the per-RODC krbtgt secret from the compromised RODC | Executed | [T1003](https://attack.mitre.org/techniques/T1003/) |
 | Readable Share | Principal has read access to a network SMB share | Executed | [T1039](https://attack.mitre.org/techniques/T1039/) |
+| SAM Database Extraction | Local account hash extraction from the SAM database | Executed | [T1003.002](https://attack.mitre.org/techniques/T1003/002/) |
 | Shadow Credentials Present | Existing shadow credentials allow PKINIT authentication and NT hash retrieval | Executed | [T1606.002](https://attack.mitre.org/techniques/T1606/002/) |
 | Timeroasting | Offline crack MS-SNTP challenge material from machine accounts | Executed | [T1110.002](https://attack.mitre.org/techniques/T1110/002/) |
 ### Delegation Abuse (4)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
-| Coercion to TGT (Unconstrained Delegation) | Coerce a target into providing a usable TGT for delegation abuse | Detected | [T1187](https://attack.mitre.org/techniques/T1187/) |
 | Constrained Delegation | Abuse AllowedToDelegate paths to impersonate users to delegated services | Executed | [T1558](https://attack.mitre.org/techniques/T1558/) |
 | Resource-Based Constrained Delegation (inbound) | Resource-based constrained delegation attack path | Executed | [T1134.001](https://attack.mitre.org/techniques/T1134/001/) |
 | SPN-Jacking | Compromise a computer by hijacking a delegated SPN: move the SPN the principal can delegate to onto the target computer, then abuse constrained delegation (S4U) with protocol transition to mint a service ticket against the target as a privileged user | Executed | [T1558.003](https://attack.mitre.org/techniques/T1558/003/) |
+| Unconstrained Delegation | A non-domain-controller account is trusted for unconstrained Kerberos delegation, so it caches the forwardable ticket of every user that authenticates to it | Detected | [T1558](https://attack.mitre.org/techniques/T1558/) |
 ### Execution (1)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
-| xp_cmdshell Execution | The SQL Server service can execute operating-system commands on its host when a session holds sysadmin. Any principal that reaches sysadmin on the instance — a direct sysadmin login, or a linked-server login mapping that lands as a sysadmin login on the remote instance — can therefore run commands on the host as the SQL Server service account, a full host code-execution capability. | Executed | [T1059](https://attack.mitre.org/techniques/T1059/) |
+| xp_cmdshell Execution | The SQL Server service can execute operating-system commands on its host when a session holds sysadmin. Any principal that reaches sysadmin on the instance (a direct sysadmin login, or a linked-server login mapping that lands as a sysadmin login on the remote instance) can therefore run commands on the host as the SQL Server service account, a full host code-execution capability. | Executed | [T1059](https://attack.mitre.org/techniques/T1059/) |
 ### Initial Access (9)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
 | Anonymous LDAP Bind | Anonymous LDAP bind entry vector | Detected | [T1087.002](https://attack.mitre.org/techniques/T1087/002/) |
 | Blank Password | Blank-password entry vector | Executed | [T1110.001](https://attack.mitre.org/techniques/T1110/001/) |
-| Credentials in User Description | Credentials recovered from LDAP user description fields | Detected | [T1087.002](https://attack.mitre.org/techniques/T1087/002/) |
-| Group Policy Preferences Password | Credentials recovered from Group Policy Preferences artifacts | Detected | [T1552.006](https://attack.mitre.org/techniques/T1552/006/) |
+| Credentials in User Description | Credentials recovered from LDAP user description fields | Executed | [T1087.002](https://attack.mitre.org/techniques/T1087/002/) |
+| Group Policy Preferences Password | Credentials recovered from Group Policy Preferences artifacts | Executed | [T1552.006](https://attack.mitre.org/techniques/T1552/006/) |
 | Password Spraying | Password spraying entry vector | Executed | [T1110.003](https://attack.mitre.org/techniques/T1110/003/) |
 | Password in File | Credentials discovered in host filesystem artifacts after service access | Detected | [T1552.001](https://attack.mitre.org/techniques/T1552/001/) |
 | Password in Share | Credentials discovered in SMB share content | Detected | [T1552.001](https://attack.mitre.org/techniques/T1552/001/) |
@@ -177,13 +179,14 @@ catalog and regenerate.
 | MSSQL Token Theft Escalation | Even when SeImpersonatePrivilege has been removed from the SQL Server process token (a common hardening measure), the original service startup token stored in LSASS retains the privilege. A CLR stored procedure recovers this token via SMB loopback named pipe authentication (Forshaw shared logon session technique) and escalates to NT AUTHORITY\SYSTEM. This bypass is architectural. Removing the privilege from the process token is insufficient. | Executed | [T1134.001](https://attack.mitre.org/techniques/T1134/001/) |
 | Print Operators Abuse | Potential escalation path unlocked by Print Operators membership | Detected | [T1547.006](https://attack.mitre.org/techniques/T1547/006/) |
 | Privileged Group Control | Direct control achieved through membership in a terminal privileged group | Detected | [T1098](https://attack.mitre.org/techniques/T1098/) |
-| Privileged Session Abuse | High-value user session observed on a non-Tier-0 computer that can be abused for scheduled-task impersonation | Executed | [T1053.005](https://attack.mitre.org/techniques/T1053/005/) |
+| Privileged Session Abuse | A higher-tier account has a logon session on a lower-tier host (a tiered-admin violation), exposing its credential for scheduled-task impersonation or credential theft once the host is locally compromised | Executed | [T1053.005](https://attack.mitre.org/techniques/T1053/005/) |
 | RODC Credential Caching | Prepare RODC credential caching by modifying the RODC password-replication policy | Executed | [T1098](https://attack.mitre.org/techniques/T1098/) |
 | Scheduled Task Execution | Impersonate a logged-on user by registering a scheduled task whose principal is that user's interactive logon session | Executed | [T1053.005](https://attack.mitre.org/techniques/T1053/005/) |
-### Trust Abuse (1)
+### Trust Abuse (2)
 
 | Technique | What ADscan does | Status | MITRE ATT&CK |
 |---|---|---|---|
+| Child-to-Forest-Root Escalation | Escalate from a compromised child domain to the forest root by forging an inter-realm ticket carrying the forest-root privileged SID history, using the shared forest trust key | Executed | [T1134.005](https://attack.mitre.org/techniques/T1134/005/) |
 | Cross-Forest TGT Delegation | Escalate across a forest trust into the trusting forest by abusing cross-organization Kerberos TGT delegation: a forwardable ticket-granting ticket from the trusting forest is delegated across the trust boundary and can be captured from a compromised trusted forest | Executed | [T1558](https://attack.mitre.org/techniques/T1558/) |
 
 <!-- END GENERATED: technique-inventory -->

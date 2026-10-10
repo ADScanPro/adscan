@@ -1,4 +1,4 @@
-"""Inspection panel for the ``adscan posture show`` command.
+"""Inspection panel for the ``posture show`` REPL command.
 
 Pure renderer over :class:`DomainPosture` snapshots. Builds a single Rich
 :class:`~rich.panel.Panel` with up to four sections (Stale, Hardening,
@@ -200,7 +200,7 @@ def render_posture_show(
             pieces.append(row)
         hint = Text()
         hint.append("    Re-probe to refresh: ", style="dim")
-        hint.append(f"adscan posture probe {domain}", style="bold")
+        hint.append(f"posture probe {domain}", style="bold")
         pieces.append(hint)
         pieces.append(Text())
 
@@ -258,11 +258,11 @@ def render_posture_show(
     # Footer hints.
     reprobe = Text()
     reprobe.append("Re-probe:  ", style="dim")
-    reprobe.append(f"adscan posture probe {domain}", style="bold")
+    reprobe.append(f"posture probe {domain}", style="bold")
     pieces.append(reprobe)
     clear = Text()
     clear.append("Clear:     ", style="dim")
-    clear.append(f"adscan posture clear {domain}", style="bold")
+    clear.append(f"posture clear {domain}", style="bold")
     pieces.append(clear)
 
     # Border palette: yellow if stale, green if hardening, dim otherwise.
@@ -299,7 +299,7 @@ def _render_empty(*, title: str, domain: str) -> Panel:
     )
     cmd = Text()
     cmd.append("  ")
-    cmd.append(f"adscan posture probe {domain}", style="bold")
+    cmd.append(f"posture probe {domain}", style="bold")
     pieces.append(cmd)
     return Panel(
         Padding(Group(*pieces), (1, 2)),

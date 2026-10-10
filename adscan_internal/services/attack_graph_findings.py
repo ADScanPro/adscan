@@ -41,7 +41,7 @@ from __future__ import annotations
 import os
 import uuid
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 from adscan_core.reporting.technical_report import (
     ReportShell,
@@ -64,10 +64,14 @@ from adscan_internal.reporting_compat import load_optional_pro_attr
 from adscan_internal.services.attack_step_catalog import (
     classify_edge_relation,
     finding_basis_for_relation,
+    source_tier_gated_for_relation,
 )
 from adscan_internal.services.compromise_class import (
     CompromiseClass,
+    esae_tier_number,
     is_direct_domain_breaker_target,
+    node_is_tier0_by_stamped_label,
+    node_stamped_privilege_tier,
 )
 from adscan_internal.services.destructive_action_policy import non_execution_statement
 from adscan_internal.services.domain_controller_classifier import (
@@ -86,6 +90,15 @@ from adscan_internal.services.severity import (
 #: Mirrors the default ``shell.domains_dir`` and the report-path convention in
 #: :mod:`adscan_internal.services.report_attack_paths`.
 _DOMAINS_DIRNAME = "domains"
+
+#: Synthetic ``properties.domain`` placeholder a graph node carries for a
+#: built-in / well-known-SID principal (Everyone, BUILTIN\\Administrators,
+#: Domain Users, ...). A WELLKNOWN principal is LOCAL — never a foreign forest —
+#: so its domain is unresolvable as a REAL domain yet must count as same-forest
+#: with any resolvable endpoint. Single spelling shared by
+#: :func:`_node_report_domain` and :func:`_node_is_synthetic_wellknown`; never
+#: hardcode a second copy.
+_WELLKNOWN_DOMAIN_SENTINEL = "wellknown"
 
 _PRO_CATALOG_PROVIDER_RESOLVED = False
 
@@ -144,6 +157,12 @@ def _summarize_attack_graph_edge_notes(notes: Any) -> dict[str, Any]:
         "vulnerable_resources",
         "template_used_for_run",
         "template_dn",
+        # ESC14 variant A carries no vulnerable SAN-UPN template — instead an
+        # honest marker of the client-auth enrollment path the attacker uses to
+        # obtain its own certificate (e.g. a Machine template via
+        # MachineAccountQuota). Preserve it so the finding names the real
+        # enrollment vehicle rather than leaving the template blank.
+        "esc14a_enroll_path",
         # Roasting / share-secret specifics: the cracking attempts (wordlist),
         # the share path and host where a secret was recovered, the SYSVOL
         # artifact. Preserved so the same weaver names them per instance.
@@ -173,6 +192,40 @@ def _summarize_attack_graph_edge_notes(notes: Any) -> dict[str, Any]:
     return summarized
 
 
+def _node_tier_zero_flagged(node: Any) -> bool:
+    """Return whether a graph node is Tier-0 by its PRIVILEGE GRADE.
+
+    The ONE authority in this module for "does this object's own privilege put
+    it in Tier 0". It reads, in order:
+
+    1. The stamped, membership+ACL-aware ``privilege_tier`` label
+       (:func:`~adscan_internal.services.compromise_class.node_is_tier0_by_stamped_label`)
+       — the SSOT, written post-graph from the transitive group closure, so a
+       principal that is Tier 0 only THROUGH group membership (Backup Operators,
+       Account Operators, Exchange Windows Permissions with a per-install RID) or
+       through a reconciled ACL grant resolves here.
+    2. The LEGACY raw ``isTierZero`` / ``highvalue`` booleans (top level and
+       under ``properties``) as a FALLBACK ONLY. The collector writes them before
+       the graph exists and gates them on a RID/SID allow-list, so they
+       legitimately read ``False`` for every membership-derived Tier 0 — they are
+       never the authority. Keeping them means a node with no stamp (an older
+       graph) resolves exactly as it did before, making this read a strict
+       SUPERSET: it can only ADD a correct Tier-0 promotion, never drop one.
+
+    A node with no stamp AND no legacy flag is NOT Tier 0: an ungraded or
+    indeterminate object must never be elevated, because a false Tier-0 claim in
+    a client report is an overclaim (``CLAUDE.md`` § Exposure Validation).
+    """
+    if not isinstance(node, dict):
+        return False
+    if node_is_tier0_by_stamped_label(node):
+        return True
+    if bool(node.get("isTierZero")) or bool(node.get("highvalue")):
+        return True
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return bool(props.get("isTierZero")) or bool(props.get("highvalue"))
+
+
 def _stamp_attack_graph_context_into_details(
     details: dict[str, Any],
     nodes_map: dict[str, Any],
@@ -189,8 +242,15 @@ def _stamp_attack_graph_context_into_details(
 
     This stamps, using ONLY the metadata already present on the graph nodes/edges
     (no re-tiering), the keys the calculator reads:
-      * ``tier_zero_accounts`` (list[str]) — target labels that are Tier-0 /
-        high-value / domain objects.
+      * ``tier_zero_accounts`` (list[str]) — target labels that are Tier-0,
+        graded through :func:`_node_tier_zero_flagged`: the stamped
+        membership+ACL-aware ``privilege_tier`` SSOT first, the legacy
+        ``isTierZero`` / ``highvalue`` booleans only as a fallback. This runs for
+        EVERY finding key, so a finding whose target is Tier 0 through group
+        membership alone (Backup Operators, Account Operators, Exchange Windows
+        Permissions) elevates like any other — it used to read the legacy
+        boolean, which is ``False`` for exactly those principals, so Tier-0
+        elevation under-fired across the catalog.
       * ``dc_hosts`` (list[str]) — target labels that are Domain Controllers.
       * ``exploitation_confirmed`` (bool) — any edge with a success status.
 
@@ -223,9 +283,11 @@ def _stamp_attack_graph_context_into_details(
             continue
         label = _label(node, str(edge.get("to") or ""))
 
-        # Tier-0 / high-value / domain object — reuse the metadata the graph
-        # builder already stamped (isTierZero / highvalue), never recompute.
-        if bool(node.get("isTierZero")) or bool(node.get("highvalue")):
+        # Tier-0 / high-value object — graded through the module's single tier
+        # authority, which consults the stamped membership+ACL-aware
+        # ``privilege_tier`` SSOT first and only falls back to the legacy
+        # ``isTierZero`` / ``highvalue`` booleans. Never re-tiers.
+        if _node_tier_zero_flagged(node):
             _append_unique(tier_zero_targets, label)
 
         # Domain Controller — alias/role-aware classification of Computer nodes
@@ -241,57 +303,420 @@ def _stamp_attack_graph_context_into_details(
         details["exploitation_confirmed"] = True
 
 
-# Relations that are a real misconfiguration finding ONLY when the holder is a
-# NON-breaker principal. When the holder/source IS a direct domain breaker
-# (Domain Admins, Enterprise Admins, BUILTIN\Administrators, Domain Controllers,
-# krbtgt, the domain object, DC computer accounts) the right is held BY DESIGN —
-# surfacing it as a vulnerability is a false positive that erodes trust in front
-# of a customer. The attack-graph EDGE is always preserved (the kill-chain /
-# attack-path materialization still needs it); only the FINDING materialization
-# is suppressed for breaker-held instances.
-#
-# Keyed by the lowercased edge ``relation`` so the set is trivially extensible to
-# any other "legitimate-when-held-by-a-breaker" relation the same FP class
-# applies to. Add the relation string here; the suppression logic below needs no
-# change.
-_BREAKER_HELD_LEGITIMATE_RELATIONS: frozenset[str] = frozenset({"dcsync"})
+def _node_report_domain(node: Any) -> str:
+    """Return a graph node's lowercased home domain, or ``""`` when unresolvable.
+
+    Reads ``properties.domain`` first (populated on ~every node kind, including
+    ``CertTemplate`` / ``EnterpriseCA``), then a top-level ``domain`` fallback.
+    The synthetic ``"wellknown"`` placeholder is treated as unresolvable so it
+    can never be used as a real domain to prove a same-forest relationship.
+    """
+    if not isinstance(node, dict):
+        return ""
+    domain = ""
+    props = node.get("properties")
+    if isinstance(props, dict):
+        domain = str(props.get("domain") or "").strip().lower()
+    if not domain:
+        domain = str(node.get("domain") or "").strip().lower()
+    if domain in ("", _WELLKNOWN_DOMAIN_SENTINEL):
+        return ""
+    return domain
 
 
-def _is_breaker_held_legitimate_edge(
+def _node_is_synthetic_wellknown(node: Any) -> bool:
+    """Return whether a node is a SYNTHETIC well-known-SID principal.
+
+    The collector materialises ONE shared synthetic node per well-known SID
+    (``collector/well_known_sids.py::_make_well_known_node``): top-level
+    ``domain == "WELLKNOWN"`` and ``properties`` carrying ``synthetic`` /
+    ``well_known_sid`` True. A well-known SID has no home domain of its own — it
+    is evaluated LOCALLY in the security context of the object the right is on —
+    so it is never a foreign forest. Detected by the robust property flags
+    first, falling back to the ``_WELLKNOWN_DOMAIN_SENTINEL`` domain spelling
+    :func:`_node_report_domain` already special-cases, so the two never diverge.
+    DISTINCT from a genuinely MISSING domain (empty / absent, no flags), which
+    stays unresolvable and must fail OPEN.
+    """
+    if not isinstance(node, dict):
+        return False
+    props = node.get("properties")
+    if isinstance(props, dict) and (
+        bool(props.get("well_known_sid")) or bool(props.get("synthetic"))
+    ):
+        return True
+    domain = ""
+    if isinstance(props, dict):
+        domain = str(props.get("domain") or "").strip().lower()
+    if not domain:
+        domain = str(node.get("domain") or "").strip().lower()
+    return domain == _WELLKNOWN_DOMAIN_SENTINEL
+
+
+def _source_effective_domain_for_edge(source_node: Any, target_node: Any) -> str:
+    """Return the SOURCE principal's EFFECTIVE domain for a tier-gated edge.
+
+    A tier-gated exploitation edge (ACL / control: GenericAll / WriteDACL /
+    DCSync / an ADCS ESC) is evaluated in the security context of the object the
+    right sits ON — the edge's TARGET object. So a SYNTHETIC well-known-SID
+    source (one shared node reused across every domain, so it may carry edges to
+    targets in DIFFERENT domains/forests) has no home domain of its own; its
+    effective domain for THIS edge is the target object's domain. The ladder:
+
+    1. The source carries its OWN resolvable real domain (any non-synthetic
+       node, or a future per-domain well-known materialisation) → use it. This
+       is what keeps a GENUINE cross-forest edge firing.
+    2. Else the source is a synthetic well-known node → anchor to the edge's
+       TARGET-object domain (:func:`_node_report_domain`), the context the SID is
+       evaluated in. (When the target is itself unresolvable this yields ``""``,
+       so the caller fails OPEN — an unanchorable synthetic edge is kept.)
+    3. Else a genuinely-missing (non-well-known) domain → ``""``; the caller
+       fails OPEN (keep).
+    """
+    real = _node_report_domain(source_node)
+    if real:
+        return real
+    if _node_is_synthetic_wellknown(source_node):
+        return _node_report_domain(target_node)
+    return ""
+
+
+def _domains_linked_within_forest(
+    source_domain: str,
+    target_domain: str,
+    domains_data: Any,
+) -> bool:
+    """Return whether a ``WITHIN_FOREST`` trust links the two domains (either way).
+
+    Reads the trust SSOT ``domains_data[<d>]["trusts"]`` exactly as
+    :func:`attack_graph_core._iter_within_forest_child_parent` does — a trust
+    entry matching the partner on ``target_domain`` with the ``WITHIN_FOREST``
+    bit in its ``attribute_flags``. A ``FOREST_TRANSITIVE`` / ``CROSS_ORGANIZATION``
+    / external / absent trust is therefore NOT a same-forest proof. Fail-closed:
+    no usable trust data → ``False`` (keep the finding).
+    """
+    if not isinstance(domains_data, dict):
+        return False
+
+    def _has_within_forest(entry: Any, partner: str) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        for trust in entry.get("trusts") or ():
+            if not isinstance(trust, dict):
+                continue
+            tgt = str(trust.get("target_domain") or "").strip().lower()
+            flags = {
+                str(flag).strip().upper()
+                for flag in (trust.get("attribute_flags") or ())
+            }
+            if tgt == partner and "WITHIN_FOREST" in flags:
+                return True
+        return False
+
+    return _has_within_forest(
+        domains_data.get(source_domain), target_domain
+    ) or _has_within_forest(domains_data.get(target_domain), source_domain)
+
+
+def _edge_endpoints_same_forest(
     edge: dict[str, Any],
     nodes_map: dict[str, Any],
+    domains_data: Any,
 ) -> bool:
-    """Return whether *edge* is a breaker-held legitimate relation (no finding).
+    """Return ``True`` ONLY on a POSITIVE same-forest proof for an edge.
 
-    A DCSync (or any other relation in
-    :data:`_BREAKER_HELD_LEGITIMATE_RELATIONS`) whose SOURCE/holder node is a
-    direct domain breaker holds that right by design — it is NOT a finding. A
-    DCSync held by a NON-breaker (a regular/low-priv principal that somehow
-    carries replication rights) is a genuine misconfiguration and MUST still
-    become a finding, so only the breaker-held case returns ``True``.
-
-    Reuses the nomenclature SSOT
-    :func:`adscan_internal.services.compromise_class.is_direct_domain_breaker_target`
-    on the source node — the same predicate ``/adcs`` uses to prune breaker
-    actors — so this never drifts from the engine/report. Only the finding
-    materialization consults this; the attack-graph edge is never touched.
+    Same domain is the always-provable same-forest floor (needs no trust data);
+    two different domains require a ``WITHIN_FOREST`` trust linking them. The
+    SOURCE domain is its EFFECTIVE domain for THIS edge
+    (:func:`_source_effective_domain_for_edge`): a real domain when the node
+    carries one (so a genuine cross-forest crossing still fires), else — for a
+    SYNTHETIC well-known-SID source — the edge's TARGET-object domain, because a
+    well-known SID is evaluated in the target's security context (never a
+    foreign forest). Every OTHER unresolvable case — a genuinely MISSING (empty,
+    non-well-known) domain on either endpoint, no trust data, a
+    non-``WITHIN_FOREST`` or absent linking trust — returns ``False`` so the
+    finding is KEPT. Suppression requires positive proof; cross-forest (either
+    direction) and any doubt fail OPEN.
     """
-    relation = str(edge.get("relation") or "").strip().lower()
-    if relation not in _BREAKER_HELD_LEGITIMATE_RELATIONS:
-        return False
     source_node = nodes_map.get(str(edge.get("from") or ""))
-    if not isinstance(source_node, dict):
+    target_node = nodes_map.get(str(edge.get("to") or ""))
+    source_domain = _source_effective_domain_for_edge(source_node, target_node)
+    target_domain = _node_report_domain(target_node)
+    if not source_domain or not target_domain:
         return False
-    if is_direct_domain_breaker_target(source_node):
+    if source_domain == target_domain:
         return True
-    # A legitimate control-plane sync account is stamped tier0_direct at
-    # collection; its DCSync is held by design, so it is breaker-held too.
-    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
-        PrivilegeTier,
-        node_stamped_privilege_tier,
+    return _domains_linked_within_forest(source_domain, target_domain, domains_data)
+
+
+def _source_is_broad_or_dynamic_identity(source_node: dict[str, Any]) -> bool:
+    """Return whether the edge source is a broad / dynamic well-known identity.
+
+    Everyone / Authenticated Users / BUILTIN Users / Domain Users / Domain
+    Computers / Anonymous Logon and the like. If such an identity is (wrongly)
+    stamped Tier-0 because it was placed INTO a Tier-0 group, its Tier-0 status
+    IS the finding — so it must NEVER be suppressed. Reuses the ACE-step SSOT
+    predicates (:func:`is_broad_domain_source` /
+    :func:`is_wellknown_all_principals_source`) plus the dynamic-identity SSOT
+    (:func:`principal_is_dynamic_identity`).
+    """
+    from adscan_internal.cli.ace_step_execution import (  # noqa: PLC0415
+        is_broad_domain_source,
+        is_wellknown_all_principals_source,
+    )
+    from adscan_internal.services.well_known_principals import (  # noqa: PLC0415
+        principal_is_dynamic_identity,
     )
 
-    return node_stamped_privilege_tier(source_node) is PrivilegeTier.TIER0_DIRECT
+    label = str(source_node.get("label") or source_node.get("name") or "")
+    sid = ""
+    props = source_node.get("properties")
+    if isinstance(props, dict):
+        sid = str(props.get("objectid") or "").strip()
+    if not sid:
+        sid = str(source_node.get("objectId") or "").strip()
+    if is_broad_domain_source(label) or is_wellknown_all_principals_source(label):
+        return True
+    return principal_is_dynamic_identity(sid=sid, label=label)
+
+
+def _source_is_non_compromisable_identity(source_node: dict[str, Any]) -> bool:
+    """Return whether the edge source is a machine/control-plane NT-AUTHORITY SID.
+
+    System / LocalService / NetworkService (``S-1-5-18/19/20``) are not
+    compromisable attack sources (see
+    :func:`adscan_internal.services.well_known_principals.is_non_compromisable_source`),
+    so an edge sourced from one — most commonly the by-design ``System
+    --GenericAll--> Domain`` ACE — must NOT become a client finding. Reads the
+    node's stamped SID, never its label name.
+    """
+    from adscan_internal.services.well_known_principals import (  # noqa: PLC0415
+        is_non_compromisable_source,
+    )
+
+    if not isinstance(source_node, dict):
+        return False
+    sid = ""
+    props = source_node.get("properties")
+    if isinstance(props, dict):
+        sid = str(props.get("objectid") or "").strip()
+    if not sid:
+        sid = str(
+            source_node.get("objectId") or source_node.get("objectid") or ""
+        ).strip()
+    return is_non_compromisable_source(sid)
+
+
+def _node_tier_number(node: Any) -> int | None:
+    """Return a graph node's coarse ESAE tier number (0/1/2), or ``None``.
+
+    Reads the membership-aware STAMPED ``privilege_tier`` SSOT
+    (:func:`node_stamped_privilege_tier`), collapsing both Tier-0 subtiers to 0
+    via :func:`esae_tier_number` (lower = more privileged). When the node carries
+    no stamp (an older graph / a synthetic node), falls back to the identity
+    direct-breaker SSOT (:func:`is_direct_domain_breaker_target`, True for the
+    domain object, the RID-500/512/… principals and DC accounts) as Tier-0.
+    Returns ``None`` only when the tier is genuinely unresolvable, so the caller
+    fails OPEN rather than inventing a tier. NEVER reads the raw ``isTierZero``.
+    """
+    if not isinstance(node, dict):
+        return None
+    stamped = node_stamped_privilege_tier(node)
+    if stamped is not None:
+        return esae_tier_number(stamped)
+    if is_direct_domain_breaker_target(node):
+        return 0
+    return None
+
+
+def _edge_vuln_key(edge: dict[str, Any]) -> str:
+    """Return the ``vuln_key`` an edge carries, falling back to its relation.
+
+    Mirrors the resolution in :func:`_group_reportable_edges_by_key`: an explicit
+    ``edge["vuln_key"]`` wins, else the key the catalog derives from the relation.
+    """
+    _, derived_vuln_key = classify_edge_relation(str(edge.get("relation") or ""))
+    return str(edge.get("vuln_key") or "").strip() or str(derived_vuln_key or "")
+
+
+def _effective_target_tier_number(
+    edge: dict[str, Any], nodes_map: dict[str, Any]
+) -> int | None:
+    """Return the EFFECTIVE target tier number of a tier-gated exploitation edge.
+
+    The gate evaluates where the edge ACTUALLY leads, not its literal graph
+    endpoint. Every other tier-gated finding (the generic control group,
+    constrained delegation, LAPS/gMSA read, RBCD write, and DCSync — whose target
+    node IS the domain, stamped ``tier0_direct``) reads the STAMPED tier of its
+    literal target node via :func:`_node_tier_number`.
+
+    **The ``adcs_esc*`` branch holds for TWO different reasons, and the second one
+    is why it must not be "corrected" away.**
+
+    1. For a TEMPLATE-terminal ESC edge the target is a ``CertTemplate`` /
+       ``EnterpriseCA`` object, but the capability it grants is a certificate that
+       impersonates a Tier-0 identity, so the effective target tier is Tier-0 (0)
+       whatever tier the template node carries.
+    2. **ESC14-A is no longer template-terminal: it terminates on the VICTIM
+       account** (the collector emits ``writer -> ADCSESC14 -> victim``), which is
+       routinely an ordinary Tier-2 user. So reason 1 does NOT describe it, and
+       reading the victim's stamped tier instead would make a Tier-2 writer over a
+       Tier-2 victim a same-tier edge, drop it out of the gate, and silently
+       delete the finding. That is forbidden: an ESC14 condition is reported
+       whether or not it reaches Tier 0, because a weak explicit
+       ``altSecurityIdentities`` mapping (or write access to one) is never a
+       legitimate configuration, unlike a ``GenericAll`` that may be a real
+       delegation model (founder decision, 2026-10-10; see BACKLOG.md § "Every
+       ESC14 finding claims a Tier-0 reach"). The proposal to suppress
+       non-escalating ESC14 findings was evaluated and REJECTED.
+
+    So do not narrow this branch to template-terminal ESC edges on the grounds
+    that reason 1 misdescribes ESC14-A. Reason 2 keeps it, and
+    ``tests/unit/services/test_tier_jump_finding_gate.py`` locks it.
+    """
+    if _edge_vuln_key(edge).lower().startswith("adcs_esc"):
+        return 0
+    return _node_tier_number(nodes_map.get(str(edge.get("to") or "")))
+
+
+def _edge_is_tier_jump_finding(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any],
+    domains_data: Any = None,
+) -> bool:
+    """Return whether a TIER-GATED exploitation edge is a boundary violation.
+
+    The single SSOT predicate (spec ``2026-10-02-acl-tier-jump-finding-gate`` §4)
+    deciding whether a relationship/ACL/escalation edge becomes a client finding.
+    A tier-gated right matters ONLY when the SOURCE principal crosses a boundary
+    it should not — a forest-trust crossing, or an UPWARD tier-band crossing —
+    regardless of the client's intent. Fires iff:
+
+    * the endpoints are NOT provably same-forest (cross-forest = a trust
+      escalation finding, regardless of the source's home-forest tier; every
+      unresolvable same-forest case fails OPEN to keep); OR
+    * same-forest AND the source is a broad / dynamic well-known identity
+      (Everyone / Authenticated Users / Domain Users / Domain Computers): the
+      whole authenticated population holding the right IS the finding; OR
+    * same-forest AND the source tier is strictly LOWER-privilege (a larger ESAE
+      number) than the EFFECTIVE target tier (:func:`_effective_target_tier_number`)
+      — the upward escalation.
+
+    A Tier-0 source administering its own same-forest estate (``Domain Admins ->
+    DCSync``, a CA's machine account over its PKI, ``Domain Admins -> ESC1``) is
+    NOT a finding: it cannot cross upward (effective target Tier-0, source
+    Tier-0, ``0 > 0`` is False), which SUBSUMES the former
+    ``_is_tier0_source_legitimate_edge``. A same-tier or downward same-forest edge
+    (e.g. ``tier2 -> tier2`` GenericAll/ForceChangePassword) is likewise NOT a
+    finding: it is a path step + choke point, not a standalone client finding.
+
+    Tiers are read from the STAMPED ``privilege_tier`` SSOT, NEVER raw
+    ``isTierZero``. The attack-graph EDGE is never touched — only finding
+    materialisation reads this, so the kill-chain / attack-path / reach surface
+    keeps the edge.
+    """
+    if not _edge_endpoints_same_forest(edge, nodes_map, domains_data):
+        return True
+    source_node = nodes_map.get(str(edge.get("from") or ""))
+    if isinstance(source_node, dict) and _source_is_broad_or_dynamic_identity(
+        source_node
+    ):
+        return True
+    source_tier = _node_tier_number(source_node)
+    target_tier = _effective_target_tier_number(edge, nodes_map)
+    if source_tier is None or target_tier is None:
+        # Fail OPEN: an unresolvable tier must not silently suppress a finding.
+        return True
+    return source_tier > target_tier
+
+
+def edge_qualifies_as_finding(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any],
+    domains_data: Any = None,
+) -> bool:
+    """Return whether an attack-graph edge qualifies as a client finding.
+
+    The PUBLIC single source of truth for "is this edge a reportable finding?",
+    shared by the report/CTEM finding materializer (via the private inverse
+    :func:`_tier_gated_edge_suppressed`) AND the CLI post-collection tactical
+    findings panel (``adscan_internal.cli.intelligence._build_tactical_findings``)
+    so the two surfaces apply ONE gate and can never diverge. The rule:
+
+    * CONDITION relation (``source_tier_gated=False``: kerberoast, asreproast,
+      unconstrained delegation, the CVEs, the access/session edges, ESC8, …) —
+      always qualifies; it BYPASSES the tier-jump gate.
+    * TIER-GATED relation (``source_tier_gated=True``: the generic control ACLs,
+      DCSync, constrained delegation, LAPS/gMSA read, RBCD write, the tier-gated
+      ADCS ESCs) — qualifies ONLY when the source principal crosses a boundary it
+      should not, per the SSOT predicate :func:`_edge_is_tier_jump_finding`
+      (cross-forest OR an upward tier-band crossing). A Tier-0 source over its own
+      same-forest estate (a DC / sync account / Account-or-Backup Operators / an
+      RODC's own ADCS ESC) is NOT a finding.
+    * Unknown relation — ``source_tier_gated_for_relation`` returns ``False`` (the
+      safe direction), so it qualifies, preserving the pre-gate behaviour.
+
+    Tiers are read from the STAMPED ``privilege_tier`` SSOT, never raw
+    ``isTierZero``. The attack-graph EDGE is never mutated — only finding
+    materialisation reads this, so the kill-chain / attack-path / reach surface
+    keeps the edge.
+    """
+    source_node = nodes_map.get(str(edge.get("from") or ""))
+    if isinstance(source_node, dict) and _source_is_non_compromisable_identity(
+        source_node
+    ):
+        # Machine / control-plane NT-AUTHORITY source (System / LocalService /
+        # NetworkService): a by-design ACE, never a compromisable finding source.
+        # Applied to EVERY relation (the materializer iterates raw edges and never
+        # consults the traversal gate) so the false SYSTEM->domain finding is
+        # suppressed regardless of whether the relation is tier-gated.
+        return False
+    relation = str(edge.get("relation") or "").strip()
+    if not source_tier_gated_for_relation(relation):
+        return True
+    return _edge_is_tier_jump_finding(edge, nodes_map, domains_data)
+
+
+def _tier_gated_edge_suppressed(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any],
+    domains_data: Any = None,
+) -> bool:
+    """Return whether the tier-jump gate suppresses this edge from finding materialisation.
+
+    The flag-aware seam applied at every finding-materialization point, defined as
+    the exact inverse of the public SSOT :func:`edge_qualifies_as_finding` so there
+    is ONE gate implementation shared by the materializer and the CLI tactical
+    findings panel. A CONDITION finding (``source_tier_gated=False`` — kerberoast,
+    the CVEs, unconstrained delegation, the privileged-session finding) BYPASSES
+    the gate and is never suppressed by it. A TIER-GATED finding is suppressed iff
+    its edge is NOT a boundary violation (:func:`_edge_is_tier_jump_finding`).
+    """
+    return not edge_qualifies_as_finding(edge, nodes_map, domains_data)
+
+
+def _is_tier0_source_legitimate_edge(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any],
+    domains_data: Any = None,
+) -> bool:
+    """Return whether an exploitation edge is a Tier-0-source, same-forest
+    legitimate relation that must NOT become a client finding.
+
+    The Tier-0-source case of the general tier-jump predicate
+    (:func:`_edge_is_tier_jump_finding`), kept as a named inverse for the PRO
+    import surface (``adscan_internal.pro.services.report_service``) and its
+    direct unit coverage (``tests/unit/services/test_attack_graph_findings.py``).
+    It is defined ENTIRELY in terms of the general predicate so there is ONE rule,
+    not two hand-rolled ones: a Tier-0 source administering its own same-forest
+    estate is exactly the ``source_tier > effective_target_tier`` branch failing
+    for an effective-Tier-0 target (``0 > 0`` is False), plus the broad-source
+    and cross-forest limbs. The production materialization seams call the
+    flag-aware :func:`_tier_gated_edge_suppressed`; this wrapper does NOT consult
+    the ``source_tier_gated`` flag, so it must only be read for an edge already
+    known to be tier-gated (DCSync / ADCS ESC, as its callers use it).
+    """
+    return not _edge_is_tier_jump_finding(edge, nodes_map, domains_data)
 
 
 def _emit_control_plane_sync_account_items(
@@ -313,6 +738,53 @@ def _emit_control_plane_sync_account_items(
         )
 
         emit_control_plane_sync_account_items(shell, domain, graph)
+    except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _reconcile_shadow_credential_segmentation(
+    shell: ReportShell,
+    domain: str,
+    graph: dict[str, Any],
+) -> None:
+    """Scope the shadow-credential finding to what a Hello rollout cannot explain.
+
+    Thin, best-effort bridge into the positive-evidence SSOT
+    (:func:`adscan_internal.services.positive_control_evidence.reconcile_shadow_credential_segmentation`).
+    It runs HERE because the segmentation needs the STAMPED privilege tier, which
+    only exists once the graph has been built: the collector that records the raw
+    finding cannot resolve a membership-derived Tier 0. Lazily imported to avoid
+    an import cycle; never raises into the caller.
+    """
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            reconcile_shadow_credential_segmentation,
+        )
+
+        reconcile_shadow_credential_segmentation(shell, domain, graph)
+    except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _reconcile_external_tenant_replication(shell: ReportShell) -> None:
+    """Settle the external-tenant replication finding across every domain.
+
+    Thin, best-effort bridge into the positive-evidence SSOT
+    (:func:`adscan_internal.services.positive_control_evidence.reconcile_external_tenant_replication`),
+    co-located with the sync-account emit above because the two are the same
+    subject: that emit surfaces the by-design hardening item per domain, this
+    decides, once the whole report exists, which of those accounts replicates
+    somewhere the organization does not own. Lazily imported to avoid an import
+    cycle; never raises into the caller.
+    """
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            reconcile_external_tenant_replication,
+        )
+
+        reconcile_external_tenant_replication(shell)
     except Exception as exc:  # pragma: no cover - best effort
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -486,9 +958,202 @@ def _retract_gated_findings(
     return updated
 
 
+#: The ``vuln_key`` of the privileged-session exposure finding ("Privileged
+#: Sessions on Lower-Tier Hosts"). Its contributing edges are ``HasSession``
+#: (``Computer -> User``), and it is a credential-exposure VIOLATION only when the
+#: logged-on USER is MORE privileged than the HOST (:func:`_session_edge_is_tier_violation`).
+_SESSION_EXPOSURE_VULN_KEY = "da_sessions"
+
+#: The constrained-delegation finding (``allowedtodelegate`` edges). Its severity
+#: is graded WITHIN the finding by whether any surviving delegation is a
+#: protocol-transition (TrustedToAuthForDelegation) one — see
+#: :func:`_grade_constrained_delegation_severity`.
+_CONSTRAINED_DELEGATION_VULN_KEY = "constrained_delegation"
+
+#: The ESC15 / EKUwu (CVE-2024-49019) finding key. Its collection-time active
+#: confirmation verdict is lifted from the edge notes to a top-level finding
+#: detail by :func:`_stamp_esc15_confirmation_into_details`.
+_ESC15_VULN_KEY = "adcs_esc15"
+
+#: The ESC14 (weak explicit certificate mapping) finding key. Same confirmation
+#: lift as ESC15, keyed on the ``esc14_confirmed`` edge-note marker.
+_ESC14_VULN_KEY = "adcs_esc14"
+
+
+def _esc15_note_flag_is_true(value: Any) -> bool:
+    """Return whether an ESC confirmation edge-note flag is truthy."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _stamp_adcs_confirmation_into_details(
+    details: dict[str, Any],
+    raw_edges: list[dict[str, Any]],
+    *,
+    confirmed_note_key: str,
+) -> None:
+    """Lift an ADCS-ESC collection-time confirmation verdict to the finding details.
+
+    The collection-stage confirmation phase stamps ``<confirmed_note_key>`` (e.g.
+    ``esc15_confirmed`` / ``esc14_confirmed``) and ``confirmation_pending`` onto the
+    derived ``ADCSESC*`` edge notes. This reads those across the contributing edges
+    and sets a top-level ``confirmation_resolved`` (a confirmed-exploitable
+    instance, graded a hard non-conformity) or ``confirmation_pending`` (the
+    existence condition could not be actively verified) on the finding details,
+    which :func:`finding_confidence.finding_requires_client_confirmation` consumes.
+
+    A confirmed instance wins over a pending one (a proven-exploitable candidate in
+    the finding makes it a real non-conformity regardless of other candidates). When
+    no edge carries a confirmation marker, neither flag is set and the static
+    ``CONFIRMATION_PENDING_FINDING_KEYS`` default (pending) stands.
+    """
+    resolved = False
+    pending = False
+    for edge in raw_edges:
+        if not isinstance(edge, dict):
+            continue
+        notes = edge.get("notes")
+        if not isinstance(notes, dict):
+            continue
+        if _esc15_note_flag_is_true(notes.get(confirmed_note_key)):
+            resolved = True
+        if _esc15_note_flag_is_true(notes.get("confirmation_pending")):
+            pending = True
+    if resolved:
+        details["confirmation_resolved"] = True
+        details.pop("confirmation_pending", None)
+    elif pending:
+        details["confirmation_pending"] = True
+        details.pop("confirmation_resolved", None)
+
+
+def _stamp_esc15_confirmation_into_details(
+    details: dict[str, Any],
+    raw_edges: list[dict[str, Any]],
+) -> None:
+    """Lift the ESC15 confirmation verdict from edge notes to the finding details."""
+    _stamp_adcs_confirmation_into_details(
+        details, raw_edges, confirmed_note_key="esc15_confirmed"
+    )
+
+
+_ESC14_FOOTPRINT_ORDER = ("A", "B", "D", "C")
+
+
+def _stamp_esc14_variant_summary_into_details(
+    details: dict[str, Any],
+    raw_edges: list[dict[str, Any]],
+) -> None:
+    """Lift the FULL confirmed ESC14 variant set + executed variant to the finding.
+
+    ESC14 renders as ONE finding across its (up to four) avenues, not four
+    near-identical findings. The confirmation phase stamps ``esc14_variants`` (the
+    full confirmed set) and the executor stamps ``esc14_executed_variant`` (the one
+    proven end to end) onto the contributing edges. This unions the confirmed set
+    across edges, footprint-orders it, and records which single variant was
+    executed, so the report and the web CTEM can say "N avenues confirmed; variant
+    X proven end to end; one root fix (StrongCertificateBindingEnforcement = Full)
+    closes all". Reach is NOT summed across variants — they are the same avenues of
+    one finding with one root remediation.
+    """
+    confirmed: set[str] = set()
+    executed: Optional[str] = None
+    for edge in raw_edges:
+        if not isinstance(edge, dict):
+            continue
+        notes = edge.get("notes")
+        if not isinstance(notes, dict):
+            continue
+        for value in notes.get("esc14_variants") or ():
+            letter = str(value).strip().upper()
+            if letter in _ESC14_FOOTPRINT_ORDER:
+                confirmed.add(letter)
+        marker = str(notes.get("esc14_executed_variant") or "").strip().upper()
+        if marker in _ESC14_FOOTPRINT_ORDER:
+            executed = marker
+    if confirmed:
+        details["esc14_confirmed_variants"] = [
+            letter for letter in _ESC14_FOOTPRINT_ORDER if letter in confirmed
+        ]
+    if executed:
+        details["esc14_executed_variant"] = executed
+
+
+def _grade_constrained_delegation_severity(
+    finding: dict[str, Any],
+    raw_edges: list[dict[str, Any]],
+) -> bool:
+    """Uplift the constrained-delegation finding when it is protocol-transition.
+
+    A constrained delegation with TrustedToAuthForDelegation ("Use any
+    authentication protocol", S4U2Self + S4U2Proxy) impersonates a victim
+    WITHOUT the victim ever authenticating to the delegating service, so it is
+    materially more dangerous than a Kerberos-only (S4U2Proxy-only) delegation.
+    The collector stamps ``protocol_transition`` on each ``AllowedToDelegate``
+    edge from the source principal's userAccountControl; if ANY surviving
+    (tier-gated, upward-crossing) delegation carries it, the finding is graded
+    HIGH (above the Kerberos-only catalog base). Uplift only — never downgrades a
+    finding the edge-severity SSOT already raised higher.
+
+    Returns ``True`` when the severity changed.
+    """
+    protocol_transition = any(
+        isinstance(edge, dict)
+        and isinstance(edge.get("notes"), dict)
+        and bool(edge["notes"].get("protocol_transition"))
+        for edge in raw_edges
+    )
+    if not protocol_transition:
+        return False
+    current = str(finding.get("severity") or "medium").lower()
+    graded = _uplift_finding_severity(current, Severity.HIGH)
+    if graded != current:
+        finding["severity"] = graded
+        return True
+    return False
+
+
+def _session_edge_is_tier_violation(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any],
+) -> bool:
+    """Return whether a ``HasSession`` edge is a real tiered-admin violation.
+
+    A logon session is a credential-exposure violation ONLY when the user whose
+    session sits on the host is MORE privileged (a LOWER ESAE tier number) than
+    the host itself: a Tier-0 user on a Tier-1/Tier-2 host, or a Tier-1 user on a
+    Tier-2 host. Then the higher-tier credential (NTLM hash / Kerberos TGT /
+    cached secret) is exposed in the LSASS of a lower-trust machine, so a
+    compromise of that host escalates the attacker's tier.
+
+    The edge is ``Computer -> HasSession -> User`` (``from`` = session host,
+    ``to`` = logged-on user). Tiers are read from the stamped, membership-aware
+    ``privilege_tier`` SSOT for BOTH endpoints (never raw ``isTierZero``). The
+    directness split within Tier 0 is collapsed by :func:`esae_tier_number`, so a
+    Tier-0-direct user on a Tier-0-escalation-capable host (both ESAE Tier 0) is
+    NOT a violation.
+
+    Fails open to EXCLUDE: a same-tier session, an inverse session (a lower-tier
+    user on a higher-tier host, which is expected and exposes no higher
+    credential), and any pair where either endpoint carries no tier stamp (an
+    honest data gap, not a provable violation) are all dropped.
+    """
+    host_node = nodes_map.get(str(edge.get("from") or ""))
+    user_node = nodes_map.get(str(edge.get("to") or ""))
+    if not isinstance(host_node, dict) or not isinstance(user_node, dict):
+        return False
+    host_tier = node_stamped_privilege_tier(host_node)
+    user_tier = node_stamped_privilege_tier(user_node)
+    if host_tier is None or user_tier is None:
+        return False
+    return esae_tier_number(user_tier) < esae_tier_number(host_tier)
+
+
 def _group_reportable_edges_by_key(
     edges: list[Any],
     nodes_map: dict[str, Any],
+    domains_data: Any = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
     """Group exploitation edges by ``vuln_key`` and split off the gated keys.
 
@@ -500,7 +1165,12 @@ def _group_reportable_edges_by_key(
 
     Args:
         edges: The graph's ``edges`` list.
-        nodes_map: The graph's ``nodes`` mapping, for the breaker-held check.
+        nodes_map: The graph's ``nodes`` mapping, for the Tier-0-source check.
+        domains_data: The session trust SSOT (``shell.domains_data``), consulted
+            only to prove a cross-domain endpoint pair is same-forest. ``None`` /
+            empty is the standalone-render case and fails open (keeps the
+            finding), so the only positive same-forest proof it is not needed for
+            is a same-domain edge.
 
     A graph written before edge classification moved to the save seam carries
     edges with no ``category`` at all — the CVE scanner's noPac / PrintNightmare
@@ -527,19 +1197,43 @@ def _group_reportable_edges_by_key(
             category = str(edge.get("category") or "")
         if category != "exploitation":
             continue
-        # Suppress finding materialization for breaker-held legitimate relations
-        # (e.g. DCSync held by Domain Admins / Domain Controllers): the right is
-        # held by design, so it is a false positive as a finding. The graph EDGE
-        # is untouched — this only governs which edges feed the derivation, so
-        # the kill-chain / attack-path materialization keeps the edge.
-        if _is_breaker_held_legitimate_edge(edge, nodes_map):
-            continue
         vuln_key = str(edge.get("vuln_key") or "").strip() or str(
             derived_vuln_key or ""
         )
         if not vuln_key:
             continue
+        # Register the key for gating BEFORE any per-edge suppression, so a key
+        # whose edges are ALL suppressed still reaches ``gated`` below and
+        # ``_retract_gated_findings`` prunes a stale row written on a pre-gate
+        # workspace. (The earlier DCSync carve-out used a bare ``continue`` here,
+        # which dropped the key from ``by_key`` entirely — a latent linger bug.)
         by_key.setdefault(vuln_key, [])
+        # Tier-jump gate (spec 2026-10-02-acl-tier-jump-finding-gate §4/§6). A
+        # TIER-GATED finding (``source_tier_gated=True``: DCSync, the generic
+        # control group, constrained delegation, LAPS/gMSA read, RBCD write, the
+        # ADCS ESCs) is a client finding ONLY when the source principal crosses a
+        # boundary upward or across a forest trust — so a Tier-0 source over its
+        # own same-forest estate (``Domain Admins -> DCSync``, ``Domain Admins ->
+        # ESC1``, a CA's machine account over its PKI) and a same-tier / downward
+        # same-forest edge (``tier2 -> tier2`` GenericAll/ForceChangePassword) are
+        # NOT findings: held/placed by design, path-shaping only. A CONDITION
+        # finding (``source_tier_gated=False``: kerberoast, the CVEs, unconstrained
+        # delegation) BYPASSES the gate and always contributes. The edge is NOT
+        # contributed when suppressed (so an all-suppressed key drops), but a
+        # MIXED-origin key survives via its upward / cross-forest edges. The graph
+        # EDGE is untouched — the kill-chain / attack-path materialization keeps it.
+        if _tier_gated_edge_suppressed(edge, nodes_map, domains_data):
+            continue
+        # Privileged-session exposure: a ``HasSession`` edge is only a tiered-admin
+        # violation when the logged-on user is MORE privileged than the host it
+        # sits on. Same-tier, inverse, and tier-unknown sessions are NOT a
+        # credential-exposure finding — they only dilute the inventory with rows a
+        # remediator cannot act on. (Keeps the key registered above so an
+        # all-suppressed workspace still prunes a stale row.)
+        if vuln_key == _SESSION_EXPOSURE_VULN_KEY and not _session_edge_is_tier_violation(
+            edge, nodes_map
+        ):
+            continue
         if not _edge_declares_no_client_exposure(edge):
             by_key[vuln_key].append(edge)
 
@@ -551,6 +1245,147 @@ def _group_reportable_edges_by_key(
         else:
             gated.add(vuln_key)
     return reportable, gated
+
+
+def _edge_report_entry(
+    edge: dict[str, Any], label_fn: Callable[[str], str]
+) -> dict[str, Any]:
+    """Build the label-based ``attack_graph_edges`` entry for a graph edge.
+
+    Not every exploitation edge is written with node ids — the CVE and
+    post-exploitation writers record the endpoints as LABELS on the edge itself
+    (``source`` / ``target``), so resolving only ``from``/``to`` would summarize
+    those edges to empty strings. Shared by the surviving-edge stamping and the
+    suppressed-edge pruning so both build byte-identical entries (``_append_unique``
+    / list membership match on value equality).
+    """
+    from_id = str(edge.get("from") or "")
+    to_id = str(edge.get("to") or "")
+    entry = {
+        "relation": str(edge.get("relation") or "").strip(),
+        "source": label_fn(from_id)
+        if from_id
+        else str(edge.get("source") or "").strip(),
+        "target": label_fn(to_id)
+        if to_id
+        else str(edge.get("target") or "").strip(),
+    }
+    # Carry the per-edge STEP status onto the summarized entry. The roasting
+    # affected-assets builder reads it to stamp a per-account crack status
+    # (success -> CRACKED, attempted/failed -> attempted, discovered -> exposed);
+    # other consumers dedupe by display string, so a status-only difference never
+    # duplicates a rendered row. Both the surviving-edge stamping and the
+    # suppressed-edge pruning go through here, so they stay byte-identical.
+    status = str(edge.get("status") or "").strip()
+    if status:
+        entry["status"] = status
+    note_summary = _summarize_attack_graph_edge_notes(edge.get("notes"))
+    if note_summary:
+        entry["notes"] = note_summary
+    return entry
+
+
+def _suppressed_tier0_edge_entries_by_key(
+    edges: list[Any],
+    nodes_map: dict[str, Any],
+    label_fn: Callable[[str], str],
+    domains_data: Any = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return, per ``vuln_key``, the label-entries of exploitation edges that the
+    tier-jump gate suppresses.
+
+    Finding EXISTENCE is already gated per-edge in
+    :func:`_group_reportable_edges_by_key` (a suppressed tier-gated edge is never
+    contributed, so an all-suppressed key drops). This completes the suppression
+    for the AFFECTED-ASSETS surface of a MIXED finding that survives on its
+    upward / cross-forest edges: the merge into ``details.attack_graph_edges`` is
+    additive, so a finding first stamped on a pre-gate workspace keeps its stale
+    same-tier / Tier-0-source rows (e.g. the Force Change Password finding carried
+    its ~1.8k ``Exchange Windows Permissions`` -> user self-management rows
+    alongside the handful of real upward-crossing rows). Reuses the SAME
+    :func:`_tier_gated_edge_suppressed` seam — no re-derived tier logic — so the
+    entries pruned here match exactly the edges the grouping gate dropped. The
+    classification mirrors :func:`_group_reportable_edges_by_key` so the two can
+    never disagree about which edges are suppressed.
+    """
+    suppressed: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip()
+        if not relation:
+            continue
+        category, derived_vuln_key = classify_edge_relation(relation)
+        if edge.get("category") is not None:
+            category = str(edge.get("category") or "")
+        if category != "exploitation":
+            continue
+        vuln_key = str(edge.get("vuln_key") or "").strip() or str(
+            derived_vuln_key or ""
+        )
+        if not vuln_key:
+            continue
+        if not _tier_gated_edge_suppressed(edge, nodes_map, domains_data):
+            continue
+        suppressed.setdefault(vuln_key, []).append(
+            _edge_report_entry(edge, label_fn)
+        )
+    return suppressed
+
+
+def _edge_entry_identity(entry: Any) -> tuple[str, str, str] | None:
+    """Return a STABLE ``(relation, source, target)`` identity for an edge entry.
+
+    The prune of suppressed Tier-0-source edges matches on this identity, NOT on
+    full-dict value equality: a persisted entry stamped by an earlier build carries
+    only ``relation``/``source``/``target``, while a freshly built one can also
+    carry ``status`` / ``notes``, so a value-equality match silently misses the
+    stale rows (the 1.8k ``Exchange Windows Permissions`` self-management rows the
+    Force Change Password finding kept). The identity is case-normalised so a label
+    casing difference never defeats the prune.
+    """
+    if not isinstance(entry, dict):
+        return None
+    return (
+        str(entry.get("relation") or "").strip().casefold(),
+        str(entry.get("source") or "").strip().casefold(),
+        str(entry.get("target") or "").strip().casefold(),
+    )
+
+
+def _merge_edge_entries_by_identity(
+    existing: list[Any], new_entries: Any
+) -> list[dict[str, Any]]:
+    """Merge edge entries deduped by ``(relation, source, target)`` identity.
+
+    The additive merge into ``details.attack_graph_edges`` must collapse entries
+    that describe the SAME edge, not keep one copy per dict shape. Two copies of
+    one edge appear whenever a persisted entry (stamped before a per-edge key like
+    ``status``/``notes`` existed) meets a freshly built one that now carries it:
+    full-dict ``_append_unique`` sees them as different and keeps both, which then
+    renders as a DUPLICATE affected-asset row (e.g. the same session pair twice in
+    the Privileged Sessions finding). Keying on the stable identity and UNIONING
+    the keys (richer value wins) collapses them to one entry while preserving the
+    added ``status``/``notes``. First-seen order is kept.
+    """
+    by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str]] = []
+    passthrough: list[dict[str, Any]] = []
+    for entry in list(existing) + [e for e in new_entries]:
+        if not isinstance(entry, dict):
+            continue
+        ident = _edge_entry_identity(entry)
+        if ident is None:
+            passthrough.append(entry)
+            continue
+        if ident in by_identity:
+            for key, value in entry.items():
+                if value not in (None, "") and not by_identity[ident].get(key):
+                    by_identity[ident][key] = value
+        else:
+            by_identity[ident] = dict(entry)
+            order.append(ident)
+    return [by_identity[i] for i in order] + passthrough
 
 
 def _stamp_exposure_provenance_into_details(
@@ -694,12 +1529,14 @@ _UNAUTH_ENTRY_LINK_FINDING_KEYS: frozenset[str] = frozenset(
 def _node_is_tier0(node: Any) -> bool:
     """Return whether a graph node is a Tier-0 / high-value / domain target.
 
-    Reuses the metadata the graph builder already stamped (``isTierZero`` /
-    ``highvalue``) plus the DC-role classifier — never re-tiers.
+    Layers the structural kinds (the domain object itself, a writable DC or an
+    RODC) on top of :func:`_node_tier_zero_flagged`, the module's single
+    privilege-grade authority — so this read inherits the stamped
+    membership-aware ``privilege_tier`` SSOT and never re-tiers.
     """
     if not isinstance(node, dict):
         return False
-    if bool(node.get("isTierZero")) or bool(node.get("highvalue")):
+    if _node_tier_zero_flagged(node):
         return True
     if str(node.get("kind") or "") == "Domain":
         return True
@@ -1280,15 +2117,35 @@ def sync_attack_graph_findings(
     """
     edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+
+    # ── NODE-driven reconciliations, above the no-edges early return ───────────
+    # Both of these read the graph's NODES, not its edges, so an edgeless graph
+    # must not skip them. (The sync-account emit's own comment always claimed it
+    # ran before the early return; it did not, so a domain whose only relevant
+    # observation carried no edge silently lost its Tier-0 hardening item.)
+
+    # Reframe a legitimate control-plane (Azure AD Connect) sync account's by-design
+    # DCSync — suppressed as a finding by the tier-jump gate — into
+    # a Tier-0 asset-hardening item, so the report is never silent about a Tier-0
+    # asset (the third-state doctrine).
+    _emit_control_plane_sync_account_items(shell, domain, graph)
+
+    # Segment the raw shadow-credential finding by population shape, now that the
+    # stamped privilege tier exists. Runs AFTER the sync-account emit above,
+    # because an observed Azure AD Connect account is the hybrid corroboration the
+    # segmentation reads. A Hello rollout produces NO graph edge at all (the
+    # analyzer deliberately emits none), so this one in particular would never
+    # fire below the early return.
+    _reconcile_shadow_credential_segmentation(shell, domain, graph)
+
     if not edges:
         return False
 
-    # Reframe a legitimate control-plane (Azure AD Connect) sync account's by-design
-    # DCSync — suppressed as a finding by ``_is_breaker_held_legitimate_edge`` — into
-    # a Tier-0 asset-hardening item, so the report is never silent about a Tier-0
-    # asset (the third-state doctrine). Runs before the early-return below so it
-    # still fires when the only relevant edge is the suppressed sync-account DCSync.
-    _emit_control_plane_sync_account_items(shell, domain, graph)
+    # Session trust SSOT, consulted by the Tier-0-source gate only to prove a
+    # cross-domain endpoint pair is same-forest. Absent (a standalone render off a
+    # bare shell) → the gate fails open, which still kills the common same-domain
+    # false-positive class and keeps every cross-forest finding.
+    domains_data = getattr(shell, "domains_data", {}) or {}
 
     def _label(node_id: str) -> str:
         node = nodes_map.get(node_id)
@@ -1300,34 +2157,28 @@ def sync_attack_graph_findings(
     # exploitation context from their target nodes (the labelled `entry` below
     # loses the node reference needed for that classification), and so the KEY
     # gate can read every contributing edge's status at once.
-    raw_edges_by_key, gated_keys = _group_reportable_edges_by_key(edges, nodes_map)
+    raw_edges_by_key, gated_keys = _group_reportable_edges_by_key(
+        edges, nodes_map, domains_data
+    )
 
     edges_by_key: dict[str, list[dict[str, Any]]] = {}
     for vuln_key, key_edges in raw_edges_by_key.items():
         entries: list[dict[str, Any]] = []
         for edge in key_edges:
-            # Not every exploitation edge is written with node ids. The CVE and
-            # post-exploitation writers record the endpoints as LABELS on the
-            # edge itself (``source`` / ``target``), so resolving only
-            # ``from``/``to`` summarized those edges to empty strings — which is
-            # why a critical noPac or PrintNightmare finding named no vulnerable
-            # host at all.
-            from_id = str(edge.get("from") or "")
-            to_id = str(edge.get("to") or "")
-            entry = {
-                "relation": str(edge.get("relation") or "").strip(),
-                "source": _label(from_id)
-                if from_id
-                else str(edge.get("source") or "").strip(),
-                "target": _label(to_id)
-                if to_id
-                else str(edge.get("target") or "").strip(),
-            }
-            note_summary = _summarize_attack_graph_edge_notes(edge.get("notes"))
-            if note_summary:
-                entry["notes"] = note_summary
-            _append_unique(entries, entry)
+            # Status is now carried by the shared ``_edge_report_entry`` helper
+            # (so the suppressed-edge builder stays byte-identical for the prune).
+            _append_unique(entries, _edge_report_entry(edge, _label))
         edges_by_key[vuln_key] = entries
+
+    # Tier-0-source exploitation edges the grouping gate drops (held by design,
+    # e.g. Exchange Windows Permissions administering its own estate). The merge
+    # into ``details.attack_graph_edges`` below is additive, so a MIXED finding
+    # that survives on its non-Tier-0 edges would keep these stale rows and the
+    # affected-assets surface would render them — this is the set pruned at stamp
+    # time so only the NON-suppressed edges populate the finding.
+    suppressed_edges_by_key = _suppressed_tier0_edge_entries_by_key(
+        edges, nodes_map, _label, domains_data
+    )
 
     # A loose credential-leak finding (the canonical gpp_passwords) links to a proven
     # unauthenticated relationship edge, not a reportable exploitation edge, so
@@ -1433,9 +2284,39 @@ def sync_attack_graph_findings(
         existing_edges = details.get("attack_graph_edges")
         if not isinstance(existing_edges, list):
             existing_edges = []
-        for entry in edge_entries:
-            _append_unique(existing_edges, entry)
+        # Prune any Tier-0-source edge the grouping gate suppressed — both a stale
+        # one the additive merge carried from a pre-gate workspace and one that
+        # would otherwise slip in — so the finding's affected-assets surface shows
+        # only the non-suppressed (non-Tier-0-source, cross-forest, or
+        # broad-identity-source) edges, matching the gated finding set.
+        suppressed_entries = suppressed_edges_by_key.get(vuln_key)
+        if suppressed_entries:
+            suppressed_identities = {
+                identity
+                for entry in suppressed_entries
+                if (identity := _edge_entry_identity(entry)) is not None
+            }
+            pruned_edges = [
+                entry
+                for entry in existing_edges
+                if _edge_entry_identity(entry) not in suppressed_identities
+            ]
+            if len(pruned_edges) != len(existing_edges):
+                updated = True
+            existing_edges = pruned_edges
+        # Snapshot (after the prune) so a change to the edge entries (e.g. a
+        # newly-stamped per-edge ``status`` the roasting crack-status reads) flips
+        # ``updated`` and is persisted — the context stamp below only reacts to the
+        # SUMMARY statuses, not to the per-entry status carried on each edge.
+        edges_before = [dict(e) for e in existing_edges if isinstance(e, dict)]
+        # Merge deduped by (relation, source, target) identity, not full-dict
+        # equality: a persisted entry (no per-edge ``status``) and a freshly built
+        # one (with ``status``) describe the SAME edge and must collapse to one, or
+        # the finding renders a duplicate affected-asset row.
+        existing_edges = _merge_edge_entries_by_identity(existing_edges, edge_entries)
         details["attack_graph_edges"] = existing_edges
+        if existing_edges != edges_before:
+            updated = True
 
         # Stamp the Tier-0 / DC / exploitation context keys the shared CVSS
         # calculator reads so contextual elevation (ADscan Priority) fires for
@@ -1446,16 +2327,52 @@ def sync_attack_graph_findings(
             "exploitation_confirmed": details.get("exploitation_confirmed"),
             "attack_graph_edge_statuses": details.get("attack_graph_edge_statuses"),
             "attack_graph_non_execution": details.get("attack_graph_non_execution"),
+            "confirmation_pending": details.get("confirmation_pending"),
+            "confirmation_resolved": details.get("confirmation_resolved"),
         }
         _stamp_attack_graph_context_into_details(
             details,
             nodes_map,
             raw_edges_by_key.get(vuln_key, []),
         )
+        if vuln_key == _CONSTRAINED_DELEGATION_VULN_KEY:
+            # Grade protocol-transition delegations above Kerberos-only ones
+            # (severity modulation, not a gate change — both already survived
+            # the upward-tier gate). Runs after the catalog-base severity is set.
+            if _grade_constrained_delegation_severity(
+                finding, raw_edges_by_key.get(vuln_key, [])
+            ):
+                updated = True
         _stamp_exposure_provenance_into_details(
             details,
             raw_edges_by_key.get(vuln_key, []),
         )
+        if vuln_key == _ESC15_VULN_KEY:
+            # Lift the ESC15 collection-time confirmation verdict (stamped on the
+            # derived edge notes by the confirmation phase) to a top-level finding
+            # detail, so the compliance annex grades a confirmed-vulnerable ESC15
+            # as a hard non-conformity and routes an unconfirmed one to pending
+            # client evidence (see finding_confidence.CONFIRMATION_PENDING_*).
+            _stamp_esc15_confirmation_into_details(
+                details,
+                raw_edges_by_key.get(vuln_key, []),
+            )
+        if vuln_key == _ESC14_VULN_KEY:
+            # Same confirmation lift for ESC14, keyed on the esc14_confirmed marker
+            # the ESC14 confirmation phase stamps when a DC accepts weak explicit
+            # certificate mappings (StrongCertificateBindingEnforcement < Full).
+            _stamp_adcs_confirmation_into_details(
+                details,
+                raw_edges_by_key.get(vuln_key, []),
+                confirmed_note_key="esc14_confirmed",
+            )
+            # One finding, all avenues: lift the full confirmed-variant set and the
+            # executed variant so the report / web CTEM render every open avenue and
+            # the single root remediation, not one finding per variant.
+            _stamp_esc14_variant_summary_into_details(
+                details,
+                raw_edges_by_key.get(vuln_key, []),
+            )
         if any(details.get(key) != previous_context[key] for key in previous_context):
             updated = True
         finding["details"] = details
@@ -1500,8 +2417,15 @@ def validate_attack_graph_findings_correlation(
     technical_report: dict[str, Any],
     *,
     domain: str | None = None,
+    trust_domains_data: Any = None,
 ) -> list[str]:
     """Validate that exploitation edges and recorded findings agree.
+
+    ``trust_domains_data`` is the session trust SSOT (``shell.domains_data``),
+    threaded to the SAME :func:`_group_reportable_edges_by_key` /
+    :func:`_tier_gated_edge_suppressed` gate the derivation uses so the guard and
+    the derivation can never disagree about a tier-jump suppression. ``None``
+    fails open exactly as the derivation does.
 
     Checks the correlation in BOTH directions, through the same
     :func:`_group_reportable_edges_by_key` gate the derivation uses:
@@ -1565,16 +2489,19 @@ def validate_attack_graph_findings_correlation(
             and str(edge.get("category") or "") != "exploitation"
         ):
             continue
-        # A breaker-held legitimate relation is deliberately NOT materialized as
-        # a finding (see _is_breaker_held_legitimate_edge) — reporting it as a
-        # correlation gap would make the reconciliation warn on every run of a
-        # perfectly healthy workspace.
-        if _is_breaker_held_legitimate_edge(edge, nodes_map):
+        # A tier-gated edge the tier-jump gate suppresses is deliberately NOT
+        # materialized as a finding (see _tier_gated_edge_suppressed) — reporting
+        # it as a correlation gap would make the reconciliation warn on every run
+        # of a perfectly healthy workspace. The guard applies the SAME flag-aware
+        # gate as the derivation, so the two can never disagree.
+        if _tier_gated_edge_suppressed(edge, nodes_map, trust_domains_data):
             continue
         if not str(edge.get("vuln_key") or "").strip():
             errors.append(f"Exploitation edge {relation} missing vuln_key")
 
-    reportable, gated = _group_reportable_edges_by_key(edges, nodes_map)
+    reportable, gated = _group_reportable_edges_by_key(
+        edges, nodes_map, trust_domains_data
+    )
     for vuln_key, key_edges in reportable.items():
         if vuln_key in findings_keys:
             continue
@@ -1601,6 +2528,7 @@ def validate_attack_graph_findings(shell: ReportShell, domain: str) -> list[str]
         graph,
         technical_report,
         domain=domain,
+        trust_domains_data=getattr(shell, "domains_data", {}) or {},
     )
 
 
@@ -1669,8 +2597,6 @@ def reconcile_workspace_attack_graph_findings(
             if domains is not None
             else _discover_graph_domains(workspace_dir)
         )
-        if not names:
-            return residual
 
         shell = SimpleNamespace(current_workspace_dir=str(workspace_dir))
         if technical_report_path:
@@ -1679,6 +2605,17 @@ def reconcile_workspace_attack_graph_findings(
             shell.technical_report_file = str(
                 os.path.abspath(str(technical_report_path))
             )
+
+        # Cross-domain reconciliation of the external-tenant replication finding.
+        # It reads ONLY the technical report (the persisted Tier-0 hardening
+        # control evidence), so it runs above the per-domain graph loop and
+        # independently of whether an attack graph is on disk. Its verdict needs
+        # every assessed domain at once, which is why it cannot be settled by the
+        # per-domain emit during the scan.
+        _reconcile_external_tenant_replication(shell)
+
+        if not names:
+            return residual
         for domain in names:
             graph_path = _workspace_graph_path(workspace_dir, domain)
             if not os.path.isfile(graph_path):
@@ -1691,6 +2628,7 @@ def reconcile_workspace_attack_graph_findings(
                 graph,
                 _load_technical_report(shell),
                 domain=domain,
+                trust_domains_data=getattr(shell, "domains_data", {}) or {},
             )
             if errors:
                 residual.extend(errors)

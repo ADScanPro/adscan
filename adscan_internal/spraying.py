@@ -48,6 +48,41 @@ class EligibleUser:
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedPrincipalDrop:
+    """How many principals the owned-exclusion removed before eligibility ran.
+
+    The spray set is narrowed in two structurally different steps, and the
+    eligibility panel must be able to tell them apart:
+
+    1. Already-owned principals are removed from the candidate list, because
+       spraying an account whose secret we already hold yields no new access and
+       adds ``badPwdCount`` noise. That is an engagement SUCCESS, not a
+       limitation.
+    2. The remaining candidates are then split into eligible / excluded by the
+       lockout-safety rules, which is a SAFETY decision.
+
+    Step 2 is already visible through ``SprayEligibilityResult.excluded_users``;
+    step 1 used to be invisible, so a domain of 186 users could render as
+    "1 eligible / 9 total" with no way for the operator to see where the other
+    177 went. This value object carries step 1 as data so the panel can render
+    the whole funnel.
+
+    Attributes:
+        list_size: Principals in the source list BEFORE the owned-exclusion.
+        dropped: Principals removed for being already owned
+            (``list_size - dropped`` is what eligibility then evaluated).
+        hash_only: Of ``dropped``, how many we hold ONLY an NT hash for (no
+            cleartext). When this equals ``dropped`` the spray cannot recover
+            cleartext for any already-owned account, which is a real and
+            non-obvious limitation of the run.
+    """
+
+    list_size: int = 0
+    dropped: int = 0
+    hash_only: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class SprayEligibilityResult:
     """Result of computing eligible users for spraying.
 
@@ -72,6 +107,9 @@ class SprayEligibilityResult:
             decide whether to enforce the safe-attempt reserve. Defaults to
             ``False`` so legacy constructors that never knew about this flag
             keep behaving like "lockout is enforced" — the conservative direction.
+        owned_drop: Already-owned principals removed from the candidate list before
+            eligibility ran. See :class:`OwnedPrincipalDrop`. Defaults to ``None``
+            so legacy constructors keep working unchanged.
     """
 
     input_users: list[str]
@@ -87,6 +125,13 @@ class SprayEligibilityResult:
     """Per-eligible-user lockout headroom (username + BadPwdCount + remaining), for
     the eligibility panel. Empty on legacy/no-policy paths; render falls back to the
     plain ``eligible_users`` list when so."""
+    owned_drop: Optional["OwnedPrincipalDrop"] = None
+    """The already-owned principals removed BEFORE this result was computed, so the
+    panel can render the full funnel (list -> owned -> safety -> sprayed) instead of
+    only the post-drop total. ``None`` on legacy constructors and on paths that never
+    ran the owned-exclusion; the panel then falls back to ``len(input_users)`` as the
+    list size and reports no owned drop, which is what it did before this field
+    existed."""
 
 
 _USERNAME_TOKEN_RE = re.compile(r"(?i)[a-z0-9._$-]+(?:\\[a-z0-9._$-]+)?")

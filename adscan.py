@@ -10946,6 +10946,26 @@ class PentestShell:
                 f"(clock-resync-backstop) arming failed: {type(exc).__name__}: {exc}"
             )
 
+        # Arm remote-artefact disclosure ONCE per session. Techniques that must
+        # write a file on a target (a process dump, a saved registry hive, an
+        # uploaded helper binary) disclose it to this session's
+        # environment-change ledger from the transport write seam, which holds
+        # no shell. This registration is what lets that seam reach the ledger,
+        # so the client's deliverable states which files ADscan wrote on their
+        # machines and whether each was removed.
+        try:
+            from adscan_internal.services.remote_artifact_disclosure import (
+                register_artifact_disclosure_for_shell,
+            )
+
+            register_artifact_disclosure_for_shell(self)
+        except Exception as exc:  # noqa: BLE001 — disclosure arming must not break startup
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"(remote-artifact-disclosure) arming failed: {type(exc).__name__}: {exc}"
+            )
+
         # Arm Kerberos ccache renewal ONCE per session. Every transport auth
         # seam (LDAP, SMB, WinRM) then renews an expired explicit ticket — and
         # recognises a capability-bearing one that must never be re-minted —
@@ -11332,6 +11352,7 @@ class PentestShell:
         untrusted_output: bool = False,
         on_line: Callable[[str], None] | None = None,
         silence_timeout: float | None = None,
+        abort_check: Callable[[], bool] | None = None,
         **kwargs,
     ) -> subprocess.CompletedProcess[str] | None:
         """
@@ -11377,6 +11398,15 @@ class PentestShell:
                           long-running command (e.g. a hung hashcat) without an
                           elapsed cap that would kill a healthy one still emitting
                           incremental output. ``None`` (default) disables it.
+            abort_check: STREAMING mode only (requires ``on_line``). A predicate
+                          polled on every read tick; returning ``True`` stops the
+                          process gracefully and returns NORMALLY with the output
+                          collected so far. For a caller whose own incremental
+                          output tells it the command is not worth finishing (a
+                          cracker whose live ETA already exceeds the operator's
+                          remaining budget), so the decision lands seconds in
+                          rather than after the whole run. ``None`` (default)
+                          never polls and never stops anything.
             **kwargs: Additional arguments passed to subprocess.run
         """
         # Never pass invisible sensitive markers to external binaries.
@@ -11410,6 +11440,7 @@ class PentestShell:
                 extra=kwargs or None,
                 on_line=on_line,
                 silence_timeout=silence_timeout,
+                abort_check=abort_check,
             )
             result = self.command_runner.run(spec)
             elapsed_seconds = getattr(result, "_adscan_elapsed_seconds", None)
@@ -13856,6 +13887,9 @@ class PentestShell:
         from adscan_internal.services.credential_harvest_store import (
             append_harvest_records,
         )
+        from adscan_internal.services.credential_harvest_view import (
+            harvest_source_for_mode,
+        )
         from adscan_internal.services.high_value import normalize_samaccountname
 
         try:
@@ -13890,6 +13924,7 @@ class PentestShell:
                 if status == "cracked":
                     cracked_users.append(username)
                 ntlm_version = str(result.detail.get("version") or "")
+                mode = str(result.detail.get("mode") or "")
                 account_type = classify_principal(username, self.domains_data, domain)
                 tier = classify_harvested_principal_tier(
                     self, domain=domain, username=username, account_type=account_type
@@ -13901,7 +13936,13 @@ class PentestShell:
                     HarvestedPrincipal(
                         domain=domain,
                         username=username,
-                        source="poisoning",
+                        # Resolved from the crack's MODE through the shared
+                        # SSOT, not hardcoded: a roast or an offline NT crack
+                        # drained here used to be filed as broadcast poisoning,
+                        # which mislabels the technique in the client-facing
+                        # harvest and hands the wrong provenance to
+                        # ``add_credential`` on activation.
+                        source=harvest_source_for_mode(mode),
                         account_type=account_type,
                         ntlm_version=ntlm_version,
                         crack_status=status,
@@ -13911,12 +13952,18 @@ class PentestShell:
                         captured_at=datetime.now(timezone.utc)
                         .replace(microsecond=0)
                         .isoformat(),
-                        mode=str(result.detail.get("mode") or ""),
+                        mode=mode,
                         max_effort=str(result.detail.get("max_effort") or ""),
                         secret=str(result.detail.get("secret") or ""),
                         method=str(result.detail.get("method") or ""),
                     )
                 )
+            # A local NT attack that reached the end of its ladder earns the
+            # full-strength coverage statement (and makes "password recovery
+            # was attempted" true for an engagement that declined the external
+            # lookup). Recorded HERE, on the foreground thread, because the job
+            # thread must never write the report.
+            self._record_local_nt_crack_outcomes(domain, cracking_results)
             if not records:
                 print_info_debug("crack-persist: no records built — nothing appended to the harvest store")
                 return []
@@ -13944,6 +13991,46 @@ class PentestShell:
             # under --debug so it is never invisible again.
             print_info_debug(f"crack-persist: FAILED to persist harvest records — {type(exc).__name__}: {exc}")
             return []
+
+    def _record_local_nt_crack_outcomes(self, domain: str, cracking_results) -> None:
+        """Promote the local NT-attack coverage class for finished cracks.
+
+        Only NT-hash cracks are considered: every other mode's hashes came from
+        a network capture or a roast, which declare their own coverage. Fully
+        best-effort, and silent on anything that is not a finished NT ladder, so
+        the drain can call it unconditionally.
+
+        The recovered principals ride along by NAME (never their secrets) so the
+        same call folds them into the domain's persisted password-hygiene
+        figures, which were derived before this attack returned. The coverage
+        class and those figures describe one event, so they move together.
+        """
+        try:
+            from adscan_internal.services.cracking.local_nt_crack import (
+                NT_HASHCAT_MODE,
+                record_local_nt_crack_outcome,
+            )
+
+            for result in cracking_results or []:
+                detail = result.detail if isinstance(result.detail, dict) else {}
+                if str(detail.get("mode") or "") != NT_HASHCAT_MODE:
+                    continue
+                users = detail.get("users")
+                recovered_accounts = (
+                    [name for name in (str(u or "").strip() for u in users) if name]
+                    if isinstance(users, list)
+                    else []
+                )
+                record_local_nt_crack_outcome(
+                    self,
+                    domain=str(detail.get("domain") or domain or ""),
+                    job_status=str(detail.get("status") or ""),
+                    recovered=len(recovered_accounts),
+                    recovered_accounts=recovered_accounts,
+                )
+        except Exception as exc:  # noqa: BLE001 — a coverage note never breaks the loop
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def do_clear(self, _arg):
         """Clears the terminal screen."""
@@ -15567,13 +15654,21 @@ class PentestShell:
             )
             return None
 
+        from adscan_internal.services.credentials.credential_origin import (
+            CredentialProvenanceStrength,
+        )
+
         store_service = CredentialStoreService()
+        # A password ADscan has just SET is the strongest provenance there is,
+        # and it also makes any previously recovered material for the account
+        # stale: it must take the slot even from a replicated hash.
         store_service.update_domain_credential(
             domains_data=self.domains_data,
             domain=domain_name,
             username=user,
             credential=new_password,
             is_hash=False,
+            provenance_strength=CredentialProvenanceStrength.PROVEN.value,
         )
 
         domain_data = self.domains_data.setdefault(domain_name, {})
@@ -20414,10 +20509,17 @@ class PentestShell:
         per-(user, password) coverage de-dup. The pre2k computer-account check is a
         separate command (``pre2k``), so this manual entry point is selector-only.
 
+        Typing this command IS the request, so it is never gated on the domain
+        already being compromised and never asks permission to do what was just
+        asked for.
+
         Args:
             domain (str): Target domain (defaults to the current domain).
         """
-        from adscan_internal.cli.spraying import run_spray_coverage
+        from adscan_internal.cli.spraying import (
+            SprayRequestOrigin,
+            run_spray_coverage,
+        )
         from adscan_internal.interaction import is_non_interactive
 
         domain = resolve_repl_domain_or_default(self, domain) or ""
@@ -20426,7 +20528,11 @@ class PentestShell:
             return
 
         run_spray_coverage(
-            self, domain, interactive=not is_non_interactive(self), include_pre2k=False
+            self,
+            domain,
+            interactive=not is_non_interactive(self),
+            include_pre2k=False,
+            origin=SprayRequestOrigin.OPERATOR_COMMAND,
         )
 
     def do_pre2k(self, domain):
@@ -22067,14 +22173,20 @@ class PentestShell:
                 from adscan_internal.services.credential_store_service import (
                     CredentialStoreService,
                 )
+                from adscan_internal.services.credentials.credential_origin import (
+                    ORIGIN_GPP_CPASSWORD,
+                )
 
                 store_service = CredentialStoreService()
+                # A GPP blob is a SCRAPED candidate: it must never displace
+                # material ADscan actually recovered for the same principal.
                 update_result = store_service.update_domain_credential(
                     domains_data=self.domains_data,
                     domain=domain_name,
                     username=username.lower(),
                     credential=password,
                     is_hash=self.is_hash(password),
+                    origin=ORIGIN_GPP_CPASSWORD,
                 )
                 marked_username = mark_sensitive(username, "user")
                 marked_domain = mark_sensitive(domain_name, "domain")
@@ -28302,6 +28414,79 @@ class PentestShell:
             print_error("Error updating the technical report.")
             print_exception(show_locals=False, exception=e)
 
+    def do_compliance_scope(self, args):
+        """
+        Read or declare the ENS security scope of the system this workspace assessed.
+
+        The compliance section reports which Anexo II measures are exigible for
+        the system, and that follows from the system's security category, which
+        is the client's own categorisation decision (RD 311/2022, Anexo I).
+        ADscan reads it and never infers it, so it is declared once here and
+        every later render reuses the declaration.
+
+        Three ways in, chosen by what you pass:
+
+        * No arguments, in a terminal: the six-question wizard. With a scope
+          already declared it shows it and offers to replace it; with none it
+          asks for the compliance profile and the level of each of the five
+          security dimensions, and derives the category from them. Leaving
+          without declaring one is free.
+        * ``--show``, or no arguments in a non-interactive run: state the
+          declaration on file, or state that none is on file and what the
+          report maps instead.
+        * ``--profile <profile> --levels C=..,I=..,T=..,A=..,D=.. [--system ..]``:
+          declare it in one command, with no prompt. All five dimensions are
+          required and an unrecognised level is refused: nothing here is
+          completed by inference. The category is never an input.
+
+        Args:
+            args (str): ``--show``, or the declaration flags above.
+        """
+        from adscan_internal.cli.compliance_scope_command import (
+            EXIT_REFUSED,
+            run_compliance_scope_command,
+        )
+
+        workspace_dir = getattr(self, "current_workspace_dir", None)
+        if not workspace_dir:
+            print_error(
+                "No workspace is open. Open or create one first, so the "
+                "declaration has somewhere to live."
+            )
+            self._report_verb_exit_code(EXIT_REFUSED)
+            return None
+        try:
+            code = run_compliance_scope_command(
+                args or "", workspace_dir=workspace_dir, shell=self
+            )
+        except KeyboardInterrupt:
+            print_warning("Scope declaration cancelled; nothing was written.")
+            return None
+        except Exception as exc:  # noqa: BLE001 - a prompt failure is not fatal
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_error("Could not complete the ENS scope declaration.")
+            self._report_verb_exit_code(EXIT_REFUSED)
+            return None
+        self._report_verb_exit_code(code)
+        return None
+
+    def _report_verb_exit_code(self, code):
+        """Record a verb's own exit code for `adscan execute` to return.
+
+        The REPL dispatches `do_<verb>` through `cmd.Cmd`, where a truthy
+        return value means "stop the loop", so a verb cannot report failure by
+        returning one. It records it here instead: `execute` reads the
+        attribute after the call and returns it, and the interactive REPL
+        simply never reads it.
+
+        Args:
+            code (int): The process exit code; ``0`` for success.
+        """
+        from adscan_internal.cli.execute import set_verb_exit_code
+
+        set_verb_exit_code(self, code)
+
     def do_deliver(self, args):
         """
         Generate the Client Deliverable Kit for the current workspace.
@@ -28483,52 +28668,42 @@ class PentestShell:
         # ── Framework selection ───────────────────────────────────────
         # Parse from args if provided as 3rd arg (e.g. "ens,iso27001,dora").
         # Otherwise prompt interactively with questionary checkbox.
-        # Keep in parity with adscan_internal/cli/deliver.py::_FRAMEWORK_KEY_MAP.
-        # ENS and NIS2 are distinct, independently-selectable frameworks.
-        _FRAMEWORK_KEY_MAP = {
-            "ENS Alto — Spain / CCN-CERT (recommended)": "ens",
-            "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
-            "ISO 27001:2022 — International ISMS standard": "iso27001",
-            "DORA — EU 2022/2554 (financial sector)": "dora",
-            "PCI DSS v4.0 — Payment Card Industry": "pci_dss",
-            "CIS Microsoft Windows Server Benchmark v4.0.0 — technical hardening (not a regulation)": "cis",
-        }
-        _VALID_FRAMEWORK_KEYS = {"ens", "nis2", "iso27001", "dora", "pci_dss", "cis"}
+        #
+        # The label map and the valid-key set come from the LITE-safe SSOT
+        # (adscan_internal/cli/common.py) that `deliver` and `report` also use
+        # — this verb used to carry its own third copy, which is how a CLI
+        # surface drifts. There is NO framework default: an empty selection
+        # stays empty and `run_generate_report` applies the single requiredness
+        # gate (an audit engagement refuses to render a conformance verdict the
+        # operator never scoped; a ctf workspace renders with none).
+        from adscan_internal.cli.common import (
+            _FRAMEWORK_KEY_MAP,
+            _parse_frameworks,
+        )
+        from adscan_internal.services.compliance_scope import CTF_ENGAGEMENT
 
         frameworks_arg: list[str] | None = None
         frameworks_index = profile_index + 1
         if len(args_parts) > frameworks_index:
-            # Explicit frameworks from CLI, e.g. "ens,iso27001,dora"
-            raw_fw = args_parts[frameworks_index].lower().split(",")
-            frameworks_arg = [
-                f.strip() for f in raw_fw if f.strip() in _VALID_FRAMEWORK_KEYS
-            ]
-            if not frameworks_arg:
-                print_error(
-                    f"Invalid frameworks '{args_parts[frameworks_index]}'. "
-                    f"Valid values: ens, nis2, iso27001, dora, pci_dss, cis"
-                )
+            # Explicit frameworks from the verb's args, e.g. "ens,iso27001".
+            try:
+                frameworks_arg = _parse_frameworks(args_parts[frameworks_index])
+            except ValueError as exc:
+                print_error(str(exc))
                 return None
+        elif getattr(self, "type", None) == CTF_ENGAGEMENT:
+            # A lab has no regulatory regime, so do not ask.
+            frameworks_arg = []
         else:
-            # Interactive prompt with questionary checkbox
             selected_labels = self._questionary_checkbox(
                 "Select compliance frameworks to include in the report:",
                 list(_FRAMEWORK_KEY_MAP.keys()),
             )
-            if selected_labels is None:
-                # Non-interactive / cancelled — default to ENS+NIS2
-                frameworks_arg = ["ens"]
-            elif not selected_labels:
-                # User deselected everything — default to ENS+NIS2
-                frameworks_arg = ["ens"]
-            else:
-                frameworks_arg = [
-                    _FRAMEWORK_KEY_MAP[label]
-                    for label in selected_labels
-                    if label in _FRAMEWORK_KEY_MAP
-                ]
-                if not frameworks_arg:
-                    frameworks_arg = ["ens"]
+            frameworks_arg = [
+                _FRAMEWORK_KEY_MAP[label]
+                for label in (selected_labels or [])
+                if label in _FRAMEWORK_KEY_MAP
+            ]
 
         # ── Report stack ────────────────────────────────────────────────────
         engine_arg = "chromium"
@@ -31201,7 +31376,7 @@ class PentestShell:
             "Sessions": ["session", "ligolo"],
             "Help": ["help"],
             "ACL": ["enumerate_user_aces", "enum_cross_domain_acl"],
-            "Reporting": ["initialize_report"],
+            "Reporting": ["initialize_report", "compliance_scope"],
             "Attack Paths": [
                 "attack_paths",
                 "attack_steps",
@@ -32320,7 +32495,11 @@ def add_ci_subparser(subparsers):
     ci_parser.add_argument(
         "--frameworks",
         default=None,
-        help="Comma-separated compliance frameworks: ens,nis2,iso27001,dora,pci_dss,cis (default: ens).",
+        help=(
+            "Comma-separated compliance frameworks: "
+            "ens,nis2,iso27001,dora,pci_dss,cis (no default; required with "
+            "--generate-report on --type audit)."
+        ),
     )
     ci_parser.add_argument(
         "--report-engine",

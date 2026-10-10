@@ -51,7 +51,7 @@ requires-dist = [
 
 [[package]]
 name = "adscan"
-version = "13.0.0"
+version = "13.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
@@ -84,6 +84,7 @@ cli = [
     { name = "pycryptodome" },
     { name = "pydantic-ai-slim", extra = ["anthropic", "google", "openai"] },
     { name = "pydantic-settings" },
+    { name = "pypdf" },
     { name = "pypsrp", extra = ["kerberos"] },
     { name = "pypykatz" },
     { name = "python-docx" },
@@ -123,8 +124,8 @@ dev = [
 requires-dist = [
     { name = "aardwolf", marker = "extra == 'cli'", editable = "vendor/aardwolf" },
     { name = "aiosmb", marker = "extra == 'cli'", editable = "vendor/aiosmb" },
-    { name = "asysocks", marker = "extra == 'cli'", directory = "vendor/asysocks" },
-    { name = "asysocks", marker = "extra == 'dev'", directory = "vendor/asysocks" },
+    { name = "asysocks", marker = "extra == 'cli'", editable = "vendor/asysocks" },
+    { name = "asysocks", marker = "extra == 'dev'", editable = "vendor/asysocks" },
     { name = "badauth", marker = "extra == 'cli'", editable = "vendor/badauth" },
     { name = "badauth", marker = "extra == 'dev'", editable = "vendor/badauth" },
     { name = "badldap", marker = "extra == 'cli'", editable = "vendor/badldap" },
@@ -154,8 +155,9 @@ requires-dist = [
     { name = "pycryptodome", marker = "extra == 'dev'", specifier = ">=3.20" },
     { name = "pydantic-ai-slim", extras = ["anthropic", "google", "openai"], marker = "extra == 'cli'", specifier = ">=0.8.1" },
     { name = "pydantic-settings", marker = "extra == 'cli'", specifier = ">=2.4.0" },
+    { name = "pypdf", marker = "extra == 'cli'", specifier = ">=5.0,<7.0" },
     { name = "pypsrp", extras = ["kerberos"], marker = "extra == 'cli'", specifier = "==0.9.1" },
-    { name = "pypykatz", marker = "extra == 'cli'", directory = "vendor/pypykatz" },
+    { name = "pypykatz", marker = "extra == 'cli'", editable = "vendor/pypykatz" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0,<10.0" },
     { name = "pytest-html", marker = "extra == 'dev'" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3,<3.0" },
@@ -176,8 +178,8 @@ requires-dist = [
     { name = "types-requests", marker = "extra == 'dev'" },
     { name = "volatility3", marker = "extra == 'cli'", specifier = ">=2.5.0" },
     { name = "volatility3", marker = "extra == 'dev'", specifier = ">=2.5.0" },
-    { name = "winacl", marker = "extra == 'cli'", directory = "vendor/winacl" },
-    { name = "winacl", marker = "extra == 'dev'", directory = "vendor/winacl" },
+    { name = "winacl", marker = "extra == 'cli'", editable = "vendor/winacl" },
+    { name = "winacl", marker = "extra == 'dev'", editable = "vendor/winacl" },
 ]
 provides-extras = ["dev", "cli"]
 
@@ -338,7 +340,7 @@ wheels = [
 [[package]]
 name = "asysocks"
 version = "0.2.18"
-source = { directory = "vendor/asysocks" }
+source = { editable = "vendor/asysocks" }
 dependencies = [
     { name = "asn1crypto" },
     { name = "cryptography" },
@@ -3353,6 +3355,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pypdf"
+version = "6.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1f/ac/63d71aaedb59acbcdef491e6ca6469165e3771c9c74358204818fd9bc5a6/pypdf-6.19.0.tar.gz", hash = "sha256:bbc43aca292369ccc6cbc8a921991ecf2538a3587ab5a116eff06c321d647155", size = 7033266, upload-time = "2026-09-16T09:32:05.946Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/2c/c43c03eaf630435f023f1dc61ec4a4a78951ad5530a62c71cc89bde307b7/pypdf-6.19.0-py3-none-any.whl", hash = "sha256:7e5d6e730e7dae87d560a2cee218b852f6498c8be61966f3cd02ead971e48d14", size = 395480, upload-time = "2026-09-16T09:32:04.087Z" },
+]
+
+[[package]]
 name = "pypdfium2"
 version = "5.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3421,7 +3435,7 @@ kerberos = [
 [[package]]
 name = "pypykatz"
 version = "0.6.13"
-source = { directory = "vendor/pypykatz" }
+source = { editable = "vendor/pypykatz" }
 dependencies = [
     { name = "aesedb" },
     { name = "aiosmb" },
@@ -4522,7 +4536,7 @@ wheels = [
 [[package]]
 name = "winacl"
 version = "0.1.9"
-source = { directory = "vendor/winacl" }
+source = { editable = "vendor/winacl" }
 dependencies = [
     { name = "cryptography" },
 ]

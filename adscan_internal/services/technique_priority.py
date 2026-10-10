@@ -319,6 +319,28 @@ def _step_action(step: Any) -> str:
     return ""
 
 
+def _step_source_label(step: Any) -> str:
+    """Return the principal that HOLDS the privilege this step exercises.
+
+    The holder is the step's SOURCE: the object a client acts on when the fix is
+    "revoke this from that account". Read from the step's own details (the shape
+    the engine stamps) so it is the real principal, never a label composed here.
+    """
+    if not isinstance(step, Mapping):
+        return ""
+    details = step.get("details")
+    if isinstance(details, Mapping):
+        for key in ("source_samaccountname", "from", "source"):
+            value = details.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for key in ("from", "source"):
+        value = step.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def path_technique_keys(path: Mapping[str, Any]) -> list[str]:
     """Return the distinct remediable technique keys one path exercises.
 
@@ -593,6 +615,26 @@ class TechniquePriority:
     #: ``meta.affected_users`` (an older snapshot), which degrades reach to the
     #: legacy path-count lead rather than fabricating a number.
     reach_users: int = 0
+    #: The HOLDER-aware remediation verdict, taken from the instance of this
+    #: technique the client can actually CHANGE, not from the technique itself.
+    #:
+    #: Remediability is a property of the holder, not of the technique: directory
+    #: replication is how a domain controller works and cannot be revoked from
+    #: it, while the identical right on a line-of-business application server is
+    #: an ACE somebody added and somebody can remove. Reading
+    #: :attr:`can_fully_mitigate` and :attr:`remediation_effort` from the
+    #: technique catalog alone threw that distinction away, and the copy then read
+    #: "nothing to do here" on a finding whose single fix was to revoke one ACE.
+    #:
+    #: ``remediability_kind`` is a ``RemediationKind`` value,
+    #: ``remediability_verb`` the imperative sentence naming the change, and
+    #: ``holder_label`` the principal that HOLDS the privilege (the object a
+    #: client acts on). All three are ``""`` when no step carried the engine's
+    #: stamp, which degrades to the technique-level guidance rather than
+    #: inventing a holder.
+    remediability_kind: str = ""
+    remediability_verb: str = ""
+    holder_label: str = ""
 
     @property
     def share(self) -> float:
@@ -759,6 +801,11 @@ def compute_technique_priorities(
                     "max_evidence": 0,
                     "sample_step": None,
                     "top_choke_point_id": "",
+                    # Holder-aware remediation, from the first REMEDIABLE
+                    # instance of this technique (see the sample-step loop).
+                    "remediability_kind": "",
+                    "remediability_verb": "",
+                    "holder_label": "",
                 }
                 accumulators[technique] = state
 
@@ -809,6 +856,15 @@ def compute_technique_priorities(
                     verdict = remediability_for_step(step)
                     if verdict is not None and not verdict.is_remediable:
                         continue
+                    # The HOLDER-aware verdict, kept from the SAME remediable
+                    # instance this sample comes from. It is what the row's "what
+                    # to change" must say: the technique catalog cannot know
+                    # whether this right sits on a domain controller (inherent)
+                    # or on an application server (one ACE to revoke).
+                    if verdict is not None and not state["remediability_kind"]:
+                        state["remediability_kind"] = verdict.kind.value
+                        state["remediability_verb"] = verdict.verb
+                        state["holder_label"] = _step_source_label(step)
                     has_details = isinstance(step.get("details"), Mapping)
                     if sample is None or has_details:
                         sample = dict(step)
@@ -843,10 +899,23 @@ def compute_technique_priorities(
                 ),
                 remediation_effort=str(metadata["remediation_effort"]),
                 remediation_steps=tuple(metadata["remediation_steps"]),
-                can_fully_mitigate=bool(metadata["can_fully_mitigate"]),
+                # Holder-aware when the engine stamped the instance: a technique
+                # whose remediable holder was identified IS mitigable for that
+                # holder, whatever the technique-level catalog flag says about the
+                # technique in general. Only a technique with NO remediable
+                # instance reaches here at all (the key filter drops those), so a
+                # stamped verdict can only ever confirm mitigability.
+                can_fully_mitigate=(
+                    True
+                    if state["remediability_kind"]
+                    else bool(metadata["can_fully_mitigate"])
+                ),
                 mitre_technique_id=metadata["mitre_technique_id"],
                 mitre_technique_name=metadata["mitre_technique_name"],
                 reach_users=len(state["affected_users"]),
+                remediability_kind=str(state["remediability_kind"]),
+                remediability_verb=str(state["remediability_verb"]),
+                holder_label=str(state["holder_label"]),
             )
         )
 

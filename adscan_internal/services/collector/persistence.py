@@ -7,9 +7,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.reporting.well_known_principals import is_worthless_victim_principal
 from adscan_core.rich_output import print_info_debug, print_warning
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import attack_graph_service
+from adscan_internal.services.collector.adcs_detectors._common import (
+    _ENROLL_RELATIONS,
+    template_has_authentication_eku,
+)
 from adscan_internal.services.collector.inventory_persistence import (
     CollectorInventoryPersistence,
 )
@@ -20,10 +25,14 @@ from adscan_internal.services.collector.models import (
     HttpSpnFinding,
 )
 from adscan_internal.services.credential_store_service import hosts_match
+from adscan_internal.services.graph_queries.filters import is_active
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
     resolve_privileged_followup_decision,
     sid_rid,
+)
+from adscan_internal.services.privileged_group_escalation import (
+    derive_privileged_group_escalation_edges,
 )
 from adscan_internal.services.share_credential_provenance_service import (
     reconcile_share_credential_edge_sources,
@@ -77,11 +86,22 @@ _ESC_TO_DOMAIN_ADMINS: frozenset[str] = frozenset(
 # ESC relations whose target is Domain Controllers after NTLM relay.
 _ESC_TO_DOMAIN_CONTROLLERS: frozenset[str] = frozenset({"ADCSESC8", "ADCSESC11"})
 
-# All ESC relations the collector re-emits as compromise-centric edges.
+# ESC relations whose target is the VICTIM principal itself (NOT an arbitrary
+# Tier-0 account). ESC14 variant A abuses the altSecurityIdentities attribute on
+# a puppet's OWN account, so a certificate maps to that puppet and the actor
+# BECOMES the puppet — never an arbitrary Domain Admin. The derived edge
+# therefore terminates at the puppet (the victim), and any Tier-0 reach flows
+# through the victim's own MemberOf edges, not a hardcoded collapse.
+_ESC_TO_VICTIM: frozenset[str] = frozenset({"ADCSESC14"})
+
+# All ESC relations the collector re-emits as compromise-centric edges. The raw
+# ``principal -> template`` detector edge for each of these is skipped as a path
+# step (see ``_should_skip_attack_graph_edge``) so paths terminate at the actual
+# compromise instead of at the abuse-vector template.
 # ADCSESC13 is intentionally excluded until issuance-policy OID resolution lands —
 # its target group is per-template and not yet derivable from raw edge notes.
 _ESC_DERIVED_RELATIONS: frozenset[str] = (
-    _ESC_TO_DOMAIN_ADMINS | _ESC_TO_DOMAIN_CONTROLLERS
+    _ESC_TO_DOMAIN_ADMINS | _ESC_TO_DOMAIN_CONTROLLERS | _ESC_TO_VICTIM
 )
 
 # Replication-rights extended rights that are evidence-only when targeting the
@@ -136,13 +156,22 @@ _ESC9_USER_WRITE_RELATIONS: frozenset[str] = frozenset(
     }
 )
 
-# ESC9/10/14 require a second precondition beyond enrollment rights: the
-# attacker must hold user-write control over a puppet account.
+# ESC9/10 require a second precondition beyond enrollment rights: the attacker
+# must hold user-write control over a puppet account AND the puppet must be able
+# to enroll the vulnerable SAN-UPN template (the UPN swap authenticates AS the
+# puppet via that template).
 #   ESC9:  write UPN + msDS-KeyCredentialLink on puppet → shadow creds + UPN swap
 #   ESC10: write UPN on puppet → weak KDC cert binding
-#   ESC14: write altSecurityIdentities on puppet → map attacker cert to puppet
-# All three share the same writer-mediated detection logic.
-_ESC_WRITER_MEDIATED: frozenset[str] = frozenset({"ADCSESC9", "ADCSESC10", "ADCSESC14"})
+# ESC14 variant A is DELIBERATELY NOT in this set. It is decoupled from the
+# SAN-UPN puppet-enroll machinery: the attacker writes the VICTIM's
+# altSecurityIdentities (a write-ACE already in the graph) and enrolls a
+# client-auth certificate IT controls (a Machine-template machine account via
+# MachineAccountQuota, or a directly-enrollable client-auth template) — the
+# victim enrolls nothing and no vulnerable SAN-UPN template is required. Gating
+# it on a SAN-UPN template + victim enrollment (the ESC9/10 logic) was a false
+# negative on every domain lacking such a template. See
+# ``_emit_esc14a_write_access_edges``.
+_ESC_WRITER_MEDIATED: frozenset[str] = frozenset({"ADCSESC9", "ADCSESC10"})
 
 # Maximum BFS depth for group-membership expansion when checking whether a
 # puppet user transitively satisfies the enroll-set of an ESC9/10/14 template.
@@ -536,6 +565,13 @@ class CollectorPersistence:
         # present). Graph-dict based so the same logic re-derives over an existing
         # attack_graph.json without a collector re-run.
         derived_edges += derive_spnjack_edges(graph)
+        # Privileged-group escalation (Backup Operators / DnsAdmins / Print
+        # Operators): one ``Group -> Domain`` edge per privileged group node.
+        # The SAME emitter runs at load time
+        # (``attack_graph_core.load_attack_graph``), so a reopened workspace
+        # carries an identical edge set. Parity is locked by
+        # tests/unit/services/test_privileged_group_escalation_edges.py.
+        derived_edges += derive_privileged_group_escalation_edges(graph)
 
         _drop_redundant_direct_compromise_to_domain_edges(graph)
 
@@ -1183,6 +1219,13 @@ def _persist_delegation_steps(
 ) -> int:
     """Persist constrained and unconstrained delegation attack steps."""
     created = 0
+    # TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION (protocol transition / "Use any
+    # authentication protocol"): a constrained delegation with this flag can
+    # impersonate a victim WITHOUT that victim ever authenticating to the
+    # delegating service (S4U2Self + S4U2Proxy), so it is materially more
+    # dangerous than a Kerberos-only (S4U2Proxy-only) delegation. Collected
+    # reliably from userAccountControl, so the finding grades severity on it.
+    protocol_transition = _node_bool_property(source_node, "hastrustedtoauth")
     for spn in _node_list_property(source_node, "allowedtodelegate"):
         target_id = _resolve_delegation_target_graph_id(
             graph,
@@ -1202,6 +1245,7 @@ def _persist_delegation_steps(
                 "collector_method": "derived_constrained_delegation",
                 "source_property": "msDS-AllowedToDelegateTo",
                 "delegated_spn": spn,
+                "protocol_transition": protocol_transition,
             },
         )
     if _node_bool_property(source_node, "hasunconstrainedauth") or _node_bool_property(
@@ -1590,16 +1634,28 @@ def _persist_esc_compromise_steps(
         impersonated_principal_hint = ""
 
         # ESC9/10 special path: derive edges from writers, not from enrollers.
+        # (ESC14 variant A is handled separately by
+        # ``_emit_esc14a_write_access_edges`` — it is NOT in _ESC_WRITER_MEDIATED
+        # and so never enters this branch; the raw ADCSESC14 detector edge falls
+        # through to the standard path's ``else: continue`` and is dropped, which
+        # is correct — it is already excluded from the graph as a path step by
+        # ``_should_skip_attack_graph_edge`` via ``_ESC_DERIVED_RELATIONS``.)
         if relation in _ESC_WRITER_MEDIATED:
+            template_oid = edge.target_object_id.upper()
+            vulnerable = _build_esc_vulnerable_resource_entry(
+                edge=edge, template_lookup=template_lookup
+            )
+            template_dn_value = getattr(
+                template_lookup.get(template_oid), "distinguished_name", None
+            )
+
+            # ESC9/10: the UPN swap authenticates as an ARBITRARY target, so any
+            # writable puppet reaches Domain Admins — keep the DA collapse.
             domain_admins_id = _resolve_well_known_target(
                 domain_admins_id, _DOMAIN_ADMINS_RID, relation
             )
             if not domain_admins_id:
                 continue
-            template_oid = edge.target_object_id.upper()
-            vulnerable = _build_esc_vulnerable_resource_entry(
-                edge=edge, template_lookup=template_lookup
-            )
             for writer_sid, puppets in user_writers.items():
                 viable_puppets = [
                     p for p in puppets if _puppet_in_enrollers(p, template_oid)
@@ -1635,13 +1691,7 @@ def _persist_esc_compromise_steps(
                         "impersonated_principal_hint": "Administrator",
                         "raw_notes_extra": {
                             "puppet_user_sids": viable_puppets,
-                            "template_dn": (
-                                getattr(
-                                    template_lookup.get(template_oid),
-                                    "distinguished_name",
-                                    None,
-                                )
-                            ),
+                            "template_dn": template_dn_value,
                             "attack_chain": "shadow_creds_pkinit_upn_swap_pkinit",
                         },
                     }
@@ -1756,6 +1806,253 @@ def _persist_esc_compromise_steps(
             notes=notes,
         )
 
+    # ESC14 variant A — decoupled from the SAN-UPN / victim-enroll machinery
+    # above. Emitted once, driven by the write-ACE edges already in the graph
+    # (``user_writers``) plus a domain-level "attacker can enroll a client-auth
+    # certificate" precondition.
+    created += _emit_esc14a_write_access_edges(
+        graph,
+        result=result,
+        user_writers=user_writers,
+        sid_to_graph_id=sid_to_graph_id,
+    )
+
+    return created
+
+
+# Broad principals whose direct client-auth enrollment makes a certificate
+# obtainable by any attacker (the MAQ-independent ESC14-A enroll route).
+_BROAD_ENROLL_WELLKNOWN_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-1-0",  # Everyone
+        "S-1-5-11",  # Authenticated Users
+    }
+)
+_BROAD_ENROLL_RIDS: frozenset[int] = frozenset(
+    {
+        513,  # Domain Users
+        515,  # Domain Computers
+    }
+)
+
+
+def _sid_is_broad_principal(sid: str) -> bool:
+    """Return True when ``sid`` is a broad principal any attacker belongs to."""
+    normalized = str(sid or "").strip().upper()
+    if normalized in _BROAD_ENROLL_WELLKNOWN_SIDS:
+        return True
+    return sid_rid(normalized) in _BROAD_ENROLL_RIDS
+
+
+def _client_auth_template_enroller_sids(
+    result: CollectionResult,
+) -> dict[str, set[str]]:
+    """Index enroller SIDs per CertTemplate OID from the raw enroll-ACL edges."""
+    enrollers: dict[str, set[str]] = {}
+    for edge in result.edges:
+        if edge.relation not in _ENROLL_RELATIONS:
+            continue
+        target_node = result.nodes.get(edge.target_object_id.upper())
+        if not target_node or str(target_node.kind) != "CertTemplate":
+            continue
+        enrollers.setdefault(edge.target_object_id.upper(), set()).add(
+            edge.source_object_id.upper()
+        )
+    return enrollers
+
+
+def _domain_can_enroll_client_auth_cert(
+    result: CollectionResult,
+) -> tuple[bool, str, list[str]]:
+    """Return ``(can_enroll, enroll_path_label, template_cns)`` for ESC14-A.
+
+    ESC14 variant A needs the ATTACKER to obtain a client-authentication
+    certificate IT controls (the victim enrolls nothing). This is satisfiable
+    whenever ADCS is deployed AND a client-auth certificate is obtainable by a
+    broad principal:
+
+    * ``ms-DS-MachineAccountQuota`` > 0 → any authenticated principal (every
+      ACE-holding writer is authenticated) can create a machine account and
+      enroll the default ``Machine`` template (client-auth, Domain
+      Computers-enrollable). Lab-proven on a patched DC.
+    * a client-auth template that is directly enrollable by a broad well-known
+      principal (Authenticated Users / Domain Users / Domain Computers /
+      Everyone) when the machine-account route is closed (MAQ == 0).
+
+    Two values come back alongside the verdict, and they are NOT interchangeable:
+
+    * ``enroll_path_label`` is human PROSE for the report / finding narrative
+      (e.g. ``"Machine template via MachineAccountQuota"``). It is sometimes a
+      bare CN and sometimes a sentence, so it is NOT machine-consumable.
+    * ``template_cns`` is the machine-consumable list of concrete template CNs
+      this function actually RESOLVED, for execution to enroll with. It stays
+      empty when no template could be named, so the executor degrades honestly
+      instead of enrolling a guessed name.
+
+    Neither is a vulnerable SAN-UPN template — variant A requires none. Returns
+    ``(False, "", [])`` when ADCS is absent or no client-auth certificate is
+    obtainable (so a domain with write-ACEs but no enrollable client-auth path
+    emits no ESC14-A edge).
+    """
+    if not _result_has_enterprise_ca(result):
+        return (False, "", [])
+    client_auth_templates = [
+        node
+        for node in result.nodes.values()
+        if str(node.kind) == "CertTemplate" and template_has_authentication_eku(node)
+    ]
+    if not client_auth_templates:
+        return (False, "", [])
+
+    maq = getattr(result.domain_policy, "machine_account_quota", None)
+    if maq is not None and maq > 0:
+        # Prefer the DEFAULT ``Machine`` template by exact CN over any CN that
+        # merely contains "machine" (``MachineEnrollmentAgent`` is the trap: it
+        # is a request-agent template, not the client-auth one a new machine
+        # account enrolls), then fall back to the substring match so a renamed
+        # machine template is still named.
+        machine_candidates = [
+            (node, cn)
+            for node, cn in ((node, _template_cn(node)) for node in client_auth_templates)
+            if cn and "machine" in cn.lower()
+        ]
+        machine_cn = next(
+            (cn for _node, cn in machine_candidates if cn.lower() == "machine"),
+            next((cn for _node, cn in machine_candidates), ""),
+        )
+        label = (
+            f"{machine_cn} template via MachineAccountQuota"
+            if machine_cn
+            else "Machine template via MachineAccountQuota"
+        )
+        return (True, label, [machine_cn] if machine_cn else [])
+
+    # MAQ == 0 / unknown: the machine-account route is closed. Fall back to the
+    # client-auth templates a broad well-known principal can directly enroll.
+    # EVERY such template is a usable enrollment vehicle, so all of them are
+    # returned and execution lets the operator pick; the prose label keeps
+    # naming the first, unchanged.
+    enrollers_by_template = _client_auth_template_enroller_sids(result)
+    broad_cns: list[str] = []
+    for node in client_auth_templates:
+        enrollers = enrollers_by_template.get(str(node.object_id).upper())
+        if not enrollers:
+            continue
+        if any(_sid_is_broad_principal(sid) for sid in enrollers):
+            cn = _template_cn(node)
+            if cn and cn not in broad_cns:
+                broad_cns.append(cn)
+    if broad_cns:
+        first = broad_cns[0]
+        return (True, f"{first} template (directly enrollable)", broad_cns)
+    # A broadly-enrollable template with no resolvable CN still proves the
+    # precondition; it just cannot name the vehicle.
+    for node in client_auth_templates:
+        enrollers = enrollers_by_template.get(str(node.object_id).upper())
+        if enrollers and any(_sid_is_broad_principal(sid) for sid in enrollers):
+            return (True, "a directly-enrollable client-auth template", [])
+    return (False, "", [])
+
+
+def _template_cn(node: Any) -> str:
+    """Return a CertTemplate node's enrollment CN (``cn`` property, else name)."""
+    raw = str((getattr(node, "properties", None) or {}).get("cn") or node.name or "")
+    return raw.split("@", 1)[0].strip()
+
+
+def _emit_esc14a_write_access_edges(
+    graph: dict[str, Any],
+    *,
+    result: CollectionResult,
+    user_writers: dict[str, list[str]],
+    sid_to_graph_id: dict[str, str],
+) -> int:
+    """Emit ESC14 variant-A derived edges, decoupled from any SAN-UPN template.
+
+    Variant A: a principal that can WRITE a victim's ``altSecurityIdentities``
+    plants a STRONG certificate mapping to a client-auth certificate it ENROLLS
+    ITSELF and PKINITs as the victim. The decisive preconditions are (a) write
+    access to the victim (``user_writers`` — already a graph ACE) and (b) the
+    attacker can obtain a client-auth certificate
+    (``_domain_can_enroll_client_auth_cert``) — NOT a vulnerable SAN-UPN
+    template and NOT the victim's own enrollment rights. The derived edge
+    terminates at the VICTIM; any Tier-0 reach flows through the victim's own
+    ``MemberOf`` edges (never a hardcoded Domain Admins collapse).
+    """
+    can_enroll, enroll_path, enroll_templates = _domain_can_enroll_client_auth_cert(
+        result
+    )
+    if not can_enroll:
+        return 0
+    created = 0
+    for writer_sid, puppets in user_writers.items():
+        writer_graph_id = sid_to_graph_id.get(writer_sid)
+        if not writer_graph_id:
+            continue
+        seen_victims: set[str] = set()
+        for puppet_sid in puppets:
+            if puppet_sid in seen_victims:
+                continue
+            seen_victims.add(puppet_sid)
+            victim_graph_id = sid_to_graph_id.get(puppet_sid)
+            if not victim_graph_id or victim_graph_id == writer_graph_id:
+                continue
+            # Suppress a worthless-built-in victim at the EMISSION SSOT so the
+            # graph itself stays clean and every downstream surface (the
+            # adcs_esc14 finding, technical_report.json, the CLI "ADCS ESC
+            # paths" tactical count) inherits the fix. ESC14-A terminates at the
+            # VICTIM, so a disabled/no-privilege reserved built-in (the domain
+            # Guest/DefaultAccount, BUILTIN\Guests, Anonymous Logon) is not a
+            # real compromise target. The deeper root is that the finding gate
+            # `_effective_target_tier_number` force-returns Tier-0 for ANY
+            # adcs_esc* edge (a shortcut from the old model where the edge target
+            # was a CertTemplate impersonating Tier-0); that shortcut is a
+            # separate severity-modeling decision and is intentionally left
+            # untouched here. This emission gate suppresses the worthless-victim
+            # symptom at the SSOT regardless.
+            if is_worthless_victim_principal(puppet_sid):
+                continue
+            puppet_node = result.nodes.get(puppet_sid)
+            victim_label = puppet_sid
+            puppet_resources: list[dict[str, Any]] = []
+            if puppet_node and puppet_node.kind == "User":
+                victim_label = puppet_node.name or puppet_sid
+                puppet_resources.append(
+                    {
+                        "kind": "User",
+                        "object_id": puppet_sid,
+                        "name": puppet_node.name,
+                        "distinguished_name": puppet_node.distinguished_name,
+                        "role": "puppet",
+                    }
+                )
+            notes: dict[str, Any] = {
+                "collector_method": "derived_esc_compromise",
+                "vulnerable_resources": puppet_resources,
+                "vulnerable_resource_count": len(puppet_resources),
+                "impersonation_method": "weak_explicit_mapping_altsecid",
+                "impersonated_principal_hint": victim_label,
+                "puppet_user_sids": [puppet_sid],
+                "esc14a_enroll_path": enroll_path,
+                "attack_chain": "write_altsecurityidentities_map_cert_pkinit",
+            }
+            # The MACHINE-CONSUMABLE companion to ``esc14a_enroll_path``, which
+            # is prose and cannot be fed to a CA. ESC14-A moved its terminal to
+            # the VICTIM account, so the template is no longer derivable from
+            # the edge's target the way ESC1/ESC2 derive theirs — without this
+            # list, execution has nothing to resolve and falls back to asking
+            # the operator to TYPE a template name. Recorded only when a CN was
+            # actually resolved; an unnamed vehicle records nothing rather than
+            # a guess.
+            if enroll_templates:
+                notes["esc14a_enroll_templates"] = list(enroll_templates)
+            created += _upsert_derived_edge(
+                graph,
+                from_id=writer_graph_id,
+                to_id=victim_graph_id,
+                relation="ADCSESC14",
+                notes=notes,
+            )
     return created
 
 
@@ -1982,8 +2279,16 @@ def _node_bool_property(node: Any, key: str) -> bool:
 
 
 def _node_is_enabled(node: Any) -> bool:
-    """Return whether a collected principal should produce executable paths."""
-    return node.enabled is not False
+    """Return whether a collected principal should produce executable paths.
+
+    ACTIVE, not merely enabled: a tombstone preserves its
+    ``userAccountControl``, so a deleted-but-was-enabled account would otherwise
+    derive a Kerberoasting / ASREPRoasting edge for an SPN that no longer
+    resolves and an account that cannot authenticate. The deleted object keeps
+    its real ACL edges (that is how the restorable-tombstone technique works);
+    only these DERIVED executable edges are withheld.
+    """
+    return is_active(node)
 
 
 def _node_list_property(node: Any, key: str) -> list[str]:

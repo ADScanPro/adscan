@@ -67,20 +67,20 @@ from adscan_core.rich_output import print_exception
 BONUSES: dict[str, dict[str, Any]] = {
     "playbook": {
         "filename": "AD_Hardening_Playbook.pdf",
-        "title":    "AD Hardening Playbook",
-        "value":    497,
+        "title": "AD Hardening Playbook",
+        "value": 497,
         "subtitle": "30-day playbook for the six tactics that cause 80% of AD breaches.",
         "template": "playbook/playbook.html",
         # Warm editorial skin — the flagship report theme. ``editorial`` bridges
         # the bonus token scheme (--paper/--ink/--sev-*) onto its warm-bone + teal
         # palette, so the playbook reads as the same document family as the
         # editorial Security Assessment Report.
-        "theme":    "editorial",
+        "theme": "editorial",
     },
     "cheatsheet": {
         "filename": "Quick_Start_Cheatsheet.pdf",
-        "title":    "Quick-Start Cheat Sheet",
-        "value":    197,
+        "title": "Quick-Start Cheat Sheet",
+        "value": 197,
         "subtitle": "Two-page desk reference: 15 commands, 14 key bindings, 5 fast fixes.",
         "template": "cheatsheet/cheatsheet.html",
         # Themeless ON PURPOSE. The cheatsheet ships a complete, self-contained
@@ -94,16 +94,16 @@ BONUSES: dict[str, dict[str, Any]] = {
         # template's own palette authoritative and immune to theme changes.
         # (The cheatsheet is a standalone LITE lead magnet — it is NOT part of
         # the ``adscan deliver`` kit, so no ``--theme`` is ever forced on it.)
-        "theme":    "",
+        "theme": "",
     },
     "checklist": {
         "filename": "MITRE_Remediation_Checklist.pdf",
-        "title":    "MITRE Remediation Checklist",
-        "value":    297,
+        "title": "MITRE Remediation Checklist",
+        "value": 297,
         "subtitle": "Auditor-grade remediation worksheet for every tracked ATT&CK technique.",
         "template": "checklist/checklist.html",
         # Unified editorial skin — see the playbook entry above.
-        "theme":    "editorial",
+        "theme": "editorial",
     },
     # The Coverage Matrix bonus was folded into the AD Control Coverage Report:
     # the verified-clear coverage view (sourced from the scan's
@@ -113,13 +113,27 @@ BONUSES: dict[str, dict[str, Any]] = {
     # ``_KIT``, ``--only coverage-matrix``, the web selection dict); only the
     # rendered artifact changed.
     "coverage-matrix": {
-        "filename":   "AD_Control_Coverage_Report.pdf",
-        "title":      "AD Control Coverage Report",
-        "value":      0,  # Assurance utility — no value-stack tag.
-        "subtitle":   "The controls ADscan tested and confirmed clear in this engagement.",
-        "template":   "coverage_report/coverage_report.html",
-        "theme":      "editorial",
-        "is_bonus":   False,
+        "filename": "AD_Control_Coverage_Report.pdf",
+        "title": "AD Control Coverage Report",
+        "value": 0,  # Assurance utility — no value-stack tag.
+        "subtitle": "The controls ADscan tested and confirmed clear in this engagement.",
+        "template": "coverage_report/coverage_report.html",
+        "theme": "editorial",
+        "is_bonus": False,
+    },
+    # The AD Password Hygiene Report is the fourth kit document, and it is
+    # CONDITIONAL: it ships only when credential recovery actually ran (see
+    # ``password_hygiene_databinding`` + ``deliver._drop_unsupportable_items``).
+    # Same editorial skin as the other kit documents. Not a value-stack bonus;
+    # it is an assessment companion driven entirely by the scan.
+    "password-hygiene": {
+        "filename": "AD_Password_Hygiene_Report.pdf",
+        "title": "AD Password Hygiene Report",
+        "value": 0,  # Assessment companion — no value-stack tag.
+        "subtitle": "The strength and reuse of the passwords recovered in this engagement.",
+        "template": "password_hygiene/password_hygiene.html",
+        "theme": "editorial",
+        "is_bonus": False,
     },
 }
 
@@ -223,8 +237,8 @@ def _load_theme(theme_name: str) -> str:
 #: on white paper. Behaviour here is unchanged: ``"dark"`` still yields the
 #: charcoal ``logo-wordmark-dark.png`` for light themes.
 _INK_VARIANT_TO_BACKGROUND: dict[str, str] = {
-    "dark": "light",   # charcoal ink  -> for a LIGHT background
-    "light": "dark",   # white ink     -> for a DARK background
+    "dark": "light",  # charcoal ink  -> for a LIGHT background
+    "light": "dark",  # white ink     -> for a DARK background
 }
 
 
@@ -287,8 +301,21 @@ def _render_html(template_source: str, context: dict[str, Any], theme_css: str) 
     return rendered
 
 
-def _render_pdf(html_str: str) -> bytes:
-    """Render HTML to PDF bytes via the chromium engine."""
+def _render_pdf(html_str: str, options: dict[str, Any] | None = None) -> bytes:
+    """Render HTML to PDF bytes via the chromium engine.
+
+    Args:
+        html_str: The rendered bonus HTML document.
+        options: Optional Chromium engine options forwarded to
+            ``engine.render_pdf``. Defaults to ``{}`` (an empty dict), which
+            keeps the default bonus render byte-identical to the historical
+            ``options={}`` call. The composition-seam path passes the running
+            per-page client-logo options here (see
+            :func:`adscan_internal.pro.reporting.composition.running_logo_engine_options`).
+
+    Returns:
+        The rendered PDF as raw bytes.
+    """
     from adscan_internal.services.report_engines import get_engine
 
     engine = get_engine("chromium")
@@ -298,7 +325,7 @@ def _render_pdf(html_str: str) -> bytes:
             f"Chromium engine unavailable ({reason}). "
             "Install with: pip install playwright && playwright install chromium"
         )
-    return engine.render_pdf(html_str, base_url=None, options={})
+    return engine.render_pdf(html_str, base_url=None, options=options or {})
 
 
 def _maybe_prompt_open(pdf_path: Path) -> None:
@@ -345,25 +372,85 @@ def _print_completion_panel(bonus_key: str, pdf_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_observed_techniques(workspace_dir: Path | None) -> set[str]:
-    """Best-effort lookup of techniques observed in the workspace scan.
+def _resolve_observed_techniques(
+    workspace_dir: Path | None,
+) -> tuple[set[str], bool]:
+    """Look up the techniques observed in the workspace scan.
 
-    Wraps :func:`bonus_workspace.get_observed_techniques` with the visible
-    warning required by the bonus contract: if no workspace signal is
-    available, the operator must know the bonus is being rendered from
-    the static reference catalog rather than the live engagement.
+    Returns ``(observed, lookup_failed)``. An empty set with
+    ``lookup_failed=False`` is the legitimate "this scan observed nothing"
+    answer; an empty set with ``lookup_failed=True`` means the lookup raised
+    and we know nothing either way. The caller words its operator warning from
+    the flag rather than attributing an empty set to the client's environment.
     """
     if workspace_dir is None:
-        return set()
+        return set(), False
     try:
         from adscan_internal.pro.reporting.bonus_workspace import (
             get_observed_techniques,
         )
-        return get_observed_techniques(workspace_dir)
+
+        return get_observed_techniques(workspace_dir), False
     except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
-        return set()
+        return set(), True
+
+
+def _bind_client_section(
+    builder: Callable[..., dict[str, Any] | None],
+    *,
+    document: str,
+    section: str,
+    **kwargs: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Bind a document's client-specific section, distinguishing both failures.
+
+    One seam for every kit document that LEADS with a client-specific section
+    and falls back to a general reference catalog. ``builder`` returning
+    ``None`` and ``builder`` raising used to arrive at the template as the same
+    ``client = None``, so an incomplete document rendered as a finished one and
+    printed the empty-workspace copy to a client whose scan had run. The two
+    causes are separated here, once, rather than at each call site.
+
+    Returns ``(client, gap_view)``:
+
+    * ``client`` the bound payload, or ``None`` for either non-data cause. The
+      client-specific sections render only when it is non-``None``, exactly as
+      before.
+    * ``gap_view`` the render-ready view from
+      :mod:`adscan_core.reporting.deliverable_section_gap`. The template reads
+      ``has_gap`` to declare the document incomplete, and ``may_invite_scan``
+      to decide whether the "run an authenticated scan" copy is still true.
+
+    The three diagnostic sinks are untouched on the failure path
+    (``capture_exception`` + ``print_exception``); what is added is the
+    operator-visible warning, which previously only existed under ``--debug``.
+    """
+    from adscan_core.reporting.deliverable_section_gap import (
+        CAUSE_BOUND,
+        CAUSE_BUILD_FAILED,
+        CAUSE_NO_CLIENT_DATA,
+        build_section_gap,
+        operator_warning,
+        section_gap_view,
+    )
+
+    client: dict[str, Any] | None = None
+    try:
+        client = builder(**kwargs)
+        cause = CAUSE_BOUND if client is not None else CAUSE_NO_CLIENT_DATA
+    except Exception as exc:  # noqa: BLE001 — the document must still ship
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        client = None
+        cause = CAUSE_BUILD_FAILED
+
+    gap = build_section_gap(document=document, section=section, cause=cause)
+    warning = operator_warning(gap)
+    if warning:
+        print_warning(warning)
+    return client, section_gap_view(gap)
 
 
 def _is_observed(technique_id: str, observed: set[str]) -> bool:
@@ -403,12 +490,12 @@ def _is_observed(technique_id: str, observed: set[str]) -> bool:
 # label used in :mod:`mitre_data` so we can score chapters by how many
 # observed techniques fall under each.
 _PLAYBOOK_TACTIC_ALIASES: dict[str, str] = {
-    "Credential Access":      "Credential Access",
-    "Privilege Escalation":   "Privilege Escalation",
-    "Lateral Movement":       "Lateral Movement",
-    "Persistence":            "Persistence",
-    "Defense Evasion":        "Defense Evasion",
-    "Initial Access":         "Initial Access",
+    "Credential Access": "Credential Access",
+    "Privilege Escalation": "Privilege Escalation",
+    "Lateral Movement": "Lateral Movement",
+    "Persistence": "Persistence",
+    "Defense Evasion": "Defense Evasion",
+    "Initial Access": "Initial Access",
 }
 
 
@@ -425,6 +512,7 @@ def _ctx_playbook(
     has_workspace_signal: bool = False,
     workspace_dir: Path | None = None,
     frameworks: list[str] | None = None,
+    branding: str = "cobrand",
 ) -> dict[str, Any]:
     """Build the Jinja context for the AD Hardening Playbook.
 
@@ -476,31 +564,40 @@ def _ctx_playbook(
             )
         )
 
-    # Tier-3 client-specific payload (None when no readable findings).
-    client: dict[str, Any] | None = None
-    try:
-        from adscan_internal.pro.reporting.playbook_databinding import (
-            build_playbook_databinding,
-        )
+    # Tier-3 client-specific payload (None when no readable findings, and also
+    # None when the bind FAILED — the two are told apart by the gap view, which
+    # is what keeps a failed build from rendering as a finished document).
+    from adscan_internal.pro.reporting.playbook_databinding import (
+        build_playbook_databinding,
+    )
 
-        client = build_playbook_databinding(workspace_dir, frameworks)
-    except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        client = None
+    client, client_section_gap = _bind_client_section(
+        build_playbook_databinding,
+        document=BONUSES["playbook"]["title"],
+        section=(
+            "remediation runbooks and executive summary built from your own findings"
+        ),
+        workspace_dir=workspace_dir,
+        frameworks=frameworks,
+        branding=branding,
+    )
 
     return {
-        "title":                PLAYBOOK["title"],
-        "subtitle":             PLAYBOOK["subtitle"],
+        "title": PLAYBOOK["title"],
+        "subtitle": PLAYBOOK["subtitle"],
         "narrative_paragraphs": PLAYBOOK["narrative_paragraphs"],
-        "tactics":              tactics,
-        "calendar":             PLAYBOOK["calendar"],
-        "report_date":          time.strftime("%B %d, %Y"),
+        "tactics": tactics,
+        "calendar": PLAYBOOK["calendar"],
+        "report_date": time.strftime("%B %d, %Y"),
         "has_workspace_signal": has_workspace_signal,
         "observed_count_total": sum(c["observed_count"] for c in tactics),
         # Tier-3 sections — present only when the workspace yielded findings.
-        "client":               client,
-        "has_client_data":      client is not None,
+        "client": client,
+        "has_client_data": client is not None,
+        # Why they are absent when they are. ``has_gap`` declares the document
+        # incomplete; ``may_invite_scan`` gates the copy that is only true for a
+        # genuinely empty workspace.
+        "client_section_gap": client_section_gap,
     }
 
 
@@ -531,21 +628,43 @@ def _ctx_cheatsheet() -> dict[str, Any]:
 # :func:`_ctx_checklist`.
 _CHECKLIST_SEVERITY: dict[str, str] = {
     # Critical — direct breakage of the domain or NTLM/Kerberos pillars.
-    "T1003": "critical", "T1003.001": "critical", "T1003.006": "critical",
-    "T1558.003": "critical", "T1558.004": "critical", "T1558": "critical",
-    "T1550.002": "critical", "T1550.003": "critical",
-    "T1078": "critical", "T1078.002": "critical",
+    "T1003": "critical",
+    "T1003.001": "critical",
+    "T1003.006": "critical",
+    "T1558.003": "critical",
+    "T1558.004": "critical",
+    "T1558": "critical",
+    "T1550.002": "critical",
+    "T1550.003": "critical",
+    "T1078": "critical",
+    "T1078.002": "critical",
     "T1486": "critical",
     # High — prerequisite or amplifier paths.
-    "T1110.003": "high", "T1187": "high",
-    "T1552.006": "high", "T1557.001": "high", "T1649": "high",
-    "T1098": "high", "T1136": "high",
-    "T1556.007": "high", "T1133": "high", "T1190": "high",
-    "T1068": "high", "T1021.001": "high", "T1021.002": "high",
+    "T1110.003": "high",
+    "T1187": "high",
+    "T1552.006": "high",
+    "T1557.001": "high",
+    "T1649": "high",
+    "T1098": "high",
+    "T1136": "high",
+    "T1556.007": "high",
+    "T1133": "high",
+    "T1190": "high",
+    "T1068": "high",
+    "T1021.001": "high",
+    "T1021.002": "high",
     # Medium — discovery and lateral helpers.
-    "T1110.001": "medium", "T1552.001": "medium", "T1555": "medium",
-    "T1018": "medium", "T1069": "medium", "T1087": "medium", "T1087.002": "medium",
-    "T1482": "medium", "T1570": "medium", "T1027": "medium", "T1070": "medium",
+    "T1110.001": "medium",
+    "T1552.001": "medium",
+    "T1555": "medium",
+    "T1018": "medium",
+    "T1069": "medium",
+    "T1087": "medium",
+    "T1087.002": "medium",
+    "T1482": "medium",
+    "T1570": "medium",
+    "T1027": "medium",
+    "T1070": "medium",
 }
 
 
@@ -584,13 +703,13 @@ def _ctx_checklist(
 
     def _row(tid: str, name: str) -> dict[str, Any]:
         return {
-            "id":         tid,
-            "name":       name,
-            "severity":   _CHECKLIST_SEVERITY.get(tid, "low"),
+            "id": tid,
+            "name": name,
+            "severity": _CHECKLIST_SEVERITY.get(tid, "low"),
             "mitigation": TECHNIQUE_MITIGATIONS.get(
                 tid, "Document the mitigation in the next sprint."
             ),
-            "observed":   _is_observed(tid, observed),
+            "observed": _is_observed(tid, observed),
         }
 
     by_tactic_obs: dict[str, list[dict[str, Any]]] = {t: [] for t in TACTICS_ORDER}
@@ -605,7 +724,9 @@ def _ctx_checklist(
         else:
             by_tactic_ref[tactic].append(row)
 
-    def _make_groups(by_tactic: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    def _make_groups(
+        by_tactic: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
         groups: list[dict[str, Any]] = []
         for tactic in TACTICS_ORDER:
             items = by_tactic.get(tactic) or []
@@ -625,31 +746,32 @@ def _ctx_checklist(
     tactic_groups = observed_groups if has_workspace_signal else reference_groups
 
     # Bind the per-finding remediation tracker (Tier-2/3 client section).
-    # Best-effort: a binding failure must never break the reference
-    # checklist render — mirror the playbook's defensive pattern.
-    client: dict[str, Any] | None = None
-    try:
-        from adscan_internal.pro.reporting.checklist_databinding import (
-            build_checklist_databinding,
-        )
+    # A binding failure must never break the reference checklist render, and
+    # must never be indistinguishable from an empty workspace either — the
+    # shared seam below is what separates the two.
+    from adscan_internal.pro.reporting.checklist_databinding import (
+        build_checklist_databinding,
+    )
 
-        client = build_checklist_databinding(workspace_dir, frameworks)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        client = None
+    client, client_section_gap = _bind_client_section(
+        build_checklist_databinding,
+        document=BONUSES["checklist"]["title"],
+        section="remediation worksheet built from your own findings",
+        workspace_dir=workspace_dir,
+        frameworks=frameworks,
+    )
 
     return {
-        "tactic_groups":        tactic_groups,
-        "observed_groups":      observed_groups,
-        "reference_groups":     reference_groups,
+        "tactic_groups": tactic_groups,
+        "observed_groups": observed_groups,
+        "reference_groups": reference_groups,
         "has_workspace_signal": has_workspace_signal,
-        "observed_count_total": sum(
-            len(g["techniques"]) for g in observed_groups
-        ),
-        "report_date":          time.strftime("%B %d, %Y"),
-        "client":               client,
-        "has_client_data":      client is not None,
+        "observed_count_total": sum(len(g["techniques"]) for g in observed_groups),
+        "report_date": time.strftime("%B %d, %Y"),
+        "client": client,
+        "has_client_data": client is not None,
+        # See ``_ctx_playbook`` — same gap contract, same two template reads.
+        "client_section_gap": client_section_gap,
     }
 
 
@@ -659,6 +781,7 @@ def _ctx_coverage_matrix(
     has_workspace_signal: bool = False,
     workspace_dir: Path | None = None,
     frameworks: list[str] | None = None,
+    branding: str = "cobrand",
 ) -> dict[str, Any]:
     """Build the Jinja context for the AD Control Coverage Report.
 
@@ -683,7 +806,33 @@ def _ctx_coverage_matrix(
         build_coverage_report_databinding,
     )
 
-    return build_coverage_report_databinding(workspace_dir, frameworks=frameworks)
+    return build_coverage_report_databinding(
+        workspace_dir, frameworks=frameworks, branding=branding
+    )
+
+
+def _ctx_password_hygiene(
+    *,
+    observed: set[str] | None = None,
+    has_workspace_signal: bool = False,
+    workspace_dir: Path | None = None,
+    frameworks: list[str] | None = None,
+    branding: str = "cobrand",
+) -> dict[str, Any]:
+    """Build the Jinja context for the AD Password Hygiene Report.
+
+    Delegates to ``password_hygiene_databinding.build_password_hygiene_databinding``,
+    which reads the ``password_hygiene`` block credential recovery persisted and
+    returns a context whose ``present`` gate the template reads. The
+    ``observed`` / ``has_workspace_signal`` / ``frameworks`` args are accepted for
+    the uniform dynamic-builder signature and unused: this document is framework-
+    agnostic and reads recovery results, not observed techniques.
+    """
+    from adscan_internal.pro.reporting.password_hygiene_databinding import (
+        build_password_hygiene_databinding,
+    )
+
+    return build_password_hygiene_databinding(workspace_dir, branding=branding)
 
 
 # Builders that consume workspace signal share a uniform signature
@@ -693,24 +842,35 @@ _CONTEXT_BUILDERS_STATIC: dict[str, Callable[[], dict[str, Any]]] = {
     "cheatsheet": _ctx_cheatsheet,
 }
 
-_CONTEXT_BUILDERS_DYNAMIC: dict[
-    str, Callable[..., dict[str, Any]]
-] = {
-    "playbook":        _ctx_playbook,
-    "checklist":       _ctx_checklist,
+_CONTEXT_BUILDERS_DYNAMIC: dict[str, Callable[..., dict[str, Any]]] = {
+    "playbook": _ctx_playbook,
+    "checklist": _ctx_checklist,
     "coverage-matrix": _ctx_coverage_matrix,
+    "password-hygiene": _ctx_password_hygiene,
 }
 
 
-def _with_score_labels(ctx: dict[str, Any]) -> dict[str, Any]:
+def _with_score_labels(
+    ctx: dict[str, Any], branding: str = "cobrand"
+) -> dict[str, Any]:
     """Inject the score vocabulary every bonus document prints.
 
     The per-finding number the bonuses show is the SAME context-elevated score
     the Security Assessment Report ranks by — ADscan's own model, not a CVSS
     Base. The names come from one place (``adscan_core.cvss.labels``) so a
     bonus cannot drift back to labelling it "CVSS".
+
+    Uses ``setdefault`` throughout, so a context a databinding builder already
+    populated (e.g. ``build_playbook_databinding``/``build_coverage_report_
+    databinding`` under ``branding="whitelabel"``, which set the debranded
+    ``"Risk Priority"`` wording themselves) is never overwritten here — this
+    is only the fallback for bonuses whose builder does not compute the label
+    itself (the cheatsheet, the checklist).
     """
-    ctx.setdefault("adscan_priority_label", ADSCAN_PRIORITY_LABEL)
+    ctx.setdefault(
+        "adscan_priority_label",
+        "Risk Priority" if branding == "whitelabel" else ADSCAN_PRIORITY_LABEL,
+    )
     ctx.setdefault("adscan_priority_short_label", ADSCAN_PRIORITY_SHORT_LABEL)
     ctx.setdefault("cvss_base_label", CVSS_BASE_LABEL)
     return ctx
@@ -721,6 +881,7 @@ def _build_context(
     workspace_dir: Path | None,
     theme: str | None = None,
     frameworks: list[str] | None = None,
+    branding: str = "cobrand",
 ) -> dict[str, Any]:
     """Build the Jinja context for ``bonus_key``, threading workspace data.
 
@@ -742,7 +903,17 @@ def _build_context(
             frameworks (an ISO 27001 kit never leaks DORA/ENS). ``None`` keeps
             the legacy all-frameworks behaviour; the coverage report ignores it
             (it is framework-agnostic).
+        branding: The resolved ``BrandingPosture`` value (``"adscan"`` /
+            ``"cobrand"`` / ``"whitelabel"``). Mirrors the Security Assessment
+            Report's debranding (``templates/premium/report.html``): under
+            ``"whitelabel"`` the ADscan wordmark is suppressed from the cover
+            and the shared ``adscan_priority_label`` scoring-model name reads
+            "Risk Priority". Forwarded to the playbook / coverage-matrix
+            databinding builders, which compute the debranded label
+            themselves; ``_with_score_labels`` below only covers the bonuses
+            (cheatsheet, checklist) whose builder does not.
     """
+
     def _with_brand(ctx: dict[str, Any]) -> dict[str, Any]:
         """Inject the ADscan wordmark data-URIs into every context.
 
@@ -763,13 +934,30 @@ def _build_context(
         mark. Templates fall back to their text wordmark when a value is
         empty. Done here so all builders — static and dynamic — get the
         brand consistently without each one importing the helper.
+
+        Under ``branding == "whitelabel"`` the wordmark data-URIs are left
+        empty so a template's ``{% if brand_logo %}`` falls through — the
+        bonus templates additionally gate their hardcoded "ADscan" fallback
+        text on ``branding`` directly (mirroring the premium report).
         """
-        theme_aware = _brand_logo_data_uri(_wordmark_variant_for_theme(theme))
+        is_whitelabel = branding == "whitelabel"
+        theme_aware = (
+            ""
+            if is_whitelabel
+            else _brand_logo_data_uri(_wordmark_variant_for_theme(theme))
+        )
         ctx.setdefault("brand_logo", theme_aware)
-        ctx.setdefault("brand_logo_white", _brand_logo_data_uri("light"))
-        ctx.setdefault("brand_logo_charcoal", _brand_logo_data_uri("dark"))
-        ctx.setdefault("brand_logo_light", _brand_logo_data_uri("light"))
-        return _with_score_labels(ctx)
+        ctx.setdefault(
+            "brand_logo_white", "" if is_whitelabel else _brand_logo_data_uri("light")
+        )
+        ctx.setdefault(
+            "brand_logo_charcoal", "" if is_whitelabel else _brand_logo_data_uri("dark")
+        )
+        ctx.setdefault(
+            "brand_logo_light", "" if is_whitelabel else _brand_logo_data_uri("light")
+        )
+        ctx.setdefault("branding", branding)
+        return _with_score_labels(ctx, branding)
 
     if bonus_key in _CONTEXT_BUILDERS_STATIC:
         return _with_brand(_CONTEXT_BUILDERS_STATIC[bonus_key]())
@@ -778,16 +966,33 @@ def _build_context(
     if builder is None:
         raise KeyError(f"No context builder for bonus '{bonus_key}'")
 
-    observed = _resolve_observed_techniques(workspace_dir)
+    observed, observed_lookup_failed = _resolve_observed_techniques(workspace_dir)
     has_signal = bool(observed)
-    if workspace_dir is not None and not has_signal:
+    # The "rendering the static reference catalog" warning only makes sense for a
+    # bonus that FALLS BACK to a static catalog when no technique was observed
+    # (the playbook / checklist). The password-hygiene document builds entirely
+    # from the recovery block the scan recorded and has no static fallback, so the
+    # warning would be misleading for it.
+    _warns_on_no_signal = bonus_key not in ("password-hygiene",)
+    if workspace_dir is not None and not has_signal and _warns_on_no_signal:
         # Workspace was supplied but produced no signal — operator must
         # know the bonus is being rendered from the static catalog so
-        # they can investigate before sending it to the customer.
-        print_warning(
-            f"Bonus '{bonus_key}': no observed techniques in {workspace_dir} — "
-            "rendering the static reference catalog as fallback."
-        )
+        # they can investigate before sending it to the customer. Say WHICH
+        # of the two it is: a lookup that raised tells us nothing about the
+        # client's environment, so it must not be reported as "no observed
+        # techniques", which is a statement about their scan.
+        if observed_lookup_failed:
+            print_warning(
+                f"Bonus '{bonus_key}': the observed-technique lookup failed for "
+                f"{workspace_dir}, so this document is ranked from the static "
+                "reference catalog rather than the engagement. Fix the cause "
+                "(traceback above) and re-run before sending this kit."
+            )
+        else:
+            print_warning(
+                f"Bonus '{bonus_key}': no observed techniques in {workspace_dir} — "
+                "rendering the static reference catalog as fallback."
+            )
     # All three dynamic bonuses now consume the raw workspace to bind
     # client-specific sections: the playbook binds Tier-3 findings /
     # roadmap / compliance gaps, the checklist binds the per-finding
@@ -799,15 +1004,23 @@ def _build_context(
         "observed": observed,
         "has_workspace_signal": has_signal,
     }
-    if bonus_key in ("playbook", "checklist", "coverage-matrix"):
+    if bonus_key in ("playbook", "checklist", "coverage-matrix", "password-hygiene"):
         kwargs["workspace_dir"] = workspace_dir
         kwargs["frameworks"] = frameworks
+    # Only the playbook / coverage-matrix / password-hygiene databinding builders
+    # accept ``branding`` (playbook / coverage-matrix compute the debranded
+    # ``adscan_priority_label`` themselves; password-hygiene only needs it for the
+    # page-furniture wordmark). The checklist builder does not, so it is left to
+    # the ``_with_score_labels`` fallback above.
+    if bonus_key in ("playbook", "coverage-matrix", "password-hygiene"):
+        kwargs["branding"] = branding
     return _with_brand(builder(**kwargs))
 
 
 # ---------------------------------------------------------------------------
 # Core renderer — used by ``adscan deliver`` to produce each kit PDF.
 # ---------------------------------------------------------------------------
+
 
 def render_bonus(
     bonus_key: str,
@@ -818,6 +1031,13 @@ def render_bonus(
     workspace_dir: Path | None = None,
     theme: str | None = None,
     frameworks: list[str] | None = None,
+    branding: str = "cobrand",
+    client_cover_html: str = "",
+    client_back_html: str = "",
+    client_logo_data_uri: str = "",
+    composition_seams_enabled: bool = False,
+    cover_title: str = "",
+    cover_subtitle: str = "",
 ) -> int:
     """Render a single bonus PDF to ``output_path``. Returns bytes written.
 
@@ -849,6 +1069,31 @@ def render_bonus(
             kit built for one regime never leaks another's content. ``None``
             keeps the legacy all-frameworks behaviour; an empty list renders no
             compliance content. The coverage report ignores it.
+        branding: The resolved ``BrandingPosture`` value (``"adscan"`` /
+            ``"cobrand"`` / ``"whitelabel"``). Under ``"whitelabel"`` every
+            bonus suppresses the ADscan cover wordmark and the shared
+            ``adscan_priority_label`` scoring-model name reads "Risk
+            Priority" — the same debranding the Security Assessment Report
+            applies. Defaults to ``"cobrand"`` so existing callers (and
+            ``scripts/regenerate_samples.py``) are unaffected.
+        client_cover_html: Optional consultancy-supplied cover HTML fragment
+            (composition seam, ``composition_seams`` entitlement-gated). When
+            entitled and supplied, it is personalized with ``cover_title`` /
+            ``cover_subtitle``, rendered full-bleed, and prepended as page 1 —
+            and the bonus template's own cover is skipped (``skip_cover``).
+        client_back_html: Optional consultancy-supplied back-page HTML fragment
+            (same gate), appended as the final page.
+        client_logo_data_uri: The client logo as a ``data:`` URI. When non-empty
+            AND ``composition_seams_enabled``, every page of the bonus body
+            carries it as a running per-page header mark.
+        composition_seams_enabled: Whether the install carries the
+            ``composition_seams`` entitlement. Gates the client cover/back and
+            the running logo. ``False`` by default — which, together with empty
+            cover/back/logo, keeps the bonus render byte-identical to today.
+        cover_title: Per-deliverable title filled into the client cover/back
+            ``{{DOCUMENT_TITLE}}`` token (e.g. "Remediation Playbook").
+        cover_subtitle: Per-deliverable subtitle filled into the client
+            cover/back ``{{DOCUMENT_SUBTITLE}}`` token.
 
     Real customer flows (``adscan deliver``, web Celery
     ``generate_deliverable_kit``) MUST NOT pass ``is_sample=True``.
@@ -861,9 +1106,24 @@ def render_bonus(
     resolved_theme = _THEME_ALIASES.get(theme or "", theme or "") or meta["theme"]
     template_source = _load_template(meta["template"])
     theme_css = _load_theme(resolved_theme)
+
+    # Composition seams: active only when entitled AND a client cover and/or
+    # back page is supplied. Any other case (not entitled, or no client
+    # cover/back) leaves every branch below at its historical default, keeping
+    # the DFY (and web Celery worker) render byte-identical.
+    seams = composition_seams_enabled and bool(client_cover_html or client_back_html)
+
     context = _build_context(
-        bonus_key, workspace_dir, theme=resolved_theme, frameworks=frameworks
+        bonus_key,
+        workspace_dir,
+        theme=resolved_theme,
+        frameworks=frameworks,
+        branding=branding,
     )
+    # Skip the bonus template's own cover only when a client cover will be
+    # prepended in its place. ``skip_cover`` defaults to a falsy value, so the
+    # bonus keeps its own cover on every non-seam render.
+    context["skip_cover"] = bool(composition_seams_enabled and client_cover_html)
     if bonus_key == "playbook":
         context["truncate"] = bool(truncate)
     html_str = _render_html(template_source, context, theme_css)
@@ -873,9 +1133,45 @@ def render_bonus(
         from adscan_internal.pro.reporting.sample_watermark import (
             inject_sample_watermark,
         )
+
         html_str = inject_sample_watermark(html_str, is_sample=True)
 
-    pdf_bytes = _render_pdf(html_str)
+    # Per-page running client logo: render-time engine options, merged
+    # additively. ``running_logo_engine_options`` returns ``{}`` (no change)
+    # whenever not entitled or no logo is set, so the default render stays
+    # byte-identical to the historical ``options={}`` call.
+    from adscan_internal.pro.reporting.composition import (
+        assemble_deliverable,
+        running_logo_engine_options,
+    )
+
+    body_options: dict[str, Any] = running_logo_engine_options(
+        client_logo_data_uri, composition_seams_enabled
+    )
+    body_pdf = _render_pdf(html_str, options=body_options)
+
+    if not seams:
+        # DFY / non-entitled: no client cover or back page — the body PDF IS
+        # the deliverable, byte-identical to the pre-seam path.
+        output_path.write_bytes(body_pdf)
+        return len(body_pdf)
+
+    # Wrap the body with the full-bleed client cover/back via the shared
+    # assembly seam, personalizing each fragment with this deliverable's own
+    # title/subtitle so one authored client cover brands every kit PDF.
+    from adscan_internal.services.report_engines import get_engine
+
+    engine = get_engine("chromium")
+    pdf_bytes = assemble_deliverable(
+        body_pdf,
+        engine=engine,
+        theme_css=theme_css,
+        cover_html=client_cover_html,
+        back_html=client_back_html,
+        title=cover_title,
+        subtitle=cover_subtitle,
+        enabled=composition_seams_enabled,
+    )
     output_path.write_bytes(pdf_bytes)
     return len(pdf_bytes)
 
@@ -889,7 +1185,9 @@ def render_bonus(
 # Instead the LITE Dockerfile copies a single pre-baked PDF here (the
 # private build pipeline produces it via ``scripts/bake_cheatsheet.sh``
 # using the PRO renderer and seeds it into the build context).
-_LITE_STATIC_CHEATSHEET_PATH = static_dir() / "cheatsheet" / "Quick_Start_Cheatsheet.pdf"
+_LITE_STATIC_CHEATSHEET_PATH = (
+    static_dir() / "cheatsheet" / "Quick_Start_Cheatsheet.pdf"
+)
 
 
 def _try_use_baked_static(bonus_key: str, output_path: Path) -> int | None:
@@ -908,6 +1206,7 @@ def _try_use_baked_static(bonus_key: str, output_path: Path) -> int | None:
     try:
         # If this import succeeds we have the PRO renderer; defer to it.
         import adscan_internal.pro  # noqa: F401
+
         return None
     except ModuleNotFoundError:
         pass

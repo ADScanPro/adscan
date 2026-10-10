@@ -27,7 +27,11 @@ from adscan_internal.services.captured_credential_policy import (
     classify_principal,
     crack_policy,
 )
-from adscan_internal.services.cracking_benchmark import get_or_run_benchmark
+from adscan_internal.services.cracking_benchmark import (
+    get_or_run_benchmark,
+    load_cached_achieved_rates,
+    make_achieved_rate_provider,
+)
 from adscan_internal.services.cracking_wordlist_policy import (
     EFFORT_LEVELS,
     resolve_effort,
@@ -39,6 +43,23 @@ from adscan_internal.services.wordlist_service import (
 from adscan_core.rich_output import print_exception
 
 _KIND = "cracking"
+
+
+def _count_hashes(hash_file: Optional[str]) -> Optional[int]:
+    """Non-empty line count of ``hash_file``, or ``None`` when unreadable.
+
+    ``None`` rather than ``1``: for a salted mode the count multiplies the
+    keyspace, so guessing one would quietly promise a fifty-account roast in
+    one account's time. ``None`` makes the estimate provisional instead.
+    """
+    if not hash_file:
+        return None
+    try:
+        with open(hash_file, "r", encoding="utf-8", errors="ignore") as handle:
+            count = sum(1 for line in handle if line.strip())
+    except OSError:
+        return None
+    return count or None
 
 # Fixed NetNTLM modes. Everything else ADscan cracks in the background is a roast
 # hash (Kerberoast / AS-REP, RC4 + AES etypes) — always a user/service account,
@@ -136,7 +157,7 @@ def enqueue_cracking_job(
         if effort:
             effort_tiers = _resolve_effort_tiers(
                 shell, effort, workspace_type=workspace_type, domain=domain,
-                wordlists_dir=wordlists_dir,
+                wordlists_dir=wordlists_dir, mode=mode_str, hash_file=hash_file,
             )
             if effort_tiers:
                 runtime_kwargs["effort_tiers"] = effort_tiers
@@ -167,17 +188,28 @@ def enqueue_cracking_job(
 
 
 def _resolve_effort_tiers(
-    shell: Any, effort: str, *, workspace_type: str, domain: str, wordlists_dir: str
+    shell: Any, effort: str, *, workspace_type: str, domain: str,
+    wordlists_dir: str, mode: Optional[str] = None,
+    hash_file: Optional[str] = None,
 ) -> Optional[list]:
     """Resolve the effort ladder via the benchmark-aware SSOT. Best-effort —
     a benchmark/resolve failure returns None so the caller falls back to the
     legacy bare wordlist_tiers_for_workspace path, never breaking
-    capture->crack."""
+    capture->crack.
+
+    ``mode`` is the mode this job will crack, so the rung is planned against
+    the rate that mode achieves. ``hash_file`` supplies the hash COUNT, which
+    multiplies the keyspace for every salted mode this lane handles (NetNTLM
+    and both roast families are all salted), so without it a job cracking
+    fifty roasted accounts plans as though it were cracking one."""
     try:
         benchmark = get_or_run_benchmark(shell)
         return resolve_effort(
             effort, workspace_type=workspace_type, domain=domain,
             wordlists_dir=wordlists_dir, benchmark=benchmark,
+            cap_reference_mode=mode, hash_count=_count_hashes(hash_file),
+            achieved=load_cached_achieved_rates(),
+            rate_provider=make_achieved_rate_provider(shell, hash_file=hash_file),
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

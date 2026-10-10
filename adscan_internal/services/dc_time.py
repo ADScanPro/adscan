@@ -43,6 +43,11 @@ from enum import Enum
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.reporting.clock_frame import (
+    CLOCK_SYNC_KEY,
+    build_clock_sync_record,
+    merge_clock_sync_record,
+)
 from adscan_core.rich_output import (
     mark_sensitive,
     print_info_debug,
@@ -879,6 +884,59 @@ def _seed_kerbad_offset(realm: str, offset: float) -> None:
         pass
 
 
+def _record_clock_agreement(
+    shell: Any,
+    domain_norm: str,
+    *,
+    stepped: bool,
+    offset_seconds: float | None,
+    channel: str,
+) -> None:
+    """Persist that the host clock now agrees with this domain's controller.
+
+    A report that prints an absolute instant has to say which clock produced it,
+    and after a step every stamp the scan writes reads the DC's clock while still
+    carrying a UTC suffix. Nothing in the workspace said so, so the containment
+    section printed an instant the client could not find and then drew a
+    conclusion from the empty result. This is the record that lets it state the
+    frame instead (read back by
+    :func:`~adscan_core.reporting.clock_frame.resolve_stamp_frame`).
+
+    Written on the clock as it stands AFTER any step, because that is the
+    boundary later stamps are compared against. Best-effort and never raises:
+    clock recovery must not break the auth it exists to help, and a missing
+    record degrades the report to naming no instant rather than a wrong one.
+    """
+    try:
+        store = getattr(shell, "domains_data", None)
+        if not isinstance(store, dict):
+            return
+        key = next(
+            (name for name in store if str(name).strip().lower() == domain_norm),
+            None,
+        )
+        if key is None:
+            return
+        entry = store.get(key)
+        if not isinstance(entry, dict):
+            return
+        fresh = build_clock_sync_record(
+            stepped=stepped,
+            offset_seconds=offset_seconds,
+            channel=channel,
+            at_iso=datetime.now(timezone.utc).isoformat(),
+        )
+        entry[CLOCK_SYNC_KEY] = merge_clock_sync_record(entry.get(CLOCK_SYNC_KEY), fresh)
+        store[key] = entry
+        save = getattr(shell, "save_workspace_data", None)
+        if callable(save):
+            save()
+    except Exception as exc:  # noqa: BLE001 — never break clock recovery
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"clock-sync-guard could not persist the clock frame: {exc}")
+
+
 async def ensure_clock_synced_fresh(
     shell: Any,
     *,
@@ -965,6 +1023,13 @@ async def _ensure_clock_synced_fresh_locked(
     # untouched.
     if abs(offset) < _CLOCK_TOLERANCE_SECONDS:
         memo[domain_norm] = now_mono
+        _record_clock_agreement(
+            shell,
+            domain_norm,
+            stepped=False,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+        )
         print_info_debug(
             f"clock-sync-guard offset {offset:+.1f}s within tolerance "
             f"(<{_CLOCK_TOLERANCE_SECONDS}s); no step dc={marked_dc} "
@@ -1075,6 +1140,13 @@ async def _ensure_clock_synced_fresh_locked(
         # We stepped but cannot confirm. Stamp fresh optimistically: the step
         # reported ok and a transient re-read failure must not undo it.
         memo[domain_norm] = time.monotonic()
+        _record_clock_agreement(
+            shell,
+            domain_norm,
+            stepped=True,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+        )
         print_success_verbose(
             f"Clock stepped to DC {marked_dc} (offset was {offset:+.1f}s; "
             "post-step verification read unavailable)"
@@ -1087,6 +1159,13 @@ async def _ensure_clock_synced_fresh_locked(
         )
     if abs(new_offset) < _CLOCK_TOLERANCE_SECONDS:
         memo[domain_norm] = time.monotonic()
+        _record_clock_agreement(
+            shell,
+            domain_norm,
+            stepped=True,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+        )
         print_success_verbose(
             f"Clock synchronized with DC {marked_dc} via {reading.channel.value} "
             f"(offset {offset:+.1f}s -> {new_offset:+.1f}s)"

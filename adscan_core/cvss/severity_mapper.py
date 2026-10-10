@@ -24,6 +24,25 @@ _THRESHOLDS: list[tuple[float, str]] = [
 _INFO = "info"
 
 
+def severity_bands() -> list[tuple[str, str]]:
+    """Return the published band table, as ``(label, range)`` pairs.
+
+    The report's methodology annex prints these so a reader can take any score
+    on any row and say which band it lands in, which is what makes the scale
+    auditable rather than merely deterministic. Derived from the same
+    thresholds :func:`score_to_severity` applies, so the published table cannot
+    drift from the mapping that produced the grades.
+    """
+    rows: list[tuple[str, str]] = []
+    previous: float | None = None
+    for threshold, label in _THRESHOLDS:
+        upper = "10.0" if previous is None else f"{previous - 0.1:.1f}"
+        rows.append((label.capitalize(), f"{threshold:.1f} to {upper}"))
+        previous = threshold
+    rows.append((_INFO.capitalize(), "0.0"))
+    return rows
+
+
 def score_to_severity(score: float) -> str:
     """Return the CVSS 3.1 severity label for *score*.
 

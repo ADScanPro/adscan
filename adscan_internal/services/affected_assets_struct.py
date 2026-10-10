@@ -49,13 +49,21 @@ import json
 from pathlib import Path
 from typing import Any
 
+from adscan_core.reporting.tier_basis import describe_tier_basis
+
 from adscan_internal.services.affected_asset_rules import (
     Extra,
+    Representation,
     Scope,
-    SourceMode,
     TargetMode,
     extract_adcs_ca_names,
     rule_for,
+)
+from adscan_internal.services.attack_relation_labels import business_relation_phrase
+from adscan_internal.services.compromise_class import (
+    PrivilegeTier,
+    node_stamped_privilege_tier,
+    privilege_tier_label,
 )
 from adscan_internal.services.affected_assets import (
     PLACEHOLDER_ASSET_TOKENS,
@@ -96,6 +104,36 @@ ROLE_SOURCE = "source"
 ROLE_TARGET = "target"
 ROLE_AFFECTED = "affected"
 
+# --------------------------------------------------------------------------- #
+# Per-account crack status (roasting findings)                                 #
+# --------------------------------------------------------------------------- #
+
+# The three HONEST per-account outcomes of a roasting finding (Exposure
+# Validation): a roastable account ADscan actually CRACKED, one it ATTEMPTED but
+# did not recover, and one merely EXPOSED (roastable, never attempted). Derived
+# from the account's attack-graph edge STEP status, never guessed.
+CRACK_STATUS_CRACKED = "cracked"
+CRACK_STATUS_ATTEMPTED = "attempted"
+CRACK_STATUS_EXPOSED = "exposed"
+
+# STEP-status tokens that prove the account's secret was recovered / was tried.
+# Mirrors the step-status vocabulary (success/succeeded == proven; failed/error
+# == attempted) — never a bare literal at a call site.
+_CRACKED_STEP_STATUSES = frozenset({"success", "succeeded"})
+_ATTEMPTED_STEP_STATUSES = frozenset({"attempted", "failed", "error"})
+
+# CRACKED leads, then attempted, then merely exposed — the proven recovery first.
+_CRACK_STATUS_SORT_RANK: dict[str, int] = {
+    CRACK_STATUS_CRACKED: 0,
+    CRACK_STATUS_ATTEMPTED: 1,
+    CRACK_STATUS_EXPOSED: 2,
+}
+
+# The roasting finding family. A roasting finding surfaces its roastable
+# accounts (the CRACKED one included — it is the most valuable result, never
+# dropped as a domain breaker) each with a per-account ``crack_status`` badge.
+ROASTING_FINDING_KEYS = frozenset({"kerberoast", "asreproast", "timeroast"})
+
 # Reserved key under a finding's ``details`` that carries the serialized
 # structured entities into ``technical_report.json``. The web ingestion reads
 # this key directly off ``finding.details`` (see ingestion_service) — it is the
@@ -132,6 +170,56 @@ class AffectedAssetEntity:
     fqdn: str | None = None
     upn: str | None = None
     node_id: str | None = None
+    # Axis 1 — the privilege TIER this object is GRANTED, read from the STAMPED
+    # ``privilege_tier`` on its graph node (membership + ACL aware), never raw
+    # ``isTierZero``. ``tier`` is the machine value (``tier0_direct`` …);
+    # ``tier_label`` is the client-facing legend label. Both ``None`` when the
+    # object carries no stamp (an older graph) or does not resolve to a node.
+    tier: str | None = None
+    tier_label: str | None = None
+    # Axis-1 CONFIDENCE for the tier verdict and its client-safe reason, translated
+    # once at the authoring boundary (``adscan_core.reporting.tier_basis``) from the
+    # stamped machine ``privilege_tier_basis``. ``tier_confidence`` is
+    # ``deterministic`` (read from the directory) or ``inferred`` (a server-role /
+    # admin heuristic the client can correct); ``tier_basis`` is the ready-to-render
+    # qualified phrase (``inferred: member server by operating-system role``). Both
+    # ``None`` when the verdict carries no meaningful basis (a plain Tier 2). No
+    # internal signal name ever reaches a client here.
+    tier_confidence: str | None = None
+    tier_basis: str | None = None
+    # The finding-specific CLIENT role LABEL for this asset (``holder``,
+    # ``roastable-target``, ``session-host``, ``delegating-account``, …), from
+    # the finding's :class:`AssetRule.role_labels`. ``None`` when the generic
+    # ``role`` axis is label enough.
+    role_label: str | None = None
+    # For a PAIRING finding (HasSession, ForceChangePassword, shadow-creds, LAPS,
+    # gMSA, RBCD, NTLMv1-relay): the stable id of the per-edge pair this asset
+    # belongs to, so the renderer can show who-can-do-what-to-whom
+    # (``user @ host``) instead of two unrelated flat lists. ``None`` for a
+    # non-paired asset.
+    pairing_id: str | None = None
+    # For a PAIRING finding whose edges carry DIFFERENT relations (the grouped
+    # "Excessive Rights Across a Tier Boundary" finding), the client-safe business
+    # phrase of THIS pair's right (``Full Control of the Target Object``,
+    # ``Reset the Account Password``, …), so the renderer can show
+    # ``holder -> <right> -> object`` instead of a bare arrow. ``None`` for a
+    # single-relation PAIRING finding and every non-paired asset.
+    pair_relation: str | None = None
+    # The CONCRETE measured value for this asset in a staleness / age / obsolete
+    # family finding, so the client sees the real figure (not a vague "older than
+    # N days"): the ``pwdLastSet`` / ``lastLogonTimestamp`` date + age for the
+    # staleness findings (``Last rotated 2017-05-23 (~3,409 days ago)``), or the
+    # concrete operating-system string for an obsolete-OS finding (``Windows
+    # Server 2003``). Derived from the asset's STAMPED graph-node property at
+    # resolution time (``pwdlastset`` / ``lastlogon`` / ``os``); ``None`` for a
+    # non-staleness finding or when the node carries no such property.
+    metric: str | None = None
+    # For a ROASTING finding (kerberoast / asreproast / timeroast): the honest
+    # per-account outcome — ``cracked`` (the account's hash was recovered),
+    # ``attempted`` (tried, not recovered) or ``exposed`` (roastable, never
+    # attempted) — derived from the account's attack-graph edge STEP status.
+    # ``None`` for every non-roasting asset.
+    crack_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the JSON contract (omitting empty optional fields)."""
@@ -151,6 +239,24 @@ class AffectedAssetEntity:
             payload["upn"] = self.upn
         if self.node_id:
             payload["node_id"] = self.node_id
+        if self.tier:
+            payload["tier"] = self.tier
+        if self.tier_label:
+            payload["tier_label"] = self.tier_label
+        if self.tier_confidence:
+            payload["tier_confidence"] = self.tier_confidence
+        if self.tier_basis:
+            payload["tier_basis"] = self.tier_basis
+        if self.role_label:
+            payload["role_label"] = self.role_label
+        if self.pairing_id:
+            payload["pairing_id"] = self.pairing_id
+        if self.pair_relation:
+            payload["pair_relation"] = self.pair_relation
+        if self.metric:
+            payload["metric"] = self.metric
+        if self.crack_status:
+            payload["crack_status"] = self.crack_status
         return payload
 
 
@@ -192,6 +298,40 @@ class _ResolvedNode:
     sid: str = ""
     upn: str = ""
     node_id: str = ""
+    # The STAMPED ``privilege_tier`` value (``tier0_direct`` …) read off the node
+    # at index-build time, never raw ``isTierZero``. Empty when the node carries
+    # no stamp.
+    tier: str = ""
+    # The STAMPED ``privilege_tier_basis`` value (``app_spn`` / ``tier0_group`` …)
+    # recording WHICH signal produced the tier verdict (axis-1 confidence). Empty
+    # when the node carries no basis (an older graph, or a deterministic Tier-0
+    # from the DC fast-path). Translated to a client-safe phrase at entity build.
+    tier_basis: str = ""
+    # Measured staleness/age/OS source properties, read off the node at
+    # index-build time for the per-asset ``metric`` of a staleness-family finding.
+    # ``pwdlastset`` / ``lastlogon`` are Windows FILETIME integers (``None`` when
+    # absent); ``os`` is the operating-system string (empty when absent).
+    pwdlastset: int | None = None
+    lastlogon: int | None = None
+    os: str = ""
+
+
+@dataclass
+class _ResolvedTemplate:
+    """A certificate template resolved from a ``CertTemplate`` graph node.
+
+    A template has TWO names that both reach a finding: the localized
+    ``displayName`` (the node ``label`` / ``properties.name`` — what the admin
+    sees, e.g. Italian ``CONTROLLER DI DOMINIO``) and the English ``cn`` (a real
+    directory attribute used inside a remediation DN, e.g. ``DomainController``).
+    Resolving either to the SAME node is what lets the builder collapse the
+    "same template under two names" duplicate and always display the localized
+    name (per the original-language rule), while keeping the CN for commands.
+    """
+
+    object_id: str = ""
+    label: str = ""  # localized displayName, realm stripped (raw case)
+    cn: str = ""
 
 
 @dataclass
@@ -208,6 +348,31 @@ class AssetIndex:
     _by_token: dict[str, _ResolvedNode] = field(default_factory=dict)
     domain: str = ""
     dc_nodes: list[_ResolvedNode] = field(default_factory=list)
+    _templates_by_token: dict[str, _ResolvedTemplate] = field(default_factory=dict)
+
+    def _register_template(self, template: _ResolvedTemplate) -> None:
+        """Index a certificate template under every spelling that names it."""
+        tokens: set[str] = set()
+        for raw in (template.object_id, template.label, template.cn):
+            token = _norm_key(raw)
+            if token:
+                tokens.add(token)
+                tokens.add(_strip_realm(token))
+        for token in tokens:
+            self._templates_by_token.setdefault(token, template)
+
+    def lookup_template(self, *candidates: Any) -> _ResolvedTemplate | None:
+        """Return the template a name/objectId/CN/displayName resolves to."""
+        for candidate in candidates:
+            token = _norm_key(candidate)
+            if not token:
+                continue
+            template = self._templates_by_token.get(
+                token
+            ) or self._templates_by_token.get(_strip_realm(token))
+            if template is not None:
+                return template
+        return None
 
     def _register(self, node: _ResolvedNode, *, is_dc: bool = False) -> None:
         tokens: set[str] = set()
@@ -250,12 +415,30 @@ class AssetIndex:
             token = _norm_key(candidate)
             if not token:
                 continue
-            node = self._by_token.get(token) or self._by_token.get(
-                _strip_realm(token)
-            )
+            node = self._by_token.get(token) or self._by_token.get(_strip_realm(token))
             if node is not None:
                 return node
         return None
+
+
+def _coerce_filetime(value: Any) -> int | None:
+    """Return a Windows FILETIME integer from a node property, else ``None``.
+
+    The collector stamps ``pwdlastset`` / ``lastlogon`` as integers, but an older
+    graph (or a JSON round-trip) can carry a numeric string. Anything that is not
+    a positive integer-like value resolves to ``None`` so the metric degrades
+    cleanly to absent rather than raising.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            parsed = int(text)
+            return parsed if parsed > 0 else None
+    return None
 
 
 def _node_props(node: Mapping[str, Any]) -> dict[str, Any]:
@@ -309,6 +492,27 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
         if not isinstance(node, dict):
             continue
         kind = str(node.get("kind") or "").strip().lower()
+        # Certificate templates are indexed on a SEPARATE axis so an ADCS finding
+        # that names a template by its localized displayName (edge target) and by
+        # its English CN (flat extractor) resolves both to one template — the
+        # dedup key for the "same template under two names" bug.
+        if kind in ("certtemplate", "cert_template"):
+            props = _node_props(node)
+            index._register_template(
+                _ResolvedTemplate(
+                    object_id=str(node.get("objectId") or node.get("id") or "").strip(),
+                    label=_strip_realm(
+                        str(
+                            node.get("label")
+                            or props.get("name")
+                            or props.get("displayname")
+                            or ""
+                        ).strip()
+                    ),
+                    cn=str(props.get("cn") or "").strip(),
+                )
+            )
+            continue
         if kind not in ("computer", "user", "group"):
             continue
         props = _node_props(node)
@@ -320,6 +524,14 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
             or ""
         ).strip()
         node_id = str(node.get("id") or "").strip()
+        # The STAMPED, membership + ACL aware privilege tier — the SSOT reader,
+        # never raw ``isTierZero`` (which diverges: it is the pre-graph collector
+        # flag and reads False on a stamp-graded Tier-0). ``None`` -> "".
+        stamped = node_stamped_privilege_tier(node)
+        tier = stamped.value if stamped is not None else ""
+        tier_basis = str(props.get("privilege_tier_basis") or "").strip()
+        pwdlastset = _coerce_filetime(props.get("pwdlastset"))
+        lastlogon = _coerce_filetime(props.get("lastlogon"))
         if kind == "computer":
             resolved = _ResolvedNode(
                 kind=TYPE_COMPUTER,
@@ -329,6 +541,14 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
                 ip=str(props.get("ip_address") or "").strip(),
                 sid=sid,
                 node_id=node_id,
+                tier=tier,
+                tier_basis=tier_basis,
+                pwdlastset=pwdlastset,
+                lastlogon=lastlogon,
+                # The operating-system string lives under ``os`` on the graph node
+                # (the collector stamps ``operatingSystem`` there); accept the raw
+                # ``operatingsystem`` alias too for an older graph.
+                os=str(props.get("os") or props.get("operatingsystem") or "").strip(),
             )
             index._register(resolved, is_dc=_is_dc_node(node, props))
         else:
@@ -337,8 +557,14 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
                 samaccountname=sam,
                 name=str(props.get("name") or node.get("label") or "").strip(),
                 sid=sid,
-                upn=str(props.get("upn") or props.get("userprincipalname") or "").strip(),
+                upn=str(
+                    props.get("upn") or props.get("userprincipalname") or ""
+                ).strip(),
                 node_id=node_id,
+                tier=tier,
+                tier_basis=tier_basis,
+                pwdlastset=pwdlastset,
+                lastlogon=lastlogon,
             )
             index._register(resolved)
     return index
@@ -352,9 +578,7 @@ def load_asset_index(workspace_dir: str | Path, domain: str) -> AssetIndex:
     enrichment rather than an exception).
     """
     try:
-        graph_path = (
-            Path(workspace_dir) / "domains" / str(domain) / "attack_graph.json"
-        )
+        graph_path = Path(workspace_dir) / "domains" / str(domain) / "attack_graph.json"
         if not graph_path.exists():
             return AssetIndex(domain=str(domain))
         with graph_path.open("r", encoding="utf-8") as handle:
@@ -453,6 +677,153 @@ def _looks_like_computer(
     return bool(domain) and _norm_key(text).endswith(f".{domain}")
 
 
+def _tier_fields(tier_value: str) -> tuple[str | None, str | None]:
+    """Return ``(tier, tier_label)`` for a stamped privilege-tier value.
+
+    ``tier_value`` is the machine value stored on the resolved node
+    (``tier0_direct`` …). Returns ``(None, None)`` for an empty / unrecognised
+    value so an unstamped asset carries no tier badge rather than a wrong one.
+    """
+    value = str(tier_value or "").strip().lower()
+    if not value:
+        return None, None
+    try:
+        tier = PrivilegeTier(value)
+    except ValueError:
+        return None, None
+    return tier.value, privilege_tier_label(tier)
+
+
+def _tier_basis_fields(node: _ResolvedNode | None) -> tuple[str | None, str | None]:
+    """Return ``(tier_confidence, tier_basis_phrase)`` for a resolved node.
+
+    Translates the node's stamped ``privilege_tier_basis`` into the client-facing
+    confidence (``deterministic`` / ``inferred``) and the ready-to-render qualified
+    phrase (``inferred: member server by operating-system role``) via the one
+    SSOT. ``(None, None)`` for an unstamped / plain-Tier-2 node so it carries no
+    basis badge rather than a wrong one.
+    """
+    if node is None:
+        return None, None
+    display = describe_tier_basis(node.tier_basis or None, node.tier or None)
+    return display.confidence if display.qualified else None, display.qualified
+
+
+# --------------------------------------------------------------------------- #
+# Per-asset measured value (metric) for the staleness / age / obsolete family  #
+# --------------------------------------------------------------------------- #
+
+# Metric SOURCE kinds — which stamped node property the metric is derived from.
+_METRIC_PWD_DATE = "pwd_date"  # pwdlastset FILETIME -> date + age
+_METRIC_LOGON_DATE = "logon_date"  # lastlogon FILETIME -> date + age
+_METRIC_OS = "os"  # the concrete operating-system string
+
+# Finding key -> (metric source kind, client-facing lead label). Covers the
+# staleness / age / obsolete-OS family; every other finding resolves to no metric
+# so its assets render exactly as before. Both the canonical report keys and the
+# detector/category aliases are listed so the map hits whichever spelling the
+# finding carries.
+_STALENESS_METRIC: dict[str, tuple[str, str]] = {
+    # krbtgt rotation — the single most consequential staleness value.
+    "krbtgt_password_age": (_METRIC_PWD_DATE, "Last rotated"),
+    "krbtgt_age": (_METRIC_PWD_DATE, "Last rotated"),
+    # Per-account password age.
+    "stale_passwords": (_METRIC_PWD_DATE, "Password set"),
+    "pwd_predates_policy": (_METRIC_PWD_DATE, "Password set"),
+    # Machine-account password rotation — the machine's own pwdLastSet.
+    "machine_password_rotation_disabled": (_METRIC_PWD_DATE, "Machine password set"),
+    "machine_password_rotation_relaxed": (_METRIC_PWD_DATE, "Machine password set"),
+    # Stale accounts / computers — keyed off real authentication activity.
+    "stale_enabled_users": (_METRIC_LOGON_DATE, "Last logon"),
+    "stale_user": (_METRIC_LOGON_DATE, "Last logon"),
+    "stale_enabled_computers": (_METRIC_LOGON_DATE, "Last logon"),
+    "stale_computer": (_METRIC_LOGON_DATE, "Last logon"),
+    # Obsolete operating system — the concrete OS string per host.
+    "obsolete_computers": (_METRIC_OS, ""),
+    "obsolete_os": (_METRIC_OS, ""),
+}
+
+
+def metric_kind_for_finding(finding_key: str) -> tuple[str, str]:
+    """Return ``(metric_source_kind, lead_label)`` for a staleness-family key.
+
+    ``("", "")`` for any finding that carries no per-asset measured value, so a
+    non-staleness finding's assets never gain a metric.
+    """
+    return _STALENESS_METRIC.get(str(finding_key or "").strip().lower(), ("", ""))
+
+
+# Windows FILETIME -> Unix epoch conversion (the same constants the collector
+# duplicates in ``audit_analyzer`` / ``graph_queries.filters``). Inlined here so
+# this reporting module keeps a minimal import closure (it is bundled into the
+# appliance backend, which must NOT reach the collector / engine stack).
+_FILETIME_EPOCH_OFFSET = 116_444_736_000_000_000
+_100NS_PER_SECOND = 10_000_000
+# The Windows "never set" / "never expires" sentinels seen on pwdLastSet /
+# lastLogon so a sentinel never renders as a bogus date.
+_FILETIME_NEVER_SENTINEL = 0x7FFFFFFFFFFFFFFF
+
+
+def _filetime_to_datetime(filetime: int) -> "Any":
+    """Return a UTC ``datetime`` for a Windows FILETIME, or ``None`` on a sentinel."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    if filetime <= 0 or filetime == _FILETIME_NEVER_SENTINEL:
+        return None
+    unix_seconds = (filetime - _FILETIME_EPOCH_OFFSET) / _100NS_PER_SECOND
+    if unix_seconds <= 0:
+        return None
+    return datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
+
+
+def _format_age_metric(filetime: int | None, label: str) -> str | None:
+    """Return ``"<label> YYYY-MM-DD (~N,NNN days ago)"`` for a FILETIME, or ``None``.
+
+    The rendered date is an ABSOLUTE calendar value derived from the FILETIME, so
+    ``datetime`` is the correct clock here (not ``monotonic``). Returns ``None``
+    for a missing / sentinel FILETIME so the asset simply carries no metric.
+    """
+    if not filetime:
+        return None
+    try:
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        moment = _filetime_to_datetime(int(filetime))
+        if moment is None:
+            return None
+        age_days = (datetime.now(tz=timezone.utc) - moment).days
+        if age_days < 0:
+            age_days = 0
+        date_str = moment.strftime("%Y-%m-%d")
+        lead = str(label or "").strip()
+        day_word = "day" if age_days == 1 else "days"
+        age_phrase = f"~{age_days:,} {day_word} ago"
+        return f"{lead} {date_str} ({age_phrase})" if lead else f"{date_str} ({age_phrase})"
+    except Exception:  # noqa: BLE001 - metric is best-effort, never fatal
+        return None
+
+
+def _metric_for_node(
+    node: _ResolvedNode | None, metric_kind: str, metric_label: str
+) -> str | None:
+    """Return the per-asset measured value for a resolved node, or ``None``.
+
+    The ONE place the staleness metric is derived from a node property, so every
+    surface shows the same figure. ``None`` when the node is unresolved or carries
+    no value for the requested kind (honest absence, never a fabricated date/OS).
+    """
+    if node is None or not metric_kind:
+        return None
+    if metric_kind == _METRIC_OS:
+        text = str(node.os or "").strip()
+        return deshout_display_label(text) if text else None
+    if metric_kind == _METRIC_PWD_DATE:
+        return _format_age_metric(node.pwdlastset, metric_label)
+    if metric_kind == _METRIC_LOGON_DATE:
+        return _format_age_metric(node.lastlogon, metric_label)
+    return None
+
+
 def _entity_for_principal(
     raw: str,
     *,
@@ -462,22 +833,44 @@ def _entity_for_principal(
     forced_type: str = "",
     qualifier: str = "",
     domain_hint: str = "",
+    role_label: str = "",
+    pairing_id: str = "",
+    pair_relation: str = "",
+    metric_kind: str = "",
+    metric_label: str = "",
 ) -> AffectedAssetEntity | None:
     """Resolve one principal token into a typed :class:`AffectedAssetEntity`.
 
     ``forced_type`` overrides the principal resolution for records that are not
     principals at all (a trust's partner domain). ``qualifier`` names the part of
     the record that is affected and is appended to the display. ``domain_hint``
-    lets an unresolved FQDN be recognised as a host of that domain.
+    lets an unresolved FQDN be recognised as a host of that domain. ``role_label``
+    carries the finding-specific client role label; ``pairing_id`` links the
+    asset to its per-edge pair for a PAIRING finding. The asset's privilege
+    ``tier`` is read from the resolved node's STAMPED tier (never ``isTierZero``).
     """
     text = str(raw or "").strip()
     if not text or _norm_key(text) in _PLACEHOLDER_TOKENS:
         return None
 
+    role_label = role_label or None
+    pairing_id = pairing_id or None
+    pair_relation = pair_relation or None
+
     if forced_type == TYPE_DOMAIN:
-        return _qualified_entity(_domain_entity(text), qualifier)
+        return _qualified_entity(
+            _domain_entity(text, role_label=role_label, pairing_id=pairing_id),
+            qualifier,
+        )
 
     node = index.lookup(text, sid_hint) if index is not None else None
+    tier, tier_label = _tier_fields(node.tier if node else "")
+    tier_confidence, tier_basis = _tier_basis_fields(node)
+    # The per-asset measured value for a staleness/age/obsolete-OS finding, read
+    # from the resolved node's stamped property (``pwdlastset`` / ``lastlogon`` /
+    # ``os``). ``None`` for every other finding, so non-staleness assets are
+    # byte-identical to before.
+    metric = _metric_for_node(node, metric_kind, metric_label)
 
     if _looks_like_computer(text, node, domain_hint=domain_hint):
         # A bare IP is not a name — leaving it out of ``fallback`` keeps the
@@ -509,6 +902,14 @@ def _entity_for_principal(
                 ip=ip or None,
                 fqdn=fqdn or None,
                 node_id=(node.node_id if node else None) or None,
+                tier=tier,
+                tier_label=tier_label,
+                tier_confidence=tier_confidence,
+                tier_basis=tier_basis,
+                role_label=role_label,
+                pairing_id=pairing_id,
+                pair_relation=pair_relation,
+                metric=metric,
             ),
             qualifier,
         )
@@ -526,9 +927,12 @@ def _entity_for_principal(
     # de-shouts (``SVC_TGS`` -> ``svc_tgs``), a well-known identity renders
     # canonical (``Everyone`` / ``Users``). The IDENTIFIER stays the raw sam so
     # correlation/joins are unchanged.
-    display = humanize_principal_for_prose(
-        label=sam, samaccountname=sam, kind=TYPE_GROUP if is_group else TYPE_USER
-    ) or sam
+    display = (
+        humanize_principal_for_prose(
+            label=sam, samaccountname=sam, kind=TYPE_GROUP if is_group else TYPE_USER
+        )
+        or sam
+    )
     if upn:
         display = f"{display} ({upn})"
     return _qualified_entity(
@@ -540,18 +944,30 @@ def _entity_for_principal(
             sid=sid or None,
             upn=upn or None,
             node_id=(node.node_id if node else None) or None,
+            tier=tier,
+            tier_label=tier_label,
+            tier_confidence=tier_confidence,
+            tier_basis=tier_basis,
+            role_label=role_label,
+            pairing_id=pairing_id,
+            pair_relation=pair_relation,
+            metric=metric,
         ),
         qualifier,
     )
 
 
-def _domain_entity(domain: str) -> AffectedAssetEntity:
+def _domain_entity(
+    domain: str, *, role_label: str | None = None, pairing_id: str | None = None
+) -> AffectedAssetEntity:
     name = str(domain or "").strip()
     return AffectedAssetEntity(
         type=TYPE_DOMAIN,
         identifier=name,
         display=name,
         role=ROLE_AFFECTED,
+        role_label=role_label or None,
+        pairing_id=pairing_id or None,
     )
 
 
@@ -638,6 +1054,45 @@ def _edge_principals(
     return sources, targets
 
 
+def _edge_pairs(
+    details: Mapping[str, Any],
+    relation_aliases: set[str],
+) -> list[tuple[list[str], list[str], str]]:
+    """Return per-edge ``(sources, targets, relation)`` tuples from matching edges.
+
+    PAIRING findings (HasSession, ForceChangePassword, shadow-creds, LAPS, gMSA,
+    RBCD, NTLMv1-relay) must preserve WHO can do WHAT to WHOM — so the builder
+    keeps each edge's source(s) and target(s) together (one pair per edge) rather
+    than flattening them into two unrelated lists. Breaker targets are dropped on
+    the same rule as :func:`_edge_principals`, so the two stay consistent.
+
+    The RAW edge relation travels with each pair so a grouped multi-relation
+    finding (``excessive_cross_tier_rights``) can surface the specific right per
+    pair; single-relation PAIRING findings ignore it.
+    """
+    edges = details.get("attack_graph_edges")
+    if not isinstance(edges, list):
+        return []
+    pairs: list[tuple[list[str], list[str], str]] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = _norm_key(edge.get("relation")).replace(" ", "")
+        if relation_aliases and relation and relation not in relation_aliases:
+            continue
+        srcs = _extract_strings(edge.get("source")) + _extract_strings(edge.get("from"))
+        tgts = [
+            value
+            for value in (
+                _extract_strings(edge.get("target")) + _extract_strings(edge.get("to"))
+            )
+            if not _is_direct_domain_breaker_asset(value)
+        ]
+        if srcs or tgts:
+            pairs.append((srcs, tgts, str(edge.get("relation") or "")))
+    return pairs
+
+
 def _prefer_precise_share_entities(
     entities: Iterable[AffectedAssetEntity],
 ) -> list[AffectedAssetEntity]:
@@ -659,14 +1114,165 @@ def _prefer_precise_share_entities(
 
 def _dedupe(entities: Iterable[AffectedAssetEntity]) -> list[AffectedAssetEntity]:
     out: list[AffectedAssetEntity] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for entity in entities:
-        key = (entity.type, _norm_key(entity.identifier), entity.role)
+        # ``pairing_id`` is part of the key so a host that holds TWO sessions
+        # (one edge pair each) keeps a copy per pair — collapsing them would lose
+        # the per-pair "user @ host" linkage. A non-paired asset has pairing_id
+        # ``None`` and dedupes exactly as before.
+        key = (
+            entity.type,
+            _norm_key(entity.identifier),
+            entity.role,
+            entity.pairing_id or "",
+        )
         if key in seen:
             continue
         seen.add(key)
         out.append(entity)
     return out
+
+
+def _resolve_template_fields(
+    name: str, index: AssetIndex | None
+) -> tuple[str, str, str]:
+    """Return ``(identifier, display, node_id)`` for a certificate template name.
+
+    A template reaches a finding under either of two names: its localized
+    ``displayName`` (the edge target / template node label) or its English ``cn``
+    (what the flat extractor resolves from the path). Both are looked up against
+    the template index so either resolves to the SAME template, which is what
+    lets the two be collapsed into one entity. The DISPLAY is always the LOCALIZED
+    displayName (de-shouted, never anglicized); the IDENTIFIER is the CN when
+    known (the real attribute a remediation DN references), so two genuinely
+    distinct templates keep distinct identifiers and never collapse.
+    """
+    bare = _strip_realm(str(name or "").strip())
+    template = index.lookup_template(name, bare) if index is not None else None
+    if template is not None:
+        localized = template.label or bare
+        return (
+            template.cn or localized,
+            deshout_display_label(localized),
+            template.object_id,
+        )
+    return bare or str(name or "").strip(), deshout_display_label(bare), ""
+
+
+# --------------------------------------------------------------------------- #
+# Roasting crack-status                                                         #
+# --------------------------------------------------------------------------- #
+
+
+def crack_status_from_step_status(status: Any) -> str:
+    """Map an attack-graph edge STEP status to a per-account crack status.
+
+    Exposure-Validation honest, three states: a proven recovery
+    (``success``/``succeeded``) → :data:`CRACK_STATUS_CRACKED`; a tried-but-failed
+    pass (``attempted``/``failed``/``error``) → :data:`CRACK_STATUS_ATTEMPTED`;
+    anything else (``discovered``/``theoretical``/empty) → :data:`CRACK_STATUS_EXPOSED`
+    — roastable, never attempted. Never a bare literal: keyed on the step-status
+    token SSOTs above.
+    """
+    token = str(status or "").strip().lower()
+    if token in _CRACKED_STEP_STATUSES:
+        return CRACK_STATUS_CRACKED
+    if token in _ATTEMPTED_STEP_STATUSES:
+        return CRACK_STATUS_ATTEMPTED
+    return CRACK_STATUS_EXPOSED
+
+
+def _max_crack_status(current: str, candidate: str) -> str:
+    """Return the more-advanced of two crack statuses (CRACKED > attempted > exposed).
+
+    One account can arrive on several edges (a ``discovered`` roastable edge AND a
+    later ``success`` crack edge); the account's badge is the strongest proof seen.
+    """
+    rank_current = _CRACK_STATUS_SORT_RANK.get(current, 99)
+    rank_candidate = _CRACK_STATUS_SORT_RANK.get(candidate, 99)
+    return current if rank_current <= rank_candidate else candidate
+
+
+def _roasting_affected_entities(
+    view: Mapping[str, Any],
+    *,
+    aliases: set[str],
+    index: AssetIndex | None,
+    domain_hint: str,
+    target_label: str | None,
+    rule: Any,
+) -> list[AffectedAssetEntity]:
+    """Return the roastable-account entities of a roasting finding, CRACKED first.
+
+    Unlike the generic target overlay, a roasting finding KEEPS a direct
+    domain-breaker target (``administrator``, RID 500): the account whose ticket
+    was CRACKED is the single most valuable result and must be surfaced, not
+    dropped as "where the escalation lands". Each account carries a per-account
+    :attr:`AffectedAssetEntity.crack_status` derived from its edge STEP status,
+    and the accounts are ordered CRACKED → attempted → exposed so the proven
+    recovery leads.
+
+    Accounts are read from the finding's attack-graph edges (the per-account STEP
+    status lives on the edge), then the flat ``to``/``target`` detail keys and any
+    per-principal account records as EXPOSED fallbacks. The same account on two
+    edges collapses to one entity carrying its strongest crack status.
+    """
+    best_status: dict[str, str] = {}
+    first_name: dict[str, str] = {}
+    order: list[str] = []
+
+    def _consider(name: Any, status_token: Any) -> None:
+        text = str(name or "").strip()
+        if not text or _norm_key(text) in _PLACEHOLDER_TOKENS:
+            return
+        crack = crack_status_from_step_status(status_token)
+        key = _norm_key(_strip_realm(text))
+        if not key:
+            return
+        if key not in best_status:
+            best_status[key] = crack
+            first_name[key] = text
+            order.append(key)
+        else:
+            best_status[key] = _max_crack_status(best_status[key], crack)
+
+    edges = view.get("attack_graph_edges")
+    if isinstance(edges, list):
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            relation = _norm_key(edge.get("relation")).replace(" ", "")
+            if aliases and relation and relation not in aliases:
+                continue
+            status_token = edge.get("status")
+            for value in _extract_strings(edge.get("target")) + _extract_strings(
+                edge.get("to")
+            ):
+                _consider(value, status_token)
+
+    # Flat detail keys + per-principal account records — roastable accounts a
+    # detector recorded without an edge carry no per-account status, so they
+    # default to EXPOSED unless an edge already proved a stronger outcome.
+    for value in _target_principals(view, drop_breaker=False):
+        _consider(value, "")
+    for name, _sid, _qualifier in iter_account_records(view, rule=rule):
+        _consider(name, "")
+
+    entities: list[AffectedAssetEntity] = []
+    for key in order:
+        entity = _entity_for_principal(
+            first_name[key],
+            role=ROLE_TARGET,
+            index=index,
+            domain_hint=domain_hint,
+            role_label=target_label,
+        )
+        if entity is not None:
+            entities.append(replace(entity, crack_status=best_status[key]))
+    entities.sort(
+        key=lambda item: _CRACK_STATUS_SORT_RANK.get(item.crack_status or "", 99)
+    )
+    return entities
 
 
 # --------------------------------------------------------------------------- #
@@ -698,19 +1304,50 @@ def build_affected_asset_entities(
     """
     view = _details_view(details)
     rule = rule_for(finding_key)
+    rep = rule.representation
     aliases = relation_aliases or set()
     entities: list[AffectedAssetEntity] = []
     domain_hint = str(domain_name or (index.domain if index is not None else "") or "")
 
+    # Finding-specific client role labels (``holder`` / ``roastable-target`` …).
+    affected_label = rule.role_label_for(ROLE_AFFECTED)
+    source_label = rule.role_label_for(ROLE_SOURCE)
+    target_label = rule.role_label_for(ROLE_TARGET)
+
+    # ---- Roasting: roastable accounts, breakers KEPT, per-account crack status
+    # A roasting finding (kerberoast / asreproast / timeroast) owns its own entity
+    # list: it must INCLUDE the cracked account (``administrator``, a direct domain
+    # breaker the generic target overlay would drop) and stamp a per-account
+    # ``crack_status`` from each account's edge STEP status. CRACKED first.
+    if finding_key in ROASTING_FINDING_KEYS:
+        return _dedupe(
+            _roasting_affected_entities(
+                view,
+                aliases=aliases,
+                index=index,
+                domain_hint=domain_hint,
+                target_label=target_label,
+                rule=rule,
+            )
+        )
+
+    # Per-asset measured value (staleness/age/obsolete-OS family). Resolved once
+    # from the finding key; ``("", "")`` for every other finding, so its assets
+    # carry no metric. Only the AFFECTED record loops below (the staleness
+    # findings are record-based / HOST_SCOPED or PER_PRINCIPAL) pass it through.
+    metric_kind, metric_label = metric_kind_for_finding(finding_key)
+
     # ---- Scope-driven isolated-vulnerability entities -----------------------
     if rule.scope is Scope.DOMAIN_WIDE:
         if domain_name:
-            entities.append(_domain_entity(domain_name))
+            entities.append(_domain_entity(domain_name, role_label=affected_label))
     elif rule.scope is Scope.DC_SCOPED:
         # The DC answered for the control. Resolve the domain's DC host(s) to
         # IP + FQDN; fall back to the domain object when no DC resolves.
         dc_nodes = list(index.dc_nodes) if index is not None else []
         for node in dc_nodes:
+            tier, tier_label = _tier_fields(node.tier)
+            tier_confidence, tier_basis = _tier_basis_fields(node)
             entities.append(
                 AffectedAssetEntity(
                     type=TYPE_COMPUTER,
@@ -723,10 +1360,15 @@ def build_affected_asset_entities(
                     ip=node.ip or None,
                     fqdn=node.fqdn or None,
                     node_id=node.node_id or None,
+                    tier=tier,
+                    tier_label=tier_label,
+                    tier_confidence=tier_confidence,
+                    tier_basis=tier_basis,
+                    role_label=affected_label or None,
                 )
             )
         if not entities and domain_name:
-            entities.append(_domain_entity(domain_name))
+            entities.append(_domain_entity(domain_name, role_label=affected_label))
     elif rule.scope is Scope.HOST_SCOPED:
         for sam, sid, qualifier in iter_account_records(view, rule=rule):
             entity = _entity_for_principal(
@@ -737,21 +1379,23 @@ def build_affected_asset_entities(
                 forced_type=rule.record_entity_type,
                 qualifier=qualifier,
                 domain_hint=domain_hint,
+                role_label=affected_label,
+                metric_kind=metric_kind,
+                metric_label=metric_label,
             )
             if entity is not None:
                 entities.append(entity)
         if not entities and domain_name:
             # A host-scoped finding that persisted no concrete host still names
             # the domain so the platform shows something, never "no assets".
-            entities.append(_domain_entity(domain_name))
+            entities.append(_domain_entity(domain_name, role_label=affected_label))
 
-    # ---- Attack-step source/target principals (per-principal scope) ---------
+    # ---- Per-principal record list (coercion host lists, etc.) --------------
+    # A per-principal finding may carry its own record list — the coercion probes
+    # record the hosts that answered while the same finding can arrive from an
+    # attack-graph edge. The flat extractor reads those records whatever the
+    # scope, so reading them here too keeps the PDF and the platform aligned.
     if rule.scope is Scope.PER_PRINCIPAL:
-        # A per-principal finding may ALSO carry its own record list — the
-        # coercion probes record the hosts that answered while the same finding
-        # can arrive from an attack-graph edge. The flat extractor reads those
-        # records whatever the scope, so reading them here too is what keeps the
-        # PDF and the platform showing the same assets.
         for name, sid, qualifier in iter_account_records(view, rule=rule):
             entity = _entity_for_principal(
                 name,
@@ -761,38 +1405,112 @@ def build_affected_asset_entities(
                 forced_type=rule.record_entity_type,
                 qualifier=qualifier,
                 domain_hint=domain_hint,
+                role_label=affected_label,
+                metric_kind=metric_kind,
+                metric_label=metric_label,
             )
             if entity is not None:
                 entities.append(entity)
-        # For ADCS the edge/detail TARGET is the abused certificate template, not
-        # a principal — those surface as typed TEMPLATE entities (via the
-        # TEMPLATES extra + flat lift), so suppress target-principal extraction
-        # here to avoid a template name leaking in as a bogus "user target".
-        is_adcs = Extra.TEMPLATES in rule.extras
+
+    # ---- Representation-driven SOURCE / TARGET principals -------------------
+    # The declarative :class:`Representation` decides whether this finding
+    # surfaces its source principal(s), its target object(s), or both, and
+    # whether per-edge pairs are preserved — decoupled from the legacy read-modes
+    # (which still drive the flat extractor). For ADCS the edge/detail TARGET is
+    # the abused template, surfaced as a typed TEMPLATE entity, so target-
+    # principal extraction is suppressed to avoid a template leaking in as a user.
+    is_adcs = Extra.TEMPLATES in rule.extras
+    # Targets are represented by the scope base for an isolated finding (the
+    # domain for DCSync, the host list for a posture finding), so the target
+    # overlay reads to/target keys only for PER_PRINCIPAL findings.
+    wants_target_overlay = (
+        rep.wants_target and rule.scope is Scope.PER_PRINCIPAL and not is_adcs
+    )
+    drop_breaker = rule.target is TargetMode.DROP_BREAKER
+
+    pairs_emitted = False
+    if rep is Representation.PAIRING:
+        # Preserve who-can-do-what-to-whom: each edge becomes one pair sharing a
+        # ``pairing_id``, so the renderer can show ``user @ host`` instead of two
+        # flat lists. The edges ARE the representation here, so the flat detail-key
+        # reads below only fire as a fallback when no edge pair was found.
+        for pair_index, (pair_sources, pair_targets, pair_rel) in enumerate(
+            _edge_pairs(view, aliases)
+        ):
+            pairing_id = f"pair-{pair_index}"
+            # For a grouped multi-relation finding, carry the specific right of
+            # THIS pair (its client-safe business phrase) so the renderer shows
+            # ``holder -> <right> -> object``. Single-relation PAIRING findings
+            # leave it blank and keep the plain arrow.
+            pair_relation = (
+                business_relation_phrase(pair_rel)
+                if rule.show_relation_in_pairing and pair_rel
+                else ""
+            )
+            for name in pair_sources:
+                entity = _entity_for_principal(
+                    name,
+                    role=ROLE_SOURCE,
+                    index=index,
+                    domain_hint=domain_hint,
+                    role_label=source_label,
+                    pairing_id=pairing_id,
+                    pair_relation=pair_relation,
+                )
+                if entity is not None:
+                    entities.append(entity)
+                    pairs_emitted = True
+            if not is_adcs:
+                for name in pair_targets:
+                    entity = _entity_for_principal(
+                        name,
+                        role=ROLE_TARGET,
+                        index=index,
+                        domain_hint=domain_hint,
+                        role_label=target_label,
+                        pairing_id=pairing_id,
+                        pair_relation=pair_relation,
+                    )
+                    if entity is not None:
+                        entities.append(entity)
+                        pairs_emitted = True
+
+    # Flat (unpaired) source/target reads — for BOTH / SOURCE_ONLY / TARGET_ONLY,
+    # and the detail-key fallback for a PAIRING finding that carried no edges. For
+    # PAIRING the attack-graph edges are consumed as pairs above, so they are NOT
+    # re-read flat here (that would duplicate the paired entity without its pair).
+    if rep is not Representation.PAIRING or not pairs_emitted:
+        include_edges = rep is not Representation.PAIRING
         sources: list[str] = []
         targets: list[str] = []
-        if rule.source is SourceMode.PRINCIPALS:
+        if rep.wants_source:
             sources.extend(_source_principals(view))
-        if not is_adcs:
-            if rule.target is TargetMode.KEEP:
-                targets.extend(_target_principals(view, drop_breaker=False))
-            elif rule.target is TargetMode.DROP_BREAKER:
-                targets.extend(_target_principals(view, drop_breaker=True))
-        edge_sources, edge_targets = _edge_principals(view, aliases)
-        if rule.source is SourceMode.PRINCIPALS:
-            sources.extend(edge_sources)
-        if not is_adcs:
-            targets.extend(edge_targets)
+            if include_edges:
+                edge_sources, _ = _edge_principals(view, aliases)
+                sources.extend(edge_sources)
+        if wants_target_overlay:
+            targets.extend(_target_principals(view, drop_breaker=drop_breaker))
+            if include_edges:
+                _, edge_targets = _edge_principals(view, aliases)
+                targets.extend(edge_targets)
 
         for name in sources:
             entity = _entity_for_principal(
-                name, role=ROLE_SOURCE, index=index, domain_hint=domain_hint
+                name,
+                role=ROLE_SOURCE,
+                index=index,
+                domain_hint=domain_hint,
+                role_label=source_label,
             )
             if entity is not None:
                 entities.append(entity)
         for name in targets:
             entity = _entity_for_principal(
-                name, role=ROLE_TARGET, index=index, domain_hint=domain_hint
+                name,
+                role=ROLE_TARGET,
+                index=index,
+                domain_hint=domain_hint,
+                role_label=target_label,
             )
             if entity is not None:
                 entities.append(entity)
@@ -811,19 +1529,26 @@ def build_affected_asset_entities(
                 name = _strip_realm(target).strip()
                 if name and name.lower() not in ca_lower:
                     template_names.append(name)
+        template_label = rule.role_label_for("template") or None
         for template in template_names:
-            # De-shout a SHOUTING localized template DISPLAY (never translated);
-            # the identifier stays the raw CN for remediation commands. Same
-            # class fix as _typed_entities_from_flat_strings.
+            # Resolve the template to ONE identity (objectId + CN + localized
+            # displayName), so the same template referenced here by its localized
+            # label and by the flat extractor's English CN collapses to one entity.
+            # Display is the localized name (de-shouted, never anglicized); the
+            # identifier is the CN for remediation commands.
+            identifier, display, node_id = _resolve_template_fields(template, index)
             entities.append(
                 AffectedAssetEntity(
                     type=TYPE_TEMPLATE,
-                    identifier=template,
-                    display=deshout_display_label(template),
+                    identifier=identifier,
+                    display=display,
                     role=ROLE_AFFECTED,
+                    role_label=template_label,
+                    node_id=node_id or None,
                 )
             )
     if Extra.CA in rule.extras:
+        ca_label = rule.role_label_for("ca") or None
         for ca in extract_adcs_ca_names(view):
             entities.append(
                 AffectedAssetEntity(
@@ -831,6 +1556,7 @@ def build_affected_asset_entities(
                     identifier=ca,
                     display=ca,
                     role=ROLE_AFFECTED,
+                    role_label=ca_label,
                 )
             )
     if Extra.SHARE_PATH in rule.extras:
@@ -945,6 +1671,7 @@ def _view_is_unauthenticated_reachable(details: Mapping[str, Any]) -> bool:
 
 def _typed_entities_from_flat_strings(
     flat_assets: Iterable[str],
+    index: AssetIndex | None = None,
 ) -> list[AffectedAssetEntity]:
     """Lift the flat extractor's typed ``Template:`` / ``CA:`` / ``Share:`` /
     ``Artifact:`` strings into structured entities.
@@ -955,6 +1682,11 @@ def _typed_entities_from_flat_strings(
     than duplicate that ADCS resolution, the serialization pass reuses it: the
     already-typed flat strings are mapped back to typed entities here so the
     structured contract carries the templates the report shows.
+
+    ``index`` lets a template named here by its English CN resolve to the SAME
+    template the builder already surfaced by its localized displayName, so the
+    two collapse into one entity (localized display, CN identifier) instead of
+    appearing as two templates.
     """
     out: list[AffectedAssetEntity] = []
     for raw in flat_assets:
@@ -963,19 +1695,17 @@ def _typed_entities_from_flat_strings(
         if lower.startswith("template: "):
             name = text[len("template: ") :].strip()
             if name:
-                # A directory can return a certificate template's DISPLAY name
-                # SHOUTING (a localized default template, e.g. Italian
-                # ``CONTROLLER DI DOMINIO`` / ``AUTENTICAZIONE KERBEROS``); the
-                # client deliverable must not render it that way beside the
-                # correctly-cased siblings. De-shout the DISPLAY to the
-                # directory's own casing (never translated) while keeping the
-                # IDENTIFIER as the raw name so the template CN used in
-                # remediation commands is unchanged.
+                # Resolve to ONE template identity so a localized-name entry from
+                # the builder and this CN entry from the flat extractor collapse.
+                # Display is the localized name (de-shouted, never anglicized);
+                # the identifier is the CN for remediation commands.
+                identifier, display, node_id = _resolve_template_fields(name, index)
                 out.append(
                     AffectedAssetEntity(
                         type=TYPE_TEMPLATE,
-                        identifier=name,
-                        display=deshout_display_label(name),
+                        identifier=identifier,
+                        display=display,
+                        node_id=node_id or None,
                     )
                 )
         elif lower.startswith("ca: "):
@@ -988,9 +1718,7 @@ def _typed_entities_from_flat_strings(
             name = text[len("share: ") :].strip()
             if name:
                 out.append(
-                    AffectedAssetEntity(
-                        type=TYPE_SHARE, identifier=name, display=name
-                    )
+                    AffectedAssetEntity(type=TYPE_SHARE, identifier=name, display=name)
                 )
         elif lower.startswith("artifact: "):
             name = text[len("artifact: ") :].strip()
@@ -1033,7 +1761,9 @@ def serialize_affected_asset_entities(
         relation_aliases=relation_aliases,
     )
     if flat_assets is not None:
-        entities = _dedupe([*entities, *_typed_entities_from_flat_strings(flat_assets)])
+        entities = _dedupe(
+            [*entities, *_typed_entities_from_flat_strings(flat_assets, index)]
+        )
     entities = _prefer_precise_share_entities(entities)
     return [entity.to_dict() for entity in entities]
 
@@ -1267,8 +1997,9 @@ def stamp_workspace_affected_assets(
             same index rather than parsing the graph twice).
 
     Returns:
-        ``True`` when at least one finding's entities changed and the report was
-        rewritten. Best-effort: never raises.
+        ``True`` when the report was rewritten, which is when a finding's
+        entities changed or its ADscan rating did. A caller holding its own copy
+        of the file re-reads it on ``True``. Best-effort: never raises.
     """
     try:
         from types import SimpleNamespace  # noqa: PLC0415
@@ -1276,6 +2007,7 @@ def stamp_workspace_affected_assets(
         from adscan_core.reporting.technical_report import (  # noqa: PLC0415
             _load_technical_report,
             _save_technical_report,
+            stamp_adscan_severity_report,
         )
 
         shell = SimpleNamespace(current_workspace_dir=str(workspace_dir))
@@ -1287,14 +2019,23 @@ def stamp_workspace_affected_assets(
         findings = entry.get("findings")
         if not isinstance(findings, list) or not findings:
             return False
-        if stamp_structured_affected_assets(
+        changed = stamp_structured_affected_assets(
             findings,
             domain_name=domain_name,
-            index=index if index is not None else load_asset_index(
-                workspace_dir, domain_name
-            ),
+            index=index
+            if index is not None
+            else load_asset_index(workspace_dir, domain_name),
             attack_paths=attack_paths,
-        ):
+        )
+        # The ADscan rating is derived from the entities above, so the two have
+        # to be settled together. A workspace whose entities did NOT move can
+        # still carry no rating at all, because it was scanned by a build that
+        # predates the rating being persisted; without this the report would
+        # never be rewritten, the rating would stay absent, and both tiers would
+        # keep counting the baseline band underneath it. The save seam re-derives
+        # the rating itself, so this only decides whether a write is owed.
+        changed = stamp_adscan_severity_report(report) or changed
+        if changed:
             _save_technical_report(shell, report)
             return True
         return False

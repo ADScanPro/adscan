@@ -52,6 +52,7 @@ def run_writeup_sync(args: argparse.Namespace) -> int:
         shell,
         output_dir=getattr(args, "output_dir", None),
         trigger=TRIGGER_REPL_WRITEUP,
+        full_credentials=bool(getattr(args, "full_credentials", False)),
     )
     return 0
 
@@ -78,6 +79,21 @@ def add_writeup_subparser(
         dest="workspace",
         default=None,
         help="Workspace name or path (default: prompt or most-recent).",
+    )
+    # Masked-by-default is the safe side of an asymmetric risk: an operator who
+    # wanted the whole table inline spends a second on this flag, while a
+    # writeup silently carrying a client's cleartext employee passwords is a
+    # confidentiality incident the first time it is forwarded. A practice-target
+    # (``ctf``) workspace prints them inline either way.
+    parser.add_argument(
+        "--full-credentials",
+        dest="full_credentials",
+        action="store_true",
+        help=(
+            "Write the complete recovered-credential table, with values, into "
+            "the writeup. On a client engagement the values are withheld by "
+            "default and the writeup points at the workspace register instead."
+        ),
     )
     parser.add_argument(
         "output_dir",

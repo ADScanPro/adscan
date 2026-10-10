@@ -235,7 +235,9 @@ def score_finding(
 # names in custom_config.yaml.
 _CS_CUSTOM_RULE_EXTRACTION_WEIGHTS: dict[str, float] = {
     # STRONG-tier — keyword + structural separator
+    "EN Misspelled Password Label":       0.20,
     "ES Contraseña Inline":               0.20,
+    "ES Clave Inline":                    0.20,
     "CA Contrasenya Inline":              0.20,
     "DE Kennwort Inline":                 0.20,
     "FR Mot de passe Inline":             0.20,

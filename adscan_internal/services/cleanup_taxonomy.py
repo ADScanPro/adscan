@@ -172,6 +172,36 @@ KIND_FORGED_CERTIFICATE = "forged_certificate"
 KIND_CA_BACKUP_SERVICE = "ca_backup_service"
 KIND_CA_BACKUP_TEMP_PFX = "ca_backup_temp_pfx"
 
+# ── Remote-artefact kinds (files ADscan writes on an assessed HOST) ───────────
+# These are not directory objects: nothing in Active Directory changes, but a
+# file exists on the client's machine that did not exist before. A credential
+# dump, a saved registry hive and an uploaded helper executable all land here.
+# They carry the same lifecycle as any other change (deleted and confirmed, or
+# manual_required with the exact path), and the disclosure must separate them
+# from directory writes so neither statement overstates the other.
+#: A file ADscan created on the target (a process dump, a saved registry hive).
+KIND_REMOTE_FILE_WRITTEN = "file_written"
+#: A file ADscan pushed to the target (a helper executable it then ran).
+KIND_REMOTE_FILE_UPLOADED = "file_uploaded"
+#: Every kind whose object lives on a host filesystem rather than in the
+#: directory. The SSOT for "was this a directory change or a file on a host?".
+HOST_ARTIFACT_KINDS: frozenset[str] = frozenset(
+    {KIND_REMOTE_FILE_WRITTEN, KIND_REMOTE_FILE_UPLOADED}
+)
+
+
+def kind_is_host_artifact(kind: str | None) -> bool:
+    """Whether a change kind is a file on a host rather than a directory object.
+
+    Args:
+        kind: The ``kind`` recorded on a ledger entry.
+
+    Returns:
+        True for a remote file ADscan wrote or uploaded, False for every
+        directory change.
+    """
+    return str(kind or "").strip().lower() in HOST_ARTIFACT_KINDS
+
 # ── Change-kind display strings (SSOT) ────────────────────────────────────────
 # Every kind any writer registers needs an entry here, or the client-facing
 # disclosure prints the raw snake_case token. Keep this in step with the
@@ -180,7 +210,8 @@ KIND_CA_BACKUP_TEMP_PFX = "ca_backup_temp_pfx"
 KIND_DISPLAY: dict[str, str] = {
     "group_membership_added": "Group membership",
     "group_membership_changed": "Group membership",
-    "file_uploaded": "File upload",
+    KIND_REMOTE_FILE_WRITTEN: "File written on an assessed host",
+    KIND_REMOTE_FILE_UPLOADED: "File uploaded to an assessed host",
     "user_created": "User created",
     "password_changed": "Password reset",
     "template_modified": "Certificate template modified",
@@ -200,6 +231,7 @@ KIND_DISPLAY: dict[str, str] = {
     "machine_account_created": "Machine account",
     "computer_account_created": "Computer account",
     "rbcd_delegation_added": "RBCD delegation",
+    "dns_record_added": "ADIDNS record",
     "keycredentiallink_added": "KeyCredentialLink",
     "upn_changed": "User principal name",
     "altsecurityidentities_written": "Certificate mapping attribute",
@@ -212,6 +244,9 @@ KIND_DISPLAY: dict[str, str] = {
     "mssql_clr_assembly_loaded": "Database CLR assembly",
     "mssql_clr_config_changed": "Database CLR configuration",
     "mssql_xp_cmdshell_enabled": "Database command execution setting",
+    "scheduled_task_created": "Scheduled task created on an assessed host",
+    "logon_script_path_modified": "Logon script path (scriptPath)",
+    "rodc_prp_modified": "RODC password-replication policy (msDS-RevealOnDemandGroup)",
 }
 
 
@@ -332,6 +367,12 @@ MANUAL_GROUP_MEMBERSHIP = (
     "  Remove-ADGroupMember -Identity 'GROUP' -Members 'MEMBER' -Confirm:$false"
 )
 
+MANUAL_DNS_RECORD = (
+    "Remove the ADIDNS record created during the engagement:\n"
+    "  Remove-DnsServerResourceRecord -ZoneName 'ZONE' -Name 'RECORD'"
+    " -RRType A -Force"
+)
+
 MANUAL_RBCD = (
     "Clear or restore msDS-AllowedToActOnBehalfOfOtherIdentity on the target:\n"
     "  Set-ADComputer -Identity TARGET -Clear 'msDS-AllowedToActOnBehalfOfOtherIdentity'"
@@ -347,6 +388,64 @@ MANUAL_KEYCREDENTIALLINK = (
 MANUAL_MACHINE_ACCOUNT = (
     "Remove the machine account created during the engagement with a privileged account:\n"
     "  Remove-ADComputer -Identity 'TARGET' -Confirm:$false"
+)
+
+# A user account ADscan created during the engagement (e.g. the HasSession
+# create-and-elevate plan). Deleting it with a privileged account removes both
+# the account and any group membership it held.
+MANUAL_USER_ACCOUNT = (
+    "Delete the account created during the engagement with a privileged account:\n"
+    "  Remove-ADUser -Identity 'TARGET' -Confirm:$false\n"
+    "  # for a host-local account instead of a domain one, on the host:\n"
+    "  Remove-LocalUser -Name 'TARGET'\n"
+    "  # confirm it is gone (a domain account should return nothing):\n"
+    "  Get-ADUser -Filter \"sAMAccountName -eq 'TARGET'\""
+)
+
+# A scheduled task ADscan registered on an assessed host to run a command as the
+# logged-on user. Removing it needs local administrator rights on that host.
+MANUAL_SCHEDULED_TASK = (
+    "A scheduled task (TASK_NAME) was registered on ARTIFACT_HOST during the engagement to "
+    "run a command, and ADscan could not confirm it was removed. Remove it with local "
+    "administrator rights on that host:\n"
+    "  1. Confirm it exists:\n"
+    '     Get-ScheduledTask -TaskName "TASK_NAME" -CimSession "ARTIFACT_HOST"\n'
+    "  2. Delete it:\n"
+    '     Unregister-ScheduledTask -TaskName "TASK_NAME" -CimSession "ARTIFACT_HOST" -Confirm:$false\n'
+    "  3. Review Event ID 4698 (a scheduled task was created) on ARTIFACT_HOST around the "
+    "assessment window and confirm no other unexpected task remains."
+)
+
+# The target user's scriptPath (logon script) was overwritten during the
+# engagement. Restoring it means clearing the injected value, or setting it back
+# to the value the client had before, with a privileged account.
+MANUAL_LOGON_SCRIPT_PATH = (
+    "The logon script (scriptPath) of TARGET was overwritten during the engagement so that "
+    "a script runs the next time an affected user logs on. Restore it with a privileged "
+    "account:\n"
+    "  1. Read the current value:\n"
+    "     Get-ADUser -Identity 'TARGET' -Properties scriptPath | Select-Object scriptPath\n"
+    "  2. Clear it if the account had no logon script before, or set it back to the "
+    "original value otherwise:\n"
+    "     Set-ADUser -Identity 'TARGET' -Clear scriptPath\n"
+    "     # or: Set-ADUser -Identity 'TARGET' -ScriptPath 'ORIGINAL_SCRIPT'\n"
+    "  3. Remove the staged script file from the NETLOGON share and confirm it is gone."
+)
+
+# The RODC password-replication policy (msDS-RevealOnDemandGroup) was modified to
+# let the read-only DC cache the target's secrets. Restoring it removes the
+# principal added during the engagement, with a privileged account.
+MANUAL_RODC_PRP = (
+    "The read-only domain controller's password-replication policy "
+    "(msDS-RevealOnDemandGroup on TARGET) was modified during the engagement to allow the "
+    "target principal's secrets to be cached. Restore it with a privileged account:\n"
+    "  1. Read the current allowed-list:\n"
+    "     Get-ADObject 'TARGET' -Properties msDS-RevealOnDemandGroup\n"
+    "  2. Remove the principal added during the engagement (REVEAL_PRINCIPAL):\n"
+    "     Set-ADObject 'TARGET' -Remove @{'msDS-RevealOnDemandGroup'='REVEAL_PRINCIPAL'}\n"
+    "  3. If the engagement also emptied msDS-NeverRevealGroup, restore its prior members, "
+    "then clear any cached secrets with Reset-ADServiceAccountPassword on affected service "
+    "accounts and consider resetting the exposed accounts' passwords."
 )
 
 # A certificate the CA issued during the assessment. Revoking it needs
@@ -467,6 +566,46 @@ MANUAL_CA_BACKUP_TEMP_PFX = (
 )
 
 
+# A file ADscan wrote or uploaded on an assessed host and could not confirm it
+# removed. Placeholders filled by :func:`remote_artifact_remediation`.
+MANUAL_REMOTE_ARTIFACT = (
+    "ADscan wrote the file ARTIFACT_PATH on ARTIFACT_HOST while running the technique, and "
+    "could not confirm it was deleted afterwards. A process dump or a saved registry hive "
+    "holds credential material that is readable by anyone who can read the file, so remove "
+    "it before the host returns to normal use. Local administrator rights on that host are "
+    "enough:\n"
+    "  1. Confirm the file is still there:\n"
+    '     Test-Path "ARTIFACT_PATH"\n'
+    "  2. Delete it:\n"
+    '     Remove-Item -Path "ARTIFACT_PATH" -Force\n'
+    "  3. Confirm it is gone (this must return False):\n"
+    '     Test-Path "ARTIFACT_PATH"\n'
+    "  4. Review the rest of the temporary directory for anything else left from the "
+    "assessment window:\n"
+    "     Get-ChildItem 'C:\\Windows\\Temp' | Sort-Object LastWriteTime -Descending | "
+    "Select-Object -First 20"
+)
+
+
+def remote_artifact_remediation(
+    *, remote_path: str | None = None, host: str | None = None
+) -> str:
+    """Render the client-facing remediation for a file left on an assessed host.
+
+    Args:
+        remote_path: The local Windows path on the target (e.g.
+            ``C:\\Windows\\Temp\\ab12cd.dmp``).
+        host: The host the file sits on.
+
+    Returns:
+        A single client-safe string using only native Windows tooling.
+    """
+    body = MANUAL_REMOTE_ARTIFACT.replace(
+        "ARTIFACT_PATH", remote_path or "the temporary file"
+    )
+    return body.replace("ARTIFACT_HOST", host or "the assessed host")
+
+
 def _ca_config_string(ca_name: str | None, ca_host: str | None) -> str:
     """Build the ``host\\CA name`` config string certutil expects."""
     if ca_host and ca_name:
@@ -529,13 +668,23 @@ KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     "group_membership_changed": MANUAL_GROUP_MEMBERSHIP,
     "group_membership_added": MANUAL_GROUP_MEMBERSHIP,
     "rbcd_delegation_added": MANUAL_RBCD,
+    "dns_record_added": MANUAL_DNS_RECORD,
     "keycredentiallink_added": MANUAL_KEYCREDENTIALLINK,
     "machine_account_created": MANUAL_MACHINE_ACCOUNT,
+    "user_created": MANUAL_USER_ACCOUNT,
+    "scheduled_task_created": MANUAL_SCHEDULED_TASK,
+    "logon_script_path_modified": MANUAL_LOGON_SCRIPT_PATH,
+    "rodc_prp_modified": MANUAL_RODC_PRP,
     KIND_ISSUED_CERTIFICATE: MANUAL_ISSUED_CERTIFICATE,
     KIND_CA_PRIVATE_KEY_EXFILTRATED: MANUAL_CA_PRIVATE_KEY_EXFILTRATED,
     KIND_FORGED_CERTIFICATE: MANUAL_FORGED_CERTIFICATE,
     KIND_CA_BACKUP_SERVICE: MANUAL_CA_BACKUP_SERVICE,
     KIND_CA_BACKUP_TEMP_PFX: MANUAL_CA_BACKUP_TEMP_PFX,
+    # The write seam stamps the fully rendered command (it knows the real path
+    # and host); this entry is the fallback for a record that reaches
+    # ``finalize()`` without one.
+    KIND_REMOTE_FILE_WRITTEN: MANUAL_REMOTE_ARTIFACT,
+    KIND_REMOTE_FILE_UPLOADED: MANUAL_REMOTE_ARTIFACT,
 }
 
 
@@ -641,6 +790,10 @@ __all__ = [
     "MANUAL_RBCD",
     "MANUAL_KEYCREDENTIALLINK",
     "MANUAL_MACHINE_ACCOUNT",
+    "MANUAL_USER_ACCOUNT",
+    "MANUAL_SCHEDULED_TASK",
+    "MANUAL_LOGON_SCRIPT_PATH",
+    "MANUAL_RODC_PRP",
     "MANUAL_ISSUED_CERTIFICATE",
     "KIND_ISSUED_CERTIFICATE",
     "issued_certificate_remediation",
@@ -659,4 +812,10 @@ __all__ = [
     "dacl_ace_remediation",
     "KIND_REMEDIATION_TEMPLATE",
     "remediation_template_for_kind",
+    "KIND_REMOTE_FILE_WRITTEN",
+    "KIND_REMOTE_FILE_UPLOADED",
+    "HOST_ARTIFACT_KINDS",
+    "kind_is_host_artifact",
+    "MANUAL_REMOTE_ARTIFACT",
+    "remote_artifact_remediation",
 ]

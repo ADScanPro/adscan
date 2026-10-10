@@ -60,6 +60,20 @@ Four rules the content obeys:
 The artifact defaults to a local, private file. It carries ``draft: true`` and
 ``published: false``, which Hugo and Jekyll both honour, so it cannot be built
 into a site by accident. Nothing in this module publishes, uploads or shares.
+
+One section of the document is ENGAGEMENT-AWARE, because the same shape served
+two readers badly. A practice-target writeup is a teaching artifact: the
+publication frontmatter is correct for a target that will retire, and the
+recovered credentials are the content of the genre, so a ``ctf`` workspace
+renders exactly as it always did. A client engagement is a different document,
+and rendering it as a draft blog post carrying hundreds of cleartext employee
+passwords was a confidentiality problem rather than a styling one. For an
+``audit`` workspace the publication framing is dropped and the credential
+ledger keeps what evidences the step (the count, the krbtgt confirmation, a few
+rows with each secret masked to its shape) while pointing at the register the
+workspace already holds. The policy, including why each of its two defaults
+takes the opposite safe side, lives in
+:mod:`adscan_internal.services.writeup_credential_disclosure`.
 """
 
 from __future__ import annotations
@@ -67,13 +81,22 @@ from __future__ import annotations
 import dataclasses
 import re
 import shutil
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
+from adscan_core.reporting.attack_step_reason_codes import (
+    REASON_CODE_KEY,
+    normalize_reason_code as _normalize_reason_code,
+    reason_code_client_note,
+)
 from adscan_core.reporting.kit_facts import chain_reconcile_clause
+from adscan_core.reporting.principal_display import (
+    deshout_directory_name,
+    resolve_sid_display_name,
+)
 from adscan_core.reporting.unauthenticated_reach import (
     REACHED_VIA_NULL_SESSION,
     UNAUTHENTICATED_REACH_BADGE,
@@ -101,6 +124,26 @@ from adscan_internal.services.compromise_class import (
     derive_compromise_class_from_path,
 )
 from adscan_internal.services.credentials.credential_origin import origin_display_label
+from adscan_internal.services.writeup_execution_record import (
+    PROOF_SOURCE_GRAPH_EDGE,
+    ExecutedPath,
+    ExecutedStep,
+    format_duration,
+    parse_executed_paths,
+)
+from adscan_internal.services.writeup_credential_disclosure import (
+    DISCLOSURE_INLINE_FULL,
+    DISCLOSURE_MASKED_EXEMPLARS,
+    CredentialStorePointers,
+    credential_store_pointers,
+    full_credentials_requested,
+    mask_secret_to_shape,
+    masked_ledger_notice,
+    resolve_credential_disclosure,
+    resolve_writeup_engagement_type,
+    select_exemplars,
+    writeup_is_publication_framed,
+)
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.path_state import _PROVEN_STATUSES
 
@@ -169,10 +212,10 @@ _TECHNIQUE_NAMES: dict[str, str] = {
     "blankpassword": "Blank password",
     "canpsremote": "PowerShell Remoting (WinRM)",
     "canrdp": "RDP",
+    "certighost": "Certighost (AD CS chase-fallback DC impersonation)",
     "coerceandrelayntlmtoadcs": "ESC8 (NTLM relay to AD CS web enrollment)",
     "coerceandrelayntlmtoldap": "NTLM relay to LDAP",
     "coerceandrelayntlmtosmb": "NTLM relay to SMB",
-    "coercetotgt": "Coerce to TGT (unconstrained delegation)",
     "computerpre2k": "Pre-Windows 2000 computer account",
     "crackntlmv1": "NTLMv1 offline crack",
     "cracksid": "Offline password cracking",
@@ -333,13 +376,18 @@ _DEAD_END_PHRASES: dict[str, str] = {
 
 # How an alternate route's engine status reads in a writeup. The engine
 # vocabulary (``theoretical``, ``exploited``) is precise and internal; a reader
-# wants to know whether it was walked. "Structurally proven" (not a bare "not
-# executed") is deliberate: these routes were derived from the reconciled
-# attack graph by the same engine that walked the primary chain, not guessed —
-# the gap is that ADscan did not RUN them, never that they are speculative.
+# wants to know whether it was walked.
+#
+# The non-executed wording is the Security Assessment Report's, VERBATIM
+# ("identified by configuration analysis", `compliance_engine.py` /
+# `templates/premium/report.html`). It used to read "structurally proven", which
+# this document said ten times for routes the engine grades `theoretical`: that
+# phrase claims more than the grade warrants, and it made the free writeup and
+# the paid report describe the same evidence in two different registers. One
+# vocabulary across the kit, owned by the report.
 _ROUTE_STATES: dict[str, str] = {
-    "theoretical": "structurally proven, not executed",
-    "discovered": "structurally proven, not executed",
+    "theoretical": "identified by configuration analysis, not executed",
+    "discovered": "identified by configuration analysis, not executed",
     "attempted": "attempted, did not complete",
     "partial": "partly executed",
     "exploited": "executed",
@@ -511,6 +559,14 @@ class SpineStep:
     #: ONLY when the workspace PROVED the replication loot (SSOT:
     #: ``adscan_core.reporting.dcsync_terminal``). Empty for every ordinary step.
     narrative_suffix: str = ""
+    #: Structured reason code for a non-proven step (a
+    #: :class:`adscan_core.reporting.attack_step_reason_codes.ReasonCode` value),
+    #: read from the edge's ``notes.reason_code`` via the step details. Carries
+    #: the specific cause (hash captured but not cracked, certificate issued but
+    #: not authenticated with) to the per-step narrative, so a dead-end reads the
+    #: honest "what and why" instead of a bare "ran, did not complete". Empty when
+    #: the step recorded no structured reason.
+    reason_code: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,12 +630,45 @@ class CredentialRow:
     ``origin`` is ``None`` when the workspace does not record how the secret was
     obtained. That is a real state, not a formatting gap, and the renderer says
     so rather than printing a placeholder that reads like a technique.
+
+    ``origin`` is the credential STORE's own tag, and on its own it answers a
+    narrower question than a reader thinks it does: it names the acquisition
+    that last touched the secret, which for a password read off a share is the
+    spray that CONFIRMED it, not the share it was read from. So the ledger also
+    carries the step the CHAIN proved recovered it (``proven_via``) and that
+    step's citation (``finding``), and keeps "supplied at the start of the run"
+    as its own fact (``also_supplied``) rather than letting it displace a
+    technique that independently proved the same secret.
     """
 
     principal: str
     secret_kind: str
     origin: str | None = None
     value: str = ""
+    #: The technique name of the proven chain step whose target is this
+    #: principal. Empty when no proven step recovered it.
+    proven_via: str = ""
+    #: Where the secret was read, when a share-content scan found this exact
+    #: value in a file. ``None`` for every other acquisition.
+    finding: ShareFileFinding | None = None
+    #: True when the store records that the run was handed this credential at
+    #: the start. Both can be true of one account: the operator supplied the
+    #: password AND the directory disclosed it, and reporting only the first
+    #: erases a real finding (on Cicada it hid an entry step that was proven).
+    also_supplied: bool = False
+
+    @property
+    def recovered_via(self) -> str:
+        """How the ledger states this secret was recovered.
+
+        The step the chain PROVED comes first, because that is a verified fact
+        about this run; the store's acquisition tag is the fallback. "Supplied
+        at the start" is never the answer while a proven step exists: it is a
+        fact about the run's entry point and the renderer states it separately.
+        """
+        if self.proven_via:
+            return self.proven_via
+        return self.origin or ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,10 +685,53 @@ class ChangeRow:
 
 @dataclass(frozen=True, slots=True)
 class FlagRow:
-    """A captured flag, recorded by name and masked value."""
+    """A captured flag, recorded by name, masked value and where it was read.
+
+    ``source`` is the remote path the collector read it from, when the run
+    recorded one (``flags/flag_sources.json``). A flag list with no capture
+    context tells a reader the box was finished and nothing about how, which is
+    the one thing the genre expects next to a flag.
+    """
 
     name: str
     masked: str
+    source: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ShareRow:
+    """One SMB share as the live probe found it.
+
+    ``broad_readers`` names the well-known identities the computed read set
+    grants, resolved through the display SSOT. A share any authenticated user
+    (or Everyone) can read is the reproducible recon a reader starts from, and
+    it is the fact that makes the credential found inside it interesting rather
+    than lucky.
+    """
+
+    name: str
+    kind: str
+    remark: str
+    accessible: bool
+    broad_readers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ShareFileFinding:
+    """A credential-shaped line the share scan read out of a file.
+
+    ``path`` is share-relative (``DEV/Backup_script.ps1``), which is what a
+    reader reproduces; the workspace's own absolute loot path is an internal
+    detail and is never printed. ``line`` and ``context`` are the citation: the
+    writeup used to attribute this credential to the spray that CONFIRMED it
+    and say nothing about where it was read from.
+    """
+
+    share: str
+    path: str
+    line: int
+    context: str
+    value: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -737,9 +869,154 @@ class SpineInputs:
     alt_routes: tuple[AltRoute, ...] = ()
     dead_ends: tuple[DeadEnd, ...] = ()
     credentials: tuple[CredentialRow, ...] = ()
+    #: The SMB shares the live probe found, with what the run's credential could
+    #: open and which broad identities the computed read set grants. Recon a
+    #: reader reproduces before anything else, and the context that makes the
+    #: credential found inside one of them a finding rather than an accident.
+    shares: tuple[ShareRow, ...] = ()
+    #: ``(total, readable, writable)`` as the share probe counted them, so the
+    #: section's headline is the probe's own arithmetic and not a re-count of a
+    #: possibly-filtered row list. ``None`` when no probe record exists.
+    share_counts: tuple[int, int, int] | None = None
+    #: Every credential-shaped line the share-content scan read, with the file,
+    #: the line number and the line itself.
+    share_findings: tuple[ShareFileFinding, ...] = ()
     changes: tuple[ChangeRow, ...] = ()
     flags: tuple[FlagRow, ...] = ()
     tags: tuple[str, ...] = ()
+    #: The engagement this workspace recorded (``"ctf"``, ``"audit"``, or
+    #: ``None`` when it is unclassified), resolved through the compliance-scope
+    #: SSOT. It is the ONE input behind both presentation decisions below, so
+    #: the two cannot be set inconsistently with each other.
+    engagement_type: str | None = None
+    #: The operator's explicit opt-in to one complete, unmasked credential table
+    #: in a document that would otherwise mask it.
+    full_credentials_inline: bool = False
+    #: The paths the run ACTUALLY walked, replayed from the execution record
+    #: (``writeup_execution_record.parse_executed_paths``), earliest first. When
+    #: this is non-empty it is the narrative: one ordered, timestamped section
+    #: per path, each with its own start principal, its own per-step actors and
+    #: its own duration. The synthesized single chain below (``stages`` /
+    #: ``chain_steps``) is the FALLBACK for a workspace with no execution
+    #: record, never a second story told alongside these.
+    executed_paths: tuple[ExecutedPath, ...] = ()
+    #: Elapsed run time, in seconds, to the first recovered credential and to
+    #: proven full domain control, read verbatim from the scan's own
+    #: ``scan_summary.json``. These are the two figures a reader wants and the
+    #: per-path windows cannot give: a path's own duration measures its
+    #: execution, while these measure the run, so they are stated as what they
+    #: are rather than left to look like a competing claim. ``None`` when the
+    #: summary does not carry them.
+    time_to_first_cred_seconds: float | None = None
+    time_to_compromise_seconds: float | None = None
+    #: What the environment-change ledger knows about this run's writes, as the
+    #: ledger's own three-state SSOT (``recorded`` / ``none`` /
+    #: ``undetermined``). An empty ledger is a POSITIVE fact and is stated;
+    #: silence would be indistinguishable from the section having been dropped.
+    change_record_state: str = ""
+    #: The run's own date (``YYYY-MM-DD``), from the first step it executed.
+    #: The frontmatter carries this rather than the generation date, so the
+    #: header cannot read a different day from the timestamps in the body.
+    run_date: str | None = None
+    #: The directory's real account names, so an executed-path label renders by
+    #: the client-label rule (a user/computer sAMAccountName lower-cased). The
+    #: record itself stays VERBATIM; humanization happens at the render.
+    chain_accounts: frozenset[str] = frozenset()
+    #: Every certificate authority the enumeration found, as
+    #: ``(name, host)``. A multi-CA PKI is a finding in itself, and naming one
+    #: CA in the enumeration table while an ADCS step acted against a different
+    #: one is how the cleanup commands came to target the wrong authority.
+    certificate_authorities: tuple[tuple[str, str], ...] = ()
+    #: Where a masked ledger sends the reader for the values it withheld: the
+    #: workspace credential store (which holds them) and the value-free
+    #: per-account register, each named only when it is actually on disk. The
+    #: store is the unsanitized side and this document is the sanitized side,
+    #: so the ledger points instead of reproducing.
+    credential_pointers: CredentialStorePointers = CredentialStorePointers()
+
+    @property
+    def credential_disclosure(self) -> str:
+        """Whether this document prints the recovered secret values."""
+        return resolve_credential_disclosure(
+            self.engagement_type, force_inline=self.full_credentials_inline
+        )
+
+    @property
+    def command_fill(self) -> CommandFill | None:
+        """The values the by-hand commands may be filled with, or ``None``.
+
+        ``None`` on any document that masks secrets, which leaves every command
+        exactly as the catalog authored it. See :class:`CommandFill`.
+        """
+        if self.credential_disclosure != DISCLOSURE_INLINE_FULL:
+            return None
+        return CommandFill(
+            domain=self.domain,
+            dc_fqdn=self.dc_fqdn or "",
+            base_dn=_base_dn_for(self.domain),
+            start_principal=self.start_principal or "",
+            secrets={
+                row.principal.strip().lower(): row.value
+                for row in self.credentials
+                if row.principal and row.value
+            },
+            findings={
+                finding.value: finding
+                for finding in self.share_findings
+                if finding.value
+            },
+        )
+
+    @property
+    def publication_framed(self) -> bool:
+        """Whether this document carries blog publication framing."""
+        return writeup_is_publication_framed(self.engagement_type)
+
+    @property
+    def execution_record_is_backbone(self) -> bool:
+        """Whether the per-path execution record is the document's spine.
+
+        The record used to win unconditionally whenever one existed, and that
+        erased proof. On HTB Cicada the graph and the report pipeline both held
+        one ``exploited`` path whose four steps carried the whole solution, while
+        the event log held two paths: one with no step events at all and one with
+        a single DCSync that did not complete. The document rendered the event
+        log, so it opened "none of them end to end", drew a two-node diagram of
+        the hop that failed, and never mentioned the three steps that worked.
+        Narrating steps the run did not take would be bad; erasing the ones it
+        did is worse, because on this artifact the proof IS the asset.
+
+        So the record is the spine only when it is the MORE COMPLETE account of
+        what the run proved. The comparison is proven steps against proven steps:
+        when the record holds at least as many as the attack graph does, it wins
+        exactly as before (it has the clock, the actor and the per-path split,
+        and it cannot fuse two executions into a claim their own timestamps
+        refute). When the graph proved more than the record logged, the chain is
+        the spine and the record's attempts are reported under it.
+
+        One predicate, consulted by the summary, the diagram and the body, so
+        those three can never tell different stories. Not a collected field: a
+        property cannot be set inconsistently with the collections it describes.
+        """
+        if not self.executed_paths:
+            return False
+        recorded = sum(len(path.succeeded_steps) for path in self.executed_paths)
+        proven_chain = sum(
+            1
+            for step in self.chain_steps
+            if not step.is_context and step.outcome == "success"
+        )
+        return recorded >= proven_chain
+
+    @property
+    def unproven_recorded_steps(self) -> tuple[ExecutedStep, ...]:
+        """The recorded steps that ran and did not complete, in clock order."""
+        return tuple(
+            step
+            for path in self.executed_paths
+            for step in path.steps
+            if not step.succeeded
+        )
 
     @property
     def chain_has_proven_step(self) -> bool:
@@ -840,7 +1117,10 @@ def display_node(
         return raw
     if account.upper() in accounts or "@" not in raw:
         return account.lower()
-    return account.title() if account.isupper() else account
+    # De-shout through the shared SSOT, never ``.title()``: this is a directory
+    # object name, and ``.title()`` capitalizes after every non-alphabetic
+    # character, so a localized built-in came out ``Computer Del Dominio``.
+    return deshout_directory_name(account)
 
 
 def _account_names(domain_dir: Path) -> frozenset[str]:
@@ -988,16 +1268,36 @@ def _is_account_node(
     }
 
 
-def _timestamp_display(value: str | None) -> str | None:
-    """Return ``YYYY-MM-DD HH:MM`` for an ISO timestamp, or ``None``."""
+def _as_utc(value: str | None) -> datetime | None:
+    """Return ``value`` as an aware UTC datetime, or ``None``.
+
+    Every clock this document prints goes through here, so the document can
+    only ever be in ONE frame. The workspace writes its stamps with an offset
+    and the engine records them in UTC, but a reader comparing a timestamp in
+    the body against a stamp elsewhere has no way to know which frame either is
+    in unless the document says so, and an unlabelled hour is where that
+    reading goes wrong. A naive stamp (no offset at all) is left alone rather
+    than assigned a zone it never carried.
+    """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime(
-            "%Y-%m-%d %H:%M"
-        )
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:  # noqa: BLE001 - a malformed stamp is simply not shown
         return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(UTC)
+
+
+def _timestamp_display(value: str | None) -> str | None:
+    """Return ``YYYY-MM-DD HH:MM`` in UTC for an ISO timestamp, or ``None``.
+
+    The frame is stated once, by the label on every row and line that prints
+    one of these (see :data:`CLOCK_FRAME_NOTE`), never repeated per value.
+    """
+    parsed = _as_utc(value)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed is not None else None
 
 
 def _mask(secret: str) -> str:
@@ -1150,6 +1450,45 @@ def _inventory_rows(
             if isinstance(templates, dict) and templates.get("count"):
                 rows.append(("Certificate templates", str(templates["count"])))
     return tuple(rows)
+
+
+def _collect_certificate_authorities(
+    domain_dir: Path,
+) -> tuple[tuple[str, str], ...]:
+    """Return every enumerated certificate authority as ``(label, host)``.
+
+    Read from the attack graph's own ``enterpriseca`` nodes rather than the
+    single ``domain_data["ca"]`` field, which records whichever authority the
+    collector saw first: on a directory carrying four issuing CAs that one
+    field is how the enumeration section came to name a different authority
+    from the one an ADCS step acted against.
+
+    Ordered by label so the table is stable across renders, and two CAs sharing
+    a host are both kept: that is a fact about the PKI, not a duplicate.
+    """
+    graph = _read_json(str(domain_dir / "attack_graph.json"))
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, dict):
+        return ()
+    found: dict[str, str] = {}
+    for node in nodes.values():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("kind") or "").strip().lower() != "enterpriseca":
+            continue
+        label = str(node.get("label") or "").strip()
+        if not label:
+            continue
+        properties = node.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        host = str(
+            properties.get("dns_hostname")
+            or properties.get("dnshostname")
+            or properties.get("hostname")
+            or ""
+        ).strip()
+        found.setdefault(label, host)
+    return tuple(sorted(found.items()))
 
 
 def _dc_operating_system(domain_dir: Path) -> str | None:
@@ -1508,6 +1847,7 @@ def _build_steps(
                 == "unauth_enrichment",
                 unauthenticated_reachable=step_unauth,
                 reached_via=step_reached_via,
+                reason_code=_normalize_reason_code(details.get(REASON_CODE_KEY)),
             )
         )
     return steps
@@ -1736,10 +2076,13 @@ def _route_status_reason(path: dict[str, Any]) -> str:
       ``blocked_reason`` note. A POSITIVE finding, so this is never phrased as
       a defensive product having stopped anything (Exposure-Validation
       doctrine) — it is stated as the configuration itself.
-    * ``attempted`` (and its execution-record synonyms) — where the chain
-      stopped: the technique of the last step the run actually tried.
+    * ``attempted`` (and its execution-record synonyms) — the STRUCTURED reason
+      the chain stopped. A step stamped with a ``reason_code`` carries a specific
+      client note (a captured-but-not-cracked hash, a certificate issued but not
+      authenticated with) which is returned verbatim; without one, the honest
+      fallback is the technique of the last step the run actually tried.
 
-    Every other status (executed, structurally proven, partial) needs no
+    Every other status (executed, identified-by-configuration, partial) needs no
     reason line — the status word already says what happened. Best-effort:
     a path with no matching step returns ``""`` rather than guessing.
     """
@@ -1763,12 +2106,24 @@ def _route_status_reason(path: dict[str, Any]) -> str:
         return ""
     if status in {"attempted", "failed", "error"}:
         last_relation = ""
+        last_reason_note = ""
         for step in steps:
             if not isinstance(step, dict):
                 continue
             step_status = str(step.get("status") or "").strip().lower()
             if step_status in {"attempted", "failed", "error"}:
                 last_relation = str(step.get("action") or "").strip()
+                # The structured reason is the richer, specific cause worth
+                # showing the client over the generic "stopped at X". Read the
+                # step's own details (the edge notes fold into it) and prefer the
+                # LAST attempted step that carries one.
+                details = step.get("details")
+                details = details if isinstance(details, dict) else {}
+                note = reason_code_client_note(details.get(REASON_CODE_KEY))
+                if note:
+                    last_reason_note = note
+        if last_reason_note:
+            return last_reason_note
         if last_relation:
             return f"stopped at {technique_for(last_relation).name}"
         return ""
@@ -1823,7 +2178,150 @@ def _collect_dead_ends(
     return tuple(collected.values())
 
 
-def _collect_credentials(domain_data: dict[str, Any]) -> tuple[CredentialRow, ...]:
+#: SIDs whose read grant makes a share broadly readable, in the order a reader
+#: cares about (the widest first). Everything else is a specific principal and
+#: belongs in the share's own ACL, not in a writeup's recon table.
+_BROAD_READER_SIDS: tuple[str, ...] = (
+    "S-1-1-0",  # Everyone
+    "S-1-5-7",  # Anonymous Logon
+    "S-1-5-11",  # Authenticated Users
+    "S-1-5-32-545",  # BUILTIN\Users
+)
+
+
+def _share_broad_readers(read_set: Any) -> tuple[str, ...]:
+    """Return the broad identities the computed read set grants, widest first."""
+    if not isinstance(read_set, list):
+        return ()
+    present = {
+        str((entry or {}).get("sid") or "").strip().upper()
+        for entry in read_set
+        if isinstance(entry, dict)
+    }
+    names: list[str] = []
+    for sid in _BROAD_READER_SIDS:
+        if sid not in present:
+            continue
+        # The display SSOT, never a local name map: a localized built-in is the
+        # client's own name for it and must not be translated here.
+        name = resolve_sid_display_name(sid) or sid
+        if name not in names:
+            names.append(name)
+    # Domain Users is domain-relative (RID 513), so it is matched by suffix.
+    for sid in sorted(present):
+        if sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == "513":
+            name = resolve_sid_display_name(sid) or "Domain Users"
+            if name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def _collect_shares(
+    domain_dir: Path,
+) -> tuple[tuple[ShareRow, ...], tuple[int, int, int] | None]:
+    """Return the share inventory and ``(total, readable, writable)``.
+
+    The share probe's own record (``smb/shares.json``), which carries what
+    answered, what the current credential could open, and the computed read set
+    per share. None of it reached the document before, so the step that read a
+    password out of a share arrived with no account of how the share was found.
+    """
+    payload = _read_json(str(domain_dir / "smb" / "shares.json"))
+    if not isinstance(payload, dict):
+        return (), None
+    views = payload.get("views")
+    rows: list[ShareRow] = []
+    for view in views if isinstance(views, list) else []:
+        if not isinstance(view, dict):
+            continue
+        name = str(view.get("name") or "").strip()
+        if not name:
+            continue
+        live = view.get("live") if isinstance(view.get("live"), dict) else {}
+        rows.append(
+            ShareRow(
+                name=name,
+                kind=str(view.get("type") or "").strip(),
+                remark=str(view.get("remark") or "").strip(),
+                accessible=bool(live.get("accessible")),
+                broad_readers=_share_broad_readers(live.get("read_set")),
+            )
+        )
+    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+
+    def _count(key: str) -> int:
+        try:
+            return int(counts.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    totals = (
+        (_count("total") or len(rows), _count("readable"), _count("writable"))
+        if rows
+        else None
+    )
+    return tuple(rows), totals
+
+
+def _collect_share_findings(workspace_dir: Path) -> tuple[ShareFileFinding, ...]:
+    """Return every credential-shaped line the share-content scan read.
+
+    The spidering records (``smb/spidering/*.json``) hold the value, the file it
+    came out of, the line number and the line itself. That is the citation the
+    credential ledger needs to attribute a secret to the step that recovered it
+    rather than to the spray that confirmed it.
+    """
+    spidering = workspace_dir / "smb" / "spidering"
+    if not spidering.is_dir():
+        return ()
+    findings: list[ShareFileFinding] = []
+    seen: set[tuple[str, int, str]] = set()
+    for entry in sorted(spidering.iterdir()):
+        # ``*.review.json`` is the reviewer's own derivative of the same hits.
+        if entry.suffix != ".json" or entry.name.endswith(".review.json"):
+            continue
+        payload = _read_json(str(entry))
+        if not isinstance(payload, dict):
+            continue
+        for hit in payload.get("credentials") or []:
+            if not isinstance(hit, dict):
+                continue
+            value = str(hit.get("value") or "").strip()
+            source = str(hit.get("source_file") or "").strip()
+            # Everything before ``loot/<host>/`` is the workspace's own absolute
+            # path (a container path, at that), so only the share-relative tail
+            # is kept: that is what a reader reproduces.
+            _head, _sep, tail = source.replace("\\", "/").partition("/loot/")
+            parts = [part for part in tail.split("/") if part]
+            if len(parts) < 2:
+                continue
+            share, path = parts[1], "/".join(parts[2:])
+            try:
+                line = int(hit.get("line_number") or 0)
+            except (TypeError, ValueError):
+                line = 0
+            key = (f"{share}/{path}", line, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                ShareFileFinding(
+                    share=share,
+                    path=path,
+                    line=line,
+                    context=str(hit.get("context_line") or "").strip(),
+                    value=value,
+                )
+            )
+    return tuple(findings)
+
+
+def _collect_credentials(
+    domain_data: dict[str, Any],
+    *,
+    chain_steps: list[SpineStep] | None = None,
+    share_findings: tuple[ShareFileFinding, ...] = (),
+) -> tuple[CredentialRow, ...]:
     """Return the credential ledger: what was recovered, and by which technique.
 
     This is the single most perishable fact in a lab run. Three months later the
@@ -1842,6 +2340,19 @@ def _collect_credentials(domain_data: dict[str, Any]) -> tuple[CredentialRow, ..
         return ()
     meta = domain_data.get("credentials_meta")
     meta = meta if isinstance(meta, dict) else {}
+    # Which proven step recovered which principal's secret, by the step's own
+    # target. This is the attribution the chain PROVED, so it outranks the
+    # store's acquisition tag in the ledger's prose.
+    proven_by_principal: dict[str, str] = {}
+    for step in chain_steps or []:
+        if step.is_context or step.outcome != "success":
+            continue
+        key = str(step.target or "").strip().lower()
+        if key and key not in proven_by_principal:
+            proven_by_principal[key] = step.technique.name
+    findings_by_value = {
+        finding.value: finding for finding in share_findings if finding.value
+    }
     rows: list[CredentialRow] = []
     for principal in sorted(credentials):
         secret = str(credentials.get(principal) or "")
@@ -1863,9 +2374,25 @@ def _collect_credentials(domain_data: dict[str, Any]) -> tuple[CredentialRow, ..
             origin = _ORIGIN_SUPPLIED
         else:
             origin = None
+        # A secret can arrive more than once. The store keeps every acquisition
+        # in ``origins``, so "the operator supplied it" and "a technique proved
+        # it independently" are both readable facts and neither overwrites the
+        # other in the ledger.
+        acquisitions = entry.get("origins")
+        also_supplied = any(
+            str((item or {}).get("origin") or "").strip() == "authenticated_scan"
+            for item in (acquisitions if isinstance(acquisitions, list) else [])
+            if isinstance(item, dict)
+        )
         rows.append(
             CredentialRow(
-                principal=principal, secret_kind=kind, origin=origin, value=secret
+                principal=principal,
+                secret_kind=kind,
+                origin=origin,
+                value=secret,
+                proven_via=proven_by_principal.get(str(principal).strip().lower(), ""),
+                finding=findings_by_value.get(secret),
+                also_supplied=also_supplied,
             )
         )
     return tuple(rows)
@@ -1940,16 +2467,24 @@ def _collect_flags(workspace_dir: Path) -> tuple[FlagRow, ...]:
     flags_dir = workspace_dir / "flags"
     if not flags_dir.is_dir():
         return ()
+    sources = _read_json(str(flags_dir / "flag_sources.json"))
+    sources = sources if isinstance(sources, dict) else {}
     rows: list[FlagRow] = []
     for entry in sorted(flags_dir.iterdir()):
-        if not entry.is_file():
+        if not entry.is_file() or entry.suffix == ".json":
             continue
         try:
             value = entry.read_text(encoding="utf-8", errors="replace").strip()
         except Exception:  # noqa: BLE001 - an unreadable flag file is just absent
             continue
         if value:
-            rows.append(FlagRow(name=entry.name, masked=_mask(value)))
+            rows.append(
+                FlagRow(
+                    name=entry.name,
+                    masked=_mask(value),
+                    source=str(sources.get(entry.name) or "").strip(),
+                )
+            )
     return tuple(rows)
 
 
@@ -2288,6 +2823,131 @@ def _chain_from_graph(
     return primary, total, len(ordered_edges)
 
 
+def _graph_proof_steps_by_actor(
+    primary: dict[str, Any],
+) -> dict[str, list[ExecutedStep]]:
+    """Return the chain's graph-proven steps, keyed by the actor that ran them.
+
+    Not every technique emits a ``step_*`` event. A derived privileged-group
+    escalation follow-up (Backup Operators to NTDS.dit) records its outcome on
+    the graph EDGE and names the owned principal that ran it in the edge's own
+    ``user`` field, emitting nothing the event log can group by ``path_id``. The
+    path those steps belong to then replays as a start, a stop and nothing in
+    between: a duration and a verdict, with the lines that carried the
+    compromise missing, while the same document's compromise section describes
+    the step that is not there.
+
+    The join key is the edge's OWN recorded actor, never a timestamp window:
+    two paths that overlap in time would each claim the other's step, which is
+    how one compromise came to be reported twice in one document. A step naming
+    no actor joins nothing.
+    """
+    by_actor: dict[str, list[ExecutedStep]] = {}
+    for raw in primary.get("steps") or []:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("status") or "").strip().lower() != "success":
+            continue
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        actor = str(details.get("user") or "").strip()
+        relation = str(raw.get("action") or raw.get("relation") or "").strip()
+        if not actor or not relation:
+            continue
+        by_actor.setdefault(actor.lower(), []).append(
+            ExecutedStep(
+                action=relation,
+                source=str(details.get("from") or ""),
+                target=str(details.get("to") or ""),
+                actor=actor,
+                outcome="success",
+                proof_source=PROOF_SOURCE_GRAPH_EDGE,
+            )
+        )
+    return by_actor
+
+
+def _attach_graph_proven_steps(
+    paths: tuple[ExecutedPath, ...],
+    primary: dict[str, Any],
+) -> tuple[ExecutedPath, ...]:
+    """Give each executed path the proven steps the event log never carried.
+
+    Attribution is by actor (see :func:`_graph_proof_steps_by_actor`) against
+    the path's own start principal, and a step already present in the path's
+    recorded steps is never duplicated.
+    """
+    by_actor = _graph_proof_steps_by_actor(primary)
+    if not by_actor:
+        return paths
+    attached: list[ExecutedPath] = []
+    for path in paths:
+        extra = by_actor.get(_node_account(path.source).strip().lower(), [])
+        if not extra:
+            attached.append(path)
+            continue
+        known = {
+            (
+                normalize_relation(step.action),
+                str(step.target or "").strip().upper(),
+            )
+            for step in path.steps
+        }
+        missing = tuple(
+            step
+            for step in extra
+            if (normalize_relation(step.action), str(step.target or "").strip().upper())
+            not in known
+        )
+        if not missing:
+            attached.append(path)
+            continue
+        attached.append(replace(path, steps=path.steps + missing))
+    return tuple(attached)
+
+
+def _path_proved_domain_compromise(path: ExecutedPath, domain: str) -> bool:
+    """Whether THIS path is the one that proved full domain compromise.
+
+    A ``domain_compromise`` event carries no path id, so the record attributes
+    it by clock — and two paths whose windows overlap both contain it. Only a
+    path that actually proved a step can claim it: the alternative printed "this
+    path reached full domain compromise" under a path whose single step did not
+    complete, twice in one document, for one compromise.
+    """
+    if not path.succeeded_steps:
+        return False
+    return bool(path.domain_compromise_evidence) or _executed_path_reaches_domain(
+        path, domain
+    )
+
+
+def _scan_run_durations(workspace_dir: Path) -> tuple[float | None, float | None]:
+    """Return ``(to_first_credential, to_compromise)`` in seconds from the scan summary.
+
+    The run's own figures, read verbatim and converted from the minutes the
+    summary stores. Not derived from the paths: a path window measures that
+    path's execution, and the distance from no credentials at all to domain
+    control is the figure worth printing.
+    """
+    payload = _read_json(str(workspace_dir / "scan_summary.json"))
+    if not isinstance(payload, dict):
+        return None, None
+
+    def _seconds(key: str) -> float | None:
+        value = payload.get(key)
+        if value is None:
+            return None
+        try:
+            minutes = float(value)
+        except (TypeError, ValueError):
+            return None
+        return minutes * 60.0 if minutes >= 0 else None
+
+    return _seconds("time_to_first_cred_minutes"), _seconds(
+        "time_to_compromise_minutes"
+    )
+
+
 def collect_spine_inputs(
     *,
     workspace_dir: str,
@@ -2298,6 +2958,8 @@ def collect_spine_inputs(
     technical_report: dict[str, Any],
     lab_provider: str | None = None,
     lab_name: str | None = None,
+    engagement_type: str | None = None,
+    full_credentials_inline: bool = False,
 ) -> SpineInputs | None:
     """Resolve everything the spine needs from one workspace and domain.
 
@@ -2305,6 +2967,14 @@ def collect_spine_inputs(
     individual source is optional: a run with no port scan, no flags or no
     executed step still produces a usable spine, with those sections absent
     rather than invented.
+
+    Args:
+        engagement_type: Pre-resolved engagement type, for a caller that holds
+            one (the live shell is the only source for a scan whose variables
+            are not saved yet). When ``None`` it is resolved from the workspace
+            through the compliance-scope SSOT.
+        full_credentials_inline: The operator's explicit opt-in to one
+            complete, unmasked credential table.
     """
     if not domain:
         return None
@@ -2448,12 +3118,14 @@ def collect_spine_inputs(
         compromised_credentials=domain_data.get("compromised_credentials"),
     )
     if _dcsync_secrets:
-        primary_spine_steps, stages, terminal_steps = _fold_dcsync_into_rendered_collections(
-            primary_spine_steps=primary_spine_steps,
-            stages=stages,
-            terminal_steps=terminal_steps,
-            secrets=_dcsync_secrets,
-            domain=domain,
+        primary_spine_steps, stages, terminal_steps = (
+            _fold_dcsync_into_rendered_collections(
+                primary_spine_steps=primary_spine_steps,
+                stages=stages,
+                terminal_steps=terminal_steps,
+                secrets=_dcsync_secrets,
+                domain=domain,
+            )
         )
     chain_nodes = tuple(
         display_node(str(n), accounts=accounts, domain=domain)
@@ -2492,6 +3164,25 @@ def collect_spine_inputs(
     # own ``generated_at`` printed "Last step executed" for a run where no step
     # executed at all, which is the report's clock presented as the operator's.
     timestamps = [record.get("at") for record in execution.values() if record.get("at")]
+    # The document's own date is the date of the RUN, not of the generation: the
+    # header read one day while every timestamp in the body read the next, which
+    # is the header contradicting the body about when the work happened.
+    _first_display = _timestamp_display(min(timestamps) if timestamps else None)
+    _run_date = _first_display.split(" ", 1)[0] if _first_display else None
+    _run_to_first_cred_seconds, _run_to_compromise_seconds = _scan_run_durations(
+        workspace_path
+    )
+    # The ledger's own three-state answer. An empty ledger is PROOF of a clean
+    # run and is stated as one; an unreadable ledger is a data gap and never
+    # reported as clean.
+    from adscan_internal.services.environment_change_ledger import (  # noqa: PLC0415
+        resolve_environment_changes,
+    )
+
+    _change_record_state = resolve_environment_changes(
+        workspace_dir=str(workspace_path),
+        report_block=technical_report.get("environment_changes"),
+    ).state
     terminal_proven = (
         any(step.outcome == "success" for step in terminal_steps)
         or str(primary.get("status") or "").strip().lower() in _PROVEN_STATUSES
@@ -2547,7 +3238,11 @@ def collect_spine_inputs(
     # author was HANDED: on one target it was recovered by a username-as-password
     # spray, and labelling it "(supplied)" would have credited the box with a
     # gift it never gave. The ledger already knows which it was.
-    credential_rows = _collect_credentials(domain_data)
+    share_rows, share_counts = _collect_shares(domain_dir)
+    share_findings = _collect_share_findings(workspace_path)
+    credential_rows = _collect_credentials(
+        domain_data, chain_steps=chain_steps, share_findings=share_findings
+    )
     start_row = next(
         (
             row
@@ -2580,6 +3275,7 @@ def collect_spine_inputs(
     # The workspace name is what the operator typed, so it carries the target's
     # real capitalisation; the normalized lab name is lower-cased for telemetry
     # and would put a lower-case title on the post.
+    # directory-name-exempt: a LAB name for a post title, not an AD object name.
     title = str(workspace_name or "").strip() or str(lab_name or "").strip().title()
 
     return SpineInputs(
@@ -2601,6 +3297,15 @@ def collect_spine_inputs(
         services=services,
         scan_asset=str(scan_file) if scan_file else None,
         inventory=_inventory_rows(domain_dir, domain_data.get("collection_stats")),
+        executed_paths=_attach_graph_proven_steps(
+            parse_executed_paths(technical_report, domain), primary
+        ),
+        time_to_first_cred_seconds=_run_to_first_cred_seconds,
+        time_to_compromise_seconds=_run_to_compromise_seconds,
+        change_record_state=_change_record_state,
+        run_date=_run_date,
+        chain_accounts=accounts,
+        certificate_authorities=_collect_certificate_authorities(domain_dir),
         ca_name=str(domain_data.get("ca") or "") or None,
         ca_host=str(domain_data.get("adcs_fqdn") or domain_data.get("adcs") or "")
         or None,
@@ -2629,9 +3334,23 @@ def collect_spine_inputs(
             paths, execution, domain=domain, accounts=accounts
         ),
         credentials=credential_rows,
+        shares=share_rows,
+        share_counts=share_counts,
+        share_findings=share_findings,
         changes=_collect_environment_changes(workspace_path, domain=domain),
         flags=_collect_flags(workspace_path),
         tags=_build_tags(chain_steps, lab_provider),
+        engagement_type=(
+            engagement_type
+            if engagement_type is not None
+            else resolve_writeup_engagement_type(workspace_dir=workspace_dir)
+        ),
+        full_credentials_inline=bool(full_credentials_inline),
+        credential_pointers=credential_store_pointers(
+            workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+        ),
     )
 
 
@@ -2778,32 +3497,20 @@ def _render_mermaid(inputs: SpineInputs) -> list[str]:
     pivot and a graph-only (unwalked) hop get a dashed one — so the count of
     solid arrows matches the summary's technique-step headline (spec §2 #13).
 
-    When a connected materialized spine is available (``diagram_hops``) it is
-    drawn — one linear story from the run's real entry node through the
-    ``MemberOf`` pivots to the terminal. Otherwise the raw proven ``chain_steps``
-    are drawn (the theoretical / unmatched-terminal fallback).
+    **The diagram is derived from the SAME step list the body narrates**, which
+    is a correctness property and not a nicety: it was previously built from a
+    separate graph projection, so a step the body printed as succeeded (an
+    executed ADCS ESC8) could be absent from the diagram entirely, and a reader
+    comparing the two had no way to tell which was wrong. With an execution
+    record the edges come from the executed paths themselves, so the diagram
+    cannot omit a step the body claims, by construction.
+
+    When no execution record exists and a connected materialized spine is
+    available (``diagram_hops``) that is drawn — one linear story from the run's
+    real entry node through the ``MemberOf`` pivots to the terminal. Otherwise
+    the raw proven ``chain_steps`` are drawn (the theoretical fallback).
     """
-    # Each edge: (source, target, label, solid, structural).
-    if inputs.diagram_hops:
-        edges: list[tuple[str, str, str, bool, bool]] = [
-            (h.source, h.target, h.label, h.solid, h.structural)
-            for h in inputs.diagram_hops
-            if h.source and h.target
-        ]
-    elif inputs.chain_steps:
-        edges = [
-            (
-                step.source,
-                step.target,
-                step.technique.name,
-                step.outcome == "success",
-                step.is_context,
-            )
-            for step in inputs.chain_steps
-            if step.source and step.target
-        ]
-    else:
-        return []
+    edges = _diagram_edges(inputs)
     if not edges:
         return []
     lines = ["```mermaid", "flowchart TD"]
@@ -2835,6 +3542,92 @@ def _render_mermaid(inputs: SpineInputs) -> list[str]:
     )
     lines.append(caption)
     return lines
+
+
+def _diagram_edges(inputs: SpineInputs) -> list[tuple[str, str, str, bool, bool]]:
+    """Return the diagram's edges as ``(source, target, label, solid, structural)``.
+
+    One definition, consumed by the drawing AND by the completeness line under
+    it, so the sentence can only describe the edges a reader is actually
+    looking at. The two used to come from different places: the line counted a
+    graph projection's proven edges while the diagram drew the executed record,
+    and it claimed four proven edges above a picture holding one dashed arrow.
+
+    Labels go through the humanization SSOT on every branch. The execution
+    record is kept VERBATIM by design (a localized group name is the client's
+    own), so the writeup's casing rules are applied HERE — the branch that
+    skipped them printed a shouting raw UPN into the diagram.
+    """
+    if inputs.execution_record_is_backbone:
+        return [
+            (
+                _diagram_node_label(
+                    step.source, accounts=inputs.chain_accounts, domain=inputs.domain
+                ),
+                _diagram_node_label(
+                    step.target, accounts=inputs.chain_accounts, domain=inputs.domain
+                ),
+                technique_for(step.action).name,
+                step.succeeded,
+                False,
+            )
+            for path in inputs.executed_paths
+            for step in path.steps
+            if step.source and step.target
+        ]
+    edges: list[tuple[str, str, str, bool, bool]]
+    if inputs.diagram_hops:
+        edges = [
+            (h.source, h.target, h.label, h.solid, h.structural)
+            for h in inputs.diagram_hops
+            if h.source and h.target
+        ]
+    elif inputs.chain_steps:
+        edges = [
+            (
+                step.source,
+                step.target,
+                step.technique.name,
+                step.outcome == "success",
+                step.is_context,
+            )
+            for step in inputs.chain_steps
+            if step.source and step.target
+        ]
+    else:
+        return []
+    return edges
+
+
+def _executed_diagram_completeness(inputs: SpineInputs) -> str:
+    """Return the completeness line for a diagram drawn from the execution record.
+
+    Derived from the RENDERED edges, never from a separate tally: every hop
+    above is a step the record holds, so the only honest claim is how many of
+    them were proven.
+    """
+    edges = _diagram_edges(inputs)
+    total = len(edges)
+    if not total:
+        return ""
+    solid = sum(1 for *_ignored, solid, _structural in edges if solid)
+    if solid == total:
+        return (
+            "The hop above was proven in this run."
+            if total == 1
+            else "Every hop above was proven in this run."
+        )
+    if solid == 0:
+        return (
+            "The hop above was not proven: it ran and did not complete."
+            if total == 1
+            else "No hop above was proven: each one ran and did not complete."
+        )
+    verb = "was" if solid == 1 else "were"
+    return (
+        f"{solid} of the {total} hops above {verb} proven; the rest ran and "
+        "did not complete."
+    )
 
 
 def _coverage_line(coverage: tuple[int, int] | None) -> str:
@@ -2922,7 +3715,124 @@ def _attribution_phrase(step: SpineStep) -> str:
     )
 
 
-def _render_step_command_block(catalog_step: dict[str, Any]) -> list[str]:
+@dataclass(frozen=True, slots=True)
+class CommandFill:
+    """The values this document may paste into a by-hand command.
+
+    The attack-step catalog authors its ``manual_command`` with angle tokens
+    (``<user>``, ``<pass>``) because the same string is read by a client whose
+    own credentials must never appear in a deliverable. This document has the
+    opposite constraint: it is a practice-target writeup that prints the whole
+    credential table two sections lower, so leaving the commands unfilled made
+    the page contradict itself and gave the reader nothing to run.
+
+    So the fill happens HERE, at the writeup's own render, never in the catalog,
+    and only when this document already discloses secret values. On a masked
+    engagement the tokens stay exactly as the catalog wrote them.
+    """
+
+    domain: str = ""
+    dc_fqdn: str = ""
+    base_dn: str = ""
+    #: The chain's own entry account, used as the authenticating account for a
+    #: step whose record names no actor (a directory read any authenticated user
+    #: can run).
+    start_principal: str = ""
+    #: Every account the run holds a secret for, lower-cased, to its secret.
+    secrets: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: Recovered secret value to the share file it was read out of, so a command
+    #: that takes a share and a path can name the real ones.
+    findings: dict[str, ShareFileFinding] = dataclasses.field(default_factory=dict)
+
+    def secret_for(self, account: str) -> str:
+        """Return the stored secret for ``account``, or an empty string."""
+        return self.secrets.get(str(account or "").strip().lower(), "")
+
+
+def _base_dn_for(domain: str) -> str:
+    """Return the base DN of ``domain`` (``DC=corp,DC=example``)."""
+    labels = [part for part in str(domain or "").strip().strip(".").split(".") if part]
+    return ",".join(f"DC={label}" for label in labels)
+
+
+def _command_actor(step: SpineStep, fill: CommandFill) -> str:
+    """Return the account the command should authenticate as.
+
+    The step's own recorded actor where the record names one, else the chain's
+    start principal, which is an account the operator genuinely held. NEVER the
+    step's ``source_username``: on a read technique that is the principal the
+    step acted AGAINST, and pairing it with its own recovered password produced
+    a command mixing one account's name with another's secret.
+    """
+    details = (step.catalog_step or {}).get("details")
+    details = details if isinstance(details, dict) else {}
+    for key in ("auth_username", "acting_principal_samaccountname", "user"):
+        value = str(details.get(key) or "").strip()
+        if value:
+            return value
+    return fill.start_principal
+
+
+def _fill_command(command: str, step: SpineStep, fill: CommandFill | None) -> str:
+    """Return ``command`` with the tokens this document can honestly fill.
+
+    Only tokens whose value the workspace RECORDS are replaced, and a secret is
+    only ever taken from the credential ledger for the account it belongs to,
+    never from whatever secret the step's own details happen to carry. A token
+    with no recorded value (``<shadow_drive>``) stays a token: a reader can tell
+    an instruction from a fact, and inventing a plausible value would put a
+    command in a published post that does not work.
+    """
+    if not command or fill is None:
+        return command
+    actor = _command_actor(step, fill)
+    target = _node_account(step.target)
+    target_secret = fill.secret_for(target)
+    finding = fill.findings.get(target_secret) if target_secret else None
+    # ``shell`` marks a token that stands as its own shell word, so a value a
+    # shell would mangle is single-quoted: a real password routinely carries
+    # ``$``, ``!`` or ``*``, and pasting one bare turns the run's own credential
+    # into a variable expansion. A token sitting INSIDE an already-quoted string
+    # (the smbclient ``-c '...'`` argument) cannot take single quotes, so it is
+    # double-quoted, which is what smbclient's own parser wants anyway.
+    tokens: list[tuple[str, str, bool]] = [
+        ("<recovered_user>", target, True),
+        ("<recovered_pass>", target_secret, True),
+        ("<user>", actor, True),
+        ("<pass>", fill.secret_for(actor), True),
+        ("<dc_fqdn>", fill.dc_fqdn, False),
+        ("<baseDN>", fill.base_dn, False),
+        ("<domain>", fill.domain, False),
+        ("<share>", finding.share if finding else "", False),
+        ("<path>", finding.path if finding else "", False),
+    ]
+    for token, value, shell_word in tokens:
+        if not value:
+            continue
+        command = command.replace(token, _quote_command_value(value, shell=shell_word))
+    return command
+
+
+#: Characters a filled value may carry without any quoting. Anything else and
+#: the value is quoted, because the command is meant to be pasted and run.
+_COMMAND_SAFE = re.compile(r"^[A-Za-z0-9._@/:=$-]+$")
+
+
+def _quote_command_value(value: str, *, shell: bool) -> str:
+    """Return ``value`` quoted for the position it is being pasted into."""
+    if shell:
+        if _COMMAND_SAFE.match(value) and "$" not in value:
+            return value
+        return value if "'" in value else f"'{value}'"
+    return f'"{value}"' if " " in value else value
+
+
+def _render_step_command_block(
+    catalog_step: dict[str, Any],
+    *,
+    step: SpineStep | None = None,
+    fill: CommandFill | None = None,
+) -> list[str]:
     """Return the offensive by-hand command for one step, fenced — or nothing.
 
     ``render_step_manual_command`` returns an empty string for a technique the
@@ -2933,6 +3843,8 @@ def _render_step_command_block(catalog_step: dict[str, Any]) -> list[str]:
     command = render_step_manual_command(catalog_step)
     if not command:
         return []
+    if step is not None:
+        command = _fill_command(command, step, fill)
     return ["```text", command, "```", ""]
 
 
@@ -3014,7 +3926,7 @@ def _kerberoast_direct_domain_twist(step: SpineStep) -> str:
     return _KERBEROAST_DA_EQUIVALENT_TWIST
 
 
-def _render_step(step: SpineStep) -> list[str]:
+def _render_step(step: SpineStep, *, fill: CommandFill | None = None) -> list[str]:
     """Return one step as a single dense line plus whatever evidence it carries.
 
     One line per step is the whole point: the technique, the two endpoints, what
@@ -3078,7 +3990,12 @@ def _render_step(step: SpineStep) -> list[str]:
     if step.outcome == "success":
         facts.append(_success_phrase(step))
     elif step.outcome in _DEAD_END_PHRASES:
-        facts.append(_DEAD_END_PHRASES[step.outcome])
+        # Prefer the STRUCTURED reason (hash captured but not cracked, cert issued
+        # but not authenticated with) over the generic dead-end phrase: it tells
+        # the reader WHY the step stopped and that ADscan still executed and holds
+        # the material, instead of a bare "ran, did not complete".
+        reason_note = reason_code_client_note(step.reason_code)
+        facts.append(reason_note or _DEAD_END_PHRASES[step.outcome])
         if step.credential_attribution:
             facts.append(_attribution_phrase(step))
     elif step.credential_attribution:
@@ -3107,7 +4024,12 @@ def _render_step(step: SpineStep) -> list[str]:
             # reads as one continuous account of the grant and the replication it
             # chained — no separate step, terminus stays the domain node.
             paragraph = " ".join(
-                part for part in (narrative.rstrip() if narrative else "", step.narrative_suffix) if part
+                part
+                for part in (
+                    narrative.rstrip() if narrative else "",
+                    step.narrative_suffix,
+                )
+                if part
             ).strip()
             if paragraph:
                 lines.append(paragraph)
@@ -3116,7 +4038,9 @@ def _render_step(step: SpineStep) -> list[str]:
         if twist:
             lines.append(twist)
             lines.append("")
-        lines.extend(_render_step_command_block(step.catalog_step))
+        lines.extend(
+            _render_step_command_block(step.catalog_step, step=step, fill=fill)
+        )
     if step.evidence:
         lines.append("```text")
         lines.extend(f"{label}: {value}" for label, value in step.evidence)
@@ -3149,8 +4073,232 @@ def _summary_step_phrase(step: SpineStep) -> str:
     return step.technique.name.removesuffix(".")
 
 
+def _fastest_domain_compromise(
+    inputs: SpineInputs,
+) -> ExecutedPath | None:
+    """Return the quickest proven path that reached full domain compromise.
+
+    This is the engagement's headline figure and it exists only per path: the
+    fused chain averaged two executions forty-eight minutes apart and could
+    state neither duration, so the fact that an ordinary domain user reached
+    full domain compromise in under three minutes went unsaid.
+    """
+    candidates = [
+        path
+        for path in inputs.executed_paths
+        if path.proven
+        and path.duration_seconds is not None
+        and _path_proved_domain_compromise(path, inputs.domain)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda path: path.duration_seconds or 0.0)
+
+
+def _domain_compromise_proof(inputs: SpineInputs) -> tuple[str, str]:
+    """Return ``(technique, evidence)`` for the step that proved the compromise.
+
+    Both parts are optional and each is read, never inferred: the technique is
+    the last proven step of the path the record attributes the compromise to,
+    and the evidence is the promotion value the run recorded. Empty strings
+    when the record names neither, so the headline states the compromise
+    without attributing it to a technique nobody can point at.
+    """
+    technique = ""
+    evidence = ""
+    for path in inputs.executed_paths:
+        if not _path_proved_domain_compromise(path, inputs.domain):
+            continue
+        evidence = evidence or str(path.domain_compromise_evidence or "")
+        if not technique and path.succeeded_steps:
+            technique = technique_for(path.succeeded_steps[-1].action).name
+    return technique, evidence
+
+
+def _run_duration_sentence(inputs: SpineInputs) -> str:
+    """Return the run's own two elapsed figures, or ``""``.
+
+    An ordinary domain user going from no credentials at all to domain control
+    in a minute and a half is the strongest fact the run produced, and it was
+    in ``scan_summary.json`` and nowhere in the document. Stated as elapsed RUN
+    time, explicitly, so it does not read as a second claim about the per-path
+    window printed under each path.
+    """
+    first = format_duration(inputs.time_to_first_cred_seconds)
+    compromise = format_duration(inputs.time_to_compromise_seconds)
+    if compromise and first:
+        return (
+            f"Measured from the start of the run, the first credential came "
+            f"back after {first} and full domain control after {compromise}."
+        )
+    if compromise:
+        return (
+            f"Measured from the start of the run, full domain control came "
+            f"after {compromise}."
+        )
+    if first:
+        return (
+            f"Measured from the start of the run, the first credential came "
+            f"back after {first}."
+        )
+    return ""
+
+
+def _render_non_execution_disclosure(inputs: SpineInputs) -> list[str]:
+    """Return the one honest line about what did NOT run, and why.
+
+    The document carried no ``attempted``, no safety-withheld and no
+    closed-by-configuration disclosure at all, which reads as though every
+    technique ADscan has was either proven or irrelevant. Stating the absence
+    is what makes the proven set mean something. Exposure-Validation: a step
+    that ran and did not finish is reported neutrally, and a step ADscan
+    refused is attributed to ADscan's own safety policy, never to a control in
+    the client's environment.
+    """
+    attempted = list(inputs.unproven_recorded_steps)
+    withheld = [
+        route
+        for route in inputs.alt_routes
+        if str(route.status or "").strip().lower() == "blocked"
+    ]
+    closed = [
+        route
+        for route in inputs.alt_routes
+        if str(route.status or "").strip().lower() == "closed_by_configuration"
+    ]
+    sentences: list[str] = []
+    if attempted:
+        names = _join_names(
+            tuple(dict.fromkeys(technique_for(step.action).name for step in attempted))
+        )
+        opening = (
+            f"{_count_phrase(len(attempted), 'step')} ran and did not complete "
+            f"({names})"
+        )
+        # The cause, from the record, verbatim. The line used to assert that the
+        # record holds where a step stopped and not why, which was false: the
+        # executor writes its own reason onto the step event, and on a lab VPN
+        # that reason is the operator lesson of the run (a DCSync needs the
+        # DRSUAPI dynamic RPC range, and a filtered range makes the technique
+        # impossible from that vantage while the replication rights still stand).
+        causes = "; ".join(
+            dict.fromkeys(step.reason for step in attempted if step.reason)
+        )
+        if causes:
+            sentences.append(f"{opening}: {causes}.")
+        else:
+            sentences.append(
+                f"{opening}; the record holds where each stopped and no cause."
+            )
+    else:
+        sentences.append("No step ran and failed in this run.")
+    if withheld:
+        names = _join_names(
+            tuple(
+                dict.fromkeys(
+                    route.techniques[0] for route in withheld if route.techniques
+                )
+            )
+        )
+        subject = f" ({names})" if names else ""
+        sentences.append(
+            f"{_count_phrase(len(withheld), 'route')} was not executed because "
+            f"ADscan withholds steps that would disrupt production{subject}; "
+            "that is ADscan's own decision, not a control in the environment."
+        )
+    if closed:
+        sentences.append(
+            f"{_count_phrase(len(closed), 'route')} is closed by configuration "
+            "ADscan observed on the target."
+        )
+    # This is a paragraph of its own, and ``_count_phrase`` opens it with a
+    # lower-case "one step": a paragraph starting mid-sentence reads as a
+    # broken render whatever it says.
+    paragraph = " ".join(sentences)
+    return [paragraph[:1].upper() + paragraph[1:] if paragraph else ""]
+
+
+def _render_executed_summary(inputs: SpineInputs) -> list[str]:
+    """Return the summary for a run with an execution record.
+
+    Every clause traces to the record: how many paths were walked, how far each
+    got, and the fastest proven route to full domain compromise with its real
+    duration. No synthesis, so no claim a timestamp can refute.
+    """
+    paths = inputs.executed_paths
+    proven = [path for path in paths if path.proven]
+    lines: list[str] = []
+    # The headline fact leads, and it is the SSOT's, not this section's own
+    # tally: the per-path replay counts the paths the step executor walked end
+    # to end, which is a different question from whether the domain fell. A
+    # document that opened "none of them end to end" and asserted a reached
+    # compromise eighty lines later was holding both halves and assembling them
+    # wrong — the shape is unambiguous and it is the better story.
+    if inputs.domain_compromise_proven or inputs.terminal_compromise_proven:
+        technique, evidence = _domain_compromise_proof(inputs)
+        verdict = f"`{inputs.domain}` fell: ADscan proved full domain compromise"
+        if technique:
+            verdict += f" through **{technique}**"
+        if evidence:
+            verdict += f", recorded as `{evidence}`"
+        lines.append(f"{verdict}.")
+    record = f"The run walked {_count_phrase(len(paths), 'attack path')}"
+    if proven and len(proven) == len(paths):
+        record += ", every one of them end to end."
+    elif proven:
+        record += f", {len(proven)} of them end to end."
+    else:
+        record += ", none of them end to end under its own step executor."
+    lines.append(record)
+
+    fastest = _fastest_domain_compromise(inputs)
+    if fastest is not None:
+        source = (
+            display_node(
+                fastest.source,
+                accounts=inputs.chain_accounts,
+                domain=inputs.domain,
+            )
+            or "an unnamed principal"
+        )
+        lines.append(
+            f"The fastest went from `{source}` to full domain compromise in "
+            f"{fastest.duration_display} of its own wall clock."
+        )
+    run_durations = _run_duration_sentence(inputs)
+    if run_durations:
+        lines.append(run_durations)
+    paragraph = " ".join(lines)
+    return [paragraph, "", *_render_non_execution_disclosure(inputs)]
+
+
 def _render_summary(inputs: SpineInputs) -> list[str]:
-    """Return the ``## Summary`` section, drafted from the executed chain.
+    """Return the ``## Summary`` section.
+
+    Two shapes, one per spine (see ``execution_record_is_backbone``), and never
+    both: a document that stated a reached compromise, "none of them end to end"
+    and "confirming domain compromise" in three places was holding one run's
+    facts and assembling them as a contradiction.
+    """
+    body = _render_chain_summary(inputs)
+    attempts = _render_recorded_attempt_note(inputs)
+    return [*body, *attempts] if attempts else body
+
+
+def _render_recorded_attempt_note(inputs: SpineInputs) -> list[str]:
+    """Return the attempts paragraph for a document whose spine is the chain.
+
+    The record still has to be disclosed when it is not the spine: what ran and
+    did not complete, with the cause it recorded. Subordinate to the proven
+    chain, one paragraph, after it.
+    """
+    if inputs.execution_record_is_backbone or not inputs.unproven_recorded_steps:
+        return []
+    return ["", *_render_non_execution_disclosure(inputs)]
+
+
+def _render_chain_summary(inputs: SpineInputs) -> list[str]:
+    """Return the summary drafted from the executed chain.
 
     One deterministic paragraph, built from facts the workspace already proved
     rather than a placeholder waiting on the author: the target, the proven
@@ -3174,8 +4322,17 @@ def _render_summary(inputs: SpineInputs) -> list[str]:
     # draws), narrate THAT as the linear kill-chain — never the raw chain_steps,
     # which _order_proven_edges may have linearized a disconnected standalone
     # proof into. The off-spine proofs are disclosed in a separate sentence.
+    # An execution record is the better summary when it is the fuller account of
+    # what the run proved: it counts the paths the run WALKED, states the fastest
+    # one's real duration, and cannot fuse two executions into a claim their own
+    # timestamps refute. When the graph proved more than the log recorded, the
+    # chain below is the account (see ``execution_record_is_backbone``).
+    if inputs.execution_record_is_backbone:
+        return _render_executed_summary(inputs)
     if inputs.primary_spine_steps:
-        teaching_steps = _collapse_multi_source_read_steps(list(inputs.primary_spine_steps))
+        teaching_steps = _collapse_multi_source_read_steps(
+            list(inputs.primary_spine_steps)
+        )
     else:
         teaching_steps = _collapse_multi_source_read_steps(list(inputs.chain_steps))
     proven_steps = [
@@ -3191,7 +4348,7 @@ def _render_summary(inputs: SpineInputs) -> list[str]:
         step_count = _count_phrase(len(discovered_steps), "step")
         return [
             f"`{inputs.domain}`: the graph found a route in {step_count}: "
-            f"{chain}. Structurally proven, not executed this run."
+            f"{chain}. Identified by configuration analysis, not executed this run."
         ]
     chain = " → ".join(_summary_step_phrase(step) for step in proven_steps)
     step_count = _count_phrase(len(proven_steps), "step")
@@ -3252,7 +4409,11 @@ def _render_other_proven_note(inputs: SpineInputs) -> list[str]:
     if not others:
         return []
     phrases = "; ".join(_summary_step_phrase(step) for step in others)
-    count_word = "one standalone finding" if len(others) == 1 else f"{len(others)} standalone findings"
+    count_word = (
+        "one standalone finding"
+        if len(others) == 1
+        else f"{len(others)} standalone findings"
+    )
     return [
         "",
         f"ADscan also proved {count_word} not on this chain: {phrases}.",
@@ -3271,7 +4432,9 @@ def _domain_compromise_events(
     So read the technical_report provenance first, falling back to ``domain_data``
     for the live-session path where both are populated.
     """
-    domains = technical_report.get("domains") if isinstance(technical_report, dict) else None
+    domains = (
+        technical_report.get("domains") if isinstance(technical_report, dict) else None
+    )
     payload = domains.get(domain) if isinstance(domains, dict) else None
     events = payload.get("events") if isinstance(payload, dict) else None
     if isinstance(events, list):
@@ -3385,46 +4548,99 @@ def _render_frontmatter(inputs: SpineInputs, *, today: str) -> list[str]:
 
     ``draft`` and ``published`` are not decoration: Hugo skips a draft and
     Jekyll skips ``published: false``, so a spine dropped into a site
-    repository does not go live because someone forgot.
+    repository does not go live because someone forgot. Those keys, the blog
+    taxonomy (``tags``, ``os``) and the lab ``platform`` are PUBLICATION
+    metadata, so an engagement record drops the lot and records the engagement
+    instead: a client's directory is never going near a site repository, and
+    carrying a draft switch for it reads as a blog post somebody forgot to
+    finish.
     """
     lines = [
         "---",
         f'title: "{inputs.title}"',
-        f"date: {today}",
-        "draft: true",
-        "published: false",
+        # The run's date when the run recorded one, the generation date only as
+        # the fallback: a header dated the day before every timestamp in the
+        # body is the document disagreeing with itself about when it happened.
+        f"date: {inputs.run_date or today}",
     ]
-    if inputs.tags:
-        rendered = ", ".join(f'"{t}"' for t in inputs.tags)
-        lines.append(f"tags: [{rendered}]")
-    if inputs.platform:
-        lines.append(f'platform: "{inputs.platform}"')
-    lines.append(f'target: "{inputs.domain}"')
-    if inputs.operating_system:
-        lines.append(f'os: "{inputs.operating_system}"')
+    if inputs.publication_framed:
+        lines.append("draft: true")
+        lines.append("published: false")
+        if inputs.tags:
+            rendered = ", ".join(f'"{t}"' for t in inputs.tags)
+            lines.append(f"tags: [{rendered}]")
+        if inputs.platform:
+            lines.append(f'platform: "{inputs.platform}"')
+        lines.append(f'target: "{inputs.domain}"')
+        if inputs.operating_system:
+            lines.append(f'os: "{inputs.operating_system}"')
+    else:
+        lines.append(f'target: "{inputs.domain}"')
+        lines.append(f"engagement: {inputs.engagement_type}")
     lines.append("---")
     return lines
 
 
-def _render_header_note() -> list[str]:
-    """Return the one comment block explaining what this file is."""
-    return [
+def _render_header_note(inputs: SpineInputs) -> list[str]:
+    """Return the one comment block explaining what this file is.
+
+    The second paragraph differs by engagement because it answers a different
+    question. For a practice target the open question is when the solution may
+    be published; for a client engagement there is no such question, and the
+    thing worth stating is that the file describes a named environment.
+    """
+    lines = [
         "<!--",
         "  Evidence spine generated by ADscan from the scan workspace. Everything",
         "  below is mechanical: what answered, what the directory held, which steps",
         "  ran and what came back.",
         "",
-        "  Solutions to a practice target are normally publishable only once the",
-        "  target has retired; confirming that, and clearing `draft: true`, is the",
-        "  author's call.",
-        "-->",
+        f"  {CLOCK_FRAME_NOTE}",
+        "",
     ]
+    if inputs.publication_framed:
+        lines.extend(
+            [
+                "  Solutions to a practice target are normally publishable only once the",
+                "  target has retired; confirming that, and clearing `draft: true`, is the",
+                "  author's call.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "  This file is the record of an engagement against a named environment,",
+                "  so it carries that engagement's handling terms.",
+            ]
+        )
+    lines.append("-->")
+    return lines
 
+
+#: One frame, stated once. Every clock in the document is rendered through
+#: ``_as_utc``, including the generation stamp, so a reader never has to work
+#: out whether a time in the body and a time in the frontmatter are comparable.
+#:
+#: What the note may NOT say is that those hours are real UTC. ADscan steps the
+#: host clock to the domain controller mid-scan for Kerberos, so a stamp written
+#: after that point carries the DC's reading under a UTC suffix, and on a DC
+#: whose own clock drifts the two are hours apart. That is the right frame to
+#: correlate against the domain's logs and the wrong one to compare with this
+#: file's generation time, so the note says which comparison to make instead of
+#: asserting a frame the scan cannot guarantee. Same class as the containment
+#: window in :mod:`~adscan_internal.services.post_compromise_obligations`,
+#: which names the clock behind the instant it prints.
+CLOCK_FRAME_NOTE = (
+    "Every time in this file comes from the clock the scan was running on, which "
+    "ADscan synchronises with the domain controller where it can. Correlate them "
+    "against the domain's own logs rather than against this file's generation time."
+)
 
 #: The accountability line every spine carries near the top: what the reader
 #: is holding was not written by a person filling in gaps, it was generated
 #: from the same graph the tool used to run the attack — and every claim in
-#: it is tagged with how it was proven (executed, structurally proven, not
+#: it is tagged with how it was proven (executed, identified by configuration
+#: analysis, not
 #: executed) rather than asserted flat.
 PROVENANCE_NOTE = (
     "This writeup was generated deterministically from an executed, verified "
@@ -3463,6 +4679,14 @@ def _render_target_table(inputs: SpineInputs) -> list[str]:
         start = f"`{inputs.start_principal}`"
         if inputs.start_principal_note:
             start += f" ({inputs.start_principal_note})"
+    # With an execution record, each path states its OWN real start principal,
+    # and this synthesized row has nothing true left to say: it was derived from
+    # the FUSED chain, so on a run that recovered Administrator by DCSync it
+    # read "administrator (via DCSync)" — circular, and to a client it claims
+    # the tester was handed domain admin. The row survives only where it is
+    # genuinely the premise of the document: no per-path replay to read it from.
+    if inputs.execution_record_is_backbone:
+        start = ""
     start_label = (
         "Starting access" if inputs.started_unauthenticated else "Starting credential"
     )
@@ -3472,38 +4696,228 @@ def _render_target_table(inputs: SpineInputs) -> list[str]:
         ("Operating system", inputs.operating_system or ""),
         ("Platform", inputs.platform or ""),
         (start_label, start),
-        ("First step executed", inputs.first_seen or ""),
-        ("Last step executed", inputs.last_seen or ""),
+        ("First step executed (UTC)", inputs.first_seen or ""),
+        ("Last step executed (UTC)", inputs.last_seen or ""),
     ]
     lines = ["| | |", "|---|---|"]
     lines.extend(f"| {label} | {value} |" for label, value in rows if value)
     return lines
 
 
-def _render_recon(inputs: SpineInputs, *, asset_link: str | None) -> list[str]:
-    """Return the recon section: what answered, per host.
+#: Technique names whose target IS a certificate authority. Used only to mark
+#: which enumerated CA a step acted against, never to classify the step.
+_ADCS_ACTION_PREFIXES = ("adcsesc", "esc", "certifried", "certighost")
 
-    Suppressed entirely when the workspace holds no port-scan output — an empty
-    section whose only content is "no output" is a confession of absence that
-    reads as a rendering failure, not a finding. The section simply does not
-    appear (an assume-breach or LDAP-only run has nothing to show here).
+
+def _adcs_step_targets(inputs: SpineInputs) -> set[str]:
+    """Return the upper-cased targets of every executed ADCS step."""
+    targets: set[str] = set()
+    for path in inputs.executed_paths:
+        for step in path.steps:
+            folded = str(step.action or "").strip().lower().replace("_", "")
+            if folded.startswith(_ADCS_ACTION_PREFIXES):
+                target = str(step.target or "").strip().upper()
+                if target:
+                    targets.add(target)
+    return targets
+
+
+def _render_certificate_authorities(inputs: SpineInputs) -> list[str]:
+    """Return every enumerated certificate authority, with its host.
+
+    One CA used to be named here (``domain_data["ca"]``, whichever the
+    collector recorded first) while an ADCS step acted against a different one
+    and the cleanup commands targeted that other one. On a directory carrying
+    four issuing CAs that is a misattribution a reader cannot detect, so the
+    full set is listed, each with its host, and the one a step acted against is
+    marked. Two CAs sharing a host is itself worth seeing and is never folded.
+    """
+    authorities = inputs.certificate_authorities
+    if not authorities:
+        # Older workspaces carry only the single collector field. Honour it
+        # rather than losing the fact entirely.
+        if inputs.ca_name:
+            host = f" on `{inputs.ca_host}`" if inputs.ca_host else ""
+            return [f"Certificate authority: `{inputs.ca_name}`{host}.", ""]
+        return []
+    acted = _adcs_step_targets(inputs)
+    count = len(authorities)
+    noun = "authority" if count == 1 else "authorities"
+    lines = [
+        "### Certificate authorities",
+        "",
+        f"The directory carries {count} certificate {noun}.",
+        "",
+        "| Authority | Host | |",
+        "|---|---|---|",
+    ]
+    for name, host in authorities:
+        display = str(name or "").split("@", 1)[0].strip() or str(name or "")
+        marker = (
+            "acted against by an executed step"
+            if str(name or "").strip().upper() in acted
+            else ""
+        )
+        lines.append(f"| `{display}` | `{host}` | {marker} |")
+    lines.append("")
+    return lines
+
+
+def _service_class(row: ServiceRow) -> str:
+    """Return the service label a recon summary groups on."""
+    service = str(row.service or "").strip().lower()
+    return service or f"port {row.port}"
+
+
+def _render_recon_summary(inputs: SpineInputs, *, asset_link: str | None) -> list[str]:
+    """Return the recon section as a summary table.
+
+    It used to print one ``###`` heading and one fenced block PER HOST: on a
+    real engagement that was 249 headings of per-IP port lists, which buried
+    the hundred-line narrative at roughly the document's midpoint. A reader
+    needs the shape of what answered, and the hosts that carry the story; the
+    rest is a count with the raw file one click away.
     """
     if not inputs.services:
         return []
-    lines = ["## Recon", ""]
-    by_host: dict[str, list[ServiceRow]] = {}
+    hosts = {row.host for row in inputs.services if row.host}
+    by_service: dict[str, set[str]] = {}
     for row in inputs.services:
-        by_host.setdefault(row.host, []).append(row)
-    for host, rows in by_host.items():
-        lines.append(f"### {host}")
+        if not row.host:
+            continue
+        by_service.setdefault(_service_class(row), set()).add(row.host)
+
+    host_count = len(hosts)
+    noun = "host" if host_count == 1 else "hosts"
+    lines = [
+        "## Recon",
+        "",
+        f"{host_count} {noun} answered.",
+        "",
+        "| Service | Hosts |",
+        "|---|---|",
+    ]
+    for service in sorted(by_service, key=lambda s: (-len(by_service[s]), s)):
+        lines.append(f"| {service} | {len(by_service[service])} |")
+    lines.append("")
+
+    # Only the hosts that appear in a chain earn a name. Everything else is
+    # already counted above, and naming it is what buried the narrative.
+    named = _hosts_in_the_story(inputs, hosts)
+    if named:
+        lines.append("Hosts that appear in a chain below:")
         lines.append("")
-        lines.append("```text")
-        for row in rows:
-            lines.append(f"{row.port + '/' + row.protocol:<10} open   {row.service}")
-        lines.append("```")
+        for host in named:
+            services = sorted(
+                _service_class(row) for row in inputs.services if row.host == host
+            )
+            lines.append(f"- `{host}`: {', '.join(dict.fromkeys(services))}")
         lines.append("")
     if asset_link:
         lines.append(f"Full scan output: [{asset_link}]({asset_link})")
+        lines.append("")
+    return lines
+
+
+def _hosts_in_the_story(inputs: SpineInputs, hosts: set[str]) -> list[str]:
+    """Return the scanned hosts that an executed step or the chain touches."""
+    touched: list[str] = []
+    candidates: list[str] = []
+    for path in inputs.executed_paths:
+        for step in path.steps:
+            candidates.extend([step.source, step.target])
+    for step in inputs.chain_steps:
+        candidates.extend([step.source, step.target])
+    if inputs.dc_ip:
+        candidates.append(inputs.dc_ip)
+    for candidate in candidates:
+        token = str(candidate or "").strip()
+        if token in hosts and token not in touched:
+            touched.append(token)
+    return touched
+
+
+def _render_shares(inputs: SpineInputs) -> list[str]:
+    """Return the share inventory and whatever the content scan read out of it.
+
+    The share probe's record never reached this document, so a chain that turned
+    on a password sitting in a deployment script opened with the password and no
+    account of the share it came from. That is the first thing a reader
+    reproduces and the first thing an author forgets, and it is already on the
+    workspace.
+
+    The line that carried the credential is printed only where this document
+    prints secret values at all: on a masked engagement the file and the line
+    number locate the finding and the value stays in the workspace register.
+    """
+    if not inputs.shares:
+        return []
+    lines = ["### Shares", ""]
+    if inputs.share_counts:
+        total, readable, writable = inputs.share_counts
+        headline = f"{_count_phrase(total, 'share')} answered"
+        headline += f", {readable} readable with the run's credential"
+        if writable:
+            headline += f", {writable} writable"
+        lines.append(f"{headline}.")
+        lines.append("")
+    lines.append("| Share | Type | Access | Read granted to |")
+    lines.append("|---|---|---|---|")
+    for share in inputs.shares:
+        access = "readable" if share.accessible else "access denied"
+        readers = ", ".join(share.broad_readers) if share.broad_readers else ""
+        remark = f" ({share.remark})" if share.remark else ""
+        lines.append(
+            f"| `{share.name}`{remark} | {share.kind} | {access} | {readers} |"
+        )
+    lines.append("")
+    lines.extend(_render_share_findings(inputs))
+    return lines
+
+
+def _render_share_findings(inputs: SpineInputs) -> list[str]:
+    """Return what the share-content scan read, confirmed hits separated out.
+
+    The scan runs at full recall by design, so its hits are a mix: a password
+    that turned out to work, and an English sentence containing the word
+    "password". Both are in the record and the discriminator is already there,
+    because a hit whose value is a credential the run went on to USE is
+    confirmed and the rest are candidates. Listing all of them flat would
+    present a line of onboarding prose as a finding; dropping the rest would
+    hide the recall. So the confirmed ones are named with their line, and the
+    remainder is one sentence naming the files it came from.
+    """
+    if not inputs.share_findings:
+        return []
+    recovered = {row.value for row in inputs.credentials if row.value}
+    confirmed = [f for f in inputs.share_findings if f.value in recovered]
+    candidates = [f for f in inputs.share_findings if f.value not in recovered]
+    show_values = inputs.credential_disclosure == DISCLOSURE_INLINE_FULL
+    lines: list[str] = []
+    if confirmed:
+        files = len({f"{f.share}/{f.path}" for f in confirmed})
+        lines.append(
+            f"{_count_phrase(len(confirmed), 'working credential')} came out of "
+            f"the share content, in {_count_phrase(files, 'file')}:"
+        )
+        lines.append("")
+        for finding in confirmed:
+            where = f"`{finding.share}/{finding.path}`"
+            if finding.line:
+                where += f" line {finding.line}"
+            if show_values and finding.context:
+                lines.append(f"- {where}: `{finding.context}`")
+            else:
+                lines.append(f"- {where}")
+        lines.append("")
+    if candidates:
+        files = _join_names(
+            sorted({f"{f.share}/{f.path}" for f in candidates}),
+        )
+        lines.append(
+            f"The scan also flagged {_count_phrase(len(candidates), 'line')} in "
+            f"{files} that did not resolve to a working credential."
+        )
         lines.append("")
     return lines
 
@@ -3516,17 +4930,25 @@ def _render_enumeration(inputs: SpineInputs) -> list[str]:
         lines.append("|---|---|")
         lines.extend(f"| {label} | {value} |" for label, value in inputs.inventory)
         lines.append("")
-    if inputs.ca_name:
-        host = f" on `{inputs.ca_host}`" if inputs.ca_host else ""
-        lines.append(f"Certificate authority: `{inputs.ca_name}`{host}.")
-        lines.append("")
+    lines.extend(_render_certificate_authorities(inputs))
+    lines.extend(_render_shares(inputs))
     diagram = _render_mermaid(inputs)
     if diagram:
         lines.append("### The chain")
         lines.append("")
         lines.extend(diagram)
         lines.append("")
-        coverage = _coverage_line(inputs.chain_coverage)
+        # When the record is the spine the diagram IS the record, so the line
+        # comes from the rendered edges; the graph-projection tally belongs to
+        # the graph-projection diagram and describes nothing a reader can see
+        # here. The record's wording ("the rest ran and did not complete") is
+        # also only true of record edges: a structural membership pivot never
+        # ran, so it must not be counted as a hop that failed.
+        coverage = (
+            _executed_diagram_completeness(inputs)
+            if inputs.execution_record_is_backbone
+            else _coverage_line(inputs.chain_coverage)
+        )
         if coverage:
             lines.append(coverage)
             lines.append("")
@@ -3613,9 +5035,21 @@ def _render_route_map(inputs: SpineInputs) -> list[str]:
     lines = ["### Other routes in the graph", ""]
     lines.append(
         "Every other route ADscan's graph carried to a comparable target, and "
-        "how far each one was verified, not just the one chain above."
+        "how far each one was verified, not just the ones walked above."
     )
     lines.append("")
+    if inputs.execution_record_is_backbone:
+        # The status on each route below is the attack GRAPH's own grade, and a
+        # graph grade can outlive the run that earned it. The execution record
+        # is what this document asserts, so the reader is told which section is
+        # authoritative rather than left to reconcile two "executed" claims.
+        count = _count_phrase(len(inputs.executed_paths), "path")
+        lines.append(
+            f"The status on each route is the attack graph's own grade. What "
+            f"THIS run executed is the {count} above, each with its own "
+            f"timestamps."
+        )
+        lines.append("")
     # Collapse near-identical routes that share a technique ROOT into ONE
     # root-cause family line (mirrors the client report's family grouping): a
     # long list of routes all beginning with the same two techniques reads as
@@ -3640,8 +5074,18 @@ def _render_route_map(inputs: SpineInputs) -> list[str]:
     return lines
 
 
-def _render_stage(stage: SpineStage, *, index: int) -> list[str]:
+def _render_stage(
+    stage: SpineStage,
+    *,
+    index: int,
+    disclosure: str = DISCLOSURE_INLINE_FULL,
+    fill: CommandFill | None = None,
+) -> list[str]:
     """Return one identity stage: heading, steps, then the recovered secret.
+
+    The stage line is the OTHER place a recovered secret reaches this document,
+    so it obeys the same disclosure policy as the ledger. Masking only the
+    ledger would have left the same cleartext password four sections higher up.
 
     No stage-level "how you found this and why it worked" placeholder: the
     catalog's causal narrative is already rendered per step by
@@ -3652,19 +5096,242 @@ def _render_stage(stage: SpineStage, *, index: int) -> list[str]:
     """
     lines = [f"## {stage.heading}", ""]
     for step in stage.steps:
-        lines.extend(_render_step(step))
+        lines.extend(_render_step(step, fill=fill))
     kind = secret_kind_label(stage.secret_kind or "") or "credential"
+    if disclosure == DISCLOSURE_MASKED_EXEMPLARS:
+        shape = mask_secret_to_shape(stage.secret_value)
+        secret = f"{kind} withheld, {shape}" if shape else f"{kind} withheld"
+    else:
+        secret = f"{kind} `{stage.secret_value}`"
     if stage.credential_origin and stage.secret_value:
         lines.append(
-            f"`{stage.principal}` → {kind} `{stage.secret_value}` "
+            f"`{stage.principal}` → {secret} "
             f"(recovered via {credential_origin_label(stage.credential_origin)})."
         )
         lines.append("")
     elif stage.has_stored_secret and stage.secret_value:
-        lines.append(f"`{stage.principal}` → {kind} `{stage.secret_value}`.")
+        lines.append(f"`{stage.principal}` → {secret}.")
         lines.append("")
-    lines.append(f"<!-- screenshot: {ASSETS_DIRNAME}/{index:02d}-{stage.slug}.png -->")
+    return lines
+
+
+# ── The executed-path narrative (replayed, never synthesized) ───────────────
+
+#: How a non-success outcome is said on the page. Exposure-Validation: a step
+#: that ran and did not finish is NEUTRAL ("did not complete"), never a claim
+#: that a defensive control stopped it.
+_EXECUTED_STEP_VERBS: dict[str, str] = {
+    "blocked": "was not executed",
+    "failed": "did not complete",
+    "error": "did not complete",
+}
+
+
+def _clock(timestamp: str | None) -> str:
+    """Return ``HH:MM:SS`` for an ISO stamp, or ``""``.
+
+    Seconds are kept deliberately: the executions this document has to keep
+    apart were twelve seconds apart inside one path, and a minute-resolution
+    stamp hides that.
+    """
+    parsed = _as_utc(timestamp)
+    return parsed.strftime("%H:%M:%S") if parsed is not None else ""
+
+
+def _actor_provenance_clause(
+    step: ExecutedStep,
+    previous: tuple[ExecutedStep, ...],
+) -> str:
+    """Return how THIS path produced the material this step authenticated with.
+
+    Two executions of the same right are not the same evidence, and the
+    difference is the interesting part: one runs on a credential an earlier
+    step of the same path recovered, the other on a machine identity the run
+    already controlled. Derived from the record only, so a step whose source no
+    earlier step produced gets no clause rather than an invented one.
+    """
+    source = str(step.source or "").strip().upper()
+    for index, earlier in enumerate(previous, start=1):
+        if not earlier.succeeded or not source:
+            continue
+        if str(earlier.target or "").strip().upper() != source:
+            continue
+        name = resolve_technique_name(earlier.action) or earlier.action
+        return f"with what step {index} ({name}) recovered"
+    if str(step.actor or "").strip().endswith("$"):
+        return "with a machine account this run already controlled"
+    return ""
+
+
+def _render_executed_step(
+    step: ExecutedStep,
+    previous: tuple[ExecutedStep, ...],
+    *,
+    accounts: frozenset[str],
+    domain: str,
+) -> list[str]:
+    """Return one step bullet, stating only what the record holds."""
+    technique = technique_for(step.action)
+    stamp = _clock(step.at)
+    lead = f"- `{stamp}` " if stamp else "- "
+    verb = (
+        "succeeded"
+        if step.succeeded
+        else _EXECUTED_STEP_VERBS.get(step.outcome, "did not complete")
+    )
+    source = display_node(step.source, accounts=accounts, domain=domain)
+    target = display_node(step.target, accounts=accounts, domain=domain)
+    actor = (
+        display_node(step.actor, accounts=accounts, domain=domain) if step.actor else ""
+    )
+
+    sentence = f"{lead}**{technique.name}** {verb}"
+    if actor:
+        sentence += f" as `{actor}`"
+    provenance = _actor_provenance_clause(step, previous)
+    if provenance:
+        sentence += f" {provenance}"
+    if source and target:
+        sentence += f", from `{source}` against `{target}`"
+    elif target:
+        sentence += f", against `{target}`"
+    sentence += "."
+    lines = [sentence]
+    if step.proof_source == PROOF_SOURCE_GRAPH_EDGE:
+        # This step emitted no event of its own, so saying "no timestamp" would
+        # describe the gap and not where the proof came from.
+        lines.append(
+            "  Proven by the attack graph's own record of this edge; the step "
+            "event log holds no event for it, so it carries no clock."
+        )
+    elif not stamp:
+        # Every sibling carries a clock, so an absent one is STATED rather than
+        # left as a dangling separator a reader takes for a broken render.
+        lines.append("  The execution record carries no timestamp for this step.")
+    return lines
+
+
+def _executed_path_reaches_domain(path: ExecutedPath, domain: str) -> bool:
+    """Whether this path's terminal IS the domain object itself."""
+    target = str(path.target or "").strip().rstrip(".").upper()
+    return bool(target) and target == str(domain or "").strip().rstrip(".").upper()
+
+
+def _executed_path_headline(
+    path: ExecutedPath, *, accounts: frozenset[str], domain: str
+) -> str:
+    """Return the one-line claim for a path, carrying its real duration.
+
+    The duration is the strongest figure a validated route produces, and the
+    fused chain had no way to state it: an ordinary domain user reaching full
+    domain compromise in under three minutes is a headline, and it exists only
+    per path.
+    """
+    source = (
+        display_node(path.source, accounts=accounts, domain=domain)
+        or "an unnamed principal"
+    )
+    target = display_node(path.target, accounts=accounts, domain=domain) or domain
+    # Only the path that actually proved a step may claim the compromise. A
+    # path whose single step did not complete is titled for what it did: it ran
+    # against the terminal and got nowhere.
+    if _path_proved_domain_compromise(path, domain):
+        headline = f"`{source}` to full domain compromise"
+    elif path.succeeded_steps:
+        headline = f"`{source}` to `{target}`"
+    else:
+        headline = f"`{source}` against `{target}`, no step completed"
+    duration = path.duration_display
+    if duration and path.proven:
+        headline += f" in {duration}"
+    return headline
+
+
+def _render_executed_path(
+    path: ExecutedPath,
+    *,
+    index: int,
+    accounts: frozenset[str],
+    domain: str,
+) -> list[str]:
+    """Return one path's section: its own order, its own clock, its own outcome.
+
+    Nothing here is shared with another path, which is the entire point: the
+    narrative this replaces fused two executions forty-eight minutes apart into
+    one causal story whose own printed timestamps contradicted the claim.
+    """
+    headline = _executed_path_headline(path, accounts=accounts, domain=domain)
+    lines = [f"## Executed path {index}: {headline}", ""]
+
+    started = _clock(path.started_at)
+    finished = _clock(path.completed_at)
+    facts: list[str] = []
+    if started and finished:
+        facts.append(f"Ran {started} to {finished}")
+    elif started:
+        facts.append(f"Started {started}")
+    duration = path.duration_display
+    if duration:
+        facts.append(f"took {duration}")
+    if path.steps:
+        noun = "step" if len(path.steps) == 1 else "steps"
+        proven = len(path.succeeded_steps)
+        if proven == len(path.steps):
+            every = "proven" if len(path.steps) == 1 else "all of them proven"
+            facts.append(f"{len(path.steps)} {noun}, {every}")
+        else:
+            facts.append(f"{len(path.steps)} {noun}, {proven} proven")
+    if facts:
+        lines.append(f"{'; '.join(facts)}.")
+        lines.append("")
+    if not path.completed:
+        lines.append(
+            "The execution record does not close this path, so it is written "
+            "as far as it ran and no further."
+        )
+        lines.append("")
+    for position, step in enumerate(path.steps, start=1):
+        lines.extend(
+            _render_executed_step(
+                step,
+                path.steps[: position - 1],
+                accounts=accounts,
+                domain=domain,
+            )
+        )
     lines.append("")
+    if _path_proved_domain_compromise(path, domain):
+        lines.append(
+            "This path reached full domain compromise, recorded as "
+            f"`{path.domain_compromise_evidence}`."
+            if path.domain_compromise_evidence
+            else "This path reached full domain compromise."
+        )
+        lines.append("")
+    elif path.domain_compromise_evidence:
+        # The compromise event carries no path id, so it lands inside every
+        # window that contains its clock — including this one, which proved
+        # nothing. Say which path owns it rather than claim it twice.
+        lines.append(
+            "The domain compromise this run recorded falls inside this path's "
+            "window but was not proven by it: no step of this path completed."
+        )
+        lines.append("")
+    return lines
+
+
+def _render_executed_paths(inputs: SpineInputs) -> list[str]:
+    """Return every executed path's section, in wall-clock order."""
+    lines: list[str] = []
+    for index, path in enumerate(inputs.executed_paths, start=1):
+        lines.extend(
+            _render_executed_path(
+                path,
+                index=index,
+                accounts=inputs.chain_accounts,
+                domain=inputs.domain,
+            )
+        )
     return lines
 
 
@@ -3714,11 +5381,27 @@ def _render_credential_ledger(inputs: SpineInputs) -> list[str]:
     table whose every cell reads "unrecorded" is worse than no column: it looks
     like a rendering failure, and it costs the reader a scan of every row to
     learn nothing.
+
+    On an engagement the table is also SAMPLED: the count and the krbtgt
+    confirmation are what evidence the replication, and a thousand further rows
+    of employee secrets evidence nothing the count does not already carry while
+    making the file unsafe to forward. See
+    ``writeup_credential_disclosure`` for the policy.
     """
     if not inputs.credentials:
         return []
-    known = [row for row in inputs.credentials if row.origin]
+    masked = inputs.credential_disclosure == DISCLOSURE_MASKED_EXEMPLARS
+    shown_rows = select_exemplars(inputs.credentials) if masked else inputs.credentials
+    known = [row for row in shown_rows if row.recovered_via]
     lines = ["### Credentials recovered", ""]
+    if masked:
+        for line in masked_ledger_notice(
+            total=len(inputs.credentials),
+            shown=len(shown_rows),
+            pointers=inputs.credential_pointers,
+        ):
+            lines.append(line)
+            lines.append("")
     # Accounts-vs-secrets reconciliation (kit-facts SSOT, spec §2 #12): this
     # ledger frames the recovered set as "secrets" while the Security Assessment
     # Report §09 frames the same credential store as "accounts". When the krbtgt
@@ -3735,12 +5418,22 @@ def _render_credential_ledger(inputs: SpineInputs) -> list[str]:
     _recovered_secret_note = recovered_secret_reconcile_clause(
         total_secrets=len(inputs.credentials), krbtgt_included=_krbtgt_recovered
     )
+
+    def _value_cell(row: CredentialRow) -> str:
+        """Render the value column: the secret, or its shape when masking."""
+        if not row.value:
+            return "n/a"
+        if masked:
+            return f"`{mask_secret_to_shape(row.value)}`"
+        return f"`{row.value}`"
+
     if not known:
         lines.append("| Account | Secret | Value |")
         lines.append("|---|---|---|")
-        for row in inputs.credentials:
-            shown = f"`{row.value}`" if row.value else "n/a"
-            lines.append(f"| `{row.principal}` | {row.secret_kind} | {shown} |")
+        for row in shown_rows:
+            lines.append(
+                f"| `{row.principal}` | {row.secret_kind} | {_value_cell(row)} |"
+            )
         lines.append("")
         # The confession is only honest when the workspace records NO provenance
         # anywhere. It must not fire when the executed chain (or a stage/row)
@@ -3757,15 +5450,37 @@ def _render_credential_ledger(inputs: SpineInputs) -> list[str]:
             lines.append(_recovered_secret_note)
             lines.append("")
         return lines
-    lines.append("| Account | Secret | Value | Recovered via |")
-    lines.append("|---|---|---|---|")
-    for row in inputs.credentials:
-        shown = f"`{row.value}`" if row.value else "n/a"
+    lines.append("| Account | Secret | Value | Recovered via | Read from |")
+    lines.append("|---|---|---|---|---|")
+    for row in shown_rows:
+        # The citation column: where this exact value was read. A credential the
+        # ledger attributed to the spray that confirmed it, with nothing about
+        # the file it came out of, sent a reader looking for a wordlist.
+        if row.finding is None:
+            read_from = ""
+        else:
+            read_from = f"`{row.finding.share}/{row.finding.path}`"
+            if row.finding.line:
+                read_from += f" line {row.finding.line}"
         lines.append(
-            f"| `{row.principal}` | {row.secret_kind} | {shown} | "
-            f"{row.origin or 'not recorded'} |"
+            f"| `{row.principal}` | {row.secret_kind} | {_value_cell(row)} | "
+            f"{row.recovered_via or 'not recorded'} | {read_from} |"
         )
     lines.append("")
+    # The run's entry point is its own fact, stated once. It used to sit in the
+    # provenance column of whichever account the operator was handed, which
+    # displaced the technique that proved the same secret independently.
+    supplied_rows = [row for row in shown_rows if row.also_supplied]
+    if supplied_rows:
+        names = _join_names([row.principal for row in supplied_rows])
+        note = f"The run started with {names}."
+        if any(row.proven_via for row in supplied_rows):
+            note += (
+                " The chain recovered that password from the directory as well,"
+                " which is the technique the column above names."
+            )
+        lines.append(note)
+        lines.append("")
     if _recovered_secret_note:
         lines.append(_recovered_secret_note)
         lines.append("")
@@ -3829,28 +5544,66 @@ def _render_terminal(inputs: SpineInputs, *, index: int) -> list[str]:
     )
     lines = [f"## {heading}", ""]
     for step in inputs.terminal_steps:
-        lines.extend(_render_step(step))
+        lines.extend(_render_step(step, fill=inputs.command_fill))
     lines.extend(_render_unexecuted_note(inputs))
     lines.extend(_render_credential_ledger(inputs))
     if inputs.flags:
         lines.append("### Flags")
         lines.append("")
         for flag in inputs.flags:
-            lines.append(f"- `{flag.name}`: `{flag.masked}`")
+            where = f", read from `{flag.source}`" if flag.source else ""
+            lines.append(f"- `{flag.name}`: `{flag.masked}`{where}")
         lines.append("")
         lines.append(
             "Truncated on purpose. Platforms ask that flag values are not "
             "republished in full."
         )
         lines.append("")
-    lines.append(
-        f"<!-- screenshot: {ASSETS_DIRNAME}/{index:02d}-{_slug(heading)}.png -->"
-    )
-    lines.append("")
     statement = _terminal_outcome_statement(inputs)
     if statement:
         lines.append(statement)
         lines.append("")
+    return lines
+
+
+def _render_recorded_attempts_section(inputs: SpineInputs) -> list[str]:
+    """Return the step executor's own attempts, subordinate to the proven chain.
+
+    Rendered only when the chain is the spine: then the per-path sections are
+    not drawn, and the attempts the executor logged still have to appear
+    somewhere. They are an appendix to the chain and not its headline, which is
+    where they ended up when the record won unconditionally.
+
+    Exposure-Validation: a step that ran and did not complete is reported with
+    the cause the executor recorded, and nothing is attributed to a control in
+    the environment.
+    """
+    attempts = inputs.unproven_recorded_steps
+    if inputs.execution_record_is_backbone or not attempts:
+        return []
+    lines = ["## What the step executor also tried", ""]
+    for step in attempts:
+        clock = _clock(step.at)
+        stamp = f"`{clock}` " if clock else ""
+        source = (
+            display_node(
+                step.source, accounts=inputs.chain_accounts, domain=inputs.domain
+            )
+            or step.source
+        )
+        target = (
+            display_node(
+                step.target, accounts=inputs.chain_accounts, domain=inputs.domain
+            )
+            or step.target
+        )
+        actor = f" as `{step.actor}`" if step.actor else ""
+        line = (
+            f"- {stamp}**{technique_for(step.action).name}**{actor}, from "
+            f"`{source}` against `{target}`, did not complete"
+        )
+        lines.append(f"{line}: {step.reason}." if step.reason else f"{line}.")
+    lines.append("")
     return lines
 
 
@@ -3889,6 +5642,33 @@ def _render_changes(inputs: SpineInputs) -> list[str]:
     identical file uploads reverted eight times is one fact.
     """
     if not inputs.changes:
+        # An absent section is indistinguishable from a dropped one, and "it
+        # changed nothing" is the strongest thing this section can say. The
+        # ledger's three states keep the two honest answers apart: it was read
+        # and holds nothing, or it could not be read at all — which is a data
+        # gap and never reported as a clean run.
+        from adscan_internal.services.environment_change_ledger import (  # noqa: PLC0415
+            CHANGE_RECORD_NONE,
+            CHANGE_RECORD_UNDETERMINED,
+        )
+
+        if inputs.change_record_state == CHANGE_RECORD_NONE:
+            return [
+                "## What ADscan changed, and what it put back",
+                "",
+                "Nothing. The change ledger was read and holds no entries, so "
+                "this run left the directory as it found it and there is "
+                "nothing to roll back.",
+                "",
+            ]
+        if inputs.change_record_state == CHANGE_RECORD_UNDETERMINED:
+            return [
+                "## What ADscan changed, and what it put back",
+                "",
+                "No change ledger could be read for this run, so what it wrote "
+                "to the directory is not recorded here.",
+                "",
+            ]
         return []
     manual = [
         c for c in inputs.changes if c.bucket == cleanup_taxonomy.CLEANUP_BUCKET_MANUAL
@@ -3947,7 +5727,7 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
     Pure: same inputs, same bytes. The whole document is assembled here so the
     section order, the one the genre already uses, is readable in one place.
     """
-    stamp = today or datetime.now().strftime("%Y-%m-%d")
+    stamp = today or datetime.now(UTC).strftime("%Y-%m-%d")
     asset_link = (
         f"{ASSETS_DIRNAME}/{_asset_name(inputs.scan_asset)}"
         if inputs.scan_asset
@@ -3957,7 +5737,7 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
     lines: list[str] = []
     lines.extend(_render_frontmatter(inputs, today=stamp))
     lines.append("")
-    lines.extend(_render_header_note())
+    lines.extend(_render_header_note(inputs))
     lines.append("")
     lines.append(f"# {inputs.title}")
     lines.append("")
@@ -3971,12 +5751,27 @@ def render_spine_markdown(inputs: SpineInputs, *, today: str | None = None) -> s
     lines.append("")
     lines.extend(_render_target_table(inputs))
     lines.append("")
-    lines.extend(_render_recon(inputs, asset_link=asset_link))
+    lines.extend(_render_recon_summary(inputs, asset_link=asset_link))
     lines.extend(_render_enumeration(inputs))
-    for index, stage in enumerate(inputs.stages, start=1):
-        lines.extend(_render_stage(stage, index=index))
+    # One spine, never two: telling both stories is what printed a step as
+    # enabling another that ran fifty-one minutes earlier. Which one is the
+    # spine is decided once, by whether the record proved at least as much as
+    # the graph did (``execution_record_is_backbone``).
+    if inputs.execution_record_is_backbone:
+        lines.extend(_render_executed_paths(inputs))
+    else:
+        for index, stage in enumerate(inputs.stages, start=1):
+            lines.extend(
+                _render_stage(
+                    stage,
+                    index=index,
+                    disclosure=inputs.credential_disclosure,
+                    fill=inputs.command_fill,
+                )
+            )
     if inputs.terminal_steps or inputs.credentials or inputs.flags:
         lines.extend(_render_terminal(inputs, index=len(inputs.stages) + 1))
+    lines.extend(_render_recorded_attempts_section(inputs))
     lines.extend(_render_dead_ends(inputs))
     lines.extend(_render_changes(inputs))
     if inputs.beyond_root_warranted and inputs.alt_routes:
@@ -4132,6 +5927,7 @@ def generate_writeup_spine(
     *,
     output_dir: str | None = None,
     trigger: str = TRIGGER_REPL_WRITEUP,
+    full_credentials: bool | None = None,
 ) -> SpineArtifacts | None:
     """Write the evidence spine for the active workspace and return what it wrote.
 
@@ -4152,11 +5948,19 @@ def generate_writeup_spine(
         trigger: Which on-ramp asked for the spine, one of the ``TRIGGER_*``
             constants in :mod:`adscan_internal.services.post_scan_report`.
             Defaults to the operator typing ``writeup``.
+        full_credentials: The operator's explicit opt-in (``--full-credentials``)
+            to one complete, unmasked credential table on an engagement that
+            would otherwise mask it. ``None`` falls through to
+            ``ADSCAN_WRITEUP_FULL_CREDENTIALS``.
 
     Returns:
         The written artifacts, or ``None`` when there was no scan data.
     """
-    started = datetime.now()
+    # UTC, like every other clock this document prints. With the local clock the
+    # directory stamp and the frontmatter date sat in a different frame from the
+    # run's own timestamps, so one run produced a directory named for one hour
+    # and a body full of another with nothing saying why.
+    started = datetime.now(UTC)
     inputs: SpineInputs | None = None
     artifacts: SpineArtifacts | None = None
     try:
@@ -4203,6 +6007,14 @@ def generate_writeup_spine(
             technical_report=technical_report,
             lab_provider=getattr(shell, "lab_provider", None),
             lab_name=getattr(shell, "lab_name", None),
+            # The workspace is authoritative; the live shell is consulted only
+            # when it carries no classification (a scan whose variables have not
+            # been saved yet), which is what keeps a CTF run from being treated
+            # as unclassified and masked.
+            engagement_type=resolve_writeup_engagement_type(
+                shell=shell, workspace_dir=workspace_dir
+            ),
+            full_credentials_inline=full_credentials_requested(flag=full_credentials),
         )
         if inputs is None:
             print_error("No domain data to build a spine from.")

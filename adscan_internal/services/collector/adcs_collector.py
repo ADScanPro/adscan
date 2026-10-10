@@ -23,8 +23,9 @@ synthetic object id ``{DOMAIN_UPPER}-{GUID}`` that cannot collide with the
 
 from __future__ import annotations
 
+import hashlib
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, NamedTuple
 
 from adscan_internal import telemetry
@@ -413,6 +414,27 @@ def _raw_bytes(entry: Any, attr: str) -> bytes | None:
     return None
 
 
+def _cert_thumbprints(der_values: Iterable[Any] | None) -> set[str]:
+    """Return the SHA-1 thumbprint (hex, lower-case) of each DER certificate value.
+
+    A certificate thumbprint is defined as the SHA-1 hash of the whole DER blob,
+    which is exactly the value ``certutil`` displays, so it round-trips into the
+    client remediation command without an X.509 parser. ``usedforsecurity=False``
+    documents that this is an identity fingerprint, not a cryptographic integrity
+    check. Empty / missing / non-bytes values are tolerated and skipped so a
+    malformed ``cACertificate`` never breaks collection.
+    """
+    thumbs: set[str] = set()
+    for value in der_values or ():
+        if not isinstance(value, (bytes, bytearray)):
+            continue
+        blob = bytes(value)
+        if not blob:
+            continue
+        thumbs.add(hashlib.sha1(blob, usedforsecurity=False).hexdigest())
+    return thumbs
+
+
 def _synthetic_object_id(domain: str, guid: str) -> str:
     """Stable synthetic object id for a non-SID ADCS object.
 
@@ -489,6 +511,19 @@ def _build_node_from_ldap_entry(
                     properties[prop_key] = int(first)
                 except (TypeError, ValueError):
                     properties[prop_key] = str(first).strip()
+        # SHA-1 thumbprints of the CA's own certificate(s), stamped so the
+        # NTAuth trust-anchor correlation (orphaned CA whose cert is still in
+        # CN=NTAuthCertificates) can intersect them against the NTAuth store.
+        ca_thumbs = _cert_thumbprints(_values(attrs, "cACertificate"))
+        if ca_thumbs:
+            properties["ca_certificate_thumbprints"] = sorted(ca_thumbs)
+    elif kind == "NTAuthStore":
+        # The NTAuthCertificates store holds every CA certificate AD trusts for
+        # client authentication (PKINIT). Stamp its thumbprint set so a
+        # decommissioned CA still present here is detectable by correlation.
+        ntauth_thumbs = _cert_thumbprints(_values(attrs, "cACertificate"))
+        if ntauth_thumbs:
+            properties["ca_certificate_thumbprints"] = sorted(ntauth_thumbs)
 
     return CollectorNode(
         object_id=object_id,
@@ -996,6 +1031,29 @@ class ADCSCollector:
                 if probe is not None and probe.registry is not None
                 else True
             )
+            # Certighost (CVE-2026-54121) read-only inputs: the chase-fallback
+            # EditFlags bit + the CA host OS build/UBR. Defaults (flag unset,
+            # EditFlags unreadable, build/UBR None) emit no edge, so a CA with
+            # no registry probe stays a data gap, never a false positive.
+            registry = probe.registry if probe is not None else None
+            certighost_chase = bool(
+                registry.editf_enablechaseclientdc_enabled
+                if registry is not None
+                else False
+            )
+            certighost_editf_readable = bool(
+                registry.edit_flags_readable if registry is not None else False
+            )
+            certighost_build = (
+                registry.os_build_number if registry is not None else None
+            )
+            certighost_ubr = registry.os_ubr if registry is not None else None
+            certighost_major = (
+                registry.os_major_version if registry is not None else None
+            )
+            certighost_minor = (
+                registry.os_minor_version if registry is not None else None
+            )
             try:
                 new_edges = _detect_adcs_ca_escalations(
                     ca_node=ca,
@@ -1003,6 +1061,12 @@ class ADCSCollector:
                     domain=self._domain,
                     web_enrollment_enabled=web_enabled,
                     enforce_encrypt_icertrequest=enforce_encrypt,
+                    certighost_chase_enabled=certighost_chase,
+                    certighost_edit_flags_readable=certighost_editf_readable,
+                    certighost_os_build_number=certighost_build,
+                    certighost_os_ubr=certighost_ubr,
+                    certighost_os_major_version=certighost_major,
+                    certighost_os_minor_version=certighost_minor,
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
@@ -1052,6 +1116,8 @@ class ADCSCollector:
                 "ADCSESC7",
                 "ADCSESC8",
                 "ADCSESC11",
+                # Certighost (CVE-2026-54121) targets the EnterpriseCA node too.
+                "certighost",
             }
         )
 
@@ -1097,9 +1163,16 @@ class ADCSCollector:
 
         * stamps ``is_orphaned_ca=True`` on the CA node so the persisted
           ``adcs_enterprise_cas.json`` record carries the signal;
-        * stamps the standalone hygiene ``adcs_finding_state`` block on the CA
-          record, so the finding stands on its own with NO dependency on an ESC
-          edge existing (an orphaned CA's web enrollment is a data gap, so it
+        * when the orphaned CA's own certificate is STILL in
+          ``CN=NTAuthCertificates`` (its thumbprints intersect the NTAuth store),
+          stamps ``in_ntauth_store`` + ``ntauth_thumbprint(s)`` instead of the
+          plain hygiene block — AD still trusts certificates the retired CA
+          issued for authentication, which the standalone HIGH catalog finding
+          ``adcs_orphaned_ca_ntauth`` reports (certificate forgery is possible if
+          the retired private key is recoverable);
+        * otherwise stamps the standalone hygiene ``adcs_finding_state`` block on
+          the CA record, so the finding stands on its own with NO dependency on an
+          ESC edge existing (an orphaned CA's web enrollment is a data gap, so it
           usually has no ESC edge at all);
         * marks ``is_orphaned_ca`` on any ADCS ESC edge that DOES target the stale
           CA, so the report/web edge views (which read the same signal) render it
@@ -1112,6 +1185,18 @@ class ADCSCollector:
         )
 
         computer_hostnames = _collect_computer_hostnames(result)
+        # The thumbprint set of CN=NTAuthCertificates — the certificates AD trusts
+        # for client authentication. An orphaned CA whose own certificate is still
+        # in this set is a live trust anchor for a decommissioned authority, which
+        # is the HIGH certificate-forgery finding (not plain cleanup hygiene).
+        ntauth_thumbprints: set[str] = set()
+        for node in result.nodes.values():
+            if str(node.kind) != "NTAuthStore":
+                continue
+            ntauth_thumbprints.update(
+                str(t).lower()
+                for t in (node.properties.get("ca_certificate_thumbprints") or [])
+            )
         orphaned = 0
         for ca in cas:
             probe = ca_probes.get(ca.object_id)
@@ -1129,9 +1214,31 @@ class ADCSCollector:
             ):
                 continue
             ca.properties["is_orphaned_ca"] = True
-            ca.properties[ADCS_FINDING_STATE_KEY] = build_adcs_finding_state(
-                state=STATE_HYGIENE, ca_host=ca_host
-            )
+            ca_thumbprints = {
+                str(t).lower()
+                for t in (ca.properties.get("ca_certificate_thumbprints") or [])
+            }
+            in_ntauth = sorted(ca_thumbprints & ntauth_thumbprints)
+            if in_ntauth:
+                # Trust-anchor exposure: the retired CA's certificate is still in
+                # NTAuthCertificates, so AD keeps trusting certificates it issued
+                # for authentication. The standalone HIGH catalog finding
+                # (adcs_orphaned_ca_ntauth) carries the client message, so the
+                # plain "just clean it up" hygiene block is deliberately NOT
+                # stamped here — it would contradict a HIGH finding on the same CA.
+                ca.properties["in_ntauth_store"] = True
+                ca.properties["ntauth_thumbprint"] = in_ntauth[0]
+                ca.properties["ntauth_thumbprints"] = in_ntauth
+                print_info_debug(
+                    "[adcs-collector] orphaned CA "
+                    f"{mark_sensitive(ca_host, 'hostname')} is STILL in "
+                    "NTAuthCertificates — decommissioned-CA trust-anchor finding "
+                    "(certificate forgery possible if the retired key is recoverable)"
+                )
+            else:
+                ca.properties[ADCS_FINDING_STATE_KEY] = build_adcs_finding_state(
+                    state=STATE_HYGIENE, ca_host=ca_host
+                )
             for edge in result.edges:
                 if (
                     edge.target_object_id == ca.object_id

@@ -134,6 +134,8 @@ def _build_ci_loot_card(
     owned = list(domain_info.get("owned_accounts", []) or [])
 
     da_paths = 0
+    da_paths_reach = 0
+    totals_read = False
     adcs_esc_count = 0
     kerberoastable = 0
     asreproastable = 0
@@ -144,19 +146,43 @@ def _build_ci_loot_card(
     ws_dir = getattr(shell, "current_workspace_dir", "") or ""
     domains_dir = getattr(shell, "domains_dir", "domains") or "domains"
 
-    # --- attack-path snapshot: DA paths + ADCS ESC paths -------------------
-    # ``da_paths`` drives the "← PWNED" banner, so it counts only PROVEN
-    # domain-compromise paths (status/path_state in the _PROVEN_STATUSES SSOT) —
-    # a domain-breaker path that was only *attempted* must NOT render as PWNED
-    # (the exposure-validation doctrine: never claim a compromise we did not
-    # prove). ADCS ESC paths are a discovery count, not gated on execution.
+    # --- attack-path counts: DA routes ------------------------------------
+    # ``da_paths`` drives the "← PWNED" banner, so it is the END-TO-END WALKED
+    # count, never a reach count: a domain-breaker route that was only attempted
+    # must not render as PWNED (the exposure-validation doctrine). ``reach`` is
+    # the identified-route figure the recap panel prints, carried so a zero can
+    # say which zero it is.
+    #
+    # Both come from the cardinality SSOT, whose first rule is that every
+    # human-facing attack-path count comes from there. This site used to walk
+    # ``attack_paths_snapshot.json`` itself, which is exactly how the card and
+    # the recap panel ended up stating different answers to one question seconds
+    # apart, and how a workspace with no readable snapshot printed "No paths
+    # found" as though the domain had been measured clean.
+    try:
+        from adscan_internal.services.attack_path_counts import (
+            client_path_totals_for_shell,
+        )
+
+        totals = client_path_totals_for_shell(shell, domain)
+        da_paths = max(0, int(totals.effective_proven_full_domain_compromise))
+        da_paths_reach = max(0, int(totals.paths_full_domain_compromise))
+        totals_read = True
+    except Exception as exc:  # noqa: BLE001 - the card must never break the run
+        # Previously swallowed, which is how a failed count became an absence of
+        # findings on the card. It still must not break the run, so it is logged
+        # and the card reports the gap.
+        totals_read = False
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    # --- attack-path snapshot: ADCS ESC discovery count --------------------
+    # A discovery count over the route inventory, not a path cardinality, so it
+    # is not one of the SSOT's named figures and is still read here.
     try:
         from adscan_internal.workspaces import domain_subpath
         from adscan_internal.cli.attack_path_execution import (
             ATTACK_PATH_SNAPSHOT_FILENAME,
-        )
-        from adscan_internal.services.exposure_score_service import (
-            _PROVEN_STATUSES,
         )
         import json as _json
 
@@ -169,16 +195,6 @@ def _build_ci_loot_card(
             for path in snap.get("paths", []) or []:
                 if not isinstance(path, dict):
                     continue
-                is_breaker = str(
-                    path.get("compromise_class") or ""
-                ).strip().lower() == "domain_breaker"
-                proven = (
-                    str(path.get("status") or "").strip().lower() in _PROVEN_STATUSES
-                    or str(path.get("path_state") or "").strip().lower()
-                    in _PROVEN_STATUSES
-                )
-                if is_breaker and proven:
-                    da_paths += 1
                 relations = path.get("relations") or []
                 if isinstance(relations, list) and any(
                     _ADCS_ESC_RELATION_RE.match(str(rel or "")) for rel in relations
@@ -253,6 +269,11 @@ def _build_ci_loot_card(
         domain=domain,
         elapsed_seconds=max(0.0, float(elapsed_seconds)),
         da_paths=da_paths,
+        da_paths_reach=da_paths_reach,
+        # A zero only means "no route" when the counts were read AND there was a
+        # graph to read them from. Either precondition missing is a data gap, and
+        # the card says so rather than crediting the domain with a clean result.
+        paths_assessed=bool(totals_read and total_nodes > 0),
         adcs_esc_count=adcs_esc_count,
         kerberoastable=kerberoastable,
         asreproastable=asreproastable,
@@ -261,6 +282,58 @@ def _build_ci_loot_card(
         total_nodes=total_nodes,
         owned_accounts=owned,
     )
+
+
+def _ci_compliance_scope_ok(args: object) -> bool:
+    """Pre-scan gate: an audit run that will report needs a scoped framework.
+
+    Returns ``True`` when the run may proceed. Prints the canonical error and
+    returns ``False`` when an ``--type audit`` run asked for a report without
+    choosing a compliance framework.
+
+    LITE is exempt by construction: the LITE exposure report carries no
+    compliance mapping at all, so there is nothing to scope. A ``ctf`` or
+    unclassified engagement is exempt for the reason the SSOT documents (no
+    regulatory regime, and an unknown type is a data gap).
+    """
+    from adscan_core import tier
+
+    if not tier.is_pro():
+        return True
+    if not getattr(args, "generate_report", False):
+        return True
+
+    from adscan_core.paths import get_workspaces_dir
+    from adscan_internal.cli.common import _parse_frameworks
+    from adscan_internal.services.compliance_scope import (
+        missing_framework_error,
+        resolve_compliance_scope,
+        workspace_engagement_type,
+    )
+
+    try:
+        explicit = _parse_frameworks(getattr(args, "frameworks", None))
+    except ValueError as exc:
+        print_error(str(exc))
+        return False
+
+    # An EXISTING workspace already carries the scan's classification and wins
+    # over the flag (``ci`` reloads its variables, so the flag would not change
+    # it anyway); a brand-new workspace has none yet, so ``--type`` is what the
+    # scan is about to persist. Either way both gates read the same value.
+    ws_name = str(getattr(args, "workspace", "") or "").strip()
+    persisted_type = (
+        workspace_engagement_type(get_workspaces_dir() / ws_name) if ws_name else None
+    )
+
+    scope = resolve_compliance_scope(
+        explicit=explicit,
+        engagement_type=persisted_type or getattr(args, "type", None),
+    )
+    if scope.missing_required:
+        print_error(missing_framework_error())
+        return False
+    return True
 
 
 def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
@@ -288,6 +361,18 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
 
     if not ensure_partner_tag_for_pro(license_mode):
+        return 1
+
+    # Compliance-scope gate — FAIL FAST, before the scan.
+    #
+    # An audit engagement that will produce a report needs its compliance
+    # framework scoped up front: it comes from the signed scope, not from
+    # anything the binary can infer. Refusing here (rather than at the report
+    # phase) means the operator is told before a long scan, not after it. The
+    # late gate in ``run_generate_report`` still covers every other entry
+    # point, and ``--type`` is the engagement classification the scan is about
+    # to persist into its own workspace, so both gates read the same thing.
+    if not _ci_compliance_scope_ok(args):
         return 1
 
     preflight_result = run_session_preflight(
@@ -776,8 +861,13 @@ def run_generate_report(
         report_file: Path to technical_report.json
         report_format: Format to generate. Public CLI flows pass "pdf".
         report_profile: Report profile ("full", "technical", "executive")
-        frameworks: Compliance frameworks. Valid values: "ens", "iso27001",
-            "dora", "pci_dss". Defaults to ["ens"] (ENS Alto + NIS2).
+        frameworks: Compliance frameworks the operator explicitly selected.
+            Valid values: "ens", "nis2", "iso27001", "dora", "pci_dss", "cis".
+            There is NO default: an empty selection renders no compliance
+            mapping, and an AUDIT engagement refuses to render at all until the
+            operator chooses (see
+            ``adscan_internal.services.compliance_scope``, the resolution SSOT
+            shared with ``adscan deliver``).
         engine: PDF engine ("chromium" — the only supported engine). Empty = env/default.
         renderer: Attack-path renderer ("graphviz" | "cytoscape"). Empty = env/default.
         template: Report template ("legacy" | "premium"). Empty = env/default.
@@ -829,6 +919,35 @@ def run_generate_report(
 
     workspace_dir = Path(os.path.dirname(report_file)) if report_file else Path.cwd()
 
+    # Compliance scoping — resolved through the SSOT ``adscan deliver`` also
+    # calls, so the two entry points can never disagree about the same
+    # decision again. An AUDIT engagement refuses to render a conformance
+    # verdict the operator never scoped; a ctf or unclassified workspace
+    # renders with no mapping and says so out loud. Reached by BOTH
+    # ``adscan ci --generate-report`` and ``adscan report`` (which calls this
+    # function), so neither needs its own framework default.
+    from adscan_internal.services.compliance_scope import (
+        announce_compliance_scope,
+        missing_framework_error,
+        resolve_compliance_scope,
+    )
+
+    scope = resolve_compliance_scope(
+        explicit=frameworks, shell=shell, workspace_dir=workspace_dir
+    )
+    if scope.missing_required:
+        print_error(
+            missing_framework_error(
+                rerender_hint=(
+                    f"adscan report --workspace {workspace_dir.name} "
+                    "--frameworks <keys>"
+                )
+            )
+        )
+        return None
+    announce_compliance_scope(scope)
+    frameworks = scope.as_list()
+
     report_path = Path(report_file)
     print_info_verbose(
         f"Using technical report source: {mark_sensitive(str(report_path), 'path')}"
@@ -850,6 +969,11 @@ def run_generate_report(
         template=template,
         theme=theme,
         display_name=display_name,
+        # The session's live change ledger. This report renders mid-run, before
+        # the ledger file is necessarily flushed, so without it the engagement
+        # integrity statement reads "the record could not be read" on exactly
+        # the run that produced the record.
+        ledger=getattr(shell, "environment_change_ledger", None),
     )
 
     result_path = report_service.generate_report(config)
@@ -966,5 +1090,10 @@ def _run_ci_deliver_selection(
     rc = _run_deliver_sync(ns)
     if rc != 0:
         return None
-    headline = workspace_dir / "deliverables" / "staging" / "Security_Assessment_Report.pdf"
-    return str(headline) if headline.is_file() else None
+    # ``run_deliver`` publishes the headline artefact it actually produced on
+    # the namespace. Take it from there rather than rebuilding a staging path:
+    # each run stages into its own directory (so a kit can never bundle an
+    # earlier run's PDF), and a reconstructed path is exactly how CI used to
+    # pick up a stale report when the current run had not produced one.
+    headline = getattr(ns, "_headline_pdf", "") or ""
+    return headline if headline and Path(headline).is_file() else None

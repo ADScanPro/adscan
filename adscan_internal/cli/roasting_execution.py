@@ -28,8 +28,12 @@ from adscan_internal.models.domain import resolve_dc_ip
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import EnumerationService
-from adscan_internal.services.attack_graph_service import upsert_roast_entry_edge
+from adscan_internal.services.attack_graph_service import (
+    update_roast_entry_edge_status,
+    upsert_roast_entry_edge,
+)
 from adscan_internal.workspaces import domain_relpath, domain_subpath
+from adscan_core.reporting.attack_step_reason_codes import ReasonCode
 from adscan_core.rich_output import print_exception
 
 
@@ -230,6 +234,40 @@ def _record_user_credential_outcome(
         "[roasting-exec] recorded credential outcome after roasting: "
         f"user={marked_user} domain={marked_domain} type={credential_type}"
     )
+
+
+def _stamp_roast_crack_outcome(
+    shell: Any,
+    *,
+    domain: str,
+    roast_type: str,
+    target_user: str,
+    recovered: bool,
+) -> None:
+    """Record the roast edge's final two-level outcome after the crack attempt.
+
+    A captured-but-not-cracked roast is the case this exists for: the roaster ran
+    and ADscan HOLDS the hash, so the edge must read ``attempted`` with the
+    structured reason ``crack_failed`` ("we executed, the offline crack did not
+    land"), NEVER the collector default ``discovered`` (indistinguishable from a
+    never-touched account) which would render as a ``theoretical`` edge. The
+    recovered case needs no stamp here: the cracking flow already transitioned
+    the edge to ``success`` and stored the credential.
+    """
+    if recovered:
+        return
+    try:
+        update_roast_entry_edge_status(
+            shell,
+            domain,
+            roast_type=roast_type,
+            username=target_user,
+            status="attempted",
+            reason_code=ReasonCode.CRACK_FAILED.value,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _ensure_cracking_dir(shell: Any, domain: str) -> tuple[str, str]:
@@ -477,6 +515,13 @@ def run_kerberoast_for_user(
         _record_user_credential_outcome(
             shell, domain=roast_domain, target_user=target_user
         )
+    _stamp_roast_crack_outcome(
+        shell,
+        domain=roast_domain,
+        roast_type="kerberoast",
+        target_user=target_user,
+        recovered=recovered,
+    )
     return recovered
 
 
@@ -613,4 +658,11 @@ def run_asreproast_for_user(
         _record_user_credential_outcome(
             shell, domain=roast_domain, target_user=target_user
         )
+    _stamp_roast_crack_outcome(
+        shell,
+        domain=roast_domain,
+        roast_type="asreproast",
+        target_user=target_user,
+        recovered=recovered,
+    )
     return recovered

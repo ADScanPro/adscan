@@ -104,6 +104,13 @@ def run_report_sync(args: argparse.Namespace) -> int:
             print_error(str(exc))
             return 1
 
+        # No framework default here either: ``run_generate_report`` applies the
+        # single compliance-scope gate, reading the engagement type from the
+        # WORKSPACE (not from this command, which cannot redefine what kind of
+        # engagement produced the data). So re-rendering an audit workspace
+        # requires an explicit --frameworks, and a lab or unclassified
+        # workspace renders with no compliance mapping and says so.
+
         report_json = _resolve_report_json(shell)
         result = run_generate_report(
             shell,
@@ -157,7 +164,8 @@ def add_report_subparser(
         default=None,
         help=(
             "Comma-separated compliance frameworks to render (PRO only). "
-            "Choices: ens, nis2, iso27001, dora, pci_dss, cis. Default: none."
+            "Choices: ens, nis2, iso27001, dora, pci_dss, cis. There is no "
+            "default: required for an audit engagement, omitted otherwise."
         ),
     )
     # Mirrors the per-subcommand --debug on start/ci/deliver/execute/doctor.

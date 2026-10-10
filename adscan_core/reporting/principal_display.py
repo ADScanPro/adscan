@@ -149,6 +149,115 @@ _CANONICAL_WELLKNOWN_NAME_BY_LOWER: dict[str, str] = {
 }
 
 
+#: Lower-case function words whose PRESENCE marks a name written in a language
+#: that sentence-cases these built-ins rather than title-casing them.
+#:
+#: There is no single re-casing rule that is right for every language, so the
+#: de-shouter has to discriminate instead of picking one wrong answer everywhere:
+#:
+#: * Romance languages write the built-ins in SENTENCE case, and CLAUDE.md's
+#:   worked example for this rule is one of them (``Computer del dominio``,
+#:   lower-case preposition).
+#: * English TITLE-cases a group name (``Helpdesk Admins``).
+#: * German capitalizes its nouns, including across a hyphen
+#:   (``Domänen-Benutzer``).
+#:
+#: A particle only ever appears in the first group, so its presence is the signal
+#: that selects sentence case. The set is deliberately the closed list of
+#: articles and prepositions that occur in Windows' own localized object names,
+#: not a general stopword list: a word here is lower-cased only inside a name
+#: ADscan is ALREADY re-casing, which means one it never read the true form of.
+_SENTENCE_CASE_PARTICLES: frozenset[str] = frozenset(
+    {
+        # Italian
+        "del", "della", "dello", "dei", "degli", "delle", "di", "da", "dal",
+        # Spanish
+        "de", "la", "las", "el", "los", "y",
+        # French
+        "du", "des", "le", "les", "et", "aux",
+        # Portuguese
+        "do", "dos", "das",
+        # Dutch
+        "van",
+    }
+)
+
+#: Elided articles that mark the same convention. An apostrophe elision does not
+#: occur in English or German object names, so a word opening with one is as
+#: strong a Romance signal as a bare particle, and ``.title()``'s habit of
+#: capitalizing the letter after the apostrophe is one of the forms it broke.
+_SENTENCE_CASE_ELISIONS: tuple[str, ...] = (
+    "l'",
+    "d'",
+    "dell'",
+    "nell'",
+    "all'",
+    "sull'",
+    "un'",
+)
+
+
+def deshout_directory_name(name: str) -> str:
+    """De-shout an ALL-CAPS directory object name to its likely written form.
+
+    ``str.title()`` cannot be used for this and must never be reintroduced: it
+    capitalizes after every non-alphabetic character, so it renders a localized
+    built-in as ``Computer Del Dominio`` and ``Gruppo L'Ufficio``. That is a
+    broken deliverable rather than a cosmetic defect, because the decisive reason
+    for the casing rule is COMMANDS: remediation and verify commands reference
+    the object by its real ``CN``/``DN``, and on a localized domain controller
+    that IS the localized name, so a client pasting
+    ``Get-Acl "AD:CN=Computer Del Dominio,…"`` gets an error from their own
+    directory.
+
+    Only a name that is ENTIRELY upper case is re-cased. Anything carrying the
+    directory's own mixed or lower casing is ground truth and is returned
+    verbatim, because the rule is to RESTORE the directory's form, never to
+    re-case past it.
+
+    For a shouted name there is no ground truth, so the convention is selected by
+    the discriminator in :data:`_SENTENCE_CASE_PARTICLES`: a name containing a
+    particle is sentence-cased (the Romance convention), and one without keeps
+    word-wise capitalization (English title case, German noun capitalization).
+    Capitalization is applied per whitespace-separated word, and within a word
+    per HYPHEN-separated segment but nothing finer. The hyphen is deliberate and
+    the apostrophe is deliberately not: German compounds capitalize both halves
+    (``Domänen-Benutzer``) while no language capitalizes after an elision
+    (``l'ufficio``), which is one of the places ``.title()`` went wrong.
+
+    Args:
+        name: The object name as the graph or the collector stored it.
+
+    Returns:
+        The de-shouted name, or ``name`` unchanged when it is not shouted.
+    """
+    raw = str(name or "")
+    if not raw.strip() or not raw.isupper():
+        return raw
+
+    def _capitalize_word(word: str) -> str:
+        """Capitalize a word, and each hyphen-separated segment inside it."""
+        return "-".join(part.capitalize() for part in word.split("-"))
+
+    words = raw.split(" ")
+    lowered = {word.strip().lower() for word in words if word.strip()}
+    sentence_case = bool(lowered & _SENTENCE_CASE_PARTICLES) or any(
+        word.startswith(_SENTENCE_CASE_ELISIONS) for word in lowered
+    )
+    out: list[str] = []
+    seen_first = False
+    for word in words:
+        if not word:
+            out.append(word)
+            continue
+        if sentence_case and seen_first:
+            out.append(word.lower())
+        else:
+            out.append(_capitalize_word(word))
+        seen_first = True
+    return " ".join(out)
+
+
 def _looks_like_sid(value: str) -> bool:
     """Return True when ``value`` is a Windows SID string (``S-1-...``)."""
     return str(value or "").strip().upper().startswith("S-1-")
@@ -396,8 +505,10 @@ def humanize_principal_for_prose(
         # case-insensitive, so a collector that stored a user ALL-CAPS (``SVC_TGS``)
         # must not make the deliverable SHOUT it while the graph and the writeup
         # render ``svc_tgs``. A shouting well-known proper noun renders canonical
-        # (``BACKUP OPERATORS`` -> ``Backup Operators``); a shouting group's words
-        # are title-cased; a shouting user account is typed lower case. A
+        # (``BACKUP OPERATORS`` -> ``Backup Operators``); a shouting group is
+        # de-shouted through ``deshout_directory_name`` (NEVER ``.title()``, which
+        # mangles a localized name's particles); a shouting user account is typed
+        # lower case. A
         # mixed/lower-case sam is left verbatim (never re-cased) — so a real
         # ``administrator`` user stays ``administrator``, not the well-known form.
         if sam.isupper():
@@ -405,7 +516,7 @@ def humanize_principal_for_prose(
             if sam_wellknown is not None:
                 display_name = sam_wellknown
             elif is_group:
-                display_name = sam.title()
+                display_name = deshout_directory_name(sam)
             else:
                 display_name = sam.lower()
         else:
@@ -418,7 +529,9 @@ def humanize_principal_for_prose(
         display_name = canonical_wellknown
     elif name_part.isupper():
         # No ground-truth casing: de-shout by object class.
-        display_name = name_part.title() if is_group else name_part.lower()
+        display_name = (
+            deshout_directory_name(name_part) if is_group else name_part.lower()
+        )
     else:
         display_name = name_part
     if not sep or not realm:

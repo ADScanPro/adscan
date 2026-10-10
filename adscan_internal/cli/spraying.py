@@ -16,8 +16,9 @@ import os
 import re
 import shlex
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Callable, Protocol
 
 from adscan_internal import (
@@ -85,6 +86,7 @@ from rich.table import Table
 
 # Import from internal spraying module
 from adscan_internal.spraying import (
+    OwnedPrincipalDrop,
     SprayEligibilityResult,
     build_kerbrute_command,
     build_kerbrute_bruteforce_command,
@@ -819,7 +821,10 @@ def _pre2k_followup_is_actionable(shell: SprayShell, domain: str) -> bool:
     - One or zero enabled computers -> suppress (nothing meaningful to spray).
     """
 
-    if shell.domains_data.get(domain, {}).get("auth") != "auth":
+    # "pwned" counts as authenticated here: pre2k is a MACHINE-account technique
+    # (computer accounts are not governed by the user account-lockout policy), so
+    # an already-compromised user side does not make it redundant.
+    if shell.domains_data.get(domain, {}).get("auth") not in {"auth", "pwned"}:
         print_info_debug(
             "[spray] pre2k follow-up gate: disabled because there is no "
             "authenticated session (pre2k computer checks require auth)."
@@ -845,10 +850,14 @@ def _pre2k_followup_is_actionable(shell: SprayShell, domain: str) -> bool:
 def maybe_offer_ctf_pre2k_followup(
     shell: SprayShell, domain: str, *, reason: str
 ) -> None:
-    """Offer a focused pre2k follow-up when it was skipped so far."""
+    """Offer a focused pre2k follow-up when it was skipped so far.
 
-    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
-        return
+    Offered on an already-compromised domain too: pre2k is a machine-account
+    technique, so a compromised user side does not make it redundant. The other
+    guards (actionability, the persistent already-attempted marker, auto mode)
+    still keep it from being pointless or repeated.
+    """
+
     if not _pre2k_followup_is_actionable(shell, domain):
         return
 
@@ -2707,8 +2716,6 @@ def _exclude_locked_from_result(
     """
     if not locked_users or result is None:
         return result
-    from dataclasses import replace  # noqa: PLC0415
-
     from adscan_internal.spraying import ExcludedUser  # noqa: PLC0415
 
     locked = {str(u).casefold() for u in locked_users}
@@ -2945,12 +2952,47 @@ def compute_spraying_eligibility(
     available for the current domain context. If policy data cannot be
     obtained or parsed, it falls back to the full user list.
 
+    The spray set narrows in two structurally different steps, and this entry
+    point owns both so the result can disclose them separately: already-owned
+    principals are dropped first (an engagement success), then the remainder is
+    split by the lockout-safety rules (a safety decision). The owned drop is
+    attached to the result as :class:`OwnedPrincipalDrop` so the eligibility
+    panel can render the whole funnel; it does not change the spray set, which
+    is byte-identical to what the inline drop produced before.
+
     Returns:
         A `SprayEligibilityResult` instance (from `adscan_internal.spraying`)
         on success, or None on fatal errors (e.g., cannot read user list).
     """
+    file_users = _read_spray_user_list(user_list_file)
+    if file_users is None:
+        return None
+
+    # Exclude already-owned principals from the spray set: spraying an account we
+    # already control yields no new access, adds badPwdCount noise, and — because
+    # authenticating as that account (e.g. password-policy enumeration) resets its
+    # badPwdCount — would otherwise keep it perpetually "eligible" and re-sprayed.
+    # Centralized here (the eligibility SSOT) so the spray, the coverage
+    # denominator, and the selector all exclude owned users consistently.
+    candidates, owned_drop = _drop_owned_with_summary(
+        shell, domain, file_users, context="eligibility"
+    )
+    result = _compute_candidate_spraying_eligibility(
+        shell,
+        domain=domain,
+        file_users=candidates,
+        safe_threshold=safe_threshold,
+    )
+    if result is None:
+        return None
+    # SprayEligibilityResult is frozen — attach the funnel via replace().
+    return replace(result, owned_drop=owned_drop)
+
+
+def _read_spray_user_list(user_list_file: str) -> list[str] | None:
+    """Read the spray user list, or None when it cannot be read (reported)."""
     try:
-        file_users = read_user_list(user_list_file)
+        return read_user_list(user_list_file)
     except FileNotFoundError:
         # The user list was never generated — e.g. a prerequisite tool (kerbrute)
         # is unavailable in this run, so the enumeration/spray step that produces
@@ -2972,18 +3014,24 @@ def compute_spraying_eligibility(
         print_exception(show_locals=False, exception=exc)
         return None
 
+
+def _compute_candidate_spraying_eligibility(
+    shell: SprayShell,
+    *,
+    domain: str,
+    file_users: list[str],
+    safe_threshold: int,
+) -> SprayEligibilityResult | None:
+    """Split already-filtered spray candidates into eligible / excluded.
+
+    ``file_users`` has already had the owned-exclusion applied by
+    :func:`compute_spraying_eligibility`; this half owns only the lockout-policy
+    lookup and the safety split.
+    """
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
     marked_domain = mark_sensitive(domain, "domain")
-
-    # Exclude already-owned principals from the spray set: spraying an account we
-    # already control yields no new access, adds badPwdCount noise, and — because
-    # authenticating as that account (e.g. password-policy enumeration) resets its
-    # badPwdCount — would otherwise keep it perpetually "eligible" and re-sprayed.
-    # Centralized here (the eligibility SSOT) so the spray, the coverage
-    # denominator, and the selector all exclude owned users consistently.
-    file_users = _drop_owned(shell, domain, file_users, context="eligibility")
 
     lockout_threshold = None
     badpwd_by_user = None
@@ -3407,7 +3455,14 @@ def print_spraying_eligibility(
         bool: True when the calling flow should continue, False when the user
             cancels after reviewing excluded accounts.
     """
-    from adscan_core.theme import COLOR_AMBER, COLOR_CRIMSON, COLOR_MUTED, COLOR_SAGE
+    from adscan_core.theme import (
+        COLOR_AMBER,
+        COLOR_CRIMSON,
+        COLOR_MUTED,
+        COLOR_SAGE,
+        COLOR_STEEL,
+    )
+    from rich.box import SIMPLE as _BOX_SIMPLE
     from rich.text import Text
 
     marked_domain = mark_sensitive(domain, "domain")
@@ -3448,58 +3503,125 @@ def print_spraying_eligibility(
         )
         lockout_border = COLOR_AMBER
 
-    # ── Eligible / excluded counts ────────────────────────────────────────────
+    # ── The funnel: where every name in the user list went ───────────────────
+    # The spray set narrows twice, for two unrelated reasons, and an operator
+    # looking at a single "N eligible / M total" cannot tell them apart — the
+    # defect this ledger fixes. Already-compromised accounts are a RESULT (they
+    # are already ours); accounts held back are a SAFETY decision. Both are named,
+    # both are signed as subtractions, and the number that matters (what will
+    # actually be sprayed) carries the weight, below the rule.
     n_eligible = len(eligibility.eligible_users)
     n_excluded = len(eligibility.excluded_users)
-    n_total = len(eligibility.input_users)
+    n_candidates = len(eligibility.input_users)
     n_locked = sum(
         1 for e in eligibility.excluded_users if e.reason == "Account locked out"
     )
+    owned_drop = getattr(eligibility, "owned_drop", None)
+    n_owned = owned_drop.dropped if owned_drop else 0
+    # No drop recorded (legacy result) — the list IS what eligibility evaluated.
+    n_listed = owned_drop.list_size if owned_drop else n_candidates
 
-    eligible_text = Text()
-    eligible_text.append("  Domain: ", style="dim")
-    eligible_text.append(f"{marked_domain}\n", style="bold")
-    eligible_text.append("  Target users: ", style="dim")
-    eligible_text.append(
-        f"{n_eligible} eligible",
-        style=f"bold {COLOR_SAGE}" if n_eligible > 0 else f"bold {COLOR_CRIMSON}",
+    header = Text()
+    header.append("Domain  ", style="dim")
+    header.append(str(marked_domain), style="bold")
+
+    sprayed_style = f"bold {COLOR_SAGE}" if n_eligible > 0 else f"bold {COLOR_CRIMSON}"
+    funnel = Table(
+        box=_BOX_SIMPLE,
+        show_edge=False,
+        show_header=False,
+        show_footer=True,
+        pad_edge=False,
+        padding=(0, 2, 0, 0),
     )
-    eligible_text.append(f" / {n_total} total", style="dim")
-    if n_excluded > 0:
-        if n_locked > 0:
-            breakdown = f"{n_locked} locked out, {n_excluded - n_locked} near lockout"
-        else:
-            breakdown = "see table below"
-        eligible_text.append(
-            f"  ({n_excluded} excluded — {breakdown})",
-            style=f" {COLOR_AMBER}",
-        )
-    eligible_text.append("\n")
+    funnel.add_column(
+        "stage",
+        style="dim",
+        footer=Text("WILL BE SPRAYED", style=sprayed_style),
+        no_wrap=True,
+    )
+    funnel.add_column(
+        "count",
+        justify="right",
+        footer=Text(str(n_eligible), style=sprayed_style),
+        no_wrap=True,
+    )
+    funnel.add_column("why", style=f"dim {COLOR_MUTED}", footer="")
 
+    funnel.add_row("Users in the list", Text(str(n_listed), style="bold"), "")
+    if n_owned:
+        # Steel, not amber: these accounts are already compromised. That is the
+        # engagement working, never a limitation, so it must not read as a warning.
+        funnel.add_row(
+            Text("Already compromised", style=COLOR_STEEL),
+            Text(f"-{n_owned}", style=COLOR_STEEL),
+            "",
+        )
+    if n_excluded:
+        if n_locked and n_locked < n_excluded:
+            why = f"{n_locked} locked out, {n_excluded - n_locked} near lockout"
+        elif n_locked:
+            why = "locked out"
+        else:
+            why = "near lockout or no BadPwdCount data"
+        funnel.add_row(
+            Text("Held back for safety", style=COLOR_AMBER),
+            Text(f"-{n_excluded}", style=COLOR_AMBER),
+            why,
+        )
+
+    detail_text = Text()
     if eligibility.safe_remaining_threshold:
-        eligible_text.append("  Safe-attempt reserve: ", style="dim")
-        eligible_text.append(
-            f"{eligibility.safe_remaining_threshold} attempt(s) held back per account\n",
+        detail_text.append("Reserve  ", style="dim")
+        detail_text.append(
+            f"{eligibility.safe_remaining_threshold} attempt(s) held back per account",
             style="dim",
         )
     if eligibility.minimum_remaining_attempts is not None:
-        eligible_text.append(
-            "  Minimum remaining attempts (worst eligible account): ", style="dim"
-        )
         remaining = eligibility.minimum_remaining_attempts
         remaining_style = (
             f"bold {COLOR_CRIMSON}"
             if remaining <= 1
             else (f"bold {COLOR_AMBER}" if remaining <= 3 else f"bold {COLOR_SAGE}")
         )
-        eligible_text.append(f"{remaining}\n", style=remaining_style)
+        if detail_text.plain:
+            detail_text.append("  ·  ", style=f"dim {COLOR_MUTED}")
+        detail_text.append("worst account has ", style="dim")
+        detail_text.append(str(remaining), style=remaining_style)
+        detail_text.append(" left", style="dim")
 
-    if eligibility.notes:
-        eligible_text.append("\n")
-        for note in eligibility.notes:
-            eligible_text.append(f"  {note}\n", style=f"dim {COLOR_MUTED}")
+    # A spray can only discover a cleartext we do not already hold. When every
+    # dropped account is hash-only, the exclusion removed exactly the population
+    # where a hit would have been new intelligence — correct policy, real
+    # limitation, and not something the operator can infer from the counts.
+    note_lines: list[tuple[str, str]] = []
+    if n_owned:
+        # The names stay out of the panel on purpose: at 177 accounts a list is
+        # noise and pushes the tables below off screen. The count is here, the
+        # roster is one command away, and --debug logs the full set.
+        note_lines.append(
+            (
+                f"{n_owned} account(s) are already compromised: spraying them would "
+                "add lockout noise without new access. Run 'creds show' to list them.",
+                f"dim {COLOR_MUTED}",
+            )
+        )
+    hash_only_note = _owned_drop_hash_only_note(owned_drop)
+    if hash_only_note:
+        note_lines.append((hash_only_note, f"dim {COLOR_STEEL}"))
+    note_lines.extend((str(note), f"dim {COLOR_MUTED}") for note in eligibility.notes)
 
-    panel_content: list[object] = [lockout_badge, Text(""), eligible_text]
+    notes_text = Text()
+    for index, (line, style) in enumerate(note_lines):
+        if index:
+            notes_text.append("\n")
+        notes_text.append(line, style=style)
+
+    panel_content: list[object] = [lockout_badge, Text(""), header, funnel]
+    if detail_text.plain:
+        panel_content.extend([Text(""), detail_text])
+    if notes_text.plain:
+        panel_content.extend([Text(""), notes_text])
 
     print_panel(
         panel_content,
@@ -3586,8 +3708,12 @@ def print_spraying_eligibility(
                 if "unreadable" in policy
                 else (COLOR_MUTED if policy == "domain" else COLOR_SAGE)
             )
+            # Text(), never a bare str: an account name is an UNCONTROLLED value
+            # from the client's directory, and a '[/...]'-shaped one (e.g.
+            # 'svc[/opt/x]') is read by Rich as a closing tag — it raises
+            # MarkupError straight out of the print and aborts the command.
             elig_table.add_row(
-                marked_user,
+                Text(str(marked_user)),
                 badpwd_str,
                 remaining_str,
                 Text(policy, style=policy_style),
@@ -3627,7 +3753,13 @@ def print_spraying_eligibility(
                 if excluded.remaining_attempts is not None
                 else "-"
             )
-            excl_table.add_row(marked_user, excluded.reason, badpwd_str, remaining_str)
+            # Same markup hazard as the eligible table above.
+            excl_table.add_row(
+                Text(str(marked_user)),
+                Text(str(excluded.reason)),
+                badpwd_str,
+                remaining_str,
+            )
         print_table(excl_table)
         if len(eligibility.excluded_users) > len(preview):
             print_info_verbose(
@@ -4429,6 +4561,120 @@ def _enforce_lockout_guardrail(
     )
 
 
+# ---------------------------------------------------------------------------
+# Spray authorization SSOT - who decides whether the USER-SIDE spray runs
+# ---------------------------------------------------------------------------
+#
+# Three call shapes reach the user-side spray (the coverage-aware selector loop:
+# user-as-password, blank password, seasonal/adaptive, wordlist batches), and
+# they must not be told apart by ``interactive=`` alone - that flag answers a
+# different question ("may I prompt?"), not "who asked for this?":
+#
+#   1. the automatic scan phase, interactive -> offer it, the operator decides
+#   2. the automatic scan phase, ci          -> ADscan decides, never prompts
+#   3. an explicit ``spraying <domain>`` REPL command -> the operator already
+#      decided by typing it, so it is never re-asked and never gated
+#
+# An already-compromised domain changes only WHO decides and what the default
+# answer is. It never changes HOW SAFELY the spray runs: the eligibility
+# computation, the 2-attempt safe reserve, the deferred-queue reconciliation and
+# the executors' own margin enforcement are untouched by everything here.
+#
+# The pre2k computer-account step is deliberately NOT governed by this resolver.
+# It is a machine-account technique (computer accounts are not governed by the
+# user account-lockout policy), so a compromised user side does not make it
+# redundant; it runs on its own guards regardless of ``auth``.
+
+
+class SprayRequestOrigin(Enum):
+    """Who asked for this spray: the automatic scan flow, or the operator."""
+
+    SCAN_PHASE = "scan_phase"
+    OPERATOR_COMMAND = "operator_command"
+
+
+@dataclass(frozen=True)
+class UserSprayDecision:
+    """Resolved answer to "should the user-side spray run, and who decides?".
+
+    Attributes:
+        run: Whether the coverage selector loop may execute at all.
+        confirm_first: Whether the confirmation question is rendered before it.
+            True for every scan-phase call (the helper auto-resolves to
+            ``confirm_default`` when there is nobody to answer); False for an
+            explicit operator command and for the non-interactive skip.
+        confirm_default: The answer a non-interactive run resolves to, and the
+            default offered to an operator.
+        note: One-line operator-facing reason, set whenever the resolver declines.
+    """
+
+    run: bool
+    confirm_first: bool
+    confirm_default: bool
+    note: str = ""
+
+
+def _domain_is_pwned(shell: SprayShell, domain: str) -> bool:
+    """True when the domain is already fully compromised (``auth == "pwned"``)."""
+    return (
+        str(shell.domains_data.get(domain, {}).get("auth", "")).strip().lower()
+        == "pwned"
+    )
+
+
+def _pwned_spray_skip_note(domain: str) -> str:
+    """One-line reason plus the way out, for the ci skip on a compromised domain."""
+    marked_domain = mark_sensitive(domain, "domain")
+    return (
+        f"Password spraying skipped: {marked_domain} is already compromised, so a "
+        f"spray can no longer win initial access. Run `spraying {marked_domain}` "
+        "to spray anyway and look for password reuse."
+    )
+
+
+def _spray_stopped_on_compromise_note(domain: str) -> str:
+    """One-line reason when a spray hit compromised the domain mid-run."""
+    marked_domain = mark_sensitive(domain, "domain")
+    return f"{marked_domain} is now fully compromised: password spraying stopped here."
+
+
+def resolve_user_spray_decision(
+    shell: SprayShell,
+    domain: str,
+    *,
+    origin: SprayRequestOrigin,
+    interactive: bool,
+) -> UserSprayDecision:
+    """Decide whether the user-side spray runs, and who gets to decide.
+
+    Args:
+        shell: Active spray-capable shell.
+        domain: Target domain.
+        origin: Which of the three call shapes this is (see the block comment
+            above). An explicit operator command is never gated.
+        interactive: Whether there is an operator who can answer a prompt.
+
+    Returns:
+        The resolved :class:`UserSprayDecision`.
+    """
+    if origin is SprayRequestOrigin.OPERATOR_COMMAND:
+        # Typing `spraying <domain>` IS the request. Never ask permission to do
+        # what was just asked for, and never return silently.
+        return UserSprayDecision(run=True, confirm_first=False, confirm_default=True)
+    if not _domain_is_pwned(shell, domain):
+        return UserSprayDecision(run=True, confirm_first=True, confirm_default=True)
+    if interactive:
+        # Still offered - the operator may want credential-reuse discovery - but
+        # the default flips to No, because initial access is no longer the point.
+        return UserSprayDecision(run=True, confirm_first=True, confirm_default=False)
+    return UserSprayDecision(
+        run=False,
+        confirm_first=False,
+        confirm_default=False,
+        note=_pwned_spray_skip_note(domain),
+    )
+
+
 def _print_spray_decision_lockout_context(shell: SprayShell, domain: str) -> None:
     """Show a context panel at the spray decision, differentiated by session type.
 
@@ -4447,6 +4693,23 @@ def _print_spray_decision_lockout_context(shell: SprayShell, domain: str) -> Non
         return
     auth_state = str(shell.domains_data.get(domain, {}).get("auth", "")).strip().lower()
     is_auth = auth_state in {"auth", "pwned"}
+    if _domain_is_pwned(shell, domain):
+        # One panel, not two: the "why bother" and the "is it safe" both belong
+        # here, so the operator gets the whole decision in a single glance.
+        marked_domain = mark_sensitive(domain, "domain")
+        print_panel(
+            f"{marked_domain} is already compromised, so this spray is no longer "
+            "about initial access.\n"
+            "What it can still find: accounts that reuse a password you do not "
+            "hold in cleartext. That is reportable credential hygiene, and the "
+            "reuse often reaches systems outside the domain.\n"
+            "Lockout safety is unchanged: accounts near the threshold stay "
+            "excluded and the safety margin is still reserved.",
+            title="[bold]Already compromised - reduced spray value[/bold]",
+            border_style="yellow",
+            expand=False,
+        )
+        return
     if is_auth:
         print_panel(
             "ADscan protects the accounts while spraying:\n"
@@ -4470,13 +4733,39 @@ def _print_spray_decision_lockout_context(shell: SprayShell, domain: str) -> Non
 
 
 def ask_for_spraying(shell: SprayShell, domain: str) -> None:
-    """Prompt user to perform password spraying on a domain."""
+    """Scan-phase entry point: offer password spraying on a domain.
+
+    This is call shape 1/2 of the spray authorization SSOT (see
+    :func:`resolve_user_spray_decision`): the AUTOMATIC phase flow. An
+    already-compromised domain no longer makes the whole phase a silent no-op.
+    Interactively the user-side spray is still offered, with the default flipped
+    to No; non-interactively it is skipped with a printed reason, while the pre2k
+    computer-account step still runs.
+    """
+    from adscan_internal.interaction import is_non_interactive
     from adscan_internal.services.scan_phases import phase_is_enabled
 
     if not phase_is_enabled(shell, "password_spraying"):
         print_info("Password Spraying skipped (disabled in scan configuration).")
         return
-    if shell.domains_data[domain]["auth"] == "pwned":
+
+    interactive = not is_non_interactive(shell)
+    decision = resolve_user_spray_decision(
+        shell,
+        domain,
+        origin=SprayRequestOrigin.SCAN_PHASE,
+        interactive=interactive,
+    )
+    if not decision.confirm_first:
+        # Non-interactive on an already-compromised domain: no prompt, no hang,
+        # and the user-side spray is skipped exactly as before.
+        # run_spray_coverage prints the reason and still runs pre2k.
+        run_spray_coverage(
+            shell,
+            domain,
+            interactive=interactive,
+            origin=SprayRequestOrigin.SCAN_PHASE,
+        )
         return
 
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
@@ -4494,9 +4783,16 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
     marked_domain = mark_sensitive(domain, "domain")
     marked_auth_1 = mark_sensitive(shell.domains_data[domain]["auth"], "domain")
     _print_spray_decision_lockout_context(shell, domain)
+    # Deliberately the direct Rich seam, not the centralized ``confirm_ask``: the
+    # non-interactive case is already handled ABOVE by ``decision.confirm_first``
+    # (which never prompts on a compromised domain), so routing this one through
+    # the helper would only swap in its auto-resolve branch, which short-circuits
+    # to the default WITHOUT calling Confirm.ask and makes the operator-declines
+    # path unreachable. Migrating this prompt to the helper is a separate change
+    # with its own effect on ci; the only thing this one changes is the DEFAULT.
     wants_spraying = Confirm.ask(
         f"Do you want to perform password spraying on domain {marked_domain} using a {marked_auth_1} session?",
-        default=True,
+        default=decision.confirm_default,
     )
     if wants_spraying:
         if shell.domains_data[domain]["auth"] == "auth":
@@ -4504,10 +4800,11 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
         # Phase 4 uses the coverage-driven continue-loop (maximum coverage for ci,
         # default-yes guided flow for interactive start). The legacy do_spraying
         # menu stays available for manual / power-user invocation.
-        from adscan_internal.interaction import is_non_interactive
-
         run_spray_coverage(
-            shell, domain, interactive=not is_non_interactive(shell)
+            shell,
+            domain,
+            interactive=interactive,
+            origin=SprayRequestOrigin.SCAN_PHASE,
         )
         return
 
@@ -8369,34 +8666,110 @@ def _owned_usernames(shell: "SprayShell", domain: str) -> set[str]:
     return {str(user).casefold() for user in creds}
 
 
-def _drop_owned(
+def _drop_owned_with_summary(
     shell: "SprayShell", domain: str, names, *, context: str
-) -> list[str]:
-    """Return ``names`` minus already-owned principals — the SINGLE owned-exclusion
-    point for EVERY spray path (user sprays AND pre2k computer-account sprays).
+) -> tuple[list[str], OwnedPrincipalDrop]:
+    """Return ``names`` minus already-owned principals, plus the drop summary — the
+    SINGLE owned-exclusion point for EVERY spray path (user sprays AND pre2k
+    computer-account sprays).
 
     Matching is case-insensitive and tolerant of the trailing ``$`` on machine
     accounts, so a cracked ``WS01$`` in the credential store excludes both
     ``WS01$`` (pre2k list) and ``WS01``. ``context`` only labels the debug line.
+
+    The returned :class:`OwnedPrincipalDrop` is what lets the eligibility panel
+    account for every name in the source list. It also counts how many of the
+    dropped principals we hold ONLY an NT hash for: when that is all of them, the
+    spray cannot recover cleartext for any already-owned account, and the operator
+    should be told rather than left to infer it. The kept list is unaffected by
+    the summary, so the spray set is unchanged.
     """
     items = list(names)
     owned = _owned_usernames(shell, domain)
     if not owned:
-        return items
+        return items, OwnedPrincipalDrop(list_size=len(items))
     owned_bare = {name.rstrip("$") for name in owned}
-    kept = [
-        name
-        for name in items
-        if str(name).casefold() not in owned
-        and str(name).casefold().rstrip("$") not in owned_bare
-    ]
-    skipped = len(items) - len(kept)
-    if skipped:
+
+    def _is_owned(name) -> bool:
+        folded = str(name).casefold()
+        return folded in owned or folded.rstrip("$") in owned_bare
+
+    kept = [name for name in items if not _is_owned(name)]
+    dropped = [name for name in items if _is_owned(name)]
+    drop = OwnedPrincipalDrop(
+        list_size=len(items),
+        dropped=len(dropped),
+        hash_only=_count_hash_only_owned(shell, domain, dropped),
+    )
+    if drop.dropped:
         print_info_debug(
-            f"[spray] {context}: excluded {skipped} already-owned principal(s) "
-            f"from the spray set for {mark_sensitive(domain, 'domain')}"
+            f"[spray] {context}: excluded {drop.dropped} already-owned principal(s) "
+            f"from the spray set for {mark_sensitive(domain, 'domain')} "
+            f"({drop.hash_only} hash-only): "
+            + ", ".join(mark_sensitive(str(name), "user") for name in dropped)
         )
+    return kept, drop
+
+
+def _drop_owned(shell: "SprayShell", domain: str, names, *, context: str) -> list[str]:
+    """``_drop_owned_with_summary`` for callers that only need the kept list."""
+    kept, _drop = _drop_owned_with_summary(shell, domain, names, context=context)
     return kept
+
+
+def _owned_drop_hash_only_note(
+    owned_drop: "OwnedPrincipalDrop | None",
+) -> str | None:
+    """One line about what the owned-exclusion costs this run, or None.
+
+    A spray can only ever discover a cleartext the engagement does not already
+    hold, so when EVERY excluded account is hash-only the exclusion removed
+    exactly the population where a hit would have been new intelligence. The
+    exclusion is still right (authenticating as an owned account resets its
+    ``badPwdCount`` and would keep it perpetually eligible), but the consequence
+    is not inferable from the counts, so it is stated.
+
+    Returns ``None`` when no account was dropped, or when at least one dropped
+    account already has its cleartext — then nothing was lost that the spray
+    could have recovered.
+    """
+    if owned_drop is None or owned_drop.dropped <= 0:
+        return None
+    if owned_drop.hash_only < owned_drop.dropped:
+        return None
+    if owned_drop.dropped == 1:
+        return (
+            "The excluded account is hash-only, so this spray cannot recover its "
+            "cleartext password."
+        )
+    return (
+        "Every compromised account is hash-only, so this spray cannot recover a "
+        "cleartext password for any of them."
+    )
+
+
+def _count_hash_only_owned(shell: "SprayShell", domain: str, names) -> int:
+    """How many of ``names`` we hold ONLY an NT hash for (no cleartext).
+
+    Read straight off the already-loaded credential store, so this costs nothing
+    on the wire. A principal with no stored secret at all does not count: the
+    question is whether a spray hit could still recover a cleartext we lack, and
+    an account we hold cleartext for already answers it.
+    """
+    creds = (shell.domains_data.get(domain, {}) or {}).get("credentials", {}) or {}
+    if not isinstance(creds, dict):
+        return 0
+    by_user = {str(user).casefold(): secret for user, secret in creds.items()}
+    by_user_bare = {user.rstrip("$"): secret for user, secret in by_user.items()}
+    total = 0
+    for name in names:
+        folded = str(name).casefold()
+        secret = by_user.get(folded)
+        if secret is None:
+            secret = by_user_bare.get(folded.rstrip("$"))
+        if secret and _domain_hit_is_hash(shell, str(secret)):
+            total += 1
+    return total
 
 
 def _eligible_remaining_count(eligible_users, covered_lower: set[str]) -> int:
@@ -8942,7 +9315,12 @@ def _spray_mined_base_word(shell: "SprayShell", domain: str) -> None:
 
 
 def run_spray_coverage(
-    shell: "SprayShell", domain: str, *, interactive: bool, include_pre2k: bool = True
+    shell: "SprayShell",
+    domain: str,
+    *,
+    interactive: bool,
+    include_pre2k: bool = True,
+    origin: SprayRequestOrigin = SprayRequestOrigin.SCAN_PHASE,
 ):
     """Run the two-step spray phase (pre2k step + coverage-aware selector loop).
 
@@ -8960,6 +9338,9 @@ def run_spray_coverage(
             flow). The manual ``spraying`` REPL command sets this False — pre2k is
             its own command (``pre2k``) there, so the manual flow is just the
             coverage selector loop.
+        origin: Which call shape this is. ``OPERATOR_COMMAND`` (an explicit
+            ``spraying <domain>``) is never gated on the domain already being
+            compromised; see :func:`resolve_user_spray_decision`.
     """
     from adscan_internal.services.spray_deferred_queue import (
         DeferredSprayCombo,
@@ -8967,27 +9348,50 @@ def run_spray_coverage(
     )
 
     queue = DeferredSprayQueue()
-    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
-        return queue
+    # "Already compromised when we started" and "compromised BY this spray" are
+    # different facts, and only the second is a reason to stop (the goal was
+    # reached here). Gating on the raw ``auth == "pwned"`` state instead is what
+    # made the whole phase, and the manual command, a silent no-op.
+    entered_pwned = _domain_is_pwned(shell, domain)
 
-    # Step 1 — pre2k (educational, gated). Skipped for the manual selector-only flow.
+    # Step 1 — pre2k (educational, gated). Skipped for the manual selector-only
+    # flow. Runs regardless of ``auth``: computer accounts are not governed by
+    # the user account-lockout policy, so an already-compromised user side does
+    # not make the machine-account technique redundant. Its own guards (subphase
+    # config, an enabled-computer list, and the persistent already-attempted
+    # marker) keep it from being pointless or repeated.
     if include_pre2k:
         _run_pre2k_step(shell, domain, interactive=interactive)
-    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+        if not entered_pwned and _domain_is_pwned(shell, domain):
+            print_info(_spray_stopped_on_compromise_note(domain))
+            return queue
+
+    decision = resolve_user_spray_decision(
+        shell, domain, origin=origin, interactive=interactive
+    )
+    if not decision.run:
+        print_info(decision.note)
         return queue
 
     # Step 2 — coverage-aware selector loop.
     ci_done: set[str] = set()
     last_overview: "dict | None" = None
     for _iteration in range(_SPRAY_SELECTOR_MAX_ITER):
-        if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+        if not entered_pwned and _domain_is_pwned(shell, domain):
+            print_info(_spray_stopped_on_compromise_note(domain))
             break
         overview = _compute_spray_coverage_overview(shell, domain)
         if overview is None:
             # Coverage could not be computed (no user list / policy). Interactive
-            # falls back to the legacy menu once; ci has nothing safe to do.
+            # falls back to the legacy menu once; ci has nothing safe to do - but
+            # it says so instead of returning silently.
             if interactive:
                 do_spraying(shell, domain)
+            else:
+                print_info(
+                    "Password spraying skipped: no user list or account-lockout "
+                    "policy is available yet, so no spray can be run safely."
+                )
             break
         last_overview = overview
         rows = overview["rows"]

@@ -254,6 +254,8 @@ def _run_writeup(shell: Any, args: str) -> None:
 
     The single positional argument is an output directory, so the operator can
     drop the spine straight into a blog repository instead of the workspace.
+    ``--full-credentials`` is the explicit opt-in to one complete, unmasked
+    credential table on an engagement that withholds the values by default.
 
     The trigger is passed explicitly rather than left to the default, so this
     on-ramp is distinguishable in the funnel from the spine a lab scan writes on
@@ -263,10 +265,13 @@ def _run_writeup(shell: Any, args: str) -> None:
     from adscan_internal.services.writeup_spine import generate_writeup_spine
 
     tokens = shlex.split(args) if args.strip() else []
+    full_credentials = "--full-credentials" in tokens
+    positional = [token for token in tokens if not token.startswith("-")]
     generate_writeup_spine(
         shell,
-        output_dir=tokens[0] if tokens else None,
+        output_dir=positional[0] if positional else None,
         trigger=TRIGGER_REPL_WRITEUP,
+        full_credentials=full_credentials,
     )
 
 
@@ -418,7 +423,7 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
         short_help="Write a Markdown evidence spine for a lab writeup (you write the prose).",
         long_help=(
             "Usage:\n"
-            "  writeup [OUTPUT_DIR]\n\n"
+            "  writeup [--full-credentials] [OUTPUT_DIR]\n\n"
             "Record the mechanical part of a writeup while it is still on disk:\n"
             "the ports that answered, what the directory held, the chain as a\n"
             "mermaid diagram, every step that ran with its outcome and a public\n"
@@ -426,11 +431,16 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
             "technique, and the routes that went nowhere.\n\n"
             "It writes no analysis. The paragraphs that carry a writeup are left\n"
             "as marked, empty placeholders for you to fill in.\n\n"
-            "The output is a local Markdown draft under the workspace, marked\n"
-            "draft in its frontmatter. Nothing is published or uploaded.\n\n"
+            "The output is a local Markdown file under the workspace. A practice\n"
+            "target is marked draft in its frontmatter; a client engagement is\n"
+            "written as an engagement record and withholds the recovered secret\n"
+            "values, pointing at the workspace register instead. Pass\n"
+            "--full-credentials for the complete table with values. Nothing is\n"
+            "published or uploaded.\n\n"
             "Examples:\n"
             "  writeup\n"
             "  writeup ~/blog/content/posts/certified\n"
+            "  writeup --full-credentials\n"
         ),
         handler=_run_writeup,
         suggested_after=(),

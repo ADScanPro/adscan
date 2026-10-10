@@ -707,6 +707,33 @@ class TacticalFinding:
 
 
 @dataclass
+class AdcsEscFinding:
+    """One distinct ADCS ESC finding, for the tactical panel enumeration.
+
+    The operator panel lists each ESC technique × target rather than a bare
+    count, so the operator sees WHICH ESCs were found without guessing. All
+    three display fields are already operator-safe strings built in
+    :func:`adscan_internal.cli.intelligence._build_tactical_findings`: the
+    target is humanized through the node-label SSOT, the template name is read
+    from the edge ``notes`` (never ``details.template``), and the status is the
+    display token derived from the edge status + any collection-stage ESC14/15
+    confirm verdict.
+    """
+
+    #: Technique label, e.g. ``"ESC1"`` / ``"ESC13"``.
+    esc_label: str
+    #: Humanized escalation target (``"Domain Admins"``). When the target node
+    #: IS the vulnerable certificate template, this holds the template name.
+    target: str
+    #: Humanized certificate-template name, or ``None`` when the target already
+    #: is the template (so the panel does not render ``(template X)`` twice).
+    template: str | None = None
+    #: Display status token: ``confirmed`` / ``confirmation-pending`` /
+    #: ``attempted`` / ``hardened`` / ``theoretical``.
+    status: str = "theoretical"
+
+
+@dataclass
 class TacticalFindings:
     """Post-collection 1-hop findings for the tactical panel."""
 
@@ -715,6 +742,10 @@ class TacticalFindings:
     kerberoastable: list[str] = field(default_factory=list)
     asreproastable: list[str] = field(default_factory=list)
     adcs_esc_count: int = 0
+    #: Enumerated, deduplicated ADCS ESC findings (one per technique × target).
+    #: When populated, the panel lists them; ``adcs_esc_count`` stays the raw
+    #: qualifying-edge total for backward compatibility.
+    adcs_esc_paths: list[AdcsEscFinding] = field(default_factory=list)
 
     @property
     def has_content(self) -> bool:
@@ -723,6 +754,7 @@ class TacticalFindings:
             or self.kerberoastable
             or self.asreproastable
             or self.adcs_esc_count
+            or self.adcs_esc_paths
         )
 
 
@@ -864,6 +896,38 @@ def _build_findings_table(
             )
 
     return table
+
+
+#: ADCS ESC display status → colour. Confirmed (proven) and hardened (observed
+#: positive control) are green; confirmation-pending is amber; attempted steel;
+#: theoretical muted.
+_ADCS_ESC_STATUS_STYLE: dict[str, str] = {
+    "confirmed": _SAGE,
+    "hardened": _SAGE,
+    "confirmation-pending": _AMBER,
+    "attempted": _STEEL,
+    "theoretical": _MUTED,
+}
+
+
+def _format_adcs_esc_line(esc: "AdcsEscFinding") -> str:
+    """Render one ADCS ESC finding as a single operator-panel line.
+
+    Shape: ``ESC<n> → <target> (template <T>) · <status>``. Every interpolated
+    display value is markup-escaped (a bracketed token would corrupt the Rich
+    parser; see the square-bracket rule in CLAUDE.md).
+    """
+    from rich.markup import escape
+
+    style = _ADCS_ESC_STATUS_STYLE.get(esc.status, _MUTED)
+    template_part = (
+        f" [{_MUTED}](template {escape(esc.template)})[/]" if esc.template else ""
+    )
+    return (
+        f"[bold {_CRIMSON}]{escape(esc.esc_label)}[/] [{_MUTED}]→[/] "
+        f"{escape(esc.target)}{template_part} "
+        f"[{_MUTED}]·[/] [{style}]{escape(esc.status)}[/]"
+    )
 
 
 def print_tactical_findings(
@@ -1051,7 +1115,12 @@ def print_tactical_findings(
             f"[bold {_AMBER}]AS-REP Roastable[/]  [{_STEEL}]{len(findings.asreproastable)}[/]"
             f" [{_MUTED}]({names}{tail})[/]"
         )
-    if findings.adcs_esc_count:
+    # ADCS ESC enumeration renders as its own multi-line block below the
+    # roasting one-liners (never folded into ``roast_parts``, which holds single
+    # lines). A bare count is kept only as the fallback for a legacy caller that
+    # never populated the enumerated list.
+    adcs_total = len(findings.adcs_esc_paths) or findings.adcs_esc_count
+    if not findings.adcs_esc_paths and findings.adcs_esc_count:
         roast_parts.append(
             f"[bold {_CRIMSON}]ADCS ESC paths[/]  [{_STEEL}]{findings.adcs_esc_count}[/]"
         )
@@ -1061,6 +1130,23 @@ def print_tactical_findings(
             lines.append(Text(""))
         for part in roast_parts:
             lines.append(Text.from_markup(f"  {part}"))
+
+    if findings.adcs_esc_paths:
+        if lines:
+            lines.append(Text(""))
+        lines.append(
+            Text.from_markup(
+                f"  [bold {_CRIMSON}]ADCS ESC paths[/]  [{_STEEL}]{adcs_total}[/]"
+            )
+        )
+        cap = 8
+        for esc in findings.adcs_esc_paths[:cap]:
+            lines.append(Text.from_markup(f"    {_format_adcs_esc_line(esc)}"))
+        overflow = adcs_total - cap
+        if overflow > 0:
+            lines.append(
+                Text.from_markup(f"    [{_MUTED}]… and {overflow} more[/]")
+            )
 
     body = RichGroup(*lines)
 
@@ -1089,11 +1175,30 @@ def print_tactical_findings(
 
 @dataclass
 class SessionLootCard:
-    """Aggregated post-run findings for the end-of-run loot card."""
+    """Aggregated post-run findings for the end-of-run loot card.
+
+    ``da_paths`` counts routes to full domain compromise ADscan WALKED END TO
+    END, because it drives the "PWNED" banner. The two fields beside it exist so
+    a zero can say which kind of zero it is: with ``da_paths_reach`` the card can
+    distinguish "we found no route" from "we found routes and walked none", and
+    with ``paths_assessed`` it can distinguish both from "we never got to look".
+    Collapsing those three into one "No paths found" line is what let the card
+    read as a contradiction of the recap panel printed seconds later, which
+    states the reach figure: the two were answering different questions in
+    wording that looked like one question. Every figure comes from the
+    cardinality SSOT (``services/attack_path_counts``), injected by the caller
+    that can resolve it, never counted here.
+    """
 
     domain: str
     elapsed_seconds: float = 0.0
     da_paths: int = 0
+    #: Routes whose terminal IS full domain compromise, walked or not. The recap
+    #: panel's "N of M identified attack paths reach full domain compromise".
+    da_paths_reach: int = 0
+    #: ``False`` when no path cardinality could be read at all, so the card
+    #: reports a data gap instead of an absence of findings.
+    paths_assessed: bool = True
     critical_findings: int = 0
     high_findings: int = 0
     kerberoastable: int = 0
@@ -1131,8 +1236,20 @@ def print_session_loot_card(card: SessionLootCard) -> None:
             "DA paths",
             f"[bold {_CRIMSON}]{card.da_paths}[/]  [bold {_CRIMSON}]← PWNED[/]",
         )
+    elif not card.paths_assessed:
+        # Nothing was read, so nothing is known. Printing an absence here would
+        # credit the domain with a clean result ADscan never measured.
+        left.add_row("DA paths", f"[{_MUTED}]not evaluated[/]")
+    elif card.da_paths_reach > 0:
+        # Routes to full compromise exist; none was walked end to end. Saying
+        # "no paths found" would hide the exposure the recap panel reports.
+        left.add_row(
+            "DA paths",
+            f"[bold {_AMBER}]0 walked[/]  "
+            f"[{_MUTED}]{card.da_paths_reach} identified, none end to end[/]",
+        )
     else:
-        left.add_row("DA paths", f"[{_MUTED}]No paths found[/]")
+        left.add_row("DA paths", f"[{_MUTED}]no route identified[/]")
 
     left.add_row(
         "Critical / High",

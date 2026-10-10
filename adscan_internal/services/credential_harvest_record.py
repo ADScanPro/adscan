@@ -24,6 +24,12 @@ HARVEST_SOURCES: tuple[str, ...] = (
     "spraying",
     "kerberoasting",
     "asreproasting",
+    # A hash ADscan already held (directory replication, a SAM dump, shadow
+    # credentials) resolved by a LOCAL wordlist attack. The slug matches
+    # ``credential_origin.ORIGIN_OFFLINE_CRACK``, which the harvest panel hands
+    # straight to ``add_credential`` on activation, and which is already
+    # classified DERIVED rather than EXECUTED.
+    "offline_crack",
 )
 
 # Mirrors captured_credential_policy.CrackPolicy's status vocabulary plus the

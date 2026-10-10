@@ -20,6 +20,7 @@ services (``CredentialService`` and ``KerberosTicketService``).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import re
 from typing import Any, MutableMapping, Optional
 
@@ -44,6 +45,88 @@ class DomainCredentialUpdateResult:
     username: str
     is_hash: bool
     credential_changed: bool
+    #: Secret kind retained in the typed per-kind slot because it lost the
+    #: ranking (``"nt_hash"`` / ``"password"``), or ``""`` when nothing lost.
+    retained_secret_kind: str = ""
+    #: Provenance strength resolved for the secret that ended up stored.
+    provenance_strength: str = "unknown"
+
+
+class DomainCredentialDeleteOutcome(str, Enum):
+    """Why a scoped credential delete did or did not remove anything."""
+
+    #: The stored secret was the one named by the caller and it was removed.
+    DELETED = "deleted"
+
+    #: A credential exists for the principal, but it is NOT the secret the
+    #: caller named. Nothing was removed — this is the outcome that keeps a
+    #: rejection of one secret from destroying another.
+    KEPT_DIFFERENT_SECRET = "kept_different_secret"
+
+    #: The stored secret IS the one named, and it is material ADscan proved
+    #: (replicated, dumped, read from a directory attribute, or validated by an
+    #: authenticating act). Nothing was removed.
+    KEPT_PROVEN_PROVENANCE = "kept_proven_provenance"
+
+    #: No credential is stored for the principal.
+    ABSENT = "absent"
+
+
+@dataclass(frozen=True)
+class DomainCredentialDeleteResult:
+    """Outcome of a scoped (compare-and-delete) domain credential removal.
+
+    Attributes:
+        domain: Domain key used in ``domains_data``.
+        username: Normalized username the delete was scoped to.
+        outcome: What happened, as :class:`DomainCredentialDeleteOutcome`.
+        stored_secret_kind: ``"password"`` / ``"nt_hash"`` for the secret that
+            was found stored, or ``""`` when nothing was stored.
+        provenance_strength: Provenance strength resolved for the stored
+            secret (``"proven"`` / ``"candidate"`` / ``"unknown"``).
+    """
+
+    domain: str
+    username: str
+    outcome: DomainCredentialDeleteOutcome
+    stored_secret_kind: str = ""
+    provenance_strength: str = "unknown"
+
+    @property
+    def deleted(self) -> bool:
+        """True iff a credential was actually removed."""
+        return self.outcome is DomainCredentialDeleteOutcome.DELETED
+
+
+@dataclass(frozen=True)
+class CredentialStoreConsistencyReport:
+    """Coherence of ``credentials`` against its sibling ``credentials_meta``.
+
+    ``credentials_meta[user]`` exists to describe the secret in
+    ``credentials[user]``. A meta record with no credential is an incoherent
+    state that can only come from a bug: the store then advertises an owned
+    principal whose secret does not exist, while usable key material sits
+    beside it unread.
+
+    Attributes:
+        domain: Domain the report describes.
+        orphaned_meta_users: Principals holding a meta record with no
+            credential.
+        reconciled_users: Orphans whose credential was restored from material
+            the store still held.
+        unreconcilable_users: Orphans with no usable material left. Reported
+            rather than silently dropped; a secret is never invented.
+    """
+
+    domain: str
+    orphaned_meta_users: tuple[str, ...] = ()
+    reconciled_users: tuple[str, ...] = ()
+    unreconcilable_users: tuple[str, ...] = ()
+
+    @property
+    def is_coherent(self) -> bool:
+        """True when nothing diverges between the two maps."""
+        return not self.orphaned_meta_users
 
 
 @dataclass
@@ -216,19 +299,56 @@ class CredentialStoreService(BaseService):
         username: str,
         credential: str,
         is_hash: bool,
+        origin: str | None = None,
+        provenance_strength: str | None = None,
     ) -> DomainCredentialUpdateResult:
         """Add or update a domain credential in ``domains_data``.
 
-        The method mirrors the non-interactive semantics of the legacy CLI
-        credential handling:
+        The active secret for a principal is one string, because every
+        authentication path in the product resolves ``credentials[username]``
+        and expects a password or an NT hash there. What changed is HOW that one
+        string is chosen, and what happens to the secret that is not chosen.
 
-        * Ensures the ``\"credentials\"`` dictionary exists for the domain.
-        * Applies deduplication rules.
-        * Prefers plaintext over hashes:
-          - Do **not** replace a stored password with a hash.
-          - Do replace a stored hash with a password.
-        * Stores the final credential string without performing any checks.
+        **Ranking is by provenance first, format second.** Material ADscan
+        proved — replicated, dumped, read out of a directory attribute, or
+        validated by an authenticating act — outranks an unproven string
+        whatever its format. The old rule ranked format alone ("prefer plaintext
+        over hashes"), so a password scraped out of a ``description`` attribute
+        displaced a replicated NT hash and the proven material was gone. At
+        EQUAL provenance the format rule still applies, because a plaintext is
+        then strictly the more usable of the two.
+
+        **The loser is retained, never discarded.** A hash that loses to a
+        stored password is kept in the typed ``nt_hash`` slot (pass-the-hash and
+        Kerberos RC4 stay available); a password that loses to proven key
+        material is kept in the typed ``password`` slot. One slot per secret
+        KIND, so the single active-secret string never costs the operator
+        material that was recovered.
+
+        Args:
+            domains_data: Shared workspace domain mapping.
+            domain: Domain key in ``domains_data``.
+            username: Principal owning the credential (normalized to lower
+                case, matching every lookup in the codebase).
+            credential: The secret string.
+            is_hash: Whether the caller's secret is an NT/LM:NT hash.
+            origin: Optional machine-readable origin slug for THIS secret. When
+                given, the provenance strength is derived from it; when omitted
+                the comparison falls back to what the store already recorded.
+            provenance_strength: Optional explicit override of the derived
+                strength, for a caller that knows better than the slug.
+
+        Returns:
+            A :class:`DomainCredentialUpdateResult`.
         """
+        from adscan_internal.services.credentials.credential_origin import (  # noqa: PLC0415
+            CredentialProvenanceStrength,
+            classify_origin_provenance_strength,
+            rank_provenance_strength,
+        )
+        from adscan_internal.services.credentials.privilege_role import (  # noqa: PLC0415
+            resolve_secret_provenance_strength,
+        )
 
         domain_data = self.ensure_domain_entry(domains_data, domain)
 
@@ -244,31 +364,127 @@ class CredentialStoreService(BaseService):
         current_is_hash = self._looks_like_ntlm_hash(current_cred)
         credential_changed = False
         stored_is_hash = is_hash
+        retained_secret_kind = ""
+
+        meta = self._credential_meta_record(domain_data, username)
+        if provenance_strength is not None:
+            incoming_strength: Any = provenance_strength
+        elif origin:
+            incoming_strength = classify_origin_provenance_strength(origin)
+        else:
+            incoming_strength = CredentialProvenanceStrength.UNKNOWN
+        current_strength = (
+            resolve_secret_provenance_strength(meta, current_cred)
+            if current_cred is not None
+            else CredentialProvenanceStrength.UNKNOWN
+        )
+        incoming_rank = rank_provenance_strength(incoming_strength)
+        current_rank = rank_provenance_strength(current_strength)
+        stored_strength = incoming_strength
 
         if current_cred is None:
             credential_changed = True
+        elif current_cred == credential:
+            # Same string: nothing to rank, nothing to retain.
+            credential_changed = False
+            stored_is_hash = current_is_hash
+            stored_strength = current_strength
+        elif incoming_rank > current_rank:
+            # Proven material takes the slot from an unproven string whatever
+            # the formats are. The displaced secret is retained below.
+            credential_changed = True
+        elif incoming_rank < current_rank:
+            credential_changed = False
+            stored_is_hash = current_is_hash
+            stored_strength = current_strength
+        elif (not current_is_hash) and is_hash:
+            # Equal provenance: a stored plaintext is the more usable secret.
+            credential_changed = False
+            stored_is_hash = False
+            stored_strength = current_strength
         else:
-            # Prefer plaintext over hashes: never overwrite a password with a hash.
-            if (not current_is_hash) and is_hash:
-                credential_changed = False
-                stored_is_hash = False
-            # If we already have the same plaintext, treat as no-op.
-            elif (not is_hash) and current_cred == credential:
-                credential_changed = False
-                stored_is_hash = False
-            else:
-                credential_changed = current_cred != credential
-                stored_is_hash = is_hash if credential_changed else current_is_hash
+            credential_changed = True
 
         if credential_changed:
             domain_data["credentials"][username] = credential
+            if current_cred is not None:
+                retained_secret_kind = self._retain_superseded_secret(
+                    domain_data,
+                    username=username,
+                    secret=current_cred,
+                    is_hash=current_is_hash,
+                )
+        elif current_cred is not None and current_cred != credential:
+            retained_secret_kind = self._retain_superseded_secret(
+                domain_data,
+                username=username,
+                secret=credential,
+                is_hash=is_hash,
+            )
 
         return DomainCredentialUpdateResult(
             domain=domain,
             username=username,
             is_hash=stored_is_hash,
             credential_changed=credential_changed,
+            retained_secret_kind=retained_secret_kind,
+            provenance_strength=str(
+                getattr(stored_strength, "value", stored_strength) or "unknown"
+            ),
         )
+
+    # ------------------------------------------------------------------ #
+    # Typed per-kind secret slots (``credentials_meta``)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _credential_meta_record(
+        domain_data: MutableMapping[str, Any], username: str
+    ) -> dict[str, Any]:
+        """Return ``credentials_meta[username]`` as a dict (never ``None``)."""
+        meta_map = domain_data.get("credentials_meta")
+        if not isinstance(meta_map, dict):
+            return {}
+        record = meta_map.get(str(username or "").strip().lower())
+        return record if isinstance(record, dict) else {}
+
+    @classmethod
+    def _retain_superseded_secret(
+        cls,
+        domain_data: MutableMapping[str, Any],
+        *,
+        username: str,
+        secret: Any,
+        is_hash: bool,
+    ) -> str:
+        """Keep a secret that lost the active slot, in its typed slot.
+
+        One slot per secret KIND inside ``credentials_meta[username]``: the
+        existing ``nt_hash`` field, and ``password`` for a cleartext. Both are
+        additive, so a workspace written by an older build is unaffected and no
+        existing consumer sees a changed shape.
+
+        Returns:
+            The kind retained (``"nt_hash"`` / ``"password"``), or ``""`` when
+            there was nothing to keep.
+        """
+        text = str(secret or "").strip()
+        if not text:
+            return ""
+        key = str(username or "").strip().lower()
+        if not key:
+            return ""
+        meta_map = domain_data.get("credentials_meta")
+        if not isinstance(meta_map, dict):
+            meta_map = {}
+            domain_data["credentials_meta"] = meta_map
+        record = meta_map.get(key)
+        if not isinstance(record, dict):
+            record = {}
+        kind = "nt_hash" if (is_hash or cls._looks_like_ntlm_hash(text)) else "password"
+        record[kind] = text.lower() if kind == "nt_hash" else text
+        meta_map[key] = record
+        return kind
 
     def delete_domain_credential(
         self,
@@ -276,19 +492,235 @@ class CredentialStoreService(BaseService):
         domains_data: MutableMapping[str, Any],
         domain: str,
         username: str,
-    ) -> bool:
-        """Delete a stored domain credential if present.
+        secret: Any,
+        allow_proven: bool = False,
+    ) -> DomainCredentialDeleteResult:
+        """Remove ONE named secret for a principal — compare-and-delete.
+
+        ``secret`` is required and is the whole point: a disposal decision is
+        always about a specific secret (the one a verification rejected), never
+        about a principal's slot. Deleting by username alone removed whatever
+        the slot happened to hold, which is how the rejection of a wrong
+        scraped cleartext destroyed a replicated NT hash and its Kerberos keys
+        on a live engagement. Nothing is removed unless the stored secret IS
+        the one named.
+
+        Material whose provenance is PROVEN is additionally protected: a
+        replicated / dumped / directory-read / validated secret is not removed
+        here even when it matches. A verification that rejects proven material
+        is far more often a stale verification (a rotation, a lockout, a policy
+        or a clock) than evidence that the directory's own key material is
+        wrong, and the cost is not symmetric: keeping it risks nothing, because
+        the lockout argument for disposal is satisfied by not retrying the
+        secret, not by erasing it. An operator-directed removal is a different
+        act and goes through :meth:`purge_domain_credential_entry`.
+
+        Args:
+            domains_data: Shared workspace domain mapping.
+            domain: Domain key in ``domains_data``.
+            username: Principal the secret belongs to (case-insensitive).
+            secret: The exact secret the caller intends to remove.
+            allow_proven: Remove the secret even when its provenance is proven.
+                Reserved for an explicit operator instruction; the rejection
+                path never sets it.
 
         Returns:
-            True if a credential was removed, False otherwise.
+            A :class:`DomainCredentialDeleteResult` naming what happened.
         """
+        preview = self.preview_domain_credential_delete(
+            domains_data=domains_data,
+            domain=domain,
+            username=username,
+            secret=secret,
+            allow_proven=allow_proven,
+        )
+        if preview.outcome is not DomainCredentialDeleteOutcome.DELETED:
+            return preview
 
-        domain_data = domains_data.get(domain, {})
-        creds = domain_data.get("credentials", {})
-        if username in creds:
-            del creds[username]
-            return True
-        return False
+        domain_data = self._resolve_domain_data(domains_data, domain)
+        creds = domain_data.get("credentials") or {}
+        key = self._resolve_credential_key(creds, preview.username)
+        if key is None:
+            return DomainCredentialDeleteResult(
+                domain=domain,
+                username=preview.username,
+                outcome=DomainCredentialDeleteOutcome.ABSENT,
+            )
+        del creds[key]
+        self._prune_credential_sidecars(domain_data, key)
+        return preview
+
+    def preview_domain_credential_delete(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        username: str,
+        secret: Any,
+        allow_proven: bool = False,
+    ) -> DomainCredentialDeleteResult:
+        """Return what :meth:`delete_domain_credential` WOULD do, mutating nothing.
+
+        Exists so a UI can ask the operator only about a removal that can
+        actually happen: prompting and then refusing is worse than not
+        prompting, and the wording has to name the secret kind that is at
+        stake. ``DELETED`` here means "would be removed".
+        """
+        from adscan_internal.services.credentials.credential_origin import (  # noqa: PLC0415
+            CredentialProvenanceStrength,
+        )
+        from adscan_internal.services.credentials.privilege_role import (  # noqa: PLC0415
+            resolve_secret_provenance_strength,
+        )
+
+        domain_data = self._resolve_domain_data(domains_data, domain)
+        creds = domain_data.get("credentials") or {}
+        key = self._resolve_credential_key(creds, username)
+        if key is None:
+            return DomainCredentialDeleteResult(
+                domain=domain,
+                username=str(username or "").strip().lower(),
+                outcome=DomainCredentialDeleteOutcome.ABSENT,
+            )
+
+        stored = creds.get(key)
+        stored_kind = "nt_hash" if self._looks_like_ntlm_hash(stored) else "password"
+        strength = resolve_secret_provenance_strength(
+            self._credential_meta_record(domain_data, key), stored
+        )
+        strength_value = str(getattr(strength, "value", strength) or "unknown")
+
+        if not self._secrets_match(stored, secret):
+            outcome = DomainCredentialDeleteOutcome.KEPT_DIFFERENT_SECRET
+        elif (
+            not allow_proven
+            and strength_value == CredentialProvenanceStrength.PROVEN.value
+        ):
+            outcome = DomainCredentialDeleteOutcome.KEPT_PROVEN_PROVENANCE
+        else:
+            outcome = DomainCredentialDeleteOutcome.DELETED
+
+        return DomainCredentialDeleteResult(
+            domain=domain,
+            username=key,
+            outcome=outcome,
+            stored_secret_kind=stored_kind,
+            provenance_strength=strength_value,
+        )
+
+    @staticmethod
+    def _resolve_domain_data(
+        domains_data: MutableMapping[str, Any], domain: str
+    ) -> MutableMapping[str, Any]:
+        """Return the per-domain bucket, matched case-insensitively."""
+        domain_data = resolve_ci(domains_data, domain)
+        if isinstance(domain_data, MutableMapping):
+            return domain_data
+        fallback = domains_data.get(domain, {}) or {}
+        return fallback if isinstance(fallback, MutableMapping) else {}
+
+    def purge_domain_credential_entry(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        username: str,
+        reason: str,
+    ) -> bool:
+        """Remove a principal's WHOLE credential entry, on operator instruction.
+
+        Deliberately a separate, explicitly-named method rather than the
+        default the rejection path can reach: this removes the active secret
+        AND the sidecar records that describe it (``credentials_meta``,
+        ``kerberos_keys``), which is correct when a human says "delete this
+        credential" and destructive in every other case. A failed verification
+        must use :meth:`delete_domain_credential`.
+
+        Keeping the sidecars coherent is part of the contract. A meta record
+        left behind with no credential advertises an owned principal whose
+        secret does not exist, and that divergence is what
+        :func:`audit_domain_credential_store` then has to repair.
+
+        Args:
+            domains_data: Shared workspace domain mapping.
+            domain: Domain key in ``domains_data``.
+            username: Principal whose entry is removed (case-insensitive).
+            reason: Short machine-readable reason, for the debug trail
+                (``"operator_delete"`` / ``"operator_clear"``).
+
+        Returns:
+            ``True`` if an entry was removed.
+        """
+        from adscan_internal.rich_output import (  # noqa: PLC0415
+            mark_sensitive,
+            print_info_debug,
+        )
+
+        domain_data = resolve_ci(domains_data, domain)
+        if not isinstance(domain_data, MutableMapping):
+            domain_data = domains_data.get(domain, {}) or {}
+        creds = domain_data.get("credentials") or {}
+        key = self._resolve_credential_key(creds, username)
+        if key is None:
+            return False
+        del creds[key]
+        self._prune_credential_sidecars(domain_data, key)
+        print_info_debug(
+            f"[credential_store] purged credential entry for "
+            f"{mark_sensitive(key, 'user')} ({reason})"
+        )
+        return True
+
+    @staticmethod
+    def _resolve_credential_key(creds: Any, username: str) -> str | None:
+        """Return the stored key for ``username``, matched case-insensitively."""
+        if not isinstance(creds, dict):
+            return None
+        wanted = str(username or "").strip()
+        if not wanted:
+            return None
+        if wanted in creds:
+            return wanted
+        folded = wanted.casefold()
+        for candidate in creds:
+            if str(candidate or "").strip().casefold() == folded:
+                return candidate
+        return None
+
+    @staticmethod
+    def _secrets_match(stored: Any, candidate: Any) -> bool:
+        """Compare two secrets for disposal purposes.
+
+        Sensitive markers are invisible zero-width wrappers added for telemetry
+        scrubbing, so a marked copy of a secret is the SAME secret and must
+        compare equal: otherwise a scoped delete silently becomes a no-op
+        depending on which layer handed over the string. Hashes compare
+        case-insensitively (hex), passwords byte-exactly.
+        """
+        left = strip_sensitive_markers(str(stored or ""))
+        right = strip_sensitive_markers(str(candidate or ""))
+        if not left or not right:
+            return left == right
+        if CredentialStoreService._looks_like_ntlm_hash(
+            left
+        ) and CredentialStoreService._looks_like_ntlm_hash(right):
+            return left.casefold() == right.casefold()
+        return left == right
+
+    @staticmethod
+    def _prune_credential_sidecars(
+        domain_data: MutableMapping[str, Any], key: str
+    ) -> None:
+        """Drop the records that only describe a now-removed credential."""
+        for bucket_name in ("credentials_meta", "kerberos_keys"):
+            bucket = domain_data.get(bucket_name)
+            if not isinstance(bucket, dict):
+                continue
+            folded = str(key or "").strip().casefold()
+            for candidate in [
+                name for name in bucket if str(name or "").strip().casefold() == folded
+            ]:
+                bucket.pop(candidate, None)
 
     # ------------------------------------------------------------------ #
     # Local credentials
@@ -488,8 +920,7 @@ class CredentialStoreService(BaseService):
         for idx, existing in enumerate(bucket):
             if (
                 isinstance(existing, dict)
-                and str(existing.get("ccache_path") or "").strip()
-                == ticket.ccache_path
+                and str(existing.get("ccache_path") or "").strip() == ticket.ccache_path
             ):
                 bucket[idx] = payload
                 return True
@@ -511,7 +942,11 @@ class CredentialStoreService(BaseService):
         )
 
         domain_data = domains_data.get(domain, {})
-        bucket = domain_data.get("service_tickets", []) if isinstance(domain_data, dict) else []
+        bucket = (
+            domain_data.get("service_tickets", [])
+            if isinstance(domain_data, dict)
+            else []
+        )
         if not isinstance(bucket, list):
             return []
 
@@ -543,11 +978,18 @@ class CredentialStoreService(BaseService):
         if not normalized:
             return False
         domain_data = domains_data.get(domain, {})
-        bucket = domain_data.get("service_tickets", []) if isinstance(domain_data, dict) else []
+        bucket = (
+            domain_data.get("service_tickets", [])
+            if isinstance(domain_data, dict)
+            else []
+        )
         if not isinstance(bucket, list):
             return False
         for idx, entry in enumerate(bucket):
-            if isinstance(entry, dict) and str(entry.get("ccache_path") or "").strip() == normalized:
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("ccache_path") or "").strip() == normalized
+            ):
                 bucket.pop(idx)
                 return True
         return False
@@ -590,13 +1032,8 @@ class CredentialStoreService(BaseService):
         normalized_nt_hash = _normalize_hex_secret(nt_hash, expected_len=32)
         normalized_aes256 = _normalize_hex_secret(aes256, expected_len=64)
         normalized_aes128 = _normalize_hex_secret(aes128, expected_len=32)
-        if (
-            not normalized_username
-            or (
-                not normalized_nt_hash
-                and not normalized_aes256
-                and not normalized_aes128
-            )
+        if not normalized_username or (
+            not normalized_nt_hash and not normalized_aes256 and not normalized_aes128
         ):
             return None
 
@@ -690,7 +1127,9 @@ class CredentialStoreService(BaseService):
         )
 
     @staticmethod
-    def select_best_kerberos_key(material: KerberosKeyMaterial) -> tuple[str, str] | None:
+    def select_best_kerberos_key(
+        material: KerberosKeyMaterial,
+    ) -> tuple[str, str] | None:
         """Return the preferred reusable key as ``(kind, value)``.
 
         AES256 is preferred over AES128, with NT/RC4 as the compatibility
@@ -705,6 +1144,107 @@ class CredentialStoreService(BaseService):
         return None
 
 
+def looks_like_ntlm_hash(value: object) -> bool:
+    """Return True when ``value`` is an NT hash (32 hex) or ``LM:NT`` pair.
+
+    Module-level so a caller outside the service can classify a secret without
+    reaching for a protected method or depending on a shell helper that a given
+    call site may not have.
+    """
+    return CredentialStoreService._looks_like_ntlm_hash(value)
+
+
+def audit_domain_credential_store(
+    domains_data: MutableMapping[str, Any],
+    domain: str,
+    *,
+    repair: bool = False,
+) -> CredentialStoreConsistencyReport:
+    """Report (and optionally repair) divergence between the credential maps.
+
+    ``credentials_meta[user]`` describes the secret in ``credentials[user]``.
+    A meta record with no credential is incoherent by construction, and the
+    store then contradicts itself: the principal is advertised as recovered
+    (``credential_origin`` names the technique, AES keys sit in the record)
+    while nothing resolves its secret, so ownership checks read it as NOT
+    owned. Surfacing the divergence is cheap; leaving it silent is how a
+    destroyed credential looked like a perfectly healthy workspace.
+
+    Repair is strictly additive and restores only material the store ALREADY
+    holds: the ``nt_hash`` / ``password`` typed slot becomes the active secret
+    again, and recovered Kerberos keys are seeded into the typed
+    ``kerberos_keys`` store so AES pass-the-key is usable. A secret is never
+    invented, and an orphan with nothing usable left is reported as
+    unreconcilable rather than quietly dropped. Scoped to orphans on purpose:
+    a coherent principal's key material is left exactly as it is.
+
+    Args:
+        domains_data: Shared workspace domain mapping.
+        domain: Domain key in ``domains_data``.
+        repair: Restore what can be restored, instead of only reporting.
+
+    Returns:
+        A :class:`CredentialStoreConsistencyReport`.
+    """
+    domain_data = resolve_ci(domains_data, domain)
+    if not isinstance(domain_data, MutableMapping):
+        return CredentialStoreConsistencyReport(domain=domain)
+    creds = domain_data.get("credentials")
+    meta_map = domain_data.get("credentials_meta")
+    if not isinstance(meta_map, dict) or not meta_map:
+        return CredentialStoreConsistencyReport(domain=domain)
+    if not isinstance(creds, dict):
+        creds = {}
+
+    held = {str(name or "").strip().casefold() for name in creds}
+    orphans = [
+        str(name) for name in meta_map if str(name or "").strip().casefold() not in held
+    ]
+    if not orphans:
+        return CredentialStoreConsistencyReport(domain=domain)
+    if not repair:
+        return CredentialStoreConsistencyReport(
+            domain=domain, orphaned_meta_users=tuple(sorted(orphans))
+        )
+
+    store = CredentialStoreService()
+    if not isinstance(domain_data.get("credentials"), dict):
+        domain_data["credentials"] = {}
+    reconciled: list[str] = []
+    unreconcilable: list[str] = []
+    for name in sorted(orphans):
+        record = meta_map.get(name)
+        if not isinstance(record, dict):
+            unreconcilable.append(name)
+            continue
+        restored = False
+        nt_hash = _normalize_hex_secret(record.get("nt_hash"), expected_len=32)
+        password = str(record.get("password") or "").strip()
+        secret = nt_hash or password
+        if secret:
+            domain_data["credentials"][str(name).strip().lower()] = secret
+            restored = True
+        material = store.store_kerberos_key_material(
+            domains_data=domains_data,
+            domain=domain,
+            username=str(name),
+            nt_hash=nt_hash or None,
+            aes256=record.get("aes256_key") or record.get("aes256"),
+            aes128=record.get("aes128_key") or record.get("aes128"),
+            source="credential_store_reconcile",
+        )
+        if material is not None:
+            restored = True
+        (reconciled if restored else unreconcilable).append(str(name))
+
+    return CredentialStoreConsistencyReport(
+        domain=domain,
+        orphaned_meta_users=tuple(sorted(orphans)),
+        reconciled_users=tuple(reconciled),
+        unreconcilable_users=tuple(unreconcilable),
+    )
+
+
 def _normalize_hex_secret(value: str | None, *, expected_len: int) -> str:
     """Return a lowercase hex secret only when it has the expected length."""
     candidate = str(value or "").strip().lower()
@@ -713,6 +1253,7 @@ def _normalize_hex_secret(value: str | None, *, expected_len: int) -> str:
     if not re.fullmatch(r"[0-9a-f]+", candidate):
         return ""
     return candidate
+
 
 # --------------------------------------------------------------------------- #
 # Service-ticket persistence + host-scoped resolution (shared, single source)
@@ -1490,9 +2031,7 @@ def resolve_execution_credential(
         return hit
     # No service-matched ticket — accept any non-expired ticket for this host
     # (a ccache carrying the TGT serves every service on the host).
-    return resolve_scoped_ticket_for_host(
-        shell, domain=domain, host=host, service=""
-    )
+    return resolve_scoped_ticket_for_host(shell, domain=domain, host=host, service="")
 
 
 # --------------------------------------------------------------------------- #

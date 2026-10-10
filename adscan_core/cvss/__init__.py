@@ -7,7 +7,9 @@ This package exposes two distinct concepts:
   no CVSS Base and none may be presented for it.
 - ADscan's own contextual priority score for environment-aware prioritization.
 
-The client-facing names for both live in :mod:`adscan_core.cvss.labels`.
+The client-facing names for both live in :mod:`adscan_core.cvss.labels`, and
+whether a deliverable prints the CVSS Base at all is decided by
+:mod:`adscan_core.cvss.disclosure` (default: it does not).
 """
 
 from adscan_core.cvss.calculator import (
@@ -31,6 +33,10 @@ from adscan_core.cvss.contextual_rules import (
     VulnCvssDefinition,
     get_vuln_cvss_definition,
 )
+from adscan_core.cvss.disclosure import (
+    CVSS_BASE_DISCLOSURE_ENV,
+    cvss_base_disclosure_enabled,
+)
 from adscan_core.cvss.labels import (
     ADSCAN_PRIORITY_LABEL,
     ADSCAN_PRIORITY_SHORT_LABEL,
@@ -47,6 +53,7 @@ from adscan_core.cvss.models import (
 from adscan_core.cvss.severity_mapper import (
     format_score_label,
     score_to_severity,
+    severity_bands,
     severity_to_min_score,
 )
 from adscan_core.cvss.vector_score import (
@@ -69,6 +76,8 @@ __all__ = [
     "make_global_report_priority_fn",
     "make_report_cvss_base_fn",
     "make_report_priority_fn",
+    "CVSS_BASE_DISCLOSURE_ENV",
+    "cvss_base_disclosure_enabled",
     "CVSS_RULES",
     "VulnCvssDefinition",
     "get_vuln_cvss_definition",
@@ -83,6 +92,7 @@ __all__ = [
     "CvssElevationRule",
     "format_score_label",
     "score_to_severity",
+    "severity_bands",
     "severity_to_min_score",
     "parse_vector",
     "score_from_vector",

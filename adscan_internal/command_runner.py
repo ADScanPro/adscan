@@ -39,6 +39,87 @@ class CommandSpec:
     # emitting incremental output (a status tick every few seconds). ``None``
     # (default) preserves the original behaviour: no silence watchdog.
     silence_timeout: Optional[float] = None
+    # STREAMING mode only (requires ``on_line``): a CALLER-driven stop. Polled on
+    # every read tick; when it returns ``True`` the process is asked to stop and
+    # the command returns normally with the output collected so far — no
+    # exception, because this is not a failure but the caller deciding it has
+    # seen enough. Use it when the incremental output itself tells the caller the
+    # command is not worth finishing (e.g. a hashcat ETA that already exceeds the
+    # operator's remaining budget), so the decision happens seconds in rather
+    # than after the whole run.
+    #
+    # The stop is GRACEFUL first (terminate, then kill after a short grace), so a
+    # child that flushes its own output on termination still does. That is what
+    # makes it safe for a cracker: hashcat writes each recovery to its potfile as
+    # it happens, so stopping it loses nothing already found.
+    abort_check: Optional[Callable[[], bool]] = None
+
+
+#: How long a cooperatively-aborted child is given to exit on its own after being
+#: asked to stop, before it is killed outright. Generous enough for a cracker to
+#: finish its own shutdown and flush, short enough that an operator who just
+#: answered a prompt is not left waiting on it.
+_ABORT_GRACE_SECONDS = 10.0
+
+
+def _is_posix_host() -> bool:
+    """Whether this host has POSIX process groups, via the PAL (never ``os.name``)."""
+    try:
+        from adscan_core.pal.platform import is_posix  # noqa: PLC0415
+
+        return bool(is_posix())
+    except Exception:  # noqa: BLE001 — unknown platform behaves like Windows
+        return False
+
+
+def _abort_requested(abort_check: Callable[[], bool]) -> bool:
+    """Poll ``abort_check``, treating any failure as "do not abort".
+
+    Best-effort by design: a predicate that raises must never be the reason a
+    legitimate command dies, so an unusable one simply lets the command run on.
+    """
+    try:
+        return bool(abort_check())
+    except Exception:  # noqa: BLE001 — a broken predicate never stops a command
+        return False
+
+
+def _stop_process(proc: "subprocess.Popen[Any]", *, own_group: bool) -> None:
+    """Ask ``proc`` to stop, then kill it if it outstays its grace period.
+
+    Termination goes through the PAL rather than a raw signal, so the same call
+    works on Windows, where there are no POSIX signals. Graceful first: a child
+    that flushes its own output on termination (a cracker writing recovered
+    plaintexts) gets the chance to.
+
+    ``own_group`` says the child was launched into its own process group, which
+    is what the abort path does on POSIX. The whole group is then signalled, so
+    the stop reaches the real worker even when a ``shell=True`` launch left a
+    shell between us and it. Without that guarantee only the direct child is
+    signalled, because signalling OUR group would take ADscan down with it.
+    """
+    from adscan_core.pal import process as pal_process  # noqa: PLC0415
+
+    def _signal(force: bool) -> None:
+        try:
+            if own_group:
+                pal_process.terminate_process_group(proc.pid, force=force)
+            else:
+                pal_process.terminate_process(proc.pid, force=force)
+        except Exception:  # noqa: BLE001 — best-effort; the kill below follows
+            pass
+
+    _signal(False)
+    try:
+        proc.wait(timeout=_ABORT_GRACE_SECONDS)
+        return
+    except Exception:  # noqa: BLE001 — still alive (or unwaitable); force it
+        pass
+    _signal(True)
+    try:
+        proc.wait(timeout=_ABORT_GRACE_SECONDS)
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
 
 
 def _extract_non_empty_lines(text: str | None) -> list[str]:
@@ -329,6 +410,15 @@ class CommandRunner:
             popen_kwargs["env"] = dict(spec.env)
         if spec.cwd is not None:
             popen_kwargs["cwd"] = spec.cwd
+        # An abortable launch goes into its OWN process group (POSIX only), so
+        # the cooperative stop can signal the whole group and reach the real
+        # worker even behind a ``shell=True`` shell. Signalling our own group
+        # instead would take ADscan down with the child, which is why this is
+        # opt-in per launch rather than the default for every streamed command.
+        own_group = False
+        if spec.abort_check is not None and _is_posix_host():
+            popen_kwargs["process_group"] = 0
+            own_group = True
 
         on_line = spec.on_line
         collected: list[str] = []
@@ -351,12 +441,21 @@ class CommandRunner:
         # reset on every chunk (any output — status ticks AND non-status banners
         # like "Starting autotune. Please be patient…" — counts as "alive").
         last_output_at = time.perf_counter()
+        aborted = False
         try:
             assert proc.stdout is not None
             selector = selectors.DefaultSelector()
             selector.register(proc.stdout, selectors.EVENT_READ)
             while True:
                 now = time.perf_counter()
+                if spec.abort_check is not None and _abort_requested(spec.abort_check):
+                    # The CALLER has seen enough. Stop gracefully so the child
+                    # flushes, keep everything collected so far, and return
+                    # normally: this is a decision, not a failure, so it must not
+                    # look like one to the caller's error handling.
+                    aborted = True
+                    _stop_process(proc, own_group=own_group)
+                    break
                 if (
                     spec.timeout is not None
                     and (now - started_at) > spec.timeout
@@ -420,7 +519,7 @@ class CommandRunner:
 
         returncode = proc.wait()
         stdout = "\n".join(collected)
-        if spec.check and returncode != 0:
+        if spec.check and returncode != 0 and not aborted:
             raise subprocess.CalledProcessError(returncode, spec.command, output=stdout)
         result: ExecutionResult = subprocess.CompletedProcess(
             spec.command, returncode, stdout, None
@@ -430,6 +529,7 @@ class CommandRunner:
             "_adscan_elapsed_seconds",
             max(0.0, time.perf_counter() - started_at),
         )
+        setattr(result, "_adscan_aborted", aborted)
         return result
 
 

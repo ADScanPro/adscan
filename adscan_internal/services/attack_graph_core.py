@@ -35,7 +35,7 @@ from adscan_core.reporting.unauthenticated_reach import (
     reached_via_from_entry_label,
     reached_via_from_notes,
 )
-from adscan_internal.services import attack_path_progress
+from adscan_internal.services import attack_path_progress, step_actor_resolution
 from adscan_internal.services.domain_controller_classifier import (
     RID_DOMAIN_CONTROLLERS,
     RODC_TARGET_PRIORITY_RANK,
@@ -46,17 +46,16 @@ from adscan_internal.services.domain_controller_classifier import (
 from adscan_internal.models.domain import resolve_domain_controllers
 from adscan_internal.services.adcs_target_filter import is_adcs_tier_zero_group
 from adscan_internal.services.privileged_group_classifier import (
-    classify_privileged_membership,
     is_dependency_only_tier_zero_group,
     is_future_followup_tier_zero_group,
     is_followup_terminal_group,
     is_graph_extension_group,
-    normalize_group_name,
 )
 
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
+from adscan_internal.services.well_known_principals import is_non_compromisable_source
 from adscan_internal.services.path_state import COVERAGE_SAMPLE_STATUS
 from adscan_internal.services.technique_priority import path_technique_keys
 from adscan_internal.services.attack_step_catalog import (
@@ -66,9 +65,6 @@ from adscan_internal.services.attack_step_catalog import (
     required_context_for_relation,
 )
 from adscan_internal.services.smb_exclusion_policy import is_globally_excluded_smb_share
-from adscan_internal.services.destructive_action_policy import (
-    safety_abstention_notes as _safety_abstention_notes,
-)
 from adscan_internal.workspaces import read_json_file, write_json_file
 from adscan_internal.workspaces.state import migrate_legacy_attack_graph
 from adscan_internal.services.tier_lattice import (
@@ -183,6 +179,22 @@ _CONTEXT_TRANSPARENT_KEYS: frozenset[str] = frozenset(
         _SQLACCESS_KEY,
         _MSSQL_LINKED_KEY,
     }
+)
+
+
+#: Relations the catalog registers as pure graph-expansion CONTEXT rather than a
+#: technique ADscan executes (MemberOf, Contains, HasSession, …), lower-cased.
+#:
+#: Derived from the ONE registry SSOT
+#: (``attack_step_support_registry.CONTEXT_ONLY_RELATIONS``, itself
+#: ``get_relation_notes_by_support_kind("context")``), never re-declared as a
+#: literal: a relation added to the catalog as ``context`` must reach every
+#: consumer, and a hand-written set is how one consumer silently keeps counting
+#: a contextual hop as a real technique. The sibling derivations live in
+#: ``attack_paths_core``, ``attack_graph_service``, ``tier_lattice`` and
+#: ``lite_html_report``; all of them read this same registry key.
+_CONTEXT_RELATIONS_LOWER: frozenset[str] = frozenset(
+    str(rel).strip().lower() for rel in CONTEXT_ONLY_RELATIONS
 )
 
 
@@ -783,7 +795,133 @@ def _is_nontraversable_attack_edge(
                 and str(target_node.get("kind") or "").strip().lower() == "computer"
             ):
                 return True
+    # Machine / control-plane NT-AUTHORITY SOURCE (System / LocalService /
+    # NetworkService) — not a compromisable attack source. Its ACE over an AD
+    # object is a by-design grant, never an escalation a foothold can walk (you
+    # cannot "become SYSTEM" as a reachable principal). The edge is KEPT in the
+    # graph for ACL/inventory completeness (same class as WriteSPN / shadow-creds)
+    # but is non-traversable, so DFS + reachability + choke-point all inherit it.
+    if isinstance(nodes_map, dict):
+        source_node = nodes_map.get(str(edge.get("from") or "").strip())
+        if isinstance(source_node, dict) and is_non_compromisable_source(
+            _node_object_sid(source_node)
+        ):
+            return True
     return False
+
+
+def _node_object_sid(node: dict[str, Any]) -> str:
+    """Return a graph node's invariant SID, or an empty string.
+
+    Reads every shape the SID is carried in across the graph: top-level
+    ``objectId`` / ``objectid`` (native nodes), and ``properties.objectid`` /
+    ``properties.objectsid`` (synthetic well-known nodes stamp it under
+    ``properties``). Mirrors the resolution the findings gate uses so the
+    traversal and finding surfaces read the same identifier.
+    """
+    if not isinstance(node, dict):
+        return ""
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return str(
+        node.get("objectId")
+        or node.get("objectid")
+        or props.get("objectid")
+        or props.get("objectsid")
+        or ""
+    ).strip()
+
+
+def is_traversable_attack_edge(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any] | None,
+) -> bool:
+    """Return True when *edge* may enter ANY attack traversal or reachability flood.
+
+    The ONE public edge-admission gate for every path/reachability computation in
+    ADscan. It is the exact inverse of :func:`_is_nontraversable_attack_edge`, so
+    the DFS (through :func:`build_expansion_view`) and the k-independent
+    reachability / choke-point floods
+    (:mod:`adscan_internal.services.attack_reachability`,
+    :mod:`adscan_internal.services.chokepoint_cardinality`) all decide
+    "is this edge traversable" through the SAME predicate — consistency BY
+    CONSTRUCTION, not by duplicated per-consumer filters.
+
+    This matters because a share-access edge (``ReadShare`` / ``WriteShare`` /
+    ``FullControlShare``) is persisted in ``attack_graph.json`` as an EXPOSURE
+    finding but is NOT a host-compromise transition. The DFS already excludes it;
+    a reachability flood that walks the raw edge set instead would cross a
+    ``Everyone --FullControlShare--> DC$`` edge and falsely report every standard
+    user as reaching full domain compromise. Routing every flood through this gate
+    is the fix for that class.
+
+    Note the MemberOf-priority suppression (:func:`_build_priority_memberof_suppression`)
+    is deliberately NOT part of this gate: it is a DFS-only path-collapse heuristic
+    (keep one redundant ``MemberOf`` when a principal belongs to several
+    direct-compromise groups), not a traversability decision. Applying it to a pure
+    reachability flood would UNDERCOUNT distinct reachable terminals.
+    :func:`build_expansion_view` layers it on top of this gate for the DFS only.
+
+    Args:
+        edge: One graph edge dict.
+        nodes_map: The graph ``nodes`` dict (id -> node). When ``None`` the
+            class-aware ``WriteSPN`` check is skipped (the relation-only exclusions
+            — share-access / shadow-creds / bulk-read — still apply), so callers
+            without node context degrade safely.
+
+    Returns:
+        ``True`` when the edge is a traversable compromise transition.
+    """
+    return not _is_nontraversable_attack_edge(edge, nodes_map)
+
+
+def build_admissible_adjacency(
+    nodes_map: dict[str, Any] | None,
+    edges: list[dict[str, Any]],
+    *,
+    reverse: bool = False,
+) -> dict[str, set[str]]:
+    """Return the admissible reachability adjacency both flood directions share.
+
+    Builds ``{from_id: {to_id, ...}}`` (or the transposed ``{to_id: {from_id,
+    ...}}`` when ``reverse=True``) over ONLY the edges that pass the shared
+    edge-admission gate :func:`is_traversable_attack_edge`. This is the SSOT the
+    reachability / choke-point floods build their adjacency from, so they walk the
+    SAME traversable edge set the DFS walks — never the raw edge set (which carries
+    the non-compromise share-access edges that inflate exposure to a false 100%).
+
+    It is the simple neighbour-set form the floods need (reachability is monotone,
+    so a plain forward/reverse flood over this adjacency is correct); the DFS keeps
+    its richer per-edge adjacency in :func:`build_expansion_view`, but both consume
+    the one admission predicate.
+
+    Args:
+        nodes_map: The graph ``nodes`` dict (id -> node), for the class-aware
+            ``WriteSPN`` exclusion. ``None`` degrades safely (relation-only
+            exclusions still apply).
+        edges: The graph ``edges`` list.
+        reverse: When ``True`` build the reverse adjacency ``to -> {from}`` (for a
+            backward flood from the value terminals). Default forward.
+
+    Returns:
+        A mapping from a node id to the set of admissible neighbour node ids.
+    """
+    adjacency: dict[str, set[str]] = {}
+    if not isinstance(edges, list):
+        return adjacency
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if not is_traversable_attack_edge(edge, nodes_map):
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if not from_id or not to_id:
+            continue
+        if reverse:
+            adjacency.setdefault(to_id, set()).add(from_id)
+        else:
+            adjacency.setdefault(from_id, set()).add(to_id)
+    return adjacency
 
 
 # ── Well-known SIDs that expand to the low-priv authenticated population ─────
@@ -1184,7 +1322,30 @@ def load_attack_graph(path: Path) -> dict[str, Any] | None:
             pass
     _backfill_edge_kinds(data)
     _backfill_privilege_tier(data)
+    _backfill_privileged_group_escalations(data)
     return data
+
+
+def _backfill_privileged_group_escalations(graph: dict[str, Any]) -> None:
+    """In-memory backfill of the privileged-group escalation edges.
+
+    A fresh scan derives these at collection time
+    (``collector/persistence._persist_derived_attack_steps``). A workspace
+    collected before that derivation existed carries the ``MemberOf`` edge INTO
+    Backup Operators / DnsAdmins / Print Operators but no edge OUT of the group,
+    so the group reads as a dead end and a direct member's membership never
+    materialises a path to domain compromise. The web CTEM reopens saved
+    workspaces, so skipping this would reintroduce the collector-only divergence
+    class that already cost us once (the sync-account Tier-0 promotion).
+
+    Calls the SAME emitter as the collector, which is additive and idempotent,
+    so a graph that already carries the edges is left unchanged.
+    """
+    from adscan_internal.services.privileged_group_escalation import (  # noqa: PLC0415
+        derive_privileged_group_escalation_edges,
+    )
+
+    derive_privileged_group_escalation_edges(graph)
 
 
 def _backfill_privilege_tier(graph: dict[str, Any]) -> None:
@@ -3180,9 +3341,7 @@ def _build_local_reuse_useful_node_ids(
     high-value node.
     """
     useful: set[str] = set()
-    context_relations = {
-        str(rel).strip().lower() for rel in CONTEXT_ONLY_RELATIONS.keys()
-    }
+    context_relations = _CONTEXT_RELATIONS_LOWER
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -4071,10 +4230,21 @@ def _build_implicit_session_followup_overlay(
     divergent variants are generated, never an explosion.
 
     CRITICAL — this is intentionally the ONLY follow-up set ``HasSession``
-    unlocks. It does NOT receive the host self-credential follow-ups (``DumpLSA``
-    / ``DumpDPAPI`` / ``DumpSAM``) that a local-admin Computer arrival gets:
-    those are minted by :func:`_build_implicit_dumplsa_overlay` on COMPUTER nodes
-    only, never on the user nodes this overlay targets.
+    unlocks. It does NOT receive the host self-credential follow-up ``DumpLSA``
+    that a local-admin Computer arrival gets: that is minted by
+    :func:`_build_implicit_dumplsa_overlay` on COMPUTER nodes only, never on the
+    user nodes this overlay targets.
+
+    ``DumpDPAPI`` and ``DumpSAM`` are deliberately absent from BOTH overlays and
+    are NOT host self-credential follow-ups. Per the SSOT
+    (``services/post_exploitation/access_followups.py``) they are LATERAL-
+    credential follow-ups: the execution layer persists a DPAPI dump's secret
+    under the recovered AD principal and a SAM dump's hashes under the host's
+    LOCAL accounts, so each emits a DIFFERENT principal and the shape would be
+    ``host -> dump -> other_principal``, not a self-loop. Neither has a
+    graph-edge producer today; they reach the operator as interactive follow-up
+    ACTIONS. Adding a producer is separate work and must model that lateral
+    shape.
 
     The overlay is computed once per DFS call and never persisted to disk.
     """
@@ -4434,6 +4604,104 @@ def _build_reverse_reachable_node_ids(
     return reachable
 
 
+# A closure step ADscan will not execute: a safety abstention (``blocked``), a
+# data gap (``unsupported``/``unavailable``), an observed configuration close, or
+# a proven-absent finding. Used only to break a LENGTH TIE when choosing the
+# Tier-0 frontier closure, so an executable route is never buried under an
+# equally short avenue ADscan declines to walk.
+_CLOSURE_ABSTENTION_STATUSES: frozenset[str] = frozenset(
+    {
+        "blocked",
+        "unsupported",
+        "unavailable",
+        "closed_by_configuration",
+        "not_vulnerable",
+    }
+)
+
+
+def _closure_step_abstention_rank(step: "AttackPathStep") -> int:
+    """0 when a closure step is executable, 1 when it is an abstention.
+
+    Reads the step's own status first, then falls back to the relation's
+    execution-support verdict, so a relation registered as ``policy_blocked`` /
+    ``unsupported`` ranks as an abstention even on a graph whose edge status was
+    never refined.
+    """
+    status = str(getattr(step, "status", "") or "").strip().lower()
+    if status in _CLOSURE_ABSTENTION_STATUSES:
+        return 1
+    relation = str(getattr(step, "relation", "") or "").strip().lower()
+    if not relation:
+        return 0
+    # Deferred import, mirroring ``path_to_display_record``'s own use of the
+    # support registry.
+    from adscan_internal.services.attack_step_support_registry import (  # noqa: PLC0415
+        classify_relation_support,
+    )
+
+    try:
+        kind = classify_relation_support(relation).kind
+    except Exception:  # pragma: no cover - a support verdict is never fatal
+        return 0
+    return 1 if kind in {"policy_blocked", "unsupported"} else 0
+
+
+def _closure_abstention_rank(steps: list["AttackPathStep"]) -> int:
+    """1 when ANY step of a closure is an abstention, else 0.
+
+    The abstention can sit anywhere in the chain, not just at its head: the
+    Forest case is ``Account Operators -GenericAll-> DnsAdmins -DnsAdminAbuse->
+    domain``, whose first hop is an ordinary ACL edge and whose SECOND hop is the
+    safety abstention. Ranking only the head would miss it.
+    """
+    for step in steps:
+        if _closure_step_abstention_rank(step):
+            return 1
+    return 0
+
+
+def _closure_real_technique_count(steps: list["AttackPathStep"]) -> int:
+    """How many steps of a closure are REAL techniques, not contextual hops.
+
+    The tie-break below compares closures by this count rather than by
+    ``len(steps)``, because a raw length carries the contextual hops
+    (``MemberOf``, ``Contains``, ``HasSession`` — whatever the catalog registers
+    as ``context``) that are graph expansion rather than anything ADscan
+    executes or the report narrates. Two closures reaching the domain through
+    the SAME techniques but a different number of group-membership hops are the
+    same avenue as far as executability goes, and comparing their raw lengths
+    makes them look unequal, which is what defeated the tie-break.
+
+    Contextual relations are read from the module-level registry derivation
+    ``_CONTEXT_RELATIONS_LOWER``, never a local literal.
+    """
+    count = 0
+    for step in steps:
+        relation = str(getattr(step, "relation", "") or "").strip().lower()
+        if relation and relation in _CONTEXT_RELATIONS_LOWER:
+            continue
+        count += 1
+    return count
+
+
+def _closures_tie(
+    existing: list["AttackPathStep"], candidate: list["AttackPathStep"]
+) -> bool:
+    """True when two closures are equally good, so executability may decide.
+
+    Equivalent by EITHER measure: the same number of real techniques (the
+    executability-relevant one, which ignores contextual hops) or the same raw
+    step count (the comparison this seam has always made). The union is
+    deliberate: it strictly ADDS the ties the raw comparison missed without
+    dropping any it already served, so the abstention tie-break can only ever
+    protect more routes than before, never fewer.
+    """
+    return _closure_real_technique_count(existing) == _closure_real_technique_count(
+        candidate
+    ) or len(existing) == len(candidate)
+
+
 def _build_tier0_to_domain_closure(
     view: Any,
     nodes_map: dict[str, Any],
@@ -4449,6 +4717,17 @@ def _build_tier0_to_domain_closure(
     node reachable to the domain, stores the ordered ``AttackPathStep`` list of
     the shortest forward path node -> ... -> domain. The domain maps to ``[]``;
     an unreachable node has no key. O(V+E), computed once per DFS call.
+
+    Ties are broken toward EXECUTABILITY. When two EQUIVALENT closures exist
+    (see ``_closures_tie``: the same number of real techniques, or the same raw
+    step count), one carrying a step ADscan will not execute (a safety
+    abstention such as ``DnsAdminAbuse``, or an unsupported avenue such as
+    ``PrintOperatorAbuse``) and one fully executable, the executable one wins.
+    Without that, an equally good abstention avenue silently REPLACES a real
+    route in the client deliverable, which would read as "not executed for
+    safety" where a validated avenue exists. Shortest-path semantics are
+    untouched in substance: BFS still assigns the raw-shortest closure first,
+    and the only thing that can displace it is an equivalent EXECUTABLE one.
     """
     domain_ids = {
         str(nid)
@@ -4479,16 +4758,74 @@ def _build_tier0_to_domain_closure(
     while queue:
         current = queue.popleft()
         for predecessor, fwd_edge in reverse.get(current, ()):
-            if predecessor in closure:
-                continue
+            # The forward edge's OWN notes travel with the step, exactly as
+            # ``admit_frontier_edge`` hands the DFS ``edge["notes"]``. A closure
+            # step is a real graph edge the path walks, so dropping its notes
+            # here silently stripped every notes-borne fact from the hop a
+            # Tier-0 frontier stop appends: the safety marker
+            # ``blocked_kind="dangerous_destructive"`` and its
+            # ``client_safe_reason`` (so a hard-refused DnsAdminAbuse closure
+            # reached the client as an ordinary un-run route rather than as
+            # restraint), the ``exec_support`` verdict, the choke-point stamp,
+            # and the ADCS template name the web edge panel interpolates.
+            # ``path_to_display_record`` folds these into the step's
+            # ``details``, which is where every reader looks.
+            fwd_notes = fwd_edge.get("notes")
             step = AttackPathStep(
                 from_id=predecessor,
                 relation=str(fwd_edge.get("relation") or ""),
                 to_id=current,
                 status=str(fwd_edge.get("status") or "discovered"),
-                notes={},
+                notes=fwd_notes if isinstance(fwd_notes, dict) else {},
             )
-            closure[predecessor] = [step, *closure[current]]
+            candidate = [step, *closure[current]]
+            existing = closure.get(predecessor)
+            if existing is not None:
+                # Already closed at this or a shorter length. Upgrade ONLY on a
+                # tie in REAL TECHNIQUE COUNT where the incumbent carries an
+                # abstention and this one does not. FIFO level order means every
+                # competing assignment for a node completes before that node is
+                # popped, so its own predecessors read the final value.
+                #
+                # The tie is measured on real techniques, NOT on ``len(steps)``.
+                # BFS guarantees ``len(candidate) >= len(existing)``, so a raw
+                # length comparison only ever fires when the two closures carry
+                # the SAME number of contextual hops too — which is why the
+                # tie-break was latently dead for every pair that reached the
+                # domain through identical techniques but a different number of
+                # MemberOf/Contains hops.
+                #
+                # The call made deliberately here: the two closures tie when
+                # they are equivalent by EITHER measure (``_closures_tie``), and
+                # NOT "equal real count" alone. Two reasons.
+                #
+                # Real-count alone would REGRESS a case that works today: an
+                # incumbent of three steps carrying one technique and two
+                # membership hops ties a candidate of three steps carrying two
+                # techniques under the current raw comparison, and the executable
+                # one correctly wins. Narrowing to real-count would call those
+                # unequal and leave the abstention standing. The seam must only
+                # ever gain ties, never lose one.
+                #
+                # Nor is the candidate guarded against being longer in raw
+                # terms. BFS makes it longer or equal by construction, so such a
+                # guard collapses back to the raw comparison and the fix becomes
+                # a no-op. And a closure reaching the domain through the same
+                # techniques with more contextual hops is not meaningfully worse
+                # to render: those hops are dropped from the narrated step list
+                # by every surface that renders one (the report, the LITE
+                # document and the web CTEM all filter contextual relations
+                # out), whereas letting a safety abstention stand in for an
+                # executable avenue costs the client a real validated finding
+                # and reads as "not executed for safety" where a route exists.
+                # Executability is the axis worth protecting; a few invisible
+                # membership hops are not.
+                if _closures_tie(existing, candidate) and _closure_abstention_rank(
+                    existing
+                ) > _closure_abstention_rank(candidate):
+                    closure[predecessor] = candidate
+                continue
+            closure[predecessor] = candidate
             queue.append(predecessor)
     return closure
 
@@ -5419,7 +5756,10 @@ def build_expansion_view(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        if _is_nontraversable_attack_edge(edge, nodes_map):
+        # The DFS shares the ONE edge-admission gate with the reachability /
+        # choke-point floods (``is_traversable_attack_edge``), then layers the
+        # DFS-only MemberOf-priority suppression on top.
+        if not is_traversable_attack_edge(edge, nodes_map):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
@@ -7464,9 +7804,7 @@ def path_to_display_record(
     )
 
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    context_relations = {
-        str(rel).strip().lower() for rel in CONTEXT_ONLY_RELATIONS.keys()
-    }
+    context_relations = _CONTEXT_RELATIONS_LOWER
 
     # Environment coordinates for the per-step remediation / verification
     # commands (the catalog renders {dc_ip}/{domain}/{netbios_domain} into the
@@ -7534,61 +7872,6 @@ def path_to_display_record(
         except Exception:  # pragma: no cover - a verdict is never fatal
             return {}
 
-    def _resolve_membership_followup_step(
-        target_node: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        if not isinstance(target_node, dict):
-            return None
-        target_kind = (
-            target_node.get("kind")
-            or target_node.get("labels")
-            or target_node.get("type")
-        )
-        if isinstance(target_kind, list):
-            target_kind = str(target_kind[0] if target_kind else "")
-        if str(target_kind or "") != "Group":
-            return None
-        props = (
-            target_node.get("properties")
-            if isinstance(target_node.get("properties"), dict)
-            else {}
-        )
-        sid_upper, _ = _extract_node_sid_and_rid(target_node)
-        group_name = str(props.get("name") or target_node.get("label") or "").strip()
-        membership = classify_privileged_membership(
-            group_sids=[sid_upper],
-            group_names=[group_name],
-        )
-        normalized_group_name = normalize_group_name(group_name)
-        # Terminate the synthetic escalation follow-up at the REAL domain object
-        # node (not a "Domain Control" placeholder) so the annotation phase — which
-        # resolves the terminal node by label — classifies it against the domain
-        # object and the canonical target_mode="object" ordering surfaces it in the
-        # Domain Compromised tier.
-        domain_label = _resolve_membership_followup_domain_label(graph, target_node)
-        if membership.dns_admins:
-            return {
-                "relation": "DnsAdminAbuse",
-                "status": "blocked",
-                "to": domain_label,
-                "reason": "Production-impacting DNS modification is blocked by design",
-            }
-        if membership.backup_operators:
-            return {
-                "relation": "BackupOperatorEscalation",
-                "status": "theoretical",
-                "to": domain_label,
-                "reason": "Backup Operators can enable a follow-up path to domain compromise",
-            }
-        if normalized_group_name == "print operators":
-            return {
-                "relation": "PrintOperatorAbuse",
-                "status": "unsupported",
-                "to": domain_label,
-                "reason": "Print Operators exposure is modeled, but ADscan has no automated follow-up yet",
-            }
-        return None
-
     nodes = [label(path.source_id)]
     relations: list[str] = []
     for step in path.steps:
@@ -7609,38 +7892,32 @@ def path_to_display_record(
         if isinstance(getattr(s, "relation", None), str)
         and str(s.relation).strip().lower() not in context_relations
     ]
-    target_node = nodes_map.get(path.target_id) if isinstance(nodes_map, dict) else None
-    synthetic_followup = None
-    if (
-        not executable_steps
-        and path.steps
-        and str(path.steps[-1].relation or "").strip().lower() == "memberof"
-    ):
-        synthetic_followup = _resolve_membership_followup_step(target_node)
-        if synthetic_followup is not None:
-            relations.append(str(synthetic_followup["relation"]))
-            nodes.append(str(synthetic_followup["to"]))
     statuses = [
         s.status.lower()
         for s in executable_steps
         if isinstance(s.status, str) and s.status
     ]
-    if synthetic_followup is not None:
-        statuses.append(str(synthetic_followup.get("status") or "").strip().lower())
     if _is_coverage_marker:
         derived_status = COVERAGE_SAMPLE_STATUS
     elif statuses and all(s == "success" for s in statuses):
         derived_status = "exploited"
-    elif any(s in {"attempted", "failed", "error"} for s in statuses):
-        derived_status = "attempted"
-    elif any(s == "unavailable" for s in statuses):
-        derived_status = "unavailable"
     elif any(s == "blocked" for s in statuses) or any(
         classify_relation_support(str(s.relation or "").strip().lower()).kind
         == "policy_blocked"
         for s in executable_steps
     ):
+        # BLOCKED outranks the remaining non-proven tokens: it is the only one
+        # that states what ADSCAN DECIDED rather than what the environment is or
+        # how far our observation got, and the blocked step is the chain's
+        # binding constraint. Kept in lockstep with the precedence in the SSOT
+        # ``attack_paths_core._derive_display_status_from_steps``; the two
+        # ladders are locked together by
+        # ``tests/unit/services/test_blocked_status_precedence.py``.
         derived_status = "blocked"
+    elif any(s in {"attempted", "failed", "error"} for s in statuses):
+        derived_status = "attempted"
+    elif any(s == "unavailable" for s in statuses):
+        derived_status = "unavailable"
     elif any(s == "closed_by_configuration" for s in statuses):
         # A relay avenue ADscan observed to be CLOSED with certainty by the
         # environment's configuration/topology (signing/CBT/no-ADCS/MAQ/single-DC
@@ -7648,6 +7925,11 @@ def path_to_display_record(
         derived_status = "closed_by_configuration"
     elif any(s == "unsupported" for s in statuses):
         derived_status = "unsupported"
+    elif any(s == "not_vulnerable" for s in statuses):
+        # A finding ADscan actively proved absent (ESC15 confirm-mode observed a
+        # patched CA). The weakness does not exist → a DISMISSED finding,
+        # excluded from exposure; never a theoretical "pending validation" edge.
+        derived_status = "not_vulnerable"
 
     steps_for_ui: list[dict[str, Any]] = []
     for idx, step in enumerate(path.steps, start=1):
@@ -7713,65 +7995,14 @@ def path_to_display_record(
             step_record["_decorate_from_id"] = step.from_id
             step_record["_decorate_to_id"] = step.to_id
         steps_for_ui.append(step_record)
-    if synthetic_followup is not None:
-        synthetic_status = str(synthetic_followup.get("status") or "theoretical")
-        # A synthetic follow-up has no target NODE (its target is a rendered
-        # label), so only the source resolves — ``source_privilege_tier`` and the
-        # ``remediability`` verdict both read the SOURCE node. Build the cheap
-        # details first, in the exact key order the decorated form produces, then
-        # add the two expensive fields (decorate) or defer them (light).
-        followup_details: dict[str, Any] = {
-            "from": label(path.target_id),
-            "to": str(synthetic_followup["to"]),
-        }
-        if decorate:
-            # Same axis-1 stamp as the real steps above, so every step a renderer
-            # receives carries the source tier.
-            followup_details["source_privilege_tier"] = privilege_tier_for_node(
-                nodes_map.get(path.target_id)
-            ).value
-            # Only the SOURCE (the escalation group) resolves to a node; the
-            # synthetic target is a rendered label with no node, so its identity
-            # honestly degrades to empty strings — the same result the deferred
-            # seam produces from the empty ``_decorate_to_id`` sentinel.
-            _stamp_step_identity(
-                followup_details,
-                nodes_map.get(path.target_id),
-                None,
-            )
-        followup_details["reason"] = str(synthetic_followup.get("reason") or "")
-        followup_details["synthetic_followup"] = True
-        followup_details["followup_source_group"] = label(path.target_id)
-        # A blocked synthetic follow-up (e.g. DNSAdmins abuse) is a safety
-        # abstention — route it through the single classifier so it is stamped
-        # ``dangerous_destructive`` and renders under "Not executed for safety",
-        # never a bare ``dangerous``.
-        if synthetic_status.strip().lower() == "blocked":
-            followup_details.update(
-                _safety_abstention_notes(str(synthetic_followup["relation"]))
-                or {
-                    "blocked_kind": "dangerous",
-                    "reason": str(synthetic_followup.get("reason") or ""),
-                }
-            )
-        _stamp_env(followup_details)
-        followup_record: dict[str, Any] = {
-            "step": len(steps_for_ui) + 1,
-            "action": str(synthetic_followup["relation"]),
-            "status": synthetic_status,
-            "details": followup_details,
-        }
-        if decorate:
-            followup_record["remediability"] = remediability_of(
-                str(synthetic_followup["relation"]), path.target_id, ""
-            )
-        else:
-            # Defer both expensive fields; stamp the source id (target id is the
-            # empty-string sentinel the decorator passes to ``remediability_of``).
-            followup_record["_decorate_from_id"] = path.target_id
-            followup_record["_decorate_to_id"] = ""
-            followup_record["_decorate_synthetic"] = True
-        steps_for_ui.append(followup_record)
+
+    # WHO ACTS in each step. A step whose source is a collective principal (a
+    # group, a well-known identity) was reached THROUGH a concrete one, and only
+    # the chain knows which: resolved here, where the whole step list is in hand,
+    # so every prose surface reads one answer. Recomputed at the deferred
+    # ``decorate_display_record`` seam from the POST-minimisation step list, so a
+    # record whose steps were sliced never keeps an actor from a dropped step.
+    step_actor_resolution.resolve_path_step_actors(steps_for_ui)
 
     return {
         "nodes": nodes,
@@ -7793,15 +8024,12 @@ def path_to_display_record(
         ),
         "source": nodes[0] if nodes else "",
         "target": nodes[-1] if nodes else "",
-        # When a synthetic escalation follow-up extends the path past the group
-        # to the domain object, the terminal IS that domain object — the
-        # annotation phase must resolve the domain node, not the group, so the
-        # path is classified/ordered as a domain-compromise terminal.
-        "terminal_target_label": (
-            str(synthetic_followup["to"])
-            if synthetic_followup is not None
-            else label(path.target_id)
-        ),
+        # The terminal IS the path's own last node. A privileged-group
+        # escalation now reaches the domain object through a REAL derived edge
+        # (``privileged_group_escalation``), so the walked path already ends at
+        # that domain node and the annotation phase resolves it with no
+        # render-time rewrite.
+        "terminal_target_label": label(path.target_id),
         "status": derived_status,
         "steps": steps_for_ui,
     }
@@ -7923,6 +8151,11 @@ def decorate_display_record(
         decorated_steps.append(new_step)
 
     record["steps"] = decorated_steps
+    # Re-resolve the acting principal on the FINAL step list (see
+    # ``path_to_display_record``). Idempotent and authoritative: this seam runs
+    # after every minimisation/collapse stage, so the chain it walks is the chain
+    # the client is shown.
+    step_actor_resolution.resolve_path_step_actors(decorated_steps)
     return record
 
 
@@ -8075,46 +8308,6 @@ def resolve_domain_node_labels(graph: dict[str, Any]) -> tuple[str, ...]:
         seen.add(label)
         labels.append(label)
     return tuple(labels)
-
-
-def _resolve_membership_followup_domain_label(
-    graph: dict[str, Any],
-    group_node: dict[str, Any] | None,
-) -> str:
-    """Return the label of the domain object a privileged-group escalation reaches.
-
-    A synthetic escalation follow-up (``BackupOperatorEscalation``,
-    ``DnsAdminAbuse``, ``PrintOperatorAbuse``) must terminate at the **real**
-    domain object node (e.g. ``BABY.VL``), not at a synthetic ``"Domain Control"``
-    placeholder string. Only a real domain-object terminal is resolvable by the
-    annotation phase (which looks the terminal node up by label), so the path is
-    classified against the domain object — surfacing it in the *Domain Compromised*
-    tier via the canonical ``target_mode="object"`` domain-object-first ordering
-    instead of as an unresolved follow-up placeholder.
-
-    Multi-domain safe: with a single domain node, return its label; with several,
-    prefer the one matching the group's ``properties.domain``; fall back to the
-    legacy ``"Domain Control"`` placeholder only when no domain node resolves.
-    """
-    labels = resolve_domain_node_labels(graph)
-    if len(labels) == 1:
-        return labels[0]
-    if not labels:
-        return "Domain Control"
-    group_domain = ""
-    if isinstance(group_node, dict):
-        props = (
-            group_node.get("properties")
-            if isinstance(group_node.get("properties"), dict)
-            else {}
-        )
-        group_domain = str((props or {}).get("domain") or "").strip().lower()
-    if group_domain:
-        for lbl in labels:
-            normalized = lbl.strip().lower()
-            if normalized == group_domain or normalized.endswith("@" + group_domain):
-                return lbl
-    return "Domain Control"
 
 
 def _extract_node_sid_and_rid(node: dict[str, Any]) -> tuple[str | None, int | None]:

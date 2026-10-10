@@ -33,6 +33,7 @@ from adscan_internal import (
     print_info,
     print_info_debug,
     print_info_verbose,
+    print_success,
     print_warning,
     print_warning_debug,
     telemetry,
@@ -90,6 +91,9 @@ from adscan_internal.services.execution_credential_scope import (
     relation_authenticates_to_source_host,
     relation_is_host_execution_read,
     scope_carried_credential_to_step,
+)
+from adscan_internal.services.post_exploitation.access_followups import (
+    step_is_engine_manufactured_followup,
 )
 from adscan_internal.services.attack_graph_runtime_service import (
     clear_attack_path_execution,
@@ -3239,13 +3243,24 @@ def _attack_path_actionable_start_indices(
 ) -> list[int]:
     """Return executable step indices whose SOURCE principal ADscan controls now.
 
-    Excludes only the :data:`_NON_RERUNNABLE_STEP_STATUSES` (nothing safe or
+    Excludes the :data:`_NON_RERUNNABLE_STEP_STATUSES` (nothing safe or
     meaningful to run) and applies the ONE ownership predicate
     :func:`attack_path_step_source_is_actionable`, so a start step is offered /
     auto-selected iff it is genuinely runnable from a controlled principal.
     Already-run steps (``success`` / ``attempted`` / …) STAY selectable — the
     operator can re-run a proven step they still control; the per-step default-No
     confirm in the execution loop is the safety gate.
+
+    Also excludes an ENGINE-MANUFACTURED FOLLOW-UP
+    (:func:`step_is_engine_manufactured_followup`). Such a step exists only
+    because a qualifying access edge to the same host exists EARLIER in this same
+    path, and its precondition is that edge's proven success — so the honest
+    start point is the access step, which is itself offered here and is a cheap,
+    read-only verification (an ``ADMIN$`` tree connect, sub-millisecond in the
+    field). Offering the follow-up as a RESUME point instead let the operator
+    begin at a step whose precondition nothing in the session had established.
+    This is where the strict ownership question belongs; the execution loop no
+    longer re-asks it between steps.
     """
     out: list[int] = []
     for idx in executable_indices:
@@ -3258,6 +3273,29 @@ def _attack_path_actionable_start_indices(
             str(step_item.get("status") or "").strip().lower()
             in _NON_RERUNNABLE_STEP_STATUSES
         ):
+            continue
+        step_details = (
+            step_item.get("details")
+            if isinstance(step_item.get("details"), dict)
+            else {}
+        )
+        step_relation = str(step_item.get("action") or "").strip().lower()
+        if step_is_engine_manufactured_followup(
+            step_relation, step_details=step_details
+        ):
+            primary_index = manufactured_followup_primary_step_index(
+                steps=steps,
+                step_index=idx,
+                relation=step_relation,
+                from_label=str(step_details.get("from") or "").strip(),
+            )
+            print_info_debug(
+                "[attack_paths] engine-manufactured follow-up not offered as a "
+                f"start step: index={idx} "
+                f"action={mark_sensitive(step_relation, 'detail')} "
+                "primary_step="
+                f"{primary_index if primary_index is not None else 'unresolved'}"
+            )
             continue
         actionable, _reason = attack_path_step_source_is_actionable(
             shell,
@@ -3753,6 +3791,43 @@ def _ca_enrollment_port_reachable(connect_ip: str, *, port: int = 445) -> bool:
         return False
 
 
+#: Hosts an ADCS CA-resolution hint has already been printed for, so a domain
+#: with many ESC edges onto the same unreachable authority says it once.
+_ESC_CA_HINT_EMITTED: set[str] = set()
+
+
+def _print_esc_ca_unresolved_hint(hosts: "list[str] | tuple[str, ...]") -> None:
+    """Tell the OPERATOR how to make an unreachable ADCS CA reachable.
+
+    The client's half of this data gap is the report's next step (worded once in
+    ``adscan_core.reporting.adcs_finding_state``, and addressed to someone who
+    does not run ADscan). This is the other half: the override that lets whoever
+    re-runs the scan validate the exposure. It belongs on the terminal and in the
+    debug log, never in the deliverable.
+
+    The variable suffix is built with the resolver's OWN normalisation
+    (``env_host_key``), so the name printed is the name the lookup reads back. A
+    host is hinted once per session.
+    """
+
+    from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+        env_host_key,
+    )
+
+    for host in hosts:
+        key = env_host_key(host)
+        if not key or key in _ESC_CA_HINT_EMITTED:
+            continue
+        _ESC_CA_HINT_EMITTED.add(key)
+        print_info(
+            "Certificate authority "
+            f"{mark_sensitive(str(host).strip(), 'hostname')} could not be "
+            "resolved or reached, so this ADCS escalation is reported as a data "
+            "gap. To validate it, set "
+            f"ADSCAN_HOST_IP_{mark_sensitive(key, 'ip')}=<ip> before the run."
+        )
+
+
 def _resolve_reachable_publishing_ca(
     shell: Any,
     domain: str,
@@ -3795,6 +3870,7 @@ def _resolve_reachable_publishing_ca(
         resolve_host_address,
     )
 
+    considered: list[str] = []
     for record in records:
         published = record.get("certificate_templates") or []
         if not isinstance(published, (list, tuple)):
@@ -3806,6 +3882,7 @@ def _resolve_reachable_publishing_ca(
         ca_dns = str(record.get("dns_hostname") or "").strip().rstrip(".")
         if not ca_dns:
             continue
+        considered.append(ca_dns)
         try:
             address = resolve_host_address(
                 shell,
@@ -3831,6 +3908,7 @@ def _resolve_reachable_publishing_ca(
             f"({mark_sensitive(connect_ip, 'ip')})"
         )
         return (ca_name, connect_ip, ca_dns or None)
+    _print_esc_ca_unresolved_hint(considered)
     return None
 
 
@@ -3874,6 +3952,7 @@ def resolve_esc_execution_ca(
             ca_object_id=str(vulnerable_ca.get("object_id") or "").strip(),
         )
         if not ca_dns:
+            _print_esc_ca_unresolved_hint([step_ca_name] if step_ca_name else [])
             return None
         from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
             resolve_connect_and_spn,
@@ -3887,6 +3966,7 @@ def resolve_esc_execution_ca(
         )
         ca_host = str(connect_ip or "")
         if not ca_host:
+            _print_esc_ca_unresolved_hint([ca_dns])
             return None
         return (
             step_ca_name or str(domain_data.get("ca") or ""),
@@ -4039,6 +4119,29 @@ def _resolve_adcs_template_candidates(
             f"{marked}"
         )
         return esc_templates
+
+    if esc_tag == "14":
+        # ESC14 variant A has no template TERMINAL and no CertTemplate in its
+        # vulnerable_resources (its terminal is the victim account), so neither
+        # the step-details extraction above nor the target-label fallback below
+        # can name one. The collector resolved it at emission time; read it back
+        # here so execution never has to ask the operator to type a name.
+        enroll_templates = _esc14_enroll_templates(details)
+        if enroll_templates:
+            from adscan_internal.cli.adcs_exploitation import _resolve_template_cn
+
+            resolved = []
+            for name in enroll_templates:
+                cn = _resolve_template_cn(shell, domain, name)
+                if cn and cn not in resolved:
+                    resolved.append(cn)
+            if resolved:
+                marked = ", ".join(mark_sensitive(t, "service") for t in resolved)
+                print_info_debug(
+                    "[adcsesc14] Using client-auth enrollment template(s) recorded "
+                    f"by the collector: {marked}"
+                )
+                return resolved
 
     if allow_target_label_template:
         # Only treat the target label as a template name when the edge actually
@@ -4607,6 +4710,274 @@ def _resolve_workspace_dir(shell: Any, domain: str) -> str:
     return str(getattr(shell, "current_workspace_dir", "") or "")
 
 
+def _execute_esc15_confirm_mode(
+    shell: Any,
+    *,
+    domain: str,
+    from_label: str,
+    to_label: str,
+    exec_username: str,
+    password: str,
+    template: str,
+    domain_data: dict[str, Any],
+    esc_ca_name: str,
+    esc_ca_host: str,
+    esc_ca_fqdn: str | None,
+) -> None:
+    """Run the NON-DESTRUCTIVE ESC15 (EKUwu) confirmation for one attack step.
+
+    Defensive validation of a client-report ESC15 finding: proves whether the CA
+    honours application-policy injection WITHOUT the on-behalf-of domain takeover
+    (subject = self, no PKINIT, no privileged identity minted), then maps the
+    verdict to the honest Exposure-Validation representation via the shared SSOT
+    ``map_esc15_confirm_result``:
+
+    * ``confirmed_vulnerable`` → edge ``success`` (proven HIGH finding; the issued
+      cert is the evidence).
+    * ``hardened`` → edge ``not_vulnerable`` (dismissed, excluded from exposure) +
+      a ``esc15_application_policy_injection_mitigated`` positive control.
+    * ``attempted`` → honest ``attempted``, never a defensive-control claim.
+    * ``indeterminate`` → ``unsupported`` (data gap: held for manager approval).
+
+    The issued cert's disclosure + revocation are inherited from the primitive
+    (``register_issued_certificate`` → ``mark_manual_required``); this adds no
+    second disclosure. Does not advance the chain (a confirmation produces no
+    privileged credential), so downstream steps run on their own resolution.
+    """
+    from adscan_internal.cli.adcs_exploitation import (
+        _resolve_template_eku_oids,
+        _resolve_template_min_key_size,
+    )
+    from adscan_internal.services.adcs.esc_runner import run_esc15_confirm_sync
+    from adscan_internal.services.adcs.esc_types import (
+        EscConfig,
+        map_esc15_confirm_result,
+    )
+
+    notes = {"username": exec_username, "template_used_for_run": template, "confirm_mode": True}
+    if hasattr(shell, "_set_active_attack_graph_step"):
+        try:
+            shell._set_active_attack_graph_step(  # type: ignore[attr-defined]
+                domain=domain,
+                from_label=from_label,
+                relation="ADCSESC15",
+                to_label=to_label,
+                notes=notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+    try:
+        try:
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=from_label,
+                relation="ADCSESC15",
+                to_label=to_label,
+                status="attempted",
+                notes=notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+        template_eku_oids = _resolve_template_eku_oids(shell, domain, template)
+        esc15_auth_domain, esc15_auth_kdc = _resolve_esc_auth_context(
+            shell,
+            domain=domain,
+            exec_username=exec_username,
+            raw_principal_label=from_label,
+        )
+        esc_cfg = EscConfig(
+            esc=15,
+            domain=domain,
+            auth_domain=esc15_auth_domain,
+            dc_ip=str(domain_data.get("pdc") or ""),
+            auth_kdc=esc15_auth_kdc or str(domain_data.get("pdc") or ""),
+            ca_host=esc_ca_host,
+            ca_name=esc_ca_name,
+            template=template,
+            username=exec_username,
+            password=password,
+            # Confirm-mode is subject = self: NO target_upn / on-behalf-of.
+            workspace_dir=_resolve_workspace_dir(shell, domain),
+            shell=shell,
+            ca_fqdn=esc_ca_fqdn,
+            dc_fqdn=(
+                domain_data.get("dc_fqdn") or domain_data.get("pdc_hostname") or None
+            ),
+            min_key_size=_resolve_template_min_key_size(shell, domain, template or ""),
+        )
+        result = run_esc15_confirm_sync(esc_cfg, template_eku_oids=template_eku_oids)
+        decision = map_esc15_confirm_result(result)
+
+        evidence = result.evidence if isinstance(result.evidence, dict) else {}
+        status_notes = {
+            **notes,
+            "confirm_verdict": decision.verdict,
+            "cve_id": "CVE-2024-49019",
+        }
+        canary = evidence.get("canary_oid")
+        if canary:
+            status_notes["canary_oid"] = str(canary)
+        if decision.reason:
+            status_notes["reason"] = decision.reason
+
+        try:
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=from_label,
+                relation="ADCSESC15",
+                to_label=to_label,
+                status=decision.edge_status,
+                notes=status_notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+        marked_domain = mark_sensitive(domain, "domain")
+        if decision.is_proven:
+            print_success(
+                f"ESC15 confirmed on {marked_domain}: the CA honours "
+                "application-policy injection (EKUwu / CVE-2024-49019). The finding "
+                "is proven; no privileged identity was minted."
+            )
+        elif decision.is_positive_control:
+            try:
+                from adscan_internal.services.positive_control_evidence import (
+                    emit_esc15_hardened_positive,
+                )
+
+                emit_esc15_hardened_positive(
+                    shell,
+                    domain,
+                    template=template,
+                    ca_name=esc_ca_name,
+                    reason=decision.reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+            print_success(
+                f"ESC15 not exploitable on {marked_domain}: the CA stripped the "
+                "injected application policy (CVE-2024-49019 patched). Finding "
+                "dismissed and recorded as a verified control."
+            )
+        elif decision.edge_status == "unsupported":
+            print_warning(
+                "ESC15 confirmation indeterminate: the CA held the request for "
+                "manager approval, so EKUwu can be neither confirmed nor ruled out."
+            )
+        else:
+            print_warning(
+                "ESC15 confirmation did not complete: "
+                + rich_markup_escape(decision.reason or "certificate not issued")
+            )
+    finally:
+        if hasattr(shell, "_clear_active_attack_graph_step"):
+            try:
+                shell._clear_active_attack_graph_step()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+
+
+def _esc15_ldaps_viable(shell: Any, domain: str) -> bool:
+    """Return whether LDAPS is viable for the ESC15 Schannel route (method A).
+
+    Method A binds over LDAPS, so a posture-observed DISABLED LDAPS makes it
+    impossible. UNKNOWN / ENABLED / stale all keep it viable (the bind itself
+    self-aborts with an honest data gap if LDAPS turns out unreachable).
+    """
+    try:
+        from adscan_internal.services.domain_posture import (
+            ConstraintCategory,
+            TriState,
+            get_posture,
+        )
+
+        snapshot = get_posture(getattr(shell, "domains_data", {}), domain=domain)
+        state = snapshot.get(ConstraintCategory.LDAPS_AVAILABLE).effective_state
+        return state is not TriState.DISABLED
+    except Exception:  # noqa: BLE001 — advisory; default to viable
+        return True
+
+
+def _resolve_esc15_route(shell: Any, *, ldaps_viable: bool) -> str:
+    """Resolve the ESC15 route: ``auto`` (default), ``schannel`` or ``onbehalf``.
+
+    The default is ALWAYS ``auto`` (viability-driven: method A first when LDAPS
+    is viable, method B otherwise). The questionary select is an OVERRIDE for the
+    operator only — in non-interactive runs the centralized helper returns the
+    default (auto), never a prompt.
+    """
+    from adscan_core.output import questionary_select_index
+
+    options = [
+        "Auto (recommended): Schannel first, then on-behalf-of",
+        "Method A: Schannel / PassTheCert (LDAPS)",
+        "Method B: on-behalf-of (enrollment agent + PKINIT)",
+    ]
+    idx = questionary_select_index(
+        title="ESC15 exploitation route",
+        options=options,
+        default_idx=0,
+        shell=shell,
+    )
+    return {0: "auto", 1: "schannel", 2: "onbehalf"}.get(idx or 0, "auto")
+
+
+def _execute_adcsesc15_with_viability(
+    shell: Any,
+    *,
+    esc_cfg: Any,
+    domain: str,
+) -> tuple[Any, str]:
+    """Run ESC15 by viability: method A (Schannel) first, method B fallback.
+
+    Returns ``(esc_result, route_used)`` where ``route_used`` is ``"schannel"``
+    or ``"onbehalf"``. Stops at the first success. An operator override forces a
+    single route; ``auto`` tries method A first when LDAPS is viable (fewer
+    dependencies: one cert, one template, no enrollment agent) and falls back to
+    method B, and skips method A entirely when LDAPS is known-unavailable.
+    """
+    from adscan_internal.services.adcs.esc_runner import (
+        run_esc15_schannel_sync,
+        run_esc_sync,
+    )
+
+    ldaps_viable = _esc15_ldaps_viable(shell, domain)
+    route = _resolve_esc15_route(shell, ldaps_viable=ldaps_viable)
+
+    if route == "schannel":
+        order = ["schannel"]
+    elif route == "onbehalf":
+        order = ["onbehalf"]
+    elif ldaps_viable:
+        order = ["schannel", "onbehalf"]
+    else:
+        # LDAPS known-unavailable: method A cannot run, go straight to method B.
+        order = ["onbehalf"]
+
+    last_result: Any = None
+    last_route = order[-1]
+    for candidate in order:
+        if candidate == "schannel":
+            result = run_esc15_schannel_sync(esc_cfg)
+        else:
+            result = run_esc_sync(esc_cfg)
+        last_result, last_route = result, candidate
+        if getattr(result, "success", False):
+            return result, candidate
+        # Method A reporting LDAPS unavailable is the explicit fall-through signal.
+        marked_domain = mark_sensitive(domain, "domain")
+        if candidate == "schannel" and "onbehalf" in order:
+            print_warning(
+                f"ESC15 method A (Schannel) did not succeed on {marked_domain}; "
+                "falling back to method B (on-behalf-of)."
+            )
+    return last_result, last_route
+
+
 def _resolve_ca_fqdn(domain_data: dict[str, Any]) -> str | None:
     """Resolve the CA FQDN from workspace data.
 
@@ -4644,6 +5015,23 @@ def _resolve_target_upn(to_label: str | None, domain: str) -> str:
     ):
         return f"administrator@{domain}"
     return f"{label}@{domain}"
+
+
+def _esc14_variant_a_impersonated(
+    esc14_puppet: str | None, to_label: str | None, domain: str
+) -> str:
+    """Principal ESC14 variant A actually impersonates: the controlled PUPPET.
+
+    Variant A writes a strong ``altSecurityIdentities`` binding on the puppet (the
+    collector-derived writable principal) and PKINITs as THAT puppet. The edge may
+    collapse its terminal into a group (e.g. Domain Admins) because the puppet is a
+    member, but the identity obtained is the puppet, not the group. Reporting the
+    group as the impersonated principal is wrong, so derive it from the puppet and
+    only fall back to the terminal label when no puppet was resolved.
+    """
+    if esc14_puppet:
+        return f"{esc14_puppet}@{domain}"
+    return _resolve_target_upn(to_label, domain)
 
 
 def _resolve_esc9_puppet_user(details: dict[str, Any], domain: str) -> str | None:
@@ -4685,6 +5073,63 @@ def _resolve_esc9_puppet_dn(details: dict[str, Any]) -> str | None:
         if dn:
             return dn
     return None
+
+
+def _esc14_confirmed_variants(details: dict[str, Any] | None) -> list[str]:
+    """Read the full confirmed ESC14 variant set from the step details / notes.
+
+    The ESC14 confirmation phase stamps ``esc14_variants`` (footprint-ordered A/B/
+    C/D letters) onto the derived edge notes. It can reach the executor either as a
+    top-level ``details`` key or nested under ``details['notes']`` depending on the
+    path projection, so both are checked. Returns ``[]`` when no confirmation
+    annotation is present (the caller then falls back to legacy variant A).
+    """
+    for container in (details or {}, (details or {}).get("notes")):
+        if not isinstance(container, dict):
+            continue
+        raw = container.get("esc14_variants")
+        if isinstance(raw, (list, tuple)) and raw:
+            return [str(v).strip().upper() for v in raw if str(v).strip()]
+    return []
+
+
+def _esc14_enroll_templates(details: dict[str, Any] | None) -> list[str]:
+    """Read the ESC14-A client-auth enrollment template CNs from details / notes.
+
+    ESC14 variant A terminates at the VICTIM account, not at a certificate
+    template, so the template the attacker enrolls is NOT derivable from the
+    edge's target the way ESC1's and ESC2's are. The collector resolves it at
+    emission time and records the concrete CN(s) under
+    ``esc14a_enroll_templates`` (the machine-consumable companion to the prose
+    ``esc14a_enroll_path`` marker). Both the top-level ``details`` key and the
+    nested ``details['notes']`` form are checked, mirroring
+    :func:`_esc14_confirmed_variants`, because the two path projections place
+    the folded edge notes differently. Returns ``[]`` when the edge names no
+    template, so the caller degrades to its own fallback instead of enrolling a
+    guessed name.
+    """
+    for container in (details or {}, (details or {}).get("notes")):
+        if not isinstance(container, dict):
+            continue
+        raw = container.get("esc14a_enroll_templates")
+        if isinstance(raw, (list, tuple)):
+            names = [str(t).strip() for t in raw if str(t).strip()]
+            if names:
+                return names
+        elif isinstance(raw, str) and raw.strip():
+            return [raw.strip()]
+    return []
+
+
+def _esc14_weak_mapping_targets(details: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Read the ESC14 weak-mapping targets (variants B/C/D) from details / notes."""
+    for container in (details or {}, (details or {}).get("notes")):
+        if not isinstance(container, dict):
+            continue
+        raw = container.get("esc14_weak_mapping_targets")
+        if isinstance(raw, (list, tuple)) and raw:
+            return [t for t in raw if isinstance(t, dict)]
+    return []
 
 
 def _resolve_default_domain_controller(
@@ -5514,6 +5959,76 @@ def _execute_writelogonscript_force_change_password_strategy(
             },
         )
 
+    # Register the two environment writes (the staged .bat and the scriptPath
+    # overwrite) with the change ledger, carrying the change ids forward in the
+    # returned details so _attempt_writelogonscript_cleanup_if_ready can settle
+    # them with a confirming read. A session that dies before cleanup has the
+    # ledger finalize() report them manual_required naming the object.
+    _wls_file_change_id: str | None = None
+    _wls_scriptpath_change_id: str | None = None
+    _wls_ledger = getattr(shell, "environment_change_ledger", None)
+    if _wls_ledger is not None:
+        try:
+            from adscan_internal.services import (  # noqa: PLC0415
+                cleanup_taxonomy as _wls_tax,
+            )
+
+            _wls_unc = (
+                f"\\\\{target_host}\\"
+                f"{str(upload_result.share_name or 'NETLOGON')}\\"
+                f"{str(upload_result.uploaded_file_path or payload.filename)}"
+            )
+            _wls_file_change_id = _wls_ledger.register_change(
+                kind="file_uploaded",
+                domain=domain,
+                target=_wls_unc,
+                detail={
+                    "host": target_host,
+                    "share": upload_result.share_name,
+                    "remote_path": upload_result.uploaded_file_path,
+                    "exec_username": exec_username,
+                    "executor_username": exec_username,
+                    "credential_lookup_domain": domain,
+                },
+                method="WriteLogonScript (staged logon script)",
+            )
+            _wls_ledger.set_revert_metadata(
+                _wls_file_change_id,
+                remediation_command=(
+                    'Remove the staged logon script from the share and confirm it is '
+                    'gone:\n'
+                    f'  Remove-Item -LiteralPath "{_wls_unc}" -Force\n'
+                    f'  Test-Path "{_wls_unc}"   # must return False'
+                ),
+                remediation_object_dn=_wls_unc,
+            )
+            _wls_scriptpath_change_id = _wls_ledger.register_change(
+                kind="logon_script_path_modified",
+                domain=domain,
+                target=target_object,
+                detail={
+                    "target_domain": domain,
+                    "target_object": target_object,
+                    "previous_script_path": previous_script_path,
+                    "exec_username": exec_username,
+                    "executor_username": exec_username,
+                    "credential_lookup_domain": domain,
+                },
+                method="WriteLogonScript (scriptPath overwrite)",
+            )
+            _wls_ledger.set_revert_metadata(
+                _wls_scriptpath_change_id,
+                remediation_command=_wls_tax.MANUAL_LOGON_SCRIPT_PATH.replace(
+                    "TARGET", target_object
+                ).replace(
+                    "ORIGINAL_SCRIPT", previous_script_path or "<original value>"
+                ),
+                remediation_object_dn=target_object,
+            )
+        except Exception as _wls_exc:  # noqa: BLE001
+            telemetry.capture_exception(_wls_exc)
+            print_exception(exception=_wls_exc)
+
     return (
         "payload_staged",
         {
@@ -5524,6 +6039,8 @@ def _execute_writelogonscript_force_change_password_strategy(
             "share": upload_result.share_name,
             "path": upload_result.directory_path,
             "uploaded_file_path": upload_result.uploaded_file_path,
+            "_wls_file_change_id": _wls_file_change_id,
+            "_wls_scriptpath_change_id": _wls_scriptpath_change_id,
             "script_relative_path": payload.script_path_value,
             "script_filename": payload.filename,
             "scriptpath_target_object": target_object,
@@ -5916,6 +6433,93 @@ def _attempt_writelogonscript_cleanup_if_ready(
             )
 
         cleanup_ok = bool(delete_result.success and revert_success)
+
+        # Settle the ledger records for the staged file and the scriptPath
+        # overwrite. reverted_confirmed is fail-closed: the staged file needs
+        # a confirmed delete, and the scriptPath needs a confirming re-read
+        # proving the value is no longer the ADscan-managed one. Anything less
+        # is manual_required with the native remediation naming the object.
+        _wls_ledger = getattr(shell, "environment_change_ledger", None)
+        if _wls_ledger is not None:
+            from adscan_internal.services import (  # noqa: PLC0415
+                cleanup_taxonomy as _wls_tax,
+            )
+
+            _wls_file_cid = details.get("_wls_file_change_id")
+            _wls_sp_cid = details.get("_wls_scriptpath_change_id")
+            _wls_unc_target = str(
+                cleanup_notes.get("target")
+                or f"{share_name}\\{uploaded_file_path}"
+            )
+            if _wls_file_cid:
+                try:
+                    if delete_result.success:
+                        _wls_ledger.mark_reverted_confirmed(
+                            _wls_file_cid,
+                            verification_method="writelogonscript_file_delete",
+                            min_credential_principal=cleanup_user,
+                        )
+                    else:
+                        _wls_ledger.mark_manual_required(
+                            _wls_file_cid,
+                            reason=_wls_tax.MANUAL_REASON_REVERT_FAILED,
+                            remediation_command=(
+                                'Remove the staged logon script from the share:\n'
+                                f'  Remove-Item -LiteralPath "{_wls_unc_target}" -Force'
+                            ),
+                            remediation_object_dn=_wls_unc_target,
+                            error=str(delete_result.error_message or "Staged file delete failed."),
+                        )
+                except Exception as _wls_sexc:  # noqa: BLE001
+                    telemetry.capture_exception(_wls_sexc)
+            if _wls_sp_cid:
+                _wls_scriptpath_gone = False
+                if revert_success:
+                    try:
+                        _wls_readback = service.acl.get_object_attributes(
+                            pdc_host=target_host,
+                            domain=domain,
+                            username=cleanup_user,
+                            password=cleanup_password,
+                            target_object=target_object,
+                            attribute_names=("scriptPath",),
+                            kerberos=use_kerberos,
+                            timeout=60,
+                        )
+                        _wls_cur = ""
+                        if getattr(_wls_readback, "success", False):
+                            _wls_cur = str(
+                                _wls_readback.attributes.get("scriptPath") or ""
+                            ).strip()
+                        # Confirmed when the live value is no longer an
+                        # ADscan-managed script path.
+                        _wls_scriptpath_gone = getattr(
+                            _wls_readback, "success", False
+                        ) and not _is_adscan_managed_logon_script_path(_wls_cur)
+                    except Exception as _wls_rexc:  # noqa: BLE001
+                        telemetry.capture_exception(_wls_rexc)
+                        _wls_scriptpath_gone = False
+                try:
+                    if _wls_scriptpath_gone:
+                        _wls_ledger.mark_reverted_confirmed(
+                            _wls_sp_cid,
+                            verification_method="writelogonscript_scriptpath_reread",
+                            min_credential_principal=cleanup_user,
+                        )
+                    else:
+                        _wls_ledger.mark_manual_required(
+                            _wls_sp_cid,
+                            reason=_wls_tax.MANUAL_REASON_REVERT_FAILED,
+                            remediation_command=_wls_tax.MANUAL_LOGON_SCRIPT_PATH.replace(
+                                "TARGET", target_object
+                            ).replace(
+                                "ORIGINAL_SCRIPT", previous_script_path or "<original value>"
+                            ),
+                            remediation_object_dn=target_object,
+                            error=str(revert_error or "scriptPath restore could not be confirmed."),
+                        )
+                except Exception as _wls_sexc:  # noqa: BLE001
+                    telemetry.capture_exception(_wls_sexc)
         cleanup_notes.update(
             {
                 "cleanup_pending": not cleanup_ok,
@@ -6624,6 +7228,130 @@ def _collect_previous_host_access_candidates(
 
     ordered = sorted(best.items(), key=lambda item: (item[1][0], item[0]))
     return [(username, metadata[1]) for username, metadata in ordered]
+
+
+# Operator-language names for a step's ``source_context_requirement``. Used ONLY
+# in the honest-failure message for an engine-manufactured follow-up, so the
+# refusal names the PRIVILEGE that is missing instead of naming a machine account
+# the operator never set out to own.
+_SOURCE_CONTEXT_OPERATOR_LABEL: dict[str, str] = {
+    "local_admin_session": "a proven local administrator session",
+    "mssql_rce_session": "a proven MSSQL command-execution session",
+    "user_credentials": "a proven interactive session",
+    "credential_recovered": "a recovered credential for the source principal",
+}
+
+
+def manufactured_followup_primary_step_index(
+    *,
+    steps: list[dict[str, Any]] | None,
+    step_index: int | None,
+    relation: str,
+    from_label: str,
+) -> int | None:
+    """Return the 1-based index of the access step a follow-up was manufactured from.
+
+    An engine-manufactured follow-up exists only because a qualifying ACCESS edge
+    to the same host exists earlier in the SAME path (the follow-up overlays emit
+    one only for a node an access edge already reached), so this walk is a lookup,
+    not a guess. Matches the LATEST preceding step whose target label is this
+    step's source label and whose relation declares a host-session grant that
+    SATISFIES this step's ``source_context_requirement`` — the same two catalog
+    SSOTs the carry-forward predicate composes
+    (:func:`access_session_grant_for_relation` /
+    :func:`access_grant_satisfies_requirement`), never a hardcoded relation list.
+
+    Label-based on purpose: it drives operator-facing messaging and the start-step
+    offer, so it must not depend on host resolution (which needs a live shell and
+    can fail for an offline host). Returns ``None`` when no such step is present.
+    """
+    if not steps or not step_index or step_index < 2:
+        return None
+    source_clean = str(from_label or "").strip().lower()
+    if not source_clean:
+        return None
+    requirement = required_context_for_relation(relation)
+    upper = min(step_index - 1, len(steps))
+    for index in range(upper - 1, -1, -1):
+        prior = steps[index]
+        if not isinstance(prior, dict):
+            continue
+        prior_action = str(prior.get("action") or "").strip().lower()
+        grant = access_session_grant_for_relation(prior_action)
+        if grant is None:
+            continue
+        if requirement is not None and not access_grant_satisfies_requirement(
+            grant, requirement
+        ):
+            continue
+        prior_details = (
+            prior.get("details") if isinstance(prior.get("details"), dict) else {}
+        )
+        if str(prior_details.get("to") or "").strip().lower() != source_clean:
+            continue
+        return index + 1
+    return None
+
+
+def render_manufactured_followup_precondition_warning(
+    *,
+    relation: str,
+    host: str,
+    steps: list[dict[str, Any]] | None,
+    step_index: int | None,
+    from_label: str,
+) -> None:
+    """Explain why a manufactured follow-up has no acting material, honestly.
+
+    Replaces the machine-account wording that used to reach the operator here,
+    which was not merely unhelpful but misleading: it told them to obtain control
+    of a host machine account they never set out to own, and pointed at "the
+    preceding step in this path" even when that step had just succeeded.
+
+    This message instead names the PRIVILEGE that is missing and the host it is
+    missing on, the step in THIS path that grants it, and why the step cannot be
+    started from directly. The status the caller records stays an honest
+    non-completion; nothing here claims a control on the client side stopped
+    anything.
+    """
+    requirement = required_context_for_relation(relation)
+    privilege = _SOURCE_CONTEXT_OPERATOR_LABEL.get(
+        str(requirement or ""), "a proven session"
+    )
+    # Escape before marking: the host/label is uncontrolled, and a bracketed
+    # token inside a Rich-rendered string is either swallowed as a style tag or,
+    # for a ``[/...]``-shaped one, raises an uncaught MarkupError.
+    marked_host = mark_sensitive(
+        rich_markup_escape(host or from_label or "?"), "hostname"
+    )
+    safe_relation = rich_markup_escape(str(relation or "this step"))
+    primary_index = manufactured_followup_primary_step_index(
+        steps=steps,
+        step_index=step_index,
+        relation=relation,
+        from_label=from_label,
+    )
+    lines = [
+        f"Cannot run {safe_relation}: it needs {privilege} on {marked_host}, and "
+        "no session, scoped ticket or stored credential currently provides one.",
+    ]
+    if primary_index is not None and steps:
+        primary = steps[primary_index - 1]
+        primary_action = rich_markup_escape(
+            str(primary.get("action") or "").strip() or "the access step"
+        )
+        lines.append(
+            f"Step #{primary_index} ({primary_action}) is what grants it. Run that "
+            "step first: this step's precondition is the session that step proves, "
+            "not a stored credential for the host, so there is nothing to obtain "
+            "beforehand."
+        )
+    else:
+        lines.append(
+            "This step's precondition is a session proven by a preceding access "
+            "step in this path, not a stored credential for the host."
+        )
+    print_warning(" ".join(lines))
 
 
 def carry_forward_foothold_actor(
@@ -7693,13 +8421,15 @@ def _write_hassession_cleanup_checkpoint(
         workspace_dir, "domains", domain, "hassession_cleanup_pending.json"
     )
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    # No plaintext secrets are persisted here: the next-run re-cleanup
+    # resolves the revert credential from the credential store via
+    # cleanup_credential_resolver (original executor first, DA escalation
+    # lazy), so a workspace JSON never carries a password or hash.
     payload: dict[str, Any] = {
         "target_user": target_user,
-        "target_password": target_password,
         "target_host": target_host,
         "session_user": session_user,
         "exec_username": exec_username,
-        "exec_password": exec_password,
         "user_created_by_us": user_created_by_us,
         "group_candidates": group_candidates,
         "is_dc_target": is_dc_target,
@@ -7749,7 +8479,7 @@ def _run_hassession_rollback(
     group_candidates: list[str],
     non_interactive: bool = False,
     is_dc_target: bool = True,
-) -> None:
+) -> tuple[bool, bool]:
     """Remove the HasSession artifact user from the domain (or the host, if local).
 
     Execution order:
@@ -7787,6 +8517,7 @@ def _run_hassession_rollback(
     # Remove from every candidate elevated group (only whichever we actually
     # added the user to will respond with success; the others will return
     # "not a member", which we treat as acceptable).
+    _group_hard_fail = False
     for group_name in group_candidates:
         remove_group_cmd = (
             f'net {group_verb} "{group_name}" "{target_user}" /delete{domain_flag}'
@@ -7820,12 +8551,14 @@ def _run_hassession_rollback(
                         f"[rollback] {marked_user} was not in '{group_name}' — skipping."
                     )
                 else:
+                    _group_hard_fail = True
                     print_warning(
                         f"[rollback] Could not remove {marked_user} from '{group_name}': "
                         f"{output[:120] if output else 'no output'}"
                     )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            _group_hard_fail = True
             print_warning(f"[rollback] Group removal raised: {exc}")
 
     # Symmetric with the runtime-membership add above: only a FRESHLY CREATED
@@ -7879,7 +8612,7 @@ def _run_hassession_rollback(
         print_info_debug(
             f"[rollback] User {marked_user} was pre-existing — skip account deletion."
         )
-        return
+        return (not _group_hard_fail, True)
 
     # Delete the account we created.
     delete_cmd = f'net user "{target_user}" /delete{domain_flag}'
@@ -7943,6 +8676,115 @@ def _run_hassession_rollback(
             f"net user {target_user} /delete{domain_flag}"
         )
 
+    return (not _group_hard_fail, deleted)
+
+
+def _settle_hassession_ledger_records(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str,
+    exec_username: str,
+    exec_password: str,
+    is_dc_target: bool,
+    target_host: str,
+    session_user: str,
+    user_change_id: str | None,
+    group_change_id: str | None,
+    group_reverted: bool,
+    account_reverted: bool,
+    selected_group: str | None,
+) -> None:
+    """Settle the HasSession DA-account ledger records against the rollback.
+
+    ``reverted_confirmed`` is the only good terminal and it is fail-closed: it
+    requires BOTH the rollback reporting it undid the change AND a confirming
+    re-read proving the principal is no longer a Domain Admin (a deleted account
+    cannot be one). A re-read that is inconclusive or still shows membership
+    keeps the record manual_required with the native remediation naming the
+    account, so the client cleanup checklist never loses a DA account ADscan
+    could not prove it removed. Best-effort: never raises into the step flow.
+    """
+    ledger = getattr(shell, "environment_change_ledger", None)
+    if ledger is None or (user_change_id is None and group_change_id is None):
+        return
+    from adscan_internal.services import cleanup_taxonomy as _hs_tax  # noqa: PLC0415
+
+    membership_gone = False
+    try:
+        if is_dc_target:
+            membership = _is_user_domain_admin_via_sid(
+                shell,
+                domain=domain,
+                target_user=target_user,
+                auth_username=exec_username,
+                auth_password=exec_password,
+            )
+        else:
+            membership = _is_user_local_admin_via_net(
+                shell,
+                domain=domain,
+                exec_username=exec_username,
+                exec_password=exec_password,
+                target_host=target_host,
+                session_user=session_user,
+                target_user=target_user,
+            )
+        # Only a definitive False (no longer a member) confirms removal; None is
+        # an inconclusive probe and must NOT be read as "gone" (fail-closed).
+        membership_gone = membership is False
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        membership_gone = False
+
+    group_name = selected_group or ("Domain Admins" if is_dc_target else "Administrators")
+
+    if group_change_id is not None:
+        try:
+            if group_reverted and membership_gone:
+                ledger.mark_reverted_confirmed(
+                    group_change_id,
+                    verification_method="hassession_membership_reread",
+                    min_credential_principal=exec_username,
+                )
+            else:
+                ledger.mark_manual_required(
+                    group_change_id,
+                    reason=_hs_tax.MANUAL_REASON_REVERT_FAILED,
+                    remediation_command=_hs_tax.MANUAL_GROUP_MEMBERSHIP.replace(
+                        "GROUP", group_name
+                    ).replace("MEMBER", target_user),
+                    remediation_object_dn=target_user,
+                    error="HasSession group-membership removal could not be confirmed.",
+                )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    if user_change_id is not None:
+        try:
+            # A deleted account cannot still be a Domain Admin, so the membership
+            # re-read doubles as the confirming read for the account removal.
+            if account_reverted and membership_gone:
+                ledger.mark_reverted_confirmed(
+                    user_change_id,
+                    verification_method="hassession_account_delete_reread",
+                    min_credential_principal=exec_username,
+                )
+            else:
+                ledger.mark_manual_required(
+                    user_change_id,
+                    reason=_hs_tax.MANUAL_REASON_REVERT_FAILED,
+                    remediation_command=_hs_tax.MANUAL_USER_ACCOUNT.replace(
+                        "TARGET", target_user
+                    ),
+                    remediation_object_dn=target_user,
+                    error="HasSession account deletion could not be confirmed.",
+                )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
 
 def _check_hassession_pending_cleanup(shell: Any, *, domain: str) -> None:
     """Offer to clean up a HasSession artifact left by a previous crashed run.
@@ -7981,7 +8823,8 @@ def _check_hassession_pending_cleanup(shell: Any, *, domain: str) -> None:
     print_warning(
         f"[rollback] Pending HasSession cleanup detected: "
         f"{marked} @ {marked_domain} (created {created_at}). "
-        "Run 'adscan cleanup hassession' or execute cleanup now."
+        "Execute the cleanup now, or it stays pending for the next run "
+        "and is disclosed as an unreverted change in the report."
     )
 
     if is_non_interactive(shell):
@@ -7990,15 +8833,54 @@ def _check_hassession_pending_cleanup(shell: Any, *, domain: str) -> None:
     from rich.prompt import Confirm
 
     if Confirm.ask("Execute cleanup now?", default=True):
+        exec_username = str(data.get("exec_username") or "")
+        # Resolve the revert credential from the credential store rather than
+        # a plaintext secret in the checkpoint: the original executor first,
+        # then a legacy checkpoint secret for back-compat. A pre-store
+        # checkpoint (written before this change) may still carry the fields;
+        # honour them so an in-flight crash recovery is not broken.
+        from adscan_internal.services.cleanup_credential_resolver import (  # noqa: PLC0415
+            resolve_minimal_revert_credential,
+        )
+
+        _legacy_exec_secret = str(data.get("exec_password") or "")
+        _cred = resolve_minimal_revert_credential(
+            shell,
+            action={
+                "exec_username": exec_username,
+                "exec_password": _legacy_exec_secret,
+            },
+            domain=domain,
+            target_domain=domain,
+        )
+        exec_secret = _cred.secret or _legacy_exec_secret
+        # The LDAP-delete fallback needs the created account's own secret;
+        # resolve it from the store, falling back to a legacy checkpoint value.
+        from adscan_internal.services.cleanup_credential_resolver import (  # noqa: PLC0415
+            _lookup_domain_credential,
+        )
+
+        target_secret = (
+            _lookup_domain_credential(shell, domain, target_user)
+            or str(data.get("target_password") or "")
+            or None
+        )
+        if not exec_secret:
+            print_warning(
+                "[rollback] No stored credential is available to remove the "
+                f"HasSession account {marked}. Remove it manually: the cleanup "
+                "appendix of the report names the account and the native command."
+            )
+            return
         _run_hassession_rollback(
             shell,
             domain=domain,
-            exec_username=str(data.get("exec_username") or ""),
-            exec_password=str(data.get("exec_password") or ""),
+            exec_username=exec_username,
+            exec_password=exec_secret,
             target_host=str(data.get("target_host") or ""),
             session_user=str(data.get("session_user") or ""),
             target_user=target_user,
-            target_password=data.get("target_password"),
+            target_password=target_secret,
             user_created_by_us=bool(data.get("user_created_by_us", True)),
             group_candidates=list(data.get("group_candidates") or []),
             non_interactive=True,
@@ -9166,8 +10048,74 @@ def execute_selected_attack_path(
             to_label: str,
             *,
             notes: dict[str, Any],
+            esc_result: Any | None = None,
         ) -> None:
-            """Mark an ADCS step as failed and surface a warning to the operator."""
+            """Mark an ADCS step as failed and surface a warning to the operator.
+
+            Two-level honesty: when a certificate WAS issued (the template is
+            proven vulnerable) but Pass-the-Certificate authentication did not
+            complete, the step is the structured ``attempted`` +
+            ``cert_issued_not_authed`` outcome, never a bare ``failed`` that reads
+            as "the template is not exploitable". When no certificate was issued,
+            the step stays ``failed`` with no fabricated cause (the real reason is
+            upstream, e.g. unreachable CA / no credential).
+            """
+            from adscan_core.reporting.attack_step_reason_codes import (
+                REASON_CODE_KEY,
+                ReasonCode,
+            )
+
+            evidence = getattr(esc_result, "evidence", None)
+            evidence = evidence if isinstance(evidence, dict) else {}
+
+            # Strong certificate binding refused the PKINIT certificate (KB5014754):
+            # the ESC9/ESC10 implicit-mapping (or ESC14 weak-mapping) EXISTENCE
+            # condition is absent, so this is a POSITIVE control, not a failed
+            # attempt. Dismiss the edge (not_vulnerable, excluded from exposure) and
+            # tell the operator honestly — never a compromise claim, never a crash,
+            # never the mis-decoded "user-to-user" wording.
+            if str(evidence.get("verdict") or "").strip().lower() == "hardened":
+                from adscan_internal.services.path_state import NOT_VULNERABLE_STATUS
+
+                hardened_reason = str(evidence.get("reason") or "").strip()
+                hardened_notes = dict(notes)
+                hardened_notes["confirm_verdict"] = "hardened"
+                if hardened_reason:
+                    hardened_notes["reason"] = hardened_reason
+                try:
+                    update_edge_status_by_labels(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status=NOT_VULNERABLE_STATUS,
+                        notes=hardened_notes,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                marked_domain = mark_sensitive(domain, "domain")
+                print_success(
+                    f"{action} not viable on {marked_domain}: the domain controller "
+                    "enforces strong certificate binding, so the certificate mapping "
+                    "is refused (KB5014754). Recorded as a verified control."
+                )
+                return
+
+            cert_issued = False
+            if esc_result is not None:
+                cert_issued = bool(
+                    getattr(esc_result, "pfx_path", None)
+                    or getattr(esc_result, "pfx_bytes", None)
+                    or evidence.get("pfx_path")
+                    or evidence.get("certificate_issued")
+                )
+            step_status = "attempted" if cert_issued else "failed"
+            notes_with_reason = dict(notes)
+            if cert_issued:
+                notes_with_reason[REASON_CODE_KEY] = (
+                    ReasonCode.CERT_ISSUED_NOT_AUTHED.value
+                )
             try:
                 update_edge_status_by_labels(
                     shell,
@@ -9175,19 +10123,27 @@ def execute_selected_attack_path(
                     from_label=from_label,
                     relation=action,
                     to_label=to_label,
-                    status="failed",
-                    notes=notes,
+                    status=step_status,
+                    notes=notes_with_reason,
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
             marked_from = mark_sensitive(from_label, "user")
             marked_to = mark_sensitive(to_label, "user")
             marked_domain = mark_sensitive(domain, "domain")
-            print_warning(
-                f"Path stopped: {action} did not obtain a certificate for "
-                f"{marked_from} → {marked_to} on {marked_domain}. "
-                "Downstream steps will not execute."
-            )
+            if cert_issued:
+                print_warning(
+                    f"Path stopped: {action} issued a certificate for "
+                    f"{marked_from} → {marked_to} on {marked_domain}, but "
+                    "authentication with it did not complete. "
+                    "Downstream steps will not execute."
+                )
+            else:
+                print_warning(
+                    f"Path stopped: {action} did not obtain a certificate for "
+                    f"{marked_from} → {marked_to} on {marked_domain}. "
+                    "Downstream steps will not execute."
+                )
 
         def _handle_successful_credential_step(
             action: str,
@@ -10205,14 +11161,44 @@ def execute_selected_attack_path(
             # auto-start decisions, so a refusal here only fires on a step the
             # operator explicitly overrode into (or a mid-chain step whose source
             # a prior failure never produced).
-            _source_actionable, _source_reason = attack_path_step_source_is_actionable(
-                shell,
-                domain=domain,
-                step=step,
-                context_username=context_username,
-                context_password=context_password,
-                steps=steps,
-                step_index=idx,
+            #
+            # EXEMPT: an engine-manufactured follow-up. The path engine minted
+            # that step FROM a preceding access edge, so its precondition is that
+            # edge's proven success, never ownership of the principal it is
+            # sourced at — which for this family is either the artifact the step
+            # produces (DumpLSA yields the machine account of the host it loops
+            # on) or a host the preceding access edge is what grants. Asking the
+            # ownership question here is the wrong question, and answering it
+            # strictly refused a DumpLSA whose AdminTo had just succeeded against
+            # the same host. The strict question belongs to the START-STEP
+            # SELECTOR, which now declines to offer a manufactured follow-up as a
+            # start step at all and routes the operator to the primary access
+            # step; between steps there is no separate strict gate. The relation
+            # branch resolves its own actor through the actor SSOT and, when no
+            # material exists, fails honestly naming the privilege it needs. Set
+            # A (control / modification) and a REAL DCSync edge are not in this
+            # family and keep the gate byte-identically.
+            _manufactured_followup = step_is_engine_manufactured_followup(
+                key, step_details=details
+            )
+            if _manufactured_followup:
+                print_info_debug(
+                    "[attack_paths] ownership gate skipped for engine-manufactured "
+                    f"follow-up: index={idx} action={mark_sensitive(action, 'detail')} "
+                    f"from={mark_sensitive(from_label or 'N/A', 'node')}"
+                )
+            _source_actionable, _source_reason = (
+                (True, "")
+                if _manufactured_followup
+                else attack_path_step_source_is_actionable(
+                    shell,
+                    domain=domain,
+                    step=step,
+                    context_username=context_username,
+                    context_password=context_password,
+                    steps=steps,
+                    step_index=idx,
+                )
             )
             if not _source_actionable:
                 _record_attack_path_execution_event(
@@ -10499,12 +11485,18 @@ def execute_selected_attack_path(
                     notes={"username": exec_username, "target": target_host},
                 ):
                     try:
-                        update_edge_status_by_labels(
+                        # Status writes inside the per-step loop go through the
+                        # step-aware SSOT, never the raw edge writer: it performs
+                        # the identical edge write AND refreshes the in-memory
+                        # step snapshot that the carry-forward predicate reads.
+                        # Writing only the edge is what made a just-proven
+                        # AdminTo invisible to the DumpLSA step that followed it
+                        # against the same host.
+                        _update_attack_path_step_status_at_index(
                             shell,
-                            domain,
-                            from_label=from_label,
-                            relation=action,
-                            to_label=to_label,
+                            domain=domain,
+                            summary=summary,
+                            step_index=idx - 1,
                             status="attempted",
                             notes={"username": exec_username, "target": target_host},
                         )
@@ -10548,12 +11540,11 @@ def execute_selected_attack_path(
                         }.get(verify_reason, "failed")
 
                         try:
-                            update_edge_status_by_labels(
+                            _update_attack_path_step_status_at_index(
                                 shell,
-                                domain,
-                                from_label=from_label,
-                                relation=action,
-                                to_label=to_label,
+                                domain=domain,
+                                summary=summary,
+                                step_index=idx - 1,
                                 status=edge_status_on_fail,
                                 notes={
                                     "username": exec_username,
@@ -10591,12 +11582,11 @@ def execute_selected_attack_path(
                         )
                         return True
 
-                    update_edge_status_by_labels(
+                    _update_attack_path_step_status_at_index(
                         shell,
-                        domain,
-                        from_label=from_label,
-                        relation=action,
-                        to_label=to_label,
+                        domain=domain,
+                        summary=summary,
+                        step_index=idx - 1,
                         status="success",
                         notes={"username": exec_username, "target": target_host},
                     )
@@ -12714,6 +13704,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "template_used_for_run": template,
                             },
+                            esc_result=esc1_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -13267,6 +14258,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "template_used_for_run": template,
                             },
+                            esc_result=esc4_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -13697,6 +14689,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "template_used_for_run": template,
                             },
+                            esc_result=esc2_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -13878,6 +14871,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "template_used_for_run": template,
                             },
+                            esc_result=esc6_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -14042,6 +15036,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "template_used_for_run": template,
                             },
+                            esc_result=esc7_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -14218,6 +15213,7 @@ def execute_selected_attack_path(
                             from_label,
                             to_label,
                             notes=esc8_notes,
+                            esc_result=esc8_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -14651,6 +15647,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "template_used_for_run": template,
                             },
+                            esc_result=esc9_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
@@ -14741,11 +15738,54 @@ def execute_selected_attack_path(
                     to_label=to_label,
                     domain_data=domain_data,
                 )
-                template = esc_templates[0] if esc_templates else None
-                if not template:
+                template = _select_adcs_template(
+                    shell,
+                    esc_number="14",
+                    templates=esc_templates,
+                    prompt_label="client-auth enrollment template",
+                )
+                if not template and not esc_templates:
+                    # LAST RESORT only: the collector named no enrollment
+                    # vehicle. A cancelled SELECTION above is the operator's
+                    # decision and must not reopen as a typing prompt.
                     template = _prompt_for_manual_adcs_template(esc_number="14")
                 if not template:
                     print_warning("No ESC14 template found or selected.")
+                    return execution_started
+                # Dispatch by CONFIRMED variant (full set annotated by the ESC14
+                # confirmation phase), least-footprint first, falling back to the
+                # next confirmed variant only on failure and stopping at the first
+                # success — one proven compromise is enough; further destructive
+                # writes add footprint with zero added certainty.
+                from adscan_internal.services.adcs.esc14_variants import (
+                    Esc14ExecVariant,
+                    build_esc14_execution_plan,
+                )
+
+                esc14_puppet = _resolve_esc9_puppet_user(details or {}, domain)
+                esc14_variants = _esc14_confirmed_variants(details)
+                if not esc14_variants:
+                    # Legacy / unconfirmed path: fall back to variant A when a
+                    # write-access puppet is resolvable.
+                    esc14_variants = ["A"] if esc14_puppet else []
+                esc14_targets = _esc14_weak_mapping_targets(details)
+                esc14_plan = build_esc14_execution_plan(
+                    confirmed_variants=esc14_variants,
+                    weak_mapping_targets=esc14_targets,
+                    has_write_access_puppet=bool(esc14_puppet),
+                )
+                if not esc14_plan:
+                    _mark_blocked_step(
+                        "ADCSESC14",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "No confirmed ESC14 variant is executable: no write-access "
+                            "puppet (variant A) and no reachable weak altSecurityIdentities "
+                            "mapping (variants B/C/D). Re-run the collector to populate."
+                        ),
+                    )
                     return execution_started
                 execution_started = True
                 with _active_step_context(
@@ -14768,23 +15808,18 @@ def execute_selected_attack_path(
                             notes={
                                 "username": exec_username,
                                 "template_used_for_run": template,
+                                "esc14_confirmed_variants": [
+                                    s.variant.value for s in esc14_plan
+                                ],
                             },
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
                     from adscan_internal.services.adcs.esc_runner import run_esc_sync
-                    from adscan_internal.services.adcs.esc_types import EscConfig
-
-                    esc14_puppet = _resolve_esc9_puppet_user(details or {}, domain)
-                    if not esc14_puppet:
-                        _mark_blocked_step(
-                            "ADCSESC14",
-                            from_label,
-                            to_label,
-                            kind="unavailable",
-                            reason="No puppet account with writable altSecurityIdentities found in edge notes — re-run the collector to populate",
-                        )
-                        return execution_started
+                    from adscan_internal.services.adcs.esc_types import (
+                        EscConfig,
+                        EscResult,
+                    )
                     from adscan_internal.cli.adcs_exploitation import (
                         _resolve_template_min_key_size,
                     )
@@ -14795,32 +15830,109 @@ def execute_selected_attack_path(
                         exec_username=exec_username,
                         raw_principal_label=from_label,
                     )
-                    esc_cfg = EscConfig(
-                        esc=14,
-                        domain=domain,
-                        auth_domain=esc14_auth_domain,
-                        dc_ip=str(domain_data.get("pdc") or ""),
-                        auth_kdc=esc14_auth_kdc or str(domain_data.get("pdc") or ""),
-                        ca_host=esc_ca_host,
-                        ca_name=esc_ca_name,
-                        template=template,
-                        username=exec_username,
-                        password=password,
-                        target_upn=_resolve_target_upn(to_label, domain),
-                        workspace_dir=_resolve_workspace_dir(shell, domain),
-                        shell=shell,
-                        ca_fqdn=esc_ca_fqdn,
-                        target_account=esc14_puppet,
-                        target_account_dn=_resolve_esc9_puppet_dn(details or {}) or "",
-                        dc_fqdn=(
-                            domain_data.get("dc_fqdn")
-                            or domain_data.get("pdc_hostname")
-                            or None
-                        ),
-                        min_key_size=_resolve_template_min_key_size(shell, domain, "Machine"),
+                    esc14_dc_fqdn = (
+                        domain_data.get("dc_fqdn")
+                        or domain_data.get("pdc_hostname")
+                        or None
                     )
-                    esc14_result = run_esc_sync(esc_cfg)
-                    if not esc14_result.success:
+                    esc14_result = None
+                    for plan_step in esc14_plan:
+                        variant_letter = plan_step.variant.value
+                        if plan_step.variant is Esc14ExecVariant.A:
+                            esc14_target_account = esc14_puppet or ""
+                            esc14_target_dn = (
+                                _resolve_esc9_puppet_dn(details or {}) or ""
+                            )
+                            # Variant A is defined by the strong altSecurityIdentities
+                            # binding written on the puppet, NOT a SAN UPN. Injecting a
+                            # SAN UPN makes the KDC map by implicit UPN (to the edge
+                            # terminal, e.g. the Domain Admins group -> KDC_ERR_C_
+                            # PRINCIPAL_UNKNOWN) and never consult the altSec binding.
+                            # Leave it empty so the enrolled cert is not ESC1-style
+                            # subject-injected (mirrors the B/C/D branch below).
+                            esc14_target_upn = ""
+                            # The identity obtained is the PUPPET we wrote the binding
+                            # on (the controlled, writable principal), not the group
+                            # terminal the edge collapses into.
+                            esc14_impersonated = _esc14_variant_a_impersonated(
+                                esc14_puppet, to_label, domain
+                            )
+                        else:
+                            esc14_target_account = plan_step.target_samaccountname or ""
+                            esc14_target_dn = plan_step.target_dn or ""
+                            # B/C/D drive the SAN from the victim attribute, not the
+                            # target UPN — leave target_upn empty so the enrolled
+                            # cert is not ESC1-style subject-injected.
+                            esc14_target_upn = ""
+                            esc14_impersonated = (
+                                f"{esc14_target_account}@{domain}"
+                                if esc14_target_account
+                                else _resolve_target_upn(to_label, domain)
+                            )
+                        esc_cfg = EscConfig(
+                            esc=14,
+                            domain=domain,
+                            auth_domain=esc14_auth_domain,
+                            dc_ip=str(domain_data.get("pdc") or ""),
+                            auth_kdc=esc14_auth_kdc
+                            or str(domain_data.get("pdc") or ""),
+                            ca_host=esc_ca_host,
+                            ca_name=esc_ca_name,
+                            template=template,
+                            username=exec_username,
+                            password=password,
+                            target_upn=esc14_target_upn,
+                            workspace_dir=_resolve_workspace_dir(shell, domain),
+                            shell=shell,
+                            ca_fqdn=esc_ca_fqdn,
+                            target_account=esc14_target_account,
+                            target_account_dn=esc14_target_dn,
+                            dc_fqdn=esc14_dc_fqdn,
+                            min_key_size=_resolve_template_min_key_size(
+                                shell, domain, "Machine"
+                            ),
+                            esc14_variant=variant_letter,
+                            esc14_weak_binding=plan_step.weak_binding or "",
+                            esc14_victim_attribute=plan_step.victim_attribute or "",
+                            esc14_match_value=plan_step.match_value or "",
+                        )
+                        if len(esc14_plan) > 1:
+                            print_info(
+                                f"ADCSESC14: attempting variant {variant_letter}."
+                            )
+                        try:
+                            esc14_result = run_esc_sync(esc_cfg)
+                        except Exception as exc:  # noqa: BLE001 — try the next variant
+                            telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
+                            esc14_result = EscResult(
+                                success=False,
+                                esc=14,
+                                error=f"ESC14 variant {variant_letter}: {exc}",
+                            )
+                        if getattr(esc14_result, "success", False):
+                            _handle_successful_adcs_step(
+                                "ADCSESC14",
+                                from_label,
+                                to_label,
+                                notes={
+                                    "username": exec_username,
+                                    "template_used_for_run": template,
+                                    "esc14_executed_variant": variant_letter,
+                                    "esc14_confirmed_variants": [
+                                        s.variant.value for s in esc14_plan
+                                    ],
+                                },
+                                impersonated_target=esc14_impersonated,
+                                esc_result=esc14_result,
+                            )
+                            break
+                        if plan_step is not esc14_plan[-1]:
+                            print_warning(
+                                f"ADCSESC14 variant {variant_letter} did not succeed; "
+                                "falling back to the next confirmed variant."
+                            )
+                    else:
                         _handle_failed_adcs_step(
                             "ADCSESC14",
                             from_label,
@@ -14828,20 +15940,13 @@ def execute_selected_attack_path(
                             notes={
                                 "username": exec_username,
                                 "template_used_for_run": template,
+                                "esc14_confirmed_variants": [
+                                    s.variant.value for s in esc14_plan
+                                ],
                             },
+                            esc_result=esc14_result,
                         )
                         return execution_started
-                    _handle_successful_adcs_step(
-                        "ADCSESC14",
-                        from_label,
-                        to_label,
-                        notes={
-                            "username": exec_username,
-                            "template_used_for_run": template,
-                        },
-                        impersonated_target=_resolve_target_upn(to_label, domain),
-                        esc_result=esc14_result,
-                    )
                 continue
 
             if key == "adcsesc15":
@@ -14925,6 +16030,33 @@ def execute_selected_attack_path(
                 if not template:
                     print_warning("No ESC15 template found or selected.")
                     return execution_started
+
+                # NON-DESTRUCTIVE confirm-mode (opt-in, ADSCAN_ESC15_CONFIRM_ONLY):
+                # defensive validation of the ESC15 finding. Proves whether the CA
+                # honours application-policy injection WITHOUT the on-behalf-of
+                # domain takeover (subject = self, no PKINIT, no privileged
+                # identity), then maps the verdict to an honest status.
+                from adscan_internal.services.adcs.esc_types import (
+                    esc15_confirm_only_enabled,
+                )
+
+                if esc15_confirm_only_enabled():
+                    execution_started = True
+                    _execute_esc15_confirm_mode(
+                        shell,
+                        domain=domain,
+                        from_label=from_label,
+                        to_label=to_label,
+                        exec_username=exec_username,
+                        password=password,
+                        template=template,
+                        domain_data=domain_data,
+                        esc_ca_name=esc_ca_name,
+                        esc_ca_host=esc_ca_host,
+                        esc_ca_fqdn=esc_ca_fqdn,
+                    )
+                    continue
+
                 from adscan_internal.cli.privileged_target_selection import (
                     resolve_privileged_target_user,
                 )
@@ -14965,7 +16097,6 @@ def execute_selected_attack_path(
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
-                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
                     from adscan_internal.services.adcs.esc_types import EscConfig
 
                     from adscan_internal.cli.adcs_exploitation import (
@@ -15000,26 +16131,35 @@ def execute_selected_attack_path(
                         ),
                         min_key_size=_resolve_template_min_key_size(shell, domain, template or ""),
                     )
-                    esc15_result = run_esc_sync(esc_cfg)
+                    # Viability-driven route selection: method A (Schannel /
+                    # PassTheCert) first when LDAPS is viable (one cert, one
+                    # template, no enrollment agent), method B (on-behalf-of)
+                    # fallback. An operator override forces a single route; the
+                    # default is always auto. Stops at the first success.
+                    esc15_result, esc15_route = _execute_adcsesc15_with_viability(
+                        shell,
+                        esc_cfg=esc_cfg,
+                        domain=domain,
+                    )
+                    esc15_notes = {
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                        "esc15_route": esc15_route,
+                    }
                     if not esc15_result.success:
                         _handle_failed_adcs_step(
                             "ADCSESC15",
                             from_label,
                             to_label,
-                            notes={
-                                "username": exec_username,
-                                "template_used_for_run": template,
-                            },
+                            notes=esc15_notes,
+                            esc_result=esc15_result,
                         )
                         return execution_started
                     _handle_successful_adcs_step(
                         "ADCSESC15",
                         from_label,
                         to_label,
-                        notes={
-                            "username": exec_username,
-                            "template_used_for_run": template,
-                        },
+                        notes=esc15_notes,
                         impersonated_target=esc15_target_upn,
                         esc_result=esc15_result,
                     )
@@ -15469,6 +16609,8 @@ def execute_selected_attack_path(
                     # knows exactly what to clean up.
                     _hs_user_created_by_us: bool = False
                     _hs_user_added_to_da: bool = False
+                    _hs_user_change_id: str | None = None
+                    _hs_group_change_id: str | None = None
 
                     try:
                         update_edge_status_by_labels(
@@ -15516,6 +16658,49 @@ def execute_selected_attack_path(
                         )
                         if create_ok:
                             _hs_user_created_by_us = True
+                            # Register the created account with the change ledger
+                            # at the write, so the client cleanup checklist carries
+                            # it and a session that dies before rollback reports it
+                            # as manual_required (ledger.finalize), instead of the
+                            # account living only in the private checkpoint file.
+                            _hs_ledger = getattr(
+                                shell, "environment_change_ledger", None
+                            )
+                            if _hs_ledger is not None:
+                                try:
+                                    from adscan_internal.services import (  # noqa: PLC0415
+                                        cleanup_taxonomy as _hs_tax,
+                                    )
+
+                                    _hs_user_change_id = _hs_ledger.register_change(
+                                        kind="user_created",
+                                        domain=domain,
+                                        target=target_user,
+                                        detail={
+                                            "target_domain": domain,
+                                            "target_object": target_user,
+                                            "is_dc_target": is_dc_target,
+                                            "target_host": target_host,
+                                            "exec_username": exec_username,
+                                            "executor_username": exec_username,
+                                            "credential_lookup_domain": domain,
+                                        },
+                                        method=(
+                                            "HasSession (create account)"
+                                            if is_dc_target
+                                            else "HasSession (create local account)"
+                                        ),
+                                    )
+                                    _hs_ledger.set_revert_metadata(
+                                        _hs_user_change_id,
+                                        remediation_command=_hs_tax.MANUAL_USER_ACCOUNT.replace(
+                                            "TARGET", target_user
+                                        ),
+                                        remediation_object_dn=target_user,
+                                    )
+                                except Exception as _hs_exc:  # noqa: BLE001
+                                    telemetry.capture_exception(_hs_exc)
+                                    print_exception(exception=_hs_exc)
                             # Write crash-recovery checkpoint immediately after
                             # creating the account so even a mid-step crash
                             # leaves a recoverable record.
@@ -15690,6 +16875,55 @@ def execute_selected_attack_path(
                         # with the rollback below, which only ever removes the
                         # membership it recorded here.
                         if create_new_user and _hs_user_added_to_da:
+                            # Register the verified privileged-group membership with
+                            # the change ledger. Scoped to a FRESHLY CREATED account
+                            # (same gate as the runtime-snapshot add below), so a
+                            # reused pre-existing membership ADscan did not create is
+                            # never recorded as its write.
+                            _hs_ledger = getattr(
+                                shell, "environment_change_ledger", None
+                            )
+                            if _hs_ledger is not None:
+                                try:
+                                    from adscan_internal.services import (  # noqa: PLC0415
+                                        cleanup_taxonomy as _hs_tax,
+                                    )
+
+                                    _hs_group_name = selected_group or (
+                                        "Domain Admins"
+                                        if is_dc_target
+                                        else "Administrators"
+                                    )
+                                    _hs_group_change_id = _hs_ledger.register_change(
+                                        kind="group_membership_added",
+                                        domain=domain,
+                                        target=f"{target_user} -> {_hs_group_name}",
+                                        detail={
+                                            "target_domain": domain,
+                                            "username": target_user,
+                                            "group": _hs_group_name,
+                                            "is_dc_target": is_dc_target,
+                                            "target_host": target_host,
+                                            "exec_username": exec_username,
+                                            "executor_username": exec_username,
+                                            "credential_lookup_domain": domain,
+                                        },
+                                        method=(
+                                            "HasSession (Domain Admins)"
+                                            if is_dc_target
+                                            else "HasSession (local Administrators)"
+                                        ),
+                                    )
+                                    _hs_ledger.set_revert_metadata(
+                                        _hs_group_change_id,
+                                        remediation_command=_hs_tax.MANUAL_GROUP_MEMBERSHIP.replace(
+                                            "GROUP", _hs_group_name
+                                        ).replace("MEMBER", target_user),
+                                        remediation_object_dn=target_user,
+                                    )
+                                except Exception as _hs_exc:  # noqa: BLE001
+                                    telemetry.capture_exception(_hs_exc)
+                                    print_exception(exception=_hs_exc)
                             try:
                                 if is_dc_target:
                                     from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
@@ -15801,19 +17035,43 @@ def execute_selected_attack_path(
                     # handled separately via the checkpoint file; this covers
                     # the normal execution path (happy and sad).
                     if _hs_user_created_by_us or _hs_user_added_to_da:
-                        _run_hassession_rollback(
+                        _hs_group_reverted, _hs_account_reverted = (
+                            _run_hassession_rollback(
+                                shell,
+                                domain=domain,
+                                exec_username=exec_username,
+                                exec_password=password,
+                                target_host=target_host,
+                                session_user=session_user,
+                                target_user=target_user,
+                                target_password=target_password,
+                                user_created_by_us=_hs_user_created_by_us,
+                                group_candidates=group_candidates,
+                                non_interactive=non_interactive,
+                                is_dc_target=is_dc_target,
+                            )
+                        )
+                        # Settle the ledger records for the DA account against
+                        # the rollback outcome. reverted_confirmed is fail-closed:
+                        # it is claimed only when the rollback reported the undo
+                        # AND a confirming re-read shows the principal is no longer
+                        # a Domain Admin. Anything less is manual_required naming
+                        # the object, so the client cleanup checklist always
+                        # carries a DA account ADscan could not prove it removed.
+                        _settle_hassession_ledger_records(
                             shell,
                             domain=domain,
+                            target_user=target_user,
                             exec_username=exec_username,
                             exec_password=password,
+                            is_dc_target=is_dc_target,
                             target_host=target_host,
                             session_user=session_user,
-                            target_user=target_user,
-                            target_password=target_password,
-                            user_created_by_us=_hs_user_created_by_us,
-                            group_candidates=group_candidates,
-                            non_interactive=non_interactive,
-                            is_dc_target=is_dc_target,
+                            user_change_id=_hs_user_change_id,
+                            group_change_id=_hs_group_change_id,
+                            group_reverted=_hs_group_reverted,
+                            account_reverted=_hs_account_reverted,
+                            selected_group=selected_group,
                         )
                         _clear_hassession_cleanup_checkpoint(shell, domain=domain)
                 if hassession_step_failed:
@@ -16464,16 +17722,27 @@ def execute_selected_attack_path(
                     password = ""
                     dump_islocal = "false"
                 if not exec_username or not password:
-                    marked_user = mark_sensitive(exec_username or from_label, "user")
-                    print_warning(
-                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
+                    # This step was manufactured from a preceding access edge, so
+                    # the honest refusal names the PRIVILEGE it needs and the
+                    # step in this path that grants it. Naming a missing
+                    # credential for the host machine account instead (the old
+                    # wording) pointed the operator at something they never set
+                    # out to own.
+                    render_manufactured_followup_precondition_warning(
+                        relation=action,
+                        host=source_host,
+                        steps=steps,
+                        step_index=idx,
+                        from_label=from_label,
                     )
                     _mark_blocked_step(
                         action,
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing stored credential for execution user",
+                        reason=(
+                            "No session or credential provides the required privilege"
+                        ),
                     )
                     return execution_started
 

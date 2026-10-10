@@ -25,6 +25,60 @@ _ESC_TITLES = {
     15: "ESC15 — Application Policy Injection (Enrollment Agent)",
 }
 
+_ESC15_CONFIRM_TITLE = "ESC15 — EKUwu Confirmation (non-destructive)"
+_ESC15_SCHANNEL_TITLE = "ESC15 — EKUwu via Schannel (method A)"
+
+
+def build_esc15_schannel_steps(config: "EscConfig") -> list["EscStep"]:
+    """Steps for ESC15 method A (Schannel / PassTheCert).
+
+    One certificate, one template, no enrollment agent: inject the Client
+    Authentication application policy with SAN UPN = target, bind to LDAPS over
+    Schannel as the target (no PKINIT), then grant DCSync to the controlled
+    principal. The DCSync ACE is a durable change recorded in the
+    environment-change ledger.
+    """
+    from adscan_internal.services.adcs.esc_types import EscStep
+
+    return [
+        EscStep(
+            "Request client-auth cert",
+            f"Enroll in {config.template} with the Client Authentication "
+            f"application policy and SAN UPN = {config.target_upn}",
+        ),
+        EscStep(
+            "Schannel LDAPS bind",
+            f"Present the certificate over LDAPS (SASL EXTERNAL) to authenticate "
+            f"as {config.target_upn} — no PKINIT",
+        ),
+        EscStep(
+            "Grant DCSync (LDAP write)",
+            "As the target, add replication rights for the controlled principal "
+            "to the domain object's DACL",
+            destructive=True,
+            rollback_label="Remove the replication ACEs from the domain DACL",
+        ),
+    ]
+
+
+def build_esc15_confirm_steps(config: "EscConfig") -> list["EscStep"]:
+    """Steps for the NON-DESTRUCTIVE ESC15 (EKUwu) confirmation.
+
+    Enrolls ONE certificate for the enrolling user themselves (subject = self)
+    with a canary application policy, then inspects the issued certificate. No
+    privileged identity is minted: no on-behalf-of, no SAN target, no PKINIT.
+    """
+    from adscan_internal.services.adcs.esc_types import EscStep
+
+    return [
+        EscStep(
+            "Confirm EKUwu (non-destructive)",
+            f"Enroll a self-subject certificate in {config.template} with a canary "
+            "application policy and inspect the issued certificate for it — no "
+            "privileged identity is minted",
+        ),
+    ]
+
 
 def build_esc_steps(config: "EscConfig") -> list["EscStep"]:
     from adscan_internal.services.adcs.esc_types import EscStep
@@ -74,6 +128,10 @@ def build_esc_steps(config: "EscConfig") -> list["EscStep"]:
             EscStep("PKINIT authenticate", f"Authenticate as {config.target_upn} via UnPAC-the-hash"),
         ]
     if n == 14:
+        variant = str(getattr(config, "esc14_variant", "A") or "A").strip().upper()
+        if variant in {"B", "C", "D"}:
+            return _build_esc14_weak_mapping_steps(config, variant)
+        # Variant A: ADscan writes the TARGET's altSecurityIdentities directly.
         return [
             EscStep("Create machine account", "Add computer account via MachineAccountQuota", destructive=True, rollback_label="Delete computer account"),
             EscStep("Request Machine certificate", "Enroll computer account in Machine template"),
@@ -84,13 +142,75 @@ def build_esc_steps(config: "EscConfig") -> list["EscStep"]:
     return []
 
 
-def print_esc_preflight(config: "EscConfig", steps: list["EscStep"]) -> bool:
+#: Per-variant victim attribute and the weak mapping each B/C/D run satisfies.
+_ESC14_VARIANT_META = {
+    "B": ("mail", "the target's RFC822 (email) altSecurityIdentities mapping"),
+    "C": ("cn", "the target's X509IssuerSubject altSecurityIdentities mapping"),
+    "D": ("dNSHostName", "the target's X509SubjectOnly altSecurityIdentities mapping"),
+}
+
+
+def _build_esc14_weak_mapping_steps(config: "EscConfig", variant: str) -> list["EscStep"]:
+    """Steps for ESC14 variants B/C/D (satisfy the target's EXISTING weak mapping).
+
+    Unlike variant A, ADscan NEVER touches the target here. It creates a throwaway
+    victim machine account, sets the victim's ``mail`` (B) / ``cn`` (C) /
+    ``dNSHostName`` (D) to the value the target's weak ``altSecurityIdentities``
+    mapping matches, enrolls a certificate as the victim, and the DC maps the
+    issued certificate to the target. Both destructive writes are on the throwaway
+    victim and are reversible: the victim account is deleted and its attribute is
+    restored, through the environment-change ledger.
+    """
+    from adscan_internal.services.adcs.esc_types import EscStep
+
+    default_attr, mapping_phrase = _ESC14_VARIANT_META.get(
+        variant, ("mail", "the target's weak altSecurityIdentities mapping")
+    )
+    attribute = (config.esc14_victim_attribute or "").strip() or default_attr
+    match_value = (config.esc14_match_value or "").strip()
+    target = config.target_account or config.target_upn or "the target"
+
+    if match_value:
+        write_description = (
+            f"Set the throwaway victim's {attribute} to {match_value}, matching "
+            f"{mapping_phrase}"
+        )
+    else:
+        write_description = (
+            f"Set the throwaway victim's {attribute} to match {mapping_phrase}"
+        )
+
+    return [
+        EscStep(
+            "Create victim machine account",
+            "Add a throwaway computer account via MachineAccountQuota",
+            destructive=True,
+            rollback_label="Delete victim computer account",
+        ),
+        EscStep(
+            f"Set victim {attribute}",
+            write_description,
+            destructive=True,
+            rollback_label=f"Restore the victim's original {attribute}",
+        ),
+        EscStep(
+            "Request certificate as victim",
+            f"Enroll the victim in {config.template or 'User'}; the DC maps the "
+            f"issued certificate to {target}",
+        ),
+        EscStep("PKINIT authenticate", f"Authenticate as {target}"),
+    ]
+
+
+def print_esc_preflight(
+    config: "EscConfig", steps: list["EscStep"], *, title_override: str | None = None
+) -> bool:
     from adscan_core.rich_output import _get_console, confirm_ask
     console = _get_console()
 
     has_destructive = any(s.destructive for s in steps)
     border = _CRIMSON if has_destructive else _AMBER
-    title_text = _ESC_TITLES.get(config.esc, f"ESC{config.esc}")
+    title_text = title_override or _ESC_TITLES.get(config.esc, f"ESC{config.esc}")
 
     grid = Table.grid(padding=(0, 1))
     grid.add_column(style=_MUTED, justify="right", min_width=16)

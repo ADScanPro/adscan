@@ -99,7 +99,14 @@ class AltSecurityIdentitiesService:
                     "userAccountControl",
                 ],
             )
-            raw_entries = list(getattr(connection.connection, "entries", []) or [])
+            # ``ADscanLDAPConnection`` exposes ``.entries`` directly (its underlying
+            # client is ``._conn``, not ``.connection``), so read the wrapper first
+            # and fall back to the older ``.connection.entries`` shape.
+            raw_entries = list(
+                getattr(connection, "entries", None)
+                or getattr(getattr(connection, "connection", None), "entries", [])
+                or []
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)

@@ -48,6 +48,7 @@ from adscan_internal.services.edge_kind import (
     edge_control_strength,
 )
 from adscan_internal.services.path_state import _PROVEN_STATUSES
+from adscan_internal.services.well_known_principals import _TIER_ZERO_WELL_KNOWN
 
 
 class CompromiseClass(str, Enum):
@@ -178,6 +179,16 @@ _PRIVILEGED_ESCALATOR_GROUP_NAMES: frozenset[str] = frozenset(
         "Enterprise Key Admins",
         "Exchange Trusted Subsystem",
         "Exchange Windows Permissions",
+        # Exchange control-plane groups: Tier 0 escalation-capable BY DESIGN. They
+        # own forest control-plane objects (WriteDACL / GenericAll over DnsAdmins,
+        # Enterprise Key Admins, Exchange Trusted Subsystem / Windows Permissions,
+        # the domain object, etc.), so compromising one is one technique from
+        # domain — exactly like EWP / ETS above. Exchange groups carry no
+        # well-known RID, so they are matched by NAME here.
+        "Exchange Servers",
+        "Exchange Enterprise Servers",
+        "Organization Management",
+        "Exchange Organization Administrators",
     )
 )
 
@@ -739,6 +750,29 @@ _COMPROMISE_CLASS_TO_PRIVILEGE_TIER: dict[CompromiseClass, PrivilegeTier] = {
 }
 
 
+def _own_wellknown_tier0_tier(
+    sid: str | None, rid: int | None = None
+) -> PrivilegeTier | None:
+    """Return a Tier-0 :class:`PrivilegeTier` when a principal's OWN SID is a Tier-0
+    well-known SID, else ``None``.
+
+    Defense in depth for a node whose own SID is a fixed Tier-0 well-known identity
+    (System ``S-1-5-18``, Enterprise Domain Controllers ``S-1-5-9``, the BUILTIN
+    Operators groups) but that carries NO Tier-0 group membership to classify by —
+    so the group-membership path would otherwise default it to Tier 2. Such an
+    identity is control-plane, never Tier 2. Directness is derived by re-running the
+    group classifier with the own SID treated as a membership (so a BUILTIN
+    Operators group node grades escalation-capable via its RID), falling back to
+    direct for the pure machine identities (System / Enterprise DCs) that match no
+    group RID. Scoped to the EXACT well-known SIDs, never a name.
+    """
+    sid_u = str(sid or "").strip().upper()
+    if not sid_u or sid_u not in _TIER_ZERO_WELL_KNOWN:
+        return None
+    own_cls = classify_principal_by_groups([sid_u], sid=sid, rid=rid)
+    return _COMPROMISE_CLASS_TO_PRIVILEGE_TIER.get(own_cls, PrivilegeTier.TIER0_DIRECT)
+
+
 def privilege_tier_for_principal(
     group_names: Iterable[str],
     sid: str | None = None,
@@ -763,7 +797,14 @@ def privilege_tier_for_principal(
         membership is :attr:`PrivilegeTier.TIER2`.
     """
     cls = classify_principal_by_groups(group_names, sid=sid, rid=rid)
-    return _COMPROMISE_CLASS_TO_PRIVILEGE_TIER.get(cls, PrivilegeTier.TIER2)
+    tier = _COMPROMISE_CLASS_TO_PRIVILEGE_TIER.get(cls)
+    if tier is not None:
+        return tier
+    # Defense in depth: a principal whose OWN SID is a Tier-0 well-known SID
+    # (System / Enterprise DCs / a BUILTIN Operators group) is control-plane, never
+    # the Tier-2 default — its control over AD objects is a by-design grant.
+    own = _own_wellknown_tier0_tier(sid, rid)
+    return own if own is not None else PrivilegeTier.TIER2
 
 
 def privilege_tier_for_computer(
@@ -845,6 +886,12 @@ def privilege_tier_for_computer(
         if tier is not None:
             return tier
 
+    # Defense in depth: a machine whose OWN SID is a Tier-0 well-known SID is
+    # control-plane (symmetry with the principal path), never the Tier-2 default.
+    own = _own_wellknown_tier0_tier(sid, rid)
+    if own is not None:
+        return own
+
     # Degraded fallback: the graph tagged this host Tier 0 but no group
     # membership was resolvable to derive directness — grade it escalation-
     # capable (the conservative, non-direct verdict).
@@ -886,6 +933,18 @@ class TierBasis(str, Enum):
     #: used to reach a DC, a hypervisor of a Tier-0 VM, a backup/EDR/monitoring
     #: agent with Tier-0 control). Microsoft: these are Tier 0, NOT Tier 1.
     TIER0_CONTROL = "tier0_control"
+    #: Heuristic Tier 1 — a PRINCIPAL (service account) that IS the identity of a
+    #: Tier-1 application: it publishes an application-class SPN registered on a
+    #: host already graded Tier 1. Microsoft defines Tier 1 as "member servers AND
+    #: the identities that manage them", so this account is Tier 1 even with no
+    #: AdminTo edge. Only set when the service-identity signal is what produced the
+    #: Tier-1 verdict (not membership or an admin grant — no double-count).
+    SERVICE_IDENTITY = "service_identity"
+    #: Heuristic Tier 1 — a COMPUTER with an unreadable ``operatingSystem`` that
+    #: nonetheless publishes a server-ONLY role SPN (DFS Replication), inferred to
+    #: be a member server rather than silently defaulting to Tier 2. Only set when
+    #: the role SPN is what PROMOTED a base Tier-2 (the empty-OS recall case).
+    SERVER_ROLE_INFERRED = "server_role_inferred"
 
 
 # Application-class SPN service classes: publishing one is a positive signal that
@@ -935,12 +994,128 @@ def spns_indicate_app_server(spns: Iterable[str] | None) -> bool:
     return False
 
 
+# Session-host SPN service-class PREFIXES: publishing one marks a member server as
+# an RDS / Citrix session host where a broad standard-user population logs on
+# interactively — a Tier 2 CLIENT despite the "Server" OS (Microsoft's #1
+# documented Tier-1 misclassification). This is a NON-``CanRDP`` recall signal for
+# the cases where no broad-group ``CanRDP`` edge was collected.
+#
+# ``upm_spn`` is the Citrix Profile Management (UPM) SPN (``UPM_SPN_<hash>``),
+# registered on a Citrix VDA — an unambiguous Citrix session-host component.
+# DELIBERATELY EXCLUDED: ``TERMSRV`` (present on EVERY server incl. DCs — it is NOT
+# a session-host discriminator) and any match on the SPN's HOST part (never key on
+# hostname). Matched case-insensitively against the service-class prefix.
+_SESSION_HOST_SPN_CLASS_PREFIXES: tuple[str, ...] = ("upm_spn",)
+
+
+def spns_indicate_session_host(spns: Iterable[str] | None) -> bool:
+    """Return whether any SPN marks a member server as an RDS / Citrix session host.
+
+    Reads the service-class prefix (token before the first ``/``) of each SPN and
+    tests it against :data:`_SESSION_HOST_SPN_CLASS_PREFIXES` (today: the Citrix
+    Profile Management ``UPM_SPN_<hash>`` marker). Generic every-server SPNs
+    (HOST / WSMAN / TERMSRV / RestrictedKrbHost) never match — TERMSRV in
+    particular is on every server including DCs and carries no session-host signal.
+    Never matches on the SPN's host part (no hostname keying). Case-insensitive;
+    tolerant of ``None`` / non-string entries.
+
+    A session host is a Tier 2 CLIENT despite its "Server" OS, so this feeds the
+    ``has_broad_interactive_logon`` input of :func:`refine_server_privilege_tier`
+    (basis :attr:`TierBasis.RDS_DOWNGRADE`) — a NON-``CanRDP`` recall signal.
+
+    Args:
+        spns: The computer's ``serviceprincipalnames`` list, or ``None``.
+
+    Returns:
+        ``True`` iff at least one SPN is a session-host service class.
+    """
+    if not spns:
+        return False
+    for spn in spns:
+        if not spn:
+            continue
+        service_class = str(spn).split("/", 1)[0].strip().lower()
+        if service_class.startswith(_SESSION_HOST_SPN_CLASS_PREFIXES):
+            return True
+    return False
+
+
+# Server-ONLY role SPN service-class PREFIXES: publishing one proves the host is a
+# member server even when its ``operatingSystem`` is unreadable, so an empty-OS
+# host is inferred Tier 1 rather than silently defaulting to Tier 2.
+#
+# ``dfsr-`` is the DFS Replication SPN (``Dfsr-<serviceGuid>``). DFS Replication is
+# a Windows Server role a workstation cannot run, so it is a sound, conservative
+# server marker. DELIBERATELY EXCLUDED: ``ntfrs-`` (the legacy File Replication
+# Service is a DC-ONLY SYSVOL marker — DCs are already Tier 0 by the fast-path, so
+# it is not a member-server signal) and the generic every-machine SPNs
+# (HOST / RestrictedKrbHost, on every workstation too). Matched case-insensitively
+# against the service-class prefix; never on the SPN host part.
+_SERVER_ROLE_SPN_CLASS_PREFIXES: tuple[str, ...] = ("dfsr-",)
+
+
+def spns_indicate_server_role(spns: Iterable[str] | None) -> bool:
+    """Return whether any SPN proves the host runs a server-ONLY role.
+
+    Reads the service-class prefix (token before the first ``/``) of each SPN and
+    tests it against :data:`_SERVER_ROLE_SPN_CLASS_PREFIXES` (today: the DFS
+    Replication ``Dfsr-<guid>`` marker). Used to infer that an empty-OS host is a
+    member server (basis :attr:`TierBasis.SERVER_ROLE_INFERRED`) — a positive
+    role signal, NEVER a guess from the empty OS alone. The legacy ``NtFrs-`` SPN
+    (a DC-only SYSVOL marker) and the generic every-machine SPNs never match.
+    Never matches on the SPN host part (no hostname keying). Case-insensitive;
+    tolerant of ``None`` / non-string entries.
+
+    Args:
+        spns: The computer's ``serviceprincipalnames`` list, or ``None``.
+
+    Returns:
+        ``True`` iff at least one SPN is a server-only role service class.
+    """
+    if not spns:
+        return False
+    for spn in spns:
+        if not spn:
+            continue
+        service_class = str(spn).split("/", 1)[0].strip().lower()
+        if service_class.startswith(_SERVER_ROLE_SPN_CLASS_PREFIXES):
+            return True
+    return False
+
+
+# Known Windows CLIENT (workstation) OS edition markers. A host whose OS matches
+# one of these is a workstation even if it publishes an application-class SPN
+# (e.g. a developer/analyst box with local SQL Express), so the app_spn Tier-1
+# promotion must NOT fire for it. "server" anywhere in the string vetoes the
+# client verdict (covers "Windows Storage Server", etc.).
+_CLIENT_OS_MARKERS: frozenset[str] = frozenset(
+    {"windows 11", "windows 10", "windows 8", "windows 7", "windows vista",
+     "windows xp"}
+)
+
+
+def is_client_os(os_str: str | None) -> bool:
+    """Return whether an OS string names a known Windows CLIENT (workstation) edition.
+
+    True for Windows 11/10/8(.1)/7/Vista/XP client editions; False for any string
+    containing "server", and for empty/unknown/non-Windows input (conservative:
+    an unknown OS is never treated as a client, so the app_spn promotion the
+    rule depends on for empty-OS hosts is preserved — see the empty-OS recall).
+    """
+    text = str(os_str or "").strip().lower()
+    if not text or "server" in text:
+        return False
+    return any(marker in text for marker in _CLIENT_OS_MARKERS)
+
+
 def refine_server_privilege_tier(
     base_tier: PrivilegeTier,
     *,
     controls_tier0_asset: bool = False,
     has_broad_interactive_logon: bool = False,
     has_app_server_spn: bool = False,
+    has_server_role_spn: bool = False,
+    is_client_os: bool = False,
 ) -> tuple[PrivilegeTier, str | None]:
     """Refine a member server's heuristic Tier-1 verdict with graph signals.
 
@@ -993,6 +1168,17 @@ def refine_server_privilege_tier(
             edge into it.
         has_app_server_spn: The server publishes an application-class SPN
             (:func:`spns_indicate_app_server`).
+        has_server_role_spn: The host publishes a server-ONLY role SPN (DFS
+            Replication, :func:`spns_indicate_server_role`). Promotes a base
+            Tier-2 (empty-OS) host to a Tier-1 member server, basis
+            :attr:`TierBasis.SERVER_ROLE_INFERRED` — the empty-OS recall case.
+            Subject to the ``is_client_os`` veto, like ``has_app_server_spn``.
+        is_client_os: The host's ``operatingSystem`` is a known Windows CLIENT
+            edition (:func:`is_client_os`). When True, an ``has_app_server_spn``
+            promotion of a base Tier-2 does NOT fire (a workstation with local
+            SQL Express is not a Tier-1 app server). A base Tier-1 member server
+            is never demoted by this veto; an empty/unknown OS (``is_client_os``
+            False) still promotes.
 
     Returns:
         A ``(PrivilegeTier, tier_basis)`` pair. ``tier_basis`` is a
@@ -1009,7 +1195,16 @@ def refine_server_privilege_tier(
     # server detection) to a member server, in addition to strengthening an
     # already-detected server's confidence. This is conservative — only the
     # curated app-class SPN classes qualify, never the generic every-server SPNs.
-    is_member_server = base_tier is PrivilegeTier.TIER1 or has_app_server_spn
+    # The promotion fires ONLY when the host is not a known client OS: a
+    # workstation with local SQL Express (Win10/7/XP + MSSQLSvc) is not a Tier-1
+    # app server. An empty/unknown OS (is_client_os False) still promotes — that
+    # is the case the rule exists for. A base Tier-1 member server is unaffected.
+    # A server-ONLY role SPN (DFS Replication) also PROVES a base Tier-2 host is a
+    # member server even with no readable OS string — the empty-OS recall case.
+    # Same client-OS veto as the app-class SPN promotion.
+    is_member_server = base_tier is PrivilegeTier.TIER1 or (
+        not is_client_os and (has_app_server_spn or has_server_role_spn)
+    )
     if not is_member_server:
         # Plain Tier 2 workstation with no server signal — no refinement applies
         # and no basis is recorded (keeps the artifact compact).
@@ -1022,6 +1217,9 @@ def refine_server_privilege_tier(
         return PrivilegeTier.TIER2, TierBasis.RDS_DOWNGRADE.value
     if has_app_server_spn:
         return PrivilegeTier.TIER1, TierBasis.APP_SPN.value
+    # An empty-OS host promoted purely by a server-role SPN records the inference.
+    if base_tier is PrivilegeTier.TIER2 and has_server_role_spn:
+        return PrivilegeTier.TIER1, TierBasis.SERVER_ROLE_INFERRED.value
     return PrivilegeTier.TIER1, TierBasis.SERVER_HEURISTIC.value
 
 
@@ -1102,6 +1300,97 @@ def privilege_tier_for_principal_with_admin_assets(
         if contribution.rank > effective.rank:
             effective = contribution
     return effective
+
+
+def app_server_spn_hosts(spns: Iterable[str] | None) -> list[str]:
+    """Return the host candidates of each application-class SPN a principal holds.
+
+    For every APPLICATION-class SPN (:data:`_APP_SERVER_SPN_CLASSES` — MSSQL /
+    Exchange / SharePoint-HTTP) in ``spns``, parse the host part (the token after
+    the first ``/``, port and instance stripped) and emit it lowercased, plus its
+    short first label. A caller matches these against its own computer host→tier
+    index to decide whether a service account IS the identity of a Tier-1 app
+    server (:func:`effective_principal_tier`). Generic every-server SPNs are
+    ignored so only a real application identity contributes.
+
+    This is NOT hostname keying: it never pattern-matches a hostname STRING; it
+    only yields the host so the caller can resolve it to a real computer node and
+    read that node's STAMPED tier.
+
+    Args:
+        spns: The principal's ``serviceprincipalnames`` list, or ``None``.
+
+    Returns:
+        A de-duplicated list of lowercased host candidates (full FQDN + short
+        label) from the principal's application-class SPNs. Empty when none.
+    """
+    hosts: list[str] = []
+    for spn in spns or ():
+        if not spn:
+            continue
+        parts = str(spn).split("/", 1)
+        if len(parts) != 2:
+            continue
+        if parts[0].strip().lower() not in _APP_SERVER_SPN_CLASSES:
+            continue
+        host = parts[1].split("/", 1)[0].split(":", 1)[0].strip().lower()
+        if not host or host in hosts:
+            continue
+        hosts.append(host)
+        short = host.split(".", 1)[0]
+        if short and short != host and short not in hosts:
+            hosts.append(short)
+    return hosts
+
+
+def effective_principal_tier(
+    membership_tier: PrivilegeTier,
+    *,
+    administered_asset_tiers: Iterable[PrivilegeTier] | None = None,
+    service_identity_host_tiers: Iterable[PrivilegeTier] | None = None,
+) -> tuple[PrivilegeTier, str | None]:
+    """Return a principal's effective Tier AND its heuristic basis (axis 1).
+
+    The single composition of the two principal-side Tier-1 floorings, shared by
+    both stamp sites so they can never diverge:
+
+    1. **Administered-asset flooring** (existing) —
+       :func:`privilege_tier_for_principal_with_admin_assets`: a principal is
+       floored by the tier of the computers it ADMINISTERS BY GRANT (AdminTo /
+       SQLAdmin). Group membership still wins (a Tier-0 principal is returned
+       unchanged).
+    2. **Service-identity flooring** (new) — a principal that IS the identity of a
+       Tier-1 application (an application-class SPN running on a host already
+       graded Tier 1) is floored to Tier 1, with basis
+       :attr:`TierBasis.SERVICE_IDENTITY`. Conservative: ONLY a Tier-1 host
+       contributes (never Tier-0 — that is axis-2 reach — and never a Tier-2 host).
+
+    The basis is returned ONLY when the service-identity signal is what PRODUCED
+    the Tier-1 verdict (the effective tier was below Tier 1 before it). If
+    membership or an admin grant already made the principal Tier 1+, no basis is
+    returned (no double-count) and the common Tier-2 principal gets ``None`` (so
+    the compact artifact keeps no basis field for it).
+
+    Args:
+        membership_tier: The principal's group-membership tier.
+        administered_asset_tiers: Tiers of the computers it administers by grant.
+        service_identity_host_tiers: Tiers of the hosts its application-class SPNs
+            run on (resolved by the caller via :func:`app_server_spn_hosts`).
+
+    Returns:
+        A ``(PrivilegeTier, tier_basis)`` pair; ``tier_basis`` is a
+        :class:`TierBasis` ``.value`` or ``None``.
+    """
+    effective = privilege_tier_for_principal_with_admin_assets(
+        membership_tier, administered_asset_tiers
+    )
+    if effective.is_tier0:
+        return effective, None
+    if effective.rank < PrivilegeTier.TIER1.rank and any(
+        t is PrivilegeTier.TIER1 for t in (service_identity_host_tiers or ())
+    ):
+        return PrivilegeTier.TIER1, TierBasis.SERVICE_IDENTITY.value
+    return effective, None
 
 
 def privilege_tier_for_computer_node(
@@ -1487,6 +1776,30 @@ def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
 
     # Resolved computer tiers by node id — PASS 1 fills, PASS 2 (PART B) reads.
     computer_tier_by_id: dict[str, PrivilegeTier] = {}
+    # Resolved computer tiers by HOST identifier (dnshostname / name /
+    # samaccountname, lowercased, short label too) — PASS 1 fills, PASS 2 reads to
+    # resolve a service account's app-class SPN host to its Tier (service identity).
+    computer_tier_by_host: dict[str, PrivilegeTier] = {}
+
+    def _record_computer_hosts(
+        props_map: dict[str, Any], node: dict[str, Any], tier: PrivilegeTier
+    ) -> None:
+        for raw in (
+            props_map.get("dnshostname"),
+            props_map.get("name"),
+            node.get("label"),
+            node.get("name"),
+            props_map.get("samaccountname"),
+        ):
+            if not raw:
+                continue
+            host = str(raw).strip().lower().rstrip("$")
+            if not host:
+                continue
+            computer_tier_by_host[host] = tier
+            short = host.split(".", 1)[0]
+            if short and short != host:
+                computer_tier_by_host.setdefault(short, tier)
 
     def _resolve_and_stamp_computer(node_id: str, node: dict[str, Any]) -> None:
         props = node.setdefault("properties", {})
@@ -1498,6 +1811,7 @@ def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
             existing = node_stamped_privilege_tier(node)
             if existing is not None:
                 computer_tier_by_id[node_id] = existing
+                _record_computer_hosts(props, node, existing)
             return
         sid = str(props.get("objectid") or node.get("objectId") or "").strip() or None
         is_tier0_flag = bool(node.get("isTierZero")) or bool(props.get("isTierZero"))
@@ -1522,15 +1836,22 @@ def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
             | deleg_targets_by_src.get(node_id, set())
         )
         spns = (props or {}).get("serviceprincipalnames")
+        spns_list = spns if isinstance(spns, (list, tuple)) else None
         refined_tier, basis = refine_server_privilege_tier(
             base_tier,
             controls_tier0_asset=controls_tier0,
-            has_broad_interactive_logon=node_id in broad_logon_targets,
-            has_app_server_spn=spns_indicate_app_server(
-                spns if isinstance(spns, (list, tuple)) else None
+            # RDS/Citrix downgrade signal: a broad-group CanRDP edge OR a Citrix
+            # session-host SPN (the non-CanRDP recall case).
+            has_broad_interactive_logon=(
+                node_id in broad_logon_targets
+                or spns_indicate_session_host(spns_list)
             ),
+            has_app_server_spn=spns_indicate_app_server(spns_list),
+            has_server_role_spn=spns_indicate_server_role(spns_list),
+            is_client_os=is_client_os(os_str),
         )
         computer_tier_by_id[node_id] = refined_tier
+        _record_computer_hosts(props, node, refined_tier)
         props["privilege_tier"] = refined_tier.value
         if basis is not None:
             props["privilege_tier_basis"] = basis
@@ -1574,10 +1895,42 @@ def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
                 for t in admin_grant_targets_by_src.get(node_id, ())
                 if t in computer_tier_by_id
             ]
-            if administered:
-                tier = privilege_tier_for_principal_with_admin_assets(
-                    tier, administered
+            # Service identity — a service account whose application-class SPN runs
+            # on a Tier-1 host IS Tier 1 even with no admin edge (shared SSOT).
+            spns = props.get("serviceprincipalnames")
+            service_host_tiers = [
+                computer_tier_by_host[h]
+                for h in app_server_spn_hosts(
+                    spns if isinstance(spns, (list, tuple)) else None
                 )
+                if h in computer_tier_by_host
+            ]
+            tier, user_basis = effective_principal_tier(
+                tier,
+                administered_asset_tiers=administered,
+                service_identity_host_tiers=service_host_tiers,
+            )
+            if user_basis is not None:
+                props["privilege_tier_basis"] = user_basis
+            # ── Azure AD Connect control-plane sync-account promotion ──────────
+            # MIRROR of the collector-side promotion in
+            # collector/inventory_persistence.py::_classify_principals_by_membership.
+            # A CONFIRMED AAD Connect sync account holds DCSync BY DESIGN and IS a
+            # Tier-0 asset (whoever controls it owns the forest via replication), so
+            # it is promoted to tier0_direct here exactly as the collector does.
+            # Without this, reopening an old / stampless workspace (or any offline
+            # re-stamp) would mis-grade an MSOL sync account as Tier-2. Detection is
+            # by AAD provenance (the description anchor + the MSOL_<hex> name) via the
+            # SHARED predicate, NEVER by "holds DCSync" (which would hide a backdoor).
+            # Keep the two sites in lockstep.
+            sync_state = node_is_control_plane_sync_account(node)
+            if sync_state is SyncAccountState.CONFIRMED:
+                tier = PrivilegeTier.TIER0_DIRECT
+                props["privilege_tier_basis"] = "control_plane_sync_account"
+            elif sync_state is SyncAccountState.AMBIGUOUS:
+                # Name-only, no confirmable AAD provenance: surface for client
+                # confirmation, never auto-promote (mirror of the collector).
+                props["control_plane_sync_state"] = "ambiguous"
         else:
             # Group / Domain / ADCS / container — tier is a property of the node's
             # own identity; the enriched node resolver already grades these.
@@ -1644,6 +1997,57 @@ _PRIVILEGE_TIER_LABELS: dict[PrivilegeTier, str] = {
 def privilege_tier_label(tier: PrivilegeTier) -> str:
     """Return the canonical buyer-facing label for a :class:`PrivilegeTier`."""
     return _PRIVILEGE_TIER_LABELS.get(tier, "Tier 2: Standard")
+
+
+def install_privilege_tier_label_provider() -> None:
+    """Point the dependency-light reporting seam at this module's labels.
+
+    ``adscan_core.reporting.privilege_tier_labels`` cannot import this module
+    (the web backend and the appliance import the reporting projections, so that
+    layer stays dependency-light), and the tier wording has exactly one owner
+    here. Every reporting surface that words a tier token therefore installs the
+    resolver through this ONE function rather than carrying its own lambda, so
+    the badge on an endpoint-defense row, on a finding's affected assets and on
+    a credential-recovery segment cannot word the same tier differently.
+
+    Idempotent and best-effort: re-installing is a no-op in effect, and a
+    failure leaves the seam unwired, which renders no badge rather than a wrong
+    one.
+    """
+    try:
+        from adscan_core.reporting.privilege_tier_labels import (  # noqa: PLC0415
+            set_privilege_tier_label_provider,
+        )
+
+        set_privilege_tier_label_provider(
+            lambda token: privilege_tier_label(PrivilegeTier(token))
+        )
+    except Exception:  # noqa: BLE001 - a missing badge beats a failed report
+        pass
+
+
+# Coarse ESAE tier NUMBER (0/1/2) — collapses the Tier-0 directness split
+# (``tier0_direct`` + ``tier0_escalation_capable``) into the single ESAE Tier 0.
+# A LOWER number is MORE privileged (Tier 0 is the identity control plane). Use
+# this (not :attr:`PrivilegeTier.rank`, which is directness-first and keeps the
+# Tier-0 split) whenever the question is "is this a CROSS-TIER relationship" — a
+# Tier-0-direct principal and a Tier-0-escalation-capable asset are the SAME
+# ESAE tier (both Tier 0), so their relationship is NOT a tier violation.
+_PRIVILEGE_TIER_NUMBER: dict[PrivilegeTier, int] = {
+    PrivilegeTier.TIER0_DIRECT: 0,
+    PrivilegeTier.TIER0_ESCALATION_CAPABLE: 0,
+    PrivilegeTier.TIER1: 1,
+    PrivilegeTier.TIER2: 2,
+}
+
+
+def esae_tier_number(tier: PrivilegeTier) -> int:
+    """Return the coarse ESAE tier number (0/1/2) for a :class:`PrivilegeTier`.
+
+    0 for both Tier-0 variants (direct AND escalation-capable), 1 for Tier 1,
+    2 for Tier 2. Lower = more privileged.
+    """
+    return _PRIVILEGE_TIER_NUMBER.get(tier, 2)
 
 
 # Axis 2 — Compromise Reach. The highest tier a principal can ATTACK INTO via a

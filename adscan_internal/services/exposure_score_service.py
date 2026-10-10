@@ -69,6 +69,9 @@ from adscan_internal.services.attack_step_support_registry import (
 from adscan_internal.services.compromise_class import (
     is_proven_unauthenticated_domain_breaker,
 )
+from adscan_internal.services.destructive_action_policy import (
+    path_is_safety_abstention,
+)
 from adscan_internal.services.path_state import (
     _PROVEN_STATUSES,
     NO_EXPOSURE_STATUSES,
@@ -1020,12 +1023,24 @@ def _reconcile_status(record: Mapping[str, Any], has_execution: bool) -> str:
     return str(record.get("status") or "theoretical").strip().lower()
 
 
+#: Key the engine stamps inside a ``path_axis[<class>]`` bucket holding the
+#: routes ADscan CONFIRMED and deliberately did not execute (a hard-refused
+#: destructive technique). It is a SUBSET of the bucket's ``blocked`` status
+#: count, because a ``blocked`` route with no safety marker is reported as
+#: ``attempted`` and is not restraint. Stamped as its own key, not inferred from
+#: the status token, so the headline figure selects exactly the routes the
+#: report's "Not Executed for Safety" section details.
+PATH_AXIS_SAFETY_WITHHELD_KEY = "safety_withheld"
+
 #: Keys the engine stamps inside a ``path_axis[<class>]`` bucket that are NOT
 #: per-status counts. ``total`` is the class inventory; ``exposure_total`` is the
-#: subset that still describes OPEN exposure. Anything iterating a bucket as a
-#: status map must skip both. Mirrored by the web view
+#: subset that still describes OPEN exposure; ``safety_withheld`` is the
+#: deliberate-abstention subset. Anything iterating a bucket as a status map must
+#: skip all three. Mirrored by the web view
 #: (``exposure_kpis_view._PATH_AXIS_NON_STATUS_KEYS``).
-PATH_AXIS_NON_STATUS_KEYS: frozenset[str] = frozenset({"total", "exposure_total"})
+PATH_AXIS_NON_STATUS_KEYS: frozenset[str] = frozenset(
+    {"total", "exposure_total", PATH_AXIS_SAFETY_WITHHELD_KEY}
+)
 
 
 @dataclass(frozen=True)
@@ -1106,6 +1121,28 @@ def split_open_exposure(bucket: Mapping[str, Any] | None) -> OpenExposureSplit:
     return OpenExposureSplit(proven=proven, partial=partial, unproven=unproven)
 
 
+def safety_withheld_total(bucket: Mapping[str, Any] | None) -> int:
+    """Return the routes in a bucket ADscan confirmed and deliberately withheld.
+
+    Reads the engine-stamped :data:`PATH_AXIS_SAFETY_WITHHELD_KEY` only; it
+    recomputes nothing and never infers restraint from a status token. An
+    artifact produced before the engine stamped the key yields ``0``, which is
+    the honest reading: that run recorded no abstention we can attribute, so the
+    document states two buckets rather than claiming a third it cannot evidence.
+
+    The figure is a SUBSET of :attr:`OpenExposureSplit.unproven`: a withheld
+    route still carries open exposure (the avenue is open; only the detonation
+    was declined), so it is inside the headline total and is carved OUT of the
+    configuration-analysis count by the caller, never added on top of it.
+    """
+    if not isinstance(bucket, Mapping):
+        return 0
+    try:
+        return max(0, int(bucket.get(PATH_AXIS_SAFETY_WITHHELD_KEY, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def compute_exposure_kpis(
     summaries: Sequence[Mapping[str, Any]],
     *,
@@ -1117,6 +1154,7 @@ def compute_exposure_kpis(
     population_tier_breakdown: Mapping[str, Any] | None = None,
     reachability: Mapping[str, int] | None = None,
     tier2_exposure: Mapping[str, Any] | None = None,
+    coverage_mode: str | None = None,
 ) -> dict[str, Any]:
     """Compute the exposure KPI block (path-axis + user-axis blast radius).
 
@@ -1270,6 +1308,17 @@ def compute_exposure_kpis(
         if carries_client_exposure(status):
             path_axis[cls]["exposure_total"] = (
                 path_axis[cls].get("exposure_total", 0) + 1
+            )
+        # Routes ADscan confirmed and deliberately did NOT execute. Counted from
+        # the SAME predicate the report's display bucket uses
+        # (``destructive_action_policy.path_is_safety_abstention``), so the
+        # client-facing "confirmed and deliberately not executed" figure and the
+        # section that details those routes can never select different routes.
+        # Deliberate restraint is the one fact in this split a competitor cannot
+        # produce, so it is never folded into the configuration-analysis count.
+        if status == "blocked" and path_is_safety_abstention(record):
+            path_axis[cls][PATH_AXIS_SAFETY_WITHHELD_KEY] = (
+                path_axis[cls].get(PATH_AXIS_SAFETY_WITHHELD_KEY, 0) + 1
             )
         distinct_paths[cls] += 1
 
@@ -1446,6 +1495,18 @@ def compute_exposure_kpis(
         block["reachability"] = dict(reachability)
     if tier2_exposure is not None:
         block["tier2_exposure"] = dict(tier2_exposure)
+    # Stamp the ACTUAL materialization-coverage signal (the memory-gate
+    # sampled/bounded truth), when the caller resolved it. This is the ONLY honest
+    # source for "were routes truncated": a COMPLETED DFS that returned 0 paths is
+    # the true answer, NOT a truncation, so ``client_path_totals_from_kpis`` must
+    # read this stamped value and never infer "sampled" from "0 paths but non-zero
+    # reachability" (that heuristic mislabelled a completed-0 run as sampled and
+    # then reported the reachability flood as the headline). Absent/"complete"
+    # means a complete run; only "sampled"/"bounded" flips the effective figures to
+    # reachability. CLAUDE.md § "a bounded computation is a data gap — declare it".
+    _mode = str(coverage_mode or "").strip().lower()
+    if _mode:
+        block["coverage_mode"] = _mode
     # TWO Tier-2 numbers coexist in this block ON PURPOSE — they measure different
     # populations, and a consumer must NEVER cross them for a denominator:
     #   * ``population_tier_breakdown.tier2`` — the graded ACCOUNT population
@@ -1485,6 +1546,7 @@ def stamp_exposure_kpis_for_domain(
     domain_users: Sequence[str] | None = None,
     computed_at: str | None = None,
     reachability: Mapping[str, int] | None = None,
+    no_cache: bool = False,
 ) -> None:
     """Compute + persist the exposure-KPI block for one domain (tier-shared, LITE-safe).
 
@@ -1514,6 +1576,19 @@ def stamp_exposure_kpis_for_domain(
     LITE flow reads the same ``technical_report.json`` — the block is left
     untouched and nothing is recomputed/overwritten.
 
+    ``no_cache=True`` BYPASSES that idempotency guard and always recomputes +
+    overwrites the block. This is the re-stamp half of the ``--no-cache`` hard
+    reset: the guard keys only on "a valid block exists", so it cannot tell a
+    block stamped THIS run (safe to reuse) from a STALE block loaded from a prior
+    run's ``technical_report.json`` (must be refreshed). After an attack-path
+    ENGINE fix the same graph yields a different exposure, but the stale stamp
+    (persisted, possibly an older schema with ``coverage_mode=None``) survived
+    the guard and the panel/report kept rendering the pre-fix figure. A caller
+    that has just (re)computed the authoritative paths — the LITE render flow,
+    or any forced-fresh report generation — passes ``no_cache=True`` so the KPI
+    block is re-derived from those fresh paths and the persisted block is
+    overwritten (``record_exposure_kpis`` writes it verbatim).
+
     Best-effort by design: a failure must NEVER break report generation, so the
     whole body is guarded and the block is simply absent on failure. Persists to
     ``domains[<domain>]["exposure_kpis"]`` (both the in-memory ``domain_data`` and
@@ -1538,14 +1613,17 @@ def stamp_exposure_kpis_for_domain(
             reachable-terminal summary is computed over the base graph.
     """
     # Idempotency guard: a valid block means a prior seam (PRO or an earlier LITE
-    # pass) already stamped it. Do not recompute/overwrite.
-    existing = domain_data.get("exposure_kpis")
-    if (
-        isinstance(existing, dict)
-        and existing.get("schema_version")
-        and isinstance(existing.get("path_axis"), dict)
-    ):
-        return
+    # pass) already stamped it. Do not recompute/overwrite — UNLESS no_cache asks
+    # for a hard refresh (a stale cross-run block the guard cannot distinguish
+    # from a fresh one; see the no_cache note in the docstring).
+    if not no_cache:
+        existing = domain_data.get("exposure_kpis")
+        if (
+            isinstance(existing, dict)
+            and existing.get("schema_version")
+            and isinstance(existing.get("path_axis"), dict)
+        ):
+            return
 
     try:
         from adscan_core import telemetry  # noqa: PLC0415
@@ -1611,34 +1689,20 @@ def stamp_exposure_kpis_for_domain(
         if _reachability is None:
             try:
                 from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
-                    _resolve_domain_enabled_low_priv_user_start_ids,
                     load_attack_graph,
                 )
                 from adscan_internal.services.attack_reachability import (  # noqa: PLC0415
-                    compute_reachable_terminals,
-                    summarize_reachable_terminals,
+                    reachability_summary_for_workspace,
                 )
 
+                # Load the base graph once so the Tier-2 exposure block below can
+                # reuse it, then summarize reachability through the SSOT helper
+                # (the SAME one the telemetry counts fallback uses, so the
+                # reachable_* numbers are identical on both paths).
                 _graph = load_attack_graph(_kpi_shell, domain)
-                _start_ids = _resolve_domain_enabled_low_priv_user_start_ids(
-                    _kpi_shell, domain, _graph
+                _reachability = reachability_summary_for_workspace(
+                    workspace_dir, domain, graph=_graph
                 )
-                # SHAPE: the runtime graph stores nodes as a DICT (id->node).
-                # compute_reachable_terminals iterates graph["nodes"] as a LIST of
-                # node dicts, so normalize before passing (else it computes 0).
-                _nodes = _graph.get("nodes")
-                _norm_graph = {
-                    "nodes": (
-                        list(_nodes.values())
-                        if isinstance(_nodes, dict)
-                        else (_nodes or [])
-                    ),
-                    "edges": _graph.get("edges") or [],
-                }
-                _reachable_terminals = compute_reachable_terminals(
-                    _norm_graph, start_node_ids=_start_ids, target="all"
-                )
-                _reachability = summarize_reachable_terminals(_reachable_terminals)
             except Exception as _reach_exc:  # noqa: BLE001
                 if print_exception is not None:
                     print_exception(exception=_reach_exc)
@@ -1667,6 +1731,42 @@ def stamp_exposure_kpis_for_domain(
                 print_exception(exception=_tier2_exc)
             _tier2_exposure = None
 
+        # Resolve the ACTUAL materialization-coverage signal from the already-
+        # stamped memory-gate block (sampled/bounded), NOT from a count heuristic.
+        # Only a genuinely sampled/bounded run flips the effective figures to
+        # reachability; a completed DFS (even one that returned 0 paths) stays
+        # "complete" and reports k. Best-effort: any failure leaves it unstamped
+        # (the consumer then defaults to "complete").
+        _coverage_mode = "complete"
+        try:
+            from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+                read_attack_path_coverage,
+            )
+            from adscan_internal.services.chokepoint_cardinality import (  # noqa: PLC0415
+                resolve_choke_bounded,
+            )
+
+            _engine_marker_bounded = (
+                str(getattr(shell, "_attack_path_engine_used", "") or "").strip().lower()
+                == "fallback"
+            )
+            # Read the coverage declaration of the computation that produced THESE
+            # paths, not the one the in-memory report entry happened to carry. The
+            # entry was loaded before the compute ran, so its block describes the
+            # PREVIOUS run — which is how a workspace that sampled once kept
+            # rendering as sampled for every later, completed render.
+            _coverage_entry: dict[str, Any] = domain_data
+            _persisted_coverage = read_attack_path_coverage(_kpi_shell, domain)
+            if _persisted_coverage is not None:
+                _coverage_entry = {"attack_path_coverage": _persisted_coverage}
+            if resolve_choke_bounded(
+                _coverage_entry, engine_marker_bounded=_engine_marker_bounded
+            ):
+                _coverage_mode = "sampled"
+        except Exception as _cov_exc:  # noqa: BLE001 - coverage read is best-effort
+            if print_exception is not None:
+                print_exception(exception=_cov_exc)
+
         _kpis = compute_exposure_kpis(
             records,
             domain_user_count=_user_count,
@@ -1679,6 +1779,7 @@ def stamp_exposure_kpis_for_domain(
             computed_at=computed_at or None,
             reachability=_reachability,
             tier2_exposure=_tier2_exposure,
+            coverage_mode=_coverage_mode,
         )
         domain_data["exposure_kpis"] = _kpis
         record_exposure_kpis(

@@ -1,10 +1,22 @@
 """ESC14 — weak SAN-based mapping on auth template + low-priv enroll.
 
-Per-user ``altSecurityIdentities`` write analysis is deferred (requires per-
-property ACL granularity which the native ACLParser collapses to Generic*).
-This phase implements the template-side half: any auth template that requires
-SAN-based UPN/Email mapping, has no manager approval, and exposes enrollment
-to a non-Tier0 principal becomes an ESC14 source.
+This phase implements the template-side half: an auth template that requires a
+SAN-based USER-impersonation subject (UPN or email), has no manager approval,
+no RA signature, and exposes enrollment to a non-Tier0 principal becomes an
+ESC14 source. It gates ONLY on ``SUBJECT_ALT_REQUIRE_UPN`` / ``_EMAIL``, the
+subject forms that bind a certificate to a user identity — NOT on
+``SUBJECT_ALT_REQUIRE_DNS`` / ``_DOMAIN_DNS`` / ``_SPN``, which bind a machine
+identity and are the ordinary shape of a computer/DC auto-enrollment template.
+(The earlier constant nibble-shift made the "email" bit alias DOMAIN_DNS, so
+machine DNS templates matched here in every domain — see ``constants.py``.)
+
+The decisive ESC14 existence condition — a weak explicit
+``altSecurityIdentities`` mapping (or write access to one) on a reachable
+target AND StrongCertificateBindingEnforcement < 2 on the DCs — is INVISIBLE to
+passive LDAP, so the edge is actively confirmed during collection by
+``adscan_internal.services.adcs.esc14_confirmation`` (mirrors the ESC15
+confirm). A template-shape match alone is a confirmation-pending candidate, not
+a flat finding.
 """
 
 from __future__ import annotations

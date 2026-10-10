@@ -38,6 +38,8 @@ from adscan_launcher.docker_runtime import (
     DockerRunConfig,
     build_adscan_run_command,
     probe_and_warn_reduced_runtime,
+    warn_gpu_degraded_and_confirm,
+    gpu_degradation_env,
     docker_access_denied,
     docker_available,
     docker_needs_sudo,
@@ -81,6 +83,13 @@ LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
 ADSCAN_RUNTIME_LICENSE_MODE_ENV = "ADSCAN_RUNTIME_LICENSE_MODE"
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
 _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\s--gpus\b", re.IGNORECASE)
+
+#: Pass-through commands that can crack, and therefore want the host GPU.
+#: Everything else the pass-through carries (`doctor`, `deliver`, `bonuses`,
+#: `demo`) has no use for one, so it skips the detection entirely.
+_GPU_RELEVANT_PASSTHROUGH_COMMANDS: frozenset[str] = frozenset(
+    {"ci", "tui", "execute", "start"}
+)
 _DOCKER_INSTALL_DOCS_URL = cta_url("docker_missing")
 _ALLOW_PODMAN_DOCKER_API_ENV = "ADSCAN_ALLOW_PODMAN_DOCKER_API"
 _ALLOW_LEGACY_IMAGE_FALLBACK_ENV = "ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK"
@@ -812,7 +821,12 @@ def _registry_label_for_host(host: str) -> str:
     (e.g. ``ghcr.io``) so the operator sees the registry the pull actually used.
     """
     normalized = str(host or "").strip().lower()
-    if normalized in ("", _DOCKER_PULL_DNS_PREFLIGHT_HOST, "docker.io", "index.docker.io"):
+    if normalized in (
+        "",
+        _DOCKER_PULL_DNS_PREFLIGHT_HOST,
+        "docker.io",
+        "index.docker.io",
+    ):
         return "Docker Hub"
     if normalized == "ghcr.io":
         return "GitHub Container Registry (ghcr.io)"
@@ -1605,7 +1619,9 @@ def _ensure_image_pulled_with_legacy_fallback(
                 {
                     "image": candidate_to_pull,
                     "reason": "transient_pull_failure",
-                    "first_failure_kind": first_failure.kind if first_failure else "unknown",
+                    "first_failure_kind": first_failure.kind
+                    if first_failure
+                    else "unknown",
                 },
             )
             time.sleep(1.5)
@@ -3130,26 +3146,44 @@ def _stop_host_helper(proc: subprocess.Popen[str] | None) -> None:
             pass
 
 
-def _detect_gpu_docker_run_args() -> tuple[str, ...]:
-    """Best-effort GPU passthrough flags for docker run.
+def _detect_gpu_docker_run_args() -> tuple[tuple[str, ...], object | None]:
+    """Best-effort GPU passthrough flags for docker run, with a health verdict.
 
     IMPORTANT:
         Intel/AMD `/dev/dri` passthrough remains **opt-in** because it can break
         OpenCL/Hashcat on some hosts (especially when running the container as a
         non-root UID/GID). NVIDIA is safer to enable automatically *only when*
-        Docker already advertises the NVIDIA runtime on the host.
+        Docker already advertises the NVIDIA runtime on the host **and** that
+        host's NVIDIA stack actually answers.
+
+        That last check is the load-bearing one. The two presence signals this
+        function used to rely on — the `/dev/nvidia*` device nodes and Docker's
+        advertised `nvidia` runtime — stay true on a host whose driver was
+        upgraded while the old kernel module was still loaded, and `--gpus all`
+        on that host does not degrade: the container never starts, and the whole
+        scan dies with a line of runc internals about a missing
+        `/run/nvidia-persistenced/socket`. Probing the stack (about 15 ms, see
+        `nvidia_runtime_check`) turns a dead run into a named degradation.
 
         Enable with:
             `export ADSCAN_DOCKER_GPU=auto`   (best-effort)
             `export ADSCAN_DOCKER_GPU=dri`    (force /dev/dri passthrough)
             `export ADSCAN_DOCKER_GPU=nvidia` (force --gpus all when supported)
             `export ADSCAN_DOCKER_GPU=all`    (dri + nvidia)
+            `export ADSCAN_DOCKER_GPU=0`      (skip GPU entirely, probe included)
+
+    Returns:
+        ``(run_args, verdict)``. ``verdict`` is an
+        :class:`~adscan_launcher.nvidia_runtime_check.NvidiaRuntimeVerdict` when
+        the host looked NVIDIA-capable and was probed, else ``None``. A verdict
+        whose ``degraded`` is true means ``--gpus`` was deliberately withheld
+        and the caller should report it; anything else needs no notice.
     """
     args: list[str] = []
 
     raw_mode = os.getenv("ADSCAN_DOCKER_GPU", "").strip().lower()
     if raw_mode in {"0", "false", "no", "off"}:
-        return ()
+        return (), None
     mode = raw_mode or "nvidia-auto"
 
     enable_dri = mode in {"1", "true", "yes", "on", "auto", "dri", "all"}
@@ -3169,6 +3203,7 @@ def _detect_gpu_docker_run_args() -> tuple[str, ...]:
         args.extend(["--device", "/dev/dri"])
 
     # NVIDIA: requires nvidia-container-toolkit + docker `--gpus`.
+    verdict: object | None = None
     has_nvidia_dev = enable_nvidia and any(
         Path(p).exists() for p in ("/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia-uvm")
     )
@@ -3191,14 +3226,52 @@ def _detect_gpu_docker_run_args() -> tuple[str, ...]:
                 )
                 # Only enable when docker advertises the nvidia runtime.
                 if "nvidia" in (info_proc.stdout or "").lower():
-                    args.extend(["--gpus", "all"])
+                    from adscan_launcher.nvidia_runtime_check import (  # noqa: PLC0415
+                        probe_nvidia_runtime,
+                    )
+
+                    verdict = probe_nvidia_runtime()
+                    # Fail-open: only a CONCLUSIVE failure withholds the GPU.
+                    if not getattr(verdict, "degraded", False):
+                        args.extend(["--gpus", "all"])
         except Exception:
             # Never fail hard on GPU detection.
             pass
 
     if args:
         print_info_debug(f"[docker] GPU passthrough enabled: {args}")
-    return tuple(args)
+    return tuple(args), verdict
+
+
+def resolve_gpu_passthrough(
+    *, command_name: str, allow_prompt: bool
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], bool]:
+    """Resolve GPU passthrough for one launch seam.
+
+    Single entry point for every seam that starts a scan container, so the
+    detection, the operator notice and the diagnosis forwarded into the
+    container can never drift apart between `start`, `ci` and the pass-through
+    commands.
+
+    Args:
+        command_name: The launcher command, for debug output.
+        allow_prompt: Whether this seam may ask the operator to confirm. True
+            for the interactive `start` seam only; `ci` and pass-through
+            commands report and continue, never blocking the run on a human.
+
+    Returns:
+        ``(run_args, extra_env, proceed)``. ``proceed`` is ``False`` only when
+        an interactive operator declined to run without GPU cracking.
+    """
+    gpu_args, verdict = _detect_gpu_docker_run_args()
+    if verdict is None or not getattr(verdict, "degraded", False):
+        return gpu_args, (), True
+
+    print_info_debug(
+        f"[docker] {command_name}: GPU withheld, code={getattr(verdict, 'code', '')}"
+    )
+    proceed = warn_gpu_degraded_and_confirm(verdict, allow_prompt=allow_prompt)
+    return gpu_args, gpu_degradation_env(verdict), proceed
 
 
 def _ensure_host_mount_dir_writable(path: Path, *, description: str) -> bool:
@@ -3337,9 +3410,7 @@ def _print_docker_install_summary() -> None:
         linkedin = ""
         x_link = ""
     note = Text()
-    note.append(
-        "Thanks for installing ADscan — it means a lot.\n", style="bold"
-    )
+    note.append("Thanks for installing ADscan — it means a lot.\n", style="bold")
     note.append(
         "I build it as a working AD pentester, and I'd love to hear how it goes "
         "for you.\n",
@@ -3747,7 +3818,12 @@ def handle_start_docker(
             return 1
         acq.helper_proc = helper_proc
 
-        gpu_args = _detect_gpu_docker_run_args()
+        gpu_args, gpu_env, gpu_proceed = resolve_gpu_passthrough(
+            command_name="start", allow_prompt=True
+        )
+        if not gpu_proceed:
+            print_info("Start cancelled. Restart the host, then run it again.")
+            return 0
         resolver_claim = _claim_container_local_resolver_ip(command_name="start")
         if resolver_claim is None:
             return 1
@@ -3766,6 +3842,7 @@ def handle_start_docker(
                     ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
                     ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
                 ]
+                + list(gpu_env)
                 + list(extra_env)
             ),
             run_host_dir=acq.session_dir,
@@ -3974,16 +4051,23 @@ def handle_ci_docker(
         if resolver_claim is None:
             return 1
         local_resolver_ip, acq.resolver_ip_lock = resolver_claim
+        # `ci` is the unattended money path: report a withheld GPU, never block
+        # the run on a prompt for a capability the assessment does not need.
+        gpu_args, gpu_env, _ = resolve_gpu_passthrough(
+            command_name="ci", allow_prompt=False
+        )
         cfg = DockerRunConfig(
             image=image,
             workspaces_host_dir=workspaces_dir,
             interactive=interactive,
+            extra_run_args=gpu_args,
             extra_env=tuple(
                 list(_build_runtime_license_env(image))
                 + [
                     ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
                     ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
                 ]
+                + list(gpu_env)
             ),
             run_host_dir=acq.session_dir,
         )
@@ -4160,10 +4244,22 @@ def run_adscan_passthrough_docker(
             return 1
         local_resolver_ip, acq.resolver_ip_lock = resolver_claim
 
+        # Only the commands that can actually crack pay for GPU resolution. A
+        # report render or a doctor run has no use for a GPU, and the detection
+        # costs two docker calls.
+        gpu_args: tuple[str, ...] = ()
+        gpu_env: tuple[tuple[str, str], ...] = ()
+        if passthrough_command in _GPU_RELEVANT_PASSTHROUGH_COMMANDS:
+            gpu_args, gpu_env, _ = resolve_gpu_passthrough(
+                command_name=f"passthrough:{passthrough_command}",
+                allow_prompt=False,
+            )
+
         cfg = DockerRunConfig(
             image=image,
             workspaces_host_dir=workspaces_dir,
             interactive=interactive,
+            extra_run_args=gpu_args,
             extra_env=tuple(
                 list(_build_runtime_license_env(image))
                 + [
@@ -4174,6 +4270,7 @@ def run_adscan_passthrough_docker(
                 # (--offline -> ADSCAN_OFFLINE=1, --no-telemetry ->
                 # ADSCAN_TELEMETRY=0). Appended last so an explicit toggle wins
                 # over any inherited value; empty by default (behaviour unchanged).
+                + list(gpu_env)
                 + list(extra_env or [])
             ),
             extra_mounts=tuple(extra_mounts or []),

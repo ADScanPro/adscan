@@ -41,7 +41,14 @@
    coloured at the call site. Same doctrine as the labels themselves: a step
    that did not run is never attributed to a defensive control. */
 .chip.proven { background: var(--red-bg); color: var(--red); border-color: var(--red-bd); }
-.chip.safety { background: rgba(154,107,0,0.12); color: var(--amber); border-color: var(--amber-bd); }
+/* "Not Executed for Safety". Two selectors, one rule: `safety` is the outcome
+   name and `safety_blocked` is the display-bucket token a renderer keys its chip
+   on (path_state.SAFETY_WITHHELD_BUCKET). Amber, like `attempted`, because both
+   are non-execution, but the LABEL carries the difference. It must not be slate:
+   that is `theoretical`, and a withheld route drawn in it was contradicting its
+   own card prose. The class is new, so no existing element changes. */
+.chip.safety,
+.chip.safety_blocked { background: rgba(154,107,0,0.12); color: var(--amber); border-color: var(--amber-bd); }
 .chip.hardening { background: rgba(47,111,79,0.10); color: var(--green); border-color: rgba(47,111,79,0.30); }
 /* Not Assessed — no reachable surface, so ADscan makes no claim either way.
    A dashed outline reads as "open question" and, crucially, is legible against
@@ -283,3 +290,18 @@ table.adscan-table tr:last-child td { border-bottom: none; }
 }
 .ds-fineprint b { color: var(--text-2); font-weight: 700; }
 .ds-muted { color: var(--text-4); }
+/* ── Baseline reference beneath a severity chip ─────────────────────
+   A finding is rated in two layers, and where this directory's own conditions
+   raised the rating, the chip alone hides the lift. This is the demoted
+   reference line that discloses the layer underneath: deliberately quiet, in
+   the mono face the document uses for every figure, so it reads as provenance
+   rather than as a second verdict competing with the chip.
+
+   Scoped under .ds-doc: new grammar, so it cannot reach the paid template,
+   which carries its own .meta-baseline-ref, until that document opts in. */
+.ds-doc .finding-baseline-ref {
+  font-family: var(--font-mono); font-size: 6pt; color: var(--text-4);
+  letter-spacing: 0.6px; text-transform: uppercase; margin-top: 1mm;
+  white-space: nowrap;
+}
+

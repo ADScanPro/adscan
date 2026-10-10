@@ -343,6 +343,34 @@ class SessionStreamer:
                 lifecycle_event = "session_finished"
             scan_metadata.update(final_metadata)
 
+        # Pseudonymize identifier fields (target domain, DC host/IP) in the
+        # structured lifecycle metadata BEFORE it leaves this host. Unlike the
+        # recording HTML buffer, ``scan_metadata`` never passes through the
+        # export-time sanitizer, so without this a raw client identifier would
+        # reach sessions.adscanpro.com (stored + the lifecycle Telegram ping).
+        # Single seam: covers scan_started / scan_finished / session_finished,
+        # the nested ``_batched_events``, and the final-metadata merge. SSOT:
+        # ``telemetry.sanitize_lifecycle_metadata`` (same pseudonym as the
+        # recording, so the token stays correlatable). Lazy import avoids the
+        # telemetry <-> telemetry_streamer module-init cycle. Best-effort: a
+        # sanitizer failure must never drop the chunk, but it MUST fail closed
+        # (drop the metadata) rather than ship a raw identifier.
+        if scan_metadata:
+            try:
+                from adscan_core.telemetry import (
+                    LIFECYCLE_PII_SANITIZED_KEY,
+                    sanitize_lifecycle_metadata,
+                )
+
+                scan_metadata = sanitize_lifecycle_metadata(scan_metadata)
+                # Tell the ingest server this payload is already sanitized, so
+                # it keeps the pseudonym instead of redacting it. An OLD client
+                # cannot stamp this, which is exactly how the server detects a
+                # raw payload and redacts it server-side.
+                scan_metadata[LIFECYCLE_PII_SANITIZED_KEY] = True
+            except Exception:  # noqa: BLE001 - fail closed, never leak raw
+                scan_metadata = {}
+
         payload: dict[str, Any] = {
             "seq": seq,
             "content_b64": content_b64,

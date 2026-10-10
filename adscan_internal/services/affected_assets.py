@@ -23,6 +23,7 @@ into a finding's narrative and remediation — is product knowledge and stays in
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 import re
 from typing import Any
 
@@ -31,13 +32,20 @@ from adscan_internal.services.adcs_path_display import extract_adcs_template_nam
 from adscan_internal.services.affected_asset_rules import (
     AssetRule,
     Extra,
+    Representation,
     Scope,
     SourceMode,
     TargetMode,
     extract_adcs_ca_names,
     rule_for,
 )
-from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
+from adscan_core.reporting.affected_assets_contract import (
+    AFFECTED_ASSETS_STRUCT_KEY,
+)
+from adscan_internal.services.compromise_class import (
+    PrivilegeTier,
+    is_direct_domain_breaker_target,
+)
 from adscan_internal.services.well_known_principals import (
     deshout_display_label,
     humanize_domain_for_display,
@@ -45,11 +53,14 @@ from adscan_internal.services.well_known_principals import (
 )
 
 #: Reserved key under a finding's ``details`` carrying the engine's typed,
-#: correlation-ready affected-asset entities. Declared here — the base module —
-#: so the flat resolution and the structured one cannot disagree about where
-#: they live; :data:`affected_assets_struct.SERIALIZED_KEY` is its alias, and
-#: that is the name the platform contract is documented under.
-SERIALIZED_ENTITIES_KEY = "_affected_assets_struct"
+#: correlation-ready affected-asset entities. The NAME is owned by
+#: :data:`adscan_core.reporting.affected_assets_contract.AFFECTED_ASSETS_STRUCT_KEY`
+#: so the engine, the LITE-safe alias collapse, the contextual severity overlay
+#: and the web backend cannot disagree about where the entities live (they did:
+#: the severity overlay read the legacy flat key for months). This is its engine
+#: alias, and :data:`affected_assets_struct.SERIALIZED_KEY` is the name the
+#: platform contract is documented under.
+SERIALIZED_ENTITIES_KEY = AFFECTED_ASSETS_STRUCT_KEY
 
 #: The flat, client-facing type name for each structured entity type. The typed
 #: vocabulary the platform correlates on says ``computer``; every flat surface
@@ -444,7 +455,9 @@ def _drop_subsumed_records(
     return kept
 
 
-def _extract_account_assets(details: Any, *, rule: AssetRule | None = None) -> list[str]:
+def _extract_account_assets(
+    details: Any, *, rule: AssetRule | None = None
+) -> list[str]:
     """Return the display labels for the principals a finding carries itself."""
     assets: list[str] = []
     for name, _sid, qualifier in iter_account_records(details, rule=rule):
@@ -567,9 +580,59 @@ def build_asset_type_index(vuln_data: Any) -> dict[str, str]:
     return index
 
 
-def resolve_asset_type(
-    asset: str, type_index: Mapping[str, str] | None = None
-) -> str:
+#: Sort rank for a stamped privilege tier (smaller = more critical = sorts
+#: first). Untiered assets fall to :data:`_UNTIERED_SORT_RANK`, after Tier 2.
+_TIER_SORT_RANK: dict[str, int] = {
+    PrivilegeTier.TIER0_DIRECT.value: 0,
+    PrivilegeTier.TIER0_ESCALATION_CAPABLE.value: 1,
+    PrivilegeTier.TIER1.value: 2,
+    PrivilegeTier.TIER2.value: 3,
+}
+_UNTIERED_SORT_RANK = 4
+
+
+def build_asset_tier_index(vuln_data: Any) -> dict[str, int]:
+    """Map a finding's flat asset strings to a privilege-tier SORT RANK.
+
+    Built from the STAMPED ``tier`` the finalization pass wrote onto each
+    structured entity (never raw ``isTierZero``), keyed by the same display /
+    identifier strings the flat extractor emits. Smaller rank = more critical, so
+    the sort puts Tier-0 assets first. Returns ``{}`` for a finding with no
+    stamped tier, so an unstamped finding keeps its existing order.
+    """
+    view = _details_view(vuln_data) if isinstance(vuln_data, dict) else {}
+    raw = view.get(SERIALIZED_ENTITIES_KEY)
+    if not isinstance(raw, list):
+        return {}
+    index: dict[str, int] = {}
+    for entity in raw:
+        if not isinstance(entity, dict):
+            continue
+        tier = str(entity.get("tier") or "").strip().lower()
+        rank = _TIER_SORT_RANK.get(tier)
+        if rank is None:
+            continue
+        for token in (entity.get("display"), entity.get("identifier")):
+            text = str(token or "").strip()
+            if not text:
+                continue
+            key = text.casefold()
+            # Keep the MOST critical rank when an alias resolves to several.
+            if key not in index or rank < index[key]:
+                index[key] = rank
+    return index
+
+
+def _asset_tier_rank(asset: str, tier_index: Mapping[str, int] | None) -> int:
+    """Return an asset's privilege-tier SORT RANK (Tier-0 first; untiered last)."""
+    if tier_index:
+        rank = tier_index.get(str(asset or "").strip().casefold())
+        if rank is not None:
+            return rank
+    return _UNTIERED_SORT_RANK
+
+
+def resolve_asset_type(asset: str, type_index: Mapping[str, str] | None = None) -> str:
     """Return an asset's type, preferring what the engine resolved over a guess.
 
     ``type_index`` comes from :func:`build_asset_type_index`. When the asset is
@@ -877,7 +940,9 @@ def _path_entry_vector_keys(path: dict[str, Any]) -> set[str]:
             entry_vector_finding_keys_for_path,
         )
 
-        return {str(k).strip().lower() for k in entry_vector_finding_keys_for_path(path)}
+        return {
+            str(k).strip().lower() for k in entry_vector_finding_keys_for_path(path)
+        }
     except Exception:  # noqa: BLE001 — entry-vector enrichment is never fatal
         return set()
 
@@ -934,7 +999,9 @@ def count_findings_on_paths(
     """
     dict_paths = [path for path in paths if isinstance(path, dict)]
     path_tokens = [
-        tokens for tokens in (_path_relation_tokens(path) for path in dict_paths) if tokens
+        tokens
+        for tokens in (_path_relation_tokens(path) for path in dict_paths)
+        if tokens
     ]
     # The entry-vector finding of each path (guest/null session) is carried as the
     # path's SOURCE NODE, not an edge relation — credit it too, or the guest-entry
@@ -1368,7 +1435,9 @@ def _humanize_principal_assets(
             # ``@WELLKNOWN`` / intra-domain ``@domain`` suffix, canonicalizes a
             # well-known identity, and lower-cases a shouting user account — it
             # preserves an already-mixed-case name verbatim (never title-cases it).
-            source_name = original_name_index.get(name.strip().casefold()) or original_name_index.get(
+            source_name = original_name_index.get(
+                name.strip().casefold()
+            ) or original_name_index.get(
                 name.strip().split("@", 1)[0].strip().casefold()
             )
             display = humanize_principal_for_prose(
@@ -1392,7 +1461,7 @@ def _humanize_principal_assets(
             # SHOUTING (a localized default template, Italian ``CONTROLLER DI
             # DOMINIO`` / ``AUTENTICAZIONE KERBEROS``). De-shout it to the
             # directory's own casing (never translated), preserving the
-            # ``Template: `` prefix. A CA name (``SIFI-CA``) is deliberately NOT
+            # ``Template: `` prefix. A CA name (``CORP-CA``) is deliberately NOT
             # de-shouted — it is an acronym/host-style identifier, not a phrase.
             prefix, psep, tname = name.partition(": ")
             if psep and tname.strip():
@@ -1437,7 +1506,9 @@ def _principal_original_name_index(vuln_data: Any) -> dict[str, str]:
                     text = str(token or "").strip()
                     if text:
                         index.setdefault(text.casefold(), original)
-                        index.setdefault(text.split("@", 1)[0].strip().casefold(), original)
+                        index.setdefault(
+                            text.split("@", 1)[0].strip().casefold(), original
+                        )
 
         for source in (view, vuln_data):
             for name, _sid, qualifier in iter_account_records(source):
@@ -1545,9 +1616,7 @@ def _extract_affected_assets_raw(
     # or the detector-specific container their rule declares. The generic list
     # scan below only handles flat lists, so without this the bare-domain
     # fallback would fire.
-    _extend_unique(
-        assets, _extract_account_assets(vuln_data.get("details"), rule=rule)
-    )
+    _extend_unique(assets, _extract_account_assets(vuln_data.get("details"), rule=rule))
     _extend_unique(assets, _extract_account_assets(vuln_data, rule=rule))
 
     assets = _drop_machine_account_shadows(assets)
@@ -1628,9 +1697,17 @@ def summarize_affected_assets(
         if isinstance(general_users, list):
             general_user_count = len(_extract_strings(general_users))
 
+    # Stamped privilege tier is the PRIMARY sort key (Tier-0 first), so the named
+    # assets above the inline cap are the ones that matter; the existing
+    # per-type / name priority is the secondary key, unchanged. Reordering only —
+    # the collapse / overflow / appendix mechanism is untouched.
+    tier_index = build_asset_tier_index(vuln_data)
     prioritized_assets = sorted(
         assets,
-        key=lambda asset: _asset_priority(asset, asset_types[asset]),
+        key=lambda asset: (
+            _asset_tier_rank(asset, tier_index),
+            *_asset_priority(asset, asset_types[asset]),
+        ),
     )
     return {
         "total_assets": len(assets),
@@ -1693,10 +1770,12 @@ def build_affected_asset_records(
 ) -> list[dict[str, str]]:
     """Return the COMPLETE, untruncated affected-asset records for a finding.
 
-    Each record is ``{"asset": str, "asset_type": str, "role": str}`` where
-    ``role`` is ``"source"`` (a source principal of the finding), ``"target"``
-    (a typed delegation/path target), or ``"affected"`` (the default — the
-    vulnerable resource itself, a posture host, or a domain-wide object).
+    Each record is ``{"asset": str, "asset_type": str, "role": str, "tier": str}``
+    where ``role`` is ``"source"`` (a source principal of the finding),
+    ``"target"`` (a typed delegation/path target), or ``"affected"`` (the default
+    — the vulnerable resource itself, a posture host, or a domain-wide object),
+    and ``tier`` is the stamped privilege-tier badge (``Tier 0`` / ``Tier 1`` /
+    ``Tier 2``) or ``""`` for an unstamped asset.
     Records are returned in priority order (most critical first), matching the
     inline display ordering, so the appendix and the PDF agree on what the
     "top N" are.
@@ -1715,6 +1794,10 @@ def build_affected_asset_records(
     prioritized_assets = list(summary["prioritized_assets"])
     asset_types = summary.get("asset_types") or {}
     source_names = _source_principal_names(vuln_name, vuln_data)
+    # The stamped privilege-tier badge per asset (``Tier 0`` / ``Tier 1`` /
+    # ``Tier 2``), so the machine-readable appendix carries the same tier signal
+    # the inline deliverable lists show. Empty for an unstamped asset.
+    meta_index = _build_asset_display_meta_index(vuln_data)
 
     records: list[dict[str, str]] = []
     for asset in prioritized_assets:
@@ -1725,7 +1808,21 @@ def build_affected_asset_records(
         # thing the finding affects. Reporting those as ``affected`` is honest;
         # we never fabricate a ``target`` label we cannot derive reliably.
         role = "source" if asset.strip().lower() in source_names else "affected"
-        records.append({"asset": asset, "asset_type": asset_type, "role": role})
+        meta = meta_index.get(str(asset or "").strip().casefold()) or {}
+        records.append(
+            {
+                "asset": asset,
+                "asset_type": asset_type,
+                "role": role,
+                "tier": meta.get("tier_badge") or "",
+                # The concrete per-asset measured value (staleness date + age /
+                # obsolete-OS string); empty for a finding with no metric.
+                "metric": meta.get("metric") or "",
+                # Roasting per-account crack status (``cracked`` / ``attempted`` /
+                # ``exposed``); ``""`` for every non-roasting asset.
+                "crack_status": meta.get("crack_status") or "",
+            }
+        )
     return records
 
 
@@ -1846,7 +1943,9 @@ def _build_display_entries_collapsing_exchange(
     health/system mailbox targets are replaced by ONE annotated row appended
     last, so they are disclosed but de-emphasized.
     """
-    exchange_mailboxes = [a for a in prioritized_assets if _is_exchange_system_mailbox(a)]
+    exchange_mailboxes = [
+        a for a in prioritized_assets if _is_exchange_system_mailbox(a)
+    ]
     other_assets = [a for a in prioritized_assets if not _is_exchange_system_mailbox(a)]
 
     shown = other_assets[:INLINE_AFFECTED_ASSETS_CAP]
@@ -1859,6 +1958,490 @@ def _build_display_entries_collapsing_exchange(
     if remaining > 0:
         entries.append(("paragraph", affected_assets_overflow_line(remaining)))
     return entries
+
+
+# --------------------------------------------------------------------------- #
+# Enriched display rows — role label, tier badge, per-edge pairing             #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AffectedAssetPairEndpoint:
+    """One end of a PAIRING row, with its own tier badge + basis.
+
+    A PAIRING finding (``da_sessions`` "Privileged Sessions on Lower-Tier Hosts",
+    HasSession, ForceChangePassword) pairs two objects that each hold their own
+    privilege tier. The ESAE violation IS the pair of tiers (a Tier-0 user on a
+    Tier-1 host), so both must be shown, one per endpoint, rather than a single
+    pair badge of only the most-critical side.
+
+    Attributes:
+        text: The endpoint's humanized display (``msardo`` / ``it-rep.corp.example``).
+        tier_badge: The compact tier badge for THIS endpoint (``Tier 0``), or
+            ``None`` when the endpoint carries no stamped tier.
+        tier_confidence: ``deterministic`` / ``inferred`` for this endpoint's tier.
+        tier_basis: The client-safe qualified basis phrase for this endpoint.
+    """
+
+    text: str
+    tier_badge: str | None = None
+    tier_confidence: str | None = None
+    tier_basis: str | None = None
+
+
+@dataclass(frozen=True)
+class AffectedAssetDisplayRow:
+    """One rendered affected-asset row, enriched for the client deliverable.
+
+    The enriched twin of a :func:`build_affected_assets_display_entries` tuple.
+    Each HTML surface (the SAR, the Playbook, the LITE exposure report) renders
+    these so a client sees, per asset, its finding-specific ROLE and its privilege
+    TIER, and a PAIRING finding reads as who-can-do-what-to-whom rather than two
+    unrelated flat lists.
+
+    Attributes:
+        kind: ``"bullet"`` (an asset row) or ``"paragraph"`` (the overflow line
+            naming the bundled appendix), exactly as the tuple contract.
+        text: The humanized display. For a PAIRING finding this is the composed
+            pair — a session renders ``logged-on-user @ host (IP)``, a control
+            pair renders ``holder → target``.
+        tier_badge: The compact privilege-tier badge (``Tier 0`` / ``Tier 1`` /
+            ``Tier 2``) read from the stamped entity's ``tier_label``, or ``None``
+            for an unstamped asset / the overflow line.
+        role_label: The finding-specific client role (``holder``,
+            ``roastable-target``, ``session-host`` …), or ``None`` when the row is
+            a pair (the connector conveys the roles) or the entity carried none.
+        pairing_id: The per-edge pair id for a PAIRING row, else ``None``.
+    """
+
+    kind: str
+    text: str
+    tier_badge: str | None = None
+    # Axis-1 confidence + client-safe basis for THIS row's tier verdict, read from
+    # the stamped entity (``deterministic`` / ``inferred`` and the qualified phrase
+    # ``inferred: member server by operating-system role``). Rendered on demand (a
+    # tooltip) next to the badge so the client sees WHY the tier was assigned
+    # without cluttering the default view. ``None`` for a plain Tier-2 / unstamped
+    # asset, or for a pair row (whose per-endpoint bases ride in ``pair_endpoints``).
+    tier_confidence: str | None = None
+    tier_basis: str | None = None
+    role_label: str | None = None
+    pairing_id: str | None = None
+    # For a PAIRING row (``user @ host``), the per-endpoint tier badge + basis so
+    # the client sees BOTH tiers of the ESAE violation (a Tier-0 user on a Tier-1
+    # host), not a single pair badge. Ordered left-to-right as the ``text`` reads.
+    # ``None``/empty for a non-pair row.
+    pair_endpoints: tuple["AffectedAssetPairEndpoint", ...] = ()
+    # The connector between the two endpoints of a PAIRING row (`` @ `` for a
+    # session pair, `` → `` for a control pair), so a renderer can rebuild
+    # ``<badge> left <connector> <badge> right``. Empty for a non-pair row.
+    pair_connector: str = ""
+    # The concrete per-asset measured value for a staleness/age/obsolete-OS
+    # finding (``Last rotated 2017-05-23 (~3,418 days ago)`` / ``Windows Server
+    # 2003``), read from the stamped entity's ``metric``. ``None`` for a
+    # non-staleness asset / the overflow line.
+    metric: str | None = None
+    # For a ROASTING asset row (kerberoast / asreproast / timeroast): the honest
+    # per-account outcome — ``cracked`` / ``attempted`` / ``exposed`` — read from
+    # the stamped entity's ``crack_status``. ``None`` for every other finding.
+    crack_status: str | None = None
+
+
+# Role labels that mark a per-edge pair as a SESSION pair (``user @ host``),
+# rendered user-first; any other pair renders ``source → target``.
+_PAIR_SESSION_ROLE_LABELS: frozenset[str] = frozenset(
+    {"session-host", "logged-on-user"}
+)
+
+
+def _tier_badge_from_label(tier_label: Any) -> str | None:
+    """Return the compact badge (``Tier 0``) from a full tier label.
+
+    The stamped entity carries the full legend label (``Tier 0: Domain Control``);
+    the inline deliverable shows only the compact tier (``Tier 0``), so split off
+    the leading tier token. ``None`` for an empty / missing label.
+    """
+    text = str(tier_label or "").strip()
+    if not text:
+        return None
+    return text.split(":", 1)[0].strip() or None
+
+
+def _build_asset_display_meta_index(vuln_data: Any) -> dict[str, dict[str, str | None]]:
+    """Map a finding's flat asset strings to ``{tier_badge, role_label}``.
+
+    Built from the stamped structured entities (``_affected_assets_struct``),
+    keyed by the same display / identifier strings the flat extractor emits (and,
+    for a typed template / CA / share / artifact, the ``Prefix: name`` form the
+    flat list carries). Returns ``{}`` for a finding with no stamped entities, so
+    an unstamped finding renders with no badge or role — the backward-compatible
+    default. Mirrors :func:`build_asset_tier_index` so the enrichment keys the
+    same way the Phase-1 tier sort does.
+    """
+    view = _details_view(vuln_data) if isinstance(vuln_data, dict) else {}
+    raw = view.get(SERIALIZED_ENTITIES_KEY)
+    if not isinstance(raw, list):
+        return {}
+    prefix_by_type = {
+        "template": "Template: ",
+        "ca": "CA: ",
+        "share": "Share: ",
+        "artifact": "Artifact: ",
+    }
+    index: dict[str, dict[str, str | None]] = {}
+    for entity in raw:
+        if not isinstance(entity, dict):
+            continue
+        tier_badge = _tier_badge_from_label(entity.get("tier_label"))
+        tier_basis = str(entity.get("tier_basis") or "").strip() or None
+        tier_confidence = str(entity.get("tier_confidence") or "").strip() or None
+        role_label = str(entity.get("role_label") or "").strip() or None
+        metric = str(entity.get("metric") or "").strip() or None
+        crack_status = str(entity.get("crack_status") or "").strip() or None
+        if (
+            tier_badge is None
+            and role_label is None
+            and metric is None
+            and crack_status is None
+        ):
+            continue
+        meta: dict[str, str | None] = {
+            "tier_badge": tier_badge,
+            "tier_basis": tier_basis,
+            "tier_confidence": tier_confidence,
+            "role_label": role_label,
+            "metric": metric,
+            "crack_status": crack_status,
+        }
+        tokens: list[Any] = [entity.get("display"), entity.get("identifier")]
+        etype = str(entity.get("type") or "").strip().lower()
+        prefix = prefix_by_type.get(etype)
+        if prefix:
+            ident = str(entity.get("identifier") or entity.get("display") or "").strip()
+            if ident:
+                tokens.append(f"{prefix}{ident}")
+        for token in tokens:
+            text = str(token or "").strip()
+            if text:
+                index.setdefault(text.casefold(), meta)
+    return index
+
+
+def _entity_tier_rank(entity: Mapping[str, Any]) -> int:
+    """Return a stamped entity's privilege-tier sort rank (Tier-0 first)."""
+    tier = str(entity.get("tier") or "").strip().lower()
+    return _TIER_SORT_RANK.get(tier, _UNTIERED_SORT_RANK)
+
+
+def _group_tier_badge(group: list[Mapping[str, Any]]) -> str | None:
+    """Return the badge of the most-critical (lowest-rank) tiered member of a pair.
+
+    A session pair pairs a Tier-0 user with a lower-tier host; surfacing the
+    most-critical member's tier is the triage signal the client acts on. ``None``
+    when no member carries a stamped tier.
+    """
+    best_rank = _UNTIERED_SORT_RANK
+    best_badge: str | None = None
+    for entity in group:
+        rank = _entity_tier_rank(entity)
+        badge = _tier_badge_from_label(entity.get("tier_label"))
+        if badge and rank < best_rank:
+            best_rank = rank
+            best_badge = badge
+    return best_badge
+
+
+def _entity_display(entity: Mapping[str, Any]) -> str:
+    """Return a stamped entity's humanized display string, or ``""``."""
+    return str(entity.get("display") or entity.get("identifier") or "").strip()
+
+
+def _endpoint_from_entities(
+    entities: list[Mapping[str, Any]], text: str
+) -> AffectedAssetPairEndpoint:
+    """Build one pair ENDPOINT carrying its own tier badge + basis.
+
+    The ESAE violation a session pair reports IS the pair of tiers (a Tier-0 user
+    on a Tier-1 host), so each endpoint shows its OWN tier, not a single pair
+    badge. When a side joins several entities, the most-critical member's tier +
+    basis represent the side (same triage choice as :func:`_group_tier_badge`).
+    """
+    best_rank = _UNTIERED_SORT_RANK
+    badge: str | None = None
+    basis: str | None = None
+    confidence: str | None = None
+    for entity in entities:
+        rank = _entity_tier_rank(entity)
+        cand = _tier_badge_from_label(entity.get("tier_label"))
+        if cand and rank < best_rank:
+            best_rank = rank
+            badge = cand
+            basis = str(entity.get("tier_basis") or "").strip() or None
+            confidence = str(entity.get("tier_confidence") or "").strip() or None
+    return AffectedAssetPairEndpoint(
+        text=text, tier_badge=badge, tier_confidence=confidence, tier_basis=basis
+    )
+
+
+def _render_pair_row(
+    group: list[Mapping[str, Any]], pairing_id: str
+) -> AffectedAssetDisplayRow | None:
+    """Compose one per-edge pair into a single display row.
+
+    A SESSION pair (``session-host`` / ``logged-on-user`` roles) renders
+    user-first as ``logged-on-user @ host (IP)``; every other pair renders
+    ``source → target`` so the client reads who-can-do-what-to-whom. When one side
+    was dropped (e.g. a direct-domain-breaker target), the surviving side renders
+    on its own. ``None`` when the pair composed no text.
+
+    Both endpoints carry their OWN tier badge + basis (``pair_endpoints``): a
+    privileged-session finding's value is precisely the ESAE violation ``Tier-0
+    user on a Tier-1 host``, so the client must see BOTH tiers, not a single
+    pair badge of the most-critical side.
+    """
+    role_labels = {
+        str(entity.get("role_label") or "").strip().lower() for entity in group
+    }
+    sources = [
+        entity for entity in group if str(entity.get("role") or "").lower() == "source"
+    ]
+    targets = [
+        entity for entity in group if str(entity.get("role") or "").lower() == "target"
+    ]
+
+    def _joined(entities: list[Mapping[str, Any]]) -> str:
+        return ", ".join(d for d in (_entity_display(e) for e in entities) if d)
+
+    if role_labels & _PAIR_SESSION_ROLE_LABELS:
+        users = [
+            e for e in group
+            if str(e.get("role_label") or "").strip().lower() == "logged-on-user"
+        ] or targets
+        hosts = [
+            e for e in group
+            if str(e.get("role_label") or "").strip().lower() == "session-host"
+        ] or sources
+        left_entities, right_entities = users, hosts
+        connector = " @ "
+        left, right = _joined(users), _joined(hosts)
+        text = f"{left}{connector}{right}" if left and right else (left or right)
+    else:
+        left_entities, right_entities = sources, targets
+        # A grouped multi-relation finding (``excessive_cross_tier_rights``)
+        # carries the specific right of this pair, so the connector names the
+        # exact excessive right (``holder -> Full Control of the Target Object ->
+        # object``) instead of a bare arrow that hides which right it is. A
+        # single-relation PAIRING finding carries no ``pair_relation`` and keeps
+        # the plain arrow.
+        pair_relation = next(
+            (
+                str(entity.get("pair_relation") or "").strip()
+                for entity in group
+                if str(entity.get("pair_relation") or "").strip()
+            ),
+            "",
+        )
+        connector = f" → {pair_relation} → " if pair_relation else " → "
+        left, right = _joined(sources), _joined(targets)
+        text = f"{left}{connector}{right}" if left and right else (left or right)
+    if not text:
+        text = _joined(group)
+    if not text:
+        return None
+    # Per-endpoint tiers, ordered left-to-right exactly as ``text`` reads. Only the
+    # sides that actually rendered text (a dropped side leaves its endpoint out).
+    endpoints: list[AffectedAssetPairEndpoint] = []
+    if left and left_entities:
+        endpoints.append(_endpoint_from_entities(list(left_entities), left))
+    if right and right_entities:
+        endpoints.append(_endpoint_from_entities(list(right_entities), right))
+    return AffectedAssetDisplayRow(
+        kind="bullet",
+        text=text,
+        # Keep the single pair badge (most-critical side) for backward-compatible
+        # surfaces that read ``tier_badge``; the per-endpoint tiers are the richer,
+        # preferred render.
+        tier_badge=_group_tier_badge(group),
+        pair_endpoints=tuple(endpoints),
+        pair_connector=connector if len(endpoints) == 2 else "",
+        pairing_id=pairing_id,
+    )
+
+
+def _render_single_entity_row(
+    entity: Mapping[str, Any],
+) -> AffectedAssetDisplayRow | None:
+    """Render one unpaired stamped entity as a display row, or ``None``."""
+    text = _entity_display(entity)
+    if not text:
+        return None
+    return AffectedAssetDisplayRow(
+        kind="bullet",
+        text=text,
+        tier_badge=_tier_badge_from_label(entity.get("tier_label")),
+        tier_confidence=str(entity.get("tier_confidence") or "").strip() or None,
+        tier_basis=str(entity.get("tier_basis") or "").strip() or None,
+        role_label=str(entity.get("role_label") or "").strip() or None,
+        metric=str(entity.get("metric") or "").strip() or None,
+        crack_status=str(entity.get("crack_status") or "").strip() or None,
+    )
+
+
+def _compose_pair_rows(vuln_data: Any) -> list[AffectedAssetDisplayRow]:
+    """Return the per-edge pair rows for a PAIRING finding, sorted Tier-0 first.
+
+    Groups the stamped structured entities by ``pairing_id`` and composes each
+    group into one row (a session pair, a control pair). Entities with no
+    ``pairing_id`` (a typed extra, or the detail-key fallback the struct builder
+    emits when a PAIRING finding carried no attack-graph edges) render as their
+    own single rows. Returns ``[]`` when the finding carries no stamped entities,
+    so the caller falls back to the flat enriched path.
+    """
+    view = _details_view(vuln_data) if isinstance(vuln_data, dict) else {}
+    raw = view.get(SERIALIZED_ENTITIES_KEY)
+    if not isinstance(raw, list) or not raw:
+        return []
+    pairs: dict[str, list[Mapping[str, Any]]] = {}
+    pair_order: list[str] = []
+    singles: list[Mapping[str, Any]] = []
+    for entity in raw:
+        if not isinstance(entity, dict):
+            continue
+        pairing_id = str(entity.get("pairing_id") or "").strip()
+        if pairing_id:
+            if pairing_id not in pairs:
+                pairs[pairing_id] = []
+                pair_order.append(pairing_id)
+            pairs[pairing_id].append(entity)
+        else:
+            singles.append(entity)
+
+    ranked: list[tuple[int, AffectedAssetDisplayRow]] = []
+    for pairing_id in pair_order:
+        group = pairs[pairing_id]
+        row = _render_pair_row(group, pairing_id)
+        if row is not None:
+            ranked.append(
+                (min((_entity_tier_rank(e) for e in group), default=_UNTIERED_SORT_RANK), row)
+            )
+    for entity in singles:
+        row = _render_single_entity_row(entity)
+        if row is not None:
+            ranked.append((_entity_tier_rank(entity), row))
+    ranked.sort(key=lambda item: item[0])
+    return [row for _rank, row in ranked]
+
+
+def _cap_display_rows(
+    rows: list[AffectedAssetDisplayRow], inline_cap: int
+) -> list[AffectedAssetDisplayRow]:
+    """Cap bullet rows at ``inline_cap`` with the shared overflow paragraph line."""
+    bullets = [row for row in rows if row.kind == "bullet"]
+    if len(bullets) <= inline_cap:
+        return list(rows)
+    shown = bullets[:inline_cap]
+    remaining = len(bullets) - len(shown)
+    capped: list[AffectedAssetDisplayRow] = list(shown)
+    if remaining > 0:
+        capped.append(
+            AffectedAssetDisplayRow(
+                kind="paragraph", text=affected_assets_overflow_line(remaining)
+            )
+        )
+    return capped
+
+
+def build_affected_assets_pair_rows(
+    vuln_name: str, vuln_data: Any
+) -> list[AffectedAssetDisplayRow]:
+    """Return the UNCAPPED per-edge pair rows for a PAIRING finding, else ``[]``.
+
+    The public seam for a surface that caps the pair rows itself (the LITE report
+    uses its own inline cap). Returns ``[]`` for a non-PAIRING finding, or when a
+    PAIRING finding carried no stamped entities (the caller then falls back to its
+    own flat path). Rows are already composed (``user @ host`` / ``holder →
+    target``) and sorted Tier-0 first.
+    """
+    if rule_for(vuln_name).representation is not Representation.PAIRING:
+        return []
+    return _compose_pair_rows(vuln_data)
+
+
+#: CRACKED leads, then attempted, then merely exposed — the proven recovery first.
+_CRACK_ROW_SORT_RANK: dict[str, int] = {"cracked": 0, "attempted": 1, "exposed": 2}
+
+
+def _sort_rows_cracked_first(rows: list[AffectedAssetDisplayRow]) -> None:
+    """Stable in-place sort putting CRACKED roasting rows first.
+
+    A no-op for any finding whose rows carry no ``crack_status`` (every
+    non-roasting finding): the rank is identical for all rows, so the stable sort
+    preserves the incoming (priority) order untouched. Paragraph rows (the
+    overflow line) always sort last.
+    """
+    if not any(row.crack_status for row in rows):
+        return
+    rows.sort(
+        key=lambda row: (
+            0 if row.kind == "bullet" else 1,
+            _CRACK_ROW_SORT_RANK.get((row.crack_status or "").strip().lower(), 3),
+        )
+    )
+
+
+def build_affected_assets_display_rows(
+    vuln_name: str,
+    vuln_data: Any,
+    *,
+    domain_name: str | None = None,
+    attack_paths: list[dict[str, Any]] | None = None,
+    inline_cap: int = INLINE_AFFECTED_ASSETS_CAP,
+) -> list[AffectedAssetDisplayRow]:
+    """Build the ENRICHED affected-asset display rows for a deliverable.
+
+    The enriched SSOT the HTML deliverables (SAR, Playbook, LITE) consume, built
+    on top of :func:`build_affected_assets_display_entries` (which stays the plain
+    ``(kind, text)`` tuple contract the legacy report path keeps). Each row
+    carries the asset's finding-specific ROLE label and its privilege TIER badge,
+    and a PAIRING finding (HasSession, ForceChangePassword, shadow-creds, LAPS,
+    gMSA, RBCD, NTLMv1-relay) renders its per-edge pairs as a pair
+    (``logged-on-user @ host (IP)``) rather than two flat lists.
+
+    Backward-compatible: a finding carrying no stamped entities (an older
+    workspace, or a finding that resolved none) renders exactly the flat text with
+    no badge / role, and the cap / collapse / overflow behaviour is inherited
+    unchanged from the tuple SSOT.
+    """
+    rule = rule_for(vuln_name)
+    if rule.representation is Representation.PAIRING:
+        pair_rows = _compose_pair_rows(vuln_data)
+        if pair_rows:
+            return _cap_display_rows(pair_rows, inline_cap)
+
+    entries = build_affected_assets_display_entries(
+        vuln_name, vuln_data, domain_name=domain_name, attack_paths=attack_paths
+    )
+    meta_index = _build_asset_display_meta_index(vuln_data)
+    rows: list[AffectedAssetDisplayRow] = []
+    for kind, text in entries:
+        if kind != "bullet":
+            rows.append(AffectedAssetDisplayRow(kind=kind, text=text))
+            continue
+        meta = meta_index.get(str(text or "").strip().casefold()) or {}
+        rows.append(
+            AffectedAssetDisplayRow(
+                kind="bullet",
+                text=text,
+                tier_badge=meta.get("tier_badge"),
+                tier_confidence=meta.get("tier_confidence"),
+                tier_basis=meta.get("tier_basis"),
+                role_label=meta.get("role_label"),
+                metric=meta.get("metric"),
+                crack_status=meta.get("crack_status"),
+            )
+        )
+    _sort_rows_cracked_first(rows)
+    return rows
 
 
 def _wordlists_from_attempts(details: Mapping[str, Any]) -> tuple[str, list[str]]:
@@ -2004,9 +2587,7 @@ def build_affected_notes_display_entries(
             _label = client_wordlist_label(_wl)
             if _label and _label not in _tried:
                 _tried.append(_label)
-        entries.append(
-            ("bullet", "Wordlists tried: " + ", ".join(_tried))
-        )
+        entries.append(("bullet", "Wordlists tried: " + ", ".join(_tried)))
     if notes.get("host"):
         entries.append(("bullet", f"Host: {notes['host']}"))
     if notes.get("share_path"):
@@ -2017,4 +2598,3 @@ def build_affected_notes_display_entries(
         entries.append(("bullet", f"Recovered credential: {notes['password']}"))
 
     return entries
-

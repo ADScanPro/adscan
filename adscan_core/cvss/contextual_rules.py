@@ -1188,8 +1188,13 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             ),
         ],
     ),
-    "rbcd_exploitable": VulnCvssDefinition(
+    "rbcd_configured": VulnCvssDefinition(
         finding_type=FindingType.VULNERABILITY,
+        # Base is Medium: a populated msDS-AllowedToActOnBehalfOfOtherIdentity is
+        # a delegation trust to investigate (it may be a legitimate front-end
+        # service or a planted backdoor), not a proven exposure on its own. It
+        # elevates when the configured delegation is confirmed abusable or the
+        # affected computer's own tier makes an unauthorised trust high-impact.
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
@@ -1200,12 +1205,28 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.0,
-                reason="RBCD writeable on a Tier-0 computer: direct path to privileged impersonation",
+                reason="Inbound RBCD configured on a Tier-0 computer: direct path to privileged impersonation",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
-                reason="RBCD writeable on a Domain Controller object: full DC takeover possible",
+                reason="Inbound RBCD configured on a Domain Controller object: full DC takeover possible",
+            ),
+        ],
+    ),
+    "recovered_account_passwords": VulnCvssDefinition(
+        finding_type=FindingType.VULNERABILITY,
+        # Base is HIGH: enabled accounts whose plaintext password is now known is
+        # a serious, actionable hygiene outcome. It elevates on the ADMIN-LIKE
+        # count, never on volume, because an administrative password in hand is
+        # an incident and a volume-driven score would average it away inside the
+        # ordinary-user total.
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=9.1,
+                reason="An administrative account's password was recovered: an attacker can authenticate as that role with no exploit",
             ),
         ],
     ),
@@ -1230,35 +1251,19 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             ),
         ],
     ),
-    "force_change_password": VulnCvssDefinition(
+    "excessive_cross_tier_rights": VulnCvssDefinition(
         finding_type=FindingType.VULNERABILITY,
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.8,
-                reason="Force-change-password right exercised: target account credentials reset by the attacker",
+                reason="Cross-tier control right exercised: the higher-tier object was taken over by its lower-tier holder",
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
-                elevated_score=8.8,
-                reason="Force-change-password right grants control over a Tier-0 account password",
-            ),
-        ],
-    ),
-    "all_extended_rights": VulnCvssDefinition(
-        finding_type=FindingType.VULNERABILITY,
-        cvss_vector=None,
-        elevation_rules=[
-            CvssElevationRule(
-                condition=CONDITION_EXPLOITATION,
-                elevated_score=8.8,
-                reason="All-extended-rights privilege exercised: object compromise confirmed",
-            ),
-            CvssElevationRule(
-                condition=CONDITION_TIER_ZERO,
-                elevated_score=8.8,
-                reason="All-extended-rights granted over a Tier-0 object: full control of the principal",
+                elevated_score=9.0,
+                reason="A lower-tier principal holds a control right over a Tier-0 object: a direct privilege-escalation path",
             ),
         ],
     ),

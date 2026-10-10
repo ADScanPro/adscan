@@ -25,6 +25,9 @@ from adscan_internal.services.collector.adcs_detectors.esc11 import detect_esc11
 from adscan_internal.services.collector.adcs_detectors.esc13 import detect_esc13
 from adscan_internal.services.collector.adcs_detectors.esc14 import detect_esc14
 from adscan_internal.services.collector.adcs_detectors.esc15 import detect_esc15
+from adscan_internal.services.collector.adcs_detectors.certighost_detector import (
+    detect_certighost,
+)
 from adscan_internal.services.collector.models import CollectorEdge, CollectorNode
 from adscan_core.rich_output import print_exception
 
@@ -45,6 +48,7 @@ __all__ = [
     "detect_esc13",
     "detect_esc14",
     "detect_esc15",
+    "detect_certighost",
     "detect_all",
     "detect_all_for_template",
     "detect_all_for_ca",
@@ -178,13 +182,21 @@ def detect_all_for_ca(
     domain: str,
     web_enrollment_enabled: bool = False,
     enforce_encrypt_icertrequest: bool = False,
+    certighost_chase_enabled: bool = False,
+    certighost_edit_flags_readable: bool = False,
+    certighost_os_build_number: int | None = None,
+    certighost_os_ubr: int | None = None,
+    certighost_os_major_version: int | None = None,
+    certighost_os_minor_version: int | None = None,
 ) -> list[CollectorEdge]:
     """Run every CA-bound ADCS detector for one EnterpriseCA.
 
-    The optional probe kwargs gate the ESC8 (web enrollment) and ESC11
-    (encrypted ICPR enforcement) detectors. With defaults, neither emits
-    edges, preserving the no-false-positive contract when probes did not
-    or could not run.
+    The optional probe kwargs gate the ESC8 (web enrollment), ESC11 (encrypted
+    ICPR enforcement) and Certighost (CVE-2026-54121 chase-fallback) detectors.
+    With defaults, none emits edges, preserving the no-false-positive contract
+    when probes did not or could not run. The ``certighost_*`` kwargs are all
+    read-only probe observations (EditFlags chase bit + CA host OS build/UBR);
+    Certighost emits only a THEORETICAL edge and never touches the environment.
     """
     if ca_node.kind != "EnterpriseCA":
         return []
@@ -212,6 +224,19 @@ def detect_all_for_ca(
             ca_node=ca_node,
             domain=domain,
             enforce_encrypt_icertrequest=enforce_encrypt_icertrequest,
+        )
+    )
+    edges.extend(
+        _safe_run(
+            detect_certighost,
+            ca_node=ca_node,
+            domain=domain,
+            editf_enablechaseclientdc_enabled=certighost_chase_enabled,
+            edit_flags_readable=certighost_edit_flags_readable,
+            os_build_number=certighost_os_build_number,
+            os_ubr=certighost_os_ubr,
+            os_major_version=certighost_os_major_version,
+            os_minor_version=certighost_os_minor_version,
         )
     )
     return edges

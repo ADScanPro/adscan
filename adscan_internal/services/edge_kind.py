@@ -108,6 +108,11 @@ _CONTROL_EDGES: Final[frozenset[str]] = frozenset(
         "ReadShare",
         "WriteShare",
         "FullControlShare",
+        # Certighost (CVE-2026-54121) — the CA chase-fallback yields a
+        # certificate that authenticates AS a DC. Classified CONTROL alongside
+        # the ADCS ESC family (which resolve via the "ADCSESC" prefix): a
+        # CA-level issuance abuse that ultimately yields domain compromise.
+        "certighost",
     }
 )
 
@@ -201,8 +206,6 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         "MsEven",
         # Coerce + relay NTLM to ADCS CA (composite technique confirmed at runtime)
         "CoerceAndRelayNTLMToADCS",
-        # Coerce principal into authenticating → capture TGT
-        "CoerceToTGT",
         # Native CVE scanner Slice 2 — DC-pack vulnerabilities confirmed at runtime
         "Zerologon",
         "NoPac",

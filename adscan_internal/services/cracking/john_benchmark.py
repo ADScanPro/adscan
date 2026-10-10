@@ -39,11 +39,15 @@ from adscan_internal.services.john_artifact_cracking_service import (
     JohnArtifactCrackingService,
 )
 
-# The four benchmark modes the effort engine expects, identical to
+# The benchmark modes the effort engine expects, identical to
 # ``cracking_benchmark.BENCHMARK_MODES``: NetNTLMv2, NetNTLMv1, Kerberoast
-# (TGS-REP, RC4), AS-REP Roasting (RC4). Kept as a local literal (not imported)
-# so this CPU backend does not couple to the GPU module's import graph.
-BENCHMARK_MODES: tuple[str, ...] = ("5600", "5500", "13100", "18200")
+# (TGS-REP, RC4), AS-REP Roasting (RC4), NT. Kept as a local literal (not
+# imported) so this CPU backend does not couple to the GPU module's import
+# graph. The duplication is deliberate and therefore has to be enforced: the two
+# tuples are asserted equal by
+# ``tests/unit/services/test_cracking_benchmark.py``, so a mode added on one
+# side can never silently leave the other backend unable to plan for it.
+BENCHMARK_MODES: tuple[str, ...] = ("5600", "5500", "13100", "18200", "1000")
 
 # A magnitude suffix John appends to a candidates-per-second figure. John prints
 # rates like ``2718K c/s`` or ``2.5M c/s``; map each suffix to its multiplier.

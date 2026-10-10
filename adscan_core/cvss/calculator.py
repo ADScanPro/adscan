@@ -49,6 +49,11 @@ from adscan_core.cvss.models import (
 )
 from adscan_core.cvss.severity_mapper import score_to_severity
 from adscan_core.cvss.vector_score import score_from_vector
+from adscan_core.reporting.affected_assets_contract import (
+    AFFECTED_ASSETS_STRUCT_KEY,
+    LEGACY_AFFECTED_ASSETS_KEY,
+)
+from adscan_core.reporting.privilege_tier_labels import token_is_tier0
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +276,127 @@ _EXPLOITATION_KEYS_BY_VULN: dict[str, tuple[str, ...]] = {
 }
 
 # Optional future refinement: registry of vuln-specific extractors.
-_CONTEXT_EXTRACTORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+def _recovered_password_context(details: dict[str, Any]) -> dict[str, Any]:
+    """Elevate the password-recovery finding on the ADMIN-LIKE count.
+
+    Severity has to key on whether an ADMINISTRATIVE account's password was
+    recovered, not on how many were. A hundred ordinary accounts with
+    recoverable passwords is a hygiene programme with a budget and a timeline;
+    one administrative account is an incident, and a severity driven by volume
+    averages the second away inside the first (the reference engagement had 122
+    ordinary and 4 administrative).
+
+    ``exploitation_confirmed`` is set whenever an enabled account was recovered,
+    because that is precisely what the flag is for: an outcome ADscan
+    MATERIALISED, not an opportunity it identified. The password is in hand.
+    """
+    try:
+        admin_like = int(details.get("admin_like_recovered") or 0)
+    except (TypeError, ValueError):
+        admin_like = 0
+    try:
+        enabled = int(details.get("enabled_recovered") or 0)
+    except (TypeError, ValueError):
+        enabled = 0
+    return {
+        "has_tier_zero_targets": admin_like > 0,
+        "tier_zero_count": max(admin_like, 0),
+        "total_affected": max(enabled, 0),
+        "exploitation_confirmed": enabled > 0,
+    }
+
+
+_CONTEXT_EXTRACTORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "recovered_account_passwords": _recovered_password_context,
+}
+
+
+@dataclass(frozen=True)
+class _AffectedAssetScan:
+    """What one affected-asset collection says about the affected population.
+
+    The Tier-0 and DC members are sets of identities rather than counters so the
+    same asset listed twice in one finding (once as the source of an edge, once
+    as its target) counts once. A finding that inflates its Tier-0 count by
+    double-listing the one account it found reads as a wider compromise than it
+    proved.
+    """
+
+    total: int
+    tier_zero: frozenset[str]
+    dc: frozenset[str]
+
+
+def _asset_identity(asset: Mapping[str, Any], position: int) -> str:
+    """A stable identity for one affected asset, for de-duplicated counting."""
+    for field in ("identifier", "node_id", "sid", "fqdn", "name", "asset", "display"):
+        value = asset.get(field)
+        if isinstance(value, str) and value.strip():
+            return f"{asset.get('type') or ''}:{value.strip().lower()}"
+    return f"#{position}"
+
+
+def _asset_is_tier_zero(asset: Mapping[str, Any]) -> bool:
+    """Whether one affected asset sits inside the Tier 0 containment boundary.
+
+    Reads the STAMPED, membership-and-ACL-aware ``tier`` token the engine writes
+    onto every structured entity, through the tier SSOT — so an account that is
+    Tier 0 only by control-plane group membership (a Backup Operators member,
+    graded ``tier0_escalation_capable``) counts, exactly as the nomenclature
+    standard requires. Reading the legacy ``isTierZero`` boolean instead is what
+    made these conditions unreachable: it is RID-gated at collection time and
+    legitimately reads false for a membership-derived Tier 0.
+
+    The legacy ``is_tier_zero`` / ``tier_zero`` booleans are still honoured so an
+    older persisted finding keeps elevating. An absent or unrecognised tier is
+    NOT Tier 0: a false elevation is the dangerous direction.
+    """
+    if token_is_tier0(asset.get("tier")):
+        return True
+    return _boolish(asset.get("is_tier_zero")) or _boolish(asset.get("tier_zero"))
+
+
+def _scan_affected_assets(raw: Any) -> _AffectedAssetScan | None:
+    """Summarise one affected-asset collection, or ``None`` when there is none.
+
+    Accepts every shape a finding has ever carried: the live list of structured
+    entities, the legacy ``{"users": [...], "hosts": [...]}`` mapping, and the
+    legacy flat list (whose members may be bare display strings, which count
+    toward the total and carry no tier).
+
+    The structured entity contract carries no domain-controller marker, so DC
+    detection stays on the explicit ``dc_hosts`` / ``has_dc_targets`` detail keys
+    the caller already reads; only a legacy entry's own ``is_dc`` is honoured
+    here. Inferring "domain controller" from a Tier-0 tier would be wrong, since
+    a certificate authority grades Tier 0 without being a DC.
+    """
+    if isinstance(raw, Mapping):
+        entries: list[Any] = []
+        for bucket in ("users", "hosts", "computers", "groups"):
+            value = raw.get(bucket)
+            if isinstance(value, list):
+                entries.extend(value)
+    elif isinstance(raw, list):
+        entries = list(raw)
+    else:
+        return None
+
+    tier_zero: set[str] = set()
+    dc: set[str] = set()
+    for position, asset in enumerate(entries):
+        if not isinstance(asset, Mapping):
+            continue
+        identity = _asset_identity(asset, position)
+        if _asset_is_tier_zero(asset):
+            tier_zero.add(identity)
+        if _boolish(asset.get("is_dc")) or _boolish(asset.get("is_domain_controller")):
+            dc.add(identity)
+
+    return _AffectedAssetScan(
+        total=len(entries),
+        tier_zero=frozenset(tier_zero),
+        dc=frozenset(dc),
+    )
 
 
 def _boolish(val: Any) -> bool:
@@ -342,34 +467,21 @@ def extract_context_from_details(
             exploitation_confirmed = True
             break
 
-    # --- Affected assets injected by report builder ---
-    affected_assets = details.get("_affected_assets")
-    if isinstance(affected_assets, dict):
-        users = affected_assets.get("users", [])
-        hosts = affected_assets.get("hosts", [])
-        total_affected = len(users) + len(hosts)
-
-        for asset in users + hosts:
-            if not isinstance(asset, dict):
-                continue
-            if _boolish(asset.get("is_tier_zero")) or _boolish(asset.get("tier_zero")):
-                has_tier_zero = True
-                tier_zero_count += 1
-            if _boolish(asset.get("is_dc")) or _boolish(asset.get("is_domain_controller")):
-                has_dc = True
-                dc_count += 1
-
-    elif isinstance(affected_assets, list):
-        total_affected = len(affected_assets)
-        for asset in affected_assets:
-            if not isinstance(asset, dict):
-                continue
-            if _boolish(asset.get("is_tier_zero")) or _boolish(asset.get("tier_zero")):
-                has_tier_zero = True
-                tier_zero_count += 1
-            if _boolish(asset.get("is_dc")) or _boolish(asset.get("is_domain_controller")):
-                has_dc = True
-                dc_count += 1
+    # --- Affected assets stamped by the engine ---
+    # The live key is the structured one; the legacy flat key is read too so an
+    # older persisted finding keeps whatever elevation it already had. Both are
+    # scanned (never one instead of the other) and the result is the union.
+    for key in (AFFECTED_ASSETS_STRUCT_KEY, LEGACY_AFFECTED_ASSETS_KEY):
+        scan = _scan_affected_assets(details.get(key))
+        if scan is None:
+            continue
+        total_affected = max(total_affected, scan.total)
+        if scan.tier_zero:
+            has_tier_zero = True
+            tier_zero_count = max(tier_zero_count, len(scan.tier_zero))
+        if scan.dc:
+            has_dc = True
+            dc_count = max(dc_count, len(scan.dc))
 
     # --- Attack graph edge annotations ---
     edges = details.get("attack_graph_edges")
@@ -648,8 +760,11 @@ def make_report_priority_fn(
 ) -> Callable[[str], float]:
     """Return the score you should use for report prioritization/order.
 
-    This replaces the old contextual 'cvss_fn' usage semantically, but note:
-    the returned value is ADscan contextual severity, not formal CVSS.
+    This is what consumers take as their ``priority_fn``: the returned value is
+    the ADscan contextual priority, not a formal CVSS score. The parameter used
+    to be called ``cvss_fn`` everywhere, which is how a reader of
+    ``compliance_section_builder`` concluded the DORA / ENS / ISO / PCI
+    conformity verdicts were graded by CVSS when they never were.
     """
     severity_fn = make_finding_severity_fn(vulnerabilities_map)
 

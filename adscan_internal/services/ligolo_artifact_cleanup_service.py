@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from adscan_internal import print_info, print_info_debug, print_warning, telemetry
 from adscan_internal.rich_output import confirm_operation, mark_sensitive
+from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.services.ligolo_service import LigoloProxyService
 from adscan_internal.services.exploitation.remote_windows_execution import (
     RemoteWindowsAuth,
@@ -503,11 +504,16 @@ def cleanup_workspace_ligolo_artifacts(
                 )
             return str(result.stdout or "")
 
-        # Register file artifact with ledger before attempting cleanup
+        # Prefer the record disclosed at upload (orchestrate_ligolo_pivot_tunnel
+        # registers the staged agent AT THE WRITE); register here only as a
+        # legacy fallback for a tunnel staged before upload-time disclosure
+        # existed, so a record is never double-registered.
         ledger = getattr(shell, "environment_change_ledger", None)
-        _ledger_change_id: str | None = None
-        if ledger is not None and remote_agent_path:
-            _unc_agent_path = remote_agent_path.replace("/", "\\")
+        _ledger_change_id: str | None = (
+            str(record.get("remote_artifact_change_id") or "") or None
+        )
+        _unc_agent_path = remote_agent_path.replace("/", "\\")
+        if ledger is not None and _ledger_change_id is None and remote_agent_path:
             _ledger_change_id = ledger.register_change(
                 kind="file_uploaded",
                 domain=str(domain or ""),
@@ -535,26 +541,31 @@ def cleanup_workspace_ligolo_artifacts(
         _persist_cleanup_result(service=service, tunnel_id=tunnel_id, result=result)
         results.append(result)
 
-        # Update ledger based on cleanup outcome
+        # Settle the record with the non-deprecated terminals.
         if ledger is not None and _ledger_change_id:
+            _unc_target = f"\\\\{pivot_host}\\{_unc_agent_path}"
+            _native_rm = (
+                "Delete the staged pivot agent and confirm it is gone:\n"
+                f'  Remove-Item -LiteralPath "{_unc_target}" -Force\n'
+                f'  Test-Path "{_unc_target}"   # must return False'
+            )
             if result.cleanup_succeeded:
-                ledger.mark_reverted(_ledger_change_id)
-            elif not result.credential_available:
-                ledger.mark_operator_required(
+                ledger.mark_reverted_confirmed(
                     _ledger_change_id,
-                    manual_cleanup_instructions=(
-                        f"Delete the staged agent manually on {pivot_host}:\n"
-                        f"  del \"{remote_agent_path}\""
-                    ),
+                    verification_method="ligolo_agent_delete",
+                    min_credential_principal=username,
                 )
             else:
-                ledger.mark_failed(
+                ledger.mark_manual_required(
                     _ledger_change_id,
-                    error=result.message,
-                    manual_cleanup_instructions=(
-                        f"Delete the staged agent manually on {pivot_host}:\n"
-                        f"  del \"{remote_agent_path}\""
+                    reason=(
+                        _tax.MANUAL_REASON_MISSING_CREDENTIAL
+                        if not result.credential_available
+                        else _tax.MANUAL_REASON_REVERT_FAILED
                     ),
+                    remediation_command=_native_rm,
+                    remediation_object_dn=_unc_target,
+                    error=result.message,
                 )
 
         if result.cleanup_succeeded:

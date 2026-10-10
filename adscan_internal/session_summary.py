@@ -513,7 +513,14 @@ def resolve_attack_path_verdict(
     return select_attack_path_verdict(
         metrics,
         scan_mode=scan_mode,
-        reachable=totals.effective_full_domain_compromise,
+        # The OPERATOR-facing closing line's magnitude floor: the route count,
+        # falling back to the reachable-Tier-0 ASSET count only when a sampled run
+        # surfaced no route at all, so the verdict never reads a collapsed 0 on a
+        # domain that carries exposure. Operator/telemetry only: a client-facing
+        # route figure is never floored with an asset count.
+        reachable=(
+            totals.effective_full_domain_compromise or totals.reachable_tier0_assets
+        ),
         domain_compromised=_verdict_domain_compromised(shell, domains),
     )
 

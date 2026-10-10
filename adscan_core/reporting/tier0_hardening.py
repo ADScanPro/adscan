@@ -22,20 +22,32 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
+
 #: ``control_evidence`` category the collector stamps on a control-plane sync
 #: account hardening item. A CONFIRMED account is a Tier 0 asset to protect; an
 #: AMBIGUOUS match needs a human confirmation.
 TIER0_HARDENING_CATEGORY = "Tier 0 Asset Hardening"
 
 
-#: The exact title the Security Assessment Report synthesizes for a foreign-tenant
-#: directory-replication account
-#: (``html_pdf_generator._build_foreign_tenant_replication_finding`` /
-#: ``playbook_databinding._FOREIGN_FINDING_TITLE``). A FOREIGN row carries it so the
-#: coverage card and the web CTEM can cross-reference that finding BY NAME — F-IDs
-#: are render-order dependent, but the title resolves regardless of numbering.
-FOREIGN_TENANT_SAR_FINDING = (
-    "Possible Unauthorized Directory Replication to an External Tenant"
+#: Catalog key of the finding a FOREIGN-tenant sync account raises. It is a real
+#: catalogued finding recorded into ``technical_report.json`` by the engine
+#: (``positive_control_evidence.reconcile_external_tenant_replication``), NOT a
+#: dict a renderer builds: a finding synthesized at a render boundary cannot
+#: reach the engine artifact, the free report, the posture score, the compliance
+#: annex or the web CTEM, which is how the paid report came to assert one more
+#: critical than the scan had recorded.
+EXTERNAL_TENANT_REPLICATION_KEY = "unauthorized_external_tenant_replication"
+
+#: The finding's client-facing title, read from the catalog rather than copied.
+#: A FOREIGN row carries it so the coverage card and the web CTEM can
+#: cross-reference the finding BY NAME: F-IDs are render-order dependent, but
+#: the title resolves regardless of numbering. Reading it from the LITE-safe
+#: catalog slice (itself drift-locked to the PRO ``VULN_CATALOG`` by
+#: ``tests/unit/test_vuln_catalog_meta_drift.py``) is what stops the reference
+#: and the finding from drifting apart on a rename.
+FOREIGN_TENANT_SAR_FINDING = str(
+    (VULN_CATALOG_META.get(EXTERNAL_TENANT_REPLICATION_KEY) or {}).get("title") or ""
 )
 
 
@@ -129,7 +141,8 @@ def build_tier0_hardening_items(
         distinct), sorted so the items that need a human decision surface first: a
         FOREIGN-TENANT account (its sync target bears no client identity token) or
         an UNCONFIRMED account leads, then confirmed same-tenant assurance items.
-        Each row: ``title`` / ``account`` / ``guidance`` / ``remediation`` /
+        Each row: ``key`` (the source ``control_evidence`` entry key) /
+        ``title`` / ``account`` / ``guidance`` / ``remediation`` /
         ``confirmed`` (bool) / ``tenant`` / ``install_host`` / ``tenant_matches``
         (bool) / ``authorization_action`` (a prominent per-account action, or
         ``""``) / ``match_basis`` (for a FOREIGN row, the clause naming the
@@ -178,6 +191,11 @@ def build_tier0_hardening_items(
             record = items.setdefault(
                 key,
                 {
+                    # The ``control_evidence`` entry key this row came from, so a
+                    # consumer that must UPDATE the entry (the engine
+                    # reconciliation that rewords a foreign-tenant account's
+                    # guidance) addresses the right one instead of guessing.
+                    "key": key,
                     "title": str(entry.get("title") or "").strip(),
                     "account": str(details.get("account") or "").strip(),
                     "guidance": guidance,
@@ -305,6 +323,7 @@ def _match_basis(
 
 
 __all__ = [
+    "EXTERNAL_TENANT_REPLICATION_KEY",
     "FOREIGN_TENANT_SAR_FINDING",
     "TIER0_HARDENING_CATEGORY",
     "build_tier0_hardening_items",

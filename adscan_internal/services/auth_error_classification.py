@@ -337,6 +337,104 @@ CREDENTIAL_REJECTION_ERROR_MARKERS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Certificate-binding refusal (PKINIT) — the KDC refused a certificate-auth
+# request because the certificate does not satisfy strong certificate binding
+# (KB5014754): a certificate with no SID security extension mapped implicitly by
+# UPN, or a weak explicit ``altSecurityIdentities`` mapping under Full SCBE. This
+# is the ESC9 mitigation working, not an ADscan fault — the honest outcome is a
+# hardened positive control, never a compromise claim and never a crash.
+#
+# RFC COLLISION — Kerberos error-code 66 means TWO different things, and kerbad
+# decodes it with the wrong one:
+#   * RFC 4120 (classic):  66 == KRB_AP_ERR_USER_TO_USER_REQUIRED
+#   * RFC 4556 (PKINIT):   66 == KDC_ERR_CERTIFICATE_MISMATCH
+# kerbad's flat ``KerberosErrorCode`` enum carries only the RFC-4120 name, so a
+# PKINIT certificate-mismatch refusal is mis-decoded as "User-to-user
+# authorization is required". We disambiguate HERE, where the caller KNOWS it is
+# in a PKINIT certificate-auth flow (``pkinit_context=True``): in that context
+# code 66 is a certificate-binding refusal, NOT a U2U requirement. A genuine
+# RFC-4120 U2U (non-PKINIT context) is left untouched.
+# ---------------------------------------------------------------------------
+
+#: Kerberos error-code 66 — ``KDC_ERR_CERTIFICATE_MISMATCH`` in PKINIT (RFC 4556).
+KDC_ERR_CERTIFICATE_MISMATCH_CODE = 66
+
+#: Unambiguous certificate-mismatch wording. These arise ONLY from a PKINIT
+#: certificate-binding refusal (e.g. a path that surfaces the RFC-4556 name, or
+#: certipy's "Object SID mismatch" phrasing), so they match regardless of
+#: context.
+CERTIFICATE_BINDING_REFUSAL_NAME_MARKERS: tuple[str, ...] = (
+    "KDC_ERR_CERTIFICATE_MISMATCH",
+    "CERTIFICATE MISMATCH",
+    "OBJECT SID MISMATCH",
+)
+
+#: kerbad's RFC-4120 MIS-DECODE of code 66. It is a certificate-binding refusal
+#: ONLY when the caller is in a PKINIT/cert-auth flow; a genuine U2U path must
+#: still read as U2U, so this bridge is gated on ``pkinit_context``.
+CERTIFICATE_BINDING_REFUSAL_PKINIT_MARKERS: tuple[str, ...] = (
+    "KRB_AP_ERR_USER_TO_USER_REQUIRED",
+    "USER-TO-USER AUTHORIZATION IS REQUIRED",
+)
+
+
+def _kerberos_error_code(exc_or_msg: Any) -> int | None:
+    """Return the numeric Kerberos error-code from an exception chain, if present.
+
+    Walks ``__cause__`` / ``__context__`` looking for a kerbad-style
+    ``KerberosError`` carrying an ``errorcode`` (an enum member exposing
+    ``.value``, or a bare int). Returns the first code found, else ``None``.
+    Duck-typed so this classifier never imports kerbad.
+    """
+    if not isinstance(exc_or_msg, BaseException):
+        return None
+    seen: set[int] = set()
+    current: BaseException | None = exc_or_msg
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "errorcode", None)
+        if code is not None:
+            value = getattr(code, "value", code)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def is_certificate_binding_refusal(
+    exc_or_msg: Any, *, pkinit_context: bool = False
+) -> bool:
+    """Return True when the KDC refused a PKINIT request for certificate binding.
+
+    The domain controller enforces strong certificate binding (KB5014754) and
+    rejected the certificate: no SID security extension + an implicit UPN mapping,
+    or a weak explicit ``altSecurityIdentities`` mapping under Full SCBE. This is
+    the certificate-mapping equivalent of ``is_credential_rejection_error`` — a
+    DEFINITIVE server verdict, not an ADscan bug, so a caller renders it as a
+    hardened positive control rather than a traceback.
+
+    Resolution of the RFC-4120/RFC-4556 code-66 collision (see module comment):
+
+    * Unambiguous certificate-mismatch wording
+      (``CERTIFICATE_BINDING_REFUSAL_NAME_MARKERS``) matches in any context.
+    * When ``pkinit_context`` is True (the caller is in a cert-auth flow), the
+      numeric code ``66`` AND kerbad's mis-decoded U2U wording
+      (``CERTIFICATE_BINDING_REFUSAL_PKINIT_MARKERS``) both count — because in a
+      PKINIT flow code 66 is ``KDC_ERR_CERTIFICATE_MISMATCH``, never U2U.
+    * With ``pkinit_context=False`` (the default) a genuine RFC-4120
+      ``KRB_AP_ERR_USER_TO_USER_REQUIRED`` is NOT matched, so a real U2U path
+      keeps its correct meaning.
+    """
+    if _matches_any_marker(exc_or_msg, CERTIFICATE_BINDING_REFUSAL_NAME_MARKERS):
+        return True
+    if not pkinit_context:
+        return False
+    if _kerberos_error_code(exc_or_msg) == KDC_ERR_CERTIFICATE_MISMATCH_CODE:
+        return True
+    return _matches_any_marker(exc_or_msg, CERTIFICATE_BINDING_REFUSAL_PKINIT_MARKERS)
+
+
 def is_credential_rejection_error(exc_or_msg: Any) -> bool:
     """Return True for a Kerberos/NTLM error SHAPED like a credential rejection.
 

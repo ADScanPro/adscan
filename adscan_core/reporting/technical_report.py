@@ -56,7 +56,25 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 from adscan_core import telemetry
-from adscan_core.reporting.finding_aliases import normalize_technical_report
+from adscan_core.cvss.calculator import (
+    compute_finding_severity,
+    extract_context_from_details,
+)
+from adscan_core.cvss.severity_mapper import score_to_severity, severity_to_min_score
+from adscan_core.reporting.adscan_severity import (
+    ADSCAN_BASELINE_SCORE_FIELD,
+    ADSCAN_PRIORITY_SCORE_FIELD,
+    ADSCAN_SEVERITY_BANDS,
+    ADSCAN_SEVERITY_ELEVATED_FIELD,
+    ADSCAN_SEVERITY_FIELD,
+    ADSCAN_SEVERITY_FIELDS,  # noqa: F401  (re-exported for existing importers)
+    reported_finding_severity,
+)
+from adscan_core.reporting.finding_aliases import (
+    collapse_finding_aliases,
+    normalize_technical_report,
+)
+from adscan_core.reporting.finding_vuln_map import is_reportable_finding
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 from adscan_core.rich_output import (
     print_error,
@@ -307,6 +325,172 @@ def _load_technical_report(shell: ReportShell) -> dict[str, Any]:
     return _init_technical_report()
 
 
+# ---------------------------------------------------------------------------
+# ADscan severity — computed ONCE, persisted onto the record
+# ---------------------------------------------------------------------------
+#
+# ADscan rates a finding with its own severity, in two layers: a BASELINE band
+# (authored per key in the finding catalog and recorded as ``severity``) and a
+# CONTEXTUAL overlay (``adscan_core.cvss``) that raises the rating when the
+# finding instance touches a Tier-0 asset, a Domain Controller, or a confirmed
+# exploitation.
+#
+# The overlay used to be re-derived independently by every surface that printed
+# it, and the failure mode was always the same: the SAME scan produced a
+# different critical count in each document of one kit, because one page applied
+# the contextual lift and the next printed the baseline it is built on. The fix
+# is not a convention about which layer to read; it is to compute the contextual
+# band ONCE, at the artifact, and have every surface read the authored value.
+#
+# These fields are that authored value. They are ADSCAN'S OWN severity and are
+# never CVSS: a client surface does not print a CVSS score (the Base score is
+# emitted separately as ``cvss_base`` + ``cvss_base_vector``, as a reproducible
+# pair, and only for the keys that carry a vector).
+#
+# The field NAMES and the READER that resolves them live in
+# ``adscan_core.reporting.adscan_severity``, beside the rule about which layer a
+# client surface counts on; they are re-exported here because this module is the
+# one the writers and the web ingestion already import.
+
+
+def _baseline_score_for_band(key: str, band: str) -> float:
+    """Return the numeric baseline for a finding whose authored band is *band*.
+
+    The BAND is authoritative, not the numeric, for two independent reasons.
+
+    It is the only one of the two that resolves in every deployment. The catalog
+    numeric lives in the PRO catalog under ``adscan_internal/pro/``, which the
+    LITE image strips wholesale and the appliance backend never ships, so the
+    lookup returns ``0.0`` there for all 93 keys — and ``0.0`` maps to ``info``,
+    which is how a real finding came to read "Informational" on a paid surface.
+    The band ships in the LITE meta catalog and so survives the strip.
+
+    And where the two disagree the band is the one the product already counts on:
+    measured on this catalog, 12 of 93 keys carry a numeric whose band is LOWER
+    than the authored one (every ADCS ESC key is authored ``critical`` with an
+    8.5, i.e. ``high``), so deriving the band from the numeric would silently
+    downgrade eleven ADCS findings.
+
+    So the numeric is used only as a within-band refinement — when it reproduces
+    the authored band — and otherwise the band's own floor is used, which
+    reproduces the band by construction and never inflates inside it.
+
+    Args:
+        key: The finding's catalog key.
+        band: The finding's recorded severity band (already lower-cased and
+            known to be a published band).
+
+    Returns:
+        A numeric baseline whose band equals *band*.
+    """
+    floor = severity_to_min_score(band)
+    catalog = finding_catalog().get(key)
+    if isinstance(catalog, dict):
+        raw = catalog.get("cvss")
+        try:
+            numeric = float(str(raw).strip().split()[0].strip("()"))
+        except (TypeError, ValueError, IndexError, AttributeError):
+            numeric = 0.0
+        if numeric > 0.0 and score_to_severity(numeric) == band:
+            return numeric
+    return floor
+
+
+def stamp_adscan_severity(finding: dict[str, Any]) -> bool:
+    """Compute and persist one finding's contextual ADscan severity.
+
+    Reads only the finding's OWN record — its ``key``, its recorded ``severity``
+    band and its ``details`` — so it produces the same answer from whichever
+    writer runs it, and recomputes rather than caches, so a finding whose context
+    changed between passes (the attack-graph reconciler stamps its Tier-0 / DC /
+    exploitation keys long after the detector first recorded it) can never be
+    left holding the band an earlier, thinner context implied.
+
+    Composing ``extract_context_from_details`` + ``compute_finding_severity``
+    here, rather than calling ``finding_severity_for_record``, is deliberate and
+    is the one place it is correct: this needs the baseline override that keeps
+    the rating honest in a tier with no catalog, and the composition now happens
+    ONCE for the whole product instead of once per surface, which is what the
+    "route surfaces through the SSOT" guidance is protecting.
+
+    Degrades to NOT RATED rather than guessing: a finding with no key, no
+    recognised baseline band, or whose computation raises is left exactly as it
+    was, with none of :data:`ADSCAN_SEVERITY_FIELDS` present. So a consumer
+    distinguishes "not rated" (the field is absent) from "rated Informational"
+    (the field is present and reads ``info``) by the field's presence alone, and
+    must never substitute a default for an absent one.
+
+    Args:
+        finding: One finding record from ``technical_report.json``.
+
+    Returns:
+        ``True`` when the record changed (a value was written or refreshed).
+    """
+    key = str(finding.get("key") or "").strip()
+    band = str(finding.get("severity") or "").strip().lower()
+    if not key or band not in ADSCAN_SEVERITY_BANDS:
+        return False
+
+    try:
+        baseline = _baseline_score_for_band(key, band)
+        details = finding.get("details")
+        context = extract_context_from_details(
+            key, dict(details) if isinstance(details, dict) else None
+        )
+        result = compute_finding_severity(key, context, catalog_base_score=baseline)
+    except Exception as exc:  # noqa: BLE001
+        # An unresolvable overlay leaves the finding unrated. Persisting a band
+        # we could not compute would be worse than persisting none: the next
+        # surface cannot tell a fabricated rating from a real one.
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        return False
+
+    stamped = {
+        ADSCAN_SEVERITY_FIELD: result.adscan.severity,
+        ADSCAN_PRIORITY_SCORE_FIELD: round(float(result.adscan.score), 1),
+        ADSCAN_BASELINE_SCORE_FIELD: round(float(baseline), 1),
+        ADSCAN_SEVERITY_ELEVATED_FIELD: bool(result.adscan.is_elevated),
+    }
+    if all(finding.get(field) == value for field, value in stamped.items()):
+        return False
+    finding.update(stamped)
+    return True
+
+
+def stamp_adscan_severity_report(report: dict[str, Any]) -> bool:
+    """Stamp every finding in a technical report with its ADscan severity.
+
+    Applied at the single save seam below, which is the one choke point EVERY
+    writer of the artifact passes through — the recorders in this module, the
+    attack-graph finding reconciler, the affected-assets resolver, the
+    choke-point stamper and the PRO report service. Deriving the rating there
+    means the persisted band always agrees with the persisted details it was
+    derived from, whichever writer wrote them last; there is no seam at which a
+    later mutation can strand it.
+
+    Args:
+        report: A ``technical_report.json``-shaped payload.
+
+    Returns:
+        ``True`` when any finding's rating changed.
+    """
+    domains = report.get("domains")
+    if not isinstance(domains, dict):
+        return False
+    changed = False
+    for domain_entry in domains.values():
+        if not isinstance(domain_entry, dict):
+            continue
+        findings = domain_entry.get("findings")
+        if not isinstance(findings, list):
+            continue
+        for finding in findings:
+            if isinstance(finding, dict) and stamp_adscan_severity(finding):
+                changed = True
+    return changed
+
+
 def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
     """Persist the technical report JSON to disk atomically.
 
@@ -319,8 +503,17 @@ def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
     ``json.JSONDecodeError`` and (downstream) driving false finding remediation.
     Mirrors the ``.tmp.docx`` + replace pattern the PRO report service already
     uses for the DOCX.
+
+    Every finding's ADscan severity is (re)derived here, immediately before the
+    bytes are written, so the rating that reaches disk is always the one the
+    details on disk imply — see :func:`stamp_adscan_severity_report`.
     """
     report_path = _get_technical_report_path(shell)
+    try:
+        stamp_adscan_severity_report(report)
+    except Exception as exc:  # noqa: BLE001  (rating never blocks the write)
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = report_path.with_name(report_path.name + ".tmp")
@@ -451,6 +644,16 @@ def record_technical_finding(
     # carries no base (yields None) → the key is omitted cleanly, exactly like
     # ``knowledge``. Only a positive score is emitted (0.0 == "no catalog base").
     cvss_base = _coerce_positive_cvss(catalog.get("cvss_base")) if isinstance(catalog, dict) else None
+    # The vector is emitted with the score or not at all. A consumer holding a
+    # Base score and no vector cannot reproduce it, and that is exactly the
+    # number no client surface prints; keeping the pair together means any
+    # consumer that does print it has the evidence beside it.
+    cvss_base_vector = ""
+    if cvss_base is not None and isinstance(catalog, dict):
+        raw_vector = catalog.get("cvss_base_vector")
+        cvss_base_vector = raw_vector.strip() if isinstance(raw_vector, str) else ""
+    if not cvss_base_vector:
+        cvss_base = None
 
     if finding is None:
         # SSOT confirmation gate: only materialize a NEW finding when the probe
@@ -515,6 +718,7 @@ def record_technical_finding(
             finding["knowledge"] = knowledge
         if cvss_base is not None:
             finding["cvss_base"] = cvss_base
+            finding["cvss_base_vector"] = cvss_base_vector
         findings.append(finding)
     else:
         finding["status"] = status
@@ -532,6 +736,7 @@ def record_technical_finding(
         # Refresh the CVSS base too (a catalog re-score reaches prior findings).
         if cvss_base is not None:
             finding["cvss_base"] = cvss_base
+            finding["cvss_base_vector"] = cvss_base_vector
 
     if summary:
         finding["details"].update(summary)
@@ -542,6 +747,55 @@ def record_technical_finding(
             _append_unique(finding["evidence"], entry)
 
     _save_technical_report(shell, report)
+
+
+def retract_technical_finding(
+    shell: ReportShell,
+    domain: str,
+    *,
+    key: str,
+) -> bool:
+    """Remove a previously recorded finding for a domain.
+
+    The counterpart to :func:`record_technical_finding`, for a RECONCILED
+    finding whose producing evidence no longer holds. ``technical_report.json``
+    persists across re-scans of the same workspace, so a finding derived from a
+    verdict that has since changed would otherwise outlive it: a client-facing
+    critical nobody can reproduce. Keeping retraction in the recorder SSOT is
+    what stops each reconciler from splicing the findings list by hand.
+
+    Use it only for a finding the caller OWNS and re-derives on every pass. A
+    finding a detector observed once is historical evidence and must not be
+    retracted because a later pass did not re-observe it.
+
+    Args:
+        shell: Shell object with report paths.
+        domain: Domain the finding was recorded under.
+        key: Finding key to remove.
+
+    Returns:
+        ``True`` when a finding was removed, ``False`` when there was none.
+    """
+    report = _load_technical_report(shell)
+    domains = report.get("domains")
+    if not isinstance(domains, dict):
+        return False
+    domain_entry = domains.get(domain)
+    if not isinstance(domain_entry, dict):
+        return False
+    findings = domain_entry.get("findings")
+    if not isinstance(findings, list):
+        return False
+    remaining = [
+        item
+        for item in findings
+        if not (isinstance(item, dict) and item.get("key") == key)
+    ]
+    if len(remaining) == len(findings):
+        return False
+    domain_entry["findings"] = remaining
+    _save_technical_report(shell, report)
+    return True
 
 
 def record_technical_event(
@@ -684,6 +938,38 @@ def record_cracking_coverage(
     _save_technical_report(shell, report)
 
 
+def record_endpoint_defense(
+    shell: ReportShell,
+    domain: str,
+    *,
+    block: dict[str, Any],
+) -> None:
+    """Persist the endpoint-defense coverage and efficacy block for *domain*.
+
+    Write-side single source of truth for two statements a client cannot get
+    anywhere else: which of their hosts ADscan actually examined for antivirus
+    and endpoint detection, and what the techniques ADscan ran did on the hosts
+    where a product was confirmed active.
+
+    The block is built by
+    :func:`adscan_core.reporting.endpoint_defense.build_endpoint_defense`,
+    which owns the honesty rules: it reports counts and never an estate
+    coverage rate (ADscan examines the hosts it touches, not the estate, so
+    both obvious percentages are false), and it never credits a product with
+    blocking anything. Stamping it here means the PDF report, the LITE report
+    and ``adscan_web`` render the SAME statement rather than each deriving one.
+
+    Best-effort: ignores a missing or invalid payload and never raises into the
+    caller. Mirrors :func:`record_cracking_coverage`.
+    """
+    if not domain or not isinstance(block, dict) or "statement" not in block:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["endpoint_defense"] = block
+    _save_technical_report(shell, report)
+
+
 def record_attack_path_coverage(
     shell: ReportShell,
     domain: str,
@@ -712,6 +998,139 @@ def record_attack_path_coverage(
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["attack_path_coverage"] = coverage
     _save_technical_report(shell, report)
+
+
+def read_cracking_coverage(
+    shell: ReportShell,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Return the PERSISTED cracking-coverage block for *domain*, or ``None``.
+
+    The read-side twin of :func:`record_cracking_coverage`, and the reason it
+    exists: password recovery declares its coverage from SEVERAL seams that each
+    know one class of the answer. The breach-corpus lookup knows how many hashes
+    it checked; the local wordlist attack knows how many it attacked and, later,
+    what it recovered. The recorder overwrites the whole block, so a seam that
+    rebuilt it from only its own class would silently drop the other's and the
+    report-wide note would revert to claiming full strength. Reading the current
+    block first is what lets each seam carry the other's declaration through.
+
+    Best-effort: ``None`` when the report, the domain entry or the block is
+    absent or unreadable, so a caller degrades to "nothing recorded yet" rather
+    than failing a scan over its own coverage note.
+    """
+    if not domain:
+        return None
+    try:
+        # Lazy, mirroring read_attack_path_coverage: the key is read from its
+        # SSOT instead of re-spelled, without adding a module-level import edge.
+        from adscan_core.reporting.cracking_coverage import CRACKING_COVERAGE_KEY
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        if not isinstance(domains, dict):
+            return None
+        entry = domains.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        block = entry.get(CRACKING_COVERAGE_KEY)
+        return block if isinstance(block, dict) else None
+    except Exception as exc:  # noqa: BLE001 - a coverage read is best-effort
+        telemetry.capture_exception(exc)
+        return None
+
+
+def read_attack_path_coverage(
+    shell: ReportShell,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Return the PERSISTED attack-path coverage block for *domain*, or ``None``.
+
+    The read-side twin of :func:`record_attack_path_coverage`, and the reason it
+    exists: the coverage block is written by the attack-path COMPUTE (which knows
+    whether it walked the whole graph) while it is read by the report / KPI stamp,
+    and those two hold DIFFERENT dicts. The stamp works from an in-memory report
+    entry it loaded BEFORE the compute ran, so reading coverage off that entry
+    yields the PREVIOUS run's declaration and a freshly-completed computation
+    still renders as sampled. Reading through here gets the declaration of the
+    computation that actually produced the paths.
+
+    Best-effort: ``None`` when the report, the domain entry or the block is
+    absent or unreadable, so a caller falls back to whatever it already holds
+    rather than losing a declaration.
+    """
+    if not domain:
+        return None
+    try:
+        # Lazy: keeps this module free of an import edge to the memory gate while
+        # still reading the key from its SSOT rather than re-spelling the literal.
+        from adscan_core.reporting.attack_path_memory_gate import (
+            ATTACK_PATH_COVERAGE_KEY,
+        )
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        if not isinstance(domains, dict):
+            return None
+        entry = domains.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        block = entry.get(ATTACK_PATH_COVERAGE_KEY)
+        return block if isinstance(block, dict) else None
+    except Exception as exc:  # noqa: BLE001 - a coverage read is best-effort
+        telemetry.capture_exception(exc)
+        return None
+
+
+def read_password_hygiene_details(
+    shell: ReportShell,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Return the PERSISTED password-hygiene block for *domain*, or ``None``.
+
+    The read-side twin of the hygiene write in the credential-dump path, and the
+    reason it exists: the block is derived when the credential material is
+    extracted, while a local password-recovery attack on those same hashes
+    finishes later and has to fold its result into what is already on record
+    (see ``adscan_core.reporting.password_hygiene.merge_recovered_into_hygiene``).
+    A fold needs the stored block, not the in-memory one the dump happened to
+    hold, so it is read back through here.
+
+    Unlike the coverage blocks above, hygiene lives in ``control_evidence``: it
+    is an observation about the environment rather than a finding. This returns
+    the raw ``details`` payload, not the consumer-facing view, because a fold
+    writes a block back and the renderers have their own extractor for reading
+    one.
+
+    Best-effort: ``None`` when the report, the domain entry or the block is
+    absent or unreadable, so a caller degrades to "nothing on record yet" rather
+    than failing a scan over its own evidence.
+    """
+    if not domain:
+        return None
+    try:
+        # Lazy, mirroring the coverage readers: the key is read from its SSOT
+        # instead of re-spelled, without adding a module-level import edge.
+        from adscan_core.reporting.password_hygiene import PASSWORD_HYGIENE_KEY
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        if not isinstance(domains, dict):
+            return None
+        entry = domains.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        for item in entry.get("control_evidence") or ():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("key") or "").strip() != PASSWORD_HYGIENE_KEY:
+                continue
+            details = item.get("details")
+            return details if isinstance(details, dict) else None
+        return None
+    except Exception as exc:  # noqa: BLE001 - an evidence read is best-effort
+        telemetry.capture_exception(exc)
+        return None
 
 
 def record_host_enrichment_coverage(
@@ -745,6 +1164,76 @@ def record_host_enrichment_coverage(
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["host_enrichment_coverage"] = coverage
     _save_technical_report(shell, report)
+
+
+def record_vantage_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the unexercised-privilege coverage statement for *domain*.
+
+    Write-side single source of truth for the honest answer to "ADscan proved
+    this privilege exists, so why is there no result from using it". When the
+    protocol the privilege is exercised over needs ports the assessment's
+    network position could not reach, the attempt is a DATA GAP in the family of
+    ``unsupported`` (see :mod:`adscan_core.reporting.vantage_coverage`), the
+    same family as the cracking-coverage, attack-path-memory and
+    host-enrichment gaps. It is emphatically NOT a configuration close: ADscan
+    observed its own reach, not the domain controller's filtering policy, so
+    crediting a control here would be the false negative the
+    Exposure-Validation doctrine forbids.
+
+    ``coverage`` carries ``complete`` (bool), ``entries`` (list of per-privilege
+    records) and a rendered client-safe ``statement``. Mirrors
+    :func:`record_host_enrichment_coverage`: stamps the value onto
+    ``domains[<domain>]["vantage_coverage"]`` so the JSON export carries it and
+    the PDF report AND ``adscan_web`` render the SAME statement rather than each
+    recomputing one. Best-effort: ignores a missing/invalid payload and never
+    raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["vantage_coverage"] = coverage
+    _save_technical_report(shell, report)
+
+
+def read_vantage_coverage(
+    shell: ReportShell,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Return the PERSISTED vantage-coverage block for *domain*, or ``None``.
+
+    The read-side twin of :func:`record_vantage_coverage`, and the reason it
+    exists: the block is a UNION of records, and each is observed at a different
+    seam (one per privilege ADscan tried to exercise). A seam that rebuilt the
+    block from only its own record would silently drop every other, so each one
+    reads the current block first and carries the rest through.
+
+    Best-effort: ``None`` when the report, the domain entry or the block is
+    absent or unreadable, so a caller degrades to "nothing recorded yet" rather
+    than failing a scan over its own coverage note.
+    """
+    if not domain:
+        return None
+    try:
+        from adscan_core.reporting.vantage_coverage import VANTAGE_COVERAGE_KEY
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        if not isinstance(domains, dict):
+            return None
+        entry = domains.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        block = entry.get(VANTAGE_COVERAGE_KEY)
+        return block if isinstance(block, dict) else None
+    except Exception as exc:  # noqa: BLE001 - a coverage read is best-effort
+        telemetry.capture_exception(exc)
+        return None
 
 
 def record_domain_assessment(
@@ -911,6 +1400,10 @@ class FindingsSummary:
     is one of those four canonical levels (there is no ``info`` severity on the
     write side). ``top`` is up to ``top_n`` findings ordered
     critical > high > medium > low, then by title.
+
+    The counts are the ones the client-facing reports render, because they come
+    from the same two shared gates both tiers apply: alias-family collapse and
+    :func:`~adscan_core.reporting.finding_vuln_map.is_reportable_finding`.
     """
 
     critical: int = 0
@@ -939,6 +1432,19 @@ def summarize_findings(
     at the lowest rank. Best-effort: returns an empty :class:`FindingsSummary` on
     any read error (never raises).
 
+    Applies the SAME two shared gates the client reports apply, so this histogram
+    and the one a client reads cannot disagree: an alias family collapses to one
+    finding (``collapse_finding_aliases``), and legacy metric residue such as a
+    ``*_count`` counter is dropped (``is_reportable_finding``). Before that, a
+    recap counting raw records could report a weakness twice, once per producer
+    spelling, and count a coverage counter as a finding.
+
+    Buckets on the band the scan AUTHORED (``reported_finding_severity``), which
+    is the contextual rating every client surface counts on, degrading to the
+    recorded baseline for an artifact that carries no rating. A recap that
+    totalled the baseline while the report totalled the contextual band told the
+    operator a different number from the document they were about to hand over.
+
     Args:
         shell: Shell object carrying the technical-report path.
         domain: Restrict to a single domain, or ``None`` to union all.
@@ -963,10 +1469,12 @@ def summarize_findings(
             findings = dentry.get("findings")
             if not isinstance(findings, list):
                 continue
-            for finding in findings:
+            for finding in collapse_finding_aliases(findings):
                 if not isinstance(finding, dict):
                     continue
-                severity = str(finding.get("severity") or "").strip().lower()
+                if not is_reportable_finding(finding):
+                    continue
+                severity = reported_finding_severity(finding)
                 title = str(finding.get("title") or "").strip()
                 if severity in counts:
                     counts[severity] += 1

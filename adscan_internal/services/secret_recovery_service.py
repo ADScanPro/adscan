@@ -411,34 +411,186 @@ def decrypt_powershell_securestring(blob: str, key: bytes) -> str | None:
     return plaintext
 
 
-# Common ways a PowerShell credential file names the owning principal next to a
-# SecureString: a PSCredential constructor, or a user/login/account assignment.
-_SECURESTRING_USERNAME_PATTERNS = (
+# Common ways a credential-bearing file names the owning principal next to a
+# secret: a PSCredential constructor, a user/login/account assignment (PowerShell
+# variable, INI/properties, YAML/JSON), or a ``-Username`` argument. Deliberately
+# KEYWORD-ANCHORED and narrow: a wider net turns an unrelated token into a
+# confident owner, and misattributing a leaked secret is worse than naming none
+# (the client rotates an account that never leaked while the real one stays live).
+_ADJACENT_PRINCIPAL_PATTERNS: tuple[str, ...] = (
     r"(?i)PSCredential[^\n(]*\(\s*[\"']([^\"']+)[\"']",
     r"(?i)\$(?:user(?:name)?|login|account|samaccountname)\s*=\s*[\"']([^\"']+)[\"']",
-    r"(?i)-User(?:name)?\s+[\"']([^\"']+)[\"']",
+    r"(?i)-User(?:name)?\s+[\"']?([^\s\"';,]+)[\"']?",
+    r"(?i)(?:^|[\s,;{])(?:user(?:name)?|login|logon|account|samaccountname)"
+    r"\s*[:=]\s*[\"']?([^\s\"',;]+)[\"']?",
 )
 
+#: Lines a named principal may sit away from the secret and still be read as its
+#: owner. A credential file states the account within a few lines of the secret
+#: (``$username`` / ``$password`` adjacent, a ``user=``/``password=`` block); a
+#: match further away is a different record in the same file, so it is not used.
+ADJACENT_PRINCIPAL_LINE_WINDOW = 8
 
-def _extract_securestring_principal(text: str) -> str | None:
+#: Tokens a keyword match can yield that are documentation, not an account.
+_PRINCIPAL_PLACEHOLDER_TOKENS = frozenset(
+    {
+        "user",
+        "username",
+        "user_name",
+        "login",
+        "logon",
+        "account",
+        "samaccountname",
+        "yourusername",
+        "your_username",
+        "your-username",
+        "usuario",
+        "changeme",
+        "none",
+        "null",
+        "n/a",
+    }
+)
+
+# A sAMAccountName-shaped token: AD allows letters, digits and a small set of
+# punctuation, and a machine account ends in ``$``. No whitespace, no path
+# separator, no shell/variable syntax — anything else is not a name we observed.
+_PRINCIPAL_TOKEN_RE = re.compile(r"^[A-Za-z0-9._@$-]{1,64}$")
+
+
+def normalize_principal_candidate(
+    raw: str | None, *, secret: str | None = None
+) -> str | None:
+    """Return *raw* as a usable sAMAccountName, or ``None`` when it is not one.
+
+    Strips a ``DOMAIN\\`` / ``domain/`` prefix and surrounding quotes, then
+    rejects anything that is not actually an observed account: a placeholder, a
+    shell/environment expansion (``$env:USERNAME``, ``%USERNAME%``, ``<user>``),
+    a value carrying whitespace or path syntax, or the secret itself (some
+    detectors hand back the password as the match).
+
+    Args:
+        raw: The token a detector or a keyword match produced.
+        secret: The secret this candidate would be attributed to, when known.
+
+    Returns:
+        The bare sAMAccountName, or ``None``.
+    """
+    text = str(raw or "").strip().strip("\"'").strip()
+    if not text:
+        return None
+    text = text.split("\\")[-1].split("/")[-1].strip()
+    if not text or not _PRINCIPAL_TOKEN_RE.match(text):
+        return None
+    if text.startswith("$") or text.startswith("@"):
+        # ``$user`` / ``$env:X`` is a variable reference, not a name.
+        return None
+    lowered = text.lower()
+    if lowered in _PRINCIPAL_PLACEHOLDER_TOKENS:
+        return None
+    if secret and lowered == str(secret).strip().lower():
+        return None
+    return text
+
+
+def _iter_principal_candidates(text: str, secret: str | None) -> list[tuple[int, str]]:
+    """Return ``(line_number, principal)`` for every named principal in *text*."""
+    candidates: list[tuple[int, str]] = []
+    for pattern in _ADJACENT_PRINCIPAL_PATTERNS:
+        for match in re.finditer(pattern, text):
+            principal = normalize_principal_candidate(match.group(1), secret=secret)
+            if not principal:
+                continue
+            line = text.count("\n", 0, match.start(1)) + 1
+            candidates.append((line, principal))
+    return candidates
+
+
+def extract_adjacent_principal(
+    text: str | None,
+    *,
+    secret: str | None = None,
+    secret_line: int | None = None,
+    line_window: int = ADJACENT_PRINCIPAL_LINE_WINDOW,
+) -> str | None:
+    """Return the principal a file names NEXT TO *secret*, or ``None``.
+
+    The single source of truth for "whose credential is this?" when the only
+    evidence is the file the secret was recovered from. A recovered secret is
+    worth far more to the client when the deliverable can name the account to
+    rotate, and worth LESS than nothing when it names the wrong one, so this
+    attributes only what the source OBSERVABLY states:
+
+    * The secret's own position anchors the search (``secret_line``, else the
+      line the secret literally appears on). The nearest named principal within
+      ``line_window`` lines wins, so a file holding several credential records
+      attributes each secret to its own account.
+    * Two DIFFERENT principals equally close to the secret is an ambiguity, not
+      a coin toss: it returns ``None``.
+    * With no anchor at all, a single distinct principal in the whole file is
+      accepted and anything more is declined.
+
+    Args:
+        text: The full text of the source file (a context line also works, with
+            correspondingly less to go on).
+        secret: The recovered secret, used to anchor the search and to reject a
+            candidate that is the secret itself.
+        secret_line: 1-based line the secret was found on, when the detector
+            reported it.
+        line_window: Maximum line distance between the secret and its owner.
+
+    Returns:
+        The bare sAMAccountName, or ``None`` when the source named no owner or
+        named more than one with no way to tell which is the secret's.
+    """
+    source = str(text or "")
+    if not source:
+        return None
+    candidates = _iter_principal_candidates(source, secret)
+    if not candidates:
+        return None
+
+    anchor = secret_line if isinstance(secret_line, int) and secret_line > 0 else None
+    if anchor is None and secret:
+        index = source.find(str(secret))
+        if index >= 0:
+            anchor = source.count("\n", 0, index) + 1
+
+    if anchor is None:
+        distinct = {principal for _line, principal in candidates}
+        return next(iter(distinct)) if len(distinct) == 1 else None
+
+    nearest: list[tuple[int, str]] = []
+    for line, principal in candidates:
+        distance = abs(line - anchor)
+        if distance <= line_window:
+            nearest.append((distance, principal))
+    if not nearest:
+        return None
+    best_distance = min(distance for distance, _ in nearest)
+    tied = {principal for distance, principal in nearest if distance == best_distance}
+    return next(iter(tied)) if len(tied) == 1 else None
+
+
+def _extract_securestring_principal(
+    text: str, *, secret: str | None = None
+) -> str | None:
     """Return the owning principal named alongside a SecureString, if any.
+
+    Thin wrapper over :func:`extract_adjacent_principal` so SecureString
+    recovery and share-secret attribution share one definition of an observed
+    owner.
 
     Args:
         text: Text content of the credential file.
+        secret: The SecureString blob, used to anchor the search in a file that
+            holds more than one credential record.
 
     Returns:
         The bare sAMAccountName (domain prefix stripped), or None when no
         adjacent principal is present.
     """
-    if not text:
-        return None
-    for pattern in _SECURESTRING_USERNAME_PATTERNS:
-        match = re.search(pattern, text)
-        if match:
-            raw = match.group(1).strip()
-            if raw:
-                return raw.split("\\")[-1].split("/")[-1].strip() or None
-    return None
+    return extract_adjacent_principal(text, secret=secret)
 
 
 def _read_full_file_text(file_path: str | None, max_bytes: int = 2_000_000) -> str | None:
@@ -741,7 +893,6 @@ def recover_securestring_secrets(
     if not keys:
         return SecureStringRecoveryResult(secrets=[], blobs_present=True, keys_present=False)
 
-    principal = _extract_securestring_principal(text)
     secrets: list[RecoveredSecret] = []
     seen_plaintext: set[str] = set()
     for blob in blobs:
@@ -753,6 +904,10 @@ def recover_securestring_secrets(
         if not plaintext or plaintext in seen_plaintext:
             continue
         seen_plaintext.add(plaintext)
+        # Anchored on THIS blob's position, so a script holding several
+        # credential records attributes each secret to its own account rather
+        # than to whichever name appears first in the file.
+        principal = _extract_securestring_principal(text, secret=blob)
         secrets.append(
             RecoveredSecret(
                 plaintext=plaintext,

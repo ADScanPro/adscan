@@ -29,20 +29,33 @@ deliverable.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 __all__ = [
     "DestructiveVerdict",
     "classify_destructive",
+    "opt_in_default_for_workspace",
+    "skipped_by_default_in_audit",
+    "OPT_IN_PREAPPROVED_WORKSPACE_TYPES",
     "client_safe_step_reason",
     "is_machine_account_name",
     "is_internal_engineering_reason",
     "non_execution_statement",
     "safety_abstention_statement",
     "DANGEROUS_DESTRUCTIVE_MARKER",
+    "GENERIC_DISRUPTION_CLAUSE",
     "NOT_EXERCISED_STATEMENT",
     "SAFETY_ABSTENTION_LABEL",
     "SAFETY_ABSTENTION_LEAD",
+    "path_is_safety_abstention",
+    "step_is_safety_abstention",
+    "safety_abstention_position",
+    "SAFETY_ABSTENTION_TERMINAL",
+    "SAFETY_ABSTENTION_MID_CHAIN",
+    "path_safety_abstention_reason",
+    "path_safety_abstention_relations",
+    "safety_abstention_disruption_clause",
     "safety_abstention_notes",
 ]
 
@@ -97,6 +110,50 @@ _HARD_BLOCKED_RELATIONS: frozenset[str] = frozenset(
 
 _FCP_RELATION = "forcechangepassword"
 
+# ── Workspace-type consent defaults for opt-in-only steps ────────────────────
+# An ``opt_in_only`` step does not run unless the operator says yes, and the
+# centralized prompt helpers AUTO-RESOLVE to the prompt's default when nobody is
+# at the keyboard (``adscan ci``, the web PoV worker). So the DEFAULT is what
+# decides whether an unattended run performs the action at all, and it is
+# workspace-type dependent: a CTF/lab target is disposable, a real engagement is
+# not.
+#
+# This is the SSOT for that rule. ``run_exploit_force_change_password`` (the
+# single ForceChangePassword consent choke point) consumes it, and the
+# customer-facing safeguard matrix derives its "not executed in an audit"
+# statement from it, so the document and the gate can never disagree.
+OPT_IN_PREAPPROVED_WORKSPACE_TYPES: frozenset[str] = frozenset({"ctf"})
+
+
+def opt_in_default_for_workspace(workspace_type: str | None) -> bool:
+    """Return the consent DEFAULT for an opt-in-only step in this workspace.
+
+    Args:
+        workspace_type: The engagement type (``"audit"``, ``"ctf"``, ``"lab"``).
+
+    Returns:
+        True when the step is pre-approved for this workspace type (an
+        unattended run performs it), False when the default is to decline (an
+        unattended run SKIPS it, and an interactive operator is asked with the
+        answer preset to no).
+    """
+    return (
+        str(workspace_type or "").strip().lower()
+        in OPT_IN_PREAPPROVED_WORKSPACE_TYPES
+    )
+
+
+def skipped_by_default_in_audit(relation: str, target_kind: str | None) -> bool:
+    """Whether this step is declined by default in an ``audit`` workspace.
+
+    True only for a step that is opt-in-only AND not pre-approved for an audit
+    engagement, i.e. one ADscan does not perform on its own against a real
+    client: unattended it is skipped outright, and interactively the operator
+    has to override a prompt that defaults to no.
+    """
+    verdict = classify_destructive(relation, target_kind)
+    return verdict.opt_in_only and not opt_in_default_for_workspace("audit")
+
 # Client-facing reasons — no offensive-tool names (they flow into deliverables).
 _FCP_COMPUTER_REASON = (
     "Resetting a computer account password would disrupt that host; "
@@ -139,6 +196,31 @@ _HARD_BLOCKED_REASONS: dict[str, str] = {
         "resolution across the whole domain."
     ),
 }
+
+# Short disruption CLAUSES, one per hard-blocked technique. These are the verb
+# phrase that completes "Running {it} would have ..." in the executive summary,
+# where the full authored sentence above is too long to carry. Client-facing
+# prose: name the disruption the client's own sysadmin would recognise, never a
+# tool and never ADscan's internals.
+_HARD_BLOCKED_DISRUPTION_CLAUSES: dict[str, str] = {
+    "zerologon": (
+        "severed a domain controller from the domain and taken Active Directory "
+        "offline for every user"
+    ),
+    "nopac": "disrupted domain authentication and left rogue machine accounts behind",
+    "printnightmare": "crashed the print spooler service or the host running it",
+    "dnsadminabuse": "disrupted name resolution for your production domain",
+    _FCP_RELATION: (
+        "broken the domain membership of the production host whose account "
+        "password it resets"
+    ),
+}
+
+#: The truthful fallback when the abstained techniques are mixed, or when the
+#: technique is one this table does not name specifically. Deliberately vague
+#: about the mechanism rather than guessing one: a wrong mechanism in a client
+#: deliverable is worse than a general one.
+GENERIC_DISRUPTION_CLAUSE = "disrupted production services"
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,3 +461,160 @@ def non_execution_statement(details: dict | None) -> str:
     if reason:
         return f"{NOT_EXERCISED_STATEMENT} {reason}"
     return NOT_EXERCISED_STATEMENT
+
+
+def safety_abstention_disruption_clause(relations: Iterable[str] | None) -> str:
+    """Return the "Running it would have ..." clause for abstained techniques.
+
+    Args:
+        relations: The relationship names of the steps ADscan abstained from.
+            Several routes commonly share ONE technique, in which case that
+            technique's specific clause is returned.
+
+    Returns:
+        A verb phrase completing "Running them would have ...". A mixed set of
+        techniques, an unrecognised technique or an empty set resolves to
+        :data:`GENERIC_DISRUPTION_CLAUSE` rather than a guessed mechanism.
+    """
+    distinct = {
+        normalized
+        for raw in (relations or ())
+        if (normalized := str(raw or "").strip().lower())
+    }
+    if len(distinct) != 1:
+        return GENERIC_DISRUPTION_CLAUSE
+    return _HARD_BLOCKED_DISRUPTION_CLAUSES.get(
+        distinct.pop(), GENERIC_DISRUPTION_CLAUSE
+    )
+
+
+def step_is_safety_abstention(step: object) -> bool:
+    """Return True when ONE step was hard-refused for safety.
+
+    The step-granularity half of :func:`path_is_safety_abstention`, and the one
+    definition both use. A renderer that badges an individual hop needs it: a
+    withheld step must read as restraint ("Not Executed for Safety"), never as
+    the neutral ``attempted`` the bare ``blocked`` token degrades to, or the card
+    contradicts its own prose one line apart.
+    """
+    if not isinstance(step, Mapping):
+        return False
+    details = step.get("details")
+    if not isinstance(details, Mapping):
+        return False
+    return (
+        str(details.get("blocked_kind") or "").strip().lower()
+        == DANGEROUS_DESTRUCTIVE_MARKER
+    )
+
+
+def _iter_safety_abstained_steps(path: object) -> Iterable[Mapping]:
+    """Yield the steps of ``path`` that were hard-refused for safety."""
+    if not isinstance(path, Mapping):
+        return
+    steps = path.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+        return
+    for step in steps:
+        if step_is_safety_abstention(step):
+            yield step  # type: ignore[misc]
+
+
+def path_is_safety_abstention(path: object) -> bool:
+    """Return True when a path carries a step ADscan hard-refused for safety.
+
+    The ONE predicate for "did ADscan confirm this route and deliberately not
+    execute it". Both the engine-stamped KPI count
+    (``exposure_score_service.compute_exposure_kpis`` ->
+    ``path_axis[<class>]["safety_withheld"]``) and the report's display bucket
+    (``attack_path_render.group_attack_paths_by_status`` -> ``safety_blocked``)
+    call it, so the headline figure and the section that details those routes
+    can never disagree about which routes they are.
+
+    A safety abstention is DISTINCT from a bare ``blocked`` status: ADscan is an
+    exposure-validation product and never attributes a non-execution to a
+    control in the client's environment, so a ``blocked`` path with no safety
+    marker is reported as ``attempted``, never as restraint.
+    """
+    for _step in _iter_safety_abstained_steps(path):
+        return True
+    return False
+
+
+#: Where in a chain the withheld step sits. The STATUS token is deliberately
+#: position-blind (one token, ``blocked``: this repo already carries three status
+#: vocabularies and a compound token would deepen that), so the POSITION is a
+#: separate fact the client-facing PROSE reads, because the two cases are
+#: different stories and only one of them may be told as "the route stops at the
+#: act we declined".
+SAFETY_ABSTENTION_TERMINAL = "terminal"
+SAFETY_ABSTENTION_MID_CHAIN = "mid_chain"
+
+
+def safety_abstention_position(path: object) -> str:
+    """Return where a path's withheld step sits, or ``""`` when none is marked.
+
+    :data:`SAFETY_ABSTENTION_TERMINAL` when the LAST actionable step of the chain
+    is the withheld one: the strongest and most precise story, because everything
+    the route needed was established and only the disruptive final act was
+    declined. :data:`SAFETY_ABSTENTION_MID_CHAIN` when the withheld step sits
+    earlier: the hops beyond it were never walked, so narrating that route as one
+    ADscan took to its end would overclaim.
+
+    Structural / context hops (``MemberOf`` and friends) are not actionable
+    steps, so a trailing one does not demote a terminal abstention to mid-chain.
+    """
+    if not isinstance(path, Mapping):
+        return ""
+    steps = path.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+        return ""
+    actionable: list[Mapping] = [
+        step
+        for step in steps
+        if isinstance(step, Mapping)
+        and str(step.get("status") or "").strip().lower() != "structural"
+    ]
+    if not actionable:
+        return ""
+    withheld = [
+        index
+        for index, step in enumerate(actionable)
+        if step_is_safety_abstention(step)
+    ]
+    if not withheld:
+        return ""
+    if withheld[-1] == len(actionable) - 1:
+        return SAFETY_ABSTENTION_TERMINAL
+    return SAFETY_ABSTENTION_MID_CHAIN
+
+
+def path_safety_abstention_reason(path: object) -> str:
+    """Return the client-safe reason a path was NOT executed for safety, or "".
+
+    The step carries the engine-produced ``client_safe_reason`` (see
+    :func:`safety_abstention_notes`); this returns it verbatim so a render can
+    surface it without re-authoring the sentence. Resolution goes through
+    :func:`client_safe_step_reason`, which screens out any engineering-register
+    reason before it can reach a deliverable.
+    """
+    for step in _iter_safety_abstained_steps(path):
+        return client_safe_step_reason(dict(step.get("details") or {}))
+    return ""
+
+
+def path_safety_abstention_relations(paths: Iterable[object] | None) -> list[str]:
+    """Return the relationship names of every safety-abstained step in ``paths``.
+
+    Feeds :func:`safety_abstention_disruption_clause`, which needs the set of
+    techniques withheld rather than any one path.
+    """
+    relations: list[str] = []
+    for path in paths or ():
+        for step in _iter_safety_abstained_steps(path):
+            relation = str(
+                step.get("relation") or step.get("action") or step.get("edge") or ""
+            ).strip()
+            if relation:
+                relations.append(relation)
+    return relations

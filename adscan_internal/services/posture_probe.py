@@ -290,7 +290,13 @@ ProbeProgressCallback = Callable[[ConstraintCategory, Optional[ProbeResult]], No
 #                    the STATUS_NTLM_BLOCKED-vs-STATUS_LOGON_FAILURE split change
 #                    the technique + classification, so bump to re-probe stale A3
 #                    caches (incl. any PROBE_FAILED/UNKNOWN from the old vehicle).
-_PROBE_SCHEMA_VERSION: int = 9
+# v10 (2026-10-05): LDAP_CHANNEL_BINDING can now be measured over StartTLS (U3b,
+#                    `_probe_ldaps_channel_binding(transport="starttls")`) when
+#                    LDAPS/636 is filtered but StartTLS is available — a NEW probe
+#                    technique for the category. Bump so a DC previously cached
+#                    LDAP_CHANNEL_BINDING=UNKNOWN (636 filtered, CBT unmeasurable
+#                    via U3) is re-probed and the StartTLS verdict learned.
+_PROBE_SCHEMA_VERSION: int = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -1703,8 +1709,22 @@ async def _probe_ldaps_channel_binding(
     sink: PostureSink,
     timeout: float,
     posture: Optional[DomainPosture] = None,
+    transport: str = "ldaps",
 ) -> ProbeResult:
-    """Probe U3 — LDAPS channel binding requirement via BIND-ONLY bogus-cred binds.
+    """Probe U3 — LDAP channel binding requirement via BIND-ONLY bogus-cred binds.
+
+    ``transport`` selects the TLS channel the two-step probe binds over:
+
+      * ``"ldaps"`` (default, U3) — implicit LDAPS on port 636. Byte-identical
+        to the long-standing behaviour.
+      * ``"starttls"`` (U3b) — a StartTLS upgrade on plain LDAP/389, for DCs
+        that firewall 636 but allow StartTLS. ``LdapEnforceChannelBinding`` is
+        channel-agnostic, so a StartTLS-upgraded bind observes CBT exactly like
+        an implicit-LDAPS bind (the vendor derives the ``tls-server-end-point``
+        token on both channels). The two-step disambiguation, the classifier,
+        the emitted category (``LDAP_CHANNEL_BINDING``) and the signal codes are
+        IDENTICAL across both transports — only the connect config and the log
+        wording differ.
 
     Two-step probe modelled on NetExec's ``check_ldaps_cbt`` (see
     ``reference/NetExec/nxc/protocols/ldap.py``), run in BIND-ONLY mode so the
@@ -1747,29 +1767,56 @@ async def _probe_ldaps_channel_binding(
 
     cat = ConstraintCategory.LDAP_CHANNEL_BINDING
     started = _now_ms()
+    _use_starttls = transport == "starttls"
+    _port = 389 if _use_starttls else 636
+    _tag = "U3b CBT-StartTLS" if _use_starttls else "U3 CBT"
 
-    # Early skip when LDAPS is known to be unavailable.
+    # Early skip when the TLS channel this transport needs is known to be
+    # unavailable — channel binding cannot exist without a TLS channel.
     if posture is not None:
-        ldaps = posture.get(ConstraintCategory.LDAPS_AVAILABLE)
-        if (
-            ldaps is not None
-            and ldaps.state == TriState.DISABLED
-            and ldaps.confidence == SignalConfidence.HIGH
-            and not ldaps.is_stale
-        ):
-            return _make_skipped(
-                cat,
-                reason=(
-                    "Skipped: LDAPS not available on this DC — channel "
-                    "binding cannot exist without a TLS channel"
-                ),
-            )
+        if _use_starttls:
+            # U3b needs a working StartTLS upgrade. Skip only on a HIGH-
+            # confidence negative; an UNKNOWN/absent StartTLS verdict lets the
+            # probe try (observe-don't-infer).
+            starttls_av = posture.get(ConstraintCategory.LDAP_STARTTLS_AVAILABLE)
+            if (
+                starttls_av is not None
+                and starttls_av.state != TriState.ENABLED
+                and starttls_av.confidence == SignalConfidence.HIGH
+                and not starttls_av.is_stale
+            ):
+                return _make_skipped(
+                    cat,
+                    reason=(
+                        "Skipped: StartTLS not available on this DC — channel "
+                        "binding over StartTLS cannot exist without a TLS channel"
+                    ),
+                )
+        else:
+            ldaps = posture.get(ConstraintCategory.LDAPS_AVAILABLE)
+            if (
+                ldaps is not None
+                and ldaps.state == TriState.DISABLED
+                and ldaps.confidence == SignalConfidence.HIGH
+                and not ldaps.is_stale
+            ):
+                return _make_skipped(
+                    cat,
+                    reason=(
+                        "Skipped: LDAPS not available on this DC — channel "
+                        "binding cannot exist without a TLS channel"
+                    ),
+                )
 
     def _make_cfg(*, null_cbt: bool) -> "ADscanLDAPConfig":
         return ADscanLDAPConfig(
             domain=domain,
             dc_ip=dc_ip,
-            use_ldaps=True,
+            # ``use_ldaps=False, use_starttls=True`` makes the fallback enter the
+            # StartTLS/389-then-plain-389 branch (no 636 rung), so the per-probe
+            # budget is spent on StartTLS, not a filtered-636 hang.
+            use_ldaps=not _use_starttls,
+            use_starttls=_use_starttls,
             use_kerberos=False,
             username=_make_bogus_probe_user(),
             password=_BOGUS_CRED_PASSWORD,
@@ -1787,7 +1834,7 @@ async def _probe_ldaps_channel_binding(
         """Run a single BIND-ONLY bind; return (exception_or_None, bind_accepted)."""
         attempt_started = _now_ms()
         print_info_debug(
-            f"[posture_probe] U3 CBT opening LDAPS bind-only bogus-cred bind to {dc_ip}:636 "
+            f"[posture_probe] {_tag} opening bind-only bogus-cred bind to {dc_ip}:{_port} "
             f"(timeout={timeout}s, step={step}, "
             f"null_cbt={getattr(cfg, 'null_channel_binding', False)})"
         )
@@ -1811,8 +1858,8 @@ async def _probe_ldaps_channel_binding(
             # serializing the two bogus-cred binds rather than running them in
             # the same wave.
             print_info_debug(
-                f"[posture_probe] U3 CBT timed out after {timeout}s (step {step}) "
-                f"on {dc_ip}:636 — elapsed {_now_ms() - attempt_started:.0f}ms"
+                f"[posture_probe] {_tag} timed out after {timeout}s (step {step}) "
+                f"on {dc_ip}:{_port} — elapsed {_now_ms() - attempt_started:.0f}ms"
             )
             return exc, False
         except Exception as exc:  # noqa: BLE001
@@ -1850,8 +1897,8 @@ async def _probe_ldaps_channel_binding(
         # probe in ``probe_auth`` is the authoritative measurement in this case.
         if _ntlm_bind_unavailable_in_chain(exc):
             print_info_debug(
-                "[posture_probe] U3 CBT step 1 -> NTLM unavailable on "
-                f"{dc_ip}:636; cannot measure CBT via NTLM (deferring to the "
+                f"[posture_probe] {_tag} step 1 -> NTLM unavailable on "
+                f"{dc_ip}:{_port}; cannot measure CBT via NTLM (deferring to the "
                 "Kerberos-path CBT probe). No verdict emitted."
             )
             return ProbeResult(
@@ -1868,7 +1915,7 @@ async def _probe_ldaps_channel_binding(
             )
         verdict = _classify_ldap_policy_response(exc)
         print_info_debug(
-            f"[posture_probe] U3 CBT step 1 -> {verdict} (exception) on {dc_ip}:636 "
+            f"[posture_probe] {_tag} step 1 -> {verdict} (exception) on {dc_ip}:{_port} "
             f"in {_now_ms() - started:.0f}ms"
         )
         if verdict == "cbt_required":
@@ -1896,7 +1943,7 @@ async def _probe_ldaps_channel_binding(
             # CBT -> CBT not enforced for absent CBT. Fall through to step 2
             # to disambiguate "Never" vs "When Supported".
             print_info_debug(
-                "[posture_probe] U3 CBT step 1 -> data 52e (no-CBT bind reached "
+                f"[posture_probe] {_tag} step 1 -> data 52e (no-CBT bind reached "
                 "credential check); proceeding to step 2"
             )
         else:
@@ -1912,7 +1959,7 @@ async def _probe_ldaps_channel_binding(
             )
     else:
         print_info_debug(
-            f"[posture_probe] U3 CBT step 1 -> no-CBT bind accepted on {dc_ip}:636 "
+            f"[posture_probe] {_tag} step 1 -> no-CBT bind accepted on {dc_ip}:{_port} "
             f"in {_now_ms() - started:.0f}ms; proceeding to step 2"
         )
 
@@ -1926,7 +1973,7 @@ async def _probe_ldaps_channel_binding(
     if accepted2:
         # Wrong-CBT bind ACCEPTED -> DC ignored the CBT token -> "Never".
         print_info_debug(
-            f"[posture_probe] U3 CBT step 2 -> wrong-CBT bind accepted on {dc_ip}:636 "
+            f"[posture_probe] {_tag} step 2 -> wrong-CBT bind accepted on {dc_ip}:{_port} "
             f"in {_now_ms() - started:.0f}ms (channel binding NOT enforced)"
         )
         _emit(
@@ -1959,8 +2006,8 @@ async def _probe_ldaps_channel_binding(
     # enforcement, so never fall through to the "not enforced" verdict below.
     if _ntlm_bind_unavailable_in_chain(exc2):
         print_info_debug(
-            "[posture_probe] U3 CBT step 2 -> NTLM unavailable on "
-            f"{dc_ip}:636; cannot measure CBT via NTLM. No verdict emitted."
+            f"[posture_probe] {_tag} step 2 -> NTLM unavailable on "
+            f"{dc_ip}:{_port}; cannot measure CBT via NTLM. No verdict emitted."
         )
         return ProbeResult(
             category=cat,
@@ -1976,7 +2023,7 @@ async def _probe_ldaps_channel_binding(
         )
     verdict2 = _classify_ldap_policy_response(exc2)
     print_info_debug(
-        f"[posture_probe] U3 CBT step 2 -> {verdict2} (exception) on {dc_ip}:636 "
+        f"[posture_probe] {_tag} step 2 -> {verdict2} (exception) on {dc_ip}:{_port} "
         f"in {_now_ms() - started:.0f}ms"
     )
     if verdict2 == "cbt_required":
@@ -3232,6 +3279,12 @@ async def probe_unauth(
              see :func:`_probe_ldaps_channel_binding`).
         U4 — ``LDAP_STARTTLS_AVAILABLE`` (StartTLS upgrade on plain
              LDAP/389, see :func:`_probe_ldap_starttls_available`).
+        U3b — ``LDAP_CHANNEL_BINDING`` over StartTLS (CONDITIONAL; same probe
+             as U3 with ``transport="starttls"``). Runs only when U3 reached
+             no HIGH verdict AND U4 found StartTLS ENABLED HIGH AND LDAPS/636
+             is not ENABLED HIGH — i.e. a DC that firewalls 636 but allows
+             StartTLS. Lets CBT be measured over the StartTLS channel instead
+             of reported Unknown.
 
     Concurrency layout — **fully sequential**: U1 → U4 → U2 → U3. No
     ``asyncio.gather``, no overlapping background tasks. Each probe runs to
@@ -3300,7 +3353,8 @@ async def probe_unauth(
 
     Returns:
         One ``ProbeResult`` per physical probe, in the order
-        ``[U1, U2, U3, U4]``.
+        ``[U1, U2, U3, U4]``, with a 5th ``LDAP_CHANNEL_BINDING`` result (U3b,
+        over StartTLS) appended when the conditional gate above fires.
     """
 
     async def _u1() -> ProbeResult:
@@ -3407,7 +3461,55 @@ async def probe_unauth(
         force=force,
     )
 
-    return [u1, u2, u3, u4]
+    results = [u1, u2, u3, u4]
+
+    # U3b — CBT over StartTLS (fallback when 636 is filtered). Runs ONLY when
+    # the implicit-LDAPS CBT probe (U3) could NOT reach a HIGH verdict, the DC
+    # presents StartTLS (U4 ENABLED HIGH), and LDAPS/636 is NOT confirmed
+    # available (U1 is not ENABLED HIGH). ``LdapEnforceChannelBinding`` is
+    # channel-agnostic, so a StartTLS-upgraded 389 bind observes the SAME policy
+    # that a 636 bind would — letting ADscan report Required/Never instead of
+    # Unknown on a DC that firewalls 636 but allows StartTLS. On a normal
+    # 636-open DC this gate stays OFF (U1 ENABLED HIGH), so U3's verdict is
+    # returned byte-identical. U4 already ran before U3, so its verdict is in
+    # hand; no extra StartTLS reachability round-trip is spent here.
+    u3_high = (
+        u3.succeeded
+        and u3.confidence == SignalConfidence.HIGH
+        and u3.state != TriState.UNKNOWN
+    )
+    starttls_enabled_high = (
+        u4.state == TriState.ENABLED and u4.confidence == SignalConfidence.HIGH
+    )
+    ldaps_enabled_high = (
+        u1.state == TriState.ENABLED and u1.confidence == SignalConfidence.HIGH
+    )
+    if (not u3_high) and starttls_enabled_high and not ldaps_enabled_high:
+        # Layer U1's + U4's finished verdicts onto the base posture so the U3b
+        # probe sees StartTLS ENABLED (self-skip consistency), reusing the same
+        # helper the AUTH SERVICE group uses.
+        posture_for_u3b = _layer_auth_verdicts(posture, domain, [u1, u4])
+
+        async def _u3b() -> ProbeResult:
+            return await _probe_ldaps_channel_binding(
+                domain=domain,
+                dc_ip=dc_ip,
+                sink=sink,
+                timeout=timeout_per_probe,
+                posture=posture_for_u3b,
+                transport="starttls",
+            )
+
+        u3b = await _run_with_lifecycle(
+            category=ConstraintCategory.LDAP_CHANNEL_BINDING,
+            runner=_u3b,
+            on_progress=on_progress,
+            posture=posture_for_u3b,
+            force=force,
+        )
+        results.append(u3b)
+
+    return results
 
 
 async def probe_auth(

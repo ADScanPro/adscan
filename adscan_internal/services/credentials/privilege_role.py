@@ -195,6 +195,51 @@ def _default_meta() -> dict[str, Any]:
     }
 
 
+def set_credential_nt_hash(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    nt_hash: str,
+) -> None:
+    """Retain ``username``'s NT hash when the stored secret is not that hash.
+
+    The credential store holds ONE secret string per principal, so a plaintext
+    recovered from a hash (an offline corpus lookup) or a plaintext that
+    outranked an incoming hash leaves nowhere for the hash to live. Dropping it
+    loses real capability: pass-the-hash and Kerberos RC4 for that account stop
+    being available even though the material was recovered, while the AES keys
+    captured in the same read are kept. This records it alongside those keys.
+
+    Not a second primary credential: consumers resolving "the secret for this
+    principal" keep reading ``credentials[username]``. Nothing renders this
+    field, so retaining it changes no output; the workspace store is the
+    operator's unsanitized working copy and sanitization stays at the output
+    boundary.
+
+    Idempotent and last-write-wins. Best-effort — never raises.
+    """
+    try:
+        normalized = str(nt_hash or "").strip().lower()
+        if not normalized:
+            return
+        domain_data = _domain_data(shell, domain)
+        if domain_data is None:
+            return
+        meta_map = _meta_bucket(domain_data)
+        key = _normalize_user(username)
+        if not key:
+            return
+        current = meta_map.get(key)
+        if not isinstance(current, dict):
+            current = _default_meta()
+        current["nt_hash"] = normalized
+        meta_map[key] = current
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def set_credential_kerberos_material(
     shell: Any,
     *,
@@ -301,6 +346,68 @@ def credential_secret_fingerprint(secret: Any) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def resolve_secret_provenance_strength(meta: Any, secret: Any) -> Any:
+    """Return the provenance strength of ONE secret held for a principal.
+
+    The credential store records provenance per ACQUISITION, each entry
+    carrying the one-way fingerprint of the secret that acquisition produced
+    (:func:`credential_secret_fingerprint`). So "how strong is the evidence for
+    this exact string" is answerable without ever comparing secrets: an entry
+    whose fingerprint matches the secret in hand attributes its origin to that
+    string and nothing else.
+
+    This is what makes a rejection safe to act on. A verification rejects ONE
+    secret; the question a disposal policy must answer is whether the material
+    it is about to remove is the rejected one and whether that material was
+    ever proven. Answering it per principal instead of per secret is how a
+    replicated hash was destroyed by the rejection of an unrelated scraped
+    string.
+
+    Args:
+        meta: ``credentials_meta[username]`` (anything non-dict is tolerated).
+        secret: The stored secret string whose strength is being resolved.
+
+    Returns:
+        A :class:`~adscan_internal.services.credentials.credential_origin.CredentialProvenanceStrength`.
+        The strongest matching acquisition wins. When no acquisition matches by
+        fingerprint, the scalar ``credential_origin`` is used as the fallback so
+        a workspace written before the ``origins`` list existed still resolves;
+        an empty store resolves to ``UNKNOWN``.
+    """
+    from adscan_internal.services.credentials.credential_origin import (  # noqa: PLC0415
+        CredentialProvenanceStrength,
+        classify_origin_provenance_strength,
+        rank_provenance_strength,
+    )
+
+    if not isinstance(meta, dict):
+        return CredentialProvenanceStrength.UNKNOWN
+
+    fingerprint = credential_secret_fingerprint(secret)
+    best = CredentialProvenanceStrength.UNKNOWN
+    matched = False
+    origins = meta.get("origins")
+    if isinstance(origins, list):
+        for entry in origins:
+            if not isinstance(entry, dict):
+                continue
+            recorded = str(entry.get("secret_fingerprint") or "")
+            if not fingerprint or recorded != fingerprint:
+                continue
+            matched = True
+            candidate = classify_origin_provenance_strength(
+                str(entry.get("origin") or "")
+            )
+            if rank_provenance_strength(candidate) > rank_provenance_strength(best):
+                best = candidate
+    if matched:
+        return best
+
+    return classify_origin_provenance_strength(
+        str(meta.get("credential_origin") or "")
+    )
 
 
 def _stored_secret(domain_data: MutableMapping[str, Any], key: str) -> str:

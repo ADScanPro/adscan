@@ -14,7 +14,7 @@ results; this module:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 from pathlib import Path
 import os
 import re
@@ -79,11 +79,15 @@ from adscan_internal.services.cracking_history_service import (
     find_matching_attempt,
     register_cracking_attempt,
 )
-from adscan_internal.services.cracking_benchmark import load_cached_benchmark
+from adscan_internal.services.cracking_benchmark import (
+    load_cached_achieved_rates,
+    load_cached_benchmark,
+)
 from adscan_internal.services.cracking_wordlist_policy import (
     EffortEstimate,
     base_for,
     estimate_effort,
+    human_duration,
     resolve_single_tier,
 )
 from adscan_internal.services.wordlist_service import (
@@ -283,6 +287,8 @@ def _compact_hashcat_stderr(stderr: str, *, max_lines: int = 6) -> str:
     if suppressed > 0:
         rendered += f"\n(+{suppressed} more hashcat stderr line(s) suppressed)"
     return rendered
+
+
 # hashcat's single-instance guard: a second process sharing the same session
 # name (the default ``hashcat``) aborts with this line and exit code 255. Every
 # ADscan crack now runs under a unique ``--session`` name (see
@@ -892,11 +898,36 @@ class _EffortDispatch:
     runtime_seconds: int | None = None
 
 
-def _effort_tier_label(level: str, est: EffortEstimate) -> str:
-    """Menu label for one effort tier: ``Balanced — ≈ 8 min · background``."""
+def _effort_tier_label(
+    level: str, est: EffortEstimate, *, inline_budget: float | None = None
+) -> str:
+    """Menu label for one effort tier: ``Balanced — ≈ 8 min · background``.
+
+    ``inline_budget`` switches the label to the BLOCKING lane's vocabulary: every
+    tier runs now, under a declared budget, so the lane is named by its budget
+    rather than by a hand-off that is not going to happen. A tier whose estimate
+    for THIS hardware exceeds that budget says so, because offering it as though
+    it were free would be the overclaim: the run would reach the budget and stop
+    part-way, which is a coverage boundary the operator should get to choose
+    knowingly rather than discover in the report.
+    """
     title = level.capitalize()
-    lane = "runs now" if level == "fast" else "background"
-    suffix = " (estimating…)" if est.provisional else ""
+    # Says the number is a ballpark, and says WHY without a sentence of
+    # explanation in a menu row. It is set when the rate behind the estimate
+    # was not measured on this box for this workload (the hardware benchmark
+    # overstates the achieved rate by a factor of several), or when the
+    # number of hashes is unknown and the mode is salted, where the cost
+    # scales with that count. The older "(estimating…)" read as work in
+    # progress, which is wrong on a host where no measurement will ever run.
+    suffix = " (provisional)" if est.provisional else ""
+    if inline_budget is None:
+        lane = "runs now" if level == "fast" else "background"
+        return f"{title} — {est.human} · {lane}{suffix}"
+    budget_label = human_duration(inline_budget).replace("≈ ", "")
+    if est.seconds > 0 and est.seconds > float(inline_budget):
+        lane = f"runs now, stops at {budget_label}"
+    else:
+        lane = f"runs now, within {budget_label}"
     return f"{title} — {est.human} · {lane}{suffix}"
 
 
@@ -907,24 +938,74 @@ def choose_cracking_effort(
     mode: str,
     wordlists_dir: str,
     domain: str | None = None,
+    inline_budgets: "Mapping[str, float] | None" = None,
+    cap_reference_mode: str | None = None,
+    hash_count: int | None = None,
 ) -> EffortSelection:
-    """Interactive effort selector for the audit crack path.
+    """Interactive effort selector, for any lane that cracks an effort ladder.
 
     Presents fast / balanced / thorough with live per-tier time estimates for
     ``mode`` on THIS hardware (plus an "Other / custom wordlist" escape hatch).
-    Non-interactive resolves to ``balanced`` with NO prompt. ``fast`` -> inline
-    (blocking); ``balanced`` / ``thorough`` -> background (enqueued by the
-    caller). ``mode`` is the resolved hashcat mode string driving the estimate.
+    Non-interactive resolves to ``balanced`` with NO prompt. ``mode`` is the
+    resolved hashcat mode string driving the estimate.
+
+    ``inline_budgets`` selects the LANE. Omitted (the audit crack path) routing
+    is by level, per the effort-engine design: ``fast`` runs inline and
+    ``balanced`` / ``thorough`` always become background jobs, even on a fast
+    hash mode where the balanced keyspace would finish in seconds.
+
+    Given, it is a lane whose tiers ALL run inline under the per-tier wall-clock
+    budgets it carries, so the menu names the budget instead of a hand-off and
+    flags any tier whose estimate for this hardware exceeds it. The NT lane is
+    the carve-out that uses this, and the reason is the cost shape of that hash:
+    a cracker tests every loaded hash in one pass over the keyspace, so a
+    replication returning thousands of accounts costs very nearly what one
+    costs, and the only variable is the tier.
+
+    The budgets deliberately do NOT change which rule rung each tier resolves
+    to. They are a wall-clock backstop, not a planning input: capping the rung
+    against a budget this small collapsed ``thorough`` onto ``balanced``'s rung
+    for no gain. Each tier keeps the rung it resolves to and the budget stops a
+    run that genuinely overruns.
+
+    ``cap_reference_mode`` is the mode this lane will actually crack, for the
+    rung the returned selection describes. Omitted, the rung is capped against
+    the slowest measured mode, which is the safe answer for a lane whose mode is
+    unknown. Passing it matters on a fast kernel: NT measures ~75x faster than
+    the slowest mode, so planning it against that mode quotes minutes for a run
+    that finishes in seconds. The per-tier ESTIMATE in the label is already
+    per-mode and needs no flag.
+
+    ``hash_count`` is how many distinct hashes this lane will load. It matters
+    because four of the five modes ADscan cracks are SALTED, so the cost scales
+    with the count: a fifty-account roast takes fifty times as long as one
+    account, and quoting it as one account is the error the operator feels. A
+    lane that does not know its count gets a provisional estimate rather than a
+    confident wrong one.
     """
     from adscan_internal import print_instruction  # noqa: PLC0415
 
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
     benchmark = load_cached_benchmark()
-    _base_path, base_lines = base_for(workspace_type, wordlists_dir)
+    # Achieved rates already measured on this box, read instantly off the cache.
+    # The live probe seam is deliberately NOT wired into the selector: the
+    # operator is sitting at a prompt, and spending a short real attack per tier
+    # before the menu renders is the wrong trade. The probe runs when a tier is
+    # RESOLVED for execution, and the menu sharpens from the cache from then on.
+    achieved = load_cached_achieved_rates()
+    base_path, base_lines = base_for(workspace_type, wordlists_dir)
     default_wordlist = os.path.join(wordlists_dir, "combined_audit_base.txt")
 
     estimates = {
-        level: estimate_effort(level, mode, benchmark=benchmark, base_lines=base_lines)
+        level: estimate_effort(
+            level,
+            mode,
+            benchmark=benchmark,
+            base_lines=base_lines,
+            base_path=base_path,
+            hash_count=hash_count,
+            achieved=achieved,
+        )
         for level in _EFFORT_SELECTOR_LEVELS
     }
 
@@ -935,14 +1016,14 @@ def choose_cracking_effort(
             workspace_type=workspace_type,
             wordlists_dir=wordlists_dir,
             benchmark=benchmark,
+            cap_reference_mode=cap_reference_mode,
+            hash_count=hash_count,
+            achieved=achieved,
         )
-        # Routing is by LEVEL, not by the per-mode estimate: per the effort-
-        # engine design, fast stays inline (blocking) and balanced/thorough
-        # ALWAYS run as background jobs -- even on a fast hash mode where the
-        # balanced keyspace would finish in a few seconds. ``is_blocking`` on
-        # the estimate stays informational (drives the web artifact).
         return EffortSelection(
-            kind="inline" if level == "fast" else "background",
+            kind="inline"
+            if (inline_budgets is not None or level == "fast")
+            else "background",
             effort=level,
             wordlist=tier.base_path,
             rule_path=tier.rule_path,
@@ -957,7 +1038,16 @@ def choose_cracking_effort(
         return _selection_for("balanced")
 
     tier_labels = [
-        _effort_tier_label(level, estimates[level]) for level in _EFFORT_SELECTOR_LEVELS
+        _effort_tier_label(
+            level,
+            estimates[level],
+            inline_budget=(
+                None
+                if inline_budgets is None
+                else float(inline_budgets.get(level) or 0.0) or None
+            ),
+        )
+        for level in _EFFORT_SELECTOR_LEVELS
     ]
     options = tier_labels + ["Other / custom wordlist"]
 
@@ -1070,6 +1160,9 @@ def _maybe_dispatch_audit_effort(
         mode=str(hashcat_mode),
         wordlists_dir=wordlists_dir,
         domain=domain,
+        # Every mode this lane reaches except NT is SALTED, so the estimate is
+        # only right if it knows how many hashes the file holds.
+        hash_count=_count_hashes_in_file(hash_file),
     )
 
     if selection.kind != "background":
@@ -1543,6 +1636,7 @@ _HASHCAT_MODE_DESCRIPTIONS: dict[str, str] = {
     "31300": "MS-SNTP Timeroast",
     "5500": "NetNTLMv1",
     "5600": "NetNTLMv2",
+    "1000": "NTLM (NT hash)",
 }
 
 # The etype field of every AES mode needs the same --username prepend handling as
@@ -1615,7 +1709,24 @@ def _resolve_hashcat_mode_and_description(
 
 
 def _hashcat_no_device_guidance() -> str:
-    """Return a user-facing hint when no hashcat backend is available."""
+    """Return a user-facing hint when no hashcat backend is available.
+
+    When the host launcher already diagnosed WHY the GPU is missing, that
+    diagnosis wins. The container can only observe "no compute device", so on
+    its own it has to guess at a cause, and its guess used to be the wrong one
+    for the most common failure: it told the operator to install
+    nvidia-container-toolkit on a host where the toolkit is installed and
+    working, and where the actual fix is to restart because the driver was
+    upgraded under a still-loaded kernel module. The launcher knows which
+    failure it is and forwards it, so both surfaces name the same cause and
+    the same fix.
+    """
+
+    from adscan_core.gpu_runtime import gpu_degradation_from_env
+
+    forwarded = gpu_degradation_from_env()
+    if forwarded is not None:
+        return forwarded.container_sentence
 
     if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
         return (
@@ -1851,6 +1962,12 @@ _HASHCAT_USERNAME_RULES: dict[str, dict[str, object]] = {
     "31300": {"needs_prepend": False, "extractor": None},
     "5500": {"needs_prepend": True, "extractor": _extract_netntlm_username},
     "5600": {"needs_prepend": True, "extractor": _extract_netntlm_username},
+    # NT hash (mode 1000) — a bare 32-hex string that carries no principal of
+    # its own, so the prepend is the ONLY way a recovery can be credited to the
+    # account that owns it. There is nothing to extract (hence no extractor);
+    # the caller supplies the sAMAccountName and the writer falls back to the
+    # placeholder when it genuinely has none.
+    "1000": {"needs_prepend": True, "extractor": None},
 }
 
 
@@ -3392,7 +3509,16 @@ def run_password_spraying(
 def handle_hash_cracking(
     shell: HashCrackingShell, domain: str, user: str, cred: str
 ) -> tuple[str, bool]:
-    """Attempt to crack an NTLM hash with weakpass.
+    """Recover an NT hash's plaintext: breach lookup, then a local attack.
+
+    Both methods are synchronous, so both can answer in this call's return value
+    and the caller never has to care which one succeeded.
+
+    The local attack runs only when the breach lookup did NOT answer: it was
+    disabled for this session, or it errored. A hash the lookup answered
+    negatively is returned as-is, because the shipped local corpus is a subset of
+    what the lookup already searched, so re-asking costs the operator time and
+    GPU for an answer that came back no against far more data.
 
     Args:
         shell: Shell instance with cracking helpers and runtime context.
@@ -3401,18 +3527,17 @@ def handle_hash_cracking(
         cred: NTLM hash to crack.
 
     Returns:
-        Tuple of (credential, is_hash). If cracking succeeds, returns the
-        cracked password and False. On failure, returns original hash
-        and True.
+        Tuple of (credential, is_hash). On a recovery by either method, the
+        plaintext and ``False``. Otherwise the original hash and ``True``.
     """
     if not weakpass_allowed(shell):
-        # Egress disabled for this context: keep the hash hashcat-ready, no
-        # external lookup. Local cracking (hashcat/John) is unaffected.
+        # Egress disabled for this context: no external lookup. The hash still
+        # gets the STRONGER method, locally and offline, in the background.
         print_info_verbose(
             f"weakpass lookup skipped for user '{mark_sensitive(user, 'user')}' "
             "(external NT-hash lookup disabled for this session); hash saved."
         )
-        return cred, True
+        return _local_nt_crack_single(shell, domain, user, cred)
 
     try:
         marked_cred = mark_sensitive(cred, "password")
@@ -3446,31 +3571,95 @@ def handle_hash_cracking(
                 f"[weakpass] lookup failed for hash {marked_cred}: "
                 f"error={mark_sensitive(result.error, 'error')}"
             )
+            # The lookup never answered, so the question is still open. This is
+            # the posture rule applied to cracking: an error tells us about our
+            # own network, not about the password.
+            return _local_nt_crack_single(shell, domain, user, cred)
 
         marked_user = mark_sensitive(user, "user")
         print_info_verbose(
             f"Could not crack the hash for user '{marked_user}'. Proceeding with the hash."
         )
+        # Answered, and the answer was no. The local corpus is a subset of what
+        # the breach lookup already searched, so attacking it here would spend
+        # the operator's time and GPU to re-ask a question that came back
+        # negative against a far larger corpus.
+        return cred, True
     except Exception as e:  # pragma: no cover - mirrors legacy best-effort handling
         telemetry.capture_exception(e)
         print_error("An unexpected error occurred during hash cracking.")
         print_exception(show_locals=False, exception=e)
 
-    return cred, True  # Return original hash if cracking fails
+    # Only reached when the lookup raised: same unanswered case as above.
+    return _local_nt_crack_single(shell, domain, user, cred)
+
+
+def _local_nt_crack_single(
+    shell: HashCrackingShell, domain: str, user: str, cred: str
+) -> tuple[str, bool]:
+    """Attack ONE NT hash locally and report the outcome in the seam's shape.
+
+    The single-hash mirror of the batch seam's fold: because the local attack is
+    synchronous, a recovery it makes is available right here, and returning it as
+    a plaintext is what makes the two recovery methods indistinguishable to every
+    caller downstream. Best-effort: anything other than a clean recovery leaves
+    the hash exactly as it arrived.
+    """
+    normalized = str(cred or "").strip().lower()
+    dispatch = _dispatch_local_nt_crack(shell, domain, {normalized: user})
+    recovered = getattr(dispatch, "recovered", None) or {}
+    plaintext = str(recovered.get(normalized) or "")
+    if plaintext:
+        print_warning(
+            f"Password recovered locally for user '{mark_sensitive(user, 'user')}': "
+            f"{mark_sensitive(plaintext, 'password')}"
+        )
+        return plaintext, False
+    return cred, True
 
 
 def handle_hash_cracking_batch(
-    shell: HashCrackingShell, hashes: list[str]
+    shell: HashCrackingShell,
+    hashes: list[str],
+    *,
+    domain: str = "",
+    principals: "Mapping[str, str] | None" = None,
 ) -> dict[str, str]:
-    """Attempt to crack multiple NTLM hashes with a single weakpass call.
+    """Recover plaintexts for NT hashes: breach lookup, then a local attack.
+
+    The ONE seam every recovered NT hash flows through, whatever produced it
+    (directory replication, a SAM dump, shadow credentials), which is why both
+    recovery methods are dispatched from here and not from any producer.
+
+    Two methods, in order of what they can prove, and BOTH synchronous:
+
+    1. the breach-corpus lookup (when egress is permitted) answers "is this
+       exact password already public?"; and
+    2. a LOCAL wordlist attack, which answers "is this password weak?" and is the
+       stronger method the deliverable's methodology note advertises.
+
+    Both therefore answer in this call's return value, which is what lets the
+    caller derive client-facing password figures from one finished picture rather
+    than from a test that had not run yet.
 
     Args:
         shell: Shell instance with cracking helpers and runtime context.
-        hashes: Candidate NTLM hashes (32 hex chars). Duplicates are allowed.
+        hashes: Candidate NT hashes (32 hex chars). Duplicates are allowed.
+        domain: The domain these hashes were replicated FROM, which is the one
+            the local attack attributes its recoveries to and the one the
+            coverage declaration is stamped on. Not the authenticating domain:
+            replicating a trusted domain across a forest trust puts those two
+            in different realms. Empty falls back to the session's active
+            domain.
+        principals: Optional ``hash_lower -> sAMAccountName`` attribution. The
+            local attack credits a recovery to the real account when it has one,
+            so pass it whenever the caller holds the pairs.
 
     Returns:
-        Mapping ``hash_lower -> cracked_password`` for successfully cracked
-        hashes. Missing entries indicate "not cracked".
+        Mapping ``hash_lower -> cracked_password`` for every hash EITHER method
+        resolved. A missing entry means neither method recovered that password,
+        which is not the same as untested: whether the hash was tested at full
+        strength is declared separately, in the coverage block.
     """
     if not hashes:
         return {}
@@ -3489,16 +3678,47 @@ def handle_hash_cracking_batch(
     if not valid_hashes:
         return {}
 
+    def _then_attack_locally(
+        from_lookup: dict[str, str],
+        *,
+        unanswered: "set[str] | None" = None,
+    ) -> dict[str, str]:
+        """The shared tail: the local attack takes on what is still UNANSWERED.
+
+        One implementation for both branches. The declined-lookup branch used to
+        carry its own copy of this dispatch and its own early return, which is
+        how the two branches came to disagree about whether a local recovery
+        reached the caller at all.
+
+        ``unanswered`` is the set of hashes the breach lookup never gave a verdict
+        on, and only those are attacked locally. ``None`` means the lookup did not
+        run at all, so every hash is unanswered. A hash the lookup answered
+        NEGATIVELY is deliberately NOT attacked: the local corpus is a subset of
+        what the lookup already searched, so re-asking spends the operator's time
+        and GPU on a question that came back no against a far larger corpus.
+        """
+        return _recover_locally_and_merge(
+            shell,
+            domain=domain,
+            principals=principals or {},
+            valid_hashes=valid_hashes,
+            from_lookup=from_lookup,
+            unanswered=unanswered,
+        )
+
     if not weakpass_allowed(shell):
-        # Egress disabled for this context: nothing cracked externally. The
-        # hashes remain hashcat-ready for local cracking.
+        # Egress disabled for this context: nothing recovered externally, so the
+        # local attack is the whole of the recovery. It needs no network at all.
         print_info_verbose(
             f"weakpass batch lookup skipped for {len(valid_hashes)} hash(es) "
             "(external NT-hash lookup disabled for this session)."
         )
-        return {}
+        return _then_attack_locally({})
 
     cracked_by_hash: dict[str, str] = {}
+    # Defaults to EVERY hash: if the lookup raises before returning, nothing was
+    # answered, and an exception must not be read as a negative verdict.
+    unanswered: set[str] = set(valid_hashes)
     try:
         print_info_verbose(
             f"Attempting batch NTLM crack for {len(valid_hashes)} hash(es)..."
@@ -3541,6 +3761,14 @@ def handle_hash_cracking_batch(
             for result in results.values()
             if getattr(result, "used_insecure_tls_fallback", False)
         )
+        # Answered = the lookup returned a result for it AND that result carries
+        # no error. Everything else stays unanswered: an error and a hash the
+        # service never returned at all are both "we do not know".
+        unanswered = {
+            h
+            for h in valid_hashes
+            if h not in results or getattr(results[h], "error", None)
+        }
         missing_result_count = max(len(valid_hashes) - len(results), 0)
         if error_results or tls_failed_count or fallback_count or missing_result_count:
             print_info_debug(
@@ -3568,7 +3796,180 @@ def handle_hash_cracking_batch(
         print_error("An unexpected error occurred during batch hash cracking.")
         print_exception(show_locals=False, exception=e)
 
-    return cracked_by_hash
+    # Only what the lookup never ANSWERED goes to the local attack: the hashes it
+    # errored on, and any it returned no result for at all. A hash it answered
+    # negatively is left alone (see ``_then_attack_locally``).
+    return _then_attack_locally(cracked_by_hash, unanswered=unanswered)
+
+
+def _recover_locally_and_merge(
+    shell: Any,
+    *,
+    domain: str,
+    principals: "Mapping[str, str]",
+    valid_hashes: "Sequence[str]",
+    from_lookup: dict[str, str],
+    unanswered: "set[str] | None" = None,
+) -> dict[str, str]:
+    """Attack whatever the lookup left, merge the result, declare both methods.
+
+    The shared tail of :func:`handle_hash_cracking_batch`, reached identically
+    whether the breach lookup ran or was declined, so the two branches cannot
+    disagree about whether a local recovery reaches the caller.
+
+    Because the local attack is BLOCKING, whatever it recovered is already in
+    hand here, and merging it is what makes the caller's client-facing password
+    figures correct BY CONSTRUCTION: the caller resolves these hashes to
+    plaintexts and derives the recovery rate from the result, so a recovery that
+    arrived after that point would have to be folded back in afterwards, which is
+    the reconciliation this lane exists to avoid needing.
+    """
+    merged = dict(from_lookup)
+    unresolved = [h for h in valid_hashes if h not in merged]
+    if unanswered is not None:
+        unresolved = [h for h in unresolved if h in unanswered]
+    if not unresolved:
+        # Nothing is open. Returning here is what keeps the consent panel and
+        # the time budget off the screen entirely when the breach lookup already
+        # answered every hash, which is the case on a healthy network.
+        return merged
+    dispatch = _dispatch_local_nt_crack(shell, domain, principals, hashes=unresolved)
+    local_recovered = getattr(dispatch, "recovered", None) or {}
+    for hash_key, plaintext in local_recovered.items():
+        if plaintext and hash_key not in merged:
+            merged[hash_key] = plaintext
+    if local_recovered:
+        print_info_verbose(
+            f"Local password recovery resolved {len(local_recovered)} of "
+            f"{len(unresolved)} remaining hash(es)."
+        )
+
+    # Declare the METHOD, not just the result. A hash whose ONLY treatment was
+    # the breach-corpus lookup has not been tested at full strength, and without
+    # this the coverage block kept claiming "every recovered hash was tested
+    # against the audit wordlist", the bounded-computation doctrine inverted: a
+    # weaker method reported as a stronger one. A hash the local attack took on
+    # is NOT in that class, so it is subtracted here, and the two classes are
+    # declared separately at the one seam both run from.
+    _record_breach_lookup_coverage(
+        shell,
+        lookup_only_hashes=max(len(valid_hashes) - dispatch.attacked, 0),
+        recovered=len(merged),
+    )
+    return merged
+
+
+def _dispatch_local_nt_crack(
+    shell: Any,
+    domain: str,
+    principals: "Mapping[str, str]",
+    *,
+    hashes: "Sequence[str] | None" = None,
+) -> Any:
+    """Hand NT hashes to the local, offline wordlist attack. Best-effort.
+
+    The single place in this module that reaches the local-cracking dispatcher,
+    so the single-hash seam and the batch seam can never diverge on whether a
+    local attack runs, under which mode, or how its coverage is declared.
+
+    Deliberately passes no ``effort``: the dispatcher then resolves one through
+    the shared effort selector, which is what puts this lane on the rule-aware,
+    benchmark-capped ladder instead of the legacy flat wordlist list, and which
+    asks the operator with real per-tier estimates when there is an operator to
+    ask. The call BLOCKS for the duration of the attack.
+
+    Args:
+        shell: The active session.
+        domain: Domain the hashes belong to; empty falls back to the session's
+            active domain (the batch seam is reached from callers that do not
+            all carry one).
+        principals: ``hash_lower -> sAMAccountName`` attribution.
+        hashes: The hashes to attack; defaults to the keys of ``principals``.
+
+    Returns:
+        The dispatcher's ``LocalNtCrackDispatch``, or a falsy stand-in when the
+        dispatcher could not be reached at all.
+    """
+    from adscan_internal.services.cracking.local_nt_crack import (  # noqa: PLC0415
+        LocalNtCrackDispatch,
+        dispatch_local_nt_crack,
+    )
+
+    try:
+        candidates = list(hashes) if hashes is not None else list(principals.keys())
+        if not candidates:
+            return LocalNtCrackDispatch()
+        resolved_domain = str(domain or "").strip() or _active_domain(shell)
+        return dispatch_local_nt_crack(
+            shell,
+            domain=resolved_domain,
+            hashes=candidates,
+            principals=principals,
+        )
+    except Exception as exc:  # noqa: BLE001 — a dispatch failure never breaks recovery
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return LocalNtCrackDispatch()
+
+
+def _active_domain(shell: Any) -> str:
+    """Resolve the session's active domain for a caller that carries none.
+
+    Prefers ``shell.domain``; falls back to the single domain in
+    ``domains_data`` when there is exactly one, which is the common case and
+    unambiguous. With several domains collected and no domain supplied it
+    returns ``""`` rather than guessing: attributing a replicated hash to the
+    wrong realm would misplace both the recovery and its coverage declaration.
+    """
+    try:
+        active = str(getattr(shell, "domain", "") or "").strip()
+        if active:
+            return active
+        domains = [
+            str(name).strip()
+            for name in (getattr(shell, "domains_data", None) or {})
+            if str(name or "").strip()
+        ]
+        return domains[0] if len(domains) == 1 else ""
+    except Exception:  # noqa: BLE001 — an unreadable shell yields no domain
+        return ""
+
+
+def _record_breach_lookup_coverage(
+    shell: Any, *, lookup_only_hashes: int, recovered: int
+) -> None:
+    """Persist the breach-lookup-only hash class into every in-scope domain's coverage.
+
+    Routed through the ONE merge-preserving coverage writer, so the local-attack
+    class the dispatcher recorded moments earlier is carried through instead of
+    being overwritten by this write (the two classes answer different questions
+    and must both survive).
+
+    Best-effort and idempotent: a report is never failed over its own coverage
+    note.
+    """
+    if lookup_only_hashes <= 0:
+        return
+    try:
+        from adscan_internal.services.wordlist_service import (  # noqa: PLC0415
+            record_cracking_coverage_for_domain,
+        )
+
+        domains = [
+            str(name).strip()
+            for name in (getattr(shell, "domains_data", None) or {})
+            if str(name or "").strip()
+        ]
+        for domain in domains:
+            record_cracking_coverage_for_domain(
+                shell,
+                domain,
+                breach_lookup_only_hashes=lookup_only_hashes,
+                breach_lookup_recovered=recovered,
+            )
+    except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def do_cracking(shell: CrackingShell, args: str) -> None:
@@ -4213,7 +4614,9 @@ def execute_cracking(
                 # Compact the stderr first: hashcat's multi-line status/setup screen
                 # is progress noise that would flood the recording verbatim.
                 compact_initial_stderr = _compact_hashcat_stderr(initial_stderr)
-                if compact_initial_stderr and not _is_benign_hashcat_stderr(initial_stderr):
+                if compact_initial_stderr and not _is_benign_hashcat_stderr(
+                    initial_stderr
+                ):
                     print_error(f"Error output:\n{compact_initial_stderr}")
                 elif compact_initial_stderr:
                     print_info_debug(
@@ -4360,15 +4763,16 @@ def execute_cracking(
             )
             # Compact the stderr: the '--show' pass also prints the hashcat
             # status/setup screen, which would flood the recording verbatim.
-            compact_show_stderr = _compact_hashcat_stderr(completed_process_show.stderr or "")
+            compact_show_stderr = _compact_hashcat_stderr(
+                completed_process_show.stderr or ""
+            )
             if compact_show_stderr and not _is_benign_hashcat_stderr(
                 completed_process_show.stderr
             ):
                 print_error(f"Error output:\n{compact_show_stderr}")
             elif compact_show_stderr:
                 print_info_debug(
-                    "Non-fatal hashcat stderr during '--show':\n"
-                    f"{compact_show_stderr}"
+                    f"Non-fatal hashcat stderr during '--show':\n{compact_show_stderr}"
                 )
         elif completed_process_show.stderr:
             compact_show_stderr = _compact_hashcat_stderr(completed_process_show.stderr)
@@ -4376,13 +4780,11 @@ def execute_cracking(
                 pass
             elif _is_benign_hashcat_stderr(completed_process_show.stderr):
                 print_info_debug(
-                    "Non-fatal hashcat stderr during '--show':\n"
-                    f"{compact_show_stderr}"
+                    f"Non-fatal hashcat stderr during '--show':\n{compact_show_stderr}"
                 )
             else:
                 print_warning_debug(
-                    "Unexpected hashcat stderr during '--show':\n"
-                    f"{compact_show_stderr}"
+                    f"Unexpected hashcat stderr during '--show':\n{compact_show_stderr}"
                 )
 
         show_stdout = ""
@@ -4561,6 +4963,9 @@ def execute_cracking(
                             from adscan_internal.services.attack_graph_service import (
                                 update_roast_entry_edge_status,
                             )
+                            from adscan_core.reporting.attack_step_reason_codes import (
+                                ReasonCode,
+                            )
 
                             update_roast_entry_edge_status(
                                 shell,
@@ -4569,6 +4974,7 @@ def execute_cracking(
                                 status="failed",
                                 username=user,
                                 wordlist=wordlist_name,
+                                reason_code=ReasonCode.CRACK_FAILED.value,
                             )
                         except Exception as exc:  # pragma: no cover
                             telemetry.capture_exception(exc)
@@ -4615,6 +5021,9 @@ def execute_cracking(
                     from adscan_internal.services.attack_graph_service import (
                         update_roast_entry_edge_status,
                     )
+                    from adscan_core.reporting.attack_step_reason_codes import (
+                        ReasonCode,
+                    )
 
                     users = _extract_hash_users(hash)
                     for user in users:
@@ -4625,6 +5034,7 @@ def execute_cracking(
                             status="failed",
                             username=user,
                             wordlist=wordlist_name,
+                            reason_code=ReasonCode.CRACK_FAILED.value,
                         )
                 except Exception as exc:  # pragma: no cover
                     telemetry.capture_exception(exc)

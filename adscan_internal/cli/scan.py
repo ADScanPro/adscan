@@ -1293,9 +1293,11 @@ def _review_description_credential_candidates(
 ) -> list:
     """Validate CredSweeper description findings interactively before saving.
 
-    Shows one Rich summary panel (all candidates at a glance) then prompts
-    once per item. High-confidence findings (ML ≥ 0.70) default to "Save and
-    verify now"; low-confidence findings default to "Ignore (false positive)".
+    Renders one summary panel showing every candidate inside the text it was
+    extracted from, then prompts once per item with that same evidence on screen.
+    The surrounding text is the discriminator: a description reading
+    ``service account for app X, pwd <token>`` is a true positive and a ticket
+    code is not, and the token alone cannot tell the operator which it is.
 
     Returns the accepted items only. Always returns a list (empty if all
     ignored, none found, or the operator stops early).
@@ -1303,84 +1305,41 @@ def _review_description_credential_candidates(
     if not desc_creds:
         return []
 
-    from rich.box import ROUNDED, SIMPLE_HEAVY
-    from rich.console import Group
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-
-    from adscan_core.rich_output import _get_console
-    from adscan_core.theme import ADSCAN_PRIMARY
-
-    HIGH_CONF = 0.70
-
-    def _rule_label(rule: str, prob: float | None) -> Text:
-        # DOC/narrative rules have near-zero ML probability by design — the ML
-        # model was trained on code/config, not natural language. Show the rule
-        # name instead of a misleading confidence bar for these deterministic hits.
-        if prob is not None and prob >= HIGH_CONF:
-            filled = round(prob * 4)
-            bar = "█" * filled + "░" * (4 - filled)
-            return Text(f"{bar} {prob:.2f}", style="bold green")
-        rule_short = rule.replace("DOC ", "").replace("_", " ").title()
-        return Text(rule_short, style="bold yellow" if prob is None or prob > 0 else "dim")
-
-    tbl = Table(box=SIMPLE_HEAVY, header_style=f"bold {ADSCAN_PRIMARY}", show_lines=True)
-    tbl.add_column("User", style="bold cyan", no_wrap=True)
-    tbl.add_column("Field", style="dim")
-    tbl.add_column("Extracted value", style="bold yellow")
-    tbl.add_column("Rule", justify="right")
-    tbl.add_column("Context", style="dim", max_width=50)
-
-    for c in desc_creds:
-        ctx = f'"{c.context_line[:60]}"' if c.context_line else "—"
-        tbl.add_row(
-            mark_sensitive(c.samaccountname, "user"),
-            c.field.replace("_", " "),
-            mark_sensitive(c.raw_value, "password"),
-            _rule_label(c.rule_name, c.ml_probability),
-            ctx,
-        )
-
-    count_line = (
-        f"[dim]{len(desc_creds)} candidate{'s' if len(desc_creds) != 1 else ''}[/dim]"
+    from adscan_internal.cli.credential_candidate_evidence import (
+        CredentialCandidateEvidence,
+        iter_candidate_review,
+        render_credential_candidates_panel,
     )
+    from adscan_internal.interaction import is_non_interactive
 
-    panel = Panel(
-        Group(
-            Text.from_markup(
-                "[dim]Detected by CredSweeper — review before saving to credential store[/dim]\n"
+    evidences = [
+        CredentialCandidateEvidence(
+            account=str(cred.samaccountname),
+            field_label=str(cred.field).replace("_", " "),
+            token=str(cred.raw_value),
+            source_value=str(
+                getattr(cred, "source_value", "") or cred.context_line or ""
             ),
-            tbl,
-            Text(""),
-            Text.from_markup(count_line),
-        ),
-        title=(
-            f"[bold {ADSCAN_PRIMARY}]🔑 Credentials in User Descriptions"
-            f"  ·  {mark_sensitive(domain, 'domain')}[/]"
-        ),
-        title_align="left",
-        border_style=ADSCAN_PRIMARY,
-        box=ROUNDED,
-        padding=(1, 2),
-    )
-    _get_console().print(panel)
-
-    accepted: list = []
-    for cred in desc_creds:
-        prob = cred.ml_probability
-        conf_hint = f"{prob:.2f}" if prob is not None else "no ML score"
-        field_label = cred.field.replace("_", " ")
-        prompt = (
-            f"{mark_sensitive(cred.samaccountname, 'user')} — "
-            f'"{mark_sensitive(cred.raw_value, "password")}" '
-            f"({field_label}, rule: {cred.rule_name}, {conf_hint})"
-            f"\n  How do you want to handle this?"
+            rule=str(cred.rule_name or ""),
+            ml_probability=cred.ml_probability,
         )
-        options = ["Save and verify now", "Ignore (false positive)", "Stop reviewing"]
-        default_idx = 0
+        for cred in desc_creds
+    ]
+    interactive_review = not is_non_interactive(self)
+    render_credential_candidates_panel(
+        evidences,
+        title=f"Credentials in User Descriptions  \u00b7  {mark_sensitive(domain, 'domain')}",
+        interactive=interactive_review,
+        max_entries=30,
+    )
 
-        selection = self._questionary_select(prompt, options, default_idx=default_idx)
+    options = ["Save and verify now", "Ignore (false positive)", "Stop reviewing"]
+    accepted: list = []
+    for cred, (_position, _evidence, prompt) in zip(
+        desc_creds,
+        iter_candidate_review(evidences, interactive=interactive_review),
+    ):
+        selection = self._questionary_select(prompt, options, default_idx=0)
         if selection is None:
             break
         selected = options[selection]

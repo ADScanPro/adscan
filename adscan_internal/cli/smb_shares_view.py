@@ -498,7 +498,7 @@ def _render_empty_state(*, view_set: ShareViewSet, mode: SharesViewMode) -> None
             cause="Live probe failed and no attack graph data is available for this host.",
             suggestions=[
                 "Run an authenticated scan first: adscan ci",
-                "Check posture: adscan posture --domain <domain>",
+                "Check posture: posture show <domain>",
             ],
         )
         return

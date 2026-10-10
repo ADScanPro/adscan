@@ -44,6 +44,11 @@ from adscan_internal.reporting_compat import handle_optional_report_service_exce
 from adscan_internal.core import AuthMode
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.cli.common import build_lab_event_fields
+from adscan_internal.cli.credential_candidate_evidence import (
+    CredentialCandidateEvidence,
+    iter_candidate_review,
+    render_credential_candidates_panel,
+)
 from adscan_internal.cli.ntlm_hash_finding_flow import (
     render_ntlm_hash_findings_flow,
 )
@@ -5813,69 +5818,6 @@ def _display_ldap_descriptions_with_rich(
     )
 
 
-def _display_ldap_description_candidates_with_rich(
-    user_descriptions: dict[str, str],
-    *,
-    title: str,
-    max_rows: int = 30,
-) -> None:
-    """Display a subset of user descriptions (e.g., those with credential candidates).
-
-    Args:
-        user_descriptions: Dictionary mapping usernames to descriptions.
-        title: Table title to display.
-        max_rows: Maximum rows to show (sorted by username).
-    """
-    if not user_descriptions:
-        return
-
-    from adscan_core.theme import COLOR_CRIMSON, COLOR_MUTED, COLOR_SAGE
-
-    # Credential patterns in user descriptions are rare and high-value. The row
-    # must JUMP: crimson glyph, prominent header, action-oriented "Next:" line.
-    print_info(
-        f"[{COLOR_CRIMSON}]* {len(user_descriptions)} description(s) match credential patterns[/{COLOR_CRIMSON}] "
-        "  -> review each for plaintext passwords, shared secrets, or onboarding hints."
-    )
-
-    max_rows = max(1, int(max_rows))
-    table = Table(
-        title=f"* {title}",
-        show_header=True,
-        header_style=f"bold {COLOR_CRIMSON}",
-    )
-    table.add_column("", width=2, justify="center")
-    table.add_column("#", style=COLOR_MUTED, width=4, justify="right")
-    table.add_column("sAMAccountName", style=COLOR_SAGE, no_wrap=False, max_width=30)
-    table.add_column("description (candidate)", no_wrap=False, max_width=80)
-
-    sorted_users = sorted(user_descriptions.items())
-    shown_users = sorted_users[:max_rows]
-
-    for idx, (username, description) in enumerate(shown_users, 1):
-        display_description = (
-            description[:77] + "..." if len(description) > 80 else description
-        )
-        table.add_row(
-            f"[{COLOR_CRIMSON}]*[/{COLOR_CRIMSON}]",
-            str(idx),
-            username,
-            display_description,
-        )
-
-    if len(sorted_users) > max_rows:
-        remaining = len(sorted_users) - max_rows
-        table.caption = (
-            f"Showing first {max_rows}. {remaining} additional rows omitted."
-        )
-
-    print_panel_with_table(table, border_style=COLOR_CRIMSON)
-    print_info(
-        f"[{COLOR_CRIMSON}]Next:[/{COLOR_CRIMSON}] try each candidate as a password for its owning account "
-        "(and for common shared accounts) before discarding."
-    )
-
-
 def _find_user_for_password_from_line(
     context_line: str, user_descriptions: dict[str, str]
 ) -> Optional[str]:
@@ -6553,6 +6495,14 @@ def _analyze_descriptions_for_passwords(
                 if ckey in seen_cands:
                     continue
                 seen_cands.add(ckey)
+                # Carry the COMPLETE field value the hit came from. It is the
+                # only thing that lets the operator tell a leaked password
+                # apart from a ticket code or a host name, and it is right
+                # here in ``cred_fields`` -- the detector's own context line is
+                # the fallback, not the source of truth.
+                source_value = str(
+                    (cred_fields.get(sam) or {}).get(field_label) or ""
+                ).strip()
                 candidates.append({
                     "username": sam,
                     "field": field_label,
@@ -6560,6 +6510,7 @@ def _analyze_descriptions_for_passwords(
                     "rule": str(rule_name or ""),
                     "ml_probability": ml_probability,
                     "context": str(context_line or ""),
+                    "source_value": source_value or str(context_line or ""),
                 })
 
         if not candidates and not ntlm_hash_candidates:
@@ -6568,30 +6519,36 @@ def _analyze_descriptions_for_passwords(
             )
             return outcomes
 
-        # Display the matching field value per candidate (not only the
-        # description), labelled by field, so non-description leaks are visible.
-        candidate_rows: dict[str, str] = {}
-        for item in candidates:
-            username = str(item["username"])
-            field_label = str(item["field"])
-            value = str(item["password"])
-            row_key = f"{username} [{field_label}]"
-            candidate_rows[row_key] = value
-
-        _display_ldap_description_candidates_with_rich(
-            candidate_rows,
-            title=f"Potential Passwords in LDAP Fields ({len(candidate_rows)} found)",
-            max_rows=30,
+        # Show each candidate inside the text it was extracted from, labelled by
+        # field, so a description leak, a unixUserPassword leak and a false
+        # positive are all distinguishable at a glance.
+        evidences = [
+            CredentialCandidateEvidence(
+                account=str(item["username"]),
+                field_label=str(item["field"]),
+                token=str(item["password"]),
+                source_value=str(item.get("source_value") or ""),
+                rule=str(item.get("rule") or ""),
+                ml_probability=item.get("ml_probability"),
+            )
+            for item in candidates
+        ]
+        interactive_review = not is_non_interactive(shell)
+        render_credential_candidates_panel(
+            evidences,
+            title=f"Potential Passwords in LDAP Fields ({len(evidences)} found)",
+            interactive=interactive_review,
+            max_entries=30,
         )
 
         confirmed: list[dict] = []
-        for item in candidates:
+        for item, (_position, _evidence, prompt) in zip(
+            candidates,
+            iter_candidate_review(evidences, interactive=interactive_review),
+        ):
             field_label = str(item["field"])
-            marked_user = mark_sensitive(str(item["username"]), "user")
-            marked_value = mark_sensitive(str(item["password"]), "password")
             selection = shell._questionary_select(
-                f"Candidate for {marked_user} ({field_label}): {marked_value}"
-                "\nHow do you want to handle this?",
+                prompt,
                 [
                     "Ignore (false positive)",
                     "Save and verify now",

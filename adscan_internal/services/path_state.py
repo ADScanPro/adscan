@@ -45,6 +45,20 @@ _PROVEN_STATUSES: frozenset[str] = frozenset(
 #: :func:`adscan_internal.services.attack_paths_core.is_coverage_marker_step`.
 COVERAGE_SAMPLE_STATUS: str = "coverage_sample"
 
+#: Display/edge-status token for a finding ADscan actively proved is NOT
+#: exploitable. Emitted today only by the ESC15 (EKUwu / CVE-2024-49019)
+#: non-destructive confirm-mode when the CA stripped the injected application
+#: policy from the issued certificate — i.e. the CA is patched, so the ESC15
+#: finding is DISMISSED. This is an OBSERVED-GOOD verdict (the probe ran and the
+#: policy was proven absent from the issued cert), distinct from the
+#: ``unsupported`` / ``unavailable`` data gaps (a gap in OUR coverage) and from
+#: ``closed_by_configuration`` (an orthogonal avenue of a STILL-EXISTING weakness
+#: closed by config). A dismissed finding is NOT client exposure, so it is a
+#: member of :data:`NO_EXPOSURE_STATUSES` below. The matching GREEN compliance
+#: evidence is persisted separately as a positive control
+#: (``esc15_application_policy_injection_mitigated``).
+NOT_VULNERABLE_STATUS: str = "not_vulnerable"
+
 #: Statuses that describe NO client exposure, and therefore may never be counted
 #: into a risk figure or offered to a client as something to remediate.
 #:
@@ -57,6 +71,10 @@ COVERAGE_SAMPLE_STATUS: str = "coverage_sample"
 #: * ``coverage_sample`` — a synthetic coverage-declaration record from the
 #:   bounded fallback (a reachable target represented without its route). It
 #:   states coverage, not exposure, so it is excluded exactly like a data gap.
+#: * ``not_vulnerable`` — a finding ADscan actively proved absent (e.g. ESC15
+#:   confirm-mode observed a patched CA). The weakness does not exist, so the
+#:   path is a dismissed finding, not exposure; the positive is carried by a
+#:   compliance control instead.
 #:
 #: This is the same set as the ``None`` entries of
 #: ``exposure_score_service._PROOF_WEIGHT`` — that table builds them from here,
@@ -66,7 +84,13 @@ COVERAGE_SAMPLE_STATUS: str = "coverage_sample"
 #: ``tests/unit/services/test_remediation_status_filter.py`` (a test-only import,
 #: which keeps this module the stdlib-only leaf its closure depends on).
 NO_EXPOSURE_STATUSES: frozenset[str] = frozenset(
-    {"closed_by_configuration", "unsupported", "unavailable", COVERAGE_SAMPLE_STATUS}
+    {
+        "closed_by_configuration",
+        "unsupported",
+        "unavailable",
+        COVERAGE_SAMPLE_STATUS,
+        NOT_VULNERABLE_STATUS,
+    }
 )
 
 
@@ -113,6 +137,19 @@ NOT_ASSESSED_STATUSES: frozenset[str] = frozenset({"unsupported", "unavailable"}
 #: Display bucket token for :data:`NOT_ASSESSED_STATUSES`. Distinct from the raw
 #: engine statuses so a renderer can key its chip/CSS on one value.
 NOT_ASSESSED_BUCKET: str = "not_assessed"
+
+#: Display bucket token for a route or step ADscan CONFIRMED and deliberately did
+#: not execute, because executing it would disrupt production. Kept out of
+#: ``theoretical`` for the same reason :data:`NOT_ASSESSED_BUCKET` is: the legend
+#: defines Theoretical as "mapped from configuration analysis; not actively
+#: exploited", which is a different and weaker claim than restraint, and a card
+#: badged that way contradicted its own prose saying the route was withheld.
+#: Resolution is MARKER-based, never token-based: a bare ``blocked`` with no
+#: safety marker stays ``attempted``, because ADscan never attributes a
+#: non-execution to a control in the client's environment. Use
+#: ``destructive_action_policy.path_is_safety_abstention`` /
+#: ``step_is_safety_abstention`` to decide; this is only the token to render.
+SAFETY_WITHHELD_BUCKET: str = "safety_blocked"
 
 #: Client-facing badge text for every NON-PROVEN status, in both report tiers.
 #:

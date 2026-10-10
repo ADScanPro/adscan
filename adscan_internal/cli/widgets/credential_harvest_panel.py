@@ -113,6 +113,7 @@ _SOURCE_LABEL: dict[str, str] = {
     "spraying": "password spray",
     "kerberoasting": "kerberoast",
     "asreproasting": "AS-REP roast",
+    "offline_crack": "offline password crack",
 }
 
 

@@ -20,6 +20,7 @@ from adscan_internal.services.graph_queries import (
     get_passwordnotreqd_users,
     get_pwdneverexpires_users,
     get_stale_users,
+    is_active,
 )
 from adscan_internal.workspaces import domain_subpath, read_json_file
 
@@ -302,9 +303,7 @@ class LocalGraphService:
                     record for record in records if bool(record.get("passwordnotreqd"))
                 ]
             else:
-                records = [
-                    record for record in records if record.get("enabled") is not False
-                ]
+                records = [record for record in records if is_active(record)]
         else:
             graph = self._graph(domain)
             if filter_type == "high_value":
@@ -391,11 +390,7 @@ class LocalGraphService:
         inventory_records = self._inventory_records(domain, "users.json")
         if inventory_records:
             source_records = (
-                [
-                    record
-                    for record in inventory_records
-                    if record.get("enabled") is not False
-                ]
+                [record for record in inventory_records if is_active(record)]
                 if enabled_only
                 else inventory_records
             )
@@ -435,9 +430,7 @@ class LocalGraphService:
                     record for record in records if not bool(record.get("haslaps"))
                 ]
             else:
-                records = [
-                    record for record in records if record.get("enabled") is not False
-                ]
+                records = [record for record in records if is_active(record)]
         else:
             graph = self._graph(domain)
             if laps_filter is True:
@@ -455,7 +448,7 @@ class LocalGraphService:
         records = [
             record
             for record in self._inventory_records(domain, "users.json")
-            if record.get("enabled") is not False and bool(record.get("hasspn"))
+            if is_active(record) and bool(record.get("hasspn"))
         ]
         if records:
             return [
@@ -474,7 +467,7 @@ class LocalGraphService:
         records = [
             record
             for record in self._inventory_records(domain, "users.json")
-            if record.get("enabled") is not False and bool(record.get("dontreqpreauth"))
+            if is_active(record) and bool(record.get("dontreqpreauth"))
         ]
         if records:
             return [
@@ -498,7 +491,7 @@ class LocalGraphService:
         """Return enabled computer accounts with enough local metadata for Timeroast."""
         candidates: list[dict[str, Any]] = []
         for record in self._inventory_records(domain, "computers.json"):
-            if record.get("enabled") is False:
+            if not is_active(record):
                 continue
             pwdlastset = _ad_time_to_epoch_seconds(record.get("pwdlastset"))
             whencreated = _ad_time_to_epoch_seconds(record.get("whencreated"))

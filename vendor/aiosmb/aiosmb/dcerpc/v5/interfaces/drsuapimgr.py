@@ -45,6 +45,24 @@ class DS_NAME_ERROR(enum.Enum):
 	TRUST_REFERRAL = 7
 
 
+#: Connect budget, in seconds, for the DRSUAPI dynamic TCP port.
+#:
+#: ``DCERPCTarget.from_connection_string`` defaults ``timeout`` to 1, and this
+#: call site used to take that default, so the ENTIRE verdict "the dynamic RPC
+#: range is filtered" rested on a single one-second TCP connect. That is fine on
+#: a lab in the same subnet and wrong everywhere else: over a VPN at 300ms RTT a
+#: legitimate, open dynamic port can miss a one-second budget, and the caller
+#: then reports a filtered range to the client. A timeout means "my budget ran
+#: out", never "the server refuses this".
+#:
+#: So the budget is taken from the SMB connection that got us here (the same
+#: inheritance ``DCERPCSMBTarget`` already does for the named-pipe path), with
+#: this floor when that connection carries none. A closed port still fails on
+#: the first RST, so the fast-fail property on an unroutable position is intact;
+#: only a DROPPED packet waits, and waiting is the correct behaviour there.
+DRSUAPI_TCP_CONNECT_TIMEOUT_FLOOR = 5
+
+
 class DRSUAPIRPC:
 	def __init__(self, domainname = None):
 		self.domainname = domainname
@@ -153,7 +171,12 @@ class DRSUAPIRPC:
 			if err is not None:
 				raise err
 
-			target = DCERPCTarget.from_connection_string(constring, smb_connection = connection)
+			_connect_timeout = DRSUAPI_TCP_CONNECT_TIMEOUT_FLOOR
+			try:
+				_connect_timeout = max(int(connection.target.timeout or 0), DRSUAPI_TCP_CONNECT_TIMEOUT_FLOOR)
+			except (AttributeError, TypeError, ValueError):
+				pass
+			target = DCERPCTarget.from_connection_string(constring, smb_connection = connection, timeout = _connect_timeout)
 			dcerpc_auth = DCERPCAuth.from_smb_gssapi(connection.gssapi)
 			rpc_connection = DCERPC5Connection(dcerpc_auth, target)
 

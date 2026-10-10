@@ -486,19 +486,57 @@ _CONNECTION_MARKERS = (
 )
 
 
+def _describe_exception(exc: Exception) -> str:
+    """Return a non-empty, human-readable description of *exc*.
+
+    Many aiosmb / asyncio errors carry their meaning in the exception TYPE and
+    have an empty ``str()`` (most importantly :class:`TimeoutError`). Falling back
+    to ``repr`` and then the type name guarantees the surfaced message is never
+    blank, so the real cause reaches the operator and ``adscan.debug.log``.
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    rep = repr(exc).strip()
+    # repr of an argument-less exception is e.g. "TimeoutError()"; keep the bare
+    # type name in that case, otherwise surface the richer repr.
+    if rep and rep != f"{type(exc).__name__}()":
+        return rep
+    return type(exc).__name__
+
+
 def _translate_aiosmb_exception(exc: Exception) -> SMBTransportError:
-    """Map an aiosmb / asyauth exception to an ADscan SMB domain exception."""
+    """Map an aiosmb / asyauth exception to an ADscan SMB domain exception.
+
+    Classification is by exception TYPE first, then by the string markers. Some
+    errors (``TimeoutError``, ``ConnectionRefusedError``, …) carry their meaning
+    in the type and have an empty ``str()`` — classifying those by string alone
+    let them fall through to an empty ``SMBConnectionError("")`` that hid the real
+    cause. The returned exception always carries a non-empty message.
+    """
+    # Type-based classification — meaning is in the type, not the message. A
+    # connect timeout is a transport/host-offline failure, NEVER auth (see
+    # auth_error_classification: a connect TimeoutError maps to HOST_OFFLINE).
+    description = _describe_exception(exc)
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionRefusedError)):
+        return SMBConnectionError(description)
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+        return SMBConnectionError(description)
+
     msg = str(exc).lower()
     if any(m.lower() in msg for m in _AUTH_MARKERS):
-        return SMBAuthError(str(exc))
+        return SMBAuthError(description)
     if any(m.lower() in msg for m in _ACCESS_DENIED_MARKERS):
-        return SMBAccessDeniedError(str(exc))
+        return SMBAccessDeniedError(description)
     if any(m.lower() in msg for m in _SIGNING_MARKERS):
-        return SMBSigningRequiredError(str(exc))
+        return SMBSigningRequiredError(description)
     if any(m.lower() in msg for m in _CONNECTION_MARKERS):
-        return SMBConnectionError(str(exc))
+        return SMBConnectionError(description)
+    # Any other OSError with no marker hit is still transport-level.
+    if isinstance(exc, OSError):
+        return SMBConnectionError(description)
     # Fallback: treat as connection error (callers can inspect .args[0] if needed)
-    return SMBConnectionError(str(exc))
+    return SMBConnectionError(description)
 
 
 # ---------------------------------------------------------------------------
@@ -1116,7 +1154,7 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
                             _self_heal_used.add(key)
                             next_config = recovered
                             raise _SelfHealRetrySentinel()
-                    raise _translate_aiosmb_exception(err)
+                    raise _translate_aiosmb_exception(err) from err
                 machine = SMBMachine(connection)
                 async with machine:
                     _emit_smb_success_posture(
@@ -1165,7 +1203,7 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
                     _self_heal_used.add(key)
                     effective_config = recovered
                     continue  # next iteration of the while loop
-            raise _translate_aiosmb_exception(exc)
+            raise _translate_aiosmb_exception(exc) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1385,10 +1423,29 @@ async def download_admin_file_bytes(machine: Any, remote_win_path: str) -> bytes
     The remote file is deleted after a successful read.  Deletion failures are
     logged at debug level and do not raise.
 
+    This is the WRITE-SEAM disclosure point for remote artefacts: every dump
+    file and every saved registry hive is retrieved through here, and this is
+    the only place that knows whether the delete succeeded. So the file is
+    disclosed to the environment-change ledger here and settled as removed or
+    as needing manual cleanup, rather than at each ``dump_*`` entry point where
+    a future backend could forget. The disclosure is shell-less and
+    best-effort (see
+    :mod:`adscan_internal.services.remote_artifact_disclosure`), so the
+    transport keeps its layering: no shell, no domain, no technique name.
+
     Raises:
         SMBConnectionError: if the file cannot be opened or a read chunk fails.
     """
     from aiosmb.commons.interfaces.file import SMBFile
+
+    from adscan_internal.services.remote_artifact_disclosure import (
+        KIND_FILE_WRITTEN,
+        disclose_remote_artifact,
+        host_from_machine,
+        local_windows_path,
+        settle_remote_artifact_manual,
+        settle_remote_artifact_removed,
+    )
 
     # \\Windows\\Temp\\foo.sav  ->  \\ADMIN$\\Temp\\foo.sav
     stripped = remote_win_path.lstrip("\\")
@@ -1402,15 +1459,39 @@ async def download_admin_file_bytes(machine: Any, remote_win_path: str) -> bytes
 
     _, err = await smb_file.open(machine.connection, "r")
     if err is not None:
+        # Nothing is disclosed here on purpose: a file that cannot be opened is
+        # most often a file the technique never produced, and disclosing one
+        # that never existed would be an inaccuracy in the client's record.
         raise SMBConnectionError(f"Cannot open remote file {admin_path}: {err}")
 
+    # The open proves the file exists on the target, so this is the earliest
+    # honest point to disclose it, and it is before the delete so a session that
+    # dies in between still leaves a record (the ledger's finalize() then
+    # reports it as manual cleanup rather than losing it).
+    artifact_host = host_from_machine(machine)
+    disclosure_id = disclose_remote_artifact(
+        remote_win_path, kind=KIND_FILE_WRITTEN, host=artifact_host
+    )
+
     buf = bytearray()
-    async for chunk, err in smb_file.read_chunked():
-        if err is not None:
-            raise SMBConnectionError(f"Read error on {admin_path}: {err}")
-        if not chunk:
-            break
-        buf.extend(chunk)
+    try:
+        async for chunk, err in smb_file.read_chunked():
+            if err is not None:
+                raise SMBConnectionError(f"Read error on {admin_path}: {err}")
+            if not chunk:
+                break
+            buf.extend(chunk)
+    except BaseException as exc:
+        # The read failed, so the delete below never runs: the file is still on
+        # the target and the client has to be told, with the path.
+        settle_remote_artifact_manual(
+            disclosure_id,
+            remote_path=remote_win_path,
+            host=artifact_host,
+            error=f"Read failed before cleanup: {exc}",
+            attempted=False,
+        )
+        raise
 
     try:
         await smb_file.close()
@@ -1427,18 +1508,32 @@ async def download_admin_file_bytes(machine: Any, remote_win_path: str) -> bytes
             from adscan_core.rich_output import print_warning as _pw
             _pw(
                 f"Remote file not deleted: {admin_path}\n"
-                f"  Remove it manually: del {remote_win_path}"
+                f"  Remove it manually: del {local_windows_path(remote_win_path)}"
             )
             print_info_debug(f"[smb-transport] del_file error: {derr}")
+            settle_remote_artifact_manual(
+                disclosure_id,
+                remote_path=remote_win_path,
+                host=artifact_host,
+                error=f"Delete failed: {derr}",
+            )
+        else:
+            settle_remote_artifact_removed(disclosure_id)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         from adscan_core.rich_output import print_warning as _pw
         _pw(
             f"Remote file not deleted (exception): {admin_path}\n"
-            f"  Remove it manually: del {remote_win_path}"
+            f"  Remove it manually: del {local_windows_path(remote_win_path)}"
         )
         print_info_debug(f"[smb-transport] delete raised (ignored): {exc}")
+        settle_remote_artifact_manual(
+            disclosure_id,
+            remote_path=remote_win_path,
+            host=artifact_host,
+            error=f"Delete raised: {exc}",
+        )
 
     return bytes(buf)
 

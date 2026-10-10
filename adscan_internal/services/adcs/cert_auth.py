@@ -60,6 +60,12 @@ class CertAuthResult:
         nt_hash: NT hash recovered via UnPAC-the-hash (if available).
         principal: The authenticated principal (``user@domain``).
         error: Error message if ``success`` is False.
+        certificate_binding_refused: True when the KDC refused the certificate
+            because the domain controller enforces strong certificate binding
+            (KB5014754) — Kerberos error 66 (``KDC_ERR_CERTIFICATE_MISMATCH``,
+            RFC 4556). This is NOT an ADscan fault: it is the ESC9/ESC10 implicit-
+            mapping mitigation working, so a caller surfaces it as a hardened
+            positive control, never a compromise claim and never a crash.
     """
 
     success: bool
@@ -67,6 +73,7 @@ class CertAuthResult:
     nt_hash: Optional[str] = None
     principal: Optional[str] = None
     error: Optional[str] = None
+    certificate_binding_refused: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +82,18 @@ class CertAuthResult:
 
 
 def _render_pkinit_preflight(
-    config: "CertAuthConfig", display_upn: str, cert
+    config: "CertAuthConfig", cert_upn: Optional[str], cert
 ) -> None:
-    """Pre-flight panel for the PKINIT step."""
+    """Pre-flight panel for the PKINIT step.
+
+    ``cert_upn`` is the SAN UPN actually present in the certificate, or ``None``
+    when it carries none. The two cases are rendered DIFFERENTLY on purpose: a
+    certificate enrolled from the ``Machine`` template for an ESC14 binding has no
+    SAN UPN at all, and the identity comes from the target's
+    ``altSecurityIdentities`` mapping. Labelling the intended impersonation target
+    as the certificate's own SAN UPN made the panel assert a field that was not
+    there, which is how a wrong root cause gets diagnosed from a log later.
+    """
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -89,7 +105,20 @@ def _render_pkinit_preflight(
     grid.add_row("Target KDC", mark_sensitive(config.kdc_ip, "ip"))
     grid.add_row("Realm", mark_sensitive(config.domain, "domain"))
     grid.add_row("Certificate", mark_sensitive(str(config.pfx_path), "path"))
-    grid.add_row("Cert SAN UPN", f"[bold red]{mark_sensitive(display_upn, 'user')}[/]")
+    if cert_upn:
+        grid.add_row(
+            "Cert SAN UPN", f"[bold red]{mark_sensitive(cert_upn, 'user')}[/]"
+        )
+    else:
+        grid.add_row("Cert SAN UPN", "[dim]none (identity from directory mapping)[/]")
+        intended = (
+            f"{config.username}@{config.domain}"
+            if config.username
+            else "(from certificate subject)"
+        )
+        grid.add_row(
+            "Requesting as", f"[bold red]{mark_sensitive(intended, 'user')}[/]"
+        )
     if cert is not None:
         try:
             grid.add_row("Cert serial", f"[cyan]{cert.serial_number:X}[/]")
@@ -238,13 +267,7 @@ async def _do_authenticate_with_cert(
     except Exception:
         pass
 
-    display_upn = cert_upn or (
-        f"{config.username}@{config.domain}"
-        if config.username
-        else "(from certificate)"
-    )
-
-    _render_pkinit_preflight(config, display_upn, cert)
+    _render_pkinit_preflight(config, cert_upn, cert)
 
     print_info_verbose("  ▸ Loading certificate credential...")
     cred = KerberosCredential.from_pfx(
@@ -312,6 +335,32 @@ async def authenticate_with_cert_native(
     try:
         return await _do_authenticate_with_cert(config, output_dir)
     except Exception as exc:
+        from adscan_internal.services.auth_error_classification import (
+            is_certificate_binding_refusal,
+        )
+
+        # The DC enforced strong certificate binding (KB5014754) and refused the
+        # certificate (Kerberos error 66 = KDC_ERR_CERTIFICATE_MISMATCH, RFC 4556,
+        # which kerbad mis-decodes as the RFC-4120 "user-to-user authorization is
+        # required"). This is the ESC9/ESC10 implicit-mapping mitigation working —
+        # an EXPECTED hardened control, not an ADscan fault. Render it honestly:
+        # no alarming error line, no traceback noise, and flag it so the caller
+        # reports a positive control instead of a compromise claim.
+        if is_certificate_binding_refusal(exc, pkinit_context=True):
+            reason = (
+                "the domain controller enforces strong certificate binding "
+                "(KB5014754): the certificate carries no SID and the implicit or "
+                "weak mapping is refused"
+            )
+            print_info_verbose(
+                "  ▸ PKINIT refused by strong certificate binding — the DC rejects "
+                "the certificate mapping (hardened control, not exploitable)."
+            )
+            return CertAuthResult(
+                success=False,
+                error=reason,
+                certificate_binding_refused=True,
+            )
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_error(f"Certificate authentication (PKINIT) failed: {exc}")

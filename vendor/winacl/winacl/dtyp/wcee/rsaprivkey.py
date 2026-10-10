@@ -2,7 +2,6 @@ import io
 import math
 
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
 
 # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/5cf2e6b9-3195-4f85-bc18-05b50e6d4e11
 class RSAPrivateKeyBlob:
@@ -50,11 +49,13 @@ class RSAPrivateKeyBlob:
 	def get_key(self):
 		public_numbers = rsa.RSAPublicNumbers(self.pubexp, self.modulus)
 		numbers = rsa.RSAPrivateNumbers(self.p, self.q, self.d, self.dp, self.dq, self.iq, public_numbers)
-		return default_backend().load_rsa_private_numbers(numbers, unsafe_skip_rsa_key_validation=False)
+		# cryptography >= 42 dropped the old Backend-based key-loading method; the
+		# numbers object builds the key itself now, with no backend argument.
+		return numbers.private_key(unsafe_skip_rsa_key_validation=False)
 
 	def get_pubkey(self):
 		public_numbers = rsa.RSAPublicNumbers(self.pubexp, self.modulus)
-		return default_backend().load_rsa_public_numbers(public_numbers)
+		return public_numbers.public_key()
 
 	def __str__(self):
 		t = ''
@@ -113,11 +114,13 @@ class BCRYPTRSAKeyBlob:
 				n=self.modulus
 			)
 		)
-		return default_backend().load_rsa_private_numbers(numbers, unsafe_skip_rsa_key_validation=False)
+		# cryptography >= 42 dropped the old Backend-based key-loading method; the
+		# numbers object builds the key itself now, with no backend argument.
+		return numbers.private_key(unsafe_skip_rsa_key_validation=False)
 
 	def get_pubkey(self):
 		public_numbers = rsa.RSAPublicNumbers(self.pubexp, self.modulus)
-		return default_backend().load_rsa_public_numbers(public_numbers)
+		return public_numbers.public_key()
 
 	def __str__(self):
 		t = ''

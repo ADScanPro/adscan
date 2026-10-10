@@ -55,7 +55,11 @@ from adscan_core.rich_output import print_exception
 # attack-path semantics, which is modularized in the content layer, not by
 # collapsing them into one key.
 _FRAMEWORK_KEY_MAP: dict[str, str] = {
-    "ENS Alto — Spain / CCN-CERT (recommended)": "ens",
+    # No category in the label: the ENS category belongs to the SYSTEM (RD
+    # 311/2022 art. 40.1), is derived from the client's own declared dimension
+    # levels, and is resolved per workspace by the declared-scope machinery in
+    # ``adscan_core.reporting.ens_applicability``.
+    "ENS — Spain / CCN-CERT (recommended)": "ens",
     "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
     "ISO 27001:2022 — International ISMS standard": "iso27001",
     "DORA — EU 2022/2554 (financial sector)": "dora",
@@ -194,6 +198,9 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "clear_creds_and_auths": "exempt",
     "clear_poisoning": "exempt",
     "cp": "exempt",
+    # Declares the assessed system's ENS scope into the workspace; it reads no
+    # directory, so it stays usable on a finished workspace like ``writeup``.
+    "compliance_scope": "exempt",
     "cracking": "requires_initialized_domain",
     "cracking_history": "exempt",
     "creds": "exempt",

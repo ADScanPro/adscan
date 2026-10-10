@@ -78,6 +78,8 @@ _EDGE_TRANSLATIONS: Final[dict[str, str]] = {
     "ForgedTicketFor": "Forged Kerberos ticket on behalf of the object",
     "ReadGMSAPasswordOf": "gMSA password successfully retrieved",
     "OwnsCertificateFor": "Authentication certificate obtained for the object",
+    # Certighost (CVE-2026-54121) — CA chase-fallback DC impersonation
+    "certighost": "CA issues a domain-controller certificate to an impostor",
 }
 
 

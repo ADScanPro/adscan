@@ -3477,6 +3477,84 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Session-lifecycle metadata sanitization
+# ─────────────────────────────────────────────────────────────────────
+#
+# Lifecycle ``scan_metadata`` (scan_started / scan_finished /
+# session_finished, emitted by ``SessionStreamer.emit_lifecycle``) is a
+# STRUCTURED JSON side-channel on every chunk. Unlike the recording HTML
+# buffer, it NEVER passes through ``_sanitize_rich_output`` / the
+# export-time sanitizer, so any real-environment identifier placed in it
+# (the target ``domain``, a DC hostname / IP) would leave the operator's
+# machine in cleartext and reach sessions.adscanpro.com (stored + the
+# lifecycle Telegram notification). This pseudonymizes the identifying
+# fields at the SAME SSOT the recording buffer uses
+# (``_pseudonymize_value`` -> deterministic keyed-HMAC), so the token in
+# the metadata MATCHES the one in the recording / viewer (still
+# correlatable per-environment, never the raw name). Non-identifying
+# fields (auth_mode, findings/path counts, compromise_status, duration,
+# command_type, environment) pass through unchanged.
+#
+# Keys are matched case-insensitively against ``_LIFECYCLE_IDENTIFIER_KEYS``
+# (the ONE place a new identifier key is registered — fix-the-class), and
+# the walk recurses into nested dicts / lists (covers ``_batched_events``).
+
+# Marker the CLI stamps on sanitized lifecycle metadata so the INGEST SERVER
+# can tell a pseudonymized payload from a raw one. The server cannot infer it
+# (a pseudonymized domain and a real one are both just strings), so without
+# this flag it must fail closed and redact. Mirrored as PII_SANITIZED_FLAG in
+# the viewer's lib/ingestPipeline.ts — keep the two literals in sync.
+LIFECYCLE_PII_SANITIZED_KEY = "pii_sanitized"
+
+_LIFECYCLE_IDENTIFIER_KEYS: dict[str, str] = {
+    "domain": "domain",
+    "target_domain": "domain",
+    "auth_domain": "domain",
+    "realm": "domain",
+    "hostname": "hostname",
+    "host": "hostname",
+    "dc_fqdn": "hostname",
+    "dc_hostname": "hostname",
+    "pdc": "hostname",
+    "target": "hostname",
+    "dc_ip": "ip",
+    "ip": "ip",
+    "user": "user",
+    "username": "user",
+}
+
+
+def sanitize_lifecycle_metadata(metadata: Any) -> Any:
+    """Pseudonymize identifier fields in session-lifecycle ``scan_metadata``.
+
+    Returns a NEW structure; the input is not mutated. Identifier keys
+    (see ``_LIFECYCLE_IDENTIFIER_KEYS``) with a non-empty string value are
+    replaced by their deterministic pseudonym; everything else — including
+    numbers, booleans, and non-identifier strings — is passed through. The
+    walk recurses into nested dicts and lists so batched / final metadata
+    is covered by the single call site in the streamer.
+    """
+    if isinstance(metadata, dict):
+        out: dict[Any, Any] = {}
+        for key, value in metadata.items():
+            dtype = (
+                _LIFECYCLE_IDENTIFIER_KEYS.get(key.lower())
+                if isinstance(key, str)
+                else None
+            )
+            if dtype and isinstance(value, str) and value:
+                out[key] = _pseudonymize_value(value, dtype)
+            elif isinstance(value, (dict, list)):
+                out[key] = sanitize_lifecycle_metadata(value)
+            else:
+                out[key] = value
+        return out
+    if isinstance(metadata, list):
+        return [sanitize_lifecycle_metadata(item) for item in metadata]
+    return metadata
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Sanitizer trace (development-only diagnostic)
 # ─────────────────────────────────────────────────────────────────────
 #

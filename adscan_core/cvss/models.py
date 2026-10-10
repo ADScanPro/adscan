@@ -102,6 +102,23 @@ class CvssContext:
             EPA was demonstrated). Distinct from full exploitation_confirmed:
             relay_confirmed says "the chain endpoint exists and is reachable",
             exploitation_confirmed says "the chain ran end-to-end".
+
+            NO PRODUCER SETS THIS TODAY. ``extract_context_from_details`` does
+            not pass it when it builds the context, so every elevation rule
+            keyed on ``CONDITION_RELAY_CONFIRMED`` is unreachable and a
+            coercion primitive against a DC grades on ``has_dc_targets``
+            instead. That is the conservative direction, so it understates
+            rather than overclaims, and the field is kept because the
+            distinction it draws is the right one. What it needs is the
+            cross-finding signal "a vulnerable relay target exists in this
+            workspace" (an ESC8 or an unsigned-LDAP finding elsewhere in the
+            same scan), which no finding's own ``details`` carries: the
+            extractor sees one finding at a time. Until a producer stamps it,
+            the client-facing method section does NOT publish this condition,
+            because an input with no effect is the one thing in a published
+            method an auditor can falsify. Reachability is locked by
+            ``tests/unit/core/test_severity_methodology_annex.py``; wire the
+            producer and that test tells you to publish the bullet again.
     """
 
     has_tier_zero_targets: bool = False

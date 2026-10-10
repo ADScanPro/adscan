@@ -360,6 +360,59 @@ class SMBFile:
 		except Exception as e:
 			return False, e
 
+	async def open_rpc_pipe(self, connection:SMBConnection):
+		"""Open a DCE/RPC named pipe (e.g. \\pipe\\winreg) for the transport.
+
+		Matches impacket's smbconnection.openFile() DEFAULTS byte-for-byte on
+		the SMB2 CREATE request, instead of the generic write-mode open()'s
+		GENERIC_READ|GENERIC_WRITE / FILE_SHARE_READ|FILE_SHARE_WRITE /
+		FILE_SYNCHRONOUS_IO_NONALERT / FILE_OPEN_IF combination (which
+		DCERPCSMBTransport.connect() previously used via open(mode='wp') --
+		correct for a generic read/write FILE, but never audited against what
+		impacket's own named-pipe client actually requests).
+
+		Four fields differ from the generic open():
+		  desiredAccess:      FILE_READ_DATA|FILE_WRITE_DATA   (not GENERIC_*)
+		  shareMode:          FILE_SHARE_READ only             (not +WRITE)
+		  createOptions:      FILE_NON_DIRECTORY_FILE only     (no SYNCHRONOUS_IO_NONALERT)
+		  createDisposition:  FILE_OPEN                        (not FILE_OPEN_IF)
+
+		Why this matters (live finding 2026-10-07, a CrowdStrike-protected
+		host): this SMB2 CREATE happens ONCE, before any DCE/RPC traffic
+		flows over the pipe, and governs the access check applied to every
+		subsequent WRITE/READ on it. Requesting a broader, less standard
+		access/share/option combination than impacket's own named-pipe client
+		is exactly the class of "raw SMB2 framing" divergence
+		BACKLOG.md's PIPE_BROKEN entry flagged as the remaining suspect once
+		the DCE/RPC-payload-level comparison came up byte-identical.
+		"""
+		try:
+			self.__connection = connection
+			self.is_pipe = True
+			self.size = 0
+			self.mode = 'rwp'
+
+			if not self.tree_id:
+				tree_entry, err = await connection.tree_connect(self.share_path)
+				if err is not None:
+					raise err
+				self.tree_id = tree_entry.tree_id
+
+			desired_access = FileAccessMask.FILE_READ_DATA | FileAccessMask.FILE_WRITE_DATA
+			share_mode = ShareAccess.FILE_SHARE_READ
+			create_options = CreateOptions.FILE_NON_DIRECTORY_FILE
+			create_disposition = CreateDisposition.FILE_OPEN
+			file_attrs = FileAttributes.FILE_ATTRIBUTE_NORMAL
+
+			self.file_id, smb_reply, err = await connection.create(self.tree_id, self.fullpath, desired_access, share_mode, create_options, create_disposition, file_attrs, return_reply = True)
+			if err is not None:
+				raise err
+			self.size = smb_reply.EndofFile
+
+			return True, None
+		except Exception as e:
+			return False, e
+
 	async def download(self, connection:SMBConnection ,local_path:str, share_mode = ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE):
 		"""Downloads the file to the local path. File must not be open."""
 		try:

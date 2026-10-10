@@ -586,7 +586,7 @@ def _stage_demo_kit(workspace_dir: Path) -> Path:
     Reproduces the layout of a real engagement:
 
     - ``<workspace>/report.pdf`` — the full technical report
-      (output of ``adscan generate_report``).
+      (output of the ``generate_report`` REPL command).
     - ``<workspace>/deliverables/<kit>.zip`` — the client kit
       (output of ``adscan deliver``).
     - ``<workspace>/deliverables/`` — the deliverable PDFs and MITRE

@@ -12,7 +12,7 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, MutableMapping
 
 if TYPE_CHECKING:
     from adscan_internal.services.credentials import CredentialMetadata
@@ -41,6 +41,7 @@ from adscan_internal import (
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_core.outbound_links import cta_url
 from adscan_core.rich_output import confirm_ask
+from adscan_core.sensitive import strip_sensitive_markers
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
@@ -66,12 +67,14 @@ from adscan_internal.services.secret_recovery_service import (
     _read_full_file_text,
     decrypt_cpassword,
     decrypt_powershell_securestring,  # noqa: F401 — re-exported for tests
+    extract_adjacent_principal,
     extract_cpassword_entries,
     extract_securestring_key_material,  # noqa: F401 — re-exported for tests
     find_powershell_securestring_blobs,  # noqa: F401 — re-exported for tests
     looks_like_cpassword_value,
     looks_like_dpapi_protected_securestring,
     looks_like_securestring_blob,
+    normalize_principal_candidate,
     recover_cpassword_secrets,  # noqa: F401 — source-agnostic SSOT orchestrator
     recover_securestring_secrets,
 )
@@ -647,8 +650,13 @@ def clear_creds(shell: Any, domain: str) -> None:
     if "credentials" in domain_data:
         usernames = list(domain_data["credentials"].keys())
         for username in usernames:
-            store_service.delete_domain_credential(
-                domains_data=shell.domains_data, domain=domain, username=username
+            # Operator-directed removal of the whole entry, sidecars included,
+            # so the store never diverges from its own metadata.
+            store_service.purge_domain_credential_entry(
+                domains_data=shell.domains_data,
+                domain=domain,
+                username=username,
+                reason="operator_clear",
             )
 
     # Clear local credentials (direct manipulation still needed as there's no bulk delete method)
@@ -834,7 +842,9 @@ def select_cred(shell: Any, domain: str) -> None:
     # On failure the disposition (keep valid-but-unusable / confirm-then-delete a
     # genuinely invalid one) is centralised in _purge_failed_domain_credential.
     if not shell.verify_domain_credentials(domain, selected_user, cred_value):
-        _purge_failed_domain_credential(shell, domain=domain, user=selected_user)
+        _purge_failed_domain_credential(
+            shell, domain=domain, user=selected_user, secret=cred_value
+        )
         return
 
     marked_domain = mark_sensitive(domain, "domain")
@@ -911,10 +921,11 @@ def delete_cred(shell: Any, domain: str) -> None:
     missing_users: list[str] = []
 
     for selected_user in selected_users:
-        credential_deleted = store_service.delete_domain_credential(
+        credential_deleted = store_service.purge_domain_credential_entry(
             domains_data=shell.domains_data,
             domain=domain,
             username=selected_user,
+            reason="operator_delete",
         )
         ticket_deleted = store_service.delete_kerberos_ticket(
             domains_data=shell.domains_data,
@@ -2399,6 +2410,7 @@ def add_credential(
     local_account_rid: str | None = None,
     metadata: "CredentialMetadata | None" = None,
     force_recheck_user_privs: bool = False,
+    offline_crack_source_hash: str | None = None,
 ) -> CredentialVerdict:
     """Add a credential to the workspace.
 
@@ -2411,10 +2423,11 @@ def add_credential(
     Args:
         shell: The PentestShell instance with domains_data and related methods.
         domain: The domain name.
-        user: The username. Accepts either a bare sAMAccountName or a UPN
-            (``user@domain``) — a UPN whose domain matches ``domain`` is
-            normalized to its bare local part before anything else runs (SSOT
-            for every credential-add caller; see the normalization block at
+        user: The username. Accepts a bare sAMAccountName, a UPN
+            (``user@domain``), or a NetBIOS-qualified name (``DOMAIN\\user``)
+            — both qualified forms are normalized to the bare local part
+            before anything else runs (SSOT for every credential-add caller;
+            see the normalization blocks at
             the top of the function body).
         cred: The credential (password or hash).
         host: Optional host for local credentials.
@@ -2493,6 +2506,17 @@ def add_credential(
             already assessed" dedup guard so a user whose privileges just changed
             (for example: an existing account just promoted to Domain Admins) is
             re-enumerated even if it was assessed earlier this session.
+        offline_crack_source_hash: The NT hash ``cred`` was resolved FROM by an
+            offline corpus lookup, when the caller already performed that
+            lookup itself. Batch flows crack once for the whole set before
+            calling here (one lookup for a full DCSync instead of one per
+            account), so by the time this function runs the secret is already a
+            plaintext and the in-function crack cannot observe the transform.
+            Declaring the source hash restores both of its consequences: the
+            plaintext is recorded as a DERIVED ``offline_crack`` acquisition
+            alongside the technique that obtained the hash, and the hash itself
+            is retained as recovered key material. Leave it ``None`` whenever
+            ``cred`` was not produced by an offline transform.
 
     Returns:
         The :class:`CredentialVerdict` for this pair. Callers that report a
@@ -2528,7 +2552,11 @@ def add_credential(
     # HERE, before ``user`` is used for anything (storage keys, lookups, live
     # verification), so every caller benefits without a per-call-site fix.
     if "@" in user:
-        upn_local_part, _, upn_domain = user.partition("@")
+        from adscan_internal.services._principal_normalization import (  # noqa: PLC0415
+            split_upn_qualifier,
+        )
+
+        upn_local_part, upn_domain = split_upn_qualifier(user)
         upn_local_part = upn_local_part.strip()
         upn_domain = upn_domain.strip()
         if upn_local_part:
@@ -2546,6 +2574,50 @@ def add_credential(
                     f"{mark_sensitive(upn_local_part, 'user')} anyway."
                 )
             user = upn_local_part
+
+    # SSOT NetBIOS-qualifier normalization — same funnel, same reasoning as
+    # the UPN block above, for the OTHER domain-qualified form a username can
+    # arrive in: ``DOMAIN\user``. A bare sAMAccountName never legitimately
+    # contains a backslash, so any caller surfacing one is handing us a
+    # NetBIOS-qualified name, not a username. This is exactly what Windows'
+    # own Credential Manager stores for a domain credential (e.g. a DPAPI
+    # dump recovering a Scheduled Task's saved credential returns
+    # "DOMAIN\user" verbatim — see dpapi_native_dump.py), and it flows
+    # straight through here unmodified. Left unstripped, downstream URL
+    # builders that prepend "DOMAIN\" themselves (_build_kerberos_url,
+    # the LDAP/SMB credential factories) double-qualify it into
+    # "DOMAIN\DOMAIN\user", which `str.split("\\")` with maxsplit=1 cannot
+    # parse — a silent-looking "too many values to unpack" deep in kerbad/
+    # badauth with no hint the real cause is an unstripped stored username.
+    # Normalize HERE, before `user` is used for anything, so every caller
+    # (DPAPI, GPP, future callers) benefits without a per-call-site fix.
+    if "\\" in user:
+        from adscan_internal.services._principal_normalization import (  # noqa: PLC0415
+            split_netbios_qualifier,
+        )
+
+        netbios_prefix, bare_user = split_netbios_qualifier(user)
+        netbios_prefix = netbios_prefix.strip()
+        bare_user = bare_user.strip()
+        if bare_user:
+            known_netbios = str(
+                (shell.domains_data.get(domain) or {}).get("netbios") or ""
+            ).strip()
+            if known_netbios and netbios_prefix.lower() != known_netbios.lower():
+                # Only warn when we have a KNOWN NetBIOS name to compare
+                # against (never guess one from the DNS domain and warn on a
+                # guess — that would be a false positive, the same "cache
+                # observations, never cache absences" discipline as posture).
+                print_warning_debug(
+                    "add_credential: NetBIOS domain mismatch — credential "
+                    f"{mark_sensitive(user, 'user')} carries NetBIOS domain "
+                    f"{mark_sensitive(netbios_prefix, 'domain')} but the target "
+                    f"domain {mark_sensitive(domain, 'domain')}'s known NetBIOS "
+                    f"name is {mark_sensitive(known_netbios, 'domain')}. "
+                    f"Normalizing to bare username "
+                    f"{mark_sensitive(bare_user, 'user')} anyway."
+                )
+            user = bare_user
 
     # SSOT provenance seam. ``add_credential`` is the funnel every capture goes
     # through, and when it runs inside an executing attack step the technique
@@ -2687,7 +2759,13 @@ def add_credential(
                     )
                     return CredentialVerdict.UNVERIFIED
                 if _dispose_or_retain_unverified_domain_credential(
-                    shell, domain=domain, user=user, ui_silent=ui_silent
+                    shell,
+                    domain=domain,
+                    user=user,
+                    ui_silent=ui_silent,
+                    secret=cred,
+                    origin=credential_origin or "",
+                    disclosure=_attribute_disclosure_from_source_steps(source_steps),
                 ):
                     return CredentialVerdict.REJECTED
                 credential_verification_skipped = True
@@ -2881,12 +2959,21 @@ def add_credential(
         # ``metadata.secret_kind`` (which describes the hash we discarded) no
         # longer describes what is stored and must not overwrite the kind.
         incoming_secret_superseded = False
+        # The NT hash this principal's stored secret ended up SUPERSEDING, from
+        # whichever of the routes below discarded it. The flat ``{user: secret}``
+        # store holds one string, so a recovered password used to evict the hash
+        # outright — which costs the operator pass-the-hash on that account while
+        # its AES keys are still kept, an asymmetry with no justification. It is
+        # retained as recovered key material at the single write point further
+        # down, never at the three places that discard it.
+        superseded_nt_hash: str | None = None
         if current_cred is not None:
             current_is_hash = shell.is_hash(current_cred)
             if not current_is_hash and is_hash:
                 print_info_verbose(
                     "Current credential is not a hash and new credential is a hash. Keeping existing."
                 )
+                superseded_nt_hash = cred
                 cred = current_cred
                 is_hash = False
                 skip_store_update = True
@@ -2898,6 +2985,16 @@ def add_credential(
                 skip_store_update = True
         store_update_skipped = skip_store_update
         offline_crack_recovered = False
+        declared_source_hash = str(offline_crack_source_hash or "").strip()
+        if declared_source_hash and not is_hash and shell.is_hash(declared_source_hash):
+            # The caller resolved the plaintext itself before calling (batch
+            # flows crack once for the whole set), so the in-function crack
+            # below cannot observe the transform. Honour the declaration: same
+            # two consequences, minus the store-precedence override — the
+            # comparison above already ran against the plaintext, so there is
+            # nothing it could have wrongly skipped.
+            offline_crack_recovered = True
+            superseded_nt_hash = declared_source_hash
         if is_hash and not user.endswith("$") and not skip_hash_cracking:
             pre_crack_cred = cred
             cred, is_hash = handle_hash_cracking(shell, domain, user, cred)
@@ -2908,6 +3005,7 @@ def add_credential(
                 # — otherwise the recovered plaintext is silently discarded.
                 offline_crack_recovered = True
                 skip_store_update = False
+                superseded_nt_hash = pre_crack_cred
 
         # Verify domain credentials before adding them (skip when domain is already pwned)
         if trusted_manual_validation:
@@ -2949,7 +3047,13 @@ def add_credential(
                     )
                     return CredentialVerdict.UNVERIFIED
                 if _dispose_or_retain_unverified_domain_credential(
-                    shell, domain=domain, user=user, ui_silent=ui_silent
+                    shell,
+                    domain=domain,
+                    user=user,
+                    ui_silent=ui_silent,
+                    secret=cred,
+                    origin=credential_origin or "",
+                    disclosure=_attribute_disclosure_from_source_steps(source_steps),
                 ):
                     return CredentialVerdict.REJECTED
                 credential_verification_skipped = True
@@ -2966,6 +3070,7 @@ def add_credential(
                 username=user,
                 credential=cred,
                 is_hash=is_hash,
+                origin=credential_origin or None,
             )
             credential_persisted = True
             # Respect store precedence rules (e.g. keep existing plaintext over new hash).
@@ -2989,6 +3094,22 @@ def add_credential(
                 secret=cred,
                 trust_metadata_secret_kind=not incoming_secret_superseded,
             )
+            if superseded_nt_hash and not shell.is_hash(cred):
+                # Keep the hash the stored plaintext replaced. The workspace
+                # credential store is the operator's own unsanitized working
+                # copy, so the material stays available for pass-the-hash and
+                # for Kerberos RC4; sanitization belongs at the output boundary
+                # (report, platform, telemetry), which is where it happens.
+                from adscan_internal.services.credentials import (  # noqa: PLC0415
+                    set_credential_nt_hash,
+                )
+
+                set_credential_nt_hash(
+                    shell,
+                    domain=domain,
+                    username=user,
+                    nt_hash=superseded_nt_hash,
+                )
             if credential_origin:
                 # Persist provenance into ``credentials_meta`` so the
                 # ``creds show`` Provenance column can attribute the source and
@@ -3461,11 +3582,18 @@ def add_credentials_batch(
         List of persisted candidates ``[(username, resolved_credential), ...]``.
         The credential is a cracked plaintext when batch cracking succeeds.
     """
+    # Filled by the resolver with the accounts whose hash it replaced with a
+    # plaintext, so each one is recorded as the DERIVED offline recovery it is
+    # instead of attributing the cleartext to the technique that only ever
+    # produced the hash.
+    offline_crack_outcome: dict[str, str] = {}
     resolved_credentials = resolve_credential_pairs_for_batch(
         shell,
         credentials=credentials,
+        domain=domain,
         skip_hash_cracking=skip_hash_cracking,
         skip_machine_accounts_cracking=True,
+        offline_crack_outcome=offline_crack_outcome,
     )
     if not resolved_credentials:
         return []
@@ -3491,6 +3619,7 @@ def add_credentials_batch(
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
             metadata=per_user_metadata,
             credential_origin=credential_origin,
+            offline_crack_source_hash=offline_crack_outcome.get(username.lower()),
         )
 
     return resolved_credentials
@@ -3500,17 +3629,34 @@ def resolve_credential_pairs_for_batch(
     shell: Any,
     *,
     credentials: list[tuple[str, str]],
+    domain: str = "",
     skip_hash_cracking: bool = False,
     skip_machine_accounts_cracking: bool = True,
+    offline_crack_outcome: dict[str, str] | None = None,
 ) -> list[tuple[str, str]]:
     """Normalize and optionally crack credential pairs for batch workflows.
 
     Args:
         shell: The active shell instance exposing ``is_hash`` and cracking helpers.
         credentials: Candidate ``[(username, credential), ...]`` pairs.
+        domain: The domain these credentials belong to, forwarded so the local
+            wordlist attack attributes its recoveries (and its coverage
+            declaration) to the right realm rather than to the authenticating
+            one. Empty falls back to the session's active domain.
         skip_hash_cracking: When True, do not attempt weakpass batch cracking.
         skip_machine_accounts_cracking: When True, skip cracking for usernames
             ending with ``$``.
+        offline_crack_outcome: Optional dict the resolver FILLS with
+            ``{lower(username): superseded_nt_hash}`` for every pair whose hash
+            it replaced with a plaintext. This substitution is the only thing
+            downstream can no longer see for itself: the resolved pairs carry a
+            plaintext, so the caller's own ``add_credential`` finds nothing left
+            to crack and cannot tell an offline recovery from a password that
+            arrived as one. Reported as an out-parameter rather than a richer
+            return value so the function's shape stays the one every existing
+            caller (and the tests that substitute it) relies on, and so the
+            outcome is available without cracking a second time. A caller that
+            passes nothing is unaffected.
 
     Returns:
         Resolved ``[(username, credential), ...]`` pairs. Hash entries are replaced
@@ -3546,7 +3692,19 @@ def resolve_credential_pairs_for_batch(
             if _is_hash_value(cred)
             and not (skip_machine_accounts_cracking and str(user).endswith("$"))
         ]
-        cracked_by_hash = handle_hash_cracking_batch(shell, hash_candidates)
+        # Hand the seam the account each hash belongs to. The lookup does not
+        # need it (it keys on the hash), but the local wordlist attack does: a
+        # recovery it makes has to be credited to a real principal in the
+        # harvest review and the deliverable, not to an opaque hash.
+        principals = {
+            cred.lower(): user
+            for user, cred in prepared
+            if _is_hash_value(cred)
+            and not (skip_machine_accounts_cracking and str(user).endswith("$"))
+        }
+        cracked_by_hash = handle_hash_cracking_batch(
+            shell, hash_candidates, domain=domain, principals=principals
+        )
 
     resolved_credentials: list[tuple[str, str]] = []
     for username, credential in prepared:
@@ -3556,6 +3714,8 @@ def resolve_credential_pairs_for_batch(
                 cracked_password = cracked_by_hash.get(credential.lower())
                 if cracked_password:
                     resolved_credential = cracked_password
+                    if offline_crack_outcome is not None:
+                        offline_crack_outcome[username.lower()] = credential.lower()
         resolved_credentials.append((username, resolved_credential))
     return resolved_credentials
 
@@ -3619,6 +3779,7 @@ def add_local_credentials_batch(
     resolved_pairs = resolve_credential_pairs_for_batch(
         shell,
         credentials=[(user, credential) for _, _, user, credential in prepared_locals],
+        domain=domain,
         skip_hash_cracking=skip_hash_cracking,
         skip_machine_accounts_cracking=True,
     )
@@ -3691,7 +3852,14 @@ def _domain_credential_verification_was_skipped(shell: Any) -> bool:
 
 
 def _dispose_or_retain_unverified_domain_credential(
-    shell: Any, *, domain: str, user: str, ui_silent: bool
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    ui_silent: bool,
+    secret: Any = None,
+    origin: str = "",
+    disclosure: Any = None,
 ) -> bool:
     """Resolve a non-successful domain verification into abort-or-continue.
 
@@ -3708,6 +3876,13 @@ def _dispose_or_retain_unverified_domain_credential(
         domain: Domain the credential belongs to.
         user: Username the credential belongs to.
         ui_silent: Suppress operator-facing panels (internal/sub-call flows).
+        secret: The secret that was actually rejected. Carried through so the
+            disposal is scoped to THAT secret and can never remove a different
+            one the account also has stored.
+        origin: Origin slug the rejected secret arrived with, recorded with the
+            demotion so a consumer can tell a scraped candidate apart.
+        disclosure: Where the rejected secret was read from, carried through to
+            the demotion record.
 
     Returns:
         ``True`` when the caller must abort, ``False`` when it must continue and
@@ -3715,7 +3890,13 @@ def _dispose_or_retain_unverified_domain_credential(
     """
     if not _domain_credential_verification_was_skipped(shell):
         _purge_failed_domain_credential(
-            shell, domain=domain, user=user, ui_silent=ui_silent
+            shell,
+            domain=domain,
+            user=user,
+            ui_silent=ui_silent,
+            secret=secret,
+            origin=origin,
+            disclosure=disclosure,
         )
         return True
 
@@ -3778,7 +3959,14 @@ def _domain_credential_failure_was_unclassified(shell: Any) -> bool:
 
 
 def _purge_failed_domain_credential(
-    shell: Any, *, domain: str, user: str, ui_silent: bool = False
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    ui_silent: bool = False,
+    secret: Any = None,
+    origin: str = "",
+    disclosure: Any = None,
 ) -> bool:
     """Dispose of a credential that FAILED verification — SSOT for the policy.
 
@@ -3789,18 +3977,42 @@ def _purge_failed_domain_credential(
       PASSWORD_EXPIRED) or whose failure was transient/unclassified is NEVER
       purged — only credentials the DC POSITIVELY rejected are deletion
       candidates (gated by :func:`_should_delete_failed_domain_credential`).
-    * Even then the delete is opt-IN for the operator: the prompt's default is
-      NO, so an unattended run — where the answer is auto-resolved — never
-      destroys stored state on its own. ``ui_silent`` (internal sub-calls such
-      as ``add_credential`` re-verifying a secret the operator just supplied)
-      does not prompt and purges only that same named rejection, because
+    * The removal is SCOPED to the secret that was rejected, as a
+      compare-and-delete through the store, and never touches material whose
+      provenance ADscan proved. A rejection is evidence about one string, so a
+      disposal that took the account's whole slot destroyed a replicated hash
+      and its Kerberos keys when an unrelated scraped password was rejected.
+    * The rejected string is DEMOTED, not discarded: a password that is wrong
+      for the account it was found on is precisely what a spray tests against
+      every other account, so it is recorded as a spray candidate for the
+      domain.
+    * The delete is opt-IN for the operator: the prompt's default is NO, so an
+      unattended run — where the answer is auto-resolved — never destroys
+      stored state on its own. ``ui_silent`` (internal sub-calls such as
+      ``add_credential`` re-verifying a secret the operator just supplied) does
+      not prompt and disposes only of that same named rejection, because
       keeping a secret the DC proved wrong just feeds the next bad-password
       attempt into the domain's lockout counter.
+
+    Args:
+        shell: Shell carrying the verification outcome and credential store.
+        domain: Domain the credential belongs to.
+        user: Principal the credential belongs to.
+        ui_silent: Suppress operator-facing panels and the prompt.
+        secret: The secret that was rejected. When omitted, the currently
+            stored secret for the principal is used, which keeps older callers
+            working while still going through the compare-and-delete.
+        origin: Origin slug the rejected secret arrived with.
+        disclosure: Where the rejected secret was read from, as an
+            ``AttributeDisclosureSource``, recorded with the demotion so a
+            later hit on another account is attributable to the leaking object
+            and attribute.
 
     Returns ``True`` iff the credential was deleted.
     """
     from adscan_internal.services.credential_store_service import (
         CredentialStoreService,
+        DomainCredentialDeleteOutcome,
     )
 
     marked_user = mark_sensitive(user, "user")
@@ -3838,37 +4050,100 @@ def _purge_failed_domain_credential(
                 )
         return False
 
-    # Reaching here means the server NAMED the rejection, so the secret provably
-    # does not work: keeping it only feeds another bad-password attempt into the
-    # domain's lockout counter. Silent internal sub-calls purge it; the operator
-    # is asked, and the question defaults to NO so an unattended run — where the
-    # answer is auto-resolved — never destroys stored state on its own.
+    # Reaching here means the server NAMED the rejection, so THAT secret provably
+    # does not work for THAT principal: retrying it only feeds another
+    # bad-password attempt into the domain's lockout counter. What follows is
+    # scoped to that one secret, and the string itself is demoted rather than
+    # lost.
+    store = CredentialStoreService()
+    rejected_secret = secret
+    if rejected_secret is None:
+        rejected_secret = _stored_domain_credential(shell, domain=domain, user=user)
+    preview = store.preview_domain_credential_delete(
+        domains_data=shell.domains_data,
+        domain=domain,
+        username=user,
+        secret=rejected_secret,
+    )
+    secret_label = "NT hash" if preview.stored_secret_kind == "nt_hash" else "password"
+
+    demoted = _demote_rejected_secret_to_spray_candidate(
+        shell,
+        domain=domain,
+        user=user,
+        secret=rejected_secret,
+        origin=origin,
+        disclosure=disclosure,
+    )
+
+    if preview.outcome is DomainCredentialDeleteOutcome.KEPT_DIFFERENT_SECRET:
+        # The account holds a DIFFERENT secret than the one just rejected. The
+        # rejection says nothing about it, so it stays and nothing is prompted.
+        message = (
+            f"The rejected secret for '{marked_user}' in domain {marked_domain} is "
+            f"not what the store holds for that account, so the stored "
+            f"{secret_label} was kept."
+        )
+        print_info_verbose(message) if ui_silent else print_info(message)
+        return False
+
+    if preview.outcome is DomainCredentialDeleteOutcome.KEPT_PROVEN_PROVENANCE:
+        # Recovered material: replicated, dumped, read from a directory
+        # attribute, or validated by an authenticating act. A rejection now is
+        # far more likely to be a rotation, a lockout or a policy than proof
+        # that the directory's own key material is wrong, and keeping it costs
+        # nothing once the secret is not retried for this account.
+        message = (
+            f"The stored {secret_label} for '{marked_user}' in domain "
+            f"{marked_domain} was recovered by ADscan, so it was kept. It is no "
+            "longer retried for this account."
+        )
+        print_info_verbose(message) if ui_silent else print_warning(message)
+        return False
+
+    if preview.outcome is DomainCredentialDeleteOutcome.ABSENT:
+        print_info_verbose(
+            f"No stored credential to dispose of for '{marked_user}' in domain "
+            f"{marked_domain}."
+        )
+        return False
+
     if not ui_silent:
         print_error(
-            f"The domain controller rejected the credential for user "
+            f"The domain controller rejected the {secret_label} for user "
             f"'[bold]{marked_user}[/bold]' in domain [bold]{marked_domain}[/bold]."
         )
+        if demoted:
+            print_info(
+                "Kept as a spray candidate for this domain: it can still be valid "
+                "for another account."
+            )
         if not confirm_ask(
-            f"Delete the rejected stored credential for '{user}'?", default=False
+            f"Remove this {secret_label} as the stored credential for '{user}'? "
+            "Any other material held for the account is kept",
+            default=False,
         ):
             print_info(
-                f"Kept the credential for '{user}' in domain {domain} (not deleted)."
+                f"Kept the {secret_label} for '{user}' in domain {domain}."
             )
             return False
 
-    deleted = CredentialStoreService().delete_domain_credential(
-        domains_data=shell.domains_data, domain=domain, username=user
+    result = store.delete_domain_credential(
+        domains_data=shell.domains_data,
+        domain=domain,
+        username=user,
+        secret=rejected_secret,
     )
-    if deleted:
+    if result.deleted:
         if ui_silent:
             print_info_verbose(
-                f"[ui_silent] The rejected credential for '{marked_user}' in domain "
-                f"{marked_domain} has been deleted."
+                f"[ui_silent] Removed the rejected {secret_label} for "
+                f"'{marked_user}' in domain {marked_domain}."
             )
         else:
             print_warning(
-                f"The rejected credential for '[bold]{marked_user}[/bold]' in "
-                f"domain [bold]{marked_domain}[/bold] has been deleted."
+                f"Removed the rejected {secret_label} for "
+                f"'[bold]{marked_user}[/bold]' in domain [bold]{marked_domain}[/bold]."
             )
         if getattr(shell, "current_workspace_dir", None) and hasattr(
             shell, "save_workspace_data"
@@ -3877,7 +4152,136 @@ def _purge_failed_domain_credential(
                 shell.save_workspace_data()
             except Exception:  # noqa: BLE001
                 pass
-    return deleted
+    return result.deleted
+
+
+def _stored_domain_credential(shell: Any, *, domain: str, user: str) -> str:
+    """Return the secret currently stored for ``user``, or ``""``.
+
+    Used only as the fallback for a caller that did not carry the rejected
+    secret through: the disposal still goes through the compare-and-delete, it
+    just compares against what is stored.
+    """
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, MutableMapping):
+        return ""
+    domain_data = domains_data.get(domain) or {}
+    if not isinstance(domain_data, MutableMapping):
+        return ""
+    creds = domain_data.get("credentials") or {}
+    if not isinstance(creds, dict):
+        return ""
+    wanted = str(user or "").strip().casefold()
+    for key, value in creds.items():
+        if str(key or "").strip().casefold() == wanted:
+            return str(value or "")
+    return ""
+
+
+def _attribute_disclosure_from_source_steps(source_steps: Any) -> Any:
+    """Derive where a scraped secret was read from, out of its provenance steps.
+
+    The producers that scrape a secret out of a directory attribute already
+    build a ``CredentialSourceStep`` carrying a free-form ``notes`` dict, and
+    that dict already names the object whose attribute held the value. Reading
+    the source from there means a producer completes the record by adding keys
+    to a dict it already owns, with no new argument through this module and no
+    change to when a provenance edge is recorded.
+
+    Recognised note keys, all optional: ``source_username`` (the leaking
+    object, already written today), ``source_attribute``, ``source_rule``,
+    ``finding_key``, ``evidence_path``. An unrecognised or absent key leaves
+    its field empty, which is the honest result.
+
+    Args:
+        source_steps: Whatever the caller passed as provenance steps.
+
+    Returns:
+        An ``AttributeDisclosureSource``; empty when nothing was recorded.
+    """
+    from adscan_internal.services.credentials.rejected_secret_pool import (  # noqa: PLC0415
+        AttributeDisclosureSource,
+    )
+
+    for step in source_steps or []:
+        notes = getattr(step, "notes", None)
+        if not isinstance(notes, dict):
+            continue
+        source = AttributeDisclosureSource(
+            principal=str(notes.get("source_username") or "").strip(),
+            attribute=str(notes.get("source_attribute") or "").strip(),
+            rule=str(notes.get("source_rule") or "").strip(),
+            finding_key=str(notes.get("finding_key") or "").strip(),
+            evidence_path=str(notes.get("evidence_path") or "").strip(),
+        )
+        if not source.is_empty:
+            return source
+    return AttributeDisclosureSource()
+
+
+def _demote_rejected_secret_to_spray_candidate(
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    secret: Any,
+    origin: str = "",
+    disclosure: Any = None,
+) -> bool:
+    """Record a rejected cleartext as a spray candidate for the domain.
+
+    A password that is wrong for the account it was found on is the exact input
+    a spray exists to test against every other account, so a definitive
+    rejection retires it for that principal instead of erasing the string. An
+    NT hash is not a spray candidate and is skipped.
+
+    ``disclosure`` records WHERE the string was read from, so a later hit on a
+    different account can be attributed back to the object and the attribute
+    an administrator has to go and clear. An absent or empty disclosure is
+    recorded as such; nothing here infers a source.
+
+    Best-effort: a failure here never blocks the disposal.
+    """
+    try:
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            looks_like_ntlm_hash,
+        )
+        from adscan_internal.services.credentials.rejected_secret_pool import (  # noqa: PLC0415
+            AttributeDisclosureSource,
+            record_rejected_secret_candidate,
+        )
+
+        text = strip_sensitive_markers(str(secret or "")).strip()
+        if not text or looks_like_ntlm_hash(text):
+            return False
+        verdict = getattr(
+            getattr(shell, "_last_domain_credential_verification_result", None),
+            "status",
+            None,
+        )
+        source = (
+            disclosure
+            if isinstance(disclosure, AttributeDisclosureSource)
+            else AttributeDisclosureSource()
+        )
+        recorded = record_rejected_secret_candidate(
+            shell.domains_data,
+            domain=domain,
+            secret=text,
+            rejected_for=user,
+            verdict=str(getattr(verdict, "value", verdict) or ""),
+            origin=origin,
+            source_principal=source.principal,
+            source_attribute=source.attribute,
+            source_rule=source.rule,
+            finding_key=source.finding_key,
+            evidence_path=source.evidence_path,
+        )
+        return recorded is not None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
 
 
 def _resolve_verified_domain_credential(
@@ -4568,6 +4972,24 @@ def process_cpassword_text(
     if not entries:
         return False
 
+    # WHOSE credentials these are. The GPP XML names the owner in the same entry
+    # as the ``cpassword``, so the pairing is OBSERVED, not inferred — and the
+    # finding has to carry it or the deliverable cannot name the account to
+    # rotate (same gap as the share-secret finding). Resolved through the pure
+    # recovery SSOT so only entries that genuinely decrypt contribute an owner,
+    # and normalized so a ``DOMAIN\`` prefix or a documentation placeholder never
+    # reaches the report as an account.
+    exposed_principals = sorted(
+        {
+            principal
+            for principal in (
+                normalize_principal_candidate(secret.principal)
+                for secret in recover_cpassword_secrets(text)
+            )
+            if principal
+        }
+    )
+
     seen_values = set()
     report_updated = False
     report_recorded = False
@@ -4600,15 +5022,23 @@ def process_cpassword_text(
                     record_technical_finding,
                 )
 
+                gpp_details: dict[str, Any] = {
+                    "source": source,
+                    "cpassword_count": len(entries),
+                }
+                if exposed_principals:
+                    gpp_details["credential_username"] = exposed_principals
+                    if len(exposed_principals) == 1:
+                        # The scalar the remediation command reads must never be
+                        # a list, and with several exposed accounts there is no
+                        # single one to name.
+                        gpp_details["username"] = exposed_principals[0]
                 record_technical_finding(
                     shell,
                     domain,
                     key="gpp_passwords",
                     value=True,
-                    details={
-                        "source": source,
-                        "cpassword_count": len(entries),
-                    },
+                    details=gpp_details,
                     evidence=[
                         {
                             "type": "artifact",
@@ -5768,6 +6198,46 @@ def _derive_credential_origin_path(file_path: str) -> str:
 MAX_PERSISTED_SECRET_LOCATIONS = 50
 
 
+def _attribute_secret_principal(
+    file_cache: dict[str, str],
+    *,
+    file_path: str,
+    secret: Any,
+    context_line: Any,
+    line_num: int | None,
+) -> str | None:
+    """Return the account a recovered secret OBSERVABLY belongs to, or ``None``.
+
+    The detector hands back a bare value, so the account is recovered from the
+    source file itself through the shared attribution SSOT
+    (:func:`extract_adjacent_principal`): the nearest principal the file names
+    next to this secret. The file text is read once per file and cached, since
+    one file commonly yields several hits.
+
+    Falls back to the detector's own context line when the file is unreadable
+    (a loot tree pruned after the scan) — less to go on, same rules. Returns
+    ``None`` whenever the source named no owner or named more than one with no
+    way to tell which is this secret's: a credential-exposure finding that names
+    the WRONG account sends the client to rotate an account that never leaked
+    while the exposed one stays live, which is worse than naming none.
+    """
+    text = ""
+    if file_path:
+        if file_path not in file_cache:
+            file_cache[file_path] = _read_full_file_text(file_path) or ""
+        text = file_cache[file_path]
+    if not text:
+        text = str(context_line or "")
+    if not text:
+        return None
+    secret_text = str(secret or "").strip() or None
+    return extract_adjacent_principal(
+        text,
+        secret=secret_text,
+        secret_line=line_num,
+    )
+
+
 def build_secret_location_records(
     credentials: dict[str, list[tuple[Any, Any, Any, Any, Any]]],
     *,
@@ -5780,15 +6250,21 @@ def build_secret_location_records(
     they can act on. These records carry the concrete file — its UNC path, host,
     share and line — so the deliverable's affected assets name what to go clear.
 
+    Each record also carries the ``principal`` the source file named next to the
+    secret, when it named one: that is what lets the finding's affected assets
+    name the exposed ACCOUNT (and so grade it by its privilege tier and rotate
+    the right one), not only the file. The secret VALUE is never persisted here.
+
     Ordered by host/share/path for a stable report, deduplicated per
     ``(location, line, detector)``, and capped at *limit*.
     """
     records: list[dict[str, Any]] = []
     seen: set[tuple[str, Any, str]] = set()
+    file_text_cache: dict[str, str] = {}
     for cred_type, creds_list in sorted((credentials or {}).items()):
         for entry in creds_list or []:
             try:
-                _value, _ml, _context, line_num, file_path = entry
+                value, _ml, context_line, line_num, file_path = entry
             except (TypeError, ValueError):
                 continue
             path_text = str(file_path or "").strip()
@@ -5813,6 +6289,15 @@ def build_secret_location_records(
             if line is not None:
                 record["line"] = line
             record["detector"] = str(cred_type)
+            principal = _attribute_secret_principal(
+                file_text_cache,
+                file_path=path_text,
+                secret=value,
+                context_line=context_line,
+                line_num=line,
+            )
+            if principal:
+                record["principal"] = principal
             records.append(record)
     records.sort(key=lambda item: str(item.get("unc") or item.get("path") or ""))
     return records[:limit]
@@ -6406,6 +6891,24 @@ def handle_found_credentials(
         # it. Without this the finding carries only detector categories.
         if secret_locations:
             finding_details["secret_locations"] = secret_locations
+        # WHOSE credential leaked. Only accounts the source file named next to
+        # the secret reach here (see ``_attribute_secret_principal``), so the
+        # finding's affected assets name the exposed account and the rotate
+        # command targets it. ``username`` is set only when the whole finding
+        # resolved to ONE account — the scalar the remediation command reads must
+        # never be a list, and with several exposed accounts there is no single
+        # one to name.
+        exposed_principals = sorted(
+            {
+                str(record["principal"])
+                for record in secret_locations
+                if record.get("principal")
+            }
+        )
+        if exposed_principals:
+            finding_details["credential_username"] = exposed_principals
+            if len(exposed_principals) == 1:
+                finding_details["username"] = exposed_principals[0]
         record_technical_finding(
             shell,
             domain,

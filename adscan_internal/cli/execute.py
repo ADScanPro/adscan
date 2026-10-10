@@ -104,6 +104,34 @@ class ExecuteVerbSpec:
     summary: str = ""
 
 
+#: Attribute a verb sets to report its OWN process exit code. ``cmd.Cmd`` reads
+#: a truthy ``do_<verb>`` return value as "stop the REPL loop", so a verb cannot
+#: report failure by returning one; it records it here and :func:`run_execute`
+#: returns it. A verb that never sets it keeps the previous behaviour (``0``
+#: whenever the handler returned without raising), so this is opt-in per verb.
+#:
+#: Used by ``compliance_scope``, where refusing an incomplete declaration must
+#: be visible to the script that ran it: the alternative is a command that looks
+#: like it declared a scope, declared nothing, and exited 0.
+VERB_EXIT_CODE_ATTR = "verb_exit_code"
+
+
+def set_verb_exit_code(shell: Any, code: int) -> None:
+    """Record the exit code ``execute`` should return for this verb."""
+    try:
+        setattr(shell, VERB_EXIT_CODE_ATTR, int(code))
+    except Exception:  # noqa: BLE001 - reporting an exit code is best-effort
+        pass
+
+
+def verb_exit_code(shell: Any) -> int:
+    """The exit code the verb reported, or ``0`` when it reported none."""
+    try:
+        return int(getattr(shell, VERB_EXIT_CODE_ATTR, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 # Conservative, easy-to-extend allowlist. Start with clearly-safe verbs that
 # either need no prior state or only need a domain + credentials (which
 # ``execute`` establishes from the session flags). Adding a verb here is the
@@ -178,6 +206,50 @@ EXECUTE_SAFE_VERBS: dict[str, ExecuteVerbSpec] = {
         # until it is reset.
         summary="Reset a domain's persisted attack-path statuses to the "
         "`theoretical` baseline (L3.5: re-arm a path for re-execution).",
+    ),
+    # Credential-dump verbs. Each is SELF-CONTAINED: it carries its own target
+    # domain, principal, secret, host and local/remote flag in its own
+    # arguments, so `needs_domain`/`needs_auth` stay False and `execute`
+    # injects nothing (`build_verb_arg_string` forwards the passthrough
+    # verbatim). They DO need a collected `--workspace`, because the native
+    # SMB/Kerberos transport reads the DC IP (the KDC to mint a ticket
+    # against) and the hardening posture out of `domains_data`; an ephemeral
+    # cold workspace leaves no KDC and the dump cannot authenticate.
+    #
+    #   adscan execute dump_lsa -w <ws> -- \
+    #       -d <domain> -u <user> -p <secret> --host <ip> --islocal false
+    "dump_lsa": ExecuteVerbSpec(
+        summary="Dump LSA secrets (SECURITY/SYSTEM hives) from a host over SMB. "
+        "Self-contained args; pass -w <workspace> for DC/posture context.",
+    ),
+    "dump_sam": ExecuteVerbSpec(
+        summary="Dump the local SAM account hashes from a host over SMB. "
+        "Self-contained args; pass -w <workspace> for DC/posture context.",
+    ),
+    "dump_lsass": ExecuteVerbSpec(
+        summary="Dump LSASS-resident credentials from a host over SMB. "
+        "Self-contained args; pass -w <workspace> for DC/posture context.",
+    ),
+    "dump_dpapi": ExecuteVerbSpec(
+        summary="Dump DPAPI master keys / secrets from a host over SMB. "
+        "Self-contained args; pass -w <workspace> for DC/posture context.",
+    ),
+    "dump_registries": ExecuteVerbSpec(
+        summary="Dump the SAM/SECURITY/SYSTEM registry hives from the domain's "
+        "PDC. Args: <domain> <username> <password>; pass -w <workspace>.",
+    ),
+    # Workspace-local compliance state: no domain, no auth, no collection. The
+    # ENS declaration is a JSON file in the workspace, so the only context this
+    # needs is `-w <workspace>` (an ephemeral one would be deleted on exit, and
+    # the verb refuses to write into it rather than declare nothing).
+    "compliance_scope": ExecuteVerbSpec(
+        summary="Read or declare the workspace's ENS compliance scope. No "
+        "arguments reads it; `--profile <p> --levels C=..,I=..,T=..,A=..,D=..` "
+        "declares it. Needs -w <workspace>.",
+    ),
+    "dump_host": ExecuteVerbSpec(
+        summary="Dump LSA + DPAPI (+ LSASS) credentials from a single host. "
+        "Args: <domain> <host> <username> <password> <islocal>; pass -w.",
     ),
 }
 
@@ -1097,6 +1169,10 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
     )
 
     created = _setup_workspace(shell, config)
+    # A verb that WRITES durable workspace state needs to know the workspace is
+    # about to be deleted, so it can refuse instead of writing into a directory
+    # that does not outlive the command.
+    shell.workspace_is_ephemeral = bool(created and not config.keep_workspace)
 
     # Best-effort myip auto-config from the interface (mirrors ci.py).
     if config.interface:
@@ -1148,7 +1224,9 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
             f"(workspace: {mark_sensitive(str(shell.current_workspace or ''), 'workspace')})"
         )
         cmd_method(arg_string)
-        exit_code = 0
+        # A verb may report its own exit code (see VERB_EXIT_CODE_ATTR); one
+        # that reports none succeeded by returning without raising.
+        exit_code = verb_exit_code(shell)
     except KeyboardInterrupt:
         print_warning("Execution interrupted.")
         exit_code = 130

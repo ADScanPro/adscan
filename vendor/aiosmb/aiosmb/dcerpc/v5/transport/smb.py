@@ -18,7 +18,12 @@ class DCERPCSMBTransport:
 		try:
 			unc_path = '\\\\%s\\%s%s' % (self.target.smb_connection.target.get_hostname_or_ip(), 'IPC$', self.target.pipe)
 			self.smbfile = SMBFile.from_uncpath(unc_path)
-			_, err = await self.smbfile.open(self.target.smb_connection, 'wp')
+			# open_rpc_pipe() matches impacket's own named-pipe CREATE request
+			# byte-for-byte (desiredAccess/shareMode/createOptions/
+			# createDisposition) -- see its docstring. The generic open(mode=
+			# 'wp') used a broader, non-standard combination of these four
+			# fields; see BACKLOG.md's PIPE_BROKEN entry for why this matters.
+			_, err = await self.smbfile.open_rpc_pipe(self.target.smb_connection)
 			return True, err
 		except Exception as e:
 			return None, e

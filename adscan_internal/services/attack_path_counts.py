@@ -64,6 +64,7 @@ from adscan_internal.services.compromise_class import (
 from adscan_internal.services.exposure_score_service import (
     PATH_AXIS_NON_STATUS_KEYS,
     open_exposure_total,
+    safety_withheld_total,
     split_open_exposure,
 )
 from adscan_internal.services.path_state import NOT_ASSESSED_STATUSES
@@ -86,11 +87,29 @@ class PathHeadline:
     """The one client-facing attack-path headline every surface renders.
 
     Built once by :meth:`ClientPathTotals.render_headline` so the CLI panel, the
-    LITE/PRO report cards and the web CTEM say the SAME sentence. ``reachable``
-    is the effective full-domain-compromise figure (k when materialization
-    walked the graph, the reachable-set cardinality when the mega-hub fallback
-    fired); ``proven`` is the end-to-end ``exploited`` count shown distinctly.
-    ``label`` never reads "0" / "not compromised" when ``compromised`` is true.
+    LITE/PRO report cards and the web CTEM say the SAME sentence.
+
+    Every field here is a ROUTE count except ``reachable_assets``, and the two
+    are never substituted for one another. Coverage changes the DISCLOSURE (the
+    "(sampled coverage)" caveat), never the UNITS of a figure: a route count
+    stays a route count under every coverage mode, because swapping in a count of
+    reachable TERMINALS under a "routes to full domain compromise" label is a
+    different quantity said in the same words — which is exactly how one PDF
+    printed two different numbers for its own headline figure.
+
+    Attributes:
+        proven: Routes validated end to end (the ``exploited`` count).
+        reachable: Routes to full domain compromise the headline leads with.
+        reachable_assets: DISTINCT Tier-0 assets reachable — a TERMINAL set
+            cardinality, not a route count. Carried separately and labelled as
+            assets (:attr:`assets_label`) so a surface can state it without
+            implying routes.
+        assets_label: The client sentence for ``reachable_assets``, empty when
+            there is nothing to state.
+        sampled: Whether coverage was sampled/bounded (drives the caveat only).
+        compromised: The ``promote_to_pwned`` oracle.
+        label: The headline sentence. Never reads "0" / "not compromised" when
+            ``compromised`` is true.
     """
 
     proven: int
@@ -98,6 +117,8 @@ class PathHeadline:
     sampled: bool
     compromised: bool
     label: str
+    reachable_assets: int = 0
+    assets_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -132,6 +153,10 @@ class ClientPathTotals:
     paths_closed_by_configuration: int = 0
     paths_not_assessed: int = 0
     #: Reachable-terminal SET cardinalities (k-independent EXPOSURE numbers).
+    #: These count TERMINALS, not routes, and must NEVER be rendered under a
+    #: route/path label or substituted for a ``paths_*`` figure. Read them through
+    #: :attr:`reachable_tier0_assets` / :meth:`render_reachable_assets_figure`,
+    #: which carry the asset wording with them.
     reachable_full_domain_compromise: int = 0
     reachable_tier0: int = 0
     reachable_domain_object: int = 0
@@ -230,15 +255,50 @@ class ClientPathTotals:
 
     @property
     def effective_full_domain_compromise(self) -> int:
-        """Routes to full domain compromise a client-facing headline may use.
+        """ROUTES to full domain compromise a client-facing headline may use.
 
-        ``paths_full_domain_compromise`` (k) on a complete run — byte-identical
-        to today — and the reachable-set cardinality when the mega-hub fallback
-        collapsed k to 0. Never renders 0 on a domain that has reachable routes.
+        Always ``paths_full_domain_compromise`` (k), under EVERY coverage mode.
+
+        It used to return :attr:`reachable_full_domain_compromise` whenever
+        coverage was not complete, which silently changed the figure's UNITS: that
+        field is a count of distinct reachable TERMINALS (the ``reachability``
+        block's own documented quantity), not of enumerated routes. The
+        substitution was justified by "the mega-hub fallback collapsed k to 0",
+        and that premise is false for the fallback engine ADscan actually runs:
+        the bounded per-terminal engine returns a coverage-floored SAMPLE of
+        routes, which is non-empty. So on a real sampled run both figures were
+        non-zero and different, and a terminal count was printed under a "routes
+        to full domain compromise" label while other sites on the same page
+        printed the route count.
+
+        Coverage changes the DISCLOSURE, not the metric: the sampled caveat is
+        appended by :meth:`render_headline`, and the reachable-asset figure is
+        exposed separately as :attr:`reachable_tier0_assets` with its own label.
         """
-        if self.effective_reach_is_sampled:
-            return self.reachable_full_domain_compromise
         return self.paths_full_domain_compromise
+
+    @property
+    def reachable_tier0_assets(self) -> int:
+        """DISTINCT Tier-0 assets reachable: a TERMINAL count, never routes.
+
+        The exposure (k-independent) companion to the route counts: how many
+        distinct domain objects / Tier-0-direct assets a start principal can
+        reach. Named and labelled as assets so it can never be rendered under a
+        route/path label (:meth:`render_reachable_assets_figure`).
+        """
+        return self.reachable_full_domain_compromise
+
+    def render_reachable_assets_figure(self) -> str:
+        """Return the client sentence for :attr:`reachable_tier0_assets`.
+
+        Empty when nothing is reachable, so a surface states a figure or states
+        nothing — never a bare 0 under an asset label.
+        """
+        count = self.reachable_tier0_assets
+        if count <= 0:
+            return ""
+        noun = "Tier 0 asset" if count == 1 else "Tier 0 assets"
+        return f"{count} {noun} reachable"
 
     @property
     def effective_proven_full_domain_compromise(self) -> int:
@@ -260,8 +320,18 @@ class ClientPathTotals:
 
         Every surface renders from this so proven-vs-reachable and the "never 0
         on a compromised domain" rule live in exactly one place.
+
+        The headline LEADS with the route figure, under every coverage mode — the
+        lead did not change. What changed is that it is now always a route count:
+        sampled coverage appends the "(sampled coverage)" caveat and, when the
+        sample produced no route at all, states the reachable-ASSET figure under
+        its own asset label instead of re-labelling it as routes. That keeps the
+        "never render a bare 0 on a domain with reachable exposure" property
+        without the unit swap.
         """
         reachable = self.effective_full_domain_compromise
+        reachable_assets = self.reachable_tier0_assets
+        assets_label = self.render_reachable_assets_figure()
         # Tie proven to the runtime compromise oracle: a stale snapshot can never
         # invent a proven route on a domain the current state says is not owned.
         proven = (
@@ -270,15 +340,32 @@ class ClientPathTotals:
         sampled = self.effective_reach_is_sampled
         suffix = " (sampled coverage)" if sampled else ""
         if domain_compromised:
-            head = "full domain compromise proven"
+            # "domain compromised" is a FACT about proven control of a Domain Admin
+            # (the authenticating / owned principal), NOT a claim that an attack
+            # ROUTE was validated end-to-end. Keep the two claims separate so the
+            # headline never asserts "proven" for routes the engine did not walk: a
+            # validated-route count appears ONLY when ``proven > 0``; otherwise the
+            # headline states the compromise fact alone. A separate reachable-route
+            # clause carries the enumerated (not validated) figure.
             if proven > 0:
-                head = f"{head} ({proven} route(s) validated end-to-end)"
+                head = (
+                    "full domain compromise proven "
+                    f"({proven} route(s) validated end-to-end)"
+                )
+            else:
+                head = "domain compromised (control of a Domain Admin proven)"
             parts = [head]
             if reachable > 0:
                 parts.append(f"{reachable} reachable route(s) to full domain compromise")
+            elif sampled and assets_label:
+                parts.append(assets_label)
             label = "; ".join(parts) + suffix
         elif reachable > 0:
             label = f"{reachable} reachable route(s) to full domain compromise{suffix}"
+        elif sampled and assets_label:
+            # A sampled run that surfaced no route still must not read as "nothing
+            # found": state what IS known, in its own units.
+            label = f"{assets_label}{suffix}"
         else:
             label = "no attack paths found"
         return PathHeadline(
@@ -287,6 +374,8 @@ class ClientPathTotals:
             sampled=sampled,
             compromised=bool(domain_compromised),
             label=label,
+            reachable_assets=reachable_assets,
+            assets_label=assets_label,
         )
 
     def merged_with(self, other: "ClientPathTotals") -> "ClientPathTotals":
@@ -345,6 +434,19 @@ class ClientPathTotals:
         ``paths_total_analyzed`` (the convergence denominator, derived from the
         SAME curated set) can never again ship two mutually incomparable path
         denominators under adjacent names.
+
+        Semantics note (``paths_proven`` vs the retired ``paths_exploited``):
+        ``paths_proven`` is the CURRENT, curated evidence count — the open-exposure
+        paths whose status is proven end-to-end, derived from the ``_PROVEN_STATUSES``
+        SSOT (spanning ``exploited`` / ``domain_compromised`` / ``success``), so it is
+        always ``<= paths_open_exposure <= paths_total`` on the same event. It is NOT
+        comparable across versions to the legacy ``paths_exploited`` key that older
+        ``scan_complete`` events carried: ``paths_exploited`` counted raw graph-walk
+        enumerations whose status was ``exploited`` (a combinatorial, depth-sensitive
+        DFS figure, the same over-counting family as the retired ``paths_to_tier0``),
+        so historically ``paths_exploited`` could exceed the curated ``paths_proven``.
+        Do NOT aggregate the two keys together; treat any ``paths_exploited`` in the
+        historical data as a different, non-curated metric.
         """
         return {
             "paths_total": self.paths_total,
@@ -449,15 +551,20 @@ def client_path_totals_from_kpis(
             elif status in NOT_ASSESSED_STATUSES:
                 not_assessed += _coerce_int(count)
 
-    # Coverage mode: prefer the engine-stamped flag; infer it when absent (older
-    # workspace) from the k-collapsed-but-reachable signature. "sampled"/
-    # "bounded" both mean the effective figures must read reachability, not k.
-    reachable_fdc = _coerce_int(reach.get("full_domain_compromise"))
+    # Coverage mode: read the engine-stamped sampling signal ONLY (the memory-gate
+    # sampled/bounded truth stamped by ``stamp_exposure_kpis_for_domain``).
+    # "sampled"/"bounded" both mean the effective figures must read reachability,
+    # not k. A COMPLETED DFS that returned 0 paths is the TRUE answer, not a
+    # truncation, so the absence of a stamped sampling signal defaults to
+    # "complete" — the old "0 paths but non-zero reachability" heuristic is gone
+    # (it mislabelled a completed-0 run as sampled and then reported the
+    # reachability flood as the headline). CLAUDE.md § "a bounded computation is a
+    # data gap — declare it" (never declare a bound that did not happen).
     declared_mode = exposure_kpis.get("coverage_mode")
     if isinstance(declared_mode, str) and declared_mode.strip():
         coverage_mode = declared_mode.strip().lower()
     else:
-        coverage_mode = "sampled" if (total == 0 and reachable_fdc > 0) else "complete"
+        coverage_mode = "complete"
 
     return ClientPathTotals(
         paths_total=total,
@@ -751,7 +858,25 @@ def client_path_totals(workspace_dir: str, domain: str) -> ClientPathTotals:
             )
         except Exception:  # noqa: BLE001 - no sidecar just means "display status"
             executions = None
-        return client_path_totals_from_paths(paths, executions=executions or None)
+        # Populate the reachable_* EXPOSURE fields even on the recompute path.
+        # ``scan_complete`` telemetry fires at the scan-end seam, BEFORE the
+        # report is generated, so no stamped ``exposure_kpis`` block exists yet
+        # and this fallback is what runs. Without this the reachability summary
+        # was never computed here and every reachable_* field shipped 0 on the
+        # event (the observed "reachable_tier0 always 0" defect). Same SSOT the
+        # report's stamping seam uses, so the numbers match once a report exists.
+        reachability = None
+        try:
+            from adscan_internal.services.attack_reachability import (
+                reachability_summary_for_workspace,
+            )
+
+            reachability = reachability_summary_for_workspace(workspace_dir, domain_name)
+        except Exception:  # noqa: BLE001 - best-effort; leaves reachable_* at 0
+            reachability = None
+        return client_path_totals_from_paths(
+            paths, executions=executions or None, reachability=reachability
+        )
     except Exception as exc:  # noqa: BLE001 - counts never break a scan
         print_exception(exception=exc)
         print_info_debug(f"[path-counts] totals unavailable for {domain_name}: {exc}")
@@ -821,8 +946,122 @@ def client_path_totals_for_session(
     return totals
 
 
+@dataclass(frozen=True)
+class FullDomainCompromiseSplit:
+    """The ``domain_breaker`` ROUTE counts one document may print, split by proof.
+
+    Every figure is a count of ROUTES to full domain compromise — never of
+    reachable terminals (see :attr:`ClientPathTotals.reachable_full_domain_compromise`
+    for that, which must not be substituted here).
+
+    This exists because the same question was answered from a hand-rolled
+    ``exposure_kpis -> path_axis -> domain_breaker`` walk at several render sites
+    of one document, each re-deriving the bucket lookup and the aggregation. The
+    splitting RULE itself was already shared
+    (:func:`~adscan_internal.services.exposure_score_service.split_open_exposure`);
+    what was duplicated was getting to the bucket and summing across domains, and
+    a duplicated path is a path that can diverge.
+
+    Four mutually exclusive figures, summing to :attr:`total`. The fourth,
+    :attr:`withheld`, is there because folding a route ADscan CONFIRMED and
+    deliberately declined to execute into the configuration-analysis count files
+    the one fact in the split a configuration scanner cannot produce under the
+    label of the one it can. It is also a claim about ADscan's restraint, never
+    about the client's defences: a route whose execution simply did not complete
+    is ``attempted`` and stays in ``unproven``.
+
+    Attributes:
+        total: Open-exposure routes to full domain compromise.
+        proven: Of those, validated end to end.
+        partial: Of those, partially validated (an executed segment, not the
+            whole chain) — its own count, never folded into ``unproven``.
+        withheld: Of those, confirmed and deliberately NOT executed, because the
+            technique would have disrupted production. Carved out of
+            ``unproven``, never added on top of it.
+        unproven: The remainder, mapped from configuration and not attempted.
+            EXCLUDES ``withheld``.
+        have_kpi: Whether any contributing domain carried a ``path_axis`` block
+            at all. ``False`` means "no engine-stamped KPI", which is different
+            from "zero routes" and is what lets a caller fall back to a legacy
+            framing instead of asserting a 0 it cannot stand behind.
+    """
+
+    total: int = 0
+    proven: int = 0
+    partial: int = 0
+    unproven: int = 0
+    withheld: int = 0
+    have_kpi: bool = False
+
+    def merged_with(
+        self, other: "FullDomainCompromiseSplit"
+    ) -> "FullDomainCompromiseSplit":
+        """Return the sum of two domains' splits."""
+        return FullDomainCompromiseSplit(
+            total=self.total + other.total,
+            proven=self.proven + other.proven,
+            partial=self.partial + other.partial,
+            unproven=self.unproven + other.unproven,
+            withheld=self.withheld + other.withheld,
+            have_kpi=self.have_kpi or other.have_kpi,
+        )
+
+
+def full_domain_compromise_split_from_kpis(
+    exposure_kpis: Any,
+) -> FullDomainCompromiseSplit:
+    """Return the ``domain_breaker`` route split for ONE domain's KPI block.
+
+    Reads the engine-stamped block only; recomputes nothing. An absent block or
+    an absent ``domain_breaker`` bucket yields an all-zero split with
+    ``have_kpi=False``.
+
+    The deliberate-abstention count is carved OUT of ``unproven`` (clamped to it,
+    so a malformed artifact can never make the four figures overshoot the
+    headline total). An artifact with no stamped abstention key reports
+    ``withheld=0`` and an ``unproven`` byte-identical to the two-bucket
+    behaviour, so an existing deliverable is unchanged.
+    """
+    if not isinstance(exposure_kpis, Mapping):
+        return FullDomainCompromiseSplit()
+    path_axis = exposure_kpis.get("path_axis")
+    if not isinstance(path_axis, Mapping):
+        return FullDomainCompromiseSplit()
+    bucket = path_axis.get(CompromiseClass.DOMAIN_BREAKER.value)
+    if not isinstance(bucket, Mapping):
+        return FullDomainCompromiseSplit()
+    split = split_open_exposure(bucket)
+    remainder = int(split.unproven or 0)
+    withheld = min(safety_withheld_total(bucket), remainder)
+    return FullDomainCompromiseSplit(
+        total=int(open_exposure_total(bucket) or 0),
+        proven=int(split.proven or 0),
+        partial=int(split.partial or 0),
+        unproven=remainder - withheld,
+        withheld=withheld,
+        have_kpi=True,
+    )
+
+
+def aggregate_full_domain_compromise_split(
+    exposure_kpis_blocks: Sequence[Any],
+) -> FullDomainCompromiseSplit:
+    """Fold several domains' ``domain_breaker`` route splits into one.
+
+    Path counts are domain-disjoint, so summing across a session's domains is
+    correct.
+    """
+    total = FullDomainCompromiseSplit()
+    for block in exposure_kpis_blocks or ():
+        total = total.merged_with(full_domain_compromise_split_from_kpis(block))
+    return total
+
+
 __all__ = [
     "ClientPathTotals",
+    "FullDomainCompromiseSplit",
+    "aggregate_full_domain_compromise_split",
+    "full_domain_compromise_split_from_kpis",
     "client_path_totals",
     "client_path_totals_for_session",
     "client_path_totals_for_shell",

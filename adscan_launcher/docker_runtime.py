@@ -347,8 +347,7 @@ def _fire_pre_container_exec_hook(
         hook()  # pylint: disable=not-callable
     except Exception as exc:  # noqa: BLE001
         print_info_debug(
-            f"[docker] pre-container-exec hook failed: "
-            f"{type(exc).__name__}: {exc}"
+            f"[docker] pre-container-exec hook failed: {type(exc).__name__}: {exc}"
         )
 
 
@@ -1018,6 +1017,173 @@ def probe_and_warn_reduced_runtime(cfg: DockerRunConfig) -> None:
             pass
 
 
+def _render_gpu_degraded_panel(verdict) -> None:
+    """Render the 'reduced cracking mode' notice for an unusable host GPU.
+
+    The headline states what the probe OBSERVED and the footer states the fix,
+    because the fix for the common case is to restart the host, and nobody
+    tries that on a security scanner's advice unless the scanner says so. The
+    rows answer the question the operator actually has next, which is whether
+    the assessment they are about to run is still worth running: it is, and
+    only GPU cracking is gone.
+
+    Honest about the Linux fallback, because there is none: ADscan does not
+    crack on CPU on Linux, so the row says the hashes are captured and reported
+    for offline cracking rather than implying a slower local attempt.
+
+    Built as a renderable group rather than one markup string so the fix text
+    keeps its hanging indent when the terminal is narrow enough to wrap it. A
+    flat string loses that alignment at 80 columns, which is where the operator
+    most needs the fix to read as one block.
+    """
+    from rich.console import Group  # noqa: PLC0415
+    from rich.padding import Padding  # noqa: PLC0415
+    from rich.text import Text  # noqa: PLC0415
+
+    from adscan_core.gpu_runtime import gpu_degradation_copy  # noqa: PLC0415
+
+    copy = gpu_degradation_copy(
+        getattr(verdict, "code", "") or "",
+        loaded_driver=getattr(verdict, "loaded_driver", None),
+        installed_driver=getattr(verdict, "installed_driver", None),
+    )
+    ok = "[success]✓[/success]"
+    warn = "[warning]⚠[/warning]"
+    blocks: list[object] = [
+        Text.from_markup(copy.headline + " The full AD assessment runs normally."),
+        Text.from_markup(
+            "\n".join(
+                (
+                    f"{ok}  Core assessment    LDAP · SMB · Kerberos · RPC · attack paths",
+                    f"{ok}  Hash capture       Kerberoast · AS-REP · NetNTLM · timeroast",
+                    f"{warn}  GPU cracking       unavailable in this run",
+                    "                      hashes are captured for offline cracking",
+                )
+            )
+        ),
+    ]
+    loaded = getattr(verdict, "loaded_driver", None)
+    installed = getattr(verdict, "installed_driver", None)
+    version_rows = [
+        row
+        for row in (
+            f"[dim]Kernel module loaded[/dim]   {loaded}" if loaded else "",
+            f"[dim]Installed driver[/dim]       {installed}" if installed else "",
+        )
+        if row
+    ]
+    if version_rows:
+        blocks.append(Text.from_markup("\n".join(version_rows)))
+    if copy.fix_lines or copy.verify_command:
+        fix_block: list[object] = [Text.from_markup("[bold]Fix[/bold]")]
+        for line in copy.fix_lines:
+            fix_block.append(Padding(Text(line), (0, 0, 0, 2)))
+        if copy.verify_command:
+            fix_block.append(
+                Padding(
+                    Text.from_markup(
+                        f"Verify with: [bold]{copy.verify_command}[/bold]"
+                    ),
+                    (0, 0, 0, 2),
+                )
+            )
+        blocks.append(Group(*fix_block))
+    print_panel(
+        Group(*_interleave_blank_lines(blocks)),
+        title=f"⚠  {copy.title}",
+        title_align="left",
+        border_style="panel.border.warning",
+    )
+
+
+def _interleave_blank_lines(blocks: list[object]) -> list[object]:
+    """Return ``blocks`` with one blank line between each, for panel spacing."""
+    from rich.text import Text  # noqa: PLC0415
+
+    spaced: list[object] = []
+    for index, block in enumerate(blocks):
+        if index:
+            spaced.append(Text(""))
+        spaced.append(block)
+    return spaced
+
+
+def warn_gpu_degraded_and_confirm(verdict, *, allow_prompt: bool) -> bool:
+    """Report an unusable host GPU and return whether to continue the run.
+
+    Called only with a CONCLUSIVE degraded verdict: an inconclusive probe says
+    nothing and keeps ``--gpus``, so a working host can never lose its GPU to a
+    flaky check.
+
+    Continuing is the default everywhere, because the degradation costs an
+    optional capability and the assessment itself is unaffected. The prompt
+    exists for the interactive seam only, so an operator who was relying on GPU
+    cracking can stop, restart the host and come back rather than discover it
+    at the end of a long scan. ``allow_prompt=False`` (the ``ci`` and
+    pass-through seams) never blocks: the money path must not wait on a human
+    for a capability it can run without.
+
+    Returns:
+        ``True`` to continue the run, ``False`` only when an interactive
+        operator explicitly declined.
+    """
+    _render_gpu_degraded_panel(verdict)
+    print_info_debug(
+        "[docker] gpu verdict: "
+        f"code={getattr(verdict, 'code', '')} "
+        f"loaded={getattr(verdict, 'loaded_driver', None)} "
+        f"installed={getattr(verdict, 'installed_driver', None)} "
+        f"detail={getattr(verdict, 'detail', '')!r}"
+    )
+    if not allow_prompt:
+        return True
+    try:
+        from adscan_core.interaction import is_non_interactive  # noqa: PLC0415
+
+        if is_non_interactive():
+            return True
+        from adscan_core.rich_output import confirm_ask  # noqa: PLC0415
+
+        return bool(confirm_ask("Continue without GPU cracking?", default=True))
+    except Exception as exc:  # noqa: BLE001 — never block the run on the prompt
+        print_info_debug(f"[docker] gpu confirm fallback to continue: {exc}")
+        return True
+
+
+def gpu_degradation_env(verdict) -> tuple[tuple[str, str], ...]:
+    """Return the container env that carries this diagnosis into the scan.
+
+    The launcher is the only layer that can tell a mismatched driver from a
+    missing toolkit, so it forwards its verdict and the container's
+    "no compute device" message names the same cause and the same fix instead
+    of guessing at a generic one.
+
+    Gated on ``degraded``, not on the code alone. An INCONCLUSIVE probe also
+    carries the ``unknown`` code while keeping ``--gpus``, so reading the code
+    by itself would tell the container the GPU had been withheld on a host
+    that still has it, and the scan would explain a degradation that never
+    happened.
+    """
+    from adscan_core.gpu_runtime import (  # noqa: PLC0415
+        ENV_GPU_DEGRADED,
+        ENV_GPU_DRIVER_INSTALLED,
+        ENV_GPU_DRIVER_LOADED,
+        is_degraded_code,
+    )
+
+    code = getattr(verdict, "code", "") or ""
+    if not getattr(verdict, "degraded", False) or not is_degraded_code(code):
+        return ()
+    env: list[tuple[str, str]] = [(ENV_GPU_DEGRADED, code)]
+    loaded = getattr(verdict, "loaded_driver", None)
+    if loaded:
+        env.append((ENV_GPU_DRIVER_LOADED, str(loaded)))
+    installed = getattr(verdict, "installed_driver", None)
+    if installed:
+        env.append((ENV_GPU_DRIVER_INSTALLED, str(installed)))
+    return tuple(env)
+
+
 #: Non-``ADSCAN_``-prefixed host environment variables forwarded verbatim into
 #: the scan container.
 #:
@@ -1076,11 +1242,11 @@ PASSTHROUGH_ENV_KEYS: tuple[str, ...] = (
 LAUNCHER_ONLY_ENV_KEYS: frozenset[str] = frozenset(
     {
         # --- docker-run mechanics: which image / runtime / channel to launch ---
-        "ADSCAN_DOCKER_IMAGE",       # image override (launcher image selection)
-        "ADSCAN_DOCKER_CHANNEL",     # stable/dev channel selection
-        "ADSCAN_DOCKER_GPU",         # GPU passthrough mode (launcher wires --gpus/--device)
-        "ADSCAN_DOCKER_GUI",         # X11 GUI passthrough toggle (launcher-side)
-        "ADSCAN_X11_SOCKET_DIR",     # host X11 socket dir the launcher mounts
+        "ADSCAN_DOCKER_IMAGE",  # image override (launcher image selection)
+        "ADSCAN_DOCKER_CHANNEL",  # stable/dev channel selection
+        "ADSCAN_DOCKER_GPU",  # GPU passthrough mode (launcher wires --gpus/--device)
+        "ADSCAN_DOCKER_GUI",  # X11 GUI passthrough toggle (launcher-side)
+        "ADSCAN_X11_SOCKET_DIR",  # host X11 socket dir the launcher mounts
         "ADSCAN_CONTAINER_RUNTIME",  # marks "inside container"; launcher sets =1 itself
         # --- host preflight / capability escape hatches (launcher-only gates) ---
         "ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK",
@@ -1090,7 +1256,7 @@ LAUNCHER_ONLY_ENV_KEYS: frozenset[str] = frozenset(
         "ADSCAN_ALLOW_UNSUPPORTED_PLATFORM",
         "ADSCAN_ALLOW_UNSUPPORTED_WSL",
         # --- host-shell integration (launcher install/alias mechanics) ---
-        "ADSCAN_CLI_PATH",           # host launcher invocation prefix
+        "ADSCAN_CLI_PATH",  # host launcher invocation prefix
         "ADSCAN_SUDO_ALIAS_MARKER",  # marker line for the auto-sudo shell alias
     }
 )

@@ -53,6 +53,7 @@ from adscan_core.rich_output import (
 __all__ = [
     "DCConnectTarget",
     "HostAddress",
+    "env_host_key",
     "resolve_connect_and_spn",
     "resolve_dc_connect_targets",
     "resolve_host_address",
@@ -109,6 +110,18 @@ def _env_host_key(host: str) -> str:
     for ch in raw.upper():
         out_chars.append(ch if ch.isalnum() else "_")
     return "".join(out_chars).strip("_")
+
+
+def env_host_key(host: str) -> str:
+    """Public alias of :func:`_env_host_key` for other operator-hint sites.
+
+    Any module that prints a ``ADSCAN_HOST_IP_<KEY>=<ip>`` hint must build the
+    suffix with the SAME normalisation this resolver reads it back with, or the
+    operator pastes a variable name the lookup never matches. Call this instead
+    of hand-rolling an ``upper()``/``replace()`` pair.
+    """
+
+    return _env_host_key(host)
 
 
 def _host_keys(host: str) -> list[str]:

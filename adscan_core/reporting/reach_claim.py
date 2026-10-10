@@ -21,7 +21,9 @@ __all__ = [
     "FULL_COMPROMISE_MAPPED_PHRASE",
     "FULL_COMPROMISE_VALIDATED_PHRASE",
     "full_compromise_reach_phrase",
+    "no_tier0_asset_reach_statement",
     "reaches_full_compromise_clause",
+    "tier0_asset_reach_population_note",
     "tier0_reach_sub_phrase",
 ]
 
@@ -80,3 +82,49 @@ def tier0_reach_sub_phrase(end_to_end_proven: bool) -> str:
     if end_to_end_proven:
         return "have a path to Tier 0, confirmed by configuration"
     return "have a mapped path to Tier 0 whose entry step is proven"
+
+
+def tier0_asset_reach_population_note(domain_user_count: int) -> str:
+    """Return the note naming WHAT the Tier-0-asset reach figure counts.
+
+    The report prints two account figures within a page of each other and they
+    count different populations by design: this one spans every enabled domain
+    account in scope, while the per-account exposure figures count only the
+    ordinary accounts that hold a route. It also counts only the routes that land
+    on a Tier 0 host or the domain object, so a route stopping at a Tier 0 group
+    sits outside it. Read side by side with nothing joining them, a zero here
+    above a "the whole population is exposed" sentence reads as the report
+    contradicting itself, which costs more credibility than the finding buys.
+
+    Both figures stay exactly as computed. This note states each one's boundary so
+    a reader can hold the two at once. Layout-neutral on purpose (no "above" or
+    "below"), so LITE, the PRO deliverable and the web CTEM can place it anywhere.
+
+    Args:
+        domain_user_count: The enabled domain accounts the figure spans.
+    """
+    return (
+        f"Measured across all {domain_user_count:,} enabled domain accounts in "
+        "scope, administrative accounts included. It counts only the routes that "
+        "land on a Tier 0 host or the domain object itself: a route that stops at "
+        "a Tier 0 group is carried under Tier 0 group takeover in the compromise "
+        "reach breakdown and is outside this figure. The per-account exposure "
+        "figures in this report count a smaller group, the ordinary accounts that "
+        "hold at least one route."
+    )
+
+
+def no_tier0_asset_reach_statement() -> str:
+    """Return the honest line for "no account reaches a Tier 0 asset at all".
+
+    The reach figure can legitimately be zero while the directory still carries
+    exposure, when every mapped route stops at a Tier 0 group. The sub-line that
+    reads "all Tier 0 reach is foothold-only" then describes reach that does not
+    exist, so this states the absence directly and points at where the exposure
+    this directory does carry is reported.
+    """
+    return (
+        "No account reaches a Tier 0 host or the domain object on any mapped "
+        "route. The exposure this directory carries is reported under Tier 0 "
+        "group takeover in the compromise reach breakdown."
+    )

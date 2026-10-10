@@ -158,6 +158,7 @@ hiddenimports = [
     "dns",
     "dns.resolver",
     "rich",
+    "pypdf",
     "questionary",
     "prompt_toolkit",
     "wcwidth",

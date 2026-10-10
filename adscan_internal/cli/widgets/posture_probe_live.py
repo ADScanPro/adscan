@@ -872,7 +872,7 @@ def _render_detected_summary(
     cmd_line = Text()
     cmd_line.append("  ")
     cmd_line.append(
-        f"adscan posture probe {masked_domain.plain if hasattr(masked_domain, 'plain') else masked_domain}",
+        f"posture probe {masked_domain.plain if hasattr(masked_domain, 'plain') else masked_domain}",
         style="bold",
     )
     pieces.append(cmd_line)
@@ -970,11 +970,11 @@ def _render_cached_summary(
     pieces.append(Text())
     show_line = Text()
     show_line.append("View full state:  ", style="dim")
-    show_line.append(f"adscan posture show {domain}", style="bold")
+    show_line.append(f"posture show {domain}", style="bold")
     pieces.append(show_line)
     force_line = Text()
     force_line.append("Force re-probe:   ", style="dim")
-    force_line.append(f"adscan posture probe {domain}", style="bold")
+    force_line.append(f"posture probe {domain}", style="bold")
     pieces.append(force_line)
 
     return Panel(

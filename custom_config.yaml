@@ -145,9 +145,49 @@
     - doc
 
 # ─────────────────────────────────────────────────────────────────
-# STRONG-TIER MULTILINGUAL RULES  (use_ml: false)
+# STRONG-TIER RULES  (use_ml: false) - multilingual, plus misspelled English
 # keyword + optional modifier + structural separator + value
 # ─────────────────────────────────────────────────────────────────
+
+- name: EN Misspelled Password Label
+  severity: high
+  confidence: strong
+  type: pattern
+  values:
+    # Matches a MISSPELLED English password label followed by a separator:
+    # "Psswd: X", "psswd = X", "Pasword: X", "Psswrd: X", "Paswd = X",
+    # "Psswd del admin: X". Whoever types the label by hand in a handover note
+    # or a user spreadsheet also mistypes it, and the correctly spelled stems
+    # (password, passwd, passwrd, passord, pswd, pwd, pw, p/w, pass) are
+    # already covered elsewhere, so this rule carries only the two stems that
+    # nothing else sees: the double-s `pssw` family and the dropped-s `pasw`
+    # family. That keeps its prefilter (`pssw`, `pasw`) disjoint from every
+    # other rule's, so it widens coverage without loosening any existing one.
+    #
+    # Measured on a 3,532-file / 904,582-line corpus of real configuration
+    # files, shell and PowerShell scripts, documentation, logs and source:
+    # zero matches, because no English word contains either stem. The bare
+    # four-letter stems are deliberately NOT accepted (`pasw = unknown` is a
+    # plausible config key, `Pasword:` is not), so the trailing `d` is
+    # required. Separator mandatory, which is why this is STRONG tier and
+    # needs no value-complexity gate: a legacy all-lowercase service-account
+    # password behind an explicit label must still be reported.
+    - (?i:\bp(?:ss|as)w(?:o?r)?d\b(?:\s+\S{1,20}){0,2}\s*[:=])\s*(?P<quote>["'`]?)(?P<value>[^\s"'{}\[\]<>]{6,80})(?P=quote)?
+  filter_type:
+    - ValueAllowlistCheck
+    - ValuePatternCheck(4)
+    - ValueDictionaryKeywordCheck
+    - LineGitBinaryCheck
+    - LineUUEPartCheck
+    - ValueFilePathCheck
+  use_ml: false
+  required_substrings:
+    - pssw
+    - pasw
+  min_line_len: 12
+  target:
+    - code
+    - doc
 
 - name: ES Contraseña Inline
   severity: high
@@ -171,6 +211,35 @@
   use_ml: false
   required_substrings:
     - contrase
+  min_line_len: 12
+  target:
+    - code
+    - doc
+
+- name: ES Clave Inline
+  severity: high
+  confidence: strong
+  type: pattern
+  values:
+    # Matches: "Clave: X", "clave de acceso = X", "Clave del administrador: X".
+    # `clave` is the other everyday Spanish word for a password, and no upstream
+    # rule carries it. It is more ambiguous than `contraseña` (clave de
+    # licencia, clave de registro, gestor de claves), so this rule is stricter
+    # than the sibling above on both axes: the separator is mandatory, and the
+    # value must contain at least one digit or symbol. Measured against 30
+    # realistic Spanish AD `description` strings including those three decoys:
+    # zero matches on all of them, three of three on labelled secrets.
+    - (?i:(?:la\s+)?clave(?:\s+de\s+(?:acceso|usuario|entrada|conexi[oó]n))?(?:\s+(?:de[l]?\s+\S{1,20}|\S{1,20}))?\s*[:=])\s*(?P<quote>["'`]?)(?P<value>(?=\S{0,80}[0-9!@#$%^&*()_+=~.,;:?/-])[^\s"'{}\[\]<>]{6,80})(?P=quote)?
+  filter_type:
+    - ValueAllowlistCheck
+    - ValuePatternCheck(4)
+    - ValueDictionaryKeywordCheck
+    - LineGitBinaryCheck
+    - LineUUEPartCheck
+    - ValueFilePathCheck
+  use_ml: false
+  required_substrings:
+    - clave
   min_line_len: 12
   target:
     - code

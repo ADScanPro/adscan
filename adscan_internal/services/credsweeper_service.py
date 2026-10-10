@@ -136,6 +136,33 @@ FILESYSTEM_RULESET_EXCLUDED_RULE_NAMES = {
     "Token",
 }
 
+# Upstream rules that only declare ``target: ['code']`` (or ``['doc','code']``)
+# but whose keyword vocabulary is the ONLY one that covers a MISSPELLED or
+# abbreviated password label: the ``Password`` keyword regex matches the whole
+# ``pass``/``passwd``/``pswd``/``psswd``/``pw`` family, where every rule in the
+# document-oriented set below understands only the correctly-spelled stems.
+#
+# A measured false negative on a real engagement: a service account whose
+# ``description`` read "<prose> Psswd: <12-char secret>" was not reported,
+# because the double-s misspelling is absent from every allowed document rule.
+# Two conditions had to hold for the miss, and BOTH are addressed here: the
+# rule was filtered out of this profile, AND the LDAP-field scan runs in
+# CredSweeper's ``doc`` mode, where a ``target: ['code']`` rule never executes
+# even when it IS allowed. So the rule is admitted (via the allowed set) and
+# widened to ``['code', 'doc']`` by ``_transform_profiled_rule`` — the same
+# mechanism ``filesystem_text`` already uses for its narrative subset.
+#
+# Scope is deliberately narrow: only the password-bearing generic rules. The
+# wider generic family (Credential/Secret/Token/Key/Auth/API/Nonce/Salt) was
+# measured on a real 41-description corpus plus 46 hand-built negatives drawn
+# from the same field's real shapes, and it added NO recall over this set while
+# adding a false positive on narrative prose ("Credential owner: <team>").
+LDAP_DESCRIPTION_WIDENED_CODE_RULE_NAMES = {
+    "Password",
+    "CMD Password",
+    "SQL Password",
+}
+
 LDAP_DESCRIPTION_RULESET_ALLOWED_RULE_NAMES = {
     "DOC_GET",
     "DOC_CREDENTIALS",
@@ -144,7 +171,7 @@ LDAP_DESCRIPTION_RULESET_ALLOWED_RULE_NAMES = {
     "IP_ID_PASSWORD_TRIPLE",
     "ID_PAIR_PASSWD_PAIR",
     "ID_PASSWD_PAIR",
-}
+} | LDAP_DESCRIPTION_WIDENED_CODE_RULE_NAMES
 
 # Broad filesystem text scans run CredSweeper in ``doc=False`` mode because the
 # inputs are still plain-text files. However, a small subset of upstream
@@ -431,7 +458,10 @@ def _rule_targets_profile(rule: dict[str, Any], profile: str) -> bool:
     if profile == CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC:
         return "doc" in targets
     if profile == CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION:
-        return "doc" in targets
+        if "doc" in targets:
+            return True
+        rule_name = str(rule.get("name", "")).strip()
+        return rule_name in LDAP_DESCRIPTION_WIDENED_CODE_RULE_NAMES
     return True
 
 
@@ -444,20 +474,56 @@ def _transform_profiled_rule(rule: dict[str, Any], profile: str) -> dict[str, An
     ``['code', 'doc']`` in the generated profile.
     """
 
+    rule_name = str(rule.get("name", "")).strip()
+    targets = _normalize_credsweeper_targets(rule.get("target"))
+
+    if profile == CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION:
+        # LDAP-field scans run in ``doc`` mode, so a ``target: ['code']`` rule
+        # would be inert. Widen the password-bearing generic rules so their
+        # misspelling-tolerant vocabulary actually executes.
+        if rule_name not in LDAP_DESCRIPTION_WIDENED_CODE_RULE_NAMES:
+            return dict(rule)
+        if "doc" in targets and "code" in targets:
+            return dict(rule)
+        transformed_rule = dict(rule)
+        transformed_rule["target"] = ["code", "doc"]
+        return transformed_rule
+
     if profile != CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT:
         return dict(rule)
 
-    rule_name = str(rule.get("name", "")).strip()
     if rule_name not in FILESYSTEM_TEXT_NARRATIVE_RULE_NAMES:
         return dict(rule)
 
-    targets = _normalize_credsweeper_targets(rule.get("target"))
     if "doc" not in targets:
         return dict(rule)
 
     transformed_rule = dict(rule)
     transformed_rule["target"] = ["code", "doc"]
     return transformed_rule
+
+
+def _profile_selection_signature(profile: str) -> str:
+    """Return a stable fingerprint of the rule-selection inputs for one profile.
+
+    Feeds the generated-profile cache key so that changing an allow/exclude set
+    in this module invalidates the on-disk generated YAML instead of silently
+    serving the previous selection.
+
+    Args:
+        profile: Profile name the variant is being generated for.
+
+    Returns:
+        Short hex fingerprint of every rule-name set that profile consults.
+    """
+
+    parts = [
+        ",".join(sorted(FILESYSTEM_RULESET_EXCLUDED_RULE_NAMES)),
+        ",".join(sorted(FILESYSTEM_TEXT_NARRATIVE_RULE_NAMES)),
+        ",".join(sorted(LDAP_DESCRIPTION_RULESET_ALLOWED_RULE_NAMES)),
+        ",".join(sorted(LDAP_DESCRIPTION_WIDENED_CODE_RULE_NAMES)),
+    ]
+    return sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 def _build_profiled_rules_variant(
@@ -470,7 +536,17 @@ def _build_profiled_rules_variant(
     try:
         source_path = Path(source_rules_path).resolve()
         source_text = source_path.read_text(encoding="utf-8")
-        digest = sha256(f"{profile}:{source_text}".encode("utf-8")).hexdigest()[:12]
+        # The digest MUST cover every input that decides which rules survive,
+        # not just the upstream YAML: a generated profile is cached on disk
+        # under ``$ADSCAN_HOME/generated/credsweeper`` and reused forever when
+        # the name matches. Keying on the source text alone meant that editing
+        # the allow/exclude sets below changed nothing on an existing install —
+        # the stale file kept being served, so a rule-selection fix silently
+        # never shipped to anyone who had already run a scan.
+        selection_signature = _profile_selection_signature(profile)
+        digest = sha256(
+            f"{profile}:{selection_signature}:{source_text}".encode("utf-8")
+        ).hexdigest()[:12]
         output_dir = get_adscan_home() / "generated" / "credsweeper"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{source_path.stem}_{profile}_{digest}.yaml"

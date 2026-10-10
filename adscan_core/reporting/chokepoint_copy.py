@@ -285,6 +285,59 @@ def _reach_lead_sentence(
     )
 
 
+#: The ONE clause stating the key the ranked fixes are actually sorted by, for a
+#: surface that embeds it ("ranks them by ...").
+#:
+#: Why a constant. The Start Here spread used to state its sort key four
+#: different ways in the paid report and three in the free one, and two of those
+#: statements were the pre-2026-10-07 rule ("proven execution first"), which
+#: stopped being true when proof became a badge and never a sort key. A reader
+#: comparing two of those sentences cannot tell which one the list obeys, and the
+#: order is the whole instruction the section exists to give. One clause, one
+#: sentence builder, every surface.
+#:
+#: It names the key literally: ``compute_remediation_priorities`` sorts the
+#: exposure block by descending ``paths_affected``, then by ascending remediation
+#: complexity. Nothing about proof, because nothing about proof orders the list.
+REMEDIATION_ORDER_CLAUSE = (
+    "how many attack paths each one closes, cheapest first where two close the "
+    "same number"
+)
+
+#: The matching clause for the CONTAINMENT block, which is ordered by time
+#: criticality rather than by volume: a forged-ticket key outlives every password
+#: reset, an issued certificate outlives one, and a dumped hash does not.
+CONTAINMENT_ORDER_CLAUSE = (
+    "how long each exposure survives the response you would normally run"
+)
+
+
+def remediation_order_sentence(containment_count: int = 0) -> str:
+    """Return the ONE sentence stating the order the ranked fixes are in.
+
+    Every surface that tells the client what the Start Here order means renders
+    THIS sentence: the section subtitle, the table caption, the free report's
+    lead, and the roadmap that defers to it. Stating it once and in one wording
+    is the point, so do not paraphrase it at a call site.
+
+    Args:
+        containment_count: How many containment actions lead the list. Zero
+            yields the exposure rule alone.
+
+    Returns:
+        One or two human-grade English sentences. No em-dash.
+    """
+    if containment_count > 0:
+        actions_noun = "action" if containment_count == 1 else "actions"
+        return (
+            f"The first {containment_count:,} {actions_noun} contain key material "
+            f"that left your control during this assessment, ordered by "
+            f"{CONTAINMENT_ORDER_CLAUSE}. The fixes after them are ordered by "
+            f"{REMEDIATION_ORDER_CLAUSE}."
+        )
+    return f"The fixes are ordered by {REMEDIATION_ORDER_CLAUSE}."
+
+
 def reach_uniform_note(
     reach_pct: float,
     *,
@@ -303,7 +356,7 @@ def reach_uniform_note(
     When the absolute affected-user population is passed (``reach_users`` /
     ``reach_total``), the lead NAMES it ("1,141 of 1,141 affected users (100%)") so
     the people number is unmistakable, states the real ordering rule the rows then
-    follow (proven execution first, then attack paths broken), and appends the ONE
+    follow (:data:`REMEDIATION_ORDER_CLAUSE`, never a paraphrase), and appends the ONE
     :data:`OVERLAP_CAVEAT`: in the uniform case this lead is the single place the
     affected-user reach is stated, so the reduce-not-remove honesty rides here. The
     verb is SURFACE ("sit on an attack path that runs through"), never a protection
@@ -324,18 +377,21 @@ def reach_uniform_note(
         if reach_users is None:
             reach_users = reach_total
         users_noun = "affected user" if reach_users == 1 else "affected users"
+        # ONE line. This note sits above the ranked table, in the block with the
+        # most valuable real estate on the page, and it exists only because the
+        # lead metric happens not to discriminate in this engagement. Spending a
+        # paragraph on that made the reader parse an explanation before reaching
+        # the numbers that actually rank the rows. The overlap caveat is not
+        # repeated here: the headline SSOT states it once.
         return (
             f"{reach_users:,} of {reach_total:,} {users_noun} ({reach_pct:g}%) sit on "
-            f"an attack path that runs through the techniques below, so the people at "
-            f"stake are the same for every fix here. The fixes differ in how much of "
-            f"your validated attack surface each one removes, and that is the order "
-            f"below. {OVERLAP_CAVEAT}"
+            f"an attack path that runs through every fix below, so the order is by "
+            f"{REMEDIATION_ORDER_CLAUSE}."
         )
     return (
         f"Ordinary-user exposure funnels through the same chains, so the fixes "
         f"that carry an ordinary-user path all reach the same share ({reach_pct:g}%). "
-        f"Fixes below are ordered by proven execution first, then by how many "
-        f"attack paths each one breaks."
+        f"Fixes below are ordered by {REMEDIATION_ORDER_CLAUSE}."
     )
 
 
@@ -771,6 +827,7 @@ def remediation_start_here_headline(
     reach_total: int | None = None,
     reach_pct: float | None = None,
     reach_is_uniform: bool = False,
+    containment_count: int = 0,
 ) -> str:
     """Return the "Start here" lead sentence for the remediation section.
 
@@ -805,11 +862,33 @@ def remediation_start_here_headline(
         only in the affected-user reach lead (when a user population is present).
     """
     stance = "we mapped" if mapped else "we executed"
+    # The overlap caveat belongs to the REACH figure, and in the uniform case the
+    # figure moves out of here into the one-line note above the table. The caveat
+    # has to follow it rather than be dropped: a reader who sees "100% of your
+    # users" must also be told that closing one technique reduces a user's
+    # exposure without necessarily removing it. So it is appended to whichever
+    # branch runs, which keeps it stated exactly ONCE.
+    uniform_with_population = bool(reach_is_uniform and reach_total)
+    # CONTAINMENT leads the whole section when there is any, so the headline has
+    # to say so and say why: these rows are an incident clock, not a planning
+    # exercise, and the rest of the report cannot be effective while key material
+    # that left the client's control is still usable. The exposure ordering rule
+    # follows for the rows below it.
+    if containment_count > 0:
+        actions_noun = "action" if containment_count == 1 else "actions"
+        lead = (
+            f"Start here: the first {containment_count:,} {actions_noun} contain "
+            "key material that left your control during this assessment, and "
+            "nothing else in this report is effective while they are "
+            f"outstanding. The fixes after them are ordered by "
+            f"{REMEDIATION_ORDER_CLAUSE}."
+        )
+        return f"{lead} {OVERLAP_CAVEAT}" if uniform_with_population else lead
     # When reach is UNIFORM (every top fix reaches the same share of users), the
     # per-fix reach lead ranks nothing — the uniform note above the table states
-    # it once. The headline then leads with the REAL ordering rule: proven
-    # execution first, then attack paths broken. Fall through to the path-count
-    # lead below (skipping the reach lead) for exactly that reason.
+    # it once. The headline then leads with the REAL ordering rule
+    # (:data:`REMEDIATION_ORDER_CLAUSE`). Fall through to the path-count lead
+    # below (skipping the reach lead) for exactly that reason.
     if reach_is_uniform:
         reach_total = None
     if reach_total and reach_users is not None and reach_pct is not None:
@@ -831,16 +910,49 @@ def remediation_start_here_headline(
         # never per row.
         return f"{lead}. {OVERLAP_CAVEAT}"
 
+    # The ordering rule stated first, then the top fix's own count ATTRIBUTED to
+    # it. A bare "(1 of 2)" trailing the sentence read as a page counter beside a
+    # ten-row table; it meant the first fix breaks one of the two validated paths.
+    paths_noun = "attack path" if total_validated_paths == 1 else "attack paths"
     lead = (
-        f"Start here: these fixes break the most attack paths {stance} "
-        "against your domain"
+        f"Start here: these fixes are ordered by {REMEDIATION_ORDER_CLAUSE}"
     )
     if bounded:
-        return (
-            f"{lead}, among the routes we evaluated "
-            f"({top_paths_broken:,} of {total_validated_paths:,})."
-        )
-    return f"{lead} ({top_paths_broken:,} of {total_validated_paths:,})."
+        lead = f"{lead}, among the routes we evaluated"
+    sentence = (
+        f"{lead}. The first breaks {top_paths_broken:,} of the "
+        f"{total_validated_paths:,} {paths_noun} {stance} against your domain."
+    )
+    return (
+        f"{sentence} {OVERLAP_CAVEAT}" if uniform_with_population else sentence
+    )
+
+
+def containment_block_note(containment_count: int) -> str:
+    """Return the note introducing the containment block, or ``""``.
+
+    Containment is the actions required because key material left the client's
+    control during the assessment: a replicated krbtgt key, an issued
+    certificate, a dumped credential. It leads the section because it is an
+    incident clock rather than a planning exercise, and because the free report
+    already tells the client that nothing else is effective while it is
+    outstanding, which fought with a page-1 instruction to start closing
+    findings.
+
+    Args:
+        containment_count: How many containment actions lead the list. ``0``
+            yields ``""`` so a clean engagement shows no containment copy at all.
+
+    Returns:
+        One or two human-grade English sentences. No em-dash.
+    """
+    if containment_count <= 0:
+        return ""
+    return (
+        "Contain first: key material left your control during this assessment "
+        "and is still usable. Nothing else in this report is effective while "
+        "these are outstanding."
+    )
 
 
 def remediation_chain_note(tied_count: int) -> str:
@@ -859,11 +971,12 @@ def remediation_chain_note(tied_count: int) -> str:
 
     Returns:
         A single human-grade English sentence naming the tie and pointing the
-        client at the ordering rule this module applies in that case
-        (cheapest fix first). No percentage, no em-dash.
+        client at the part of the stated order that resolves it (the cheapest-first
+        tie-break in :data:`REMEDIATION_ORDER_CLAUSE`, deferred to rather than
+        reworded). No percentage, no em-dash.
     """
     return (
         f"The top {tied_count} fixes below sit on the same attack chain, so "
-        f"each one alone breaks every path it covers. They are ordered by "
-        f"how much effort each takes to apply, cheapest first."
+        f"each one alone breaks every path it covers and they all close the same "
+        f"number. The cheapest-first tie-break is what puts them in this order."
     )

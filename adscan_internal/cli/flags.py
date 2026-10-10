@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 import asyncio
+import json
 import os
 import re
 
@@ -231,13 +232,21 @@ def _save_flags_to_files(
     os.makedirs(flags_dir, exist_ok=True)
 
     user_flag = root_flag = system_flag = None
-    for kind, _path, flag in results:
+    # Where each flag was READ. The value alone answers "did we get it" and
+    # nothing else, so a writeup built from the workspace months later could
+    # list both flags and say nothing about where either came from. The path is
+    # known right here and was being discarded.
+    sources: dict[str, str] = {}
+    for kind, path, flag in results:
         if kind == "user" and user_flag is None:
             user_flag = flag
+            sources["user.txt"] = path
         elif kind == "root" and root_flag is None:
             root_flag = flag
+            sources["root.txt"] = path
         elif kind == "system" and system_flag is None:
             system_flag = flag
+            sources["system.txt"] = path
 
     def _persist(name: str, value: str | None, label: str) -> None:
         if value is None:
@@ -260,6 +269,21 @@ def _save_flags_to_files(
     # marker. If only system.txt exists, mirror it.
     if system_flag and not root_flag:
         _persist("root.txt", system_flag, "Privileged flag")
+        if "system.txt" in sources:
+            sources.setdefault("root.txt", sources["system.txt"])
+
+    # A sidecar rather than a second column in the value files, because those
+    # files are read verbatim by several consumers that expect the flag and
+    # nothing else.
+    if sources:
+        index = os.path.join(flags_dir, "flag_sources.json")
+        try:
+            with open(index, "w", encoding="utf-8") as fp:
+                json.dump(sources, fp, indent=1, sort_keys=True)
+        except Exception as exc:  # noqa: BLE001 - provenance is best-effort
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_warning_verbose(f"Failed to record flag provenance: {exc}")
 
 
 # ---------------------------------------------------------------------------

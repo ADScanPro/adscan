@@ -64,6 +64,77 @@ def configure_prompt_behavior(
     _PROMPT_USE_QUESTIONARY_IN_CONTAINER = use_questionary_in_container
 
 
+#: Attribute stamped on every ADscan prompt-logging wrapper so the installer can
+#: recognise one of its own and refuse to capture it as "the original".
+PROMPT_LOGGING_WRAPPER_FLAG = "_adscan_prompt_logging_wrapper"
+
+
+def mark_prompt_logging_wrapper(func: Any) -> Any:
+    """Stamp ``func`` as an ADscan prompt-logging wrapper and return it."""
+    try:
+        setattr(func, PROMPT_LOGGING_WRAPPER_FLAG, True)
+    except (AttributeError, TypeError):  # pragma: no cover - builtins/slots
+        pass
+    return func
+
+
+def is_prompt_logging_wrapper(func: Any) -> bool:
+    """Return whether ``func`` is one of ADscan's prompt-logging wrappers."""
+    return bool(getattr(func, PROMPT_LOGGING_WRAPPER_FLAG, False))
+
+
+def rich_genuine_ask(prompt_class_name: str) -> PromptAsk:
+    """Return rich's OWN ``ask`` for ``prompt_class_name``, bypassing wrappers.
+
+    Resolved from ``PromptBase.__dict__["ask"]`` and re-bound to the requested
+    subclass rather than read off the subclass attribute, because that
+    attribute may be an ADscan wrapper: reading it there is how a wrapper ends
+    up calling itself, recursing until ``RecursionError`` and (before this
+    seam existed) resolving an operator confirmation to its default with no
+    answer ever read.
+
+    Args:
+        prompt_class_name: ``"Prompt"`` / ``"Confirm"`` / ``"IntPrompt"`` /
+            ``"FloatPrompt"``.
+
+    Returns:
+        A callable with ``cls.ask``'s signature that runs rich's real prompt
+        loop for that subclass.
+    """
+    import rich.prompt as _rich_prompt
+
+    prompt_cls = getattr(_rich_prompt, prompt_class_name)
+    raw_ask = _rich_prompt.PromptBase.__dict__["ask"]
+    base_ask = getattr(raw_ask, "__func__", raw_ask)
+    if is_prompt_logging_wrapper(base_ask):  # pragma: no cover - defensive
+        raise RuntimeError(
+            "rich.prompt.PromptBase.ask is an ADscan wrapper; cannot resolve "
+            "rich's genuine prompt implementation."
+        )
+
+    def _genuine_ask(*args: Any, **kwargs: Any) -> Any:
+        return base_ask(prompt_cls, *args, **kwargs)
+
+    return _genuine_ask
+
+
+def resolve_original_ask(prompt_class_name: str) -> PromptAsk:
+    """Return the callable the wrapper installer should treat as the original.
+
+    Normally that is whatever ``cls.ask`` currently is, so a third-party
+    wrapper installed underneath ADscan keeps working. The one case it must
+    NOT be is an ADscan wrapper: capturing one of our own makes the wrapper
+    call itself. Resetting the installed flag then becomes recoverable
+    instead of poisonous.
+    """
+    import rich.prompt as _rich_prompt
+
+    current_ask = getattr(_rich_prompt, prompt_class_name).ask
+    if is_prompt_logging_wrapper(current_ask):
+        return rich_genuine_ask(prompt_class_name)
+    return current_ask
+
+
 def set_prompt_auto_mode(active: bool) -> None:
     """Enable or disable prompt auto-mode."""
     global _PROMPT_AUTO_MODE_ACTIVE
@@ -234,12 +305,8 @@ def logged_prompt_ask(
         )
 
     if answer is None:
-        if original_prompt_ask is None:
-            from rich.prompt import Prompt
-
-            answer = Prompt.ask(*prompt_args, **kwargs)
-        else:
-            answer = original_prompt_ask(*prompt_args, **kwargs)
+        resolved_prompt_ask = original_prompt_ask or rich_genuine_ask("Prompt")
+        answer = resolved_prompt_ask(*prompt_args, **kwargs)
 
     answer_text = "" if answer is None else str(answer)
     _log_prompt_answer(
@@ -321,9 +388,7 @@ def logged_numeric_prompt_ask(
         return resolved
 
     if original_prompt_ask is None:
-        import rich.prompt as _rich_prompt
-
-        original_prompt_ask = getattr(_rich_prompt, rich_prompt_name).ask
+        original_prompt_ask = rich_genuine_ask(rich_prompt_name)
     answer = original_prompt_ask(*prompt_args, **kwargs)
 
     _log_prompt_answer(
@@ -425,12 +490,8 @@ def logged_confirm_ask(
             f"[confirm] Active asyncio event loop detected; using Rich confirm fallback for '{prompt_message}'."
         )
 
-    if original_confirm_ask is None:
-        from rich.prompt import Confirm
-
-        answer = Confirm.ask(*confirm_args, **kwargs)
-    else:
-        answer = original_confirm_ask(*confirm_args, **kwargs)
+    resolved_confirm_ask = original_confirm_ask or rich_genuine_ask("Confirm")
+    answer = resolved_confirm_ask(*confirm_args, **kwargs)
 
     resolved = bool(answer)
     _log_confirm_answer(prompt_message, resolved, telemetry=telemetry, debug=debug)

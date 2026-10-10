@@ -40,6 +40,7 @@ from adscan_core.rich_output import print_exception
 _NETNTLM_MODES: frozenset[str] = frozenset({"5500", "5600"})
 _KERBEROAST_MODES: frozenset[str] = frozenset({"13100", "19600", "19700"})
 _ASREP_MODES: frozenset[str] = frozenset({"18200", "19800", "19900"})
+_NT_MODE = "1000"
 
 # NetNTLM version, so the "cracking…" row can still label NTLMv1/v2 (the roast
 # modes carry no NTLM version).
@@ -70,16 +71,30 @@ def parse_cracking_job_scope(scope: str) -> tuple[str, str]:
     return user, mode
 
 
-def _source_for_mode(mode: str) -> str:
-    """Infer the likely harvest source for a running crack from its mode."""
+def harvest_source_for_mode(mode: str) -> str:
+    """Resolve the harvest source for a crack from its hashcat mode.
+
+    The SSOT both the in-progress row and the drained-result persist read, so a
+    cracked roast or NT hash can no longer be filed under broadcast poisoning
+    just because that was the first surface this subsystem served. Returns a
+    :data:`~adscan_internal.services.credential_harvest_record.HARVEST_SOURCES`
+    member; an unrecognised mode falls back to ``"poisoning"``, which is where
+    an unlabelled background crack historically came from.
+    """
     m = str(mode or "").strip()
     if m in _KERBEROAST_MODES:
         return "kerberoasting"
     if m in _ASREP_MODES:
         return "asreproasting"
+    if m == _NT_MODE:
+        return "offline_crack"
     if m in _NETNTLM_MODES:
         return "poisoning"
     return "poisoning"
+
+
+#: Backwards-compatible private alias for the SSOT above.
+_source_for_mode = harvest_source_for_mode
 
 
 def build_in_progress_harvest_records(

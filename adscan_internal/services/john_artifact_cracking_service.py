@@ -20,6 +20,12 @@ from adscan_internal.services.base_service import BaseService
 
 CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
 
+#: Headroom over a ``--max-run-time`` cap for the subprocess timeout. John stops
+#: and writes its pot on its own at the cap; the timeout exists only so a John
+#: that outlives its own limit is still bounded, and so it must sit ABOVE the cap
+#: rather than racing it (a kill mid-write would lose the recovered plaintexts).
+_MAX_RUN_TIME_TIMEOUT_HEADROOM_SECONDS = 60
+
 
 def _shell_quote(arg: str) -> str:
     """Quote one argument for the CURRENT OS's command shell.
@@ -343,6 +349,7 @@ class JohnArtifactCrackingService(BaseService):
         rules: str | None = None,
         john_config: str | None = None,
         timeout: int = 300,
+        max_run_time: int | None = None,
         _hash_file_reader: Callable[[str], str] | None = None,
     ) -> dict[str, str]:
         """Crack a multi-principal roast/NetNTLM hash file with John (CPU).
@@ -371,6 +378,14 @@ class JohnArtifactCrackingService(BaseService):
                 this is ``None`` the bundled conf path is resolved as a fallback so
                 the section is always found.
             timeout: Per-invocation subprocess timeout in seconds.
+            max_run_time: Wall-clock ceiling for the CRACK pass, emitted as
+                John's own ``--max-run-time=<n>``. John stops gracefully at that
+                point with the pot already written, so the ``--show`` read below
+                still recovers everything it found. ``None`` (the default, and
+                every caller that is not spending the operator's own wall clock)
+                emits no flag and leaves the pass uncapped. When set, the
+                subprocess timeout is raised above it so it never races the
+                graceful stop.
             _hash_file_reader: Test seam to inject the capture-file reader.
 
         Returns:
@@ -429,9 +444,25 @@ class JohnArtifactCrackingService(BaseService):
         session_fragment = (
             f"--session={_shell_quote(unique_crack_session_name('adscan-john'))} "
         )
+        # A blocking caller's budget becomes John's OWN graceful stop. Omitted
+        # entirely when unset, so an uncapped pass stays byte-identical.
+        capped_run_time = (
+            int(max_run_time)
+            if max_run_time is not None and int(max_run_time) > 0
+            else 0
+        )
+        runtime_fragment = (
+            f"--max-run-time={capped_run_time} " if capped_run_time else ""
+        )
+        crack_timeout = (
+            max(int(timeout), capped_run_time + _MAX_RUN_TIME_TIMEOUT_HEADROOM_SECONDS)
+            if capped_run_time
+            else int(timeout)
+        )
         crack_command = (
             f"{_shell_quote(self._john_path)} --format={_shell_quote(normalized_format)} "
             f"{session_fragment}"
+            f"{runtime_fragment}"
             f"{rules_fragment}"
             f"--pot={quoted_pot} "
             f"--wordlist={_shell_quote(wordlist_path)} {_shell_quote(john_input_file)}"
@@ -442,7 +473,7 @@ class JohnArtifactCrackingService(BaseService):
             f"wordlist={marked_wordlist}"
         )
         crack_completed = self._command_executor(
-            crack_command, timeout=timeout, use_clean_env=True
+            crack_command, timeout=crack_timeout, use_clean_env=True
         )
         show_command = (
             f"{_shell_quote(self._john_path)} --format={_shell_quote(normalized_format)} "

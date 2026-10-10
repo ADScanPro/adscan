@@ -492,6 +492,145 @@ def classify_origin_acquisition(origin: str) -> CredentialAcquisition:
     return CredentialAcquisition.EXECUTED
 
 
+class CredentialProvenanceStrength(str, Enum):
+    """How strong the evidence is that a stored secret is genuine material.
+
+    Orthogonal to :class:`CredentialAcquisition`, which answers "did ADscan act
+    against the environment". This answers "do we know this string is real key
+    material for this principal", which is what governs whether a later failed
+    verification is allowed to destroy it.
+    """
+
+    #: Read out of an authoritative secret store (directory replication, a
+    #: registry/LSASS/NTDS read, a LAPS/gMSA attribute) or proven by an act that
+    #: can only succeed with the real secret (an authenticating spray, an
+    #: offline crack validated against the captured material). A later rejection
+    #: of a DIFFERENT secret, or a rejection explained by rotation, lockout or
+    #: policy, is not evidence against it.
+    PROVEN = "proven"
+
+    #: A string observed in content and not yet proven to be anyone's password:
+    #: a directory ``description`` field, a GPP blob, a file on a share, a
+    #: browser store. Useful as a spray candidate; never treated as held key
+    #: material.
+    CANDIDATE = "candidate"
+
+    #: Nothing recorded, or an origin that is neither (an operator-supplied
+    #: secret, a session harvest). Treated as the neutral middle.
+    UNKNOWN = "unknown"
+
+
+#: Origins whose secret is PROVEN material by construction. Deliberately
+#: evidence-based, mirroring :data:`DERIVED_ORIGINS`: an origin belongs here
+#: only when the code path either reads the secret from an authoritative store
+#: or validates it before persisting.
+PROVEN_PROVENANCE_ORIGINS: frozenset[str] = frozenset(
+    _normalize_origin(origin)
+    for origin in (
+        # Directory replication / database extraction.
+        ORIGIN_DCSYNC,
+        ORIGIN_NTDS,
+        ORIGIN_SECRETSDUMP,
+        "getchanges",
+        "getchangesall",
+        "getchangesinfilteredset",
+        # Host secret stores.
+        ORIGIN_SAM_DUMP,
+        ORIGIN_LSASS_DUMP,
+        ORIGIN_LSA_SECRETS,
+        ORIGIN_DPAPI,
+        "dumplsass",
+        "dumplsa",
+        "dumpdpapi",
+        ORIGIN_BACKUP_OPERATORS,
+        # Directory attributes that hold the secret itself.
+        ORIGIN_GMSA,
+        "readgmsapassword",
+        ORIGIN_READ_LAPS,
+        ORIGIN_SYNC_LAPS,
+        ORIGIN_RODC_KEY_LIST,
+        "kerberoskeylist",
+        ORIGIN_MACHINE_ACCOUNT,
+        # Validated offline resolution of captured material.
+        ORIGIN_KERBEROAST,
+        ORIGIN_ASREPROAST,
+        ORIGIN_TIMEROAST,
+        ORIGIN_OFFLINE_CRACK,
+        ORIGIN_NTLMV2_CAPTURE_CRACK,
+        ORIGIN_NTLMV1_CAPTURE_CRACK,
+        # Authenticating acts: the secret is only persisted after it worked.
+        ORIGIN_SPRAY,
+        ORIGIN_PASSWORD_SPRAY,
+        ORIGIN_USERNAME_AS_PASSWORD,
+        ORIGIN_BLANK_PASSWORD,
+        ORIGIN_COMPUTER_PRE2K,
+        ORIGIN_CREDENTIAL_REUSE,
+        ORIGIN_LOCAL_CRED_RETRY,
+    )
+)
+
+#: Origins whose secret is a scraped CANDIDATE: observed in content, never yet
+#: proven against the domain. A rejection of one of these is honest evidence
+#: that THAT string is not that principal's password, so it may be removed as
+#: that principal's credential (and is demoted to a spray candidate instead of
+#: being discarded).
+CANDIDATE_PROVENANCE_ORIGINS: frozenset[str] = frozenset(
+    _normalize_origin(origin)
+    for origin in (
+        ORIGIN_USER_DESCRIPTION,
+        "userdescription",
+        ORIGIN_GPP_CPASSWORD,
+        ORIGIN_GPP_AUTOLOGON,
+        "gpppassword",
+        "autologon",
+        ORIGIN_PASSWORD_IN_SHARES,
+        "passwordinshare",
+        "passwordinfile",
+        ORIGIN_PASSWORD_IN_KEEPASS,
+        ORIGIN_BROWSER_CREDENTIAL_STORE,
+    )
+)
+
+
+def classify_origin_provenance_strength(origin: str) -> CredentialProvenanceStrength:
+    """Return the provenance strength for a raw origin slug.
+
+    Args:
+        origin: Raw machine-readable origin slug.
+
+    Returns:
+        :attr:`CredentialProvenanceStrength.PROVEN` for material read from an
+        authoritative store or validated by an act that needs the real secret;
+        :attr:`CredentialProvenanceStrength.CANDIDATE` for a scraped string;
+        :attr:`CredentialProvenanceStrength.UNKNOWN` for anything else,
+        including an empty slug.
+    """
+    normalized = _normalize_origin(origin)
+    if not normalized:
+        return CredentialProvenanceStrength.UNKNOWN
+    if normalized in PROVEN_PROVENANCE_ORIGINS:
+        return CredentialProvenanceStrength.PROVEN
+    if normalized in CANDIDATE_PROVENANCE_ORIGINS:
+        return CredentialProvenanceStrength.CANDIDATE
+    return CredentialProvenanceStrength.UNKNOWN
+
+
+def rank_provenance_strength(strength: Any) -> int:
+    """Return a comparable rank for a provenance strength (higher is stronger).
+
+    ``PROVEN`` (2) outranks ``UNKNOWN`` (1) outranks ``CANDIDATE`` (0). Accepts
+    the enum, its string value, or anything unrecognised (treated as
+    ``UNKNOWN``) so persisted workspaces and legacy callers compare safely.
+    """
+    text = getattr(strength, "value", strength)
+    normalized = str(text or "").strip().lower()
+    if normalized == CredentialProvenanceStrength.PROVEN.value:
+        return 2
+    if normalized == CredentialProvenanceStrength.CANDIDATE.value:
+        return 0
+    return 1
+
+
 def build_method_set(primary_origin: str, recorded_origins: Any) -> list[dict[str, str]]:
     """Return the ordered, de-duplicated method set for one credential.
 

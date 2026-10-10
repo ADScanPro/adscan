@@ -741,14 +741,83 @@ def run_native_collection(
         # variables.json. See _ensure_shell_domain_context for why the automated
         # scan path leaves it unset otherwise.
         _ensure_shell_domain_context(shell, target_domain)
+        # Gate the ADCS-ESC finding set BEFORE anything reads or persists it.
+        # _populate_adcs_metadata writes the domains_data ADCS flags the ESC15
+        # CA-resolution consumes, so it must run first; _run_esc15_confirmation_phase
+        # then confirms each ESC15 candidate and removes a hardened (CVE-2024-49019
+        # patched) edge from the saved graph. This block MUST precede
+        # _print_collection_summary_from_graph (whose tactical-findings panel counts
+        # ADCSESC* edges) and _persist_collector_findings, or a patched CA shows a
+        # false-positive "ADCS ESC paths" count in the live panel for an edge the
+        # confirm dismisses moments later. Both calls depend only on the shell
+        # domain context, the in-memory collector_result, and the already-persisted
+        # attack graph — nothing the persist calls below produce — so running them
+        # here is correct. Opt-out: ADSCAN_NO_ESC15_CONFIRM.
+        _populate_adcs_metadata(shell, target_domain, collector_result)
+        _run_esc15_confirmation_phase(
+            shell,
+            target_domain,
+            credential=credential,
+            dc_ip=dc_ip,
+            auth_domain=resolved_auth_domain,
+            auth_kdc=auth_kdc,
+        )
+        # ESC14 (weak explicit certificate mapping) active confirmation — same
+        # early position as the ESC15 confirm, for the same reason: the decisive
+        # existence condition (the DCs' StrongCertificateBindingEnforcement mode)
+        # is invisible to passive LDAP, so this non-destructive registry read must
+        # gate the ADCSESC14 edges BEFORE the tactical-findings panel counts them
+        # and before the findings are persisted. Opt-out: ADSCAN_NO_ESC14_CONFIRM.
+        _run_esc14_confirmation_phase(
+            shell,
+            target_domain,
+            credential=credential,
+            dc_ip=dc_ip,
+            auth_domain=resolved_auth_domain,
+            auth_kdc=auth_kdc,
+        )
+        # ESC9 / ESC10 (implicit certificate mapping) active confirmation — same
+        # early position and reason as the ESC14/ESC15 confirms: the decisive
+        # existence condition (the DCs' StrongCertificateBindingEnforcement mode) is
+        # invisible to passive LDAP, so this non-destructive probe must gate the
+        # ADCSESC9 / ADCSESC10 edges BEFORE the tactical-findings panel counts them
+        # and before the findings are persisted. It reuses the SCBE read the ESC14
+        # confirm just memoized (shared observation SSOT), so the DC registry is
+        # probed once per scan. Opt-out: ADSCAN_NO_ESC9_CONFIRM.
+        _run_esc9_confirmation_phase(
+            shell,
+            target_domain,
+            credential=credential,
+            dc_ip=dc_ip,
+            auth_domain=resolved_auth_domain,
+            auth_kdc=auth_kdc,
+        )
         _print_collection_summary_from_graph(shell, target_domain, elapsed)
         _print_collector_enrichment_panel(collector_result, target_domain, shell=shell)
         _persist_collector_findings(shell, target_domain, collector_result)
         _persist_defensive_posture_inventory(
             shell, target_domain, collector_result, _workspace_root
         )
+        # Record the client-facing endpoint-defense block from what collection
+        # just observed. The dump paths record it again after each attempt;
+        # this call is what makes a collection-only scan (no credential dump
+        # anywhere) still report which hosts were examined, rather than
+        # omitting the section as though nothing had been looked at.
+        try:
+            from adscan_internal.services.endpoint_defense_attempts import (
+                record_endpoint_defense_for_domain,
+            )
+
+            record_endpoint_defense_for_domain(shell, target_domain)
+        except Exception as exc:  # noqa: BLE001 — never break collection
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         _persist_machine_pwd_rotation_interval(shell, target_domain, collector_result)
-        _populate_adcs_metadata(shell, target_domain, collector_result)
+        # ADCS metadata + ESC15 (EKUwu / CVE-2024-49019) confirmation moved EARLIER
+        # — see the block right after _ensure_shell_domain_context above. The passive
+        # LDAP detector cannot see the CA's patch state, so the active confirmation
+        # must gate the graph BEFORE the tactical-findings panel counts ADCSESC*
+        # edges and before the findings are persisted.
         # Unified Phase-2 reachability: now that the graph (and enabled_computers)
         # exist, run the single nmap port scan that feeds every collector + the
         # post-auth sweeps + the Phase-3 reachability UI. render=False (Phase 3
@@ -1196,6 +1265,111 @@ def _persist_defensive_posture_inventory(
         print_info_debug(f"[intelligence] defensive posture inventory write failed: {exc}")
 
 
+def _record_recovered_password_finding(
+    shell: Any,
+    domain: str,
+    result: Any,
+    safe_record: Any,
+) -> None:
+    """Record the measured password-recovery outcome as a client finding.
+
+    Intersects the accounts whose plaintext password this run holds with the
+    ENABLED-user population, through the pure derivation in
+    ``collector.audit_analyzer``. The ratio is against enabled users because that
+    is the population the client can act on and the only denominator they can
+    check against their own directory, and the severity keys on the admin-like
+    count rather than the volume.
+
+    Method-neutral by design: a password resolved by a public breach-corpus
+    lookup and one resolved by a local wordlist attack are the same exposure to
+    the client. Which method ran is declared once, separately, by the cracking
+    coverage block.
+    """
+    from adscan_internal.services.collector.audit_analyzer import (  # noqa: PLC0415
+        RECOVERED_PASSWORD_FINDING_KEY,
+        build_recovered_password_summary,
+    )
+    from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+        looks_like_ntlm_hash,
+    )
+
+    domain_data = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    credentials = domain_data.get("credentials")
+    if not isinstance(credentials, dict) or not credentials:
+        return
+
+    # A recovered PLAINTEXT only. A stored NT hash is not a recovered password,
+    # and a ccache path is a ticket rather than a secret the user types.
+    recovered: set[str] = set()
+    for username, secret in credentials.items():
+        value = str(secret or "").strip()
+        if not value or looks_like_ntlm_hash(value):
+            continue
+        if value.endswith(".ccache") or "/" in value or "\\" in value:
+            continue
+        name = str(username or "").strip()
+        if name:
+            recovered.add(name)
+    if not recovered:
+        return
+
+    compliance = getattr(result, "password_compliance", None)
+    entries = list(getattr(compliance, "entries", None) or ())
+    enabled = {
+        str(getattr(entry, "samaccountname", "") or "").strip()
+        for entry in entries
+        if str(getattr(entry, "samaccountname", "") or "").strip()
+    }
+    admin_like = {
+        str(getattr(entry, "samaccountname", "") or "").strip()
+        for entry in entries
+        if getattr(entry, "is_admin_like", False)
+        and str(getattr(entry, "samaccountname", "") or "").strip()
+    }
+    if not enabled:
+        # No enabled-user population read, so there is no denominator the client
+        # could verify. Reporting a bare count against an unknown population is
+        # the kind of unanchored figure this finding exists to replace.
+        return
+
+    summary = build_recovered_password_summary(
+        enabled_usernames=enabled,
+        admin_like_usernames=admin_like,
+        recovered_usernames=recovered,
+    )
+    if not summary.should_report:
+        return
+
+    safe_record(
+        key=RECOVERED_PASSWORD_FINDING_KEY,
+        details={
+            "enabled_recovered": summary.enabled_recovered,
+            "enabled_total": summary.enabled_total,
+            "enabled_pct": summary.enabled_pct,
+            # Drives the contextual elevation to critical.
+            "admin_like_recovered": summary.admin_like_recovered,
+            "recovered_total": summary.recovered_total,
+            # The accounts themselves, so the affected-assets block names real
+            # objects and the remediation commands fill with them. Administrative
+            # accounts first: they are the ones that make this an incident.
+            "accounts": [
+                {"samaccountname": name, "is_admin_like": True}
+                for name in summary.admin_like_recovered_usernames
+            ]
+            + [
+                {"samaccountname": name, "is_admin_like": False}
+                for name in summary.enabled_recovered_usernames
+                if name not in set(summary.admin_like_recovered_usernames)
+            ],
+            "username": (
+                summary.admin_like_recovered_usernames[0]
+                if summary.admin_like_recovered_usernames
+                else summary.enabled_recovered_usernames[0]
+            ),
+        },
+    )
+
+
 def _persist_collector_findings(
     shell: Any,
     domain: str,
@@ -1284,13 +1458,43 @@ def _persist_collector_findings(
             emit_domain_policy_positives,
         )
 
-        emit_domain_policy_positives(shell, domain, getattr(result, "domain_policy", None))
+        # ``psos`` so the reversible-storage positive checks BOTH policy scopes
+        # the negative finding checks (domain root + every fine-grained policy),
+        # which is what makes that green earned rather than assumed from the
+        # domain default alone.
+        emit_domain_policy_positives(
+            shell,
+            domain,
+            getattr(result, "domain_policy", None),
+            psos=getattr(result, "psos", None),
+        )
     except Exception as exc:  # noqa: BLE001 — positive emit never breaks persistence
         from adscan_internal import telemetry as _tel
 
         _tel.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"[intelligence] domain policy positives emit failed: {exc}")
+
+    # ── Recovered account passwords (the measured password-recovery outcome) ──
+    # The run's most client-actionable output had no finding at all: 227 cleartext
+    # passwords, 122 on currently-enabled accounts out of 1,172, 4 of them
+    # administrative, and the report carried only policy and hygiene findings
+    # derived from directory attributes. The outcome reached the client as rows in
+    # a credential appendix.
+    #
+    # Recorded HERE because the derivation needs both halves and this is the one
+    # seam that holds them: the collection result (the enabled-user population and
+    # the is_admin_like flags) and the shell (the credential store holding what was
+    # actually recovered). The derivation itself is pure and lives with the other
+    # audit analysis.
+    try:
+        _record_recovered_password_finding(shell, domain, result, _safe_record)
+    except Exception as exc:  # noqa: BLE001 — a finding never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] recovered-password finding failed: {exc}")
 
     # ── Shadow credentials ────────────────────────────────────────────────
     shadow = getattr(result, "shadow_credential_findings", None) or []
@@ -1376,6 +1580,54 @@ def _persist_collector_findings(
                     for f in http_spn
                 ],
                 "principals": [getattr(f, "samaccountname", "") for f in http_spn],
+            },
+        )
+
+    # ── Decommissioned CA still trusted in NTAuthCertificates ──────────────
+    # A CA whose host is gone (NXDOMAIN + no Computer object) but whose own
+    # certificate is STILL in CN=NTAuthCertificates: AD keeps trusting
+    # certificates that retired authority issued for authentication (PKINIT).
+    # HONEST / CONDITIONAL — ADscan observes the trust anchor, not the retired
+    # key's custody, so whether it can be realized depends on key recovery
+    # (a property of how the CA host was decommissioned). Emitted in ALL scopes
+    # (real exposure, not audit-only). The canonical key is gated into the web
+    # CTEM by ``VULN_CATALOG_META`` (drift-locked), so this single emit reaches
+    # the PDF and the web product.
+    orphaned_ntauth_cas = [
+        node
+        for node in getattr(result, "nodes", {}).values()
+        if str(getattr(node, "kind", "")) == "EnterpriseCA"
+        and getattr(node, "properties", {}).get("is_orphaned_ca")
+        and getattr(node, "properties", {}).get("in_ntauth_store")
+    ]
+    if orphaned_ntauth_cas:
+        cas_evidence: list[dict[str, Any]] = []
+        for ca in orphaned_ntauth_cas:
+            props = getattr(ca, "properties", {}) or {}
+            thumbprints = [str(t) for t in (props.get("ntauth_thumbprints") or [])]
+            if not thumbprints and props.get("ntauth_thumbprint"):
+                thumbprints = [str(props.get("ntauth_thumbprint"))]
+            cas_evidence.append(
+                {
+                    "ca_host": str(props.get("dns_hostname") or ""),
+                    "ca_object_dn": str(getattr(ca, "distinguished_name", "") or ""),
+                    "thumbprints": thumbprints,
+                }
+            )
+        _safe_record(
+            key="adcs_orphaned_ca_ntauth",
+            details={
+                "count": len(cas_evidence),
+                "certificate_authorities": cas_evidence,
+                "ca_hosts": [c["ca_host"] for c in cas_evidence if c["ca_host"]],
+                # First matched thumbprint across the affected CAs — surfaced for
+                # the operator; the remediation command keeps the <THUMBPRINT>
+                # fill-in because the admin removes each thumbprint the NTAuth
+                # viewstore lists (there may be more than one).
+                "thumbprint": next(
+                    (t for c in cas_evidence for t in c["thumbprints"]),
+                    "",
+                ),
             },
         )
 
@@ -1501,6 +1753,117 @@ def _populate_adcs_metadata(shell: Any, domain: str, result: Any) -> None:
         )
 
 
+def _run_esc15_confirmation_phase(
+    shell: Any,
+    domain: str,
+    *,
+    credential: Any,
+    dc_ip: str | None,
+    auth_domain: str | None,
+    auth_kdc: str | None,
+) -> None:
+    """Confirm ESC15 candidates for ``domain`` and gate their graph edges.
+
+    Thin bridge to the collection-stage confirmation phase. Best-effort: a
+    failure must never abort collection (the phase itself swallows errors and
+    leaves the edge confirmation-pending, the honest default).
+    """
+    try:
+        from adscan_internal.cli.esc15_confirmation_phase import (
+            run_esc15_confirmation_phase,
+        )
+
+        run_esc15_confirmation_phase(
+            shell,
+            domain,
+            credential=credential,
+            dc_ip=dc_ip,
+            auth_domain=auth_domain,
+            auth_kdc=auth_kdc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[intelligence] ESC15 confirmation phase failed for "
+            f"{mark_sensitive(domain, 'domain')}: {exc}"
+        )
+
+
+def _run_esc14_confirmation_phase(
+    shell: Any,
+    domain: str,
+    *,
+    credential: Any,
+    dc_ip: str | None,
+    auth_domain: str | None,
+    auth_kdc: str | None,
+) -> None:
+    """Confirm ESC14 candidates for ``domain`` and gate their graph edges.
+
+    Thin bridge to the collection-stage confirmation phase. Best-effort: a
+    failure must never abort collection (the phase itself swallows errors and
+    leaves the edge confirmation-pending, the honest default).
+    """
+    try:
+        from adscan_internal.cli.esc14_confirmation_phase import (
+            run_esc14_confirmation_phase,
+        )
+
+        run_esc14_confirmation_phase(
+            shell,
+            domain,
+            credential=credential,
+            dc_ip=dc_ip,
+            auth_domain=auth_domain,
+            auth_kdc=auth_kdc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[intelligence] ESC14 confirmation phase failed for "
+            f"{mark_sensitive(domain, 'domain')}: {exc}"
+        )
+
+
+def _run_esc9_confirmation_phase(
+    shell: Any,
+    domain: str,
+    *,
+    credential: Any,
+    dc_ip: str | None,
+    auth_domain: str | None,
+    auth_kdc: str | None,
+) -> None:
+    """Confirm ESC9/10 candidates for ``domain`` and gate their graph edges.
+
+    Thin bridge to the collection-stage confirmation phase. Best-effort: a
+    failure must never abort collection (the phase itself swallows errors and
+    leaves the edges confirmation-pending, the honest default).
+    """
+    try:
+        from adscan_internal.cli.esc9_confirmation_phase import (
+            run_esc9_confirmation_phase,
+        )
+
+        run_esc9_confirmation_phase(
+            shell,
+            domain,
+            credential=credential,
+            dc_ip=dc_ip,
+            auth_domain=auth_domain,
+            auth_kdc=auth_kdc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[intelligence] ESC9 confirmation phase failed for "
+            f"{mark_sensitive(domain, 'domain')}: {exc}"
+        )
+
+
 def _print_collection_summary_from_graph(
     shell: Any, domain: str, elapsed: float
 ) -> None:
@@ -1549,7 +1912,9 @@ def _print_collection_summary_from_graph(
                 elapsed_seconds=elapsed,
             )
         )
-        _print_tactical_findings(domain, nodes, edges)
+        _print_tactical_findings(
+            domain, nodes, edges, getattr(shell, "domains_data", None)
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -1560,12 +1925,13 @@ def _print_tactical_findings(
     domain: str,
     nodes: dict[str, Any],
     edges: list[dict[str, Any]],
+    domains_data: Any = None,
 ) -> None:
     """Build and render the post-collection tactical findings panel."""
     try:
         from adscan_core.rich_output_collection import print_tactical_findings
 
-        tf = _build_tactical_findings(domain, nodes, edges)
+        tf = _build_tactical_findings(domain, nodes, edges, domains_data)
         print_tactical_findings(tf)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -1759,7 +2125,7 @@ def _select_shadow_credential_rows(
     for finding in findings:
         object_id = str(getattr(finding, "object_id", "") or "")
         node = nodes.get(object_id.upper()) if object_id else None
-        is_tier0 = bool(getattr(node, "highvalue", False))
+        is_tier0 = _node_is_tier0_stamped(node)
         enriched.append(
             _ShadowRow(
                 samaccountname=str(getattr(finding, "samaccountname", "") or ""),
@@ -2038,8 +2404,37 @@ def _node_display_name(node: dict[str, Any]) -> str:
     return fallback
 
 
+def _node_is_tier0_stamped(node: Any) -> bool:
+    """Return whether a graph node is Tier 0 via the stamped ``privilege_tier`` SSOT.
+
+    Reads the membership+ACL-aware STAMPED ``privilege_tier``
+    (:func:`~adscan_internal.services.compromise_class.node_is_tier0_by_stamped_label`),
+    so this surface inherits the full tiering: the AAD Connect / MSOL sync-account
+    Tier-0 promotion, the Exchange control plane, Account/Backup/Server/Print
+    Operators and the RODC class — a signal the legacy raw ``isTierZero`` /
+    ``highvalue`` collector flags miss. Falls back to those legacy raw flags ONLY
+    when the node carries no stamp (an older graph, or a synthetic node), so a
+    stamped graph never reads a stale raw tag. Never raises.
+    """
+    from adscan_internal.services.compromise_class import (
+        node_is_tier0_by_stamped_label,
+        node_stamped_privilege_tier,
+    )
+
+    if not isinstance(node, dict):
+        return False
+    if node_stamped_privilege_tier(node) is not None:
+        return node_is_tier0_by_stamped_label(node)
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return (
+        bool(node.get("isTierZero"))
+        or bool((props or {}).get("isTierZero"))
+        or bool(node.get("highvalue"))
+    )
+
+
 def _node_is_high_value(node: dict[str, Any]) -> bool:
-    if node.get("highvalue"):
+    if _node_is_tier0_stamped(node):
         return True
     kind = str(node.get("kind") or "")
     if kind == "Domain":
@@ -2333,7 +2728,10 @@ def _node_tier0_asset_role(node: dict[str, Any]) -> str | None:
     if bool(node.get("is_dc")) or bool(props.get("is_dc")):
         return "DC"
 
-    is_tier0 = bool(props.get("isTierZero")) or bool(node.get("isTierZero"))
+    # Read the membership+ACL-aware STAMPED privilege_tier SSOT (never the raw
+    # isTierZero flag). Falls back to the legacy raw flags only for an unstamped
+    # node (see _node_is_tier0_stamped).
+    is_tier0 = _node_is_tier0_stamped(node)
 
     if kind == "Computer":
         if _name_matches_role(name, _EXCHANGE_NAME_FRAGMENTS):
@@ -2436,17 +2834,118 @@ def _compute_finding_severity(
     return sev.value, target_role, target_is_t0_asset, src_unauth
 
 
+def _note_flag_is_true(value: Any) -> bool:
+    """Interpret a note value (bool / ``"1"`` / ``"true"`` / ...) as truthy."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _adcs_edge_display_status(edge: dict[str, Any]) -> str:
+    """Return the operator-facing display status for an ``ADCSESC*`` edge.
+
+    Maps the edge's raw status plus any collection-stage ESC14/ESC15 confirm
+    marker to one honest Exposure-Validation token. Proven wins (the engine's
+    ``_PROVEN_STATUSES`` SSOT → ``confirmed``); a ``not_vulnerable`` edge is a
+    patched/positive-control ``hardened``; a ``confirmation_pending`` note or an
+    ``unsupported`` (data-gap) status is ``confirmation-pending``; ``attempted``
+    stays ``attempted`` and never attributes the stop to a defensive control;
+    everything else (``discovered`` / unset) is ``theoretical``.
+    """
+    from adscan_internal.services.path_state import _PROVEN_STATUSES
+
+    status = str(edge.get("status") or "").strip().lower()
+    notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+    if status in _PROVEN_STATUSES:
+        return "confirmed"
+    if _note_flag_is_true(notes.get("esc15_confirmed")) or _note_flag_is_true(
+        notes.get("esc14_confirmed")
+    ):
+        return "confirmed"
+    if status == "not_vulnerable":
+        return "hardened"
+    if _note_flag_is_true(notes.get("confirmation_pending")) or status == "unsupported":
+        return "confirmation-pending"
+    if status == "attempted":
+        return "attempted"
+    return "theoretical"
+
+
+def _cn_from_dn(dn: str) -> str:
+    """Extract the leaf CN value from a distinguished name, else ``""``."""
+    first = str(dn or "").split(",", 1)[0].strip()
+    if first[:3].upper() == "CN=":
+        return first[3:].strip()
+    return ""
+
+
+def _adcs_edge_template_name(
+    edge: dict[str, Any], to_node: dict[str, Any], domain: str
+) -> str | None:
+    """Return the humanized certificate-template name for an ``ADCSESC*`` edge.
+
+    The template lives in the edge ``notes`` dict (NOT ``details.template``):
+    ``template_used_for_run`` is preferred, then a ``CertTemplate`` entry in
+    ``vulnerable_resources``, then the leaf CN of ``template_dn``. Returns
+    ``None`` when the TARGET node already is the certificate template (so the
+    panel does not render the template name twice).
+    """
+    if str((to_node or {}).get("kind") or "").strip().lower() == "certtemplate":
+        return None
+    notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+
+    name = str(notes.get("template_used_for_run") or "").strip()
+    if name:
+        return name
+
+    for resource in notes.get("vulnerable_resources") or []:
+        if (
+            isinstance(resource, dict)
+            and str(resource.get("kind") or "").strip().lower() == "certtemplate"
+        ):
+            res_name = str(resource.get("name") or "").strip()
+            if res_name:
+                from adscan_internal.services.node_label_display import (
+                    format_graph_node_label,
+                )
+
+                return format_graph_node_label(res_name, domain)
+
+    cn = _cn_from_dn(str(notes.get("template_dn") or ""))
+    return cn or None
+
+
+#: Display-status strength, strongest first, to collapse several edges with the
+#: same (ESC, target, template) into one line keeping the best-proven status.
+_ADCS_STATUS_RANK: dict[str, int] = {
+    "confirmed": 0,
+    "confirmation-pending": 1,
+    "attempted": 2,
+    "hardened": 3,
+    "theoretical": 4,
+}
+
+
 def _build_tactical_findings(
     domain: str,
     nodes: dict[str, Any],
     edges: list[dict[str, Any]],
+    domains_data: Any = None,
 ) -> "TacticalFindings":
-    from adscan_core.rich_output_collection import TacticalFinding, TacticalFindings
+    from adscan_core.rich_output_collection import (
+        AdcsEscFinding,
+        TacticalFinding,
+        TacticalFindings,
+    )
+    from adscan_internal.services.attack_graph_findings import edge_qualifies_as_finding
+    from adscan_internal.services.node_label_display import format_graph_node_label
 
     findings: list[TacticalFinding] = []
     kerberoastable: list[str] = []
     asreproastable: list[str] = []
     adcs_esc_count = 0
+    # One deduplicated enumerated line per (ESC technique × target × template).
+    adcs_esc_by_key: dict[tuple[str, str, str], AdcsEscFinding] = {}
 
     for edge in edges:
         relation = str(edge.get("relation") or "")
@@ -2464,11 +2963,19 @@ def _build_tactical_findings(
             continue
 
         if relation.startswith("ADCSESC"):
-            adcs_esc_count += 1
             from_node = nodes.get(str(edge.get("from") or ""))
             to_node = nodes.get(str(edge.get("to") or ""))
             if not from_node or not to_node:
                 continue
+            # Shared tier-jump finding gate (same SSOT the PRO/LITE report and
+            # web CTEM apply): a tier-gated ADCS ESC (ESC1/3/4/5/7/13/14/15)
+            # whose source already sits in Tier 0 over its own same-forest
+            # estate (e.g. an RODC's own ESC path) is redundant and suppressed,
+            # exactly as the reports suppress it. A CONDITION ESC (ESC8, web
+            # enrollment) always qualifies.
+            if not edge_qualifies_as_finding(edge, nodes, domains_data):
+                continue
+            adcs_esc_count += 1
             sev_val, target_role, t0_asset, src_unauth = _compute_finding_severity(
                 source_node=from_node,
                 target_node=to_node,
@@ -2490,6 +2997,32 @@ def _build_tactical_findings(
                     source_is_unauthenticated=src_unauth,
                 )
             )
+            # Enumerated line: ESC<n> → <humanized target> (template <T>) · status.
+            # The label is humanized through the node-label SSOT; the status is
+            # the honest display token for the edge; dedup by technique × target
+            # × template, keeping the strongest-proven status when several
+            # enrollment principals share the same line.
+            esc_label = relation[len("ADCSESC"):]
+            esc_label = f"ESC{esc_label}" if esc_label else relation
+            raw_target = str(to_node.get("label") or to_node.get("name") or "")
+            esc_target = format_graph_node_label(raw_target, domain) or raw_target
+            esc_template = _adcs_edge_template_name(edge, to_node, domain)
+            esc_status = _adcs_edge_display_status(edge)
+            esc_key = (
+                esc_label,
+                esc_target.casefold(),
+                (esc_template or "").casefold(),
+            )
+            existing = adcs_esc_by_key.get(esc_key)
+            if existing is None or _ADCS_STATUS_RANK.get(
+                esc_status, 9
+            ) < _ADCS_STATUS_RANK.get(existing.status, 9):
+                adcs_esc_by_key[esc_key] = AdcsEscFinding(
+                    esc_label=esc_label,
+                    target=esc_target,
+                    template=esc_template,
+                    status=esc_status,
+                )
             continue
 
         if relation not in _TACTICAL_RELATIONS:
@@ -2504,6 +3037,16 @@ def _build_tactical_findings(
             source_node=from_node,
             target_node=to_node,
         ):
+            continue
+        # Shared tier-jump finding gate (same SSOT the PRO/LITE report and web
+        # CTEM apply). A TIER-GATED control/escalation relation (the generic
+        # control ACLs, DCSync, LAPS/gMSA read, RBCD write, constrained
+        # delegation) is a finding ONLY on an upward or cross-forest crossing —
+        # so a Tier-0 source administering its own same-forest estate (a DC,
+        # an MSOL/AAD Connect sync account, Account/Backup/Server/Print
+        # Operators) is suppressed as redundant. CONDITION relations (access /
+        # session edges, etc.) always qualify, leaving them unchanged.
+        if not edge_qualifies_as_finding(edge, nodes, domains_data):
             continue
 
         is_hv = _node_is_high_value(to_node)
@@ -2543,12 +3086,24 @@ def _build_tactical_findings(
 
     unique = _filter_container_scope_findings(unique)
 
+    # Order the enumerated ESC lines by proven-strength (confirmed first), then
+    # by technique and target for a stable, triage-friendly listing.
+    adcs_esc_paths = sorted(
+        adcs_esc_by_key.values(),
+        key=lambda e: (
+            _ADCS_STATUS_RANK.get(e.status, 9),
+            e.esc_label,
+            e.target.casefold(),
+        ),
+    )
+
     return TacticalFindings(
         domain=domain,
         findings=unique,
         kerberoastable=sorted(set(kerberoastable)),
         asreproastable=sorted(set(asreproastable)),
         adcs_esc_count=adcs_esc_count,
+        adcs_esc_paths=adcs_esc_paths,
     )
 
 

@@ -1899,12 +1899,44 @@ def _resolve_attack_path_reachability_headline(
             # The REPL session does not stamp exposure_kpis into domains_data;
             # fall back to the persisted report so reachability is available.
             kpis = _load_exposure_kpis_from_report(shell, target_domain)
+        # Prefer the FRESHLY-loaded in-memory graph over the persisted
+        # exposure_kpis block: the REPL / --no-cache path holds a just-recomputed
+        # graph, while the persisted block can be a stale pre-fix stamp (the 100%
+        # tier2 figure that contradicts the same run's fresh DFS). The tier2 ratio
+        # and the exposure-source count are cheap, k-independent set algebra, so we
+        # re-derive them from the graph in hand and only fall back to the persisted
+        # block / a second load when no graph is available.
+        graph = None
+        try:
+            loaded = load_attack_graph(shell, target_domain)
+            if isinstance(loaded, dict):
+                graph = loaded
+        except Exception:  # noqa: BLE001 — best-effort; the persisted block stands
+            graph = None
+        if graph is not None and isinstance(kpis, dict):
+            from adscan_internal.services.attack_graph_service import (
+                _resolve_tier2_exposure_for_graph,
+            )
+
+            fresh_tier2 = _resolve_tier2_exposure_for_graph(graph)
+            if fresh_tier2 is not None:
+                kpis = {**kpis, "tier2_exposure": fresh_tier2.as_dict()}
         snapshot = _load_attack_paths_snapshot(shell, target_domain)
         totals = client_path_totals_for_domain(kpis, snapshot=snapshot)
         domain_compromised = (
             str(domain_data.get("auth", "")).strip().lower() == "pwned"
         )
-        source_count = _load_exposure_source_count(shell, target_domain)
+        if graph is not None:
+            from adscan_internal.services.attack_graph_service import (
+                _resolve_exposure_source_count_for_graph,
+            )
+
+            # Same computation build_graph_stats uses, over the graph in hand;
+            # coerce the best-effort ``None`` to 0 to keep the int contract (an
+            # empty / unresolvable graph simply omits the line).
+            source_count = _resolve_exposure_source_count_for_graph(graph) or 0
+        else:
+            source_count = _load_exposure_source_count(shell, target_domain)
         return (
             totals.render_headline(domain_compromised),
             int(totals.reachable_tier0),
@@ -1936,11 +1968,14 @@ def _render_sampled_reachability_rows(
 ) -> list[Any]:
     """Return the operator rows for a sampled-materialization reachable result.
 
-    Turns "0 materialized routes" into immediate offensive value: the reachable
-    route count + the sampling cause (control mega-hubs) + the magnitude of the
+    Turns a bounded result into immediate offensive value: the sampling cause
+    (control mega-hubs) + the shared headline sentence + the magnitude of the
     exposure and a pointer to the choke points that cut the most routes. The
-    route sentence is the shared :meth:`ClientPathTotals.render_headline` label,
-    so the CLI, report and web quote the SAME figure.
+    headline sentence is the shared :meth:`ClientPathTotals.render_headline`
+    label, so the CLI, report and web quote the SAME figure in the SAME units: a
+    route count when the sample surfaced routes, and the reachable-Tier-0 ASSET
+    figure under its own asset label when it surfaced none. A terminal count is
+    never printed as a route count.
 
     The exposure magnitude line headlines the standard-user ratio
     (``tier2_exposure_sentence`` — "N% of standard user accounts hold a reachable
@@ -1998,8 +2033,14 @@ def _render_attack_path_compute_progress(
         # routes even though the reachability set proves the domain is exposed.
         # Report the reachable figure so a bare "0" never reads as "nothing
         # found" (the reachable-routes panel below carries the actionable copy).
-        sampled_materialization = (
-            progress.final_paths == 0 and _headline_has_reachability(headline)
+        #
+        # Key the "sampled" label on the ACTUAL materialization-coverage signal
+        # (``headline.sampled``, derived from the engine-stamped sampled/bounded
+        # mode), NOT on "0 paths + any reachability". A COMPLETED DFS that returned
+        # 0 routes is the true answer, not a truncation, and must read "complete"
+        # (the honest "no validated routes"), never "Materialization sampled".
+        sampled_materialization = headline is not None and bool(
+            getattr(headline, "sampled", False)
         )
         if sampled_materialization:
             rows.append(

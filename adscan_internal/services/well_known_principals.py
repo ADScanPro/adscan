@@ -71,6 +71,41 @@ _TIER_ZERO_WELL_KNOWN: frozenset[str] = frozenset(
     }
 )
 
+# Machine / control-plane NT-AUTHORITY identities that are NOT compromisable attack
+# SOURCES. The decisive axis is ACTIONABILITY, not tier: System / LocalService /
+# NetworkService are computed OS identities you can never "become" as a reachable
+# foothold (there is no credential to capture, no account to own), and their
+# full-control ACEs over AD objects are a by-design grant, not an escalation a
+# pentester can start from. An attack-graph / finding edge SOURCED from one of these
+# is therefore a false capability — the by-design ``System (S-1-5-18) --GenericAll-->
+# Domain`` edge must neither be walked nor materialized as a client finding. They are
+# conceptually Tier-0 (see :data:`_TIER_ZERO_WELL_KNOWN`), never Tier-2.
+#
+# Scoped to the EXACT fixed SIDs, case-insensitive — NEVER a name match: a real
+# ``S-1-5-21-...`` service account merely named "system-..." must be untouched. This
+# is ORTHOGONAL to :data:`DYNAMIC_IDENTITY_SIDS` (Family B — Everyone / Authenticated
+# Users / Domain Users: a dynamic SCOPE that REMAINS a legitimate finding source).
+NON_COMPROMISABLE_SOURCE_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-5-18",  # System (NT AUTHORITY\SYSTEM)
+        "S-1-5-19",  # LocalService (NT AUTHORITY\LOCAL SERVICE)
+        "S-1-5-20",  # NetworkService (NT AUTHORITY\NETWORK SERVICE)
+    }
+)
+
+
+def is_non_compromisable_source(sid: str) -> bool:
+    """Return True when ``sid`` is a machine/control-plane identity that cannot be
+    a compromisable attack / finding SOURCE.
+
+    See :data:`NON_COMPROMISABLE_SOURCE_SIDS`. Matched by the EXACT SID
+    (case-insensitive), NEVER by name — a real ``S-1-5-21-...`` account whose name
+    merely contains "system" is a genuine compromisable principal and stays
+    untouched.
+    """
+    return str(sid or "").strip().upper() in NON_COMPROMISABLE_SOURCE_SIDS
+
+
 # The subset of well-known identities that have NO manageable member list.
 #
 # The axis is COMPUTED/IMPLICIT identity, not privilege tier and not "is it

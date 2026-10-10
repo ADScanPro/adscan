@@ -49,6 +49,8 @@ from adscan_core.theme import (
     COLOR_STEEL,
 )
 from adscan_internal.services.attack_step_catalog import (
+    NO_NATIVE_EVENT_DETECTION_NOTES,
+    declares_no_native_event_telemetry,
     get_attack_step_entry,
     render_step_manual_command,
     render_step_narrative,
@@ -343,8 +345,21 @@ def render_deep_card(step_or_relation: Any) -> Panel | None:
         _section(mitre_section, "MITRE ATT&CK", mitre)
 
     # Detection.
-    event_ids = tuple(getattr(entry, "detection_event_ids", ()) or ())
-    if event_ids:
+    raw_event_ids = getattr(entry, "detection_event_ids", ())
+    event_ids = tuple(raw_event_ids or ())
+    if declares_no_native_event_telemetry(raw_event_ids):
+        # The technique leaves no Windows event of its own. That is the most
+        # useful thing a defender can learn about it, so the card says where the
+        # audit log is blind and what detection does see it, instead of hiding
+        # the section (which would read as "nobody wrote this down yet").
+        note = NO_NATIVE_EVENT_DETECTION_NOTES.get(
+            str(getattr(entry, "relation", "") or "")
+        )
+        if note:
+            det = Text()
+            det.append(note, style="default")
+            _section(detection, "How it's detected", det)
+    elif event_ids:
         det = Text()
         det.append("Windows Event ID(s): ", style="default")
         det.append(", ".join(str(e) for e in event_ids), style="bold " + COLOR_STEEL)

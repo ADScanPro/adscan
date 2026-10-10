@@ -10,11 +10,20 @@ web CTEM:
   executed. The headline finding; the "validated, not estimated" wedge.
 * **Not validated — data gap** — the vulnerability exists (the collector detected
   it) but no reachable CA (or publishing CA, for template ESCs) was found: the CA
-  host is NXDOMAIN / offline / the enrollment port is closed. Rendered WITH the
-  actionable next step ("provide ``ADSCAN_HOST_IP_<HOST>=<ip>`` to validate, or
-  confirm the CA is decommissioned"). NEVER a confirmed CRITICAL, NEVER
-  ``closed_by_configuration`` (a dead host is a data gap, not observed hardening),
-  and NEVER the misleading "check the template DACL / Web Enrollment" message.
+  host is NXDOMAIN / offline / the enrollment port is closed. Rendered WITH a next
+  step addressed to the CLIENT (confirm whether the CA is still in service; retire
+  its stale directory object if not; open the path to the assessor if it is).
+  NEVER a confirmed CRITICAL, NEVER ``closed_by_configuration`` (a dead host is a
+  data gap, not observed hardening), and NEVER the misleading "check the template
+  DACL / Web Enrollment" message.
+
+  The next step is a CONSTANT, and deliberately so. It once interpolated the CA
+  host into an ADscan environment-variable name and told the reader to re-run the
+  scan, which addressed the consultant inside the client's own report, bypassed
+  the principal-label humanisation SSOT by shouting the value, and was fed a
+  principal-shaped label rather than a hostname by its caller. The operator hint
+  that information belongs in now lives on the operator's terminal, at the seam
+  that fails to resolve the CA (``resolve_esc_execution_ca``).
 * **Hygiene** — an orphaned / decommissioned CA object still registered in AD (a
   ``pKIEnrollmentService`` object whose host is NXDOMAIN and which has no computer
   object). Actionable value the client did not have: clean up the stale CA object.
@@ -74,6 +83,7 @@ ADCS_ESC_RELATIONS = frozenset(
         "adcsesc13",
         "adcsesc14",
         "adcsesc15",
+        "certighost",
         "coerceandrelayntlmtoadcs",
     }
 )
@@ -111,21 +121,18 @@ _HYGIENE_NEXT_STEP = (
 )
 
 
-def _data_gap_next_step(host_label: str) -> str:
-    """Actionable next step for a data-gap ADCS finding (never an apology)."""
-
-    host = str(host_label or "").strip()
-    hint = (
-        f"provide ADSCAN_HOST_IP_{host.upper().replace('.', '_')}=<ip>"
-        if host
-        else "provide ADSCAN_HOST_IP_<HOST>=<ip>"
-    )
-    return (
-        f"The vulnerability was detected but its certificate authority could not "
-        f"be reached to validate it (host unresolved, offline, or the enrollment "
-        f"port is closed). To confirm the exposure, {hint} and re-run, or confirm "
-        f"the CA is decommissioned."
-    )
+#: Next step for a data-gap ADCS finding, worded for the reader who can act on
+#: it: the client. Both branches are theirs to decide and theirs to do, and
+#: neither asks them to operate the assessment. Never an apology, and never a
+#: claim in either direction about whether the weakness is exploitable.
+_DATA_GAP_NEXT_STEP = (
+    "Confirm whether this certificate authority is still in service. If it has "
+    "been decommissioned, remove its object from Active Directory so it stops "
+    "advertising enrollment services that no longer exist. If it is in service, "
+    "the exposure can be validated once the authority is reachable from the "
+    "assessment network: check that the host is running, that its name resolves, "
+    "and that the firewall allows the enrollment service through."
+)
 
 
 def _data_gap_statement() -> str:
@@ -151,9 +158,11 @@ def build_adcs_finding_state(
             :data:`STATE_HYGIENE`. An unrecognised value yields an empty block
             (``state=""``) so a caller that could not classify the finding does
             not fabricate a state.
-        ca_host: The CA host the finding concerns, used to render the
-            ``ADSCAN_HOST_IP_<HOST>`` hint on a data-gap. Never surfaced as a raw
-            override token when empty.
+        ca_host: The CA host the finding concerns, persisted on a data-gap
+            block as evidence of WHICH authority was unreachable. It is NOT
+            interpolated into any client-facing sentence, so a caller that can
+            only offer a non-hostname label degrades to an empty field rather
+            than leaking it into the report. Must be a hostname when supplied.
 
     Returns:
         The block to persist alongside the finding. Carries ``state``,
@@ -174,7 +183,7 @@ def build_adcs_finding_state(
     return {
         "state": STATE_DATA_GAP,
         "statement": _data_gap_statement(),
-        "next_step": _data_gap_next_step(ca_host),
+        "next_step": _DATA_GAP_NEXT_STEP,
         "ca_host": str(ca_host or "").strip(),
     }
 

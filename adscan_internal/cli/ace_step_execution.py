@@ -1929,6 +1929,21 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             )
         if result.get("krbtgt") or int(result.get("tier0_count", 0)) >= 1:
             return True
+        if result.get("vantage_unreachable"):
+            # The replication port range never answered from this network
+            # position, so nothing about the acting principal's RIGHTS was
+            # tested. Saying it "lacks replication rights" here would assert
+            # the opposite of what the directory read proved, and that wrong
+            # cause is what gets recorded against the step. The client-facing
+            # declaration is persisted by the dump seam that observed the
+            # silence (SSOT: adscan_core.reporting.vantage_coverage).
+            return _ace_step_failed(
+                shell,
+                "DCSync could not be exercised from this network position: the "
+                "DRSUAPI dynamic RPC range (49152-65535) did not answer. The "
+                "replication rights themselves were read from the directory and "
+                "stand; only the attempt was impossible from here",
+            )
         return _ace_step_failed(
             shell,
             "DCSync replicated but returned no Tier-0 secret (no krbtgt / RID-500 / "

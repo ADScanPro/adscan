@@ -922,6 +922,68 @@ CHANGE_RECORD_UNDETERMINED = "undetermined"
 DETERMINED_KEY = "determined"
 
 
+#: The live ledger of each ACTIVE workspace, keyed by its normalized root.
+#:
+#: A report renders DURING the run, and the ledger file is flushed on its own
+#: schedule: on a first run the in-run render can land one second BEFORE
+#: ``environment_changes.json`` exists, so sources 2 and 3 are both unreadable
+#: and the resolver correctly answers UNDETERMINED while the live ledger that
+#: holds the answer sits in the session. Threading that ledger down to every
+#: render seam is not possible for all of them (the deliver helpers take a
+#: workspace path and no shell), so the session publishes it here, at the ONE
+#: place a ledger is created (``workspaces.session.activate_workspace``).
+#:
+#: Keyed BY WORKSPACE on purpose: a long-lived shell re-rendering workspace A
+#: must never be handed workspace B's changes, which is what a single "active
+#: ledger" global would allow. A lookup that does not match the workspace being
+#: rendered returns nothing and the resolver falls through to the file.
+_SESSION_LEDGERS: dict[str, Any] = {}
+
+
+def _normalized_workspace_key(workspace_dir: Any) -> str:
+    """Normalize a workspace path into the session-ledger registry key."""
+    text = str(workspace_dir or "").strip()
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.realpath(text))
+    except Exception:  # noqa: BLE001 - a weird path is simply not registered
+        return os.path.normcase(text)
+
+
+def register_session_ledger(ledger: Any, *, workspace_dir: str) -> None:
+    """Publish the live ledger of a workspace the session has just activated.
+
+    One call site: ``workspaces.session.activate_workspace``. Passing ``None``
+    unregisters, so a workspace whose ledger failed to initialize is never
+    mistaken for one with an empty ledger.
+
+    Args:
+        ledger: The live :class:`EnvironmentChangeLedger`, or None.
+        workspace_dir: Root of the workspace the ledger belongs to.
+    """
+    key = _normalized_workspace_key(workspace_dir)
+    if not key:
+        return
+    if ledger is None:
+        _SESSION_LEDGERS.pop(key, None)
+        return
+    _SESSION_LEDGERS[key] = ledger
+
+
+def active_session_ledger(workspace_dir: Any) -> Any:
+    """The live ledger for ``workspace_dir``, or None when the session has none.
+
+    Args:
+        workspace_dir: Root of the workspace being rendered.
+
+    Returns:
+        The live ledger registered for exactly that workspace, else None.
+    """
+    key = _normalized_workspace_key(workspace_dir)
+    return _SESSION_LEDGERS.get(key) if key else None
+
+
 @dataclass(frozen=True)
 class EnvironmentChangeResolution:
     """What is known about this scan's writes to the directory.
@@ -981,7 +1043,10 @@ def resolve_environment_changes(
     Preference order, freshest first:
 
     1. the LIVE ledger held by the session — authoritative, and the only source
-       that exists before anything has been flushed;
+       that exists before anything has been flushed. Either passed in by a
+       caller that holds it, or looked up for ``workspace_dir`` in the
+       session registry (:func:`register_session_ledger`) for the render seams
+       that only receive a workspace path;
     2. ``environment_changes.json`` in the workspace — written on every mutation
        and materialized empty at workspace activation, so its presence with an
        empty change list is itself proof of a clean run;
@@ -1002,10 +1067,20 @@ def resolve_environment_changes(
         The resolution. Never raises — an unreadable source falls through to the
         next one.
     """
-    if ledger is not None:
+    live = ledger
+    live_source = "live_ledger"
+    if live is None:
+        # The render seam holds no ledger (report_service's config-driven path
+        # before it was threaded, every deliver helper, any future seam that
+        # takes a workspace path). The session published the live ledger for
+        # THIS workspace, so source 1 is still available and the answer no
+        # longer depends on whether the file happened to be flushed yet.
+        live = active_session_ledger(workspace_dir)
+        live_source = "session_ledger"
+    if live is not None:
         try:
             return _resolution_from_parts(
-                ledger.get_summary(), ledger.get_changes(), source="live_ledger"
+                live.get_summary(), live.get_changes(), source=live_source
             )
         except Exception as exc:  # pylint: disable=broad-except
             telemetry.capture_exception(exc)

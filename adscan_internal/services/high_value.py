@@ -87,6 +87,25 @@ class UserRiskFlags:
     is_high_value: bool = False
 
 
+@dataclass(frozen=True)
+class UserTierFlags:
+    """A user's PRIVILEGE TIER, plus the orthogonal high-value flag.
+
+    ``tier`` is a ``compromise_class.PrivilegeTier`` token, or "" when the
+    assessment could not grade the account: no graph node for it, or a node
+    carrying no tier stamp. An empty tier is the declared absence of a grade and
+    must never be reported as Tier 2, because "we could not place this account"
+    and "this account is a standard user" are different statements.
+
+    ``is_high_value`` is the graph's own ``highvalue`` impact flag, which is a
+    SEPARATE axis from the tier and overlaps all of them. It is never folded
+    into the tier.
+    """
+
+    tier: str = ""
+    is_high_value: bool = False
+
+
 def _find_user_node_in_attack_graph(
     shell: object,
     *,
@@ -695,4 +714,182 @@ def classify_users_tier0_high_value(
             is_high_value=bool(flags["is_high_value"]),
         )
         for user, flags in results.items()
+    }
+
+
+def classify_users_privilege_tier(
+    shell: Any, *, domain: str, usernames: list[str]
+) -> dict[str, UserTierFlags]:
+    """Grade many users by PRIVILEGE TIER in a single pass.
+
+    The batch sibling of :func:`classify_users_tier0_high_value`, for a surface
+    that reports per TIER rather than per Tier-0 boolean. Credential-recovery
+    reporting is the first consumer: a breakdown that only knows "Tier-0 or not"
+    reports a server or application admin to the client as a standard account.
+
+    Resolution ladder, most specific first. Every rung is an existing SSOT; no
+    tier taxonomy is duplicated here:
+
+    1. The node's STAMPED ``privilege_tier`` (``node_stamped_privilege_tier``).
+       This is the canonical, membership-aware grade: it is what places a Domain
+       Admins MEMBER in ``tier0_direct``, a Backup Operators member in
+       ``tier0_escalation_capable``, and a user who administers a server or
+       whose service identity runs on one in ``tier1``. ``load_attack_graph``
+       backfills the stamp on every load, so a workspace collected before the
+       stamp existed still resolves.
+    2. The collector's identity-risk record, graded through
+       :func:`compromise_class.privilege_tier_for_principal` on the groups it
+       already resolved.
+    3. The membership snapshot's Tier-0 RIDs (512/518/519) → ``tier0_direct``.
+    4. A well-known domain-control name (krbtgt, the built-in Administrator,
+       including a renamed one) → ``tier0_direct``.
+    5. The legacy per-node Tier-0 flag, graded through the node resolver so it
+       yields the conservative escalation-capable verdict rather than a lost
+       finding.
+
+    An account no rung resolves is returned with ``tier=""``. That is
+    deliberate: the honest answer is the declared absence of a grade, and the
+    caller renders it as such. ``highvalue`` NEVER promotes a tier, because it
+    is the other axis; it is returned alongside instead.
+
+    Args:
+        shell: Shell-like object with workspace / graph context.
+        domain: The target AD domain.
+        usernames: Candidate usernames or principals to grade.
+
+    Returns:
+        Mapping keyed by normalized sAMAccountName. Every requested account is
+        present, carrying :class:`UserTierFlags`.
+    """
+    normalized_users: list[str] = sorted(
+        {
+            normalized
+            for normalized in (
+                normalize_samaccountname(str(username)) for username in usernames
+            )
+            if normalized
+        },
+        key=str.lower,
+    )
+    if not normalized_users:
+        return {}
+
+    from adscan_internal.services.compromise_class import (
+        PrivilegeTier,
+        install_privilege_tier_label_provider,
+        node_stamped_privilege_tier,
+        privilege_tier_for_principal,
+        privilege_tier_for_principal_node,
+    )
+
+    # Wire the label seam while we are here: every consumer of a tier token also
+    # needs its client-facing wording, and the owner of that wording is the
+    # module just imported.
+    install_privilege_tier_label_provider()
+
+    tiers: dict[str, str] = {user: "" for user in normalized_users}
+    high_value: dict[str, bool] = {user: False for user in normalized_users}
+    nodes: dict[str, dict[str, Any]] = {}
+
+    # Pass 1 — the stamped tier, from a single graph load.
+    try:
+        from adscan_internal.services.attack_graph_service import load_attack_graph
+
+        graph = load_attack_graph(shell, domain)
+        nodes_map = graph.get("nodes") if isinstance(graph, dict) else None
+        if isinstance(nodes_map, dict):
+            for node in nodes_map.values():
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("kind") or "") != "User":
+                    continue
+                props = (
+                    node.get("properties")
+                    if isinstance(node.get("properties"), dict)
+                    else {}
+                )
+                candidates: set[str] = set()
+                for raw in (props.get("samaccountname"), node.get("label")):
+                    if isinstance(raw, str):
+                        normalized = normalize_samaccountname(raw)
+                        if normalized:
+                            candidates.add(normalized)
+                for candidate in candidates & set(tiers):
+                    nodes.setdefault(candidate, node)
+                    if is_node_high_value(node):
+                        high_value[candidate] = True
+                    if tiers[candidate]:
+                        continue
+                    stamped = node_stamped_privilege_tier(node)
+                    if stamped is not None:
+                        tiers[candidate] = stamped.value
+    except Exception as exc:  # noqa: BLE001 — an ungraded account is honest
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    # Pass 2 — the collector's resolved membership, graded through the SSOT.
+    for user in normalized_users:
+        if tiers[user]:
+            continue
+        identity_record = get_identity_risk_record(
+            shell, domain=domain, samaccountname=user
+        )
+        if not isinstance(identity_record, dict):
+            continue
+        node = nodes.get(user) or {}
+        node_props = node.get("properties") if isinstance(node, dict) else {}
+        sid = str(
+            (node_props or {}).get("objectid") or node.get("objectId") or ""
+        ).strip()
+        tiers[user] = privilege_tier_for_principal(
+            identity_record.get("group_names") or (),
+            sid=sid or None,
+        ).value
+        if identity_record.get("is_control_exposed"):
+            high_value[user] = True
+
+    # Pass 3 — the membership snapshot's Tier-0 RIDs.
+    unresolved = {user for user in normalized_users if not tiers[user]}
+    if unresolved:
+        try:
+            from adscan_internal.services.attack_graph_service import (
+                get_users_in_group_rid_from_snapshot,
+            )
+
+            tier0_members: set[str] = set()
+            for rid in (512, 518, 519):
+                members = get_users_in_group_rid_from_snapshot(shell, domain, rid)
+                for member in members or ():
+                    normalized = normalize_samaccountname(str(member))
+                    if normalized:
+                        tier0_members.add(normalized)
+            for user in unresolved:
+                if user in tier0_members:
+                    tiers[user] = PrivilegeTier.TIER0_DIRECT.value
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    # Passes 4 and 5 — the well-known control-plane names, then the legacy flag.
+    for user in normalized_users:
+        if tiers[user]:
+            continue
+        if is_well_known_da_name(user, shell=shell, domain=domain):
+            tiers[user] = PrivilegeTier.TIER0_DIRECT.value
+            continue
+        node = nodes.get(user)
+        if node is not None and is_node_tier0(node):
+            tiers[user] = privilege_tier_for_principal_node(
+                node, is_tier0_asset=True
+            ).value
+
+    graded = sum(1 for tier in tiers.values() if tier)
+    print_info_debug(
+        "[high-value] batch tier classify: "
+        f"domain={mark_sensitive(domain, 'domain')} "
+        f"users={len(tiers)} graded={graded} ungraded={len(tiers) - graded}"
+    )
+    return {
+        user: UserTierFlags(tier=tiers[user], is_high_value=bool(high_value[user]))
+        for user in normalized_users
     }

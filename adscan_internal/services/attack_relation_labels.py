@@ -59,6 +59,7 @@ def format_relation_label(relation: str) -> str:
         "adcsesc10": "ADCS ESC10",
         "adcsesc10a": "ADCS ESC10a",
         "adcsesc10b": "ADCS ESC10b",
+        "certighost": "Certighost (AD CS)",
         "zerologon": "Zerologon",
         "nopac": "NoPac",
         "printnightmare": "PrintNightmare",
@@ -81,7 +82,7 @@ def format_relation_label(relation: str) -> str:
         "readlapspassword": "ReadLAPSPassword",
         "readgmsapassword": "ReadGMSAPassword",
         "allowedtodelegate": "AllowedToDelegate",
-        "coercetotgt": "CoerceToTGT",
+        "unconstraineddelegation": "UnconstrainedDelegation",
         "allowedtoactonbehalfofotheridentity": "AllowedToActOnBehalfOfOtherIdentity",
         "adminto": "AdminTo",
         "canrdp": "CanRDP",
@@ -178,7 +179,7 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "readlapspassword": "Read the Local Administrator Password",
     "readgmsapassword": "Read the Managed Service Account Password",
     "allowedtodelegate": "Constrained Delegation Abuse",
-    "coercetotgt": "Coerce Authentication to a Ticket",
+    "unconstraineddelegation": "Unconstrained Kerberos Delegation",
     "allowedtoactonbehalfofotheridentity": "Resource-Based Delegation Abuse",
     # Access / lateral-movement edges ─────────────────────────────────────
     "adminto": "Local Administrator Access",
@@ -230,6 +231,7 @@ _BUSINESS_RELATION_HEADLINES: dict[str, str] = {
     "adcsesc15": "Certificate Application-Policy Abuse",
     "adcsesc16": "Certificate Extension Abuse",
     "adcsesc17": "Certificate Services Privilege Escalation",
+    "certighost": "Certificate Authority Domain Controller Impersonation",
     # Named CVEs / coercion ───────────────────────────────────────────────
     "zerologon": "Domain Controller Takeover",
     "nopac": "Kerberos Privilege Escalation",

@@ -175,3 +175,26 @@ def make_adcs_edge(
         source="adcs_detector",
         method="adcs",
     )
+
+
+def make_certighost_edge(
+    *, principal_sid: str, ca_node: CollectorNode, notes: dict
+) -> CollectorEdge:
+    """Build a Certighost (CVE-2026-54121) CA-bound attack-graph edge.
+
+    Unlike :func:`make_adcs_edge`, the target is the EnterpriseCA node (there is
+    no template node): Certighost is a CA-level ``EditFlags`` + patch-level
+    weakness, not a template misconfiguration. The source is the enrolling
+    principal (Authenticated Users) — any authenticated domain user can request
+    the DC-impersonation certificate. ``notes`` carries the CVE id, the
+    EditFlags chase state, the CA host build / UBR, the DC-impersonation intent
+    and the read-only disclosure, so the report / web CTEM render the evidence.
+    """
+    return CollectorEdge(
+        source_object_id=principal_sid,
+        target_object_id=ca_node.object_id,
+        relation="certighost",
+        source="adcs_detector",
+        method="adcs",
+        notes=dict(notes or {}),
+    )

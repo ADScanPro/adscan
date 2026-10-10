@@ -47,6 +47,54 @@ AUDIT_BASE_LABEL = "ADscan AD Audit Wordlist"
 #: the advertised audit claim.
 FAST_BASE_WORDLIST = "rockyou.txt"
 
+#: The local wordlist attack is UNDERWAY against the declared hashes but had not
+#: finished when the assessment was written. A bounded computation, so the block
+#: reads as incomplete and the statement names the boundary.
+LOCAL_ATTACK_RUNNING = "running"
+
+#: The local wordlist attack walked its ladder to the end. Full strength: the
+#: declared hashes were tested against the audit corpus.
+LOCAL_ATTACK_COMPLETED = "completed"
+
+#: The local wordlist attack STOPPED at its time budget, part-way through the
+#: candidate set. A bounded computation, and a state none of the other three can
+#: express honestly: ``completed`` would claim a full-strength test that did not
+#: happen, which is the "your passwords held" false negative this whole block
+#: exists to prevent; ``running`` would promise results that will arrive later,
+#: when in fact nothing more is coming; ``unavailable`` would blame a missing
+#: engine that was in fact present and working. So the boundary gets its own
+#: word: the attack ran, it ran out of time, and what it did not reach is
+#: unproven.
+LOCAL_ATTACK_TRUNCATED = "truncated"
+
+#: No password-cracking engine was available on the host that ran the
+#: assessment, so the declared hashes were never attacked locally at all. A data
+#: gap about ADscan's runtime, never a verdict about the client's passwords.
+LOCAL_ATTACK_UNAVAILABLE = "unavailable"
+
+#: Every recognised local-attack status. Anything else normalizes to ``""`` (no
+#: local attack recorded), so a malformed value can never manufacture a gap.
+_LOCAL_ATTACK_STATUSES: frozenset[str] = frozenset(
+    {
+        LOCAL_ATTACK_RUNNING,
+        LOCAL_ATTACK_TRUNCATED,
+        LOCAL_ATTACK_COMPLETED,
+        LOCAL_ATTACK_UNAVAILABLE,
+    }
+)
+
+#: Worst-first order for the report-wide fold. A gap any domain had is a gap for
+#: the whole assessment, so an unavailable engine outranks an unfinished attack,
+#: which outranks one that stopped at its time budget, which outranks a finished
+#: one. Unfinished sits above truncated because an attack still in flight leaves
+#: the figures provisional, where a truncated one is final and merely partial.
+_LOCAL_ATTACK_MERGE_PRECEDENCE: tuple[str, ...] = (
+    LOCAL_ATTACK_UNAVAILABLE,
+    LOCAL_ATTACK_RUNNING,
+    LOCAL_ATTACK_TRUNCATED,
+    LOCAL_ATTACK_COMPLETED,
+)
+
 #: Map an internal base-wordlist filename to the ONE client-facing name the
 #: deliverable brands its cracking corpus with. Both house bases fold to the
 #: audit label: the per-finding line and the methodology note must agree, and a
@@ -210,6 +258,119 @@ def _clean_names(names: Any) -> tuple[str, ...]:
     return tuple(cleaned)
 
 
+def _breach_lookup_clause(count: int, *, standalone: bool) -> str:
+    """Declare the hash class that went to a breach-corpus lookup ONLY.
+
+    The two recovery methods answer different questions, and conflating them is
+    how a coverage note came to claim a stronger method than the one that ran:
+
+    * a breach-corpus lookup asks "is this exact password already public?";
+    * a wordlist attack asks "is this password weak?".
+
+    Passing the first proves only absence from one corpus, so a hash that saw
+    only the lookup has NOT been tested at full strength and the statement must
+    not imply it was. ``standalone`` renders it as the whole statement; otherwise
+    it is appended after a more serious absent-corpus gap.
+    """
+    if count <= 0:
+        return ""
+    hashes_noun = "hash" if count == 1 else "hashes"
+    if standalone:
+        return (
+            "Password recovery did not run at one strength for every hash. "
+            f"{count:,} {hashes_noun} replicated from the directory were checked "
+            "against a public breach-password corpus by lookup, which identifies "
+            "a password that is already exposed in a public breach but does not "
+            f"test its strength against the {AUDIT_BASE_LABEL}. An account not "
+            "named here was not shown to have a strong password, only to be "
+            "absent from that public corpus."
+        )
+    return (
+        f"Separately, {count:,} {hashes_noun} replicated from the directory were "
+        "checked against a public breach-password corpus by lookup, which reports "
+        "a password already exposed in a public breach and does not test strength."
+    )
+
+
+def _local_attack_clause(
+    status: str, count: int, *, standalone: bool, audit_available: bool = True
+) -> str:
+    """Declare what a LOCAL wordlist attack did to a class of recovered hashes.
+
+    A local attack and a breach-corpus lookup answer different questions, and
+    this clause exists so the stronger method is never credited to the weaker
+    one (nor the other way round):
+
+    * a lookup asks "is this exact password already public?";
+    * a local wordlist attack asks "is this password weak?" — the question the
+      report's methodology note advertises.
+
+    So the four states a local attack can be in get four distinct sentences: it
+    finished (full strength, no gap), it stopped at its time budget part-way
+    through the candidate set (a bounded computation — the boundary is declared
+    and nothing further is coming), it was still running when the assessment was
+    written (also bounded, but provisional: more may yet land), or it could not
+    run at all on this host (a data gap about ADscan's own runtime, never a
+    verdict about the client). ``standalone`` renders the clause as the whole
+    statement; otherwise it is appended after a more serious absent-corpus gap.
+
+    ``audit_available`` decides whether the clause may NAME the advertised
+    audit corpus. It must not when that corpus was absent from the runtime:
+    the statement would then claim, one sentence after saying the corpus was
+    unavailable, that hashes were tested against it.
+    """
+
+    if count <= 0 or status not in _LOCAL_ATTACK_STATUSES:
+        return ""
+    hashes_noun = "hash" if count == 1 else "hashes"
+    were = "was" if count == 1 else "were"
+    corpus = (
+        f"the {AUDIT_BASE_LABEL}"
+        if audit_available
+        else "the narrower password corpus this assessment carried"
+    )
+    if status == LOCAL_ATTACK_COMPLETED:
+        tested = (
+            f"{count:,} recovered password {hashes_noun} {were} tested "
+            f"locally against {corpus}."
+        )
+        if standalone:
+            return tested
+        return f"Separately, {tested[0].lower()}{tested[1:]}"
+    if status == LOCAL_ATTACK_TRUNCATED:
+        stopped = (
+            f"{count:,} recovered password {hashes_noun} {were} tested locally "
+            f"against {corpus}, and that test reached its time budget and "
+            "stopped before working through the whole candidate set. Any "
+            "password it had not reached is unproven: an account not named in "
+            "this report was not shown to have a strong password."
+        )
+        if standalone:
+            return stopped
+        return f"Separately, {stopped[0].lower()}{stopped[1:]}"
+    if status == LOCAL_ATTACK_RUNNING:
+        running = (
+            f"a password-strength attack against {corpus} was still "
+            f"running over {count:,} recovered password {hashes_noun}, "
+            "so any password it recovers after this point is not reflected here."
+        )
+        if standalone:
+            return (
+                "Password recovery was still underway when this assessment was "
+                f"written: {running}"
+            )
+        return f"Separately, {running}"
+    unavailable = (
+        f"{count:,} recovered password {hashes_noun} could not be "
+        "tested against a password corpus, because the host running this "
+        "assessment had no password-recovery engine available. Their strength is "
+        "therefore unproven either way."
+    )
+    if standalone:
+        return unavailable
+    return f"Separately, {unavailable[0].lower()}{unavailable[1:]}"
+
+
 def _statement_for(missing: tuple[str, ...]) -> str:
     """Render the client-facing sentence for a set of absent corpora.
 
@@ -247,6 +408,11 @@ def build_cracking_coverage(
     base_wordlist: str = "",
     engine: Any = None,
     ruleset: Any = None,
+    breach_lookup_only_hashes: Any = 0,
+    breach_lookup_recovered: Any = 0,
+    local_attack_hashes: Any = 0,
+    local_attack_recovered: Any = 0,
+    local_attack_status: Any = "",
 ) -> dict[str, Any]:
     """Build the ``cracking_coverage`` block for one domain.
 
@@ -262,6 +428,16 @@ def build_cracking_coverage(
         ruleset: The rule set applied (``CrackResult.ruleset``, e.g.
             ``"adscan_r1"``), or ``None`` when the tier ran without rules. Never
             surfaced verbatim; it is translated to an effort description.
+        local_attack_hashes: How many recovered hashes were handed to a LOCAL
+            wordlist attack (the strong method), as opposed to the
+            breach-corpus lookup. A DISTINCT class from
+            ``breach_lookup_only_hashes``: conflating the two is how a weaker
+            method comes to be reported as a stronger one.
+        local_attack_recovered: How many of those the local attack resolved.
+        local_attack_status: :data:`LOCAL_ATTACK_RUNNING`,
+            :data:`LOCAL_ATTACK_TRUNCATED`, :data:`LOCAL_ATTACK_COMPLETED` or
+            :data:`LOCAL_ATTACK_UNAVAILABLE`. Only ``COMPLETED`` is full
+            strength; the other three are declared coverage boundaries.
 
     Returns:
         The block to hand to ``record_cracking_coverage``. Always carries
@@ -274,13 +450,84 @@ def build_cracking_coverage(
     """
 
     missing = _clean_names(missing_wordlists)
-    complete = not missing
+    try:
+        lookup_only = max(int(breach_lookup_only_hashes or 0), 0)
+    except (TypeError, ValueError):
+        lookup_only = 0
+    try:
+        lookup_recovered = max(int(breach_lookup_recovered or 0), 0)
+    except (TypeError, ValueError):
+        lookup_recovered = 0
+    try:
+        local_only = max(int(local_attack_hashes or 0), 0)
+    except (TypeError, ValueError):
+        local_only = 0
+    try:
+        local_recovered = max(int(local_attack_recovered or 0), 0)
+    except (TypeError, ValueError):
+        local_recovered = 0
+    local_status = str(local_attack_status or "").strip().lower()
+    if local_status not in _LOCAL_ATTACK_STATUSES or local_only <= 0:
+        # An unrecognised status, or a status with nothing behind it, records NO
+        # local-attack class at all — a malformed value must never manufacture
+        # either a gap or a full-strength claim.
+        local_status = ""
+        local_only = 0
+        local_recovered = 0
+    # A hash class that saw ONLY the breach-corpus lookup is a genuine coverage
+    # boundary: it was never tested at full strength, so the block must not read
+    # as complete. Same for a local attack that was still running, or that could
+    # not run at all on this host. This is the bounded-computation doctrine
+    # applied to METHOD rather than to volume.
+    local_gap = local_status in {
+        LOCAL_ATTACK_RUNNING,
+        LOCAL_ATTACK_TRUNCATED,
+        LOCAL_ATTACK_UNAVAILABLE,
+    }
+    complete = not missing and lookup_only == 0 and not local_gap
+    audit_available = AUDIT_BASE_WORDLIST not in missing
+    local_clause_primary = _local_attack_clause(
+        local_status, local_only, standalone=True, audit_available=audit_available
+    )
+    local_clause_appended = _local_attack_clause(
+        local_status, local_only, standalone=False, audit_available=audit_available
+    )
+    if missing:
+        statement = _statement_for(missing)
+        for clause in (
+            local_clause_appended,
+            _breach_lookup_clause(lookup_only, standalone=False),
+        ):
+            if clause:
+                statement = f"{statement} {clause}"
+    elif local_gap:
+        statement = local_clause_primary
+        clause = _breach_lookup_clause(lookup_only, standalone=False)
+        if clause:
+            statement = f"{statement} {clause}"
+    elif lookup_only:
+        statement = _breach_lookup_clause(lookup_only, standalone=True)
+        if local_clause_appended:
+            statement = f"{statement} {local_clause_appended}"
+    else:
+        statement = _FULL_STATEMENT
     block: dict[str, Any] = {
         "complete": complete,
         "missing_wordlists": list(missing),
         "base_wordlist": str(base_wordlist or "").strip(),
         "audit_base_available": AUDIT_BASE_WORDLIST not in missing,
-        "statement": _FULL_STATEMENT if complete else _statement_for(missing),
+        # How many hashes were tested by breach-corpus LOOKUP ONLY, and how many
+        # of those the lookup resolved. Recorded so a machine consumer can state
+        # the method per class instead of inferring one from the recovery count.
+        "breach_lookup_only_hashes": lookup_only,
+        "breach_lookup_recovered": lookup_recovered,
+        # The LOCAL wordlist-attack class, kept strictly apart from the lookup
+        # counters above: the two methods prove different things, and one must
+        # never be credited with the other's strength.
+        "local_attack_hashes": local_only,
+        "local_attack_recovered": local_recovered,
+        "local_attack_status": local_status,
+        "statement": statement,
     }
     cracker_class = cracker_class_label(engine)
     if cracker_class:
@@ -323,11 +570,40 @@ def cracking_coverage_view(coverage: Any) -> dict[str, Any]:
             "statement": "",
             "audit_base_available": True,
             "missing_wordlists": [],
+            "breach_lookup_only_hashes": 0,
+            "breach_lookup_recovered": 0,
+            "local_attack_hashes": 0,
+            "local_attack_recovered": 0,
+            "local_attack_status": "",
             "cracker_class": "",
             "rule_effort": "",
             "effort_statement": "",
         }
     missing = _clean_names(coverage.get("missing_wordlists"))
+    try:
+        lookup_only = max(int(coverage.get("breach_lookup_only_hashes") or 0), 0)
+    except (TypeError, ValueError):
+        lookup_only = 0
+    try:
+        lookup_recovered = max(int(coverage.get("breach_lookup_recovered") or 0), 0)
+    except (TypeError, ValueError):
+        lookup_recovered = 0
+    try:
+        local_hashes = max(int(coverage.get("local_attack_hashes") or 0), 0)
+    except (TypeError, ValueError):
+        local_hashes = 0
+    try:
+        local_recovered = max(int(coverage.get("local_attack_recovered") or 0), 0)
+    except (TypeError, ValueError):
+        local_recovered = 0
+    local_status = str(coverage.get("local_attack_status") or "").strip().lower()
+    if local_status not in _LOCAL_ATTACK_STATUSES or local_hashes <= 0:
+        local_status = ""
+        local_hashes = 0
+        local_recovered = 0
+    # A block written before this record carries no lookup counter, so it reads
+    # exactly as it did: default to the block's OWN ``complete``, never infer a
+    # method boundary nobody observed.
     complete = bool(coverage.get("complete", not missing))
     statement = str(coverage.get("statement") or "").strip()
     audit_available = coverage.get("audit_base_available")
@@ -349,6 +625,11 @@ def cracking_coverage_view(coverage: Any) -> dict[str, Any]:
         "statement": statement if not complete else "",
         "audit_base_available": bool(audit_available),
         "missing_wordlists": list(missing),
+        "breach_lookup_only_hashes": lookup_only,
+        "breach_lookup_recovered": lookup_recovered,
+        "local_attack_hashes": local_hashes,
+        "local_attack_recovered": local_recovered,
+        "local_attack_status": local_status,
         "cracker_class": cracker_class,
         "rule_effort": rule_effort,
         "effort_statement": effort,
@@ -387,6 +668,14 @@ def merge_cracking_coverage(domain_entries: Any) -> dict[str, Any]:
     best_effort_block: Mapping[str, Any] | None = None
     best_effort_rank = -1
     saw_record = False
+    lookup_only = 0
+    lookup_recovered = 0
+    # Per local-attack status, the largest (hashes, recovered) any domain
+    # recorded. Folded by WORST status (see _LOCAL_ATTACK_MERGE_PRECEDENCE): the
+    # assessment-wide statement must report the weakest coverage any domain had,
+    # never the strongest — the opposite of the effort fold below, which credits
+    # the hardest attempt because that one genuinely ran.
+    local_by_status: dict[str, tuple[int, int]] = {}
     for entry in domain_entries or ():
         if not isinstance(entry, Mapping):
             continue
@@ -398,6 +687,20 @@ def merge_cracking_coverage(domain_entries: Any) -> dict[str, Any]:
             if name not in missing:
                 missing.append(name)
         view = cracking_coverage_view(block)
+        # Carry the breach-lookup-only class through the fold. The merge rebuilds
+        # the block from scratch, so a field it does not re-pass is DROPPED and
+        # the report-wide note silently reverts to claiming full strength. The
+        # lookup runs once per assessment and is recorded onto every in-scope
+        # domain, so the fold takes the MAX rather than a sum.
+        lookup_only = max(lookup_only, int(view["breach_lookup_only_hashes"]))
+        lookup_recovered = max(lookup_recovered, int(view["breach_lookup_recovered"]))
+        local_status = str(view["local_attack_status"] or "")
+        if local_status:
+            prev_hashes, prev_recovered = local_by_status.get(local_status, (0, 0))
+            local_by_status[local_status] = (
+                max(prev_hashes, int(view["local_attack_hashes"])),
+                max(prev_recovered, int(view["local_attack_recovered"])),
+            )
         if view["has_gap"] and view["statement"] not in statements:
             statements.append(view["statement"])
         rank = _effort_rank(block.get("engine"), block.get("ruleset"))
@@ -407,7 +710,20 @@ def merge_cracking_coverage(domain_entries: Any) -> dict[str, Any]:
     if not saw_record:
         return cracking_coverage_view(None)
 
-    merged = build_cracking_coverage(missing_wordlists=missing)
+    merged_status = next(
+        (s for s in _LOCAL_ATTACK_MERGE_PRECEDENCE if s in local_by_status), ""
+    )
+    merged_local_hashes, merged_local_recovered = local_by_status.get(
+        merged_status, (0, 0)
+    )
+    merged = build_cracking_coverage(
+        missing_wordlists=missing,
+        breach_lookup_only_hashes=lookup_only,
+        breach_lookup_recovered=lookup_recovered,
+        local_attack_hashes=merged_local_hashes,
+        local_attack_recovered=merged_local_recovered,
+        local_attack_status=merged_status,
+    )
     if len(statements) == 1:
         merged["statement"] = statements[0]
     if best_effort_block is not None:
@@ -431,6 +747,10 @@ __all__ = [
     "AUDIT_BASE_WORDLIST",
     "CRACKING_COVERAGE_KEY",
     "FAST_BASE_WORDLIST",
+    "LOCAL_ATTACK_COMPLETED",
+    "LOCAL_ATTACK_RUNNING",
+    "LOCAL_ATTACK_TRUNCATED",
+    "LOCAL_ATTACK_UNAVAILABLE",
     "build_cracking_coverage",
     "cracker_class_label",
     "cracking_coverage_view",

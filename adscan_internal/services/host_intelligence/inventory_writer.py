@@ -42,6 +42,30 @@ def _serialize_product(product: DetectedProduct) -> dict:
     }
 
 
+def posture_was_assessed(fingerprint: HostFingerprint) -> bool:
+    """Whether this host's endpoint posture was actually determined.
+
+    The distinction an empty ``products`` list cannot carry on its own, and
+    the reason this field exists: a host whose probe FAILED and a host where
+    ADscan genuinely detected nothing both serialize to ``products: []``.
+    Collapsing the two would let a failed probe render as "no endpoint
+    protection" — false assurance about the one control the client most
+    wants to be true, and the same falsehood class as greening a compliance
+    control nobody tested.
+
+    Mirrors the collector's ``endpoint_posture_assessed`` semantics:
+
+    * products detected -> assessed, whatever partial error came back (we
+      definitively observed something).
+    * no products, no error -> assessed; ADscan detected none active. Still
+      NOT a claim that the host has none, only that none was observed.
+    * no products, with an error -> NOT assessed. UNKNOWN, never clean.
+    """
+    if list(getattr(fingerprint, "products", None) or []):
+        return True
+    return not getattr(fingerprint, "error", None)
+
+
 def _serialize_host(
     host_object_id: str,
     fingerprint: HostFingerprint,
@@ -58,6 +82,10 @@ def _serialize_host(
         "host_object_id": host_object_id,
         "dns_name": dns_name,
         "products": [_serialize_product(p) for p in fingerprint.products],
+        # Carries the "could we tell?" axis, which ``products`` cannot. A
+        # consumer MUST read this before concluding anything from an empty
+        # product list — see ``posture_was_assessed``.
+        "posture_assessed": posture_was_assessed(fingerprint),
         "ppl_enabled": (None if ppl_enabled is None else bool(ppl_enabled)),
         "lsass_pid_visible": (None if lsass_pid is None else bool(lsass_pid)),
         "observed_at": observed_at.isoformat() if observed_at else None,
@@ -139,5 +167,6 @@ def write_defensive_posture_inventory(
 __all__ = [
     "INVENTORY_SCHEMA_VERSION",
     "RECORD_TYPE",
+    "posture_was_assessed",
     "write_defensive_posture_inventory",
 ]

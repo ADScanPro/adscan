@@ -636,48 +636,60 @@ class MSLDAPClientConnection:
 								res['protocolOp']['diagnosticMessage']
 							)
 			elif self.credential.protocol == asyauthProtocol.SSL:
-				if self.target.protocol == UniProto.CLIENT_SSL_TCP:
-					# NOTE! If LDAPS is used with SSL authentication, EXTERNAL bid is NOT needed!
-					# Again, it is NOT needed!
-					# If the handshake is successful, the client is authenticated (but sometimes not?)
-					self.__bind_success()
-					return True, None
-				elif self.target.protocol == UniProto.CLIENT_TCP:
+				# Schannel / PassTheCert: the client certificate is presented during
+				# the TLS handshake. ADSCAN FIX (2026-10-08): Active Directory maps
+				# that channel certificate to its account ONLY on a SASL EXTERNAL
+				# bind. WITHOUT it the bind is ANONYMOUS, so the connection
+				# authenticates as nobody and every later write silently fails with
+				# insufficientAccessRights. The old "EXTERNAL not needed over LDAPS"
+				# note (and its "but sometimes not?") held only for a generic LDAP
+				# server that auto-maps on the handshake; AD does not. So send the
+				# SASL EXTERNAL bind in BOTH channel cases (direct LDAPS and a
+				# StartTLS upgrade over plain 389), over the already-established TLS
+				# channel. This mirrors certipy's schannel_connect and the native
+				# PassTheCert tooling. Locked by
+				# tests/unit/vendor/test_badldap_schannel_external_bind.py.
+				if self.target.protocol == UniProto.CLIENT_TCP:
+					# Plain 389: raise the TLS channel first (the client cert is in
+					# the target ssl_ctx), then bind EXTERNAL over it.
 					_, err = await self.starttls()
 					if err is not None:
 						return False, err
-					
-					sasl = {
-						'mechanism' : 'EXTERNAL'.encode(),
-					}
-					auth = {
-						'sasl' : SaslCredentials(sasl)
-					}
+				elif self.target.protocol != UniProto.CLIENT_SSL_TCP:
+					return False, Exception(
+						'SSL (Schannel) bind requires an LDAPS or StartTLS channel'
+					)
 
-					bindreq = {
-						'version' : 3,
-						'name': b'',
-						'authentication': AuthenticationChoice(auth), 
-					}
+				sasl = {
+					'mechanism' : 'EXTERNAL'.encode(),
+				}
+				auth = {
+					'sasl' : SaslCredentials(sasl)
+				}
 
-					br = { 'bindRequest' : BindRequest( bindreq	)}
-					msg = { 'protocolOp' : protocolOp(br)}
+				bindreq = {
+					'version' : 3,
+					'name': b'',
+					'authentication': AuthenticationChoice(auth),
+				}
 
-					msg_id = await self.send_message(msg)
-					res = await self.recv_message(msg_id)
-					if isinstance(res[0], Exception):
-						return False, res[0]
-					resp = res[0].native['protocolOp']
-					if resp['resultCode'] != 'success':
-						#startls refused :(
-						return False, LDAPBindException(
-								resp['resultCode'], 
-								resp['diagnosticMessage']
-							)
-					self.__bind_success()
-					return True, None
-				
-				return False, Exception('Not implemented: %s' % self.credential.protocol.name)
+				br = { 'bindRequest' : BindRequest( bindreq	)}
+				msg = { 'protocolOp' : protocolOp(br)}
+
+				msg_id = await self.send_message(msg)
+				res = await self.recv_message(msg_id)
+				if isinstance(res[0], Exception):
+					return False, res[0]
+				resp = res[0].native['protocolOp']
+				if resp['resultCode'] != 'success':
+					# AD refused the certificate mapping (unmapped / revoked cert,
+					# or Schannel disabled) -- fail honestly, never a false bind.
+					return False, LDAPBindException(
+							resp['resultCode'],
+							resp['diagnosticMessage']
+						)
+				self.__bind_success()
+				return True, None
 					
 			else:
 				raise Exception('Not implemented authentication method: %s' % self.credential.protocol.name)
@@ -710,6 +722,23 @@ class MSLDAPClientConnection:
 			await self.network.wrap_ssl(self.target.get_ssl_context(ssl.PROTOCOL_TLS_CLIENT))
 			self.handle_incoming_task = asyncio.create_task(self.__handle_incoming())
 			self.status = MSLDAPClientStatus.CONNECTED
+			# ADSCAN PATCH (2026-10-05) — derive the RFC 5929 channel-binding token
+			# from the now-wrapped StartTLS peer certificate. The LDAPS block in
+			# connect() only fires on CLIENT_SSL_TCP; on a StartTLS (CLIENT_TCP)
+			# connection the TLS channel is established HERE, so the token has to be
+			# computed here too. LdapEnforceChannelBinding is channel-agnostic, so a
+			# StartTLS-upgraded bind can observe and satisfy CBT exactly like an
+			# implicit-LDAPS bind. This is mutually exclusive with the connect()
+			# LDAPS block (that path is CLIENT_SSL_TCP, this one only runs for
+			# CLIENT_TCP), so cb_data is never double-computed. Honours the same two
+			# flags as the LDAPS block: _disable_channel_binding (skip entirely) and
+			# _null_channel_binding (the empty-SHA256 scanner token).
+			if self._disable_channel_binding is False:
+				if self._null_channel_binding is True:
+					self.cb_data = b'tls-server-end-point:' + sha256(b'').digest()
+				else:
+					certdata = self.network.get_peer_certificate()
+					self.cb_data = b'tls-server-end-point:' + _tls_server_end_point_digest(certdata)
 			await asyncio.sleep(0)
 			return True, None
 		except Exception as e:

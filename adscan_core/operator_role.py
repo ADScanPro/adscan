@@ -131,6 +131,35 @@ def get_operator_role() -> str | None:
     return key
 
 
+def operator_runs_own_estate() -> bool | None:
+    """Return whether the operator runs the Active Directory being assessed.
+
+    Three-valued on purpose, because the two consumers of this split want
+    opposite defaults when the role is unknown and a boolean would force one of
+    them to be wrong:
+
+    * ``True`` — a buyer role (:data:`_BUYER_ROLES`): internal security, a
+      sysadmin / blue team, a security manager or CISO. The estate is theirs.
+    * ``False`` — an explicit non-buyer role: a consultant or pentester, a
+      student, "something else", "prefer not to say". A third party operated it.
+    * ``None`` — no role captured, or a role this build does not recognise.
+
+    This deliberately does NOT apply the Windows tie-break
+    :func:`resolve_cta_lane` uses. That tie-break is right for a commercial
+    call-to-action, where guessing wrong only shows the wrong link, and wrong
+    for a consequence that carries an obligation: a caller deciding how much to
+    ask of the reader needs to know that it is guessing, and pick its own safe
+    direction. Never raises.
+    """
+    try:
+        role = get_operator_role()
+    except Exception:  # noqa: BLE001
+        return None
+    if role is None:
+        return None
+    return role in _BUYER_ROLES
+
+
 class CtaLane(str, Enum):
     """Which commercial destination the peak-value CTA points at."""
 
@@ -174,5 +203,6 @@ __all__ = [
     "CtaLane",
     "get_operator_role",
     "is_enterprise_lane",
+    "operator_runs_own_estate",
     "resolve_cta_lane",
 ]

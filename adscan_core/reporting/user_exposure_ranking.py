@@ -269,20 +269,49 @@ def _build_population_statement(
 
     Client-safe, human-grade English (no em-dash, no percentage): states that
     exposure is uniform across the whole ordinary population, so the finding is
-    the population, not a ranking of interchangeable accounts. The hardening
-    advice it invites is population-level (fix the shared chain), never "add these
-    specific accounts to Protected Users".
+    the population rather than a ranking of interchangeable accounts. The
+    hardening advice it invites is population-level (fix the shared chain), never
+    "add these specific accounts to Protected Users".
+
+    **Names its own population.** The report prints this within a page of the
+    Tier-0 reach figure, which spans every enabled domain account in scope and
+    counts only the routes landing on a Tier 0 host or the domain object. The two
+    therefore carry different numbers by design, and an unqualified "all N users
+    share the same exposure" under a zero in that figure reads as the report
+    contradicting itself. Saying which accounts this one counts (ordinary,
+    non-administrative, holding at least one route) lets a reader hold both
+    without either number changing. Deliberately layout-neutral: no "above" or
+    "below", because LITE omits the Tier-0 card at zero and the web CTEM orders
+    its panels independently.
+
+    **The single-route case gets its own lead.** With one shared route the
+    uniformity is the whole finding and a ranking would separate nothing, so the
+    sentence leads with the shared chain and the fact that closing it clears the
+    whole population. Nothing is softened: one route to Tier 0 held by every
+    ordinary account is still the headline.
     """
-    users_noun = "ordinary user" if total_exposed == 1 else "ordinary users"
+    # Always plural: the caller builds this only when exposure is uniform, which
+    # requires at least two exposed accounts (one account is a ranking of one).
     routes_noun = "compromise route" if route_count == 1 else "compromise routes"
+    population = (
+        f"{total_exposed:,} ordinary, non-administrative accounts with at least "
+        f"one route"
+    )
     proven_clause = ""
     if proven_count > 0:
         # "them" already refers to the routes, so the noun is not repeated:
         # "2 of them validated end to end", not "2 of them routes validated".
         proven_clause = f", {proven_count:,} of them validated end to end"
+    if route_count == 1:
+        return (
+            f"All {population} hold the same route{proven_clause}, so none of "
+            f"them is less exposed than another and ranking them would separate "
+            f"nothing. A single shared chain carries the whole population, and "
+            f"closing it clears the exposure for all {total_exposed:,}."
+        )
     return (
-        f"There is no low-risk ordinary account here: all {total_exposed:,} "
-        f"{users_noun} share the same exposure. Each one reaches the same "
-        f"{route_count:,} {routes_noun}{proven_clause}. Harden the shared chain "
-        f"the whole population funnels through, not any single account."
+        f"There is no low-risk ordinary account here: all {population} reach the "
+        f"same {route_count:,} {routes_noun}{proven_clause}. Harden the shared "
+        f"chains the whole population funnels through rather than any single "
+        f"account."
     )

@@ -5,8 +5,9 @@ from typing import Any
 from adscan_internal.services.graph_queries.filters import (
     STALE_DAYS_DEFAULT,
     domain_matches,
-    is_enabled,
+    is_active,
     is_stale,
+    is_tombstoned,
 )
 from adscan_internal.services.graph_queries.tier_classification import (
     is_tier0_or_high_value,
@@ -19,11 +20,6 @@ def _nodes_props(graph: dict[str, Any], kind: str, domain: str) -> list[dict[str
         for node in (graph.get("nodes") or {}).values()
         if node.get("kind") == kind and domain_matches(node, domain)
     ]
-
-
-def _prop_enabled(props: dict[str, Any]) -> bool:
-    v = props.get("enabled")
-    return bool(v) if v is not None else True
 
 
 def is_managed_service_account(props: dict[str, Any]) -> bool:
@@ -95,7 +91,7 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # LDAP-query MIRROR of the predicates above — single source of truth.
 #
-# The predicates (_prop_enabled / _is_machine_or_trust_user /
+# The predicates (is_active / _is_machine_or_trust_user /
 # is_managed_service_account) and get_enabled_users/get_enabled_computers define
 # "a real enabled user/computer" for the SCAN, which filters already-collected
 # graph nodes. The `adscan doctor` preflight issues a raw paged LDAP COUNT BEFORE
@@ -103,6 +99,11 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
 # These constants are that mirror and MUST stay in lockstep with the predicates
 # (locked by tests/unit/services/graph_queries/test_enabled_inventory_parity.py).
 #
+#   active        = LIVE (not a CN=Deleted Objects tombstone) AND enabled.
+#                   A raw paged LDAP search never returns tombstones (they need
+#                   the SHOW_DELETED control), so the LDAP form expresses the
+#                   live half implicitly, and the two sides agree only now that
+#                   the graph predicates exclude deletions too.
 #   enabled       = ACCOUNTDISABLE (0x2) NOT set on userAccountControl.
 #   real user     = a normal user (objectCategory=person + objectClass=user)
 #                   OR a (group) managed service account — a gMSA/sMSA is a real
@@ -140,19 +141,47 @@ ENABLED_REAL_COMPUTERS_LDAP_FILTER = (
 
 
 def get_enabled_users(graph: dict[str, Any], domain: str) -> list[dict[str, Any]]:
+    """Return the domain's ACTIVE user population: live (not deleted) AND enabled.
+
+    ``is_active`` rather than a raw enabled check, because a tombstone preserves
+    its ``userAccountControl`` and therefore reaches here as ``enabled=True``
+    whenever it was enabled on the day it was deleted. Counting one as part of
+    the domain's user population inflates every figure derived from this list:
+    the spray population, the estate-size telemetry, the exposure-KPI
+    denominator, and the ``enabled_users.txt`` artifact this feeds. Deleted
+    accounts stay fully available through :func:`get_tombstoned_users`.
+    """
     return [
         p
         for p in _nodes_props(graph, "User", domain)
-        if _prop_enabled(p) and not _is_machine_or_trust_user(p)
+        if is_active(p) and not _is_machine_or_trust_user(p)
     ]
 
 
 def get_enabled_computers(graph: dict[str, Any], domain: str) -> list[dict[str, Any]]:
+    """Return the domain's ACTIVE computer population: live AND enabled.
+
+    See :func:`get_enabled_users` for why deletion is excluded here rather than
+    left to each consumer.
+    """
     return [
         p
         for p in _nodes_props(graph, "Computer", domain)
-        if _prop_enabled(p) and not is_managed_service_account(p)
+        if is_active(p) and not is_managed_service_account(p)
     ]
+
+
+def get_tombstoned_users(graph: dict[str, Any], domain: str) -> list[dict[str, Any]]:
+    """Return the domain's DELETED user objects (AD Recycle Bin tombstones).
+
+    The complement of :func:`get_enabled_users` on the live/deleted axis, so a
+    surface whose subject IS the deleted population (a restorable-tombstone
+    finding, a "deleted accounts an attacker can reanimate" count) reads it
+    explicitly instead of leaning on the active inventory having let them
+    through. Each record keeps its raw ``enabled`` flag, which is what says
+    whether reanimating it yields a usable account.
+    """
+    return [p for p in _nodes_props(graph, "User", domain) if is_tombstoned(p)]
 
 
 def get_high_value_users(graph: dict[str, Any], domain: str) -> list[dict[str, Any]]:
@@ -161,7 +190,7 @@ def get_high_value_users(graph: dict[str, Any], domain: str) -> list[dict[str, A
         for node in (graph.get("nodes") or {}).values()
         if node.get("kind") == "User"
         and domain_matches(node, domain)
-        and is_enabled(node)
+        and is_active(node)
         and is_tier0_or_high_value(node)
     ]
 
@@ -188,7 +217,7 @@ def get_stale_users(
         for node in (graph.get("nodes") or {}).values()
         if node.get("kind") == "User"
         and domain_matches(node, domain)
-        and is_enabled(node)
+        and is_active(node)
         and is_stale(node, stale_days)
     ]
 

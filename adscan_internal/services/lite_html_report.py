@@ -80,7 +80,7 @@ Honesty (CLAUDE.md § Nomenclature Standard):
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -107,21 +107,30 @@ from adscan_core.posture_score import (
     PostureScore,
     compute_posture_score,
 )
+from adscan_core.reporting.adscan_severity import (
+    authored_adscan_rating,
+    recorded_baseline_severity,
+    reported_finding_severity,
+)
 from adscan_core.reporting.attack_path_memory_gate import (
     exposure_population_reconciliation,
     merge_attack_path_coverage,
 )
 from adscan_core.reporting.chokepoint_copy import (
     CHOKEPOINT_MAX_ROWS,
+    REMEDIATION_ORDER_CLAUSE,
     STRUCTURAL_CHOKE_BADGE,
     chokepoint_headline,
+    containment_block_note,
     is_structural_choke,
     reach_uniform_note,
     remediation_chain_note,
     remediation_item_line,
     remediation_kpi_lines,
+    remediation_order_sentence,
     remediation_start_here_headline,
 )
+from adscan_core.reporting.endpoint_defense import merge_endpoint_defense
 from adscan_core.reporting.host_enrichment_coverage import (
     merge_host_enrichment_coverage,
 )
@@ -144,10 +153,18 @@ from adscan_core.reporting.reach_claim import (
     reaches_full_compromise_clause,
     tier0_reach_sub_phrase,
 )
+from adscan_core.reporting.severity_methodology import severity_methodology_view
 from adscan_core.reporting.share_credential_verification import (
     source_verification_label_for_step,
 )
 from adscan_core.reporting.technical_report import _get_technical_report_path
+from adscan_core.reporting.time_to_compromise import (
+    AssessmentDuration,
+    TimeToCompromise,
+    assessment_duration_from_summary,
+    load_scan_summary,
+    time_to_compromise_from_summary,
+)
 from adscan_core.reporting.unauthenticated_reach import (
     UNAUTHENTICATED_REACH_BADGE,
     UNAUTHENTICATED_REACH_SO_WHAT,
@@ -166,6 +183,10 @@ from adscan_internal.services.adcs_path_display import (
     extract_adcs_authority_names,
     extract_adcs_template_names,
 )
+from adscan_internal.services.affected_assets import (
+    build_affected_assets_pair_rows,
+)
+from adscan_internal.services.affected_asset_rules import Representation, rule_for
 from adscan_internal.services.affected_assets_struct import (
     SERIALIZED_KEY,
     TYPE_DOMAIN,
@@ -184,9 +205,16 @@ from adscan_internal.services.attack_step_catalog import (
     get_attack_step_entry,
     render_step_narrative,
 )
+from adscan_internal.services.attack_step_support_registry import (
+    CONTEXT_ONLY_RELATIONS,
+)
 from adscan_internal.services.attack_surface_analysis import (
     compute_attack_surface_analysis,
     top_remediation_targets,
+)
+from adscan_internal.services.remediation_start_here import (
+    containment_kind_for_technique,
+    containment_sort_rank,
 )
 from adscan_internal.services.technique_priority import (
     TechniquePriority,
@@ -207,6 +235,9 @@ from adscan_internal.services.compromise_class import (
     CompromiseClass,
     compromise_reach_label_short,
     tier_glossary,
+)
+from adscan_internal.services.destructive_action_policy import (
+    path_is_safety_abstention,
 )
 from adscan_internal.services.environment_change_ledger import (
     EnvironmentChangeResolution,
@@ -238,7 +269,17 @@ _SEVERITY_ORDER: tuple[str, ...] = ("critical", "high", "medium", "low")
 
 # Attack-step relations that are pure graph-expansion context, not a technique a
 # reader needs narrated (kept out of the step list so the story reads cleanly).
-_CONTEXT_RELATIONS: frozenset[str] = frozenset({"memberof", "hassession"})
+#
+# Derived from the ONE registry SSOT, never hand-listed: a relation the catalog
+# registers as ``context`` has to reach this document the same way it reaches
+# the engine, and the literal this replaced ({"memberof", "hassession"}) was
+# already short of the registry, so a new contextual relation would have been
+# narrated here as if it were a technique. The registry is LITE-safe — its whole
+# module-level dependency closure is ``attack_step_catalog``, which this module
+# already imports above.
+_CONTEXT_RELATIONS: frozenset[str] = frozenset(
+    str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS
+)
 
 _REPORT_FILENAME_PREFIX = "adscan_exposure_report"
 # The upgrade links inside the rendered HTML/PDF document. The terminal
@@ -330,14 +371,49 @@ def _score_tone(score: int) -> str:
 
 
 @dataclass(frozen=True)
+class AssetLabel:
+    """One affected-asset label for a LITE finding row, with its tier + role.
+
+    ``text`` is the humanized object name (for a PAIRING finding, the composed
+    pair ``logged-on-user @ host (IP)``); ``tier`` is the compact privilege-tier
+    badge (``Tier 0`` / ``Tier 1`` / ``Tier 2``) or ``""``; ``role`` is the
+    finding-specific client role (``holder``, ``roastable-target`` …) or ``""``.
+    """
+
+    text: str
+    tier: str = ""
+    #: Axis-1 confidence + client-safe basis for the tier verdict (``inferred:
+    #: member server by operating-system role``), shown on demand (tooltip) next to
+    #: the badge. ``""`` for a plain Tier-2 / unstamped asset.
+    tier_basis: str = ""
+    tier_confidence: str = ""
+    role: str = ""
+    #: The concrete per-asset measured value for a staleness/age/obsolete-OS
+    #: finding (``Last rotated 2017-05-23 (~3,418 days ago)`` / ``Windows Server
+    #: 2003``), or ``""`` for a non-staleness asset.
+    metric: str = ""
+    #: For a ROASTING account (kerberoast / asreproast / timeroast): the honest
+    #: per-account outcome — ``cracked`` / ``attempted`` / ``exposed``, from the
+    #: stamped entity's ``crack_status``. ``""`` for every other finding.
+    crack_status: str = ""
+    #: For a PAIRING row, the per-endpoint tiers so the client sees BOTH tiers of
+    #: the ESAE violation (a Tier-0 user on a Tier-1 host), ordered as ``text``
+    #: reads: ``({"text","tier","tier_basis"}, ...)``. Empty for a non-pair row.
+    pair_endpoints: tuple[dict[str, str], ...] = ()
+    #: The connector between the two endpoints (`` @ `` / `` → ``). ``""`` otherwise.
+    pair_connector: str = ""
+
+
+@dataclass(frozen=True)
 class FindingRow:
     """One finding as rendered: LITE fields only (no knowledge prose).
 
     ``assets`` names the objects the finding is about — the accounts, hosts,
     shares, certificate templates and files an administrator can open, disable
-    or revoke. It is capped at :data:`_INLINE_ASSET_CAP` and ``assets_overflow``
-    carries how many were left out, so a posture finding covering a thousand
-    hosts states its scale instead of running for pages.
+    or revoke, each carrying its privilege-tier badge and finding-specific role.
+    It is capped at :data:`_INLINE_ASSET_CAP` and ``assets_overflow`` carries how
+    many were left out, so a posture finding covering a thousand hosts states its
+    scale instead of running for pages.
     """
 
     title: str
@@ -345,8 +421,19 @@ class FindingRow:
     category: str
     mitre: tuple[dict[str, str], ...] = ()
     domain: str = ""
-    assets: tuple[str, ...] = ()
+    assets: tuple[AssetLabel, ...] = ()
     assets_overflow: int = 0
+    #: The numeric behind ``severity``: the contextual rating this report counts
+    #: the finding at. ``None`` for an artifact written before the rating was
+    #: persisted, and the card then shows the band alone, exactly as it always
+    #: did, rather than an invented figure.
+    score: Optional[float] = None
+    #: The BASELINE band and its numeric, what the technique is worth in any
+    #: directory. Carried only when this directory's own conditions RAISED the
+    #: rating, which is the case the reader needs explained; when the two agree
+    #: there is nothing to reconcile and the card stays one chip.
+    baseline_severity: str = ""
+    baseline_score: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -510,6 +597,18 @@ class LiteRemediationStartHereRow:
     #: The pill text for a ``largest_reduction`` row, e.g. "Largest single reduction
     #: · 42 of 48" (attack paths broken of all-status total). Empty otherwise.
     largest_reduction_label: str = ""
+    #: Which block this row belongs to: ``"containment"`` (key material left the
+    #: client's control during the assessment, ranked by time criticality) or
+    #: ``"exposure"`` (ranked by routes closed, cheapest first at a tie).
+    #: ``containment_kind`` names WHICH clock (``krbtgt`` / ``certificate`` /
+    #: ``credential``) and is ``""`` on an exposure row.
+    #:
+    #: A containment row deliberately draws NO impact bar. It is not competing on
+    #: volume: a one-route krbtgt reset outranks a thirty-route credential
+    #: rotation, and drawing a short bar beside it would say the opposite of the
+    #: order. The bars contradicting the rows is the defect this split fixes.
+    block: str = "exposure"
+    containment_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -519,9 +618,10 @@ class LiteRemediationStartHere:
     Mirrors the PRO deliverable's ``build_remediation_start_here`` render model
     (E4): the LITE report LEADS with the same technique ranking ADscan already
     computes (:func:`compute_technique_priorities`) — fixes ordered by how many
-    attack paths each one breaks, weighting executed over theoretical and
-    remediation effort — reframed to counts and executed-framed. The order stays
-    the ranking's own; the structural-choke badge decorates but never reorders.
+    attack paths each one closes, cheapest first on a tie, with containment
+    leading — reframed to counts and executed-framed. The order stays the
+    ranking's own; the structural-choke badge decorates but never reorders, and
+    neither does proof.
 
     ``present`` is ``False`` on a scan with no attack paths (or none carrying
     client exposure): the lead is omitted and the older centrality "techniques"
@@ -556,6 +656,24 @@ class LiteRemediationStartHere:
     #: that promises "the single fix that removes the most paths is flagged below",
     #: so that promise is never printed when no row is flagged.
     has_largest_reduction: bool = False
+    #: How many leading rows are containment actions, and the one-line note that
+    #: introduces them. ``0`` / ``""`` on a clean engagement, which prints no
+    #: containment copy at all.
+    containment_count: int = 0
+    containment_note: str = ""
+    #: The order, stated ONCE: the full sentence for a section lead, and the bare
+    #: clause for a surface that embeds it. Both from the shared copy SSOT
+    #: (:func:`adscan_core.reporting.chokepoint_copy.remediation_order_sentence`),
+    #: the same source the paid deliverable renders, so the free and paid
+    #: documents cannot describe this order differently. They did: this section
+    #: stated its key three ways, one of them the pre-2026-10-07 "proven
+    #: execution first" rule that stopped being true when proof became a badge.
+    order_rule: str = ""
+    order_rule_clause: str = ""
+    #: True when at least one row EARNED the structural-choke durability badge.
+    #: The legend defined that badge unconditionally, so a table where nothing
+    #: earned it still explained a mark the reader could not find in it.
+    has_structural_badge: bool = False
 
 
 @dataclass(frozen=True)
@@ -781,6 +899,15 @@ class LiteReportModel:
     #: byte-identical.
     paths_folded: bool
     proven_paths: int
+    #: Routes ADscan CONFIRMED and deliberately did not execute, because the
+    #: technique would have disrupted production. Stated as its own figure, with
+    #: the restraint attributed to ADscan: it is never worded as a control in the
+    #: client's environment stopping the attack (CLAUDE.md § Exposure
+    #: Validation), and never as a gap in this scan's coverage. Counted through
+    #: the shared predicate the paid deliverable's headline figure and the
+    #: "Not Executed for Safety" bucket both use, so the two tiers cannot name a
+    #: different set of routes. ``0`` leaves the clause out entirely.
+    paths_withheld_for_safety: int
     choke_points: tuple[ChokePointRow, ...]
     #: The prioritized "Start here" choke-point remediation section, ranked by the
     #: validated cut set (which object, if fixed, severs the most validated routes
@@ -860,6 +987,15 @@ class LiteReportModel:
     hardening: HardeningObserved = HardeningObserved(
         present=False, count=0, rows=()
     )
+    #: Endpoint defense: which hosts were examined for antivirus and endpoint
+    #: detection, and what the techniques ADscan ran did where a product was
+    #: confirmed active. Stored as the shared SSOT's own render view rather
+    #: than a LITE-side dataclass, so the free report cannot word the same
+    #: observation differently from the paid one. Empty dict (and the section
+    #: omitted) when no host was examined. Carries COUNTS and no coverage rate
+    #: on purpose: ADscan examines the hosts it touches, not the estate.
+    #: SSOT: :mod:`adscan_core.reporting.endpoint_defense`.
+    endpoint_defense: dict[str, Any] = field(default_factory=dict)
     #: The headline exposure figure, LABELLED distinctly from the posture score:
     #: the share of accounts with a validated path to Tier 0 — ADscan's thesis as
     #: a number. Read from the shared
@@ -881,6 +1017,25 @@ class LiteReportModel:
     #: worse". Always ends with the direction cue so the card can never read as
     #: the opposite-polarity posture score beside it.
     exposure_reach_sub: str = ""
+    #: How long this engagement took to reach proven domain compromise, resolved
+    #: through the tier-shared SSOT
+    #: :func:`adscan_core.reporting.time_to_compromise.time_to_compromise_from_summary`
+    #: so the free report and the paid kit state one duration in one wording. It
+    #: carries the whole card: the numeral, the labels, the forwardable sentence
+    #: and the one qualifier. ``None`` on any run that did not reach compromise,
+    #: and the callout is then OMITTED entirely rather than printing a zero or a
+    #: dash, which would read as an instantaneous compromise.
+    time_to_compromise: Optional[TimeToCompromise] = None
+    #: How long the WHOLE assessment ran, resolved through the same tier-shared
+    #: SSOT
+    #: (:func:`adscan_core.reporting.time_to_compromise.assessment_duration_from_summary`).
+    #: A different question from the figure above and therefore a different slot:
+    #: it belongs to scope and method, because what a reader needs it for is
+    #: deciding whether recurring validation fits a change window. It renders on
+    #: a run that compromised nothing as readily as on one that took the domain,
+    #: and its label says "assessment duration" where the other says "time to
+    #: domain compromise", so the two can never be read as one number.
+    assessment_duration: Optional[AssessmentDuration] = None
     #: "Most Exposed Accounts" (IA v2) — the transpose of the affected-user data:
     #: which accounts the most compromise paths can REACH. The render model from
     #: the import-safe SSOT
@@ -895,6 +1050,16 @@ class LiteReportModel:
     #: :func:`~adscan_internal.services.compromise_class.tier_glossary`, so every
     #: surface defines the tiers identically.
     tier_glossary: tuple[TierGlossaryRow, ...] = ()
+    #: The published method behind the severity this report counts by, from the
+    #: shared SSOT :func:`adscan_core.reporting.severity_methodology.severity_methodology_view`.
+    #: This document's counts group findings by the CONTEXTUAL rating (what the
+    #: technique is worth once this directory's own conditions are read), the same
+    #: band the paid report and the platform count on, so the method has to be
+    #: stated here too: publishing a number without the method it came from is
+    #: exactly the objection the no-CVSS decision exists to avoid. Consumed
+    #: verbatim, never re-authored, so the free and paid documents define the
+    #: grade identically.
+    severity_methodology: Optional[dict[str, Any]] = None
     pro_url: str = _PRO_URL
     repo_url: str = _LITE_REPO_URL
     #: The Enterprise-demo door for the report's primary upsell, resolved through
@@ -956,7 +1121,7 @@ def _entity_label(entity: dict[str, Any]) -> str:
     The structured affected-asset entities carry the RAW directory label in
     ``display`` / ``identifier`` — a collector that shouts an account or computer
     (``SMATIKVISION$``) would otherwise print it that way beside a correctly
-    lower-cased ``quality2$`` on the same finding. Route a principal / machine
+    lower-cased ``appsrv2$`` on the same finding. Route a principal / machine
     through the prose humanization SSOT (the SAME seam the flat affected-assets
     list uses) so a shouting user/computer reads lower-case and a localized
     built-in group keeps its OWN directory language (never translated). A
@@ -1003,28 +1168,96 @@ def finding_asset_state(finding: Any) -> tuple[bool, bool]:
     return (has_assets, False)
 
 
-def _finding_asset_labels(finding: Any) -> tuple[tuple[str, ...], int]:
+#: CRACKED roasting accounts lead, then attempted, then merely exposed.
+_CRACK_LABEL_SORT_RANK: dict[str, int] = {"cracked": 0, "attempted": 1, "exposed": 2}
+
+
+def _entity_tier_badge(entity: dict[str, Any]) -> str:
+    """Return the compact privilege-tier badge (``Tier 0``) for an entity, or ``""``.
+
+    Reads the stamped ``tier_label`` (``Tier 0: Domain Control``) and keeps only
+    the leading tier token, so the row shows ``Tier 0`` beside the object. Empty
+    for an unstamped entity, so a legacy finding renders no badge.
+    """
+    text = str(entity.get("tier_label") or "").strip()
+    if not text:
+        return ""
+    return text.split(":", 1)[0].strip()
+
+
+def _finding_asset_labels(finding: Any) -> tuple[tuple[AssetLabel, ...], int]:
     """Return the capped asset labels for a finding row plus the overflow count.
 
-    Locators come first — an account, host, share, certificate template or file
-    is what the reader acts on, while the bare domain object is the fallback the
-    resolver emits when nothing concrete was found, and it is worth showing only
-    when it is all there is.
+    A PAIRING finding (HasSession, ForceChangePassword, shadow-creds, LAPS, gMSA,
+    RBCD, NTLMv1-relay) renders its per-edge pairs as a pair
+    (``logged-on-user @ host (IP)``) via the shared affected-assets SSOT, so the
+    reader sees who-can-do-what-to-whom rather than two unrelated flat lists.
+
+    Otherwise, locators come first — an account, host, share, certificate template
+    or file is what the reader acts on, while the bare domain object is the
+    fallback the resolver emits when nothing concrete was found, and it is worth
+    showing only when it is all there is. Every label carries its privilege-tier
+    badge and finding-specific role.
     """
-    locators: list[str] = []
-    fallback: list[str] = []
+    key = str(finding.get("key") or "") if isinstance(finding, dict) else ""
+    details = finding.get("details") if isinstance(finding, dict) else None
+    if key and rule_for(key).representation is Representation.PAIRING:
+        pair_rows = build_affected_assets_pair_rows(key, details or {})
+        if pair_rows:
+            shown = tuple(
+                AssetLabel(
+                    text=row.text,
+                    tier=row.tier_badge or "",
+                    tier_basis=row.tier_basis or "",
+                    tier_confidence=row.tier_confidence or "",
+                    role=row.role_label or "",
+                    metric=row.metric or "",
+                    pair_endpoints=tuple(
+                        {
+                            "text": ep.text,
+                            "tier": ep.tier_badge or "",
+                            "tier_basis": ep.tier_basis or "",
+                            "tier_confidence": ep.tier_confidence or "",
+                        }
+                        for ep in row.pair_endpoints
+                    ),
+                    pair_connector=row.pair_connector or "",
+                )
+                for row in pair_rows[:_INLINE_ASSET_CAP]
+            )
+            return shown, max(0, len(pair_rows) - len(shown))
+
+    locators: list[AssetLabel] = []
+    fallback: list[AssetLabel] = []
     for entity in _finding_asset_entities(finding):
         label = _entity_label(entity)
         if not label:
             continue
+        row = AssetLabel(
+            text=label,
+            tier=_entity_tier_badge(entity),
+            tier_basis=str(entity.get("tier_basis") or "").strip(),
+            tier_confidence=str(entity.get("tier_confidence") or "").strip(),
+            role=str(entity.get("role_label") or "").strip(),
+            metric=str(entity.get("metric") or "").strip(),
+            crack_status=str(entity.get("crack_status") or "").strip(),
+        )
         bucket = (
             fallback
             if str(entity.get("type") or "").strip().lower() == TYPE_DOMAIN
             else locators
         )
-        if label not in bucket:
-            bucket.append(label)
+        if label not in [existing.text for existing in bucket]:
+            bucket.append(row)
     ordered = locators or fallback
+    # CRACKED roasting accounts lead so the proven credential recovery is first;
+    # a no-op for any finding whose labels carry no crack status (stable sort).
+    if any(item.crack_status for item in ordered):
+        ordered.sort(
+            key=lambda item: _CRACK_LABEL_SORT_RANK.get(
+                item.crack_status.strip().lower(), 3
+            )
+        )
     shown = tuple(ordered[:_INLINE_ASSET_CAP])
     return shown, max(0, len(ordered) - len(shown))
 
@@ -1096,13 +1329,20 @@ def _collect_findings(
     ``findings[]`` before the recorder routed metrics to control evidence. The
     paid report has always applied that gate; applying it here is what stops the
     free report from listing a coverage counter as a medium finding.
+
+    Counts on the band the scan AUTHORED (``reported_finding_severity``): the
+    contextual rating, which is what the paid report and the platform count on
+    too, degrading to the recorded baseline for an artifact that carries no
+    rating. The method behind it is published in this report's own severity
+    annex, because a count whose method is not stated is the figure a reader
+    stops trusting.
     """
     counts: dict[str, int] = {sev: 0 for sev in _SEVERITY_ORDER}
     rows: list[FindingRow] = []
     with_assets = 0
     with_locator = 0
     for domain_name, finding in iter_reportable_findings(domains):
-        severity = str(finding.get("severity") or "").strip().lower()
+        severity = reported_finding_severity(finding)
         title = str(finding.get("title") or "").strip()
         if severity in counts:
             counts[severity] += 1
@@ -1110,6 +1350,19 @@ def _collect_findings(
         with_assets += int(has_assets)
         with_locator += int(has_locator)
         assets, assets_overflow = _finding_asset_labels(finding)
+        # The evidence behind the band, READ from the rating the scan authored
+        # and never recomputed here. This report's own severity annex promises
+        # the card carries the baseline beside the grade it is counted at, and
+        # until now the card carried neither: no score appeared anywhere in the
+        # document and the word "baseline" appeared once, in the unkept promise.
+        # The baseline pair is carried only when the context RAISED the rating,
+        # which is the one case a reader has something to reconcile.
+        rating = authored_adscan_rating(finding)
+        baseline_band = ""
+        baseline_score: Optional[float] = None
+        if rating is not None and rating.elevated:
+            baseline_band = recorded_baseline_severity(finding)
+            baseline_score = rating.baseline
         rows.append(
             FindingRow(
                 title=title,
@@ -1119,6 +1372,9 @@ def _collect_findings(
                 domain=domain_name if multi_domain else "",
                 assets=assets,
                 assets_overflow=assets_overflow,
+                score=rating.score if rating is not None else None,
+                baseline_severity=baseline_band,
+                baseline_score=baseline_score,
             )
         )
     rows.sort(
@@ -1510,8 +1766,8 @@ def _format_via_accounts_note(path: dict[str, Any], report_domain: str = "") -> 
 
     Each sampled account is named through the humanization SSOT
     (:func:`humanize_principal_for_prose`) so a raw / shouting / machine-account
-    label never reaches the client — an all-caps machine account ``QUALITY2$@SIFI.IT``
-    reads ``quality2$``, exactly as the PRO side (``attack_path_render._via_accounts_line``)
+    label never reaches the client — an all-caps machine account ``APPSRV2$@CORP.EXAMPLE``
+    reads ``appsrv2$``, exactly as the PRO side (``attack_path_render._via_accounts_line``)
     and every other principal-label surface do.
     """
     count = path.get("via_accounts_count")
@@ -1902,16 +2158,25 @@ def build_lite_remediation_start_here(
     if not priorities:
         return _empty
 
-    # Proven-first prefix (CLAUDE.md § Nomenclature Standard, "PROVEN-FIRST prefix
-    # stays"): a technique ADscan PROVED — an end-to-end exploited path OR a proven
-    # STEP on a partial route — leads every theoretical fix, regardless of the
-    # attack-path count. Within each group the base compute_technique_priorities
-    # order (attack-paths-broken) is preserved (Python's sort is stable), so LITE
-    # keeps its own within-group order (the intentional LITE-vs-PRO divergence: PRO
-    # adds an _impact_score tiebreaker LITE cannot import across the tier boundary).
-    # LITE consumed the base ranking VERBATIM before, which put executed fixes BELOW
-    # theoretical ones and made the section's "ordered by proven execution first"
-    # caption false. The proven-first PREFIX now applies to both tiers.
+    # CONTAINMENT-first prefix, replacing the proven-first one.
+    #
+    # Proof is no longer a sort key in either tier. It inverted the work order:
+    # proven-versus-theoretical says whether ADscan WALKED the route, not whether
+    # the fix works, so ranking the client's WORK by the quality of our own
+    # evidence put a fix closing 7 of 47 routes above the one closing 42 of 47.
+    # Here it was worse than in the paid report, because the impact BARS followed
+    # the counts while the ROWS followed proof: the three widest bars sat at the
+    # bottom of the table, and prose does not beat a bar chart.
+    #
+    # What leads instead is containment: key material that left the client's
+    # control during the assessment, sorted by TIME CRITICALITY. Within each
+    # block the base ``compute_technique_priorities`` order is preserved (Python's
+    # sort is stable), which is already the exposure rule the decision calls for
+    # (``-paths_affected`` then remediation complexity, cheapest first). The
+    # documented LITE-vs-PRO within-block divergence therefore stands: PRO adds an
+    # ``_impact_score`` tiebreaker LITE cannot import across the tier boundary.
+    #
+    # Proof survives as the PROVEN pill on the row, which is where it belongs.
     proven_step_techniques = _proven_step_technique_keys(raw_paths)
     # Techniques proven as a route's domain-compromise TERMINAL (e.g. a DCSync that
     # ends the route). Distinguishes a proven terminal from a mid-chain partial one,
@@ -1924,7 +2189,20 @@ def build_lite_remediation_start_here(
             str(entry.technique or "").strip().lower() in proven_step_techniques
         )
 
-    priorities = sorted(priorities, key=lambda entry: 0 if _is_proven(entry) else 1)
+    def _containment_kind(entry: TechniquePriority) -> str:
+        return containment_kind_for_technique(
+            str(entry.technique or ""), int(entry.exploited_paths)
+        )
+
+    priorities = sorted(
+        priorities,
+        key=lambda entry: (
+            0 if _containment_kind(entry) else 1,
+            containment_sort_rank(_containment_kind(entry))
+            if _containment_kind(entry)
+            else 0,
+        ),
+    )
 
     card_map = _node_cardinality_map(domains)
     # The affected-USER reach denominator (domain union of meta.affected_users),
@@ -2010,29 +2288,34 @@ def build_lite_remediation_start_here(
                 reach_users=reach_users,
                 reach_total=reach_total,
                 reach_pct=reach_pct,
+                block=(
+                    "containment" if _containment_kind(entry) else "exposure"
+                ),
+                containment_kind=_containment_kind(entry),
             )
         )
 
     if not rows:
         return _empty
 
-    # Largest-single-reduction flag (findings 1a). The list LEADS proven-first for
-    # credibility, which can BURY the single fix that removes the most attack paths
-    # further down (e.g. an ADCS ESC1 breaking 42 of 48 sitting at #4 while a proven
-    # #1 breaks 8 of 48). Keep the proven-first order, but VISUALLY flag the biggest
-    # lever so the reader sees it. Computed locally as the row with the largest
-    # all-status blast radius (``paths_affected``), and set ONLY when that row is
-    # NOT already the top row AND strictly exceeds the top row's reach — i.e. only
-    # when the proven-first order genuinely buries a bigger lever. The badge
-    # DECORATES; it never reorders.
+    # Largest-single-reduction flag. This existed because the list LED
+    # proven-first, which BURIED the single fix that removes the most attack
+    # paths (an ESC1 breaking 42 of 48 sat at #4 while a proven #1 broke 8 of
+    # 48), so the biggest lever was flagged where the order could not show it.
+    #
+    # The exposure block is now ordered by exactly that figure, so within it the
+    # biggest lever IS the first row and the flag cannot fire. It is scoped to the
+    # exposure rows and kept rather than deleted: it is the detector that proves
+    # the ordering holds. If a future change ever buries a bigger lever again,
+    # this fires and the badge reappears on its own.
     has_largest_reduction = False
-    if int(total_mapped_paths) > 0:
-        largest_idx = max(
-            range(len(rows)), key=lambda i: rows[i].paths_affected
-        )
+    _exposure_idx = [i for i, row in enumerate(rows) if row.block != "containment"]
+    if int(total_mapped_paths) > 0 and _exposure_idx:
+        largest_idx = max(_exposure_idx, key=lambda i: rows[i].paths_affected)
+        first_exposure = _exposure_idx[0]
         if (
-            largest_idx != 0
-            and rows[largest_idx].paths_affected > rows[0].paths_affected
+            largest_idx != first_exposure
+            and rows[largest_idx].paths_affected > rows[first_exposure].paths_affected
         ):
             biggest = rows[largest_idx]
             rows[largest_idx] = replace(
@@ -2054,6 +2337,10 @@ def build_lite_remediation_start_here(
     top_denominator = (
         int(total_executed_paths) if top_executed else int(total_mapped_paths)
     )
+    # Containment leads the whole section, so the headline states that and why
+    # before it states the ordering rule for the fixes below it. Same copy SSOT
+    # the paid deliverable uses, so the two tiers cannot word it differently.
+    containment_count = sum(1 for row in rows if row.block == "containment")
     headline = remediation_start_here_headline(
         top_paths_broken=top_paths_broken,
         total_validated_paths=top_denominator,
@@ -2063,6 +2350,7 @@ def build_lite_remediation_start_here(
         reach_total=top.reach_total,
         reach_pct=top.reach_pct,
         reach_is_uniform=reach_is_uniform,
+        containment_count=containment_count,
     )
     kpi = remediation_kpi_lines(
         top_paths_broken=top_paths_broken,
@@ -2111,6 +2399,13 @@ def build_lite_remediation_start_here(
             else ""
         ),
         has_largest_reduction=has_largest_reduction,
+        containment_count=containment_count,
+        containment_note=containment_block_note(containment_count),
+        # The order, from the SAME copy SSOT the paid deliverable renders, so the
+        # free and paid reports cannot word this key differently.
+        order_rule=remediation_order_sentence(containment_count),
+        order_rule_clause=REMEDIATION_ORDER_CLAUSE,
+        has_structural_badge=any(row.badge for row in rows),
     )
 
 
@@ -2452,20 +2747,25 @@ def build_bottom_line(
             "the number move at all."
         )
 
-    # 4. WHAT lifts it — concrete, ordered, and honest about what LITE can point at.
+    # 4. WHAT lifts it — concrete, ordered, and honest about what LITE can point
+    # at. It says "from the top" and nothing about proof: the ranked list is
+    # ordered by how many paths each fix closes, and proof is a badge on a row
+    # that orders nothing (CLAUDE.md, three-block decision 2026-10-07). Both of
+    # these sentences used to tell the reader proven fixes lead, which contradicts
+    # the order the very section they point at prints above its own table.
     if paths_to_da > 0 or tier0_exposed > 0:
         if priority > 0:
             parts.append(
                 f"Cut the paths first by closing the {priority} high-priority "
                 f"finding{'' if priority == 1 else 's'} ({critical} critical, "
                 f"{high} high) listed below; the paths overlap heavily, so work "
-                "the fixes ranked overleaf, proven ones first, where the single "
-                "fix that closes the most paths is flagged."
+                "the fixes ranked overleaf from the top, which is where the one "
+                "that closes the most paths sits."
             )
         else:
             parts.append(
-                "Work the fixes ranked overleaf: proven fixes lead, and the "
-                "single fix that closes the most paths is flagged there."
+                "Work the fixes ranked overleaf from the top, which is where the "
+                "one that closes the most paths sits."
             )
     elif priority > 0:
         parts.append(
@@ -2498,9 +2798,9 @@ def reach_walked_end_to_end(raw_paths: Sequence[Mapping[str, Any]]) -> bool:
 
 
 #: The card sub-line + verdict note shown when attack-path materialization fell
-#: back to SAMPLED coverage (a control mega-hub). The headline then reads the
-#: k-independent reachable-set cardinality, so the note states what that figure
-#: represents. (No em-dash: this is client-facing prose.)
+#: back to SAMPLED coverage (a control mega-hub). The headline figure stays a
+#: ROUTE count; the note states the coverage boundary that route count was found
+#: within. (No em-dash: this is client-facing prose.)
 _SAMPLED_COVERAGE_NOTE = (
     "sampled coverage: every reachable Tier-0 target represented"
 )
@@ -2569,14 +2869,15 @@ def build_verdict(
     resolved through the shared reach-claim SSOT so the free and paid documents
     cannot drift apart on this sentence.
 
-    ``headline`` carries the shared effective figures from
-    :meth:`~adscan_internal.services.attack_path_counts.ClientPathTotals.render_headline`.
-    Under the control-mega-hub SAMPLED fallback the materialized set (k) collapses
-    to 0, so ``paths_to_da``/``paths_total`` read a false 0 on a domain that has
-    reachable routes; when the headline reports sampled coverage or a proven
-    compromise, the verdict reads its k-independent reachable figure instead and
-    never states "0 / no attack paths" on a compromised domain. On a complete run
-    the headline is inert here and the wording is byte-identical to before.
+    ``headline`` carries the shared figures from
+    :meth:`~adscan_internal.services.attack_path_counts.ClientPathTotals.render_headline`,
+    whose ``reachable`` is a ROUTE count in every coverage mode. It is read here
+    when the caller's own ``paths_to_da``/``paths_total`` would state a false
+    "0 / no attack paths" (a sampled run, or a compromised domain with an empty
+    materialized set), and when even the shared route count is 0 on a proven
+    compromise the verdict states the compromise rather than a bare 0. On a
+    complete run the headline is inert here and the wording is byte-identical to
+    before.
     """
     # Only override when the raw materialized figures would collapse to a false
     # "0 / no attack paths": under sampled coverage, or on a compromised domain
@@ -3061,6 +3362,7 @@ def build_report_model(
     client_logo_uri: str = "",
     obligations: Sequence[dict[str, Any]] = (),
     reference_environment: str = "",
+    scan_summary: Optional[Mapping[str, Any]] = None,
 ) -> LiteReportModel:
     """Build the fully-resolved, client-safe report model from loaded data.
 
@@ -3082,6 +3384,12 @@ def build_report_model(
     (see :func:`~adscan_internal.services.post_compromise_obligations.load_post_compromise_obligations`).
     It is a parameter for the same reason: deriving it reads the workspace
     credential store, and this builder stays pure.
+
+    ``scan_summary`` is the parsed ``scan_summary.json`` record for this run
+    (:func:`~adscan_core.reporting.time_to_compromise.load_scan_summary`). It is
+    a parameter for the same reason as the two above: reading it is I/O and this
+    builder stays pure. Omit it and the document simply carries no time to
+    compromise, which is the correct behaviour for a run that never produced one.
 
     ``reference_environment`` is for ONE caller: the sample generator that
     produces the published example report. Pass it and the document opens by
@@ -3175,6 +3483,26 @@ def build_report_model(
             1 for p in raw_paths if path_is_unauthenticated_reachable(p)
         )
         verdict_unauthenticated_lead = unauthenticated_headline(_unauth_routes)
+    # Time to compromise: the one figure a board member repeats. Resolved here,
+    # beside the zero-credential gate, because the prose asserts the starting
+    # position and that assertion is only honest when the engine PROVED a
+    # no-credential entry — the same ``_unauth_present`` signal, not the scan
+    # mode. The tier-shared SSOT owns both the arithmetic and the wording, so the
+    # paid kit cannot state the same duration differently. ``None`` on a run that
+    # never reached compromise, and the template then omits the callout.
+    # The domain NAME is taken from the scan-summary record itself rather than
+    # this document's ``domain_label``: the duration and the name then come from
+    # one measurement, and a multi-domain label ("2 domains (a, b)") can never be
+    # interpolated into a sentence that is about the one domain that fell.
+    time_to_compromise = time_to_compromise_from_summary(
+        scan_summary,
+        unauthenticated_start=_unauth_present,
+    )
+    # The whole assessment's runtime, off the SAME persisted record. Resolved
+    # unconditionally: unlike the figure above it does not depend on the
+    # engagement having reached anything, and on a clean run it is the only time
+    # measurement the document can honestly state.
+    assessment_duration = assessment_duration_from_summary(scan_summary)
     # Two figures off one artifact: how many ordinary accounts REACH Tier 0,
     # and how many are already IN it. The second is what makes excluding the
     # administrators from the first defensible, and where it is pathological it
@@ -3258,6 +3586,9 @@ def build_report_model(
         paths_rendered_routes=rendered_routes,
         paths_folded=paths_folded,
         proven_paths=proven,
+        paths_withheld_for_safety=sum(
+            1 for _p in raw_paths if path_is_safety_abstention(_p)
+        ),
         choke_points=build_choke_points(raw_paths),
         chokepoint_remediation=build_chokepoint_remediation(domains),
         # The "Start here" LEAD (E4): the same validated-paths-broken ranking the
@@ -3298,8 +3629,17 @@ def build_report_model(
         # from the SAME ``raw_paths`` (carrying ``meta.affected_users``) the reach
         # metric reads, via the import-safe ranking SSOT. The template omits the
         # sub-block when ``top_users`` is empty (no path carries an affected user).
+        time_to_compromise=time_to_compromise,
+        assessment_duration=assessment_duration,
         user_exposure=build_user_exposure_ranking(raw_paths),
         tier_glossary=build_tier_glossary_rows(),
+        severity_methodology=severity_methodology_view(),
+        # Endpoint defense, merged across domains by the shared SSOT. The free
+        # report carries the two statements and the per-state counts; the
+        # per-technique table stays in the paid deliverable.
+        endpoint_defense=merge_endpoint_defense(
+            domains.values() if isinstance(domains, dict) else ()
+        ),
         cta_lane_enterprise=cta_lane_enterprise,
     )
 
@@ -3604,7 +3944,10 @@ def _stamp_domain_assessments(
 
 
 def _stamp_chokepoints(
-    workspace_dir: str, domains: list[str], raw_domains: Any = None
+    workspace_dir: str,
+    domains: list[str],
+    raw_paths: list[dict[str, Any]],
+    raw_domains: Any = None,
 ) -> bool:
     """Stamp the choke-point cardinality block for each domain (LITE flow).
 
@@ -3618,9 +3961,24 @@ def _stamp_chokepoints(
     derivation exactly (same graph load, same start-id + terminal builders, same
     ``bounded`` resolution) so both tiers produce the identical block.
 
-    Idempotent: the shared helper skips a domain that already carries a valid
-    ranked block (e.g. a prior PRO run persisted it into the same
-    ``technical_report.json``), so this never recomputes/overwrites.
+    Seeds each domain's slice of ``raw_paths`` onto the in-memory report entry
+    before stamping, exactly as ``_stamp_affected_assets`` filters on
+    ``_domain``. Two of the block's sub-blocks are derived from the domain's
+    attack paths — ``remediation_start_here`` (the client's "Start Here" work
+    order) and ``user_exposure`` ("Most Exposed Accounts") — and only a PRO run
+    ever populated ``attack_paths`` on the report entry, so a workspace scanned
+    AND rendered in LITE used to persist a choke block with neither. The paid web
+    CTEM reads both from the persisted block, and the PRO Playbook silently omits
+    a domain that has no ``remediation_start_here``, so the two paid surfaces
+    were the ones losing them. The seed is in-memory only: the stamp persists
+    just its own block, so ``attack_paths: []`` stays on disk as designed.
+
+    Idempotent: the shared predicate
+    (:func:`~adscan_internal.services.chokepoint_cardinality.chokepoint_block_is_derived`)
+    skips a domain whose block is ranked AND already carries the path-derivation
+    marker, so a prior PRO stamp is never recomputed or overwritten. A ranked
+    block written before the paths reached the seam lacks that marker and is
+    re-stamped once.
 
     Best-effort by construction: every domain is guarded, so a missing/unreadable
     attack graph leaves that domain's choke block absent and the document simply
@@ -3632,6 +3990,7 @@ def _stamp_chokepoints(
     from types import SimpleNamespace
 
     from adscan_internal.services.chokepoint_cardinality import (
+        chokepoint_block_is_derived,
         resolve_choke_bounded,
         stamp_chokepoint_cardinality_for_domain,
     )
@@ -3644,15 +4003,19 @@ def _stamp_chokepoints(
             domain_data = entries.get(domain)
             if not isinstance(domain_data, dict):
                 domain_data = {}
-            # Idempotency: if the block is already ranked (a PRO run stamped it),
-            # skip the graph load entirely.
-            existing = domain_data.get("chokepoint_cardinality")
-            if (
-                isinstance(existing, dict)
-                and existing.get("schema_version")
-                and isinstance(existing.get("ranked_chokepoints"), list)
-            ):
+            # Idempotency: when the block is already complete, skip the graph
+            # load entirely. Same predicate the stamp itself guards on, so the
+            # cheap pre-check and the stamp can never disagree.
+            if chokepoint_block_is_derived(domain_data.get("chokepoint_cardinality")):
                 continue
+
+            # The paths this domain's "Start Here" and "Most Exposed Accounts"
+            # sub-blocks are derived from. Already computed once for this render
+            # by the shared report SSOT (``_compute_report_paths``), so this is a
+            # filter, not a recompute.
+            domain_data["attack_paths"] = [
+                path for path in raw_paths if str(path.get("_domain") or "") == domain
+            ]
 
             # Mirror the PRO seam: reachability is computed over the BASE attack
             # graph (load_attack_graph), normalizing the node dict->list shape,
@@ -3724,9 +4087,13 @@ def _stamp_exposure_kpis(
     headline figure AND its user-reach verdict prose render empty. This mirrors
     ``_stamp_chokepoints`` exactly — same tier-shared SSOT, same idempotency.
 
-    Idempotent: the shared helper skips a domain that already carries a valid
-    ``exposure_kpis`` block (e.g. a prior PRO run persisted it into the same
-    ``technical_report.json``), so this never recomputes/overwrites.
+    Always re-derives: the LITE render recomputes ``raw_paths`` fresh from the
+    reconciled graph every run (``_compute_report_paths``) and renders once, so it
+    re-derives the KPI block from those fresh paths (``no_cache=True``) rather than
+    trust a persisted ``exposure_kpis`` block. A persisted block can be STALE across
+    runs — a prior run wrote it, then an attack-path engine fix changed the exposure
+    — and the old idempotency reuse kept rendering the pre-fix figure. The block is
+    recomputed and the persisted copy overwritten on every render.
 
     Best-effort by construction: every domain is guarded inside the SSOT, so a
     missing/unreadable attack graph leaves that domain's block absent and the
@@ -3751,15 +4118,19 @@ def _stamp_exposure_kpis(
             domain_data = entries.get(domain)
             if not isinstance(domain_data, dict):
                 domain_data = {}
-            # Idempotency: a PRO run may have already stamped the block into the
-            # same technical_report.json — skip if it is present and valid.
-            existing = domain_data.get("exposure_kpis")
-            if (
-                isinstance(existing, dict)
-                and existing.get("schema_version")
-                and isinstance(existing.get("path_axis"), dict)
-            ):
-                continue
+            # The LITE render recomputes raw_paths fresh from the reconciled graph
+            # every run (see _compute_report_paths — it never trusts the persisted
+            # path snapshot, for determinism), and it renders ONCE per process, so
+            # it must re-derive the KPI block from those fresh paths rather than
+            # trust a persisted exposure_kpis block. A persisted block can be STALE
+            # across runs — e.g. a prior run (or an older ADscan whose stamp had
+            # coverage_mode=None) wrote it, then an attack-path ENGINE fix changed
+            # the exposure, but the stale block survived the idempotency guard and
+            # the headline figure kept rendering the pre-fix number. no_cache=True
+            # bypasses the SSOT guard and overwrites the persisted block. (There is
+            # no within-process double-stamp to dedup here: PRO's two-call report
+            # flow is a separate process/tier; the LITE render stamps each domain
+            # once.)
             summaries = [
                 path for path in raw_paths if str(path.get("_domain") or "") == domain
             ]
@@ -3768,6 +4139,7 @@ def _stamp_exposure_kpis(
                 domain,
                 summaries=summaries,
                 domain_data=domain_data,
+                no_cache=True,
             )
             # The SSOT persisted to disk; signal a re-read to the caller.
             if isinstance(domain_data.get("exposure_kpis"), dict):
@@ -3913,12 +4285,16 @@ def generate_lite_report_artifacts(
         # attack-path seam; the LITE render flow never calls that path, so in a
         # LITE build (pro/ stripped) the block would be absent and the choke
         # section would render empty. This tier-shared, LITE-safe seam produces
-        # the identical block. Idempotent — a domain a prior PRO run already
-        # stamped is skipped. Re-read the report when anything was written so the
-        # model reads the stamped block.
+        # the identical block. The already-computed paths go in with it, because
+        # the "Start Here" work order and the "Most Exposed Accounts" sub-block
+        # are derived from them and the paid web CTEM and the PRO Playbook read
+        # both from this persisted block. Idempotent — a domain a prior PRO run
+        # already stamped is skipped. Re-read the report when anything was
+        # written so the model reads the stamped block.
         if _stamp_chokepoints(
             workspace_dir,
             domain_names,
+            raw_paths,
             technical_report.get("domains"),
         ):
             restamped_choke = read_json_file(str(tr_path))
@@ -3974,6 +4350,11 @@ def generate_lite_report_artifacts(
                     domain_order=domain_names,
                 )
             ),
+            # How long this run took to reach proven domain compromise. The same
+            # persisted record the paid kit reads, so the two tiers state one
+            # duration. Absent on a workspace produced before the scan-outcome
+            # seam wrote it, and the callout is then omitted.
+            scan_summary=load_scan_summary(workspace_dir),
         )
         html_text = render_report_html(model)
 
@@ -4315,6 +4696,29 @@ _TEMPLATE = r"""<!DOCTYPE html>
   line-height: 1.3; letter-spacing: -0.2px; color: var(--critical);
 }
 .lede .ds-verdict-lead + .ds-verdict { margin-top: 4mm; }
+/* Time to compromise: the one figure a board member repeats, so it opens the
+   document and the duration itself is the largest thing in the sentence. Set in
+   the serif at reading size rather than as a bare numeral in the figure strip —
+   a duration only carries its meaning inside the sentence that says what it
+   measured, and the strip beside it already holds the counts. The accent rail
+   marks it as the document's lead statement without a second colour. */
+.lede .ds-ttc { margin-top: 12mm; max-width: 52ch; padding-left: 4mm;
+  border-left: 2px solid var(--critical); }
+.lede .ds-ttc-t {
+  margin: 0; font-family: var(--font-serif); font-weight: 800; font-size: 15pt;
+  line-height: 1.28; letter-spacing: -0.3px; color: var(--text);
+}
+/* The duration is the figure the reader takes away, so it never breaks across
+   two lines: "in 1" at the end of one line and "minute 33 seconds" on the next
+   costs it most of its force. */
+.lede .ds-ttc-t b { color: var(--critical); font-weight: 800; white-space: nowrap; }
+.lede .ds-ttc-q {
+  margin: 2.5mm 0 0; font-size: 7.5pt; line-height: 1.5; color: var(--text-3);
+}
+/* The lead statement already took the top gap, so the elements under it tuck in
+   rather than both claiming 12mm. */
+.lede .ds-ttc + .ds-verdict-lead,
+.lede .ds-ttc + .ds-verdict { margin-top: 6mm; }
 .lede .ds-verdict { max-width: 30ch; margin-top: 12mm; }
 .lede .ds-cols { margin-top: 12mm; }
 .lede .ds-col { padding-top: 5mm; }
@@ -4347,8 +4751,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
 /* ── Findings table ─────────────────────────────────────────────────────── */
 .findings-table { table-layout: fixed; }
-.findings-table th.col-finding { width: 46%; }
-.findings-table th.col-sev { width: 13%; }
+.findings-table th.col-finding { width: 42%; }
+/* The severity cell carries the band, its figure, and the baseline reference
+   beneath it when the rating was raised. The chip does not wrap, so the column
+   is widened to hold "CRITICAL 9.5" rather than push it past the cell. */
+.findings-table th.col-sev { width: 17%; }
 .findings-table th.col-attck { width: 25%; }
 .findings-table th.col-domain { width: 16%; }
 .finding-name { font-weight: 600; color: var(--text); line-height: 1.35; }
@@ -4367,6 +4774,27 @@ _TEMPLATE = r"""<!DOCTYPE html>
   content: "·"; color: var(--text-4); margin: 0 1.2mm;
 }
 .finding-assets-more { color: var(--text-4); margin-left: 1.2mm; }
+.asset-tier {
+  display: inline-block; font-family: var(--font-sans); font-weight: 700;
+  font-size: 5.6pt; letter-spacing: 0.3px; text-transform: uppercase;
+  padding: 0 1mm; border-radius: 1.4px; margin-right: 1mm; vertical-align: 0.5px;
+  background: rgba(148,163,184,0.14); color: var(--text-4);
+  border: 1px solid var(--line-2);
+}
+.asset-tier.t0 { background: var(--critical-bg); color: var(--critical); border-color: var(--critical-bd); }
+.asset-tier.t1 { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-bd); }
+.asset-role { font-family: var(--font-sans); font-size: 5.8pt; color: var(--text-4); font-style: italic; margin-left: 1mm; }
+.asset-metric { font-family: var(--font-sans); font-size: 6.2pt; color: var(--text-3); margin-left: 1mm; }
+/* Roasting per-account crack status — CRACKED is the proven credential recovery. */
+.crack-badge {
+  display: inline-block; font-family: var(--font-sans); font-weight: 700;
+  font-size: 5.6pt; letter-spacing: 0.3px; text-transform: uppercase;
+  padding: 0 1mm; border-radius: 1.4px; margin-left: 1mm; vertical-align: 0.5px;
+  background: rgba(148,163,184,0.14); color: var(--text-4);
+  border: 1px solid var(--line-2);
+}
+.crack-badge.crack-cracked { background: var(--critical-bg); color: var(--critical); border-color: var(--critical-bd); }
+.crack-badge.crack-attempted { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-bd); }
 .attck {
   display: inline-block; font-family: var(--font-mono); font-size: 6.5pt;
   color: var(--accent); border: 1px solid rgba(14,110,120,0.28);
@@ -4397,7 +4825,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 }
 /* "Proven" pill on a "Start here" fix ADscan executed against the directory —
    the "validated, not estimated" signal. Filled (the structural-choke badge is
-   outlined) so the eye lands on the proven fixes the list now leads with. Inline,
+   outlined) so the eye lands on the fixes that close the most paths. Inline,
    so it also renders inside the caption and the "how to read this" note. */
 .ds-proven-badge {
   display: inline-block;
@@ -4463,6 +4891,11 @@ ul.hardening-list > li {
 .tier-table th.col-tier { width: 26%; }
 .tier-table th.col-tier-groups { width: 40%; }
 .tier-table th.col-tier-meaning { width: 34%; }
+/* The published severity method. Two columns, same hairline table as the tier
+   legend it sits beside, so the reference pages read as one register. */
+.sevmeth-table { table-layout: fixed; }
+.sevmeth-table th.col-sevmeth-k { width: 26%; }
+.sevmeth-table th.col-sevmeth-b { width: 74%; }
 .tier-label { font-weight: 700; color: var(--text); line-height: 1.35; }
 .tier-groups { font-size: 8pt; color: var(--text-2); line-height: 1.45; }
 .tier-meaning { font-size: 8pt; color: var(--text-3); line-height: 1.45; }
@@ -4749,6 +5182,21 @@ ol.oblig-steps > li {
   {% endif %}
 
   <section class="lede">
+    {# TIME TO COMPROMISE — the single most valuable fact this engagement
+       produced, so it opens the document. The whole sentence (including the
+       no-credential starting position, which is what makes the duration land)
+       comes from the tier-shared SSOT, so the paid kit states it word for word.
+       Omitted entirely on a run that did not reach compromise: that run has no
+       time to compromise, and a zero or a dash in this slot would read as an
+       instantaneous one. The emphasis uses the SSOT's own split of its sentence
+       around the duration, so no wording and no string surgery lives here. #}
+    {% if m.time_to_compromise %}
+    {% set _ttc = m.time_to_compromise %}
+    <div class="ds-ttc">
+      <p class="ds-ttc-t">{{ _ttc.headline_before }}<b>{{ _ttc.duration_text }}</b>{{ _ttc.headline_after }}</p>
+      <p class="ds-ttc-q">{{ _ttc.qualifier }}</p>
+    </div>
+    {% endif %}
     {# The zero-credential lead: the single most severe fact, when a path to full
        domain compromise was proven from an unauthenticated foothold. It leads the
        verdict because "no account needed" outranks any count. Omitted otherwise. #}
@@ -4881,6 +5329,25 @@ ol.oblig-steps > li {
   </section>
   {% endif %}
 
+  {# ASSESSMENT DURATION — how long the whole run took, which is a different
+     question from the time to domain compromise on the cover and therefore sits
+     here, in the document's scope commentary, rather than competing with it. A
+     reader needs this one to decide whether repeating the assessment fits a
+     change window, so the sentence states that rather than just the figure. The
+     label carries the distinction from the cover figure; neither renders in the
+     other's slot. Rendered whenever the scan recorded a runtime, including on a
+     run that compromised nothing: a clean assessment occupied the same window,
+     and this is then the only time measurement the document can state. Wording
+     comes from the tier-shared SSOT, so the paid kit says it word for word. #}
+  {% if m.assessment_duration %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">{{ m.assessment_duration.card_label }}</div>
+      <div class="ds-note-t">{{ m.assessment_duration.statement }}</div>
+    </div>
+  </section>
+  {% endif %}
+
   {# A domain reached over a trust but never enumerated contributes to nothing
      above, so it is stated separately rather than counted as scope. Naming it
      is the useful part: it is the surface this engagement did not measure. #}
@@ -4964,6 +5431,78 @@ ol.oblig-steps > li {
   </section>
   {% endif %}
 
+  {# How the severity this report counts by is arrived at. It belongs here, in
+     the same reference register as the tier legend, because the counts above
+     group findings by the CONTEXTUAL grade: what each technique is worth once
+     this directory's own conditions are read, which is the grade the paid
+     report and the platform count on as well. A figure published without its
+     method is the figure an assessor queries first, and that is the whole
+     reason this document rates on its own model rather than on a decimal
+     nobody can recompute. Content is the shared SSOT
+     (adscan_core.reporting.severity_methodology), consumed verbatim so the free
+     and paid documents cannot define the grade differently. #}
+  {% if m.severity_methodology and m.severity_methodology.finding %}
+  <section class="ds-section">
+    <div class="ds-section-head">
+      <div class="ds-eyebrow">Reference</div>
+      <h2 class="ds-section-title">{{ m.severity_methodology.finding.heading }}</h2>
+      {# The lead is the SSOT's own. The "what the counts group by" sentence it
+         used to carry here is already on the third input below, two inches
+         down the same block, and reading it twice in one breath is the kind of
+         repetition a client notices. #}
+      <p class="ds-section-lead">{{ m.severity_methodology.finding.lead }}</p>
+    </div>
+    <table class="adscan-table sevmeth-table">
+      <thead>
+        <tr>
+          <th class="col-sevmeth-k">Input</th>
+          <th class="col-sevmeth-b">What it reads</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in m.severity_methodology.finding.inputs %}
+        <tr>
+          <td><div class="tier-label">{{ item.name }}</div></td>
+          <td class="tier-meaning">{{ item.body }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if m.severity_methodology.bands and m.severity_methodology.bands.rows %}
+    <table class="adscan-table sevmeth-table">
+      <thead>
+        <tr>
+          <th class="col-sevmeth-k">Band</th>
+          <th class="col-sevmeth-b">Score</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in m.severity_methodology.bands.rows %}
+        <tr>
+          <td><div class="tier-label">{{ row.label }}</div></td>
+          <td class="tier-meaning">{{ row.range }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    {% if m.severity_methodology.finding.rules %}
+    <div class="ds-fineprint">
+      <b>What follows from it.</b>
+      {% for rule in m.severity_methodology.finding.rules %}{{ rule }} {% endfor %}
+    </div>
+    {% endif %}
+    {# The paid report's "why no CVSS column appears" annex is deliberately NOT
+       rendered here. It defends the absence of a score column against a
+       regulated reader's expectation, which is a question the paid audit
+       deliverable is asked and this document is not: this report prints no
+       score column at all, and four paragraphs of regulatory argument would
+       cost more of a nine-page document than the absence needs. What this
+       document does owe the reader, the method behind the grade it counts by,
+       is above. #}
+  </section>
+  {% endif %}
+
   {# Page-break bookkeeping for the post-executive page. The FIRST content section
      after the executive page opens a fresh page; every later section flows
      naturally. The positive hardening callout, when present, IS that first
@@ -5007,6 +5546,99 @@ ol.oblig-steps > li {
       </ul>
       {% endif %}
     </div>
+  </section>
+  {% endif %}
+
+  {# ENDPOINT DEFENSE — the lighter, free-tier cut of the paid section. Carries
+     the two statements and the per-state counts; the per-technique efficacy
+     table stays in the Client Deliverable Kit. COUNTS, never a rate: ADscan
+     examines the hosts a technique needed to reach, not the estate, so on a
+     measured engagement (173 computers, 8 examined) both obvious percentages
+     are false. Omitted entirely when no host was examined.
+     SSOT: adscan_core.reporting.endpoint_defense. #}
+  {% if m.endpoint_defense.present %}
+    {# The finding before the methodology, from the same authored sentences the
+       paid report prints. Nothing is softened; only the order changes. #}
+    {% if m.endpoint_defense.verdict_lines %}
+    <div class="ds-note">
+      {% for line in m.endpoint_defense.verdict_lines %}
+      <p style="margin:0 0 1.5mm 0"><b>{{ line }}</b></p>
+      {% endfor %}
+    </div>
+    {% endif %}
+  <section class="ds-section{% if not _page2.broken %} section-new-page{% endif %}">
+    {% set _page2.broken = True %}
+    <div class="ds-section-head">
+      <div class="ds-eyebrow">Your own defences</div>
+      <h2 class="ds-section-title">Endpoint defence, as observed</h2>
+      <p class="ds-section-lead">
+        {{ m.endpoint_defense.coverage_statement }}
+      </p>
+    </div>
+    <table class="adscan-table tier-table">
+      <thead>
+        <tr>
+          <th class="col-tier">Observed state</th>
+          <th class="col-tier-groups">Hosts</th>
+          <th class="col-tier-meaning">What that means</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if m.endpoint_defense.posture_counts.active %}
+        <tr>
+          <td><div class="tier-label">Observed active</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(m.endpoint_defense.posture_counts.active) }}</td>
+          <td class="tier-meaning">A product was running with real-time protection on when it was examined.</td>
+        </tr>
+        {% endif %}
+        {% if m.endpoint_defense.posture_counts.installed_inactive %}
+        <tr>
+          <td><div class="tier-label">Installed, not active</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(m.endpoint_defense.posture_counts.installed_inactive) }}</td>
+          <td class="tier-meaning">Present but not protecting the host: the service is disabled, or real-time protection is off. This is protection the host appears to have and does not.</td>
+        </tr>
+        {% endif %}
+        {% if m.endpoint_defense.posture_counts.none_detected %}
+        <tr>
+          <td><div class="tier-label">None detected</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(m.endpoint_defense.posture_counts.none_detected) }}</td>
+          <td class="tier-meaning">Examined, and no product was found. Not a statement that the host has none: a product ADscan does not recognise reads the same way.</td>
+        </tr>
+        {% endif %}
+        {% if m.endpoint_defense.posture_counts.undetermined %}
+        <tr>
+          <td><div class="tier-label">Undetermined</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(m.endpoint_defense.posture_counts.undetermined) }}</td>
+          <td class="tier-meaning">The check did not complete, so protection here is unknown. Deliberately not counted as unprotected.</td>
+        </tr>
+        {% endif %}
+        {% if m.endpoint_defense.posture_counts.not_assessed %}
+        <tr>
+          <td><div class="tier-label">Not examined</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(m.endpoint_defense.posture_counts.not_assessed) }}</td>
+          <td class="tier-meaning">No technique in this assessment needed to reach these hosts, so nothing here says anything about them.</td>
+        </tr>
+        {% endif %}
+      </tbody>
+    </table>
+    {% if m.endpoint_defense.has_efficacy %}
+    <div class="ds-fineprint">
+      <b>What the active products did.</b> {{ m.endpoint_defense.efficacy_statement }}
+      A technique that completed recovered credential material from a host whose
+      product was active at the time, so the product did not stop it. A technique
+      recorded as interrupted was cut off on every attempt, at the point where it
+      read credential material; that is assessed with high confidence as the
+      product interrupting it, which is neither a claim that the attack was
+      blocked nor a detection. These figures count what happened; they do not
+      say which host was which, nor whether either of them controls your
+      domain, and confirming any of it in your own console needs the host and
+      the time. The paid Client Deliverable Kit carries the
+      {{ '{:,}'.format(m.endpoint_defense.pairs_on_protected_hosts) }} host
+      {{ 'row' if m.endpoint_defense.pairs_on_protected_hosts == 1 else 'rows' }}
+      behind these figures, each with that host's privilege tier and the
+      UTC window to search.
+    </div>
+    {% endif %}
   </section>
   {% endif %}
 
@@ -5072,12 +5704,20 @@ ol.oblig-steps > li {
     <div class="ds-section-head">
       <div class="ds-eyebrow">Start here</div>
       <h2 class="ds-section-title">Fixes to apply first</h2>
+      {# The order, from the ONE copy SSOT (``order_rule``), so this lead, the
+         "How to read this" note below it and the paid report's spread all state
+         the same key. It used to state the pre-2026-10-07 rule ("proven execution
+         first"), which stopped being true when proof became a badge and never a
+         sort key, while the note below already described the real order: the free
+         report told the reader two different things on one page. #}
       <p class="ds-section-lead">
-        Ordered by proven execution first, then by how many attack paths each fix
-        breaks. A <span class="ds-proven-badge">PROVEN</span> fix is one ADscan
-        executed against your directory, so it leads the list.{% if m.remediation_start_here.has_largest_reduction %} The single fix
-        that removes the most attack paths is flagged below, even where a proven
-        fix ranks above it.{% endif %} Work them in this order.
+        {{ m.remediation_start_here.order_rule }} A
+        <span class="ds-proven-badge">PROVEN</span> fix is one ADscan executed
+        against your directory, which tells you the attack is demonstrated rather
+        than that the fix is bigger, so it is marked on the row and never ranked
+        by.{% if m.remediation_start_here.has_largest_reduction %} The single fix
+        that removes the most attack paths is flagged below, wherever it
+        sits.{% endif %} Work them in this order.
       </p>
     </div>
     {% if m.remediation_start_here.reach_uniform_note %}
@@ -5116,7 +5756,12 @@ ol.oblig-steps > li {
             {% if c.badge %}<div class="ds-choke-badge">{{ c.badge_label }}</div>{% endif %}
           </td>
           <td>
-            {% if c.paths_affected %}<div class="impact-bar" aria-hidden="true"><span style="width: {{ ((c.paths_affected / _max_paths * 100) | round(0, 'ceil')) | int }}%"></span></div>{% endif %}
+            {# A CONTAINMENT row draws no bar. It is ranked by how long the
+               exposure survives the client's default response, not by volume, so
+               a short bar beside a krbtgt reset would contradict its position.
+               Bars contradicting the order is the defect the block split fixes:
+               prose does not beat a bar chart. #}
+            {% if c.block != 'containment' and c.paths_affected %}<div class="impact-bar" aria-hidden="true"><span style="width: {{ ((c.paths_affected / _max_paths * 100) | round(0, 'ceil')) | int }}%"></span></div>{% endif %}
             {{ c.item_line }}
           </td>
         </tr>
@@ -5124,17 +5769,19 @@ ol.oblig-steps > li {
       </tbody>
     </table>
     <div class="ds-fineprint">
-      <b>How to read this.</b> A <span class="ds-proven-badge">PROVEN</span> fix is a
-      technique ADscan actually executed against your directory, so it leads the list.
-      Each fix eliminates the count of attack paths shown:
-      &ldquo;validated&rdquo; paths are ones ADscan executed end to end, &ldquo;mapped&rdquo;
-      paths are ones it identified but did not run. Paths overlap, so the counts are not
-      meant to add up.{% if m.remediation_start_here.has_largest_reduction %} A
-      <span class="ds-largest-badge">Largest single reduction</span> badge marks the
-      single fix that removes the most attack paths; it leads on impact even where a
-      proven fix ranks above it, so weigh both.{% endif %} A &ldquo;{{ m.remediation_start_here.rows[0].badge_label if m.remediation_start_here.rows[0].badge else 'durable fix' }}&rdquo;
+      <b>How to read this.</b>{% if m.remediation_start_here.containment_count %} The
+      first {{ m.remediation_start_here.containment_count }} row{{ '' if m.remediation_start_here.containment_count == 1 else 's' }}
+      contain key material that left your control during this assessment, and they come
+      first because nothing else here is effective while they are outstanding. The rest
+      are{% else %} The fixes are{% endif %} ordered by
+      {{ m.remediation_start_here.order_rule_clause }}, so the one at the top is the one
+      to fund first. Each fix eliminates the
+      count of attack paths shown: &ldquo;validated&rdquo; paths are ones ADscan executed
+      end to end, &ldquo;mapped&rdquo; paths are ones it identified but did not run. Paths
+      overlap, so the counts are not meant to add up.{% if m.remediation_start_here.has_structural_badge %} A
+      &ldquo;{{ m.remediation_start_here.rows | selectattr('badge') | map(attribute='badge_label') | first }}&rdquo;
       badge marks an object with no alternate route around it, so the fix holds as the
-      directory changes. The step-by-step remediation for each one, written for the
+      directory changes.{% endif %} The step-by-step remediation for each one, written for the
       administrator who has to apply it, is part of <a href="{{ m.pro_url }}">ADscan PRO</a>.
     </div>
   </section>
@@ -5184,12 +5831,26 @@ ol.oblig-steps > li {
             <div class="finding-cat">{{ f.category }}</div>
             {% if f.assets %}
             <div class="finding-assets">
-              {%- for a in f.assets %}<span class="finding-asset">{{ a }}</span>{% endfor -%}
+              {%- for a in f.assets %}<span class="finding-asset">{% if a.pair_endpoints and a.pair_endpoints|length == 2 %}{% for ep in a.pair_endpoints %}{% if ep.tier %}<span class="asset-tier {% if ep.tier == 'Tier 0' %}t0{% elif ep.tier == 'Tier 1' %}t1{% endif %}"{% if ep.tier_basis %} title="{{ ep.tier_basis }}"{% endif %}>{{ ep.tier }}</span>{% endif %}{{ ep.text }}{% if not loop.last %}{{ a.pair_connector }}{% endif %}{% endfor %}{% else %}{% if a.tier %}<span class="asset-tier {% if a.tier == 'Tier 0' %}t0{% elif a.tier == 'Tier 1' %}t1{% endif %}"{% if a.tier_basis %} title="{{ a.tier_basis }}"{% endif %}>{{ a.tier }}</span>{% endif %}{{ a.text }}{% endif %}{% if a.metric %}<span class="asset-metric">&middot; {{ a.metric }}</span>{% endif %}{% if a.crack_status %}<span class="crack-badge crack-{{ a.crack_status }}">{{ a.crack_status }}</span>{% endif %}{% if a.role %}<span class="asset-role">{{ a.role }}</span>{% endif %}</span>{% endfor -%}
               {%- if f.assets_overflow %}<span class="finding-assets-more">and {{ f.assets_overflow }} more</span>{% endif -%}
             </div>
             {% endif %}
           </td>
-          <td><span class="chip {{ f.severity }}">{{ f.severity }}</span></td>
+          {# The grade the finding is COUNTED at, with the figure behind it, and
+             the baseline beneath it when this directory's own conditions raised
+             the rating. The severity annex in this document promises exactly
+             that pairing, and the pair is also the cheapest answer to "why is
+             this Critical": the reader sees the lift instead of being told one
+             happened. Both numerics are read from the rating the scan persisted,
+             never recomputed here, so they are the same figures the paid report
+             prints. An artifact written before the rating existed carries no
+             score and renders the band alone. #}
+          <td>
+            <span class="chip {{ f.severity }}">{{ f.severity }}{% if f.score is not none %} {{ '%.1f' % f.score }}{% endif %}</span>
+            {% if f.baseline_severity and f.baseline_score is not none %}
+            <div class="finding-baseline-ref">baseline {{ f.baseline_severity }} {{ '%.1f' % f.baseline_score }}</div>
+            {% endif %}
+          </td>
           <td>
             {% for t in f.mitre %}<span class="attck" title="{{ t.name }}">{{ t.id }}</span>{% endfor %}
             {% if not f.mitre %}<span class="ds-muted">-</span>{% endif %}
@@ -5210,7 +5871,9 @@ ol.oblig-steps > li {
       <h2 class="ds-section-title">Attack paths</h2>
       <p class="ds-section-lead">
         {% if m.proven_paths %}{{ m.proven_paths }} path{{ '' if m.proven_paths == 1 else 's' }}
-        validated end to end. {% endif %}Each step carries its honest outcome. A step that did
+        validated end to end. {% endif %}{% if m.paths_withheld_for_safety %}{{ m.paths_withheld_for_safety }} path{{ '' if m.paths_withheld_for_safety == 1 else 's' }}
+        confirmed and deliberately not executed, to avoid disrupting production. {% endif %}Each step
+        carries its honest outcome. A step that did
         not succeed is never attributed to a defensive control.
       </p>
     </div>
@@ -5302,10 +5965,11 @@ ol.oblig-steps > li {
   <section class="ds-section">
     <div class="ds-section-head">
       <div class="ds-eyebrow">Accountability</div>
-      <h2 class="ds-section-title">Changes made to your directory</h2>
+      <h2 class="ds-section-title">Changes made to your environment</h2>
       <p class="ds-section-lead">
         Proving an attack path sometimes requires writing to Active Directory: enrolling a
-        certificate, creating an account, changing a permission. Every write is recorded as it
+        certificate, creating an account, changing a permission. Reading credentials off a
+        server also means writing a temporary file on it. Every write is recorded as it
         happens and undone at the end, and this is the complete record for this scan.
       </p>
     </div>
@@ -5323,7 +5987,8 @@ ol.oblig-steps > li {
     <div class="ds-note">
       <div class="ds-note-k">Nothing was changed</div>
       <div class="ds-note-t">
-        This scan made no writes to the directory. Nothing needs to be undone.
+        This scan made no writes to the directory and left no files on your hosts. Nothing
+        needs to be undone.
       </div>
     </div>
     {% else %}

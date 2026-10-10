@@ -406,14 +406,18 @@ def _classify_principals_by_membership(
         CompromiseClass,
         PrivilegeTier,
         SyncAccountState,
+        app_server_spn_hosts,
         classify_principal_by_groups,
+        effective_principal_tier,
+        is_client_os,
         node_is_control_plane_sync_account,
         privilege_tier_for_computer,
         privilege_tier_for_principal,
-        privilege_tier_for_principal_with_admin_assets,
         refine_server_privilege_tier,
         relation_is_admin_grant,
         spns_indicate_app_server,
+        spns_indicate_server_role,
+        spns_indicate_session_host,
     )
 
     # group object_id (upper) → set of parent group object_ids (upper) it is a
@@ -491,6 +495,10 @@ def _classify_principals_by_membership(
     # in the principal pass (PART B floors a principal by the tier of the computers
     # it administers). Local cache, never leaks out of this call.
     _COMPUTER_TIER_CACHE: dict[str, PrivilegeTier] = {}
+    # Resolved PrivilegeTier per computer HOST identifier (FQDN / short label /
+    # samaccountname, lowercased) — read in the principal pass to resolve a service
+    # account's application-class SPN host to its tier (service-identity flooring).
+    _COMPUTER_TIER_BY_HOST: dict[str, PrivilegeTier] = {}
 
     # ── PASS 1 — Computers (PART A): membership tier, then graph refinement ──
     # Runs BEFORE the principal pass so PART B consumes CORRECTED computer tiers.
@@ -524,15 +532,37 @@ def _classify_principals_by_membership(
             member_of_by_src=parents_by_id,
         )
         spns = node.properties.get("serviceprincipalnames")
+        spns_list = spns if isinstance(spns, (list, tuple)) else None
         refined_tier, basis = refine_server_privilege_tier(
             base_tier,
             controls_tier0_asset=controls_tier0,
-            has_broad_interactive_logon=oid in broad_logon_targets,
-            has_app_server_spn=spns_indicate_app_server(
-                spns if isinstance(spns, (list, tuple)) else None
+            # RDS/Citrix downgrade signal: a broad-group CanRDP edge OR a Citrix
+            # session-host SPN (the non-CanRDP recall case).
+            has_broad_interactive_logon=(
+                oid in broad_logon_targets
+                or spns_indicate_session_host(spns_list)
             ),
+            has_app_server_spn=spns_indicate_app_server(spns_list),
+            has_server_role_spn=spns_indicate_server_role(spns_list),
+            is_client_os=is_client_os(os_str),
         )
         _COMPUTER_TIER_CACHE[oid] = refined_tier
+        # Index this computer's host identifiers → tier, for the service-identity
+        # flooring in PASS 2 (resolve a service account's app-SPN host to its tier).
+        for raw in (
+            node.name,
+            node.properties.get("dnshostname"),
+            node.samaccountname,
+        ):
+            if not raw:
+                continue
+            host = str(raw).strip().lower().rstrip("$")
+            if not host:
+                continue
+            _COMPUTER_TIER_BY_HOST[host] = refined_tier
+            short = host.split(".", 1)[0]
+            if short and short != host:
+                _COMPUTER_TIER_BY_HOST.setdefault(short, refined_tier)
         if refined_tier is not PrivilegeTier.TIER2:
             tiers[oid] = refined_tier.value
         if basis is not None:
@@ -560,15 +590,32 @@ def _classify_principals_by_membership(
             )
             if t is not None
         ]
-        effective_tier = privilege_tier_for_principal_with_admin_assets(
-            membership_tier, administered_tiers
+        # Service identity — a service account whose application-class SPN runs on a
+        # Tier-1 host IS Tier 1 even with no admin edge (shared SSOT, both axes).
+        user_spns = node.properties.get("serviceprincipalnames")
+        service_host_tiers = [
+            _COMPUTER_TIER_BY_HOST[h]
+            for h in app_server_spn_hosts(
+                user_spns if isinstance(user_spns, (list, tuple)) else None
+            )
+            if h in _COMPUTER_TIER_BY_HOST
+        ]
+        effective_tier, user_basis = effective_principal_tier(
+            membership_tier,
+            administered_asset_tiers=administered_tiers,
+            service_identity_host_tiers=service_host_tiers,
         )
+        if user_basis is not None:
+            tier_basis[oid] = user_basis
         # Legitimate control-plane sync account (AAD Connect): its DCSync is held
         # by design and it is a Tier-0 asset (whoever controls it owns the forest
         # via replication). Promote a CONFIRMED account to tier0_direct so it is
         # skipped as a source and its DCSync is reframed (spec §4). AMBIGUOUS is
         # NOT promoted; it is marked for a client-confirmation item. Detection is
         # by AAD provenance, never by "holds DCSync" (which would hide a backdoor).
+        # MIRROR: the load-time backfill
+        # compromise_class.stamp_membership_aware_privilege_tier applies this SAME
+        # promotion via the SAME shared predicate — keep the two sites in lockstep.
         # The node's samaccountname lives on a dedicated field for a CollectorNode,
         # so feed it into the node-shaped mapping the predicate reads.
         sync_props = dict(node.properties or {})

@@ -41,13 +41,15 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from adscan_core.reporting.adscan_severity import reported_finding_severity
+from adscan_core.reporting.affected_assets_contract import (
+    AFFECTED_ASSETS_STRUCT_KEY,
+)
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 
 #: Key under which the structured affected-asset entities ride in a finding's
-#: ``details``. Mirrors ``affected_assets_struct.SERIALIZED_KEY``; duplicated as
-#: a literal because that module lives in ``adscan_internal`` and this one must
-#: stay importable from LITE and from the web backend.
-_AFFECTED_ASSETS_KEY = "_affected_assets_struct"
+#: ``details``, from the one declaration every tier shares.
+_AFFECTED_ASSETS_KEY = AFFECTED_ASSETS_STRUCT_KEY
 
 #: Severity ordering used to pick which member of a family leads the merged
 #: record. Anything unrecognised sorts last.
@@ -154,8 +156,16 @@ def canonical_finding_key(key: Any) -> str | None:
 
 
 def _severity_rank(finding: Mapping[str, Any]) -> int:
-    """Rank a finding by its recorded severity, falling back to the catalog."""
-    severity = str(finding.get("severity") or "").strip().lower()
+    """Rank a finding by the band a client surface counts it under.
+
+    Reads the authored contextual rating first and the recorded baseline next
+    (``reported_finding_severity``), falling back to the catalog band for a
+    record carrying neither. Ranking on the baseline alone let the member with
+    the higher baseline lead a family whose OTHER member the directory's own
+    conditions had lifted further, so the merged finding was published a band
+    below the worst thing observed in it.
+    """
+    severity = reported_finding_severity(finding)
     if not severity:
         key = str(finding.get("key") or "").strip()
         severity = str((VULN_CATALOG_META.get(key) or {}).get("severity") or "").lower()

@@ -40,6 +40,10 @@ from typing import Optional
 
 from adscan_internal import print_warning, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.services._principal_normalization import (
+    split_netbios_qualifier,
+    split_upn_qualifier,
+)
 from adscan_core.rich_output import print_exception
 
 # ---------------------------------------------------------------------------
@@ -79,9 +83,9 @@ def _normalize_principal_name(value: str) -> str:
     if not name:
         return ""
     if "\\" in name:
-        name = name.split("\\", 1)[1]
+        _, name = split_netbios_qualifier(name)
     if "@" in name:
-        name = name.split("@", 1)[0]
+        name, _ = split_upn_qualifier(name)
     # Trailing ``$`` (machine account) is significant — keep it.
     return name.strip().lower()
 

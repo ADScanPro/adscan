@@ -29,12 +29,14 @@ from adscan_internal.services.background_jobs.results_bus import (
     JobResult,
     JobResultSink,
 )
+from adscan_internal.services.cracking.hash_kind import HashKind, hashcat_mode_for
 from adscan_internal.services.cracking_wordlist_policy import EffortTier
 from adscan_internal.services.credentials.credential_origin import (
     ORIGIN_ASREPROAST,
     ORIGIN_KERBEROAST,
     ORIGIN_NTLMV1_CAPTURE_CRACK,
     ORIGIN_NTLMV2_CAPTURE_CRACK,
+    ORIGIN_OFFLINE_CRACK,
 )
 from adscan_core.rich_output import print_exception
 
@@ -43,6 +45,12 @@ from adscan_core.rich_output import print_exception
 # adscan_internal.cli.cracking's _HASHCAT_MODE_DESCRIPTIONS mapping.
 _NTLM_V1_MODE = "5500"
 _NTLM_V2_MODE = "5600"
+
+# The NT-hash mode (1000). Unlike every other mode here it does not come from a
+# network capture: the hash was already recovered (directory replication, a SAM
+# dump, shadow credentials) and the crack is a purely offline transform of
+# material ADscan already held.
+_NT_MODE = hashcat_mode_for(HashKind.NT)
 
 # hashcat modes grouped by human-readable hash family, for the JobResult labels.
 # Roast modes span RC4 + the two AES etypes (same $krb5*$ shape).
@@ -88,6 +96,13 @@ def _credential_origin_for_mode(mode: str) -> str:
         return ORIGIN_NTLMV1_CAPTURE_CRACK
     if m == _NTLM_V2_MODE:
         return ORIGIN_NTLMV2_CAPTURE_CRACK
+    if m == _NT_MODE:
+        # No technique was run against the environment to produce this
+        # plaintext: an NT hash ADscan already held was resolved offline. That
+        # is exactly what ORIGIN_OFFLINE_CRACK means, and it is already
+        # classified DERIVED rather than EXECUTED, so the deliverable credits
+        # the recovery without crediting ADscan with an attack it never made.
+        return ORIGIN_OFFLINE_CRACK
     return ""
 
 
@@ -102,6 +117,8 @@ def _mode_label(mode: str) -> str:
         return "Kerberoast"
     if m in _ASREP_MODES:
         return "AS-REP"
+    if m == _NT_MODE:
+        return "NT hash"
     return f"mode {m}" if m else "hash"
 
 
@@ -206,6 +223,11 @@ _CRACK_SILENCE_TIMEOUT_SECONDS = 120.0
 # The ``--show`` completion pass is a quick potfile lookup, not a crack, so a
 # short overall timeout is correct there.
 _SHOW_PASS_TIMEOUT_SECONDS = 300
+# Headroom added to a capped crack's subprocess timeout. ``--runtime`` makes
+# hashcat stop and flush of its OWN accord; the subprocess timeout exists only so
+# a hashcat that ignores or outlives its own limit is still bounded, so it must
+# sit ABOVE the cap rather than racing it. Mirrors cli/cracking.py's convention.
+_RUNTIME_CAP_TIMEOUT_HEADROOM_SECONDS = 60
 
 
 def _nice_prefix() -> list[str]:
@@ -503,6 +525,7 @@ def _run_hashcat_tier(
     status_sink: Optional[StatusSink] = None,
     slot_state_sink: Optional[SlotStateSink] = None,
     background: bool = False,
+    runtime_seconds: Optional[int] = None,
 ) -> dict:
     """Run one crack pass, dispatching hashcat vs the Windows-only John fallback.
 
@@ -550,6 +573,7 @@ def _run_hashcat_tier(
         status_sink=status_sink,
         slot_state_sink=slot_state_sink,
         background=background,
+        runtime_seconds=runtime_seconds,
     )
 
 
@@ -563,6 +587,8 @@ def _run_hashcat_tier_impl(
     status_sink: Optional[StatusSink] = None,
     slot_state_sink: Optional[SlotStateSink] = None,
     background: bool = False,
+    runtime_seconds: Optional[int] = None,
+    abort_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Run one hashcat pass against ``hash_file`` with ``wordlist`` under ``mode``.
 
@@ -598,6 +624,22 @@ def _run_hashcat_tier_impl(
     blocked, nothing concurrent to protect) the crack runs at FULL speed with none
     of those levers, because faster completion is strictly better with no
     interactivity to starve.
+
+    ``runtime_seconds``, when set, becomes hashcat ``--runtime=<n>``: hashcat
+    stops of its own accord after that many seconds with everything it cracked
+    already flushed to the potfile, so the ``--show`` pass below still recovers
+    it. ``None`` (every background caller, and the default) runs UNCAPPED, which
+    is the invariant a job off the scan flow depends on: a legitimate long crack
+    must never be cut off. Only a BLOCKING caller, which is spending the
+    operator's own wall clock, passes a budget.
+
+    ``abort_check``, when set, is polled while the crack streams and stops it
+    GRACEFULLY as soon as it returns ``True``, returning everything recovered up
+    to that point (hashcat writes each recovery to its potfile as it happens, so
+    the ``--show`` pass below still reads them). This is how a blocking caller
+    acts on the crack's own live ETA rather than watching a pass it already knows
+    will not finish run on to a truncation. Forwarded only when a ``status_sink``
+    is present, because the abort rides the same streaming path the ticks do.
     """
     from adscan_internal.services.hashcat_coordination import (  # noqa: PLC0415
         hashcat_slot,
@@ -653,6 +695,17 @@ def _run_hashcat_tier_impl(
         # session lock; the ``--show`` potfile read below does not, so it needs
         # no session name.
         session_args = ["--session", unique_crack_session_name()]
+        # A blocking caller's wall-clock budget, handed to hashcat as its OWN
+        # graceful limit rather than enforced by killing the process: hashcat
+        # flushes its potfile on a --runtime stop, so the --show pass below still
+        # recovers every password it found before the cap. Absent (the default,
+        # and every background caller) the crack runs uncapped.
+        capped_runtime = (
+            int(runtime_seconds)
+            if runtime_seconds is not None and int(runtime_seconds) > 0
+            else 0
+        )
+        runtime_args = [f"--runtime={capped_runtime}"] if capped_runtime else []
         crack_argv = [
             *launch_prefix,
             "hashcat",
@@ -662,6 +715,7 @@ def _run_hashcat_tier_impl(
             *session_args,
             *status_args,
             *device_args,
+            *runtime_args,
             *rules_args,
             hash_file,
             wordlist,
@@ -711,9 +765,17 @@ def _run_hashcat_tier_impl(
             "stdin": subprocess.DEVNULL,
             "untrusted_output": True,
         }
+        if capped_runtime:
+            # Above the cap, never racing it: --runtime is what stops the crack,
+            # and this only bounds a hashcat that outlives its own limit.
+            crack_kwargs["timeout"] = (
+                capped_runtime + _RUNTIME_CAP_TIMEOUT_HEADROOM_SECONDS
+            )
         if status_sink is not None:
             crack_kwargs["on_line"] = _make_status_line_handler(status_sink)
             crack_kwargs["silence_timeout"] = _CRACK_SILENCE_TIMEOUT_SECONDS
+            if abort_check is not None:
+                crack_kwargs["abort_check"] = abort_check
         # Serialize the real crack + its --show read against every other
         # hashcat launch (a concurrent crack, or the best-effort benchmark
         # warm-up) via the shared single-instance slot. block=True: a real

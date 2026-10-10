@@ -784,7 +784,7 @@ def check_posture_confidence_low(
             observed=", ".join(weak),
             why="Some posture observations are low-confidence or stale; the go/no-go "
             "is built on weak evidence.",
-            remediation="Run 'adscan posture probe <domain>' to refresh before relaying.",
+            remediation="Run 'posture probe <domain>' to refresh before relaying.",
             confidence=SignalConfidence.LOW,
         )
     return FeasibilityVerdict(

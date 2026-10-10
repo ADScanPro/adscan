@@ -353,7 +353,7 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
     ScanPhase(
         phase_id="domain_collection",
         title="Domain Collection",
-        subtitle="Native LDAP/SMB collector — graph, sessions, ACLs.",
+        subtitle="Native LDAP/SMB collector: graph, sessions, ACLs.",
         chapter="collection",
         weight=12,
         commands=_ALL_AUTH,
@@ -370,7 +370,7 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
             Subphase(
                 subphase_id="ldap",
                 title="Directory Graph & ACLs",
-                subtitle="Graph, group memberships, security descriptors, and PKI — always runs.",
+                subtitle="Graph, group memberships, security descriptors, and PKI. Always runs.",
             ),
             Subphase(
                 subphase_id="samr",

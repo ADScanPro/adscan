@@ -727,11 +727,11 @@ def build_kit_facts(report: dict[str, Any], workspace_dir: str) -> dict[str, Any
             pass
         try:
             # Route the figures through the cardinality SSOT with the persisted
-            # snapshot, so the EFFECTIVE full-domain-compromise count (k on a
-            # complete run, the reachable-set cardinality under the sampled
-            # fallback) and the snapshot-sourced proven count survive the
-            # collapse. On a complete run every value equals the pre-change ``k``
-            # figure, so a healthy domain stays byte-identical.
+            # snapshot, so the full-domain-compromise ROUTE count and the
+            # snapshot-sourced proven count come from one place. The route figure
+            # is a route count in every coverage mode; a sampled run declares its
+            # boundary through the coverage block rather than by substituting the
+            # reachable-terminal cardinality here.
             _snapshot = _load_snapshot_paths(workspace_dir, str(domain_name))
             totals = client_path_totals_for_domain(
                 entry.get("exposure_kpis"),

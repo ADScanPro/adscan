@@ -7,7 +7,8 @@ collected CollectionResult data — no additional LDAP queries.
 from __future__ import annotations
 
 import time
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Iterable
 
 from adscan_internal.services.collector.models import (
     AuditFinding,
@@ -15,6 +16,7 @@ from adscan_internal.services.collector.models import (
     CollectorNode,
     DomainPolicy,
 )
+from adscan_internal.services.graph_queries.filters import is_active
 
 _FILETIME_EPOCH_OFFSET = 116_444_736_000_000_000
 _100NS_PER_SECOND = 10_000_000
@@ -42,6 +44,117 @@ def _days_since_filetime(filetime: int | None) -> float | None:
 def _is_obsolete_os(os_string: str) -> bool:
     os_lower = os_string.lower()
     return any(obs.lower() in os_lower for obs in _OBSOLETE_OS_SUBSTRINGS)
+
+
+#: Catalog key for the measured password-recovery outcome.
+#:
+#: The engagement that motivated it recovered 227 cleartext passwords, 122 of
+#: them belonging to currently-enabled accounts out of 1,172 (10.4%) and 4 of
+#: those administrative, and reported NONE of it as a finding. The 24 findings it
+#: did carry were all policy and hygiene, derived from directory attributes:
+#: ``weak_password_policy``, ``password_not_required``, ``stale_passwords``,
+#: ``password_never_expires``. The outcome ADscan actually measured reached the
+#: client only as rows in a credential appendix.
+#:
+#: This key reports the OUTCOME and is deliberately method-neutral. Whether the
+#: passwords were resolved by a public breach-corpus lookup or by a local
+#: wordlist attack is a question about COVERAGE, answered once by
+#: ``adscan_core.reporting.cracking_coverage``; folding the method into the
+#: finding name would make the client's exposure sound like a property of our
+#: tooling.
+RECOVERED_PASSWORD_FINDING_KEY = "recovered_account_passwords"
+
+
+@dataclass(frozen=True)
+class RecoveredPasswordSummary:
+    """What password recovery proved about the client's ENABLED accounts.
+
+    The ratio is against the enabled-user population because that is the
+    population the client can act on and the only denominator they can check
+    against their own directory. The raw recovery total is carried alongside it,
+    never used as the ratio: a recovered password for a long-disabled account is
+    a real observation and not a live exposure.
+    """
+
+    #: Enabled accounts whose password was recovered, and the enabled population.
+    enabled_recovered: int
+    enabled_total: int
+    #: Of those, the ones the compliance snapshot flags administrative.
+    admin_like_recovered: int
+    #: Every password recovered in the run, enabled or not.
+    recovered_total: int
+    #: The enabled accounts, named, so the finding's affected assets are real.
+    enabled_recovered_usernames: tuple[str, ...] = ()
+    admin_like_recovered_usernames: tuple[str, ...] = ()
+
+    @property
+    def enabled_pct(self) -> float:
+        """Recovered share of the enabled population, the client-verifiable figure."""
+        if self.enabled_total <= 0:
+            return 0.0
+        return round(self.enabled_recovered / self.enabled_total * 100, 1)
+
+    @property
+    def severity(self) -> str:
+        """Severity keyed on the ADMIN-LIKE count, never the raw total.
+
+        A hundred ordinary accounts with recoverable passwords is a hygiene
+        programme with a budget and a timeline. One administrative account is an
+        incident, and a severity driven by volume hides the second inside the
+        first: the 4 administrative recoveries in the reference engagement would
+        have been averaged away by the 122.
+        """
+        return "critical" if self.admin_like_recovered > 0 else "high"
+
+    @property
+    def should_report(self) -> bool:
+        """Only report when a LIVE account is affected."""
+        return self.enabled_recovered > 0
+
+
+def build_recovered_password_summary(
+    *,
+    enabled_usernames: Iterable[str],
+    admin_like_usernames: Iterable[str],
+    recovered_usernames: Iterable[str],
+) -> RecoveredPasswordSummary:
+    """Intersect the recovered passwords with the enabled-account population.
+
+    Pure, so the derivation is testable without a collection result or a
+    credential store. Matching is case-insensitive because AD account names are.
+
+    Args:
+        enabled_usernames: Every enabled user account in the domain.
+        admin_like_usernames: The subset the compliance snapshot flags
+            administrative (``is_admin_like``).
+        recovered_usernames: Accounts whose cleartext password this run holds,
+            by any method.
+
+    Returns:
+        A :class:`RecoveredPasswordSummary`.
+    """
+
+    def _fold(values: Iterable[str]) -> set[str]:
+        return {
+            str(value or "").strip().lower()
+            for value in values
+            if str(value or "").strip()
+        }
+
+    enabled = _fold(enabled_usernames)
+    admin_like = _fold(admin_like_usernames)
+    recovered = _fold(recovered_usernames)
+
+    enabled_hits = sorted(enabled & recovered)
+    admin_hits = sorted(admin_like & recovered & enabled)
+    return RecoveredPasswordSummary(
+        enabled_recovered=len(enabled_hits),
+        enabled_total=len(enabled),
+        admin_like_recovered=len(admin_hits),
+        recovered_total=len(recovered),
+        enabled_recovered_usernames=tuple(enabled_hits),
+        admin_like_recovered_usernames=tuple(admin_hits),
+    )
 
 
 def _password_compliance_findings(
@@ -120,7 +233,7 @@ def analyze_audit_findings(
     findings: list[AuditFinding] = []
 
     def _is_human_user(node: Any) -> bool:
-        """True for enabled, NON-``$`` User nodes — the hygiene audit's human scope.
+        """True for ACTIVE, NON-``$`` User nodes — the hygiene audit's human scope.
 
         Intentionally NARROWER than the inventory predicate
         ``get_enabled_users`` (graph_queries/inventories.py): that predicate now
@@ -128,10 +241,15 @@ def analyze_audit_findings(
         hygiene findings target HUMAN accounts.  A gMSA has a machine-managed
         password (no ``passwordnotreqd``) and a service-account logon cadence, so
         ``$``-suffixed managed service accounts are deliberately excluded here.
+
+        ``is_active`` rather than ``node.enabled``: a deleted account keeps its
+        ``userAccountControl`` and its last-logon timestamp, so a tombstone is
+        the perfect shape for a false "stale enabled user" finding, stale by
+        definition and already remediated by the deletion the client performed.
         """
         return (
             node.kind == "User"
-            and bool(node.enabled)
+            and is_active(node)
             and not str(node.samaccountname).endswith("$")
         )
 
@@ -230,7 +348,7 @@ def analyze_audit_findings(
             # of password rotation. When it is unavailable (0/None — e.g. a domain
             # that disabled lastLogonTimestamp updates) we DO NOT flag, to avoid
             # false positives; better to miss than to mislabel a live legacy host.
-            if bool(node.enabled):
+            if is_active(node):
                 days_ago = _days_since_filetime(node.properties.get("lastlogon"))
                 if days_ago is not None and days_ago > stale_days:
                     findings.append(
@@ -805,7 +923,7 @@ def analyze_duplicate_dns_findings(result: CollectionResult) -> list[AuditFindin
 
     by_ip: dict[str, list[CollectorNode]] = {}
     for node in result.nodes.values():
-        if node.kind != "Computer" or not bool(node.enabled):
+        if node.kind != "Computer" or not is_active(node):
             continue
         ip = str(node.properties.get("ip_address") or "").strip()
         if ip:

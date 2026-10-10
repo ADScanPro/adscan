@@ -165,7 +165,8 @@ CI_PASSTHROUGH = PassthroughCommand(
         PassthroughArg(("--report-format",), "Report format.", choices=("pdf",)),
         PassthroughArg(
             ("--frameworks",),
-            "Compliance frameworks: ens,nis2,iso27001,dora,pci_dss,cis (default: ens).",
+            "Compliance frameworks: ens,nis2,iso27001,dora,pci_dss,cis "
+            "(no default; required with --generate-report on --type audit).",
             metavar="LIST",
         ),
         PassthroughArg(("--report-engine",), "PDF engine.", choices=("chromium",)),
@@ -232,6 +233,13 @@ EXECUTE_PASSTHROUGH = PassthroughCommand(
         "adscan execute kerberoast -d corp.local --dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'",
         "adscan execute kerberoast -d corp.local --dc-ip 10.0.0.1 --dns-server 10.0.0.53 "
         "-u alice -p 'S3cr3t!'",
+        # A verb's OWN flags are not declared here (this spec mirrors the
+        # `execute` subparser, and the contract test rejects an entry the
+        # subparser has no action for): they forward through the REMAINDER
+        # after `--`. One example, because a declaration nobody can see how to
+        # type is a feature nobody uses.
+        "adscan execute compliance_scope -w Lab-Demo -- "
+        "--profile general --levels C=medio,I=medio,T=bajo,A=medio,D=bajo",
     ),
 )
 

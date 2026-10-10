@@ -59,8 +59,57 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from adscan_internal.services.attack_graph_core import is_traversable_attack_edge
+from adscan_internal.services.graph_queries.filters import is_tombstoned
+
 # Node kinds that can plausibly originate an attack (an enabled principal).
 _PRINCIPAL_KINDS: frozenset[str] = frozenset({"User", "Computer", "Group"})
+
+#: Key of the derivation marker that records whether the two path-derived
+#: sub-blocks (``remediation_start_here``, ``user_exposure``) were ever DERIVED
+#: for a stamped choke block, and from how many attack paths.
+#:
+#: It exists because those two sub-blocks are legitimately absent in two
+#: different situations that look identical on disk: the domain genuinely has no
+#: attack paths to rank, or the derivation never ran at all (a stamp written
+#: before the paths were in scope). A consumer that cannot tell them apart will
+#: read an UNCOMPUTED block as a complete one, which CLAUDE.md § "A bounded
+#: computation is a data gap" forbids. The marker is always written, so its
+#: presence means "derived", its ``attack_paths_considered`` says what it had to
+#: work with, and its two booleans say honestly whether each sub-block came out
+#: non-empty.
+PATH_DERIVED_BLOCKS_KEY = "path_derived_blocks"
+
+
+def chokepoint_block_is_derived(block: Any) -> bool:
+    """Whether a persisted choke block is complete enough to reuse as-is.
+
+    The single predicate behind the stamp's idempotency, shared with the LITE
+    report flow so the cheap pre-check that skips the (expensive) graph load and
+    the stamp's own guard can never disagree about what counts as "already
+    stamped" — they were two hand-copied conditions before.
+
+    "Already stamped" means ranked AND carrying the path-derivation marker
+    (:data:`PATH_DERIVED_BLOCKS_KEY`). Requiring the marker is what makes the
+    stamp self-healing for a block written before the attack paths reached this
+    seam: such a block is ranked but can never have derived
+    ``remediation_start_here`` / ``user_exposure``, so it is re-stamped ONCE and
+    then carries the marker forever. Recomputation is therefore bounded at one
+    pass per workspace even for a domain with zero attack paths, whose marker
+    records that honest emptiness rather than looking uncomputed.
+
+    Args:
+        block: The value at ``domains[<domain>]["chokepoint_cardinality"]``.
+
+    Returns:
+        ``True`` when the block may be reused untouched.
+    """
+    return (
+        isinstance(block, dict)
+        and bool(block.get("schema_version"))
+        and isinstance(block.get("ranked_chokepoints"), list)
+        and isinstance(block.get(PATH_DERIVED_BLOCKS_KEY), dict)
+    )
 
 
 def _iter_nodes(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -98,6 +147,8 @@ def _iter_nodes(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _build_reverse_adjacency(
     graph: dict[str, Any],
+    *,
+    nodes_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, set[str]]:
     """Build the reverse adjacency ``to -> {from, ...}`` from the graph edges.
 
@@ -105,8 +156,18 @@ def _build_reverse_adjacency(
     stable edge key). A reverse edge ``to -> from`` is what a reverse BFS from a
     terminal follows to discover every node that can reach that terminal.
 
+    Only TRAVERSABLE compromise edges enter the adjacency — the SAME gate the DFS
+    uses (:func:`attack_graph_core.is_traversable_attack_edge`). Without it the
+    reverse flood would cross share-access edges (``ReadShare`` / ``WriteShare`` /
+    ``FullControlShare``) that are exposure findings, not host-compromise
+    transitions, and would falsely count every standard user as reaching the
+    value-terminal set (the ``Everyone --FullControlShare--> DC$`` flood).
+
     Args:
         graph: The attack graph dict.
+        nodes_map: The ``id -> node`` map for the class-aware ``WriteSPN``
+            exclusion. When ``None`` it is built from ``graph`` (the relation-only
+            exclusions still apply either way).
 
     Returns:
         A mapping from a node id to the set of node ids that have an edge INTO
@@ -116,8 +177,11 @@ def _build_reverse_adjacency(
     edges = graph.get("edges")
     if not isinstance(edges, list):
         return reverse
+    resolved_nodes = nodes_map if isinstance(nodes_map, dict) else _iter_nodes(graph)
     for edge in edges:
         if not isinstance(edge, dict):
+            continue
+        if not is_traversable_attack_edge(edge, resolved_nodes):
             continue
         from_id = str(edge.get("from") or "").strip()
         to_id = str(edge.get("to") or "").strip()
@@ -188,20 +252,28 @@ def _node_is_enabled_principal(node: dict[str, Any]) -> bool:
     """Return ``True`` if the node is a plausible, non-disabled attack source.
 
     An enabled principal is a node whose ``kind`` is a user / computer / group
-    principal and that is not explicitly disabled. The predicate is deliberately
-    permissive: the brief's ``exposure_source_count`` test only needs ``>= 1``,
-    and over-counting a container as a principal is harmless here because the
-    reverse-reachable set already bounds the count to nodes that actually reach a
-    value terminal.
+    principal, that is not explicitly disabled, and that still EXISTS in the
+    directory. The predicate is deliberately permissive about kind:
+    over-counting a container as a principal is harmless here because the
+    reverse-reachable set already bounds the count to nodes that actually reach
+    a value terminal.
+
+    Deletion is the one exclusion that is not permissive, because it is not a
+    matter of degree: a tombstone preserves its ``userAccountControl`` and so
+    reads as enabled, but nobody can authenticate as a deleted account without
+    reanimating it first. Counting one as a source would overstate how many of
+    the client's principals hold a route to the crown jewels.
 
     Args:
         node: The node dict.
 
     Returns:
-        ``True`` for an enabled principal node.
+        ``True`` for an active principal node.
     """
     kind = str(node.get("kind") or "").strip()
     if kind not in _PRINCIPAL_KINDS:
+        return False
+    if is_tombstoned(node):
         return False
     return not _node_is_disabled(node)
 
@@ -229,7 +301,7 @@ def exposure_source_count(graph: dict[str, Any], *, value_terminals: set[str]) -
     if not terminals:
         return 0
     nodes = _iter_nodes(graph)
-    reverse = _build_reverse_adjacency(graph)
+    reverse = _build_reverse_adjacency(graph, nodes_map=nodes)
     reachable = _reverse_reach(reverse, terminals)
     count = 0
     for node_id in reachable:
@@ -376,7 +448,7 @@ def tier2_exposure_ratio(
     if not terminals:
         return Tier2ExposureRatio(with_path=0, total=total)
 
-    reverse = _build_reverse_adjacency(graph)
+    reverse = _build_reverse_adjacency(graph, nodes_map=nodes)
     reachable = _reverse_reach(reverse, terminals)
     with_path = sum(1 for node_id in standard_users if node_id in reachable)
     return Tier2ExposureRatio(with_path=with_path, total=total)
@@ -396,11 +468,21 @@ def edge_key(from_id: str, relation: str, to_id: str) -> str:
     return f"{from_id}|{relation}|{to_id}"
 
 
-def _build_forward_adjacency(graph: dict[str, Any]) -> dict[str, set[str]]:
+def _build_forward_adjacency(
+    graph: dict[str, Any],
+    *,
+    nodes_map: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, set[str]]:
     """Build the forward adjacency ``from -> {to, ...}`` from the graph edges.
+
+    Only TRAVERSABLE compromise edges enter the adjacency — the SAME gate the DFS
+    uses (:func:`attack_graph_core.is_traversable_attack_edge`), so the forward
+    flood never crosses the non-compromise share-access edges that inflate reach.
 
     Args:
         graph: The attack graph dict.
+        nodes_map: The ``id -> node`` map for the class-aware ``WriteSPN``
+            exclusion. When ``None`` it is built from ``graph``.
 
     Returns:
         A mapping from a node id to the set of node ids it has an edge INTO.
@@ -409,8 +491,11 @@ def _build_forward_adjacency(graph: dict[str, Any]) -> dict[str, set[str]]:
     edges = graph.get("edges")
     if not isinstance(edges, list):
         return forward
+    resolved_nodes = nodes_map if isinstance(nodes_map, dict) else _iter_nodes(graph)
     for edge in edges:
         if not isinstance(edge, dict):
+            continue
+        if not is_traversable_attack_edge(edge, resolved_nodes):
             continue
         from_id = str(edge.get("from") or "").strip()
         to_id = str(edge.get("to") or "").strip()
@@ -505,7 +590,8 @@ def compute_chokepoint_cardinality(
     if not terminals or not isinstance(edges, list):
         return {}
 
-    reverse = _build_reverse_adjacency(graph)
+    nodes = _iter_nodes(graph)
+    reverse = _build_reverse_adjacency(graph, nodes_map=nodes)
     reach = _reverse_reach(reverse, terminals)
 
     # Sources = leaf originators: reachable nodes with no inbound reach edge.
@@ -517,12 +603,17 @@ def compute_chokepoint_cardinality(
     if not sources:
         return {}
 
-    forward = _build_forward_adjacency(graph)
+    forward = _build_forward_adjacency(graph, nodes_map=nodes)
 
     # Relation lookup so the omitted-cardinality edges never cost a graph scan.
+    # Only traversable edges are keyed — the SAME gate the adjacency uses — so a
+    # pair that carries both a share-access edge (non-traversable) and a real
+    # compromise edge never picks up the share relation for its stable key.
     relation_by_pair: dict[tuple[str, str], str] = {}
     for edge in edges:
         if not isinstance(edge, dict):
+            continue
+        if not is_traversable_attack_edge(edge, nodes):
             continue
         from_id = str(edge.get("from") or "").strip()
         to_id = str(edge.get("to") or "").strip()
@@ -667,7 +758,7 @@ def compute_node_chokepoint_cardinality(
         return {}
 
     nodes = _iter_nodes(graph)
-    reverse = _build_reverse_adjacency(graph)
+    reverse = _build_reverse_adjacency(graph, nodes_map=nodes)
     reach = _reverse_reach(reverse, terminals)
 
     sources = {
@@ -1087,10 +1178,18 @@ def stamp_chokepoint_cardinality_for_domain(
     ``domain_data`` and the technical-report file) exactly the way the exposure
     KPIs are recorded.
 
-    Idempotency: if ``domain_data`` already carries a valid, already-ranked
-    ``chokepoint_cardinality`` block (e.g. a PRO run stamped it and the LITE flow
-    reads the same ``technical_report.json``), the block is left untouched — the
-    graph is not re-loaded and nothing is recomputed/overwritten.
+    The two path-derived sub-blocks (``remediation_start_here`` and
+    ``user_exposure``) come from ``domain_data["attack_paths"]``, so a caller
+    that wants them must seed that list before calling — the persisted
+    ``technical_report.json`` carries ``attack_paths: []`` by design (paths are
+    derived on demand, never persisted).
+
+    Idempotency: a block that :func:`chokepoint_block_is_derived` accepts is
+    left untouched — the graph is not re-loaded and nothing is recomputed or
+    overwritten, so a PRO-stamped block always wins. A ranked block written
+    before the attack paths reached this seam lacks the derivation marker and is
+    re-stamped exactly once, after which it carries the marker and is skipped
+    like any other.
 
     Args:
         shell: A shell namespace carrying ``current_workspace_dir`` (the same
@@ -1102,14 +1201,13 @@ def stamp_chokepoint_cardinality_for_domain(
             :func:`resolve_choke_bounded`).
         domain_data: The in-memory report entry to stamp the summary onto.
     """
-    # Idempotency guard: a valid, already-ranked block means a prior seam (PRO or
-    # an earlier LITE pass) already stamped it. Do not recompute/overwrite.
-    existing = domain_data.get("chokepoint_cardinality")
-    if (
-        isinstance(existing, dict)
-        and existing.get("schema_version")
-        and isinstance(existing.get("ranked_chokepoints"), list)
-    ):
+    # Idempotency guard: a block that is ranked AND carries the path-derivation
+    # marker was stamped by a prior seam (PRO, or an earlier LITE pass) with the
+    # attack paths in scope, so there is nothing left to add. Do not
+    # recompute/overwrite. A ranked block WITHOUT the marker predates the paths
+    # reaching this seam and is re-stamped once; see
+    # :func:`chokepoint_block_is_derived`.
+    if chokepoint_block_is_derived(domain_data.get("chokepoint_cardinality")):
         return
 
     try:
@@ -1227,6 +1325,24 @@ def stamp_chokepoint_cardinality_for_domain(
         except Exception as _ue_exc:  # noqa: BLE001 - block is best-effort
             if print_exception is not None:
                 print_exception(exception=_ue_exc)
+
+        # Declare the derivation, always. Both sub-blocks above are omitted when
+        # they come out empty, and on disk that is indistinguishable from never
+        # having been derived at all — so a renderer or the paid web CTEM would
+        # read an uncomputed block as a complete one. This marker is the
+        # distinction: it records how many attack paths the derivation had and
+        # whether each sub-block materialised, so "none to rank" reads as the
+        # honest result it is and only a genuinely unmarked block is re-derived.
+        _considered = domain_data.get("attack_paths")
+        summary[PATH_DERIVED_BLOCKS_KEY] = {
+            "attack_paths_considered": (
+                len([_p for _p in _considered if isinstance(_p, dict)])
+                if isinstance(_considered, list)
+                else 0
+            ),
+            "remediation_start_here": "remediation_start_here" in summary,
+            "user_exposure": "user_exposure" in summary,
+        }
 
         domain_data["chokepoint_cardinality"] = summary
         record_chokepoint_cardinality(shell, domain, summary=summary)

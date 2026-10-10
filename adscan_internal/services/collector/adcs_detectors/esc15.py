@@ -1,12 +1,10 @@
-"""ESC15 (EKUwu) — Schema V1 template + EnrolleeSuppliesSubject + ClientAuth EKU."""
+"""ESC15 (EKUwu, CVE-2024-49019) — Schema V1 template + EnrolleeSuppliesSubject."""
 
 from __future__ import annotations
 
 from adscan_internal.services.collector.adcs_detectors._common import (
     get_enroll_principal_sids,
-    has_client_auth_or_no_eku,
     make_adcs_edge,
-    template_eku_list,
     template_int_property,
 )
 from adscan_internal.services.collector.adcs_detectors.constants import (
@@ -28,10 +26,19 @@ def detect_esc15(
       * Template kind is CertTemplate
       * msPKI-Template-Schema-Version == 1
       * msPKI-Certificate-Name-Flag has ENROLLEE_SUPPLIES_SUBJECT bit
-      * msPKI-Enrollment-Flag does NOT have PEND_ALL_REQUESTS
-      * msPKI-RA-Signature == 0
-      * EKU grants client auth (or empty / any purpose)
+      * msPKI-Enrollment-Flag does NOT have PEND_ALL_REQUESTS (no manager approval)
+      * msPKI-RA-Signature == 0 (no RA co-sign)
       * At least one principal holds an enrollment-capable ACL right
+
+    The template's configured EKU is deliberately NOT a precondition. ESC15
+    (EKUwu, CVE-2024-49019) abuses the fact that a schema version 1 CA honors
+    application policies supplied by the requester in the CSR, overriding the
+    template's own EKU. So a schema-v1 enrollee-supplies-subject template is
+    vulnerable regardless of whether its configured EKU grants client auth —
+    the attacker injects a client-authentication application policy at request
+    time. Gating on the configured EKU would miss exactly the templates (e.g. a
+    Server Authentication / WebServer template) that EKUwu targets, which is the
+    same class certipy flags as ESC15.
     """
     if template_node.kind != "CertTemplate":
         return []
@@ -58,9 +65,6 @@ def detect_esc15(
         template_node, "mspki_ra_signature", "msPKI-RA-Signature"
     )
     if ra_signature > 0:
-        return []
-
-    if not has_client_auth_or_no_eku(template_eku_list(template_node)):
         return []
 
     return [

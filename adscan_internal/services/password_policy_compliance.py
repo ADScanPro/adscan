@@ -49,6 +49,7 @@ from adscan_internal.services.collector.models import (
     PasswordSettingsObject,
     UserPasswordCompliance,
 )
+from adscan_internal.services.graph_queries.filters import is_active
 
 _FILETIME_EPOCH_OFFSET = 116_444_736_000_000_000
 _100NS_PER_SECOND = 10_000_000
@@ -131,10 +132,17 @@ def _is_admin_like(node: CollectorNode) -> bool:
 
 
 def _enabled_users(result: CollectionResult) -> list[CollectorNode]:
+    """Return the ACTIVE user population the password-policy report measures.
+
+    ``is_active`` rather than ``node.enabled``: a deleted account preserves both
+    its ``userAccountControl`` and its ``pwdLastSet``, so a tombstone would be
+    counted as a live account out of compliance with a policy that no longer
+    applies to it.
+    """
     return [
         node
         for node in result.nodes.values()
-        if node.kind == "User" and node.enabled
+        if node.kind == "User" and is_active(node)
     ]
 
 

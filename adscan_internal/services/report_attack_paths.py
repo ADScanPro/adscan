@@ -159,7 +159,13 @@ def compute_report_attack_paths(
             )
 
         paths = attack_graph_service._recover_from_memory_abort(  # noqa: SLF001
-            shell, domain, exc, recompute_bounded=_recompute_bounded_report
+            shell,
+            domain,
+            exc,
+            recompute_bounded=_recompute_bounded_report,
+            # This IS the canonical domain listing, so its coverage declaration
+            # owns the per-domain block the deliverable renders.
+            scope="domain",
         )
         if not isinstance(paths, list):
             return []
@@ -334,12 +340,17 @@ def stamp_adcs_finding_views(path: Any) -> None:
                 is_orphaned_ca=bool(details.get("is_orphaned_ca")),
             )
             if state_name:
+                # ``ca_host`` must be a HOSTNAME. ``details["to"]`` is the
+                # step's humanised TARGET label, which for an ADCS ESC edge is
+                # the principal the escalation lands on (``user@domain``), never
+                # the certificate authority, so it is deliberately NOT a
+                # fallback here: it fed a principal into a field named for a
+                # host and the leak reached a client PDF.
                 state_block = build_adcs_finding_state(
                     state=state_name,
                     ca_host=str(
-                        details.get("target_dnshostname")
-                        or details.get("ca_host")
-                        or details.get("to")
+                        details.get("ca_host")
+                        or details.get("target_dnshostname")
                         or ""
                     ),
                 )

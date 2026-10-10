@@ -990,6 +990,39 @@ def orchestrate_ligolo_pivot_tunnel(
         remote_agent_path = ""
         remote_agent_pid: int | None = None
         persisted_tunnel_id: str | None = None
+        ligolo_agent_change_id: str | None = None
+
+        def _settle_ligolo_agent_ledger(cleanup_succeeded: bool, *, message: str = "") -> None:
+            """Settle the staged-agent ledger record against a cleanup outcome.
+
+            reverted_confirmed on a confirmed delete, else manual_required
+            reusing the remediation + object path stamped at disclosure. The
+            change id was created at upload, so every cleanup path (keepalive
+            exit, failed tunnel, workspace exit) settles the SAME record.
+            """
+            _led = getattr(shell, "environment_change_ledger", None)
+            if _led is None or not ligolo_agent_change_id:
+                return
+            try:
+                from adscan_internal.services import cleanup_taxonomy as _lg_tax
+
+                if cleanup_succeeded:
+                    _led.mark_reverted_confirmed(
+                        ligolo_agent_change_id,
+                        verification_method="ligolo_agent_delete",
+                        min_credential_principal=username,
+                    )
+                else:
+                    _led.mark_manual_required(
+                        ligolo_agent_change_id,
+                        reason=_lg_tax.MANUAL_REASON_REVERT_FAILED,
+                        remediation_command="",
+                        remediation_object_dn="",
+                        error=message or "Staged Ligolo agent could not be removed.",
+                    )
+            except Exception as _settle_exc:  # noqa: BLE001
+                telemetry.capture_exception(_settle_exc)
+                print_exception(exception=_settle_exc)
 
         def _persist_artifact_cleanup_update(updates: dict[str, Any]) -> None:
             updater = getattr(service, "update_tunnel_record", None)
@@ -1173,6 +1206,42 @@ def orchestrate_ligolo_pivot_tunnel(
                 raise RuntimeError(
                     f"Failed to upload the Ligolo agent to {remote_agent_path}."
                 )
+
+        # The agent binary now exists on the pivot host (any transfer failure
+        # raised above). Register it with the change ledger AT THE WRITE, so a
+        # session that dies before the tunnel is cleaned has finalize() report
+        # the staged agent manual_required naming the host path, rather than
+        # the artifact only being tracked if the exit cleanup happens to run.
+        _ligolo_ledger = getattr(shell, "environment_change_ledger", None)
+        if _ligolo_ledger is not None and remote_agent_path:
+            try:
+                _ligolo_unc = f"\\\\{pivot_host}\\" + remote_agent_path.replace('/', '\\')
+                ligolo_agent_change_id = _ligolo_ledger.register_change(
+                    kind="file_uploaded",
+                    domain=str(domain or ""),
+                    target=_ligolo_unc,
+                    detail={
+                        "host": str(pivot_host or ""),
+                        "remote_path": str(remote_agent_path or ""),
+                        "exec_username": username,
+                        "executor_username": username,
+                        "credential_lookup_domain": str(domain or ""),
+                    },
+                    method="CanPSRemote pivot (staged Ligolo agent)",
+                )
+                _ligolo_ledger.set_revert_metadata(
+                    ligolo_agent_change_id,
+                    remediation_command=(
+                        'Delete the staged pivot agent from the host and confirm it is '
+                        'gone:\n'
+                        f'  Remove-Item -LiteralPath "{_ligolo_unc}" -Force\n'
+                        f'  Test-Path "{_ligolo_unc}"   # must return False'
+                    ),
+                    remediation_object_dn=_ligolo_unc,
+                )
+            except Exception as _ligolo_exc:  # noqa: BLE001
+                telemetry.capture_exception(_ligolo_exc)
+                print_exception(exception=_ligolo_exc)
 
         known_session_ids = {
             str(agent.get("session_id") or "").strip()
@@ -1359,6 +1428,7 @@ def orchestrate_ligolo_pivot_tunnel(
             "connect_target": connect_target,
             "fingerprint": fingerprint,
             "remote_agent_path": remote_agent_path,
+            "remote_artifact_change_id": ligolo_agent_change_id,
             "remote_artifact_transfer_method": artifact_transfer_method,
             "remote_agent_pid": launch_payload.get("pid"),
             "agent": agent,
@@ -1438,6 +1508,10 @@ def orchestrate_ligolo_pivot_tunnel(
                                 "remote_artifact_deleted": cleanup_result.file_deleted,
                             }
                         )
+                    _settle_ligolo_agent_ledger(
+                        cleanup_result.cleanup_succeeded,
+                        message=cleanup_result.message,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
@@ -1537,6 +1611,10 @@ def orchestrate_ligolo_pivot_tunnel(
                     "remote_artifact_cleanup_message": cleanup_result.message,
                     "remote_artifact_deleted": cleanup_result.file_deleted,
                 }
+            )
+            _settle_ligolo_agent_ledger(
+                cleanup_result.cleanup_succeeded,
+                message=cleanup_result.message,
             )
             if cleanup_result.cleanup_succeeded:
                 print_info(

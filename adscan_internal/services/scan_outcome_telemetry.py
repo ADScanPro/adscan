@@ -285,15 +285,19 @@ def emit_scan_outcome(shell: Any, command_name: str) -> None:
 
 
 def _read_effective_reachable_count(ws_dir: str) -> int:
-    """Sum the EFFECTIVE reachable routes to full domain compromise, best-effort.
+    """Sum the exposure magnitude per domain for INTERNAL telemetry, best-effort.
 
-    Under the control-mega-hub sampled fallback the materialized snapshot
-    collapses to 0 while the run still stamped a reachability set. Reading the
-    effective full-domain-compromise figure off each domain's ``exposure_kpis``
-    (via the counts SSOT) keeps the telemetry count honest — never 0 on a domain
-    that has reachable routes. On a COMPLETE run the effective figure equals k,
-    but this is only consulted when the materialized snapshot summed to 0, so a
-    healthy run's count is unchanged. Best-effort; 0 on any miss.
+    Consulted only when the materialized snapshot summed to 0, so a healthy run's
+    count is unchanged. Prefers the full-domain-compromise ROUTE count and falls
+    back to the reachable-Tier-0 ASSET count only when the sampled run surfaced no
+    route at all, so the telemetry magnitude is never a collapsed 0 on a domain
+    that carries exposure.
+
+    This mixing of units is confined to INTERNAL analytics and is NOT permitted on
+    any client-facing surface: a report / CTEM figure labelled as routes is always
+    a route count (see
+    :attr:`~adscan_internal.services.attack_path_counts.ClientPathTotals.reachable_tier0_assets`
+    for the asset-labelled companion). Best-effort; 0 on any miss.
     """
     try:
         from adscan_internal.services.attack_path_counts import (
@@ -312,7 +316,11 @@ def _read_effective_reachable_count(ws_dir: str) -> int:
             kpis = entry.get("exposure_kpis") if isinstance(entry, dict) else None
             if not isinstance(kpis, dict):
                 continue
-            total += client_path_totals_from_kpis(kpis).effective_full_domain_compromise
+            _totals = client_path_totals_from_kpis(kpis)
+            total += (
+                _totals.effective_full_domain_compromise
+                or _totals.reachable_tier0_assets
+            )
         return max(0, total)
     except Exception:  # noqa: BLE001 - best effort
         return 0

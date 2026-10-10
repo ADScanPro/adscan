@@ -18,6 +18,7 @@ from adscan_internal.cli.privileged_target_selection import (
     resolve_privileged_target_user,
 )
 from adscan_internal.principal_utils import normalize_machine_account
+from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info,
@@ -1900,6 +1901,7 @@ def offer_rodc_escalation(
     original_reveal_values: tuple[str, ...] | None = None
     original_never_reveal_values: tuple[str, ...] | None = None
     wrote_reveal = False
+    _prp_change_id: str | None = None
     service: ExploitationService | None = None
     pdc_host = ""
     normalized_machine = normalize_machine_account(rodc_machine or username)
@@ -2304,6 +2306,42 @@ def offer_rodc_escalation(
             cleanup_required = True
             wrote_reveal = True
 
+            # Record the password-replication-policy modify with the change
+            # ledger so its reversal is tracked and verified like every other
+            # directory write. The confirming re-read + settle happens in the
+            # finally; a session that dies before cleanup leaves a
+            # manual_required record naming the RODC object (ledger.finalize).
+            _prp_ledger = getattr(shell, "environment_change_ledger", None)
+            if _prp_ledger is not None:
+                try:
+                    _prp_change_id = _prp_ledger.register_change(
+                        kind="rodc_prp_modified",
+                        domain=domain,
+                        target=normalized_machine,
+                        detail={
+                            "target_domain": domain,
+                            "target_object": rodc_dn or normalized_machine,
+                            "target_dn": rodc_dn or normalized_machine,
+                            "reveal_principal": target_user_dn or target_user,
+                            "exec_username": policy_username,
+                            "exec_password": policy_password,
+                            "executor_username": policy_username,
+                            "credential_lookup_domain": domain,
+                        },
+                        method="RODC password-replication policy (PrepareRodcCredentialCaching)",
+                    )
+                    _prp_ledger.set_revert_metadata(
+                        _prp_change_id,
+                        remediation_command=_tax.MANUAL_RODC_PRP.replace(
+                            "TARGET", rodc_dn or normalized_machine
+                        ).replace("REVEAL_PRINCIPAL", target_user_dn or target_user),
+                        remediation_object_dn=rodc_dn or normalized_machine,
+                    )
+                    _prp_ledger.mark_revert_in_progress(_prp_change_id)
+                except Exception as _prp_exc:  # noqa: BLE001
+                    telemetry.capture_exception(_prp_exc)
+                    print_exception(exception=_prp_exc)
+
             if never_reveal_values:
                 never_reveal_update = service.acl.set_object_attribute_values(
                     pdc_host=pdc_host,
@@ -2497,6 +2535,59 @@ def offer_rodc_escalation(
                 reveal_values=reveal_restore_values,
                 never_reveal_values=never_reveal_restore_values,
             )
+
+            # Settle the ledger record for the password-replication-policy
+            # modify. ``reverted_confirmed`` is fail-closed: it requires a
+            # confirming re-read proving the principal we added is gone from
+            # msDS-RevealOnDemandGroup. Anything less is manual_required with
+            # the native remediation naming the RODC object.
+            if _prp_change_id is not None:
+                _prp_ledger = getattr(shell, "environment_change_ledger", None)
+                if _prp_ledger is not None:
+                    _reveal_gone = False
+                    if cleanup_completed:
+                        try:
+                            _rb_dn, _rb_reveal, _rb_never = _load_rodc_attribute_state(
+                                service,
+                                pdc_host=pdc_host,
+                                domain=domain,
+                                username=policy_username,
+                                password=policy_password,
+                                target_object=normalized_machine,
+                            )
+                            _added = str(target_user_dn or "").strip().casefold()
+                            _reveal_gone = bool(_added) and not any(
+                                str(v or "").strip().casefold() == _added
+                                for v in _rb_reveal
+                            )
+                        except Exception as _vexc:  # noqa: BLE001
+                            telemetry.capture_exception(_vexc)
+                            _reveal_gone = False
+                    try:
+                        if _reveal_gone:
+                            _prp_ledger.mark_reverted_confirmed(
+                                _prp_change_id,
+                                verification_method="rodc_prp_reveal_reread",
+                                min_credential_principal=policy_username,
+                            )
+                        else:
+                            _prp_ledger.mark_manual_required(
+                                _prp_change_id,
+                                reason=_tax.MANUAL_REASON_REVERT_FAILED,
+                                remediation_command=_tax.MANUAL_RODC_PRP.replace(
+                                    "TARGET", rodc_dn or normalized_machine
+                                ).replace(
+                                    "REVEAL_PRINCIPAL", target_user_dn or target_user
+                                ),
+                                remediation_object_dn=rodc_dn or normalized_machine,
+                                error=(
+                                    "RODC password-replication policy restore could not "
+                                    "be confirmed by re-read."
+                                ),
+                            )
+                    except Exception as _sexc:  # noqa: BLE001
+                        telemetry.capture_exception(_sexc)
+                        print_exception(exception=_sexc)
             marked_rodc = mark_sensitive(normalized_machine, "user")
             marked_domain = mark_sensitive(domain, "domain")
             if cleanup_completed:

@@ -180,7 +180,20 @@ def _try_clock_resync(credential: Any) -> bool:
 
 
 def _normalize_principal(principal: Any) -> str:
-    """Normalize a principal to a comparable key (bare name, lowercased)."""
+    """Normalize a principal to a comparable key (bare name, lowercased).
+
+    NOTE — deliberately NOT routed through the shared
+    ``adscan_internal.services._principal_normalization`` splitters even
+    though the ``\\``/``@`` logic below is the same primitive they provide.
+    This module's own docstring documents a hard invariant: it never imports
+    anything from ``adscan_internal`` to keep the dependency direction clean
+    (it is imported for its monkey-patch side effect, before a shell exists).
+    Importing a sibling ``adscan_internal.services`` module here would
+    violate that invariant, so the two-line split is kept inline. The
+    ``/realm``-style SPN suffix strip below is unique to this helper and is
+    NOT part of the shared splitters either way (an SPN suffix is not a
+    username-qualifier to sanitize before storage).
+    """
     name = str(principal or "").strip()
     if not name:
         return ""

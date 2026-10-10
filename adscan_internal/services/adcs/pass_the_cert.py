@@ -1,7 +1,15 @@
-"""Native Pass-the-Certificate adapter.
+"""Native certificate-to-credential adapter (PKINIT + UnPAC-the-hash).
 
-Wraps :func:`authenticate_with_cert_native` (kerbad PKINIT + UnPAC-the-hash)
-in the same result shape as :class:`PassTheCertificateResult`, so
+NAMING NOTE: despite the filename, this is NOT the Schannel "Pass-the-Cert"
+technique (an LDAPS bind that presents the client certificate via SASL
+EXTERNAL). It wraps :func:`authenticate_with_cert_native` (kerbad **PKINIT** +
+UnPAC-the-hash): the certificate is exchanged for a Kerberos TGT and, best
+effort, the account's NT hash. The genuine Schannel / EXTERNAL LDAPS
+client-certificate bind (used by ESC15 method A and PassTheCert generally) is
+``ldap_transport_service.async_schannel_cert_bind``. Pick by what the cert must
+do: PKINIT/TGT -> here; authenticate an LDAPS bind -> the Schannel seam.
+
+Wraps the result in the same shape as :class:`PassTheCertificateResult`, so
 ``shell.ptc_certipy`` can route the result through its existing post-processing
 pipeline (table render, attack-graph status, credential store, identity
 inference fallback) without changes.

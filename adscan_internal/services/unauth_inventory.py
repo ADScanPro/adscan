@@ -151,6 +151,11 @@ class DescriptionCredential:
     context_line: str
     rule_name: str
     ml_probability: float | None = None
+    # The COMPLETE value of the field the hit came from. The extracted token on
+    # its own is not reviewable: a 12-character string is a leaked password or a
+    # ticket code depending entirely on the sentence around it, so the reviewer
+    # is shown that sentence. Empty only when the source field is unavailable.
+    source_value: str = ""
 
 
 def scan_description_credentials(
@@ -174,6 +179,7 @@ def scan_description_credentials(
 
     targets: list[InMemoryCredSweeperTarget] = []
     path_index: dict[str, tuple[str, str]] = {}
+    value_index: dict[str, str] = {}
     for u in users:
         for field_name in ("description", "full_name", "comment"):
             value = (getattr(u, field_name, "") or "").strip()
@@ -189,6 +195,7 @@ def scan_description_credentials(
                 )
             )
             path_index[key] = (u.samaccountname, field_name)
+            value_index[key] = value
 
     if not targets:
         return []
@@ -231,6 +238,7 @@ def scan_description_credentials(
                     context_line=context_line,
                     rule_name=rule_name,
                     ml_probability=ml_probability,
+                    source_value=value_index.get(file_path, "") or context_line,
                 )
             )
     return findings

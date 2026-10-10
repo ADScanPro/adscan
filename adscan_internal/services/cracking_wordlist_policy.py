@@ -42,7 +42,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
 
+from adscan_internal.services.cracking.achieved_rate_probe import (
+    achieved_rate_key,
+    mode_is_salted,
+)
 from adscan_internal.services.cracking_benchmark import BENCHMARK_MODES
+
+#: A callable that answers "what rate does a real crack ACHIEVE for this
+#: workload on this box", measuring it if it has to. Injected rather than
+#: imported so this module stays pure logic and runnable with no shell: the web
+#: renders the same estimates off a persisted cache and has no shell to probe
+#: with. Built by ``cracking_benchmark.make_achieved_rate_provider(shell)``;
+#: called with the keywords ``(mode, wordlist, rule_path, device_class,
+#: hash_count)``.
+AchievedRateProvider = Any
 
 _ROCKYOU = "rockyou.txt"
 # The bundled audit base: combined_audit_base.txt (~94.0M lines) — the host-side
@@ -207,10 +220,29 @@ _TIER_BUDGET_SECONDS: dict[str, float] = {
     "thorough": 3600.0,
 }
 
-# Worst-case mode (lowest measured H/s of the four modes ADscan cracks) used
-# to decide whether a tier needs capping -- Kerberoast is consistently the
-# slowest in the design spec's calibration table.
+# The DEFAULT mode a tier's rule rung is capped against, for a caller that does
+# not know which hash mode its lane will crack: the slowest mode ADscan
+# measures (Kerberoast, consistently the slowest in the design spec's
+# calibration table). Capping against the slowest mode can never overspend, so
+# it is the right default for an unknown lane.
+#
+# It is the WRONG answer for a lane that DOES know its mode, and NT is why. NT
+# benchmarks ~75x faster than Kerberoast, so planning the NT lane against
+# Kerberoast's rate is not conservative, it discards most of the hardware: the
+# ladder picks a rung the box finishes in seconds and the operator is quoted
+# minutes. A lane that knows its mode therefore passes it as
+# ``cap_reference_mode`` and is planned against the speed it will actually run
+# at; every other caller keeps this default and is unchanged.
 _CAP_REFERENCE_MODE = "13100"
+
+# The rate a mode ADscan does NOT separately benchmark borrows for its estimate
+# (etype-derived AES roast 19600.., timeroast 31300). Deliberately the slowest
+# measured mode, so an unmeasured mode's estimate is pessimistic rather than
+# absent. Same value as _CAP_REFERENCE_MODE today and a DIFFERENT question:
+# this one is "what rate stands in for a mode we never measured", not "what mode
+# do we plan an unknown lane against". They are kept apart so measuring one of
+# these modes later moves only the role it belongs to.
+_UNMEASURED_MODE_RATE_SOURCE = "13100"
 
 # The custom-targeted tier always runs first, at the heaviest rule set.
 _CUSTOM_TIER_NAME = "custom"
@@ -541,19 +573,160 @@ def _device_class_for(benchmark: dict, mode: str) -> str:
     return "unknown"
 
 
-def _pick_capped_rule_index(
-    nominal_index: int, base_lines: int, h_per_s: Optional[float], budget_seconds: float
+def _resolve_cap_mode(benchmark: dict, cap_reference_mode: Optional[str]) -> str:
+    """The mode a tier's rule rung is capped against, for this benchmark.
+
+    ``cap_reference_mode`` is the mode the LANE will actually crack, when the
+    caller knows it. It is honoured only when this benchmark genuinely measured
+    it; a record that never measured it (an older cache, or a sweep paused
+    before reaching that pair) falls back to :data:`_CAP_REFERENCE_MODE`, which
+    is the slowest measured mode and therefore the pessimistic answer. So a
+    missing measurement degrades to the previous, over-cautious behaviour rather
+    than to no cap at all.
+    """
+    requested = str(cap_reference_mode or "").strip()
+    if requested and (benchmark.get(requested) or {}):
+        return requested
+    return _CAP_REFERENCE_MODE
+
+
+# --- keyspace, salt multiplier, and per-rung achieved rates ----------------
+#
+# Two corrections live here, and both moved the estimate by more than an order
+# of magnitude on measured hardware.
+#
+# SALT. For a salted mode hashcat tries every candidate against every distinct
+# hash loaded, so the keyspace is ``base_lines x rules x hash_count``, not
+# ``base_lines x rules``. Measured on mode 13100 against the 94M base with the
+# 10k rule file: one hash gives a keyspace of 940,038,390,000 and 25 hashes
+# gives 23,500,959,750,000, exactly 25x, at the same ~155 MH/s. So a Kerberoast
+# of fifty accounts costs fifty times what one costs and used to be quoted as
+# though it were one. Four of the five modes ADscan benchmarks are salted; NT
+# is the one that is not, which is why the NT lane's "thousands of accounts
+# cost very nearly what one costs" is true THERE and false everywhere else.
+#
+# RATE PER WORKLOAD. The achieved rate is a property of the (mode, rule rung,
+# hash count) triple, because the GPU amortizes the host's word-feed cost over
+# the candidates it derives from each word: mode 1000 measured 0.017 GH/s
+# ruleless, 0.52 GH/s at 77 rules and 2.12 GH/s at 10,000, and mode 13100 at 77
+# rules measured 54 MH/s against one salt and 143 MH/s against twenty-five. So
+# each candidate rung has to be evaluated at ITS OWN rate, never at one rate for
+# the mode, or the ladder walk compares rungs against a number that only
+# describes one of them.
+
+
+def keyspace_for(
+    base_lines: int, rule_lines: int, *, mode: str, hash_count: Optional[int]
 ) -> int:
-    """Walk the rule ladder backward from ``nominal_index`` until the
-    estimated keyspace/H_per_s time fits ``budget_seconds``. Never returns
-    below 0 (a bare wordlist is always the floor)."""
-    if not h_per_s:
-        return nominal_index
+    """The candidate keyspace hashcat will walk, in the units it counts in.
+
+    ``hash_count`` multiplies only for a salted mode. ``None`` is treated as one
+    hash, which is the smallest honest assumption; the caller is responsible for
+    flagging such an estimate provisional for a salted mode, because a count it
+    does not know could be any size.
+    """
+    lines = max(1, int(base_lines or 1))
+    rules = max(1, int(rule_lines or 1))
+    multiplier = 1
+    if mode_is_salted(mode):
+        try:
+            multiplier = max(1, int(hash_count or 1))
+        except (TypeError, ValueError):
+            multiplier = 1
+    return lines * rules * multiplier
+
+
+def resolve_rung_rate(
+    *,
+    mode: str,
+    rung: int,
+    base_path: str,
+    device_class: str,
+    hash_count: Optional[int] = None,
+    achieved: Optional[dict] = None,
+    rate_provider: AchievedRateProvider = None,
+    benchmark: Optional[dict] = None,
+) -> "tuple[Optional[float], bool]":
+    """``(rate, measured)`` for one (mode, rung) pair on this hardware.
+
+    Preference order, and the reason for it:
+
+    1. A live probe through ``rate_provider`` when one was injected. This is a
+       short real attack in the production configuration, so it is the only
+       number that describes what the crack will actually do. Measured.
+    2. A persisted probe for the same workload. Same measurement, read off the
+       cache. Measured.
+    3. The ``hashcat -b`` rate for the mode. PROVISIONAL, and flagged as such:
+       it benchmarks the optimized kernels against a synthetic mask and
+       overstated the achieved rate by 1.7x to 15.5x across the five measured
+       modes. It is kept because an honest ballpark beats no estimate on a host
+       where no probe can run, but it must never be presented as measured.
+
+    Returns ``(None, False)`` when nothing is available, which the caller turns
+    into a provisional calibration estimate or an explicit "cannot estimate".
+    """
+    rule_name, _rule_lines = _RULE_LADDER[rung]
+    rule_path = _resolve_rule_asset_path(rule_name) if rule_name else None
+    # A rung whose rule FILE is not installed cannot be probed and has no cache
+    # key, but it is still a rung the ladder walk has to price, so it drops
+    # straight to the provisional benchmark rate. Returning nothing here would
+    # stop the walk on that rung and keep a tier the budget cannot afford.
+    measurable = bool(rule_path) or not rule_name
+
+    if measurable and callable(rate_provider):
+        try:
+            rate = rate_provider(
+                mode=str(mode),
+                wordlist=base_path,
+                rule_path=rule_path,
+                device_class=device_class,
+                hash_count=hash_count,
+            )
+        except Exception:  # noqa: BLE001 -- planning must never break on a probe
+            rate = None
+        if rate:
+            return float(rate), True
+
+    if measurable and achieved:
+        key = achieved_rate_key(base_path, rule_path, hash_count)
+        cached = ((achieved.get(str(mode)) or {}).get(key) or {}).get(device_class)
+        if cached:
+            return float(cached), True
+
+    if benchmark:
+        fallback = (benchmark.get(str(mode)) or {}).get(device_class)
+        if fallback:
+            return float(fallback), False
+    return None, False
+
+
+def _pick_capped_rule_index(
+    nominal_index: int,
+    base_lines: int,
+    budget_seconds: float,
+    *,
+    rate_at: "Any",
+    mode: str,
+    hash_count: Optional[int],
+) -> int:
+    """Walk the rule ladder backward from ``nominal_index`` until the estimated
+    time fits ``budget_seconds``, evaluating each rung at ITS OWN rate.
+
+    ``rate_at(rung)`` answers the achieved H/s for that rung, or ``None`` when
+    unknown. A rung whose rate is unknown is accepted as-is rather than
+    downgraded past, because downgrading on absent information would quietly
+    shrink coverage. Never returns below 0: a bare wordlist is always the floor.
+    """
     index = nominal_index
     while index > 0:
+        rate = rate_at(index)
+        if not rate:
+            break
         _, rule_lines = _RULE_LADDER[index]
-        estimated = (base_lines * rule_lines) / h_per_s
-        if estimated <= budget_seconds:
+        keyspace = keyspace_for(
+            base_lines, rule_lines, mode=mode, hash_count=hash_count
+        )
+        if keyspace / rate <= budget_seconds:
             break
         index -= 1
     return index
@@ -566,6 +739,10 @@ def _build_tier(
     wordlists_dir: str,
     benchmark: Optional[dict],
     base_override: Optional[str] = None,
+    cap_reference_mode: Optional[str] = None,
+    hash_count: Optional[int] = None,
+    achieved: Optional[dict] = None,
+    rate_provider: AchievedRateProvider = None,
 ) -> EffortTier:
     base_path, base_lines = base_for(
         workspace_type, wordlists_dir, override=base_override
@@ -583,17 +760,54 @@ def _build_tier(
             rule_rung=0,
         )
 
-    device_class = _device_class_for(benchmark, _CAP_REFERENCE_MODE)
-    ref_rate = (benchmark.get(_CAP_REFERENCE_MODE) or {}).get(device_class)
+    cap_mode = _resolve_cap_mode(benchmark, cap_reference_mode)
+    device_class = _device_class_for(benchmark, cap_mode)
     budget = _TIER_BUDGET_SECONDS[level]
-    capped_index = _pick_capped_rule_index(nominal_index, base_lines, ref_rate, budget)
+
+    def _rate_at(rung: int) -> Optional[float]:
+        rate, _measured = resolve_rung_rate(
+            mode=cap_mode,
+            rung=rung,
+            base_path=base_path,
+            device_class=device_class,
+            hash_count=hash_count,
+            achieved=achieved,
+            rate_provider=rate_provider,
+            benchmark=benchmark,
+        )
+        return rate
+
+    capped_index = _pick_capped_rule_index(
+        nominal_index,
+        base_lines,
+        budget,
+        rate_at=_rate_at,
+        mode=cap_mode,
+        hash_count=hash_count,
+    )
     rule_name, rule_lines = _RULE_LADDER[capped_index]
 
     estimated: "dict[str, float]" = {}
     for mode in BENCHMARK_MODES:
-        rate = (benchmark.get(mode) or {}).get(device_class)
+        rate, _measured = resolve_rung_rate(
+            mode=mode,
+            rung=capped_index,
+            base_path=base_path,
+            device_class=device_class,
+            hash_count=hash_count,
+            achieved=achieved,
+            # Only the rung the tier RESOLVED to is probed, and only for the
+            # mode the lane will crack. Probing the other four modes here would
+            # cost four short real attacks per tier for numbers nothing in this
+            # ladder consumes; they read the cache or fall back.
+            rate_provider=rate_provider if mode == cap_mode else None,
+            benchmark=benchmark,
+        )
         if rate:
-            estimated[mode] = (base_lines * rule_lines) / rate
+            estimated[mode] = (
+                keyspace_for(base_lines, rule_lines, mode=mode, hash_count=hash_count)
+                / rate
+            )
 
     return EffortTier(
         name=level,
@@ -623,7 +837,14 @@ def _resolve_custom_tier_base(domain: str) -> Optional[str]:
     return str(candidate) if candidate.is_file() else None
 
 
-def _build_custom_tier(domain: str, benchmark: Optional[dict]) -> Optional[EffortTier]:
+def _build_custom_tier(
+    domain: str,
+    benchmark: Optional[dict],
+    *,
+    cap_reference_mode: Optional[str] = None,
+    hash_count: Optional[int] = None,
+    achieved: Optional[dict] = None,
+) -> Optional[EffortTier]:
     """The custom-targeted tier -- ALWAYS run first, at the heaviest rule set.
 
     The auto-mined per-domain list is small (~1k-50k lines) so it can carry
@@ -641,12 +862,31 @@ def _build_custom_tier(domain: str, benchmark: Optional[dict]) -> Optional[Effor
     device_class = "unknown"
     estimated: "dict[str, float]" = {}
     if benchmark:
-        device_class = _device_class_for(benchmark, _CAP_REFERENCE_MODE)
+        device_class = _device_class_for(
+            benchmark, _resolve_cap_mode(benchmark, cap_reference_mode)
+        )
         base_lines = _estimate_line_count(base_path, _CUSTOM_BASE_LINES_FALLBACK)
         for mode in BENCHMARK_MODES:
-            rate = (benchmark.get(mode) or {}).get(device_class)
+            # No probe here: the custom tier is deliberately never rule-capped
+            # and runs unconditionally, so a measurement could not change what
+            # it does. A cached one sharpens the number it reports; absent that,
+            # the benchmark rate is the ballpark.
+            rate, _measured = resolve_rung_rate(
+                mode=mode,
+                rung=len(_RULE_LADDER) - 1,
+                base_path=base_path,
+                device_class=device_class,
+                hash_count=hash_count,
+                achieved=achieved,
+                benchmark=benchmark,
+            )
             if rate:
-                estimated[mode] = (base_lines * rule_lines) / rate
+                estimated[mode] = (
+                    keyspace_for(
+                        base_lines, rule_lines, mode=mode, hash_count=hash_count
+                    )
+                    / rate
+                )
 
     return EffortTier(
         name=_CUSTOM_TIER_NAME,
@@ -666,6 +906,10 @@ def resolve_effort(
     wordlists_dir: str,
     benchmark: Optional[dict],
     base_override: Optional[str] = None,
+    cap_reference_mode: Optional[str] = None,
+    hash_count: Optional[int] = None,
+    achieved: Optional[dict] = None,
+    rate_provider: AchievedRateProvider = None,
 ) -> "List[EffortTier]":
     """Resolve an effort choice into the tier ladder to try, in order.
 
@@ -682,13 +926,33 @@ def resolve_effort(
     ``base_override`` is the pluggable seam for the generic audit base (see
     ``base_for()``) -- swap the combined asset for a curated list without
     editing this function.
+
+    ``cap_reference_mode`` is the hash mode this lane will actually crack. Given,
+    the rule rung is capped against THAT mode's measured rate, so a lane on a
+    fast kernel is planned at the speed it will run. Omitted, the cap falls back
+    to the slowest measured mode (:data:`_CAP_REFERENCE_MODE`), which is the only
+    safe answer when the lane is unknown and is what every caller that does not
+    pass it keeps getting.
+
+    ``hash_count`` is how many distinct hashes the lane will load. For a SALTED
+    mode it multiplies the keyspace, so omitting it quotes a fifty-account
+    Kerberoast as though it were one account. ``achieved`` is a persisted
+    achieved-rate cache and ``rate_provider`` is the live probe seam; together
+    they are what makes the planned rung and the quoted time describe the rate a
+    crack actually runs at rather than the ``hashcat -b`` number.
     """
     normalized = str(effort or "").strip().lower()
     if normalized not in EFFORT_LEVELS:
         normalized = _DEFAULT_EFFORT
 
     tiers: "List[EffortTier]" = []
-    custom_tier = _build_custom_tier(domain, benchmark)
+    custom_tier = _build_custom_tier(
+        domain,
+        benchmark,
+        cap_reference_mode=cap_reference_mode,
+        hash_count=hash_count,
+        achieved=achieved,
+    )
     if custom_tier is not None:
         tiers.append(custom_tier)
 
@@ -700,6 +964,8 @@ def resolve_effort(
                 wordlists_dir=wordlists_dir,
                 benchmark=None,
                 base_override=base_override,
+                cap_reference_mode=cap_reference_mode,
+                hash_count=hash_count,
             )
         )
         return tiers
@@ -712,6 +978,10 @@ def resolve_effort(
             wordlists_dir=wordlists_dir,
             benchmark=benchmark,
             base_override=base_override,
+            cap_reference_mode=cap_reference_mode,
+            hash_count=hash_count,
+            achieved=achieved,
+            rate_provider=rate_provider,
         )
         for level in EFFORT_LEVELS[start_idx:]
     )
@@ -775,10 +1045,12 @@ def resolve_effort_or_default(shell: Any) -> str:
 # hardware -- a 'thorough' request on a CPU-only box therefore reports the capped
 # (budget-fitting) time, not a raw 26h keyspace.
 #
-# When no benchmark has been measured yet (cold box, warm-up still running) it
-# falls back to a design-calibration rate table (an RTX 4060 GPU reference plus
-# the CPU numbers from the same run) and flags the estimate ``provisional`` so
-# the UI can render "(estimating...)".
+# When nothing has been measured for this workload (a cold box, a host with no
+# hashcat) the rate falls back to the hardware benchmark and then to a
+# design-calibration rate table (an RTX 4060 GPU reference plus the CPU numbers
+# from the same run), and the estimate is flagged ``provisional`` so the UI can
+# render "(provisional)". Neither fallback is a measurement of the achieved
+# rate and neither may be presented as one.
 
 # Fast fits inline (the operator waits the few seconds); anything slower routes
 # to a background job. 30s is the fast/background boundary.
@@ -797,7 +1069,10 @@ _CALIBRATION_RATES: dict[str, dict[str, float]] = {
 }
 
 # Bumped whenever the estimates-artifact SHAPE changes (the web consumes it).
-_ESTIMATES_SCHEMA_VERSION = 1
+# v2 adds ``hash_count``: for a salted mode the cost scales with the number of
+# hashes loaded, so an estimate is only interpretable alongside the count it
+# assumed.
+_ESTIMATES_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -832,25 +1107,9 @@ def _calibration_rate(mode: str) -> Optional[float]:
     """GPU calibration H/s for ``mode`` (worst-case reference mode when the mode
     is not separately calibrated -- AES roast / timeroast)."""
     rates = _CALIBRATION_RATES.get(str(mode)) or _CALIBRATION_RATES.get(
-        _CAP_REFERENCE_MODE
+        _UNMEASURED_MODE_RATE_SOURCE
     )
     return (rates or {}).get("gpu")
-
-
-def _measured_rate_for_mode(
-    benchmark: dict, mode: str
-) -> "tuple[Optional[float], str]":
-    """``(rate, device_class)`` for ``mode`` from a measured benchmark. Modes
-    ADscan does not separately benchmark (AES roast 19600.. / timeroast 31300)
-    fall back to the worst-case reference mode so their estimate is pessimistic,
-    never absent."""
-    for candidate in (str(mode), _CAP_REFERENCE_MODE):
-        rates = benchmark.get(candidate) or {}
-        if rates.get("gpu"):
-            return rates.get("gpu"), "gpu"
-        if rates.get("cpu"):
-            return rates.get("cpu"), "cpu"
-    return None, "unknown"
 
 
 def estimate_effort(
@@ -859,15 +1118,44 @@ def estimate_effort(
     *,
     benchmark: Optional[dict],
     base_lines: Optional[int] = None,
+    base_path: Optional[str] = None,
+    hash_count: Optional[int] = None,
+    achieved: Optional[dict] = None,
+    rate_provider: AchievedRateProvider = None,
 ) -> EffortEstimate:
     """Estimate the wall-clock for one effort tier cracking ``mode`` on THIS box.
 
-    Pure logic. Reuses the same keyspace/H-per-s math and the same benchmark
-    rule-cap that :func:`resolve_effort` uses, so the estimate matches what the
-    crack job actually runs. ``benchmark`` is the measured
-    ``{mode: {gpu|cpu: H/s}}`` map (or ``None`` -> provisional calibration
-    fallback). ``base_lines`` overrides the assumed base-wordlist line count
-    (the selector passes the real ``base_for()`` count).
+    Pure logic. Reuses the same keyspace math and the same rule-cap walk that
+    :func:`resolve_effort` uses, so the estimate matches what the crack job
+    actually runs.
+
+    Args:
+        effort: ``fast`` / ``balanced`` / ``thorough``.
+        mode: The hashcat mode this lane will crack.
+        benchmark: The ``hashcat -b`` ``{mode: {gpu|cpu: H/s}}`` map. Used only
+            as the PROVISIONAL fallback rate, because it benchmarks the
+            optimized kernels against a synthetic mask and overstated the
+            achieved rate by 1.7x to 15.5x across the five measured modes.
+        base_lines: The base wordlist's line count, from ``base_for()``.
+        base_path: The base wordlist's path, which is half of the workload key
+            an achieved-rate measurement is stored under. Defaults to the audit
+            base's own filename so a caller that passes only ``base_lines``
+            still resolves the common case.
+        hash_count: How many distinct hashes the lane will load. For a SALTED
+            mode this MULTIPLIES the keyspace. Omitting it for a salted mode
+            makes the estimate PROVISIONAL rather than silently quoting one
+            hash, because a count we do not know could be fifty.
+        achieved: A persisted achieved-rate cache
+            (``cracking_benchmark.load_cached_achieved_rates()``).
+        rate_provider: The live probe seam
+            (``cracking_benchmark.make_achieved_rate_provider(shell)``).
+            Injected, never imported, so this stays pure logic.
+
+    Returns:
+        An :class:`EffortEstimate`. ``provisional`` is set whenever the rate was
+        not measured on this workload or the salt multiplier is unknown, which
+        is what lets the UI mark the number as provisional instead of
+        asserting it.
     """
     normalized = str(effort or "").strip().lower()
     if normalized not in EFFORT_LEVELS:
@@ -877,19 +1165,64 @@ def estimate_effort(
         if base_lines and base_lines > 0
         else _COMBINED_AUDIT_BASE_LINES_FALLBACK
     )
+    resolved_base = str(base_path or _DEFAULT_AUDIT_BASE_FILENAME)
     nominal_index = _EFFORT_RULE_INDEX[normalized]
     budget = _TIER_BUDGET_SECONDS[normalized]
 
-    provisional = False
-    rate: Optional[float] = None
-    if benchmark:
-        rate, _device = _measured_rate_for_mode(benchmark, mode)
-    if not rate:
-        rate = _calibration_rate(mode)
-        provisional = True
+    device_class = _device_class_for(benchmark or {}, str(mode))
+    if device_class == "unknown":
+        device_class = _device_class_for(benchmark or {}, _CAP_REFERENCE_MODE)
+    if device_class == "unknown":
+        device_class = "gpu"
 
-    if not rate:
-        # No measurement AND no calibration for this mode -- cannot estimate.
+    # A salted mode's cost scales with the number of hashes. Assuming one would
+    # understate a real roast by exactly the number of accounts, so the
+    # assumption is made but never presented as measured.
+    hash_count_unknown = hash_count is None and mode_is_salted(mode)
+
+    # Measured-ness is tracked PER RUNG and read off the rung the tier actually
+    # resolves to. The ladder walk consults lower rungs on its way down, and a
+    # fallback rate on a rung that was considered and rejected says nothing
+    # about the number finally quoted.
+    rate_cache: "dict[int, tuple[Optional[float], bool]]" = {}
+
+    def _rate_entry(rung: int) -> "tuple[Optional[float], bool]":
+        if rung in rate_cache:
+            return rate_cache[rung]
+        rate, measured = resolve_rung_rate(
+            mode=str(mode),
+            rung=rung,
+            base_path=resolved_base,
+            device_class=device_class,
+            hash_count=hash_count,
+            achieved=achieved,
+            rate_provider=rate_provider,
+            benchmark=benchmark,
+        )
+        if rate is None:
+            # Modes ADscan does not separately benchmark (AES roast, timeroast)
+            # borrow the slowest measured mode's rate so their estimate is
+            # pessimistic rather than absent.
+            rate, measured = resolve_rung_rate(
+                mode=_UNMEASURED_MODE_RATE_SOURCE,
+                rung=rung,
+                base_path=resolved_base,
+                device_class=device_class,
+                hash_count=hash_count,
+                achieved=achieved,
+                benchmark=benchmark,
+            )
+        if rate is None:
+            rate = _calibration_rate(mode)
+            measured = False
+        rate_cache[rung] = (rate, bool(measured))
+        return rate_cache[rung]
+
+    def _rate_at(rung: int) -> Optional[float]:
+        return _rate_entry(rung)[0]
+
+    if _rate_at(nominal_index) is None:
+        # No measurement, no benchmark AND no calibration -- cannot estimate.
         return EffortEstimate(
             effort=normalized,
             mode=str(mode),
@@ -899,16 +1232,28 @@ def estimate_effort(
             provisional=True,
         )
 
-    capped_index = _pick_capped_rule_index(nominal_index, lines, rate, budget)
+    capped_index = _pick_capped_rule_index(
+        nominal_index,
+        lines,
+        budget,
+        rate_at=_rate_at,
+        mode=str(mode),
+        hash_count=hash_count,
+    )
     _rule_name, rule_lines = _RULE_LADDER[capped_index]
-    seconds = (lines * rule_lines) / rate
+    rate, measured = _rate_entry(capped_index)
+    if rate is None:
+        rate, measured = _rate_entry(nominal_index)
+    seconds = (
+        keyspace_for(lines, rule_lines, mode=str(mode), hash_count=hash_count) / rate
+    )
     return EffortEstimate(
         effort=normalized,
         mode=str(mode),
         seconds=seconds,
         human=human_duration(seconds),
         is_blocking=seconds <= _BLOCKING_THRESHOLD_SECONDS,
-        provisional=provisional,
+        provisional=(not measured) or hash_count_unknown,
     )
 
 
@@ -919,13 +1264,18 @@ def resolve_single_tier(
     wordlists_dir: str,
     benchmark: Optional[dict],
     base_override: Optional[str] = None,
+    cap_reference_mode: Optional[str] = None,
+    hash_count: Optional[int] = None,
+    achieved: Optional[dict] = None,
+    rate_provider: AchievedRateProvider = None,
 ) -> EffortTier:
     """The single benchmark-capped :class:`EffortTier` for one effort level.
 
     The interactive selector's inline / escape resolution: one tier (base
     wordlist x capped rules) rather than the escalating ladder
     :func:`resolve_effort` returns. Reuses the same ``_build_tier`` so capping
-    and asset resolution stay identical.
+    and asset resolution stay identical, including ``cap_reference_mode`` (the
+    mode this lane will actually crack, when the caller knows it).
     """
     normalized = str(effort or "").strip().lower()
     if normalized not in EFFORT_LEVELS:
@@ -936,6 +1286,10 @@ def resolve_single_tier(
         wordlists_dir=wordlists_dir,
         benchmark=benchmark,
         base_override=base_override,
+        cap_reference_mode=cap_reference_mode,
+        hash_count=hash_count,
+        achieved=achieved,
+        rate_provider=rate_provider,
     )
 
 
@@ -944,6 +1298,8 @@ def build_estimates_payload(
     *,
     wordlists_dir: str,
     hardware_label: str,
+    achieved: Optional[dict] = None,
+    hash_count: Optional[int] = None,
 ) -> dict:
     """Build the ``cracking_benchmark_estimates.json`` payload (per mode x tier).
 
@@ -974,7 +1330,13 @@ def build_estimates_payload(
         per_tier: dict[str, dict] = {}
         for level in EFFORT_LEVELS:
             est = estimate_effort(
-                level, mode, benchmark=benchmark, base_lines=base_lines
+                level,
+                mode,
+                benchmark=benchmark,
+                base_lines=base_lines,
+                base_path=base_path,
+                hash_count=hash_count,
+                achieved=achieved,
             )
             per_tier[level] = {
                 "seconds": round(est.seconds, 2),
@@ -988,5 +1350,11 @@ def build_estimates_payload(
         "hardware_label": str(hardware_label or "unknown"),
         "base_wordlist": os.path.basename(base_path),
         "base_lines": base_lines,
+        # What the estimates assume about how many hashes the lane loads. It
+        # matters to a consumer because for a SALTED mode the cost scales with
+        # it, so an estimate for one hash and an estimate for fifty are
+        # different numbers for the same tier. ``null`` means unknown, which is
+        # also why those tiers come back ``provisional``.
+        "hash_count": int(hash_count) if hash_count else None,
         "modes": modes,
     }

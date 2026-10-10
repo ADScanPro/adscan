@@ -24,9 +24,13 @@ ruleless and reports :attr:`CrackResult.ruleset` as ``None``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
-from adscan_internal.services.cracking.crack_engine import CrackResult
+from adscan_internal.services.cracking.crack_engine import (
+    AbortCheck,
+    CrackResult,
+    StatusSink,
+)
 from adscan_internal.services.cracking.hash_kind import HashKind, john_format_for
 from adscan_internal.services.cracking.john_rules import (
     john_conf_path,
@@ -63,7 +67,16 @@ class JohnEngine:
         self._executor = command_executor
         self._john_path = john_path
 
-    def run(self, tier: EffortTier, hash_file: str, *, hash_kind: str) -> CrackResult:
+    def run(
+        self,
+        tier: EffortTier,
+        hash_file: str,
+        *,
+        hash_kind: str,
+        runtime_seconds: Optional[int] = None,
+        status_sink: Optional[StatusSink] = None,  # noqa: ARG002 — no live feed
+        abort_check: Optional[AbortCheck] = None,  # noqa: ARG002 — nothing to act on
+    ) -> CrackResult:
         """Run ``tier`` against ``hash_file`` via the existing John service.
 
         Args:
@@ -72,6 +85,17 @@ class JohnEngine:
             hash_file: Path to the file of hashes to attack.
             hash_kind: Neutral hash identifier (a :class:`HashKind` value, e.g.
                 ``"asrep"``); mapped to a John ``--format`` internally.
+            runtime_seconds: Wall-clock ceiling, forwarded as John's own
+                ``--max-run-time``. ``None`` runs uncapped.
+            status_sink: Accepted for protocol parity and deliberately unused:
+                John emits no machine-readable progress stream to feed it, so a
+                blocking caller's surface falls back to its elapsed-vs-budget
+                reading rather than being told a progress figure nobody measured.
+            abort_check: Accepted for protocol parity and deliberately unused,
+                for the same reason: with no live progress stream there is never
+                anything to decide mid-run, so a caller's early-stop seam is
+                never armed on this backend and John's own ``--max-run-time``
+                remains its only bound.
 
         Returns:
             A :class:`CrackResult` carrying every recovered ``username ->
@@ -108,6 +132,7 @@ class JohnEngine:
             john_format=fmt,
             rules=ruleset,
             john_config=john_conf_path() if ruleset else None,
+            max_run_time=runtime_seconds,
         )
         return CrackResult(
             recovered=dict(recovered or {}),

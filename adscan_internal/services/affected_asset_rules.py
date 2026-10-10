@@ -52,7 +52,29 @@ from typing import Any, Mapping
 
 
 class SourceMode(str, Enum):
-    """How a finding's SOURCE principals contribute to affected assets."""
+    """Whether the FLAT extractor reads a finding's top-level source-principal keys.
+
+    Narrow by design, and narrower than the name suggests: ``PRINCIPALS`` makes
+    ``affected_assets._extract_registry_extras_from_details`` read the detail
+    keys ``from`` / ``source`` / ``source_user`` / ``source_username`` / ``user``
+    / ``username`` / ``credential_username`` off the TOP level of the finding's
+    details, and makes ``_source_principal_names`` label those same values
+    ``role="source"`` in the machine-readable appendix. That is all it does.
+
+    It does **not** make the structured builder surface a source entity —
+    :class:`Representation` decides that, and it defaults to ``TARGET_ONLY``. So
+    a rule can declare ``PRINCIPALS`` and surface no principal at all, silently:
+    the finding still renders, just without the account, and the tier-aware
+    severity overlay (which grades a finding by the privilege tier of its
+    affected assets) has nothing to grade. ``smb_share_secrets`` shipped in
+    exactly that state. The two fields are not redundant and must not be
+    collapsed — ``dcsync`` legitimately pairs ``source=NONE`` with
+    ``representation=BOTH``, because its holder arrives from the attack-graph
+    edge rather than from a top-level detail key — but a rule declaring
+    ``PRINCIPALS`` whose representation drops the source role has to name the
+    channel its principals really arrive through. That pairing is checked by
+    ``tests/unit/pro/reporting/test_affected_asset_rules_drift.py``.
+    """
 
     NONE = "none"
     PRINCIPALS = "principals"
@@ -117,6 +139,54 @@ class RecordEntityType(str, Enum):
     DOMAIN = "domain"
 
 
+class Representation(str, Enum):
+    """The per-finding SHAPE of its affected assets.
+
+    Where :class:`SourceMode` / :class:`TargetMode` / :class:`Scope` are the
+    MECHANICAL read-hints the flat extractor uses, this is the DECLARATIVE intent
+    of what the finding affects — so the structured builder can emit the right
+    object(s) with the right role regardless of which legacy read-mode happens to
+    carry them.
+
+    * ``TARGET_ONLY`` — the affected asset is the target object(s); no source.
+      Every object-hygiene / posture / host-config / domain-config finding, plus
+      roasting (the roaster precondition is noise), the host-CVE / coercion
+      families, and the CA-flag ADCS ESCs.
+    * ``SOURCE_ONLY`` — the affected asset is the source principal(s). Rare; most
+      "source" cases are ``BOTH``.
+    * ``BOTH`` — the relation ``source -> target``, both named by role: DCSync
+      (holder -> domain), delegation, cross-domain/cross-forest escalation, the
+      ADCS enrollment ESCs.
+    * ``PAIRING`` — per-edge pairs preserved (not two flat lists), so the reader
+      sees who-can-do-what-to-whom: HasSession (``user @ host``),
+      ForceChangePassword / shadow-creds / LAPS / gMSA (holder -> object), RBCD,
+      NTLMv1-relay.
+    """
+
+    TARGET_ONLY = "target_only"
+    SOURCE_ONLY = "source_only"
+    BOTH = "both"
+    PAIRING = "pairing"
+
+    @property
+    def wants_source(self) -> bool:
+        """Return whether the finding surfaces its SOURCE principal(s)."""
+        return self in (
+            Representation.SOURCE_ONLY,
+            Representation.BOTH,
+            Representation.PAIRING,
+        )
+
+    @property
+    def wants_target(self) -> bool:
+        """Return whether the finding surfaces its TARGET object(s)."""
+        return self in (
+            Representation.TARGET_ONLY,
+            Representation.BOTH,
+            Representation.PAIRING,
+        )
+
+
 @dataclass(frozen=True)
 class AssetRule:
     """Declarative composition rule for one finding's affected assets.
@@ -161,6 +231,21 @@ class AssetRule:
             the genuinely over-scoped human/service-account grants itemized and
             de-emphasizes the by-design noise. Display-only: the machine-readable
             appendix and the structured entities keep every mailbox.
+        representation: The declarative SHAPE of the finding's affected assets
+            (see :class:`Representation`). The structured builder uses it to
+            decide whether to surface the SOURCE principal(s), the TARGET
+            object(s), or both, and whether to preserve per-edge pairs — the
+            single SSOT for "what does this finding affect", decoupled from the
+            legacy read-modes above. Defaults to ``TARGET_ONLY`` so the ~40
+            object-centric / posture findings inherit the object-only shape with
+            no per-key branch.
+        role_labels: Maps a structured entity's role axis
+            (``source`` / ``target`` / ``affected`` / ``template`` / ``ca``) to
+            the client-facing role LABEL for this finding (``holder``,
+            ``roastable-target``, ``session-host``, ``delegating-account``, …).
+            Stored as a tuple of pairs so the rule stays frozen/hashable; read
+            via :meth:`role_label_for`. Empty when the generic role is label
+            enough.
     """
 
     source: SourceMode = SourceMode.PRINCIPALS
@@ -173,6 +258,30 @@ class AssetRule:
     record_entity_type: str = ""
     scan_details_lists: bool = False
     collapse_exchange_system_targets: bool = False
+    representation: Representation = Representation.TARGET_ONLY
+    role_labels: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    #: For a PAIRING finding whose constituent edges carry DIFFERENT relations
+    #: (the grouped "Excessive Rights Across a Tier Boundary" finding collects
+    #: GenericAll / WriteDacl / ForceChangePassword / AllExtendedRights / … under
+    #: one key), surface the specific right per pair so the client reads
+    #: ``holder (tier) -> <right> -> controlled-object (tier)`` rather than a bare
+    #: arrow that hides WHICH excessive right each entry is. Off by default: a
+    #: single-relation PAIRING finding (sessions, LAPS, gMSA) needs no per-pair
+    #: right and its connector stays the plain arrow.
+    show_relation_in_pairing: bool = False
+
+    def role_label_for(self, role: str) -> str:
+        """Return this finding's client role LABEL for a structured role, or ``""``.
+
+        ``role`` is the structured axis (``source`` / ``target`` / ``affected``
+        / ``template`` / ``ca``); the returned label is the finding-specific
+        name the deliverable renders (``holder`` for a DCSync source, …).
+        """
+        key = str(role or "").strip().lower()
+        for candidate, label in self.role_labels:
+            if candidate == key:
+                return label
+        return ""
 
 
 # Fallback for a finding key with no rule. Source principals + non-breaker
@@ -186,28 +295,81 @@ DEFAULT_RULE = AssetRule(
 )
 
 
-def _adcs_rule() -> AssetRule:
-    """Shared rule for every ADCS ESC finding (templates + CA, breaker dropped)."""
+#: Role labels shared by every ADCS ESC finding for its typed template / CA.
+_ADCS_TEMPLATE_CA_LABELS: tuple[tuple[str, str], ...] = (
+    ("template", "vulnerable-template"),
+    ("ca", "certificate-authority"),
+)
+
+
+def _adcs_rule(
+    *,
+    representation: Representation = Representation.BOTH,
+    source_label: str = "enrollee",
+) -> AssetRule:
+    """Shared rule for an ADCS ESC finding (templates + CA, breaker dropped).
+
+    ``representation`` is ``BOTH`` for the enrollment / ACL ESCs (the enrolling
+    or writing principal plus the abused template / CA) and ``TARGET_ONLY`` for
+    the CA-flag / web-enrollment ESCs (ESC6/8/11/16 and certighost), where the
+    affected asset is the CA itself and the broad source principal is noise.
+    ``source_label`` names the client role of the source principal when one is
+    surfaced.
+
+    Every per-source field hangs off that ONE switch — the role label, and the
+    :class:`SourceMode` read too. A CA-flag ESC that kept declaring
+    ``SourceMode.PRINCIPALS`` while its representation dropped the source role
+    was claiming to surface an enrolling principal it could never emit; the
+    declaration now follows the shape, so the two cannot drift apart as new ESCs
+    are added.
+    """
+    role_labels: tuple[tuple[str, str], ...] = _ADCS_TEMPLATE_CA_LABELS
+    if representation.wants_source and source_label:
+        role_labels = (("source", source_label), *role_labels)
     return AssetRule(
-        source=SourceMode.PRINCIPALS,
+        source=(
+            SourceMode.PRINCIPALS
+            if representation.wants_source
+            else SourceMode.NONE
+        ),
         target=TargetMode.DROP_BREAKER,
         extras=(Extra.TEMPLATES, Extra.CA),
         scope=Scope.PER_PRINCIPAL,
+        representation=representation,
+        role_labels=role_labels,
     )
 
 
-def _attack_step_rule(*, source: SourceMode = SourceMode.PRINCIPALS) -> AssetRule:
+def _attack_step_rule(
+    *,
+    source: SourceMode = SourceMode.PRINCIPALS,
+    representation: Representation | None = None,
+    role_labels: tuple[tuple[str, str], ...] = (),
+) -> AssetRule:
     """Shared rule for a finding materialized from an attack-graph edge.
 
     The edge SOURCE is who can abuse it, the edge TARGET is what gets taken
     over; both are affected assets of the finding. ``source=NONE`` for the CVE
     families whose edge source is the scanner itself rather than a client
-    principal.
+    principal. ``representation`` / ``role_labels`` declare the finding's shape
+    and client role labels for the structured builder.
+
+    When ``representation`` is left unset it defaults to ``BOTH`` for a
+    source-bearing finding and ``TARGET_ONLY`` for a ``source=NONE`` one — so a
+    CVE whose edge source is the scanner never surfaces a bogus source entity.
     """
+    if representation is None:
+        representation = (
+            Representation.BOTH
+            if source is SourceMode.PRINCIPALS
+            else Representation.TARGET_ONLY
+        )
     return AssetRule(
         source=source,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
+        representation=representation,
+        role_labels=role_labels,
     )
 
 
@@ -235,13 +397,6 @@ _COERCION_RULE = _host_list_rule(
     "dcs", "non_dcs", "all_computers", scope=Scope.PER_PRINCIPAL
 )
 
-#: The ADCS ESC finding keys that exist in ``VULN_CATALOG``. ESC12 is absent
-#: there on purpose (no detector), so it is absent here — the drift test flags
-#: the day a catalog entry appears without a rule.
-_ADCS_ESC_KEYS: tuple[str, ...] = tuple(
-    f"adcs_esc{n}" for n in (*range(1, 12), *range(13, 18))
-)
-
 #: Rule keys that are live finding keys but carry no ``VULN_CATALOG`` entry.
 #: The drift test allows exactly these and nothing else, so a typo in a rule key
 #: still fails the build.
@@ -259,45 +414,128 @@ NON_CATALOG_RULE_KEYS: frozenset[str] = frozenset(
 )
 
 
+# ADCS ESC families by representation (see the per-finding mapping table):
+#   * enrollment ESCs — the enrolling principal -> the vulnerable template (+CA).
+#   * ACL ESCs — the writing/holding principal -> the template or CA ACL.
+#   * CA-flag / web-enrollment ESCs — the CA itself (dangerous flag / HTTP enroll);
+#     the broad source principal is noise, so TARGET_ONLY.
+_ADCS_ESC_ENROLLMENT: tuple[str, ...] = tuple(
+    f"adcs_esc{n}" for n in (1, 2, 3, 9, 10, 13, 15, 17)
+)
+_ADCS_ESC_ACL_HOLDER: tuple[str, ...] = tuple(f"adcs_esc{n}" for n in (4, 5, 7, 14))
+_ADCS_ESC_CA_FLAG: tuple[str, ...] = tuple(f"adcs_esc{n}" for n in (6, 8, 11, 16))
+
+
 # Keyed by the canonical VULN_CATALOG finding-key.
 AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
-    # --- ADCS ESC findings: enrolling principal(s) + abused template + CA ----
-    **{key: _adcs_rule() for key in _ADCS_ESC_KEYS},
+    # --- ADCS ESC findings: enrolling/holding principal + abused template + CA
+    **{
+        key: _adcs_rule(representation=Representation.BOTH, source_label="enrollee")
+        for key in _ADCS_ESC_ENROLLMENT
+    },
+    **{
+        key: _adcs_rule(representation=Representation.BOTH, source_label="holder")
+        for key in _ADCS_ESC_ACL_HOLDER
+    },
+    **{
+        key: _adcs_rule(representation=Representation.TARGET_ONLY)
+        for key in _ADCS_ESC_CA_FLAG
+    },
+    # Certighost (CVE-2026-54121): the affected asset is the certificate
+    # authority itself (a CA-level EditFlags + patch weakness), so TARGET_ONLY,
+    # mirroring the ESC6/8/11/16 CA-flag findings.
+    "certighost": _adcs_rule(representation=Representation.TARGET_ONLY),
+    # --- Decommissioned CA still trusted in NTAuthCertificates ----------------
+    # The affected assets are the retired CA host(s), carried as
+    # details.certificate_authorities[] keyed by ``ca_host``. The host is orphaned
+    # (no live computer object), so it is surfaced as the record itself rather than
+    # resolved against the graph — the trust anchor to withdraw, not an enrolling
+    # principal. HOST_SCOPED so iter_account_records reads the record container.
+    "adcs_orphaned_ca_ntauth": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.HOST_SCOPED,
+        record_containers=("certificate_authorities",),
+        record_name_field="ca_host",
+        role_labels=(("affected", "decommissioned-ca"),),
+    ),
     # --- Roasting: roastable principals + the cracking wordlist --------------
+    # TARGET_ONLY: the affected asset is the roastable service account; the edge
+    # SOURCE (Authenticated Users — anyone can request the ticket) is a
+    # precondition, not an asset, so the structured builder drops it.
     "kerberoast": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         extras=(Extra.WORDLIST,),
         scope=Scope.PER_PRINCIPAL,
+        representation=Representation.TARGET_ONLY,
+        role_labels=(("target", "roastable-target"),),
     ),
     "asreproast": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         extras=(Extra.WORDLIST,),
         scope=Scope.PER_PRINCIPAL,
+        representation=Representation.TARGET_ONLY,
+        role_labels=(("target", "asrep-roastable-target"),),
+    ),
+    # Timeroast: the affected asset is the CRACKED machine account (the edge is
+    # emitted only on a successful crack), so the target computer is what gets
+    # named. The entry-vector source (ANONYMOUS LOGON) is noise, hence TARGET_ONLY.
+    "timeroast": AssetRule(
+        source=SourceMode.PRINCIPALS,
+        target=TargetMode.KEEP,
+        extras=(Extra.WORDLIST,),
+        scope=Scope.PER_PRINCIPAL,
+        representation=Representation.TARGET_ONLY,
+        role_labels=(("target", "cracked-machine-account"),),
     ),
     # --- Delegation: principals + the delegation target (kept, not a breaker) -
+    # Constrained delegation: the delegating account (what you re-scope) and the
+    # target service(s) it can impersonate to (the blast radius), both named.
     "constrained_delegation": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
+        representation=Representation.BOTH,
+        role_labels=(
+            ("source", "delegating-account"),
+            ("target", "target-service"),
+        ),
     ),
-    "rbcd_exploitable": AssetRule(
+    # RBCD (AllowedToAct): the grantee principal -> the target computer whose
+    # ``msDS-AllowedToActOnBehalfOfOtherIdentity`` is the object to clear.
+    "rbcd_configured": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
+        representation=Representation.PAIRING,
+        role_labels=(("source", "grantee"), ("target", "at-risk")),
     ),
+    # Unconstrained delegation: the delegating host (UAC bit) is the affected
+    # asset; the broad source is noise, so TARGET_ONLY.
     "unconstrained_delegation": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
+        representation=Representation.TARGET_ONLY,
+        role_labels=(("target", "delegating-host"),),
     ),
     # --- Credentials in shares: principals + host + share + redacted secret --
+    # The exposed ACCOUNT is an affected asset of this finding, not only the file
+    # holding its password: it is what the client rotates, and its privilege tier
+    # is what makes the finding critical rather than routine. The producer writes
+    # the account the source file named next to each secret into that hit's
+    # ``secret_locations`` record (``principal``), so the record walker surfaces
+    # it with the AFFECTED role and the stamped tier. A hit the file named no
+    # owner for contributes no principal and its file entry stands alone.
     "smb_share_secrets": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         extras=(Extra.HOST, Extra.SHARE_PATH, Extra.PASSWORD_REDACTED),
         scope=Scope.PER_PRINCIPAL,
+        record_containers=("secret_locations",),
+        record_name_field="principal",
     ),
     # --- Secrets in directory attributes: the account AND the attribute ------
     # Both detectors persist one record per leaking account under their own
@@ -353,6 +591,12 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
     #     session" access vector, surfaced only when the finding carries
     #     ``unauthenticated_reachable`` + a proven ``reached_via`` (an
     #     authenticated-only GPP finding shows the read-set but NOT this vector).
+    # The exposed ACCOUNT is an affected asset here too: the GPP XML names the
+    # owner in the same entry as the ``cpassword``, so both producers (the share
+    # / loot scan and the unauthenticated enrichment sweep) carry it. Read from
+    # BOTH vocabularies — the list every owner lands in and the single
+    # ``username`` the unauth sweep writes — so the merged finding names every
+    # account it observed rather than whichever producer ran last.
     "gpp_passwords": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.KEEP,
@@ -363,48 +607,102 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
             Extra.NULL_SESSION_VECTOR,
         ),
         scope=Scope.PER_PRINCIPAL,
+        record_containers=("credential_username", "username"),
     ),
-    # --- DCSync: domain-wide (the breaker target is dropped) -----------------
+    # --- DCSync: the holder of the replication right -> the domain (scope) ----
+    # BOTH: the client cannot remediate the domain object; what they fix is the
+    # non-Tier-0 principal HOLDING the DS-Replication ACE. The structured builder
+    # surfaces that holder (edge source) alongside the domain it replicates (the
+    # DOMAIN_WIDE scope base, relabelled ``scope``). The flat side keeps the
+    # domain-wide shape unchanged.
     "dcsync": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.DROP_BREAKER,
         scope=Scope.DOMAIN_WIDE,
+        representation=Representation.BOTH,
+        role_labels=(("source", "holder"), ("affected", "scope")),
     ),
-    # --- ACL abuse: principals + the controlled target -----------------------
-    # On an Exchange domain this finding's target set is dominated by the
-    # Exchange management groups resetting their own health/system mailboxes
-    # (by-design self-management). Collapse those into one annotated row on the
-    # PDF so the genuinely over-scoped human/service-account grants stay visible.
-    "force_change_password": AssetRule(
+    # --- Accounts whose plaintext password was recovered ----------------------
+    # The affected objects are the ACCOUNTS, named, with the administrative ones
+    # first (the engine orders them that way): what the client acts on is a list
+    # of accounts to reset, not a count.
+    "recovered_account_passwords": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.PER_PRINCIPAL,
+    ),
+    # --- Directory replication to a tenant that is not the organization's -----
+    # The affected object is the SYNC ACCOUNT, not the domain: what the client
+    # confirms or revokes is that one account's replication grant. The engine
+    # persists one record per account under ``accounts`` carrying the tenant it
+    # replicates to, and the qualifier surfaces that tenant next to the account
+    # (``msol_… · fabrikam0.onmicrosoft.com``) so the reader sees WHICH account
+    # ships credentials WHERE without opening the appendix.
+    "unauthorized_external_tenant_replication": AssetRule(
+        source=SourceMode.NONE,
+        target=TargetMode.NONE,
+        scope=Scope.PER_PRINCIPAL,
+        record_qualifier="sync_target",
+    ),
+    # --- Excessive rights across a tier boundary (grouped control finding) ----
+    # The generic control primitives (GenericAll / GenericWrite / WriteDacl /
+    # WriteOwner / Owns / AddMember / AddSelf / WriteSPN / AddKeyCredentialLink /
+    # WriteAccountRestrictions / WriteLogonScript) PLUS ForceChangePassword and
+    # AllExtendedRights share one grouped finding: a lower-tier holder that
+    # controls a higher-tier object. PAIRING keeps each edge's holder -> object
+    # pair, and ``show_relation_in_pairing`` surfaces the specific right per pair
+    # (``holder (tier) -> Full Control of the Target Object -> object (tier)``) so
+    # the one finding does not hide WHICH excessive right each entry is. The
+    # Exchange self-management collapse is kept: on an Exchange domain the reset
+    # grants over health/system mailboxes are by-design noise that would bury the
+    # genuinely over-scoped cross-tier grants.
+    "excessive_cross_tier_rights": AssetRule(
         source=SourceMode.PRINCIPALS,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
         collapse_exchange_system_targets=True,
+        representation=Representation.PAIRING,
+        role_labels=(("source", "holder"), ("target", "controlled-object")),
+        show_relation_in_pairing=True,
     ),
-    # ``AllExtendedRights`` over an object grants every extended right on it —
-    # the affected assets are the principal holding it and the object it holds
-    # it over, both carried on the attack-graph edge.
-    "all_extended_rights": _attack_step_rule(),
     # --- Session exposure ----------------------------------------------------
-    # A privileged session on a lower-tier host: the edge names the host the
-    # session sits on and the privileged account exposed on it. Both are the
-    # finding — the host is where the credential material lives, the account is
-    # what an attacker gets.
-    "da_sessions": _attack_step_rule(),
+    # A privileged session on a lower-tier host: the edge (``Computer ->
+    # HasSession -> User``) names the host the session sits on (source) and the
+    # privileged account exposed on it (target). PAIRING keeps the pair so the
+    # client sees WHICH privileged user is exposed on WHICH host and can go clear
+    # that one session.
+    "da_sessions": _attack_step_rule(
+        representation=Representation.PAIRING,
+        role_labels=(("source", "session-host"), ("target", "logged-on-user")),
+    ),
     # --- Readable managed secrets (gMSA / LAPS) ------------------------------
-    # The edge target is the account or machine whose password is readable; the
-    # edge source is who can read it. A remediator needs both: which object to
-    # re-scope, and whose access to remove.
-    "gmsa_readable": _attack_step_rule(),
-    "laps_readable": _attack_step_rule(),
+    # PAIRING: the holder who can read the secret -> the account (gMSA) / machine
+    # (LAPS) whose password is at risk. The remediator needs both — which object
+    # to re-scope and whose access to remove.
+    "gmsa_readable": _attack_step_rule(
+        representation=Representation.PAIRING,
+        role_labels=(("source", "holder"), ("target", "at-risk")),
+    ),
+    "laps_readable": _attack_step_rule(
+        representation=Representation.PAIRING,
+        role_labels=(("source", "holder"), ("target", "at-risk")),
+    ),
     # --- Shadow credentials --------------------------------------------------
-    # The detector records one entry per object carrying a
-    # ``msDS-KeyCredentialLink`` value, which is the object to go clear.
+    # PAIRING: the holder who can write ``msDS-KeyCredentialLink`` -> the target
+    # object whose key material they can forge. The detector records one entry per
+    # object carrying a value (the at-risk targets); an attack-graph edge adds the
+    # holder when present.
     "shadow_credentials_present": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.NONE,
         scope=Scope.HOST_SCOPED,
         record_containers=("objects",),
+        representation=Representation.PAIRING,
+        role_labels=(
+            ("source", "holder"),
+            ("target", "at-risk"),
+            ("affected", "at-risk"),
+        ),
     ),
     # --- SQL Server bulk-operations over-privilege ---------------------------
     # The MSSQL collector records one entry per NON-sysadmin principal holding
@@ -427,32 +725,51 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
     # asset survives even when the edge is summarized away. The edge SOURCE is
     # dropped: on these it is Domain Users (anyone), which names no asset a
     # remediator can act on and only dilutes the list.
+    # crackntlmv1: TARGET_ONLY — the at-risk machine account(s) whose NetNTLMv1
+    # response is recoverable; the broad edge source (Domain Users) is noise.
     "ntlmv1_crack": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
         record_containers=("dc_hosts", "tier_zero_accounts"),
+        role_labels=(("target", "at-risk"),),
     ),
+    # ntlmv1relay{rbcd,shadowcreds}: PAIRING — the coercible source host whose
+    # NetNTLMv1 is relayed -> the relay-target it is relayed to. Remediate by
+    # disabling NTLMv1 and enforcing SMB/LDAP signing + EPA.
     "ntlmv1_relay_rbcd": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
         record_containers=("dc_hosts", "tier_zero_accounts"),
+        representation=Representation.PAIRING,
+        role_labels=(("source", "coercible-host"), ("target", "relay-target")),
     ),
     "ntlmv1_relay_shadowcreds": AssetRule(
         source=SourceMode.NONE,
         target=TargetMode.KEEP,
         scope=Scope.PER_PRINCIPAL,
         record_containers=("dc_hosts", "tier_zero_accounts"),
+        representation=Representation.PAIRING,
+        role_labels=(("source", "coercible-host"), ("target", "relay-target")),
     ),
     # --- Remotely exploitable CVEs -------------------------------------------
     # The affected asset is the vulnerable host on the edge TARGET. The edge
     # source of a CVE probe is the scanner, not a client principal, so it is
     # dropped — naming it would put ADscan itself in the client's asset list.
-    "zerologon": _attack_step_rule(source=SourceMode.NONE),
-    "nopac": _attack_step_rule(source=SourceMode.NONE),
-    "printnightmare": _attack_step_rule(source=SourceMode.NONE),
-    "ms17-010": _attack_step_rule(source=SourceMode.NONE),
+    # TARGET_ONLY (the _attack_step_rule default for a ``source=NONE`` finding).
+    "zerologon": _attack_step_rule(
+        source=SourceMode.NONE, role_labels=(("target", "vulnerable-host"),)
+    ),
+    "nopac": _attack_step_rule(
+        source=SourceMode.NONE, role_labels=(("target", "vulnerable-host"),)
+    ),
+    "printnightmare": _attack_step_rule(
+        source=SourceMode.NONE, role_labels=(("target", "vulnerable-host"),)
+    ),
+    "ms17-010": _attack_step_rule(
+        source=SourceMode.NONE, role_labels=(("target", "vulnerable-host"),)
+    ),
     # --- Coercion primitives -------------------------------------------------
     # Each records the hosts that answered the coercion call, split DC / non-DC.
     # They also materialize from an attack-graph edge when the coercion is part
@@ -464,9 +781,7 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
     "mseven": _COERCION_RULE,
     "webdav": _COERCION_RULE,
     # --- Relay surface / LAPS coverage (host inventories) --------------------
-    "smb_relay_targets": _host_list_rule(
-        "dcs", "non_dcs", "all_computers", "sample"
-    ),
+    "smb_relay_targets": _host_list_rule("dcs", "non_dcs", "all_computers", "sample"),
     # ``laps`` is the coverage gap: the hosts with NO LAPS-managed password.
     "laps": _host_list_rule("dcs", "non_dcs", "all_computers"),
     # --- Kerberos web-service (HTTP SPN) relay surface -----------------------
@@ -483,8 +798,15 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
     # ``from`` = the compromised child domain node, ``to`` = the parent /
     # forest-root domain it escalates INTO. The forest root is the asset taken
     # over (target), the child-domain principals are who abuse it (source) — the
-    # standard attack-step edge shape, both endpoints carried on the edge.
-    "raise_child_forest_root": _attack_step_rule(),
+    # standard attack-step edge shape, both endpoints carried on the edge. BOTH:
+    # name both domains (they are different domains in one forest).
+    "raise_child_forest_root": _attack_step_rule(
+        representation=Representation.BOTH,
+        role_labels=(
+            ("source", "child-domain"),
+            ("target", "forest-root-domain"),
+        ),
+    ),
     # --- Trust posture: the partner domain on the far side of the trust ------
     # The locator is the counterpart domain, qualified by the trust type, so the
     # reader knows which trust relationship to go reconfigure.
@@ -822,7 +1144,10 @@ def extract_adcs_ca_names(details: Mapping[str, Any] | None) -> list[str]:
     raw_resources = details.get("vulnerable_resources")
     if isinstance(raw_resources, list):
         for entry in raw_resources:
-            if isinstance(entry, dict) and str(entry.get("kind") or "") == "EnterpriseCA":
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("kind") or "") == "EnterpriseCA"
+            ):
                 _append(entry.get("name"))
 
     return names

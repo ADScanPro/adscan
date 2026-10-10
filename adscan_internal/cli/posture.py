@@ -255,9 +255,9 @@ def _resolve_domain(
 def _print_usage_banner() -> None:
     """Locked usage banner shown when no current domain and no args."""
     body = (
-        "  adscan posture show [<domain>]\n"
-        "  adscan posture probe [<domain>]\n"
-        "  adscan posture clear [<domain>]\n"
+        "  posture show [<domain>]\n"
+        "  posture probe [<domain>]\n"
+        "  posture clear [<domain>]\n"
         "\n"
         "  Run a scan first to learn the domain's security posture, or\n"
         "  re-probe an existing one."

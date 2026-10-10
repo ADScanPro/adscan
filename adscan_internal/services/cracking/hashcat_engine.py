@@ -18,9 +18,13 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
-from adscan_internal.services.cracking.crack_engine import CrackResult
+from adscan_internal.services.cracking.crack_engine import (
+    AbortCheck,
+    CrackResult,
+    StatusSink,
+)
 from adscan_internal.services.cracking.hash_kind import HashKind, hashcat_mode_for
 
 if TYPE_CHECKING:
@@ -49,7 +53,16 @@ class HashcatEngine:
         """
         self._command_executor = command_executor
 
-    def run(self, tier: EffortTier, hash_file: str, *, hash_kind: str) -> CrackResult:
+    def run(
+        self,
+        tier: EffortTier,
+        hash_file: str,
+        *,
+        hash_kind: str,
+        runtime_seconds: Optional[int] = None,
+        status_sink: Optional[StatusSink] = None,
+        abort_check: Optional[AbortCheck] = None,
+    ) -> CrackResult:
         """Run ``tier`` against ``hash_file`` via the existing hashcat runner.
 
         Args:
@@ -57,6 +70,13 @@ class HashcatEngine:
             hash_file: Path to the file of hashes to attack.
             hash_kind: Neutral hash identifier (a :class:`HashKind` value, e.g.
                 ``"asrep"``); mapped to a hashcat ``-m`` mode internally.
+            runtime_seconds: Wall-clock ceiling, forwarded as hashcat
+                ``--runtime``. ``None`` runs uncapped.
+            status_sink: Optional live-progress callback, fed each
+                ``--status-json`` tick the runner parses.
+            abort_check: Optional predicate polled while the crack streams;
+                ``True`` stops hashcat gracefully and keeps every plaintext it
+                had already written to the potfile.
 
         Returns:
             A :class:`CrackResult` carrying every recovered ``username ->
@@ -78,6 +98,9 @@ class HashcatEngine:
             tier.base_path,
             mode,
             rules_path=tier.rule_path,
+            runtime_seconds=runtime_seconds,
+            status_sink=status_sink,
+            abort_check=abort_check,
         )
         ruleset = os.path.basename(tier.rule_path) if tier.rule_path else None
         return CrackResult(

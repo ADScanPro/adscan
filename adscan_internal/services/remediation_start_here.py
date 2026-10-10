@@ -45,6 +45,134 @@ from adscan_internal.services.technique_priority import (
 _SEVERITY_WEIGHT = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 _COMPLEXITY_RANK = {"low": 4, "medium": 3, "high": 2, "very_high": 1}
 
+#: The two blocks the ranked list is split into, each with its OWN sort key.
+#:
+#: The split exists because one list cannot answer two questions. Containment is
+#: "key material left your control during this assessment and is still usable" —
+#: an incident-response clock. Exposure cut is "these routes exist and this fix
+#: removes the most of them per unit of effort" — a planning exercise. Sorting
+#: them together let a 1-route certificate revocation and a 42-route template fix
+#: compete on the same axis, and nothing in the result told the reader that the
+#: first one has to happen this week regardless of how few routes it closes.
+CONTAINMENT_BLOCK = "containment"
+EXPOSURE_BLOCK = "exposure"
+
+#: Containment actions in TIME-CRITICALITY order, which is the only axis that
+#: makes sense inside this block: volume is irrelevant to a clock, and proof is
+#: irrelevant because every row here was proven by construction (the material
+#: left the client's control, which only an executed technique can do).
+#:
+#: The ladder is "how long does the exposure survive the client's DEFAULT
+#: response", so each rung is an argument the client can check:
+#:
+#: * ``krbtgt`` — replicated domain secrets. A ticket forged from the krbtgt key
+#:   outlives EVERY password reset in the domain until krbtgt itself is reset
+#:   twice, so the ordinary response does not touch it.
+#: * ``certificate`` — an issued certificate authenticates for its whole
+#:   lifetime and a password reset does not revoke it. Shorter-lived than a
+#:   forged ticket, and it still survives the default response.
+#: * ``credential`` — dumped password hashes and keys. The rotation the client
+#:   runs anyway clears these, so they are last.
+CONTAINMENT_KIND_ORDER: tuple[str, ...] = ("krbtgt", "certificate", "credential")
+
+_CONTAINMENT_KIND_RANK = {kind: i for i, kind in enumerate(CONTAINMENT_KIND_ORDER)}
+
+#: Techniques whose EXECUTION takes key material out of the client's control, and
+#: which containment kind each one creates. Keyed by the lower-cased edge token.
+#:
+#: Membership here is about what the technique EXTRACTS, never about how severe it
+#: is: a technique that only grants access creates no containment obligation
+#: because nothing left the directory. And the obligation only exists when ADscan
+#: actually RAN it (see ``_containment_kind_for``) — a mapped-but-unexecuted
+#: route removed nothing, so asking the client to reset krbtgt for it would be
+#: the same overclaim the Exposure-Validation doctrine forbids everywhere else.
+_CONTAINMENT_TECHNIQUES: dict[str, str] = {
+    # Directory replication hands over every secret in the domain, krbtgt
+    # included, which is the one key an ordinary reset cannot evict.
+    "dcsync": "krbtgt",
+    "getchanges": "krbtgt",
+    "getchangesall": "krbtgt",
+    "getchangesinfilteredset": "krbtgt",
+    # Certificate enrolment / theft: the certificate authenticates until it
+    # expires or is revoked, and a password reset does neither.
+    "adcsesc1": "certificate",
+    "adcsesc2": "certificate",
+    "adcsesc3": "certificate",
+    "adcsesc4": "certificate",
+    "adcsesc5": "certificate",
+    "adcsesc6": "certificate",
+    "adcsesc6a": "certificate",
+    "adcsesc6b": "certificate",
+    "adcsesc7": "certificate",
+    "adcsesc8": "certificate",
+    "adcsesc9": "certificate",
+    "adcsesc10": "certificate",
+    "adcsesc11": "certificate",
+    "adcsesc13": "certificate",
+    "adcsesc14": "certificate",
+    "adcsesc15": "certificate",
+    "adcsesc16": "certificate",
+    "adcsesc17": "certificate",
+    "certifried": "certificate",
+    "shadowcredentials": "certificate",
+    "addkeycredentiallink": "certificate",
+    # Host credential material: cleared by the rotation the client runs anyway.
+    "dumplsa": "credential",
+    "dumpsam": "credential",
+    "dumplsass": "credential",
+    "dumpdpapi": "credential",
+    # Both spellings of each roast are carried: the derivation keeps a technique
+    # key as the literal edge token the record used, so two spellings of one
+    # technique are two rows, and a containment obligation must not depend on
+    # which spelling a producer happened to write.
+    "kerberoast": "credential",
+    "kerberoasting": "credential",
+    "asreproast": "credential",
+    "asreproasting": "credential",
+    "timeroast": "credential",
+    "timeroasting": "credential",
+    "readgmsapassword": "credential",
+    "readlapspassword": "credential",
+}
+
+
+def containment_kind_for_technique(action: str, exploited_paths: int) -> str:
+    """Return the containment kind this technique creates, or ``""`` for none.
+
+    Gated on EXECUTION: a technique ADscan only mapped took nothing out of the
+    client's control, so it carries no containment obligation however severe it
+    is. This is the same honesty gate the rest of the report applies, applied to
+    a work-order position rather than to a status label.
+
+    Public because BOTH tiers classify the block: the free report keeps its own
+    within-block order (it cannot import the PRO impact score) but the
+    containment-first split is not a per-surface choice.
+
+    Args:
+        action: The technique's lower-cased edge token.
+        exploited_paths: How many of this technique's paths ADscan executed end
+            to end. Zero means nothing left the client's control.
+
+    Returns:
+        One of :data:`CONTAINMENT_KIND_ORDER`, or ``""`` when the technique
+        creates no containment obligation.
+    """
+    if exploited_paths <= 0:
+        return ""
+    return _CONTAINMENT_TECHNIQUES.get(str(action or "").strip().lower(), "")
+
+
+def containment_sort_rank(containment_kind: str) -> int:
+    """Return the TIME-CRITICALITY rank of a containment kind (lower is sooner).
+
+    An unknown kind sorts last rather than first, so a future containment kind
+    added to the map without a declared rank cannot silently outrank a krbtgt
+    reset.
+    """
+    return _CONTAINMENT_KIND_RANK.get(
+        str(containment_kind or ""), len(CONTAINMENT_KIND_ORDER)
+    )
+
 
 def _impact_score(
     paths_affected: int,
@@ -155,6 +283,14 @@ def compute_remediation_priorities(
                     "_", " "
                 ).title(),
                 "can_mitigate": entry.can_fully_mitigate,
+                # The HOLDER-aware remediation: who holds the privilege and what
+                # to change about THAT holder. Carried onto every surface (PDF,
+                # free report, web CTEM) so none of them re-derives it from the
+                # technique, which cannot tell a domain controller's inherent
+                # replication right from an application server's revocable ACE.
+                "remediability_kind": entry.remediability_kind,
+                "remediability_verb": entry.remediability_verb,
+                "holder_label": entry.holder_label,
                 "remediation_effort": entry.remediation_effort,
                 "remediation_steps": list(entry.remediation_steps[:5]),  # top 5 steps
                 "mitre_id": entry.mitre_technique_id,
@@ -163,22 +299,46 @@ def compute_remediation_priorities(
             }
         )
 
-    # Proven-first ordering (the "most first" ranking the section header promises):
-    # any fix that breaks an EXECUTED attack path leads the mapped-only fixes. The
-    # LEAD discriminator after the proven prefix is the number of ATTACK PATHS each
-    # fix breaks (the honest sort the section title now states), because affected-
-    # user reach is uniform on a bridged domain (every ordinary account funnels
-    # through the same chains) and so ranks nothing there. Affected-user reach is
-    # the TIE-BREAK at an equal path count, which keeps a 100%-user fix above a
-    # 0%-user (computer/group-foothold) fix when they break the same number of
-    # paths. The impact score is the final deterministic tie-break. The proven-
-    # first key is a SORT prefix only; it never touches ``impact_score`` (other
-    # report figures read it).
+    # ── Three blocks, each with its OWN sort key ──────────────────────────────
+    #
+    # Proof is NO LONGER a sort key. It was, and it inverted the work order: on
+    # the reference engagement the list led with a fix closing 7 of 47 routes and
+    # put the 42-of-47 fix third, so a reader working top-down funded the sprints
+    # that removed the fewest routes. Proven-versus-theoretical says whether
+    # ADscan WALKED the route, not whether the fix works, and the two are
+    # different questions: a template fix is exactly as effective whether or not
+    # we demonstrated the attack. Ordering the client's WORK by the quality of our
+    # own evidence conflated them. Proof survives as the ``proven`` badge on the
+    # row, and the attack-path section still carries the full evidence.
+    #
+    # 1. CONTAINMENT, by time criticality. Key material that left the client's
+    #    control is an incident clock, so neither volume nor proof orders it (every
+    #    row here is proven by construction). See ``CONTAINMENT_KIND_ORDER``.
+    # 2. EXPOSURE CUT, by routes closed, tie-broken by remediation complexity
+    #    (cheapest first) — effort-adjusted risk removal, which is the only
+    #    defensible operational reading of "fix this first". Affected-user reach
+    #    then the impact score keep it deterministic below that.
+    for item in results:
+        kind = containment_kind_for_technique(item["action"], item["exploited_paths"])
+        item["containment_kind"] = kind
+        item["block"] = CONTAINMENT_BLOCK if kind else EXPOSURE_BLOCK
+        # Proof as a BADGE: computed here so every surface reads one flag rather
+        # than re-deriving "was this executed" from the counts.
+        item["proven"] = item["exploited_paths"] > 0
+
     results.sort(
         key=lambda x: (
-            0 if x["exploited_paths"] > 0 else 1,
-            -x["exploited_paths"],
-            -x["paths_affected"],
+            # Block first, so containment is a contiguous prefix.
+            0 if x["block"] == CONTAINMENT_BLOCK else 1,
+            # Inside containment: time criticality only.
+            containment_sort_rank(x["containment_kind"])
+            if x["block"] == CONTAINMENT_BLOCK
+            else 0,
+            # Inside exposure: routes closed, then cost (cheapest first).
+            -x["paths_affected"] if x["block"] == EXPOSURE_BLOCK else 0,
+            -_COMPLEXITY_RANK.get(x["complexity"], 2)
+            if x["block"] == EXPOSURE_BLOCK
+            else 0,
             -x["reach_users"],
             -x["impact_score"],
         )
@@ -220,9 +380,18 @@ def _break_ties_by_remediation_effort(results: list[dict[str, Any]]) -> None:
     i = 0
     n = len(results)
     while i < n:
+        # Containment is ordered by TIME CRITICALITY and must never be re-sorted
+        # by cost: resetting krbtgt is not optional because revoking a
+        # certificate happens to be cheaper.
+        if results[i].get("block") == CONTAINMENT_BLOCK:
+            i += 1
+            continue
         j = i + 1
-        while j < n and (
-            results[j]["exploited_paths"] == results[i]["exploited_paths"]
+        while (
+            j < n
+            # A run never crosses a block boundary.
+            and results[j].get("block") == results[i].get("block")
+            and results[j]["exploited_paths"] == results[i]["exploited_paths"]
             and results[j]["paths_affected"] == results[i]["paths_affected"]
         ):
             j += 1
@@ -317,8 +486,9 @@ def build_remediation_start_here(
             the headline.
 
     Returns:
-        A JSON/Jinja-safe render model ``{headline, chain_note,
-        total_executed_paths, total_mapped_paths, rows, kpi_card}`` where each
+        A JSON/Jinja-safe render model ``{headline, chain_note, order_rule,
+        order_rule_clause, total_executed_paths, total_mapped_paths, rows,
+        kpi_card}`` where each
         row is ``{label, item_line, badge, badge_label, paths_affected,
         exploited_paths, executed, chain_tie_size, reach_*}`` PLUS the
         per-technique remediation guidance carried for the merged section
@@ -331,12 +501,15 @@ def build_remediation_start_here(
         priorities to lead with.
     """
     from adscan_core.reporting.chokepoint_copy import (  # noqa: PLC0415
+        REMEDIATION_ORDER_CLAUSE,
         STRUCTURAL_CHOKE_BADGE,
+        containment_block_note,
         is_structural_choke,
         reach_uniform_note,
         remediation_chain_note,
         remediation_item_line,
         remediation_kpi_lines,
+        remediation_order_sentence,
         remediation_start_here_headline,
     )
 
@@ -462,6 +635,18 @@ def build_remediation_start_here(
                 "can_mitigate": bool(entry.get("can_mitigate", True)),
                 "paths_pct": entry.get("paths_pct"),
                 "affected_principals": int(entry.get("affected_principals") or 0),
+                # Which block this row belongs to and why, so a renderer groups
+                # the section instead of inferring the split from the order.
+                "block": str(entry.get("block") or EXPOSURE_BLOCK),
+                "containment_kind": str(entry.get("containment_kind") or ""),
+                # Proof is a BADGE now, never the sort key.
+                "proven": bool(entry.get("proven")),
+                # The HOLDER-aware fix: who holds the privilege, and the change to
+                # make about that holder. Empty when no step carried the engine's
+                # stamp, which degrades to the technique guidance above.
+                "holder_label": str(entry.get("holder_label") or ""),
+                "remediability_kind": str(entry.get("remediability_kind") or ""),
+                "remediability_verb": str(entry.get("remediability_verb") or ""),
             }
         )
 
@@ -479,6 +664,9 @@ def build_remediation_start_here(
     top_reach_users = int(rows[0].get("reach_users") or 0)
     top_reach_total = int(rows[0].get("reach_total") or 0)
     top_reach_pct = float(rows[0].get("reach_pct") or 0.0)
+    # Containment leads the whole section, so the headline states that and why
+    # before it states the ordering rule for the fixes below it.
+    containment_count = sum(1 for row in rows if row["block"] == CONTAINMENT_BLOCK)
     headline = remediation_start_here_headline(
         top_paths_broken=top_paths_broken,
         total_validated_paths=top_denominator,
@@ -488,6 +676,7 @@ def build_remediation_start_here(
         reach_total=top_reach_total,
         reach_pct=top_reach_pct,
         reach_is_uniform=reach_is_uniform,
+        containment_count=containment_count,
     )
     # KPI headline card — derived from the SAME top fix the section leads with (the
     # #1 paths-broken row), executed-framed, so the CISO's headline card and the
@@ -528,6 +717,26 @@ def build_remediation_start_here(
     return {
         "headline": headline,
         "chain_note": chain_note,
+        # ── The order, stated ONCE for every surface ──────────────────────────
+        # The sentence a renderer prints wherever it tells the client what this
+        # order means, and the bare clause for a surface that embeds it ("ranks
+        # them by ..."). Both come from the copy SSOT, so the section subtitle,
+        # the table caption, the free report's lead and the roadmap that defers
+        # to this section cannot each describe a different sort key. They did:
+        # the paid spread stated it four ways and the free report three, two of
+        # them still carrying the pre-2026-10-07 "proven execution first" rule
+        # that stopped being true when proof became a badge.
+        "order_rule": remediation_order_sentence(containment_count),
+        "order_rule_clause": REMEDIATION_ORDER_CLAUSE,
+        # ── The three-block split, exposed so no renderer re-derives it ───────
+        "containment_count": containment_count,
+        "containment_note": containment_block_note(containment_count),
+        "exposure_count": len(rows) - containment_count,
+        # Whether ANY row carries the structural-choke durability badge. The
+        # legend defined that badge unconditionally, so a table where nothing
+        # earned it still explained a mark the reader could not find. A renderer
+        # shows the legend entry only when this is true.
+        "has_structural_badge": any(row["badge"] for row in rows),
         # When affected-user reach is uniform across the fixes, the ONE sentence a
         # renderer shows above the table instead of repeating the same percentage
         # per row (empty string otherwise). ``reach_is_uniform`` lets a renderer
@@ -548,8 +757,9 @@ def build_remediation_start_here(
         "kpi_card": {
             # The NAMED fix the card is about — the #1 row's technique label — so
             # the hero can say WHICH fix is the highest-confidence one, not just a
-            # bare count. The order is proven-executed first, so the #1 is the
-            # highest-CONFIDENCE (proven in this environment) fix, not the widest.
+            # bare count. Within the exposure block the order is routes closed,
+            # so the #1 exposure fix IS the widest; a containment action leads
+            # the whole list when the assessment produced one.
             "label": str(rows[0].get("label") or ""),
             "big": kpi_card["big"],
             "ratio": kpi_card["ratio"],

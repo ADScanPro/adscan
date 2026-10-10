@@ -12,6 +12,7 @@ from adscan_internal.services.graph_queries.inventories import (
     get_sessions,
     get_pwdneverexpires_users,
     get_passwordnotreqd_users,
+    get_tombstoned_users,
 )
 from adscan_internal.services.graph_queries.tier_classification import (
     is_tier0,
@@ -24,7 +25,10 @@ from adscan_internal.services.graph_queries.transitive import (
     transitive_groups_of,
 )
 from adscan_internal.services.graph_queries.filters import (
+    is_active,
     is_enabled,
+    is_live,
+    is_tombstoned,
     domain_matches,
     has_flag,
     is_stale,
@@ -44,13 +48,17 @@ __all__ = [
     "get_sessions",
     "get_pwdneverexpires_users",
     "get_passwordnotreqd_users",
+    "get_tombstoned_users",
     "is_tier0",
     "is_high_value",
     "is_tier0_or_high_value",
     "classify_tier0_by_rid",
     "build_membership_index",
     "transitive_groups_of",
+    "is_active",
     "is_enabled",
+    "is_live",
+    "is_tombstoned",
     "domain_matches",
     "has_flag",
     "is_stale",

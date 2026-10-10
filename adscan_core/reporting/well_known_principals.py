@@ -168,6 +168,53 @@ def is_domain_guest_account_sid(sid: str) -> bool:
     return s.endswith("-501")
 
 
+#: BUILTIN\\Guests fixed SID (RID 546) and Anonymous Logon (S-1-5-7) — the two
+#: non-domain-specific worthless reserved built-ins. A domain RID 503 is the
+#: DefaultAccount (a disabled, no-privilege management placeholder). RID 501 is
+#: the domain Guest (matched by shape via :func:`is_domain_guest_account_sid`).
+_WORTHLESS_VICTIM_EXACT_SIDS: frozenset[str] = frozenset(
+    {
+        _BUILTIN_GUESTS_SID,  # S-1-5-32-546 — BUILTIN\Guests
+        _ANONYMOUS_LOGON_SID,  # S-1-5-7 — Anonymous Logon
+    }
+)
+
+
+def is_worthless_victim_principal(sid: str) -> bool:
+    """Return whether a SID names a worthless reserved built-in victim.
+
+    ``True`` ONLY for genuinely worthless reserved built-ins that are never a
+    meaningful compromise TARGET: the domain Guest (RID 501) and DefaultAccount
+    (RID 503), plus the fixed ``BUILTIN\\Guests`` (S-1-5-32-546) and Anonymous
+    Logon (S-1-5-7). These accounts are disabled/no-privilege placeholders — an
+    attack step that "impersonates" one of them has escalated to nothing.
+
+    This predicate is NARROW by design. It returns ``False`` for every valuable
+    reserved object so those are still emitted: RID 500 (Administrator — may be
+    disabled yet remains Tier-0, enable-then-abuse is real), RID 502 (krbtgt),
+    RIDs 512/518/519 (Domain/Schema/Enterprise Admins), RID 513 (Domain Users),
+    and ANY RID ``>= 1000`` (operator-created accounts, including gMSAs and legit
+    low-privilege users — real credential theft against a low-priv user is a
+    genuine compromise target). It is matched by SID / RID SHAPE, never by name,
+    because a localized directory renders built-in names in its own language.
+
+    Args:
+        sid: The candidate principal SID (any case; ``""``/``None`` is not worthless).
+
+    Returns:
+        ``True`` only for the worthless reserved built-ins above.
+    """
+    s = str(sid or "").strip().upper()
+    if not s:
+        return False
+    if s in _WORTHLESS_VICTIM_EXACT_SIDS:
+        return True
+    if is_domain_guest_account_sid(s):  # domain RID 501
+        return True
+    # Domain RID 503 (DefaultAccount): S-1-5-21-<d1>-<d2>-<d3>-503.
+    return s.startswith("S-1-5-21-") and s.endswith("-503")
+
+
 def credential_less_readset_sids(
     reached_via: str, everyone_includes_anonymous: bool = False
 ) -> frozenset[str]:

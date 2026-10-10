@@ -4,7 +4,7 @@ The recap is the highest-value screen in the LITE experience: it renders what
 the scan actually proved (the headline validated attack path, the severity
 picture, the top findings) in the same editorial-forensic house style as the
 interactive ``attack_paths`` view. It is a DIGEST, not the explorer — one
-headline path, severity counts, and a pointer to ``adscan attack_paths``.
+headline path, severity counts, and a pointer to the ``attack_paths`` REPL command.
 
 Design: a pure data model (:class:`ScanRecapModel`) plus a pure renderer
 (:func:`build_recap_body`) that is a total function of the model. All AD I/O
@@ -343,7 +343,7 @@ def _closest_reach_line(cr, klass, path: RecapPath, nodes: list[str], edges: lis
         line.append_text(arrow)
         line.append(next_node, style="bold")
         # More than one hop: elide the middle with an ellipsis, then the real
-        # target. The full chain lives in ``adscan attack_paths``.
+        # target. The full chain lives in the ``attack_paths`` REPL command.
         if len(nodes) > 2:
             line.append_text(arrow)
             line.append("…", style="dim")

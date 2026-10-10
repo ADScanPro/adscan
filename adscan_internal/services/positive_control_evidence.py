@@ -35,7 +35,7 @@ offensive tool.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from adscan_core import telemetry
 from adscan_core.reporting.principal_display import humanize_principal_for_prose
@@ -110,7 +110,15 @@ _POSTURE_POSITIVES: tuple[
         TriState.ENABLED,
         "ldaps_available",
         "LDAPS Available for Encrypted Directory Traffic",
-        "The domain controller completed an LDAPS (TCP 636) TLS handshake — encrypted "
+        "The domain controller completed an LDAPS (TCP 636) TLS handshake: encrypted "
+        "directory transport is available.",
+    ),
+    (
+        ConstraintCategory.LDAP_STARTTLS_AVAILABLE,
+        TriState.ENABLED,
+        "starttls_available",
+        "StartTLS Available for Encrypted Directory Traffic",
+        "The domain controller completed a StartTLS upgrade on LDAP (TCP 389): encrypted "
         "directory transport is available.",
     ),
     (
@@ -226,7 +234,9 @@ def emit_password_policy_positive(shell: Any, domain: str) -> None:
         print_info_debug(f"[positive-control] password policy positive emit failed: {exc}")
 
 
-def emit_domain_policy_positives(shell: Any, domain: str, domain_policy: Any) -> None:
+def emit_domain_policy_positives(
+    shell: Any, domain: str, domain_policy: Any, psos: Any = None
+) -> None:
     """Emit standalone domain-policy positives when read with certainty.
 
     Two controls whose observed-good state is a definitive directory read on the
@@ -234,9 +244,14 @@ def emit_domain_policy_positives(shell: Any, domain: str, domain_policy: Any) ->
     ``strong_password_policy`` positive so a domain that fails one policy knob can
     still green the controls it passes:
 
-    - ``reversible_encryption_disabled`` — the domain does NOT store passwords with
-      reversible encryption (``reversible_encryption_enabled is False``). Reversible
-      encryption is cleartext-equivalent; its absence is a real hardening fact.
+    - ``reversible_encryption_disabled`` — reversible password storage is off
+      across BOTH policy scopes: the reversible-storage bit of ``pwdProperties``
+      on the domain root, and every fine-grained password policy's
+      ``msDS-PasswordReversibleEncryptionEnabled``. ``psos`` carries
+      ``result.psos`` so this positive checks the SAME two scopes the negative
+      finding does (``audit_analyzer._analyze_reversible_encryption``). Passing
+      ``None`` reads as "no fine-grained policies were collected", which narrows
+      the declared scope rather than widening the claim.
     - ``machine_account_quota_zero`` — ``ms-DS-MachineAccountQuota == 0``, so no
       standard user can join a computer (closes the "add a machine account then
       RBCD/shadow-creds" avenue at the source).
@@ -244,6 +259,18 @@ def emit_domain_policy_positives(shell: Any, domain: str, domain_policy: Any) ->
     Third-state discipline: only a definitive read emits. ``None`` (attribute not
     read) or the insecure value (``True`` / ``> 0``) never greens — that would be
     the INFERRED_BY_ABSENCE falsehood the doctrine forbids.
+
+    **SCOPE, and why it is in the client-visible evidence rather than only in
+    ``details``.** Judged as a sentence this positive was honest, and it still
+    misled: in a deliverable listing recovered account passwords, the clause
+    "cleartext-equivalent storage is disabled" read as a contradiction, and the
+    green tick reached the compliance scorecard while the scope qualifier stayed
+    in a ``details`` dict nobody renders. So the evidence now states the scope it
+    covers (the password POLICIES) and the sub-scope it never read (the
+    per-account reversible-encryption flag, ``userAccountControl`` ``0x80``),
+    because under the three-state doctrine an unread sub-scope must not ride
+    along inside a green. The compliance MAPPING was narrowed for the same
+    reason: the mapping, not the sentence, is what reaches the scorecard.
     """
     domain_name = str(domain or "").strip()
     if not domain_name or domain_policy is None:
@@ -254,22 +281,57 @@ def emit_domain_policy_positives(shell: Any, domain: str, domain_policy: Any) ->
             return
 
         reversible = getattr(domain_policy, "reversible_encryption_enabled", None)
-        if reversible is False:  # definitive read; None (unread) must NOT green
+        # Both policy scopes, the same pair the negative finding checks. A
+        # fine-grained policy that ENABLES reversible storage blocks the green
+        # outright; one that did not return the attribute is counted as unread and
+        # declared, never folded in as a clean read.
+        pso_list = list(psos or ())
+        pso_enabled = any(
+            getattr(pso, "reversible_encryption_enabled", None) is True
+            for pso in pso_list
+        )
+        psos_read = sum(
+            1
+            for pso in pso_list
+            if getattr(pso, "reversible_encryption_enabled", None) is False
+        )
+        psos_unread = len(pso_list) - psos_read - (1 if pso_enabled else 0)
+        if reversible is False and not pso_enabled:
+            policies_read = 1 + psos_read
+            policies_noun = "policy" if policies_read == 1 else "policies"
+            unread_clause = ""
+            if psos_unread > 0:
+                pol = "policy" if psos_unread == 1 else "policies"
+                did = "did" if psos_unread == 1 else "did"
+                unread_clause = (
+                    f", and {psos_unread} fine-grained {pol} {did} not return "
+                    "the attribute"
+                )
             recorder(
                 shell,
                 domain_name,
                 key="reversible_encryption_disabled",
-                title="Reversible Password Encryption Disabled",
+                title="Reversible Password Storage Disabled in Policy",
                 category="Password Policy",
                 status="observed",
                 details={
-                    "scope": "default_domain_policy",
+                    "scope": "password_policy",
                     "reversible_encryption_enabled": False,
+                    "policies_read": policies_read,
+                    "policies_unread": max(psos_unread, 0),
+                    # The sub-scope this control does NOT cover, machine-readable
+                    # so a consumer can qualify the green without parsing prose.
+                    "per_account_flag_read": False,
                     "source": "directory",
                     "evidence": (
-                        "Default domain policy read via directory: passwords are "
-                        "NOT stored with reversible encryption (cleartext-equivalent "
-                        "storage is disabled)."
+                        f"Reversible password storage is disabled across the "
+                        f"{policies_read} password {policies_noun} read in this "
+                        "domain: the reversible-storage bit is off on the domain "
+                        "root, and no fine-grained password policy enables it. "
+                        "This covers the policy scope. The per-account "
+                        "reversible-encryption flag was not read in this "
+                        "assessment, so this states nothing about an individual "
+                        f"account carrying it{unread_clause}."
                     ),
                 },
             )
@@ -641,7 +703,7 @@ def emit_endpoint_protection_positive(shell: Any, domain: str, nodes: Any) -> No
 # An Azure AD Connect ("AAD Connect" / DirSync) account named MSOL_<12 hex> holds
 # directory-replication (DCSync-equivalent) rights on the domain BY DESIGN, to
 # support Password Hash Sync. ADscan suppresses the anomalous DCSync finding for a
-# confirmed one (attack_graph_findings._is_breaker_held_legitimate_edge, keyed on
+# confirmed one (attack_graph_findings._is_tier0_source_legitimate_edge, keyed on
 # the stamped Tier-0 label). This must NOT leave the report silent about a Tier-0
 # asset (the third-state doctrine), so in place of the suppressed finding ADscan
 # surfaces a Tier-0 asset-HARDENING item — a positive/action item, never a
@@ -833,6 +895,671 @@ def emit_control_plane_sync_account_items(shell: Any, domain: str, graph: Any) -
         print_info_debug(f"[positive-control] sync-account hardening emit failed: {exc}")
 
 
+# ── Foreign-tenant replication: the finding, and the item it reconciles with ──
+# A sync account whose replication TARGET tenant carries none of the organization's
+# own identity tokens is the one case where the by-design reading above does not
+# hold: the rights are real, and the destination is not the client's. That is a
+# CLIENT FINDING, so it is recorded as one HERE, in the engine, under the catalogued
+# key EXTERNAL_TENANT_REPLICATION_KEY. It used to be synthesized inside the PDF
+# renderer and again inside the bonus playbook, which is why the paid report asserted
+# one more critical than the scan had recorded and the free report, the posture score,
+# the compliance annex and the web CTEM never saw it at all.
+#
+# The verdict needs the FULL assessed domain set (the client's own identity tokens
+# come from every domain in the report), and a domain enumerated later must be able
+# to change it, so it cannot be settled per-domain while the scan runs. It is settled
+# once, at the reconciliation seam both tiers pass through before reading the report.
+
+
+def _foreign_sync_account_guidance(
+    *, account: str, tenant: str, install_host: str, finding_title: str
+) -> str:
+    """Author the hardening guidance for a FOREIGN-tenant sync account.
+
+    The third state, alongside the CONFIRMED and AMBIGUOUS prose authored in
+    :func:`emit_control_plane_sync_account_items`. It exists because the CONFIRMED
+    text states that the replication access "is expected and is not a
+    misconfiguration", which is true of an account synchronizing to the
+    organization's own tenant and false of this one. Shipping both that sentence
+    and a critical finding about the same account in one report is a contradiction
+    a reader is right to distrust, so the reassurance is withdrawn and the item
+    points at the finding instead.
+    """
+    where = ""
+    if install_host:
+        where = f", running on {install_host}"
+    return (
+        f"{account} matches the naming of an Azure AD Connect directory-"
+        "synchronization account and holds the directory-replication rights such an "
+        f"account is given at installation{where}. Its synchronization target, "
+        f"tenant {tenant or 'an external tenant'}, carries none of this "
+        "organization's own identifiers, so the usual reading of those rights as "
+        "expected does not apply here and this account is not treated as assured. "
+        f"It is raised as the finding {finding_title}, which carries the full "
+        "analysis and the steps to take. Verify this account before the rest of "
+        "this section: confirm with your identity team that the installation exists "
+        "and is authorized. If it does, protect the account and its server as "
+        "Tier 0 identities. If no such installation is authorized, the replication "
+        "rights are unauthorized and have to be removed."
+    )
+
+
+def reconcile_external_tenant_replication(shell: Any) -> None:
+    """Record, refresh or retract the external-tenant replication finding.
+
+    Folds the persisted Tier-0 hardening control evidence across EVERY domain in
+    the report through the shared verdict SSOT
+    (:func:`~adscan_core.reporting.tier0_hardening.build_tier0_hardening_items`),
+    so the coverage card's "does not match this organization's domains" verdict
+    and the existence of the finding can never disagree: both read one derivation
+    over one domain set.
+
+    Per owning domain, for the accounts whose sync target is foreign:
+
+    * records the catalogued finding, carrying the real account, tenant and
+      install host so the remediation commands and the affected-assets block name
+      the actual objects rather than a fill-in token;
+    * rewords that account's hardening item so the report does not call the same
+      account expected and critical at once.
+
+    Retracts the finding for a domain that no longer has a foreign-tenant account,
+    because ``technical_report.json`` outlives a single scan and a stale critical
+    is a claim the client cannot reproduce.
+
+    Idempotent (both recorders update by key) and best-effort: a failure here must
+    never break a render.
+    """
+    try:
+        from adscan_core.reporting.tier0_hardening import (  # noqa: PLC0415
+            EXTERNAL_TENANT_REPLICATION_KEY,
+            FOREIGN_TENANT_SAR_FINDING,
+            build_tier0_hardening_items,
+        )
+
+        record_finding = load_optional_report_service_attr(
+            "record_technical_finding",
+            action="External-tenant replication finding",
+            debug_printer=print_info_debug,
+            prefix="[positive-control]",
+        )
+        retract_finding = load_optional_report_service_attr(
+            "retract_technical_finding",
+            action="External-tenant replication retraction",
+            debug_printer=print_info_debug,
+            prefix="[positive-control]",
+        )
+        record_evidence = _resolve_recorder()
+        if not callable(record_finding) or not callable(retract_finding):
+            return
+
+        # Read the report through the LITE-safe core reader (always present; the
+        # PRO report service only re-exports the writers).
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            _load_technical_report,
+        )
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains") if isinstance(report, dict) else None
+        if not isinstance(domains, dict):
+            return
+        blocks = [
+            (str(name), block)
+            for name, block in domains.items()
+            if isinstance(block, dict)
+        ]
+        if not blocks:
+            return
+
+        rows = [
+            row
+            for row in build_tier0_hardening_items(blocks)
+            if isinstance(row, dict) and not row.get("tenant_matches", True)
+        ]
+
+        # One finding per OWNING domain (the first domain a cross-domain account
+        # was seen in), so an account visible through two domains is not counted
+        # as two findings.
+        by_domain: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            owner = next(
+                (d for d in (row.get("domains") or []) if str(d).strip()), ""
+            )
+            if owner:
+                by_domain.setdefault(owner, []).append(row)
+
+        for domain_name, _block in blocks:
+            domain_rows = by_domain.get(domain_name) or []
+            if not domain_rows:
+                retract_finding(shell, domain_name, key=EXTERNAL_TENANT_REPLICATION_KEY)
+                continue
+
+            accounts = [
+                {
+                    "samaccountname": str(row.get("account") or "").strip(),
+                    "sync_target": str(row.get("tenant") or "").strip(),
+                    "install_host": str(row.get("install_host") or "").strip(),
+                }
+                for row in domain_rows
+                if str(row.get("account") or "").strip()
+            ]
+            if not accounts:
+                retract_finding(shell, domain_name, key=EXTERNAL_TENANT_REPLICATION_KEY)
+                continue
+
+            record_finding(
+                shell,
+                domain_name,
+                key=EXTERNAL_TENANT_REPLICATION_KEY,
+                status="confirmed",
+                details={
+                    "accounts": accounts,
+                    # The finding's own subject principal, read by the shared
+                    # command personalizer to fill the ``<ACCOUNT>`` token.
+                    "username": accounts[0]["samaccountname"],
+                    "tenants": sorted(
+                        {a["sync_target"] for a in accounts if a["sync_target"]}
+                    ),
+                    "install_hosts": sorted(
+                        {a["install_host"] for a in accounts if a["install_host"]}
+                    ),
+                },
+            )
+
+            if not callable(record_evidence):
+                continue
+            for row in domain_rows:
+                evidence_key = str(row.get("key") or "").strip()
+                if not evidence_key:
+                    continue
+                record_evidence(
+                    shell,
+                    domain_name,
+                    key=evidence_key,
+                    title=str(row.get("title") or "").strip() or None,
+                    category="Tier 0 Asset Hardening",
+                    status="needs_confirmation",
+                    details={
+                        "sync_target_is_foreign": True,
+                        "evidence": _foreign_sync_account_guidance(
+                            account=str(row.get("account") or "").strip(),
+                            tenant=str(row.get("tenant") or "").strip(),
+                            install_host=str(row.get("install_host") or "").strip(),
+                            finding_title=FOREIGN_TENANT_SAR_FINDING,
+                        ),
+                    },
+                )
+    except Exception as exc:  # pragma: no cover - best effort reconciliation
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[positive-control] external-tenant replication reconcile failed: {exc}"
+        )
+
+
+# ── Shadow credentials: separate the Hello rollout from the planted ones ──────
+# ``msDS-KeyCredentialLink`` is populated both by a sanctioned Windows Hello /
+# hybrid-join rollout and by an attacker planting a backdoor, and one entry looks
+# identical either way. Reported as one aggregate finding the number means
+# nothing: on a reference engagement it covered 86 Tier-2 computers and 3 Tier-0
+# users, and an AD team dismisses 89 objects as "our Hello rollout" in thirty
+# seconds, taking the three that mattered with it.
+#
+# The discriminators are already in the workspace (object type, privilege tier,
+# population scale, an observed sync account as hybrid corroboration), so the
+# finding is SEGMENTED here rather than hedged. Pure shape logic lives in the
+# LITE-safe SSOT ``adscan_core.reporting.shadow_credential_segmentation``; this
+# resolves its inputs from the stamped graph and persists the two outcomes.
+
+#: ``control_evidence`` key for the observed rollout. Deliberately NOT a
+#: POSITIVE_CONTROL_KEYS member: observing the attribute populated at scale
+#: proves key registration was DEPLOYED, not that passwordless authentication is
+#: ENFORCED, and greening an authentication control on the weaker fact is the
+#: over-claim the third-state doctrine forbids. It is recorded as an observation
+#: of the environment, which is what makes the segmented finding legible.
+_WHFB_ROLLOUT_EVIDENCE_KEY = "whfb_key_credential_rollout"
+
+
+def _graph_node_tier0_index(graph: Any) -> dict[str, bool]:
+    """Map lower-cased sAMAccountName to its stamped Tier-0 verdict.
+
+    Reads the stamped, membership+ACL-aware ``privilege_tier`` via the SSOT
+    predicate, never the raw ``isTierZero`` boolean: the two legitimately
+    diverge, and the raw flag is collector-time output that misses any
+    membership- or ACL-derived Tier 0.
+    """
+    index: dict[str, bool] = {}
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, dict):
+        return index
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            node_is_tier0_by_stamped_label,
+        )
+    except Exception:  # noqa: BLE001 - no stamp available, every object reads Tier-2
+        return index
+    for node in nodes.values():
+        if not isinstance(node, dict):
+            continue
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        name = str(props.get("samaccountname") or "").strip().lower()
+        if not name:
+            label = str(node.get("label") or node.get("name") or "").strip()
+            name = label.split("@", 1)[0].split("\\")[-1].strip().lower()
+        if not name:
+            continue
+        try:
+            is_tier0 = bool(node_is_tier0_by_stamped_label(node))
+        except Exception:  # noqa: BLE001 - a malformed node is simply not Tier-0
+            is_tier0 = False
+        # A name seen twice keeps the STRONGER verdict: never downgrade a Tier-0
+        # object because a second node carried the same sAMAccountName.
+        index[name] = index.get(name, False) or is_tier0
+    return index
+
+
+def _workspace_is_hybrid(domain_block: Any) -> bool:
+    """Whether this domain carries an observed Azure AD Connect sync account.
+
+    Independent corroboration that a hybrid rollout exists, read from the
+    control evidence the sync-account emit above already persisted, so hybridness
+    is an observed fact rather than an assumption about the environment.
+    """
+    if not isinstance(domain_block, Mapping):
+        return False
+    entries = domain_block.get("control_evidence")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(entry, Mapping)
+        and str(entry.get("category") or "").strip() == "Tier 0 Asset Hardening"
+        for entry in entries
+    )
+
+
+def reconcile_shadow_credential_segmentation(shell: Any, domain: str, graph: Any) -> None:
+    """Scope the shadow-credential finding to the objects a rollout cannot explain.
+
+    Re-reads the raw ``shadow_credentials_present`` finding the collector
+    recorded, resolves each object's stamped privilege tier from the graph,
+    segments it by population shape, and persists the two outcomes:
+
+    * the objects to confirm stay the finding, now scoped and Tier-0 first, so
+      the contextual Tier-0 CVSS elevation applies to the accounts that earned
+      it instead of to an 89-object blob;
+    * the rollout is recorded as control evidence, an observation of the
+      environment and never a weakness.
+
+    Retracts the finding outright when every object belongs to the rollout: a
+    managed Hello deployment is not a client finding.
+
+    Idempotent (both recorders update by key) and best-effort.
+    """
+    try:
+        from adscan_core.reporting.shadow_credential_segmentation import (  # noqa: PLC0415
+            ShadowCredentialObject,
+            segment_shadow_credentials,
+        )
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            _load_technical_report,
+        )
+
+        domain_name = str(domain or "").strip()
+        if not domain_name:
+            return
+
+        record_finding = load_optional_report_service_attr(
+            "record_technical_finding",
+            action="Shadow credential segmentation",
+            debug_printer=print_info_debug,
+            prefix="[positive-control]",
+        )
+        retract_finding = load_optional_report_service_attr(
+            "retract_technical_finding",
+            action="Shadow credential retraction",
+            debug_printer=print_info_debug,
+            prefix="[positive-control]",
+        )
+        if not callable(record_finding) or not callable(retract_finding):
+            return
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains") if isinstance(report, dict) else None
+        domain_block = domains.get(domain_name) if isinstance(domains, dict) else None
+        if not isinstance(domain_block, Mapping):
+            return
+        findings = domain_block.get("findings")
+        if not isinstance(findings, list):
+            return
+        raw = next(
+            (
+                item
+                for item in findings
+                if isinstance(item, Mapping)
+                and item.get("key") == "shadow_credentials_present"
+            ),
+            None,
+        )
+        if raw is None:
+            return
+        details = raw.get("details") if isinstance(raw.get("details"), Mapping) else {}
+        objects = details.get("objects")
+        if not isinstance(objects, list) or not objects:
+            return
+        # Already segmented by an earlier pass: re-segmenting the scoped set would
+        # judge the confirm list as its own population and could baseline it.
+        if details.get("segmented_by_population_shape"):
+            return
+
+        tier0_index = _graph_node_tier0_index(graph)
+        records = []
+        for entry in objects:
+            if not isinstance(entry, Mapping):
+                continue
+            name = str(entry.get("samaccountname") or "").strip()
+            if not name:
+                continue
+            records.append(
+                ShadowCredentialObject(
+                    samaccountname=name,
+                    kind=str(entry.get("kind") or ""),
+                    is_tier0=tier0_index.get(name.lower(), False),
+                    key_count=int(entry.get("key_count") or 1),
+                )
+            )
+        if not records:
+            return
+
+        by_name = {
+            str(e.get("samaccountname") or "").strip().lower(): e
+            for e in objects
+            if isinstance(e, Mapping)
+        }
+        segmentation = segment_shadow_credentials(
+            records, hybrid=_workspace_is_hybrid(domain_block)
+        )
+
+        if segmentation.has_accounts_to_confirm:
+            scoped = []
+            for obj in segmentation.accounts_to_confirm:
+                original = dict(by_name.get(obj.samaccountname.lower()) or {})
+                original["samaccountname"] = obj.samaccountname
+                original["kind"] = obj.kind
+                original["is_tier0"] = obj.is_tier0
+                scoped.append(original)
+            record_finding(
+                shell,
+                domain_name,
+                key="shadow_credentials_present",
+                status="confirmed",
+                details={
+                    "objects": scoped,
+                    "count": len(scoped),
+                    "tier0_count": segmentation.tier0_count,
+                    "segmented_by_population_shape": True,
+                    "rollout_baseline_count": len(segmentation.rollout_baseline),
+                    "rollout_computer_count": segmentation.computer_count,
+                    "rollout_user_count": segmentation.user_count,
+                    "rollout_threshold": segmentation.rollout_threshold,
+                    "hybrid_environment": segmentation.hybrid,
+                },
+            )
+        else:
+            retract_finding(shell, domain_name, key="shadow_credentials_present")
+
+        if not segmentation.has_rollout_baseline:
+            return
+        recorder = _resolve_recorder()
+        if not callable(recorder):
+            return
+        computers = segmentation.computer_count
+        users = segmentation.user_count
+        population: list[str] = []
+        if computers:
+            population.append(f"{computers} computer account{'s' if computers != 1 else ''}")
+        if users:
+            population.append(f"{users} user account{'s' if users != 1 else ''}")
+        population_phrase = " and ".join(population) or "accounts"
+        corroboration = (
+            " A directory-synchronization account for Azure AD Connect was also "
+            "observed in this domain, which is consistent with a hybrid "
+            "deployment."
+            if segmentation.hybrid
+            else ""
+        )
+        guidance = (
+            f"{population_phrase} carry a key credential "
+            "(msDS-KeyCredentialLink), the attribute written when a device or a "
+            "user is enrolled for certificate-based logon through Windows Hello "
+            "for Business or hybrid directory join. At this scale the population "
+            "reads as a managed rollout rather than individually planted entries, "
+            "so it is recorded as an observation of the environment and not as a "
+            f"weakness.{corroboration} Key credentials are device-bound and "
+            "phishing-resistant, so a rollout is good hygiene. Objects whose entry "
+            "the rollout does not account for are reported separately under "
+            "Shadow Credentials, which is where the accounts needing a decision "
+            "are listed."
+        )
+        remediation = (
+            "Keep enrolment under sanctioned policy so new key credentials stay "
+            "attributable: confirm the rollout scope with Get-ADObject -LDAPFilter "
+            "'(msDS-KeyCredentialLink=*)' -Properties msDS-KeyCredentialLink, and "
+            "audit writes to the attribute (Event ID 5136) through the Default "
+            "Domain Controllers Policy so an entry added outside the rollout is "
+            "visible."
+        )
+        recorder(
+            shell,
+            domain_name,
+            key=_WHFB_ROLLOUT_EVIDENCE_KEY,
+            title="Certificate-Based Logon Enrolment Observed (Windows Hello / Hybrid Join)",
+            category="Control Evidence",
+            status="observed",
+            details={
+                "computer_count": computers,
+                "user_count": users,
+                "rollout_threshold": segmentation.rollout_threshold,
+                "hybrid_environment": segmentation.hybrid,
+                "source": "attack_graph",
+                "evidence": guidance,
+                "remediation": remediation,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best effort reconciliation
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[positive-control] shadow-credential segmentation failed: {exc}"
+        )
+
+
+def emit_esc15_hardened_positive(
+    shell: Any,
+    domain: str,
+    *,
+    template: Optional[str] = None,
+    ca_name: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Emit ``esc15_application_policy_injection_mitigated`` from a confirm-mode hardened verdict.
+
+    The ESC15 (EKUwu / CVE-2024-49019) NON-DESTRUCTIVE confirm-mode enrolled a
+    self-subject certificate with a canary application policy and OBSERVED that
+    the CA stripped the injected policy from the issued certificate — a
+    definitive, actively-probed positive (the CA is patched). This greens the
+    control the ESC15 finding would otherwise fail, exactly like the CVE
+    ``*_not_vulnerable`` positives: only the OBSERVED-GOOD verdict emits (the
+    caller calls this only for the ``hardened`` verdict, never for
+    ``attempted`` / ``indeterminate``, which are data gaps).
+
+    Best-effort and idempotent (``record_control_evidence`` updates by key).
+    Client-safe: names only observed PKI facts, never an offensive tool.
+    """
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return
+    try:
+        recorder = _resolve_recorder()
+        if recorder is None:
+            return
+        details: dict[str, Any] = {
+            "verdict": "hardened",
+            "cve_id": "CVE-2024-49019",
+            "source": "adcs_esc15_confirm",
+            "evidence": (
+                "ADscan enrolled a self-subject certificate with an injected "
+                "application policy and observed that the certification authority "
+                "stripped it from the issued certificate. The CA does not honour "
+                "attacker-supplied application policies, so the EKUwu escalation "
+                "(ESC15 / CVE-2024-49019) is not exploitable on this CA."
+            ),
+        }
+        if template:
+            details["template"] = str(template)
+        if ca_name:
+            details["ca_name"] = str(ca_name)
+        if reason:
+            details["observation"] = str(reason)
+        recorder(
+            shell,
+            domain_name,
+            key="esc15_application_policy_injection_mitigated",
+            title="ADCS Application-Policy Injection Not Honoured (ESC15 / EKUwu Patched)",
+            category="Certificate Services",
+            status="observed",
+            details=details,
+        )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[positive-control] ESC15 hardened positive emit failed: {exc}")
+
+
+def emit_esc14_hardened_positive(
+    shell: Any,
+    domain: str,
+    *,
+    scbe: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Emit ``esc14_weak_explicit_mapping_mitigated`` from a hardened SCBE verdict.
+
+    The ESC14 (weak explicit certificate mapping) NON-DESTRUCTIVE confirm READ
+    StrongCertificateBindingEnforcement on every domain controller over Remote
+    Registry and OBSERVED Full enforcement (== 2) everywhere — a definitive,
+    actively-probed positive: a weak ``altSecurityIdentities`` mapping is refused,
+    so the explicit-mapping abuse is not exploitable. This greens the control the
+    ESC14 finding would otherwise fail, exactly like the CVE ``*_not_vulnerable``
+    positives: only the OBSERVED-GOOD verdict emits (the caller calls this only for
+    the hardened verdict, never for a pending / confirmed one, which are data gaps
+    or live findings).
+
+    Best-effort and idempotent (``record_control_evidence`` updates by key).
+    Client-safe: names only observed DC facts, never an offensive tool.
+    """
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return
+    try:
+        recorder = _resolve_recorder()
+        if recorder is None:
+            return
+        details: dict[str, Any] = {
+            "verdict": "hardened",
+            "source": "adcs_esc14_confirm",
+            "evidence": (
+                "ADscan read StrongCertificateBindingEnforcement on every domain "
+                "controller and observed Full enforcement (value 2) throughout. "
+                "Domain controllers refuse weak explicit certificate mappings "
+                "(altSecurityIdentities), so the ESC14 explicit-mapping escalation "
+                "is not exploitable (KB5014754)."
+            ),
+        }
+        if isinstance(scbe, int):
+            details["strong_certificate_binding_enforcement"] = scbe
+        if reason:
+            details["observation"] = str(reason)
+        recorder(
+            shell,
+            domain_name,
+            key="esc14_weak_explicit_mapping_mitigated",
+            title="Strong Certificate Binding Enforced (ESC14 Explicit-Mapping Abuse Mitigated)",
+            category="Certificate Services",
+            status="observed",
+            details=details,
+        )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[positive-control] ESC14 hardened positive emit failed: {exc}")
+
+
+def emit_esc9_hardened_positive(
+    shell: Any,
+    domain: str,
+    *,
+    scbe: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Emit ``esc9_implicit_mapping_mitigated`` from a hardened ESC9/10 verdict.
+
+    The ESC9/ESC10 (implicit certificate mapping) NON-DESTRUCTIVE confirm OBSERVED
+    that the domain controllers enforce strong certificate binding (KB5014754 Full):
+    either the registry read reported Full on every DC, or the behavioral canary saw
+    a Kerberos code-66 refusal of a self no-SID certificate. A certificate with no
+    SID security extension is refused, so the implicit-mapping escalation is not
+    exploitable. This greens the control the ESC9/10 finding would otherwise fail,
+    exactly like the CVE ``*_not_vulnerable`` positives: only the OBSERVED-GOOD
+    verdict emits (the caller calls this only for the hardened verdict, never for a
+    pending / confirmed one).
+
+    The note records BOTH the active mitigation AND the latent template weakness
+    (the template still carries ``CT_FLAG_NO_SECURITY_EXTENSION``), the
+    defence-in-depth signal: the escalation becomes exploitable again if strong
+    certificate binding is ever lowered. Best-effort and idempotent
+    (``record_control_evidence`` updates by key). Client-safe: names only observed
+    DC/PKI facts, never an offensive tool.
+    """
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return
+    try:
+        recorder = _resolve_recorder()
+        if recorder is None:
+            return
+        details: dict[str, Any] = {
+            "verdict": "hardened",
+            "source": "adcs_esc9_confirm",
+            "evidence": (
+                "ADscan observed that the domain controllers enforce strong "
+                "certificate binding (KB5014754 Full): a certificate carrying no SID "
+                "security extension is refused for implicit mapping, so the ESC9 / "
+                "ESC10 escalation is not exploitable on this domain. Note the "
+                "underlying certificate template still carries "
+                "CT_FLAG_NO_SECURITY_EXTENSION, so the escalation would become "
+                "exploitable again if strong certificate binding is lowered — keep "
+                "StrongCertificateBindingEnforcement at Full and remove the flag "
+                "from the template for defence in depth."
+            ),
+        }
+        if isinstance(scbe, int):
+            details["strong_certificate_binding_enforcement"] = scbe
+        if reason:
+            details["observation"] = str(reason)
+        recorder(
+            shell,
+            domain_name,
+            key="esc9_implicit_mapping_mitigated",
+            title="Strong Certificate Binding Enforced (ESC9 / ESC10 Implicit-Mapping Abuse Mitigated)",
+            category="Certificate Services",
+            status="observed",
+            details=details,
+        )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[positive-control] ESC9 hardened positive emit failed: {exc}")
+
+
 __all__ = [
     "emit_posture_positives",
     "emit_password_policy_positive",
@@ -840,4 +1567,9 @@ __all__ = [
     "emit_registry_positives",
     "emit_endpoint_protection_positive",
     "emit_control_plane_sync_account_items",
+    "emit_esc15_hardened_positive",
+    "emit_esc14_hardened_positive",
+    "emit_esc9_hardened_positive",
+    "reconcile_external_tenant_replication",
+    "reconcile_shadow_credential_segmentation",
 ]
