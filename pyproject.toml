@@ -113,7 +113,7 @@ cli = [
     # full-bleed client cover/back pages around the body PDF (composition-seam
     # 3-render concat in pro/reporting/orchestrator.py). BSD-licensed.
     "pypdf>=5.0,<7.0",
-    "playwright==1.62.0",
+    "playwright==1.64.1",
     "jinja2>=3.0",
     "graphviz>=0.20",
     "python-magic>=0.4.27,<0.5; platform_system == 'Linux'",
